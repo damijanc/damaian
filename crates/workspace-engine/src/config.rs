@@ -48,6 +48,10 @@ pub struct Config {
     pub require_approval_for_all_commands: bool,
     pub block_generated_secrets: bool,
     pub shell: String,
+    pub model_provider: String,
+    pub model_name: String,
+    pub model_base_url: String,
+    pub model_api_key_env: String,
 }
 
 impl Config {
@@ -85,6 +89,12 @@ impl Default for Config {
             require_approval_for_all_commands: false,
             block_generated_secrets: true,
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()),
+            model_provider: "openai-compatible".to_string(),
+            model_name: std::env::var("OPENAI_MODEL")
+                .unwrap_or_else(|_| "configured-model".to_string()),
+            model_base_url: std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com".to_string()),
+            model_api_key_env: "OPENAI_API_KEY".to_string(),
         }
     }
 }

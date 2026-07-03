@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, ClientError, CommandPolicy, CommandRisk, Config, PatchEngine, PathPolicy,
-    ProjectIndexer, ProposedChange, SecretScanner,
+    AuditLog, ClientError, CommandPolicy, CommandRisk, Config, MockModelAdapter, ModelMessage,
+    ModelRequest, PatchEngine, PathPolicy, ProjectIndexer, ProposedChange, SecretScanner,
+    SessionStore, WorkspaceEngine, extract_model_tokens, model_request_json,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -298,4 +299,87 @@ fn blocks_generated_hardcoded_secrets_by_default() {
     assert!(matches!(error, ClientError::PolicyBlocked(_)));
 
     fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn persists_session_tasks_and_messages() {
+    let repo = temp_dir("session-store");
+    let store = SessionStore::new(repo.join(".damaian"));
+    let session = store.create_session("repo_1", "Explain auth flow").unwrap();
+    let task = store
+        .create_task(&session.id, "Explain auth", "mock", "mock-model")
+        .unwrap();
+    store
+        .append_message(&session.id, Some(&task.id), "user", "Explain auth")
+        .unwrap();
+    store
+        .append_message(
+            &session.id,
+            Some(&task.id),
+            "assistant",
+            "Auth uses tokens — safely.",
+        )
+        .unwrap();
+
+    let messages = store.read_messages(&session.id).unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[1].content, "Auth uses tokens — safely.");
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn orchestrates_chat_with_indexed_context_and_mock_model() {
+    let repo = temp_dir("chat");
+    write_fixture(&repo, "README.md", "# Chat test\n");
+    write_fixture(
+        &repo,
+        "src/auth.js",
+        "export function refreshToken() { return 'ok'; }\n",
+    );
+    let config = test_config(&repo);
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new("Refresh token is implemented in src/auth.js.");
+    let mut streamed = String::new();
+    let mut on_token = |token: &str| streamed.push_str(token);
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "How does refresh token work?",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert_eq!(streamed, "Refresh token is implemented in src/auth.js.");
+    assert!(result.context_files.contains(&"src/auth.js".to_string()));
+    assert!(result.response.contains("src/auth.js"));
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    assert_eq!(messages.len(), 2);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn builds_openai_request_json_and_extracts_stream_tokens() {
+    let request = ModelRequest {
+        provider: "openai-compatible".to_string(),
+        model: "test-model".to_string(),
+        messages: vec![ModelMessage::user("hello \"repo\"")],
+        temperature: Some("0".to_string()),
+        stream: true,
+    };
+    let body = model_request_json(&request);
+    assert!(body.contains("\"model\":\"test-model\""));
+    assert!(body.contains("hello \\\"repo\\\""));
+
+    let raw = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" repo — ok\"}}]}\n\ndata: [DONE]\n\n";
+    assert_eq!(extract_model_tokens(raw), vec!["Hello", " repo — ok"]);
 }
