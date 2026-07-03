@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
     AuditLog, ClientError, CommandPolicy, CommandRisk, Config, MockModelAdapter, ModelMessage,
     ModelRequest, PatchEngine, PathPolicy, ProjectIndexer, ProposedChange, SecretScanner,
-    SessionStore, WorkspaceEngine, extract_model_tokens, model_request_json,
+    SessionStore, WorkspaceEngine, extract_model_tokens, model_request_json, parse_generated_edit,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -382,4 +382,91 @@ fn builds_openai_request_json_and_extracts_stream_tokens() {
 
     let raw = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" repo — ok\"}}]}\n\ndata: [DONE]\n\n";
     assert_eq!(extract_model_tokens(raw), vec!["Hello", " repo — ok"]);
+}
+
+#[test]
+fn parses_generated_edit_envelope() {
+    let raw = "DAMAIAN_EDIT_V1\nSUMMARY: Update greeting\nFILE: src/app.js\nSTATUS: modified\nCONTENT:\nexport const greeting = 'hi';\nEND_FILE\nEND_PATCH\n";
+    let edit = parse_generated_edit(raw).unwrap();
+
+    assert_eq!(edit.summary, "Update greeting");
+    assert_eq!(edit.changes.len(), 1);
+    assert_eq!(edit.changes[0].path, "src/app.js");
+    assert_eq!(
+        edit.changes[0].new_content,
+        "export const greeting = 'hi';\n"
+    );
+}
+
+#[test]
+fn proposes_edit_stores_patch_and_applies_selected_files() {
+    let repo = temp_dir("edit-apply");
+    write_fixture(&repo, "src/a.js", "export const a = 1;\n");
+    write_fixture(&repo, "src/b.js", "export const b = 1;\n");
+    let config = test_config(&repo);
+    let engine = WorkspaceEngine::new(config);
+    let response = "DAMAIAN_EDIT_V1\nSUMMARY: Update constants\nFILE: src/a.js\nSTATUS: modified\nCONTENT:\nexport const a = 2;\nEND_FILE\nFILE: src/b.js\nSTATUS: modified\nCONTENT:\nexport const b = 2;\nEND_FILE\nEND_PATCH\n";
+    let mut adapter = MockModelAdapter::new(response);
+
+    let proposal = engine
+        .edit_orchestrator
+        .propose_edit(&repo, "Update constants", &[], &mut adapter)
+        .unwrap();
+
+    assert_eq!(proposal.patch.files.len(), 2);
+    assert!(
+        proposal.patch.files[0]
+            .diff
+            .contains("-export const a = 1;")
+    );
+    assert!(
+        proposal.patch.files[0]
+            .diff
+            .contains("+export const a = 2;")
+    );
+
+    let approved = vec!["src/a.js".to_string()];
+    let result = engine
+        .edit_orchestrator
+        .apply_stored_patch(&repo, &proposal.patch.id, Some(&approved), "tester")
+        .unwrap();
+
+    assert_eq!(result.applied_files, vec!["src/a.js"]);
+    assert_eq!(
+        fs::read_to_string(repo.join("src/a.js")).unwrap(),
+        "export const a = 2;\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("src/b.js")).unwrap(),
+        "export const b = 1;\n"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn rejects_stored_patch_without_modifying_workspace() {
+    let repo = temp_dir("edit-reject");
+    write_fixture(&repo, "src/app.js", "export const value = 1;\n");
+    let config = test_config(&repo);
+    let engine = WorkspaceEngine::new(config);
+    let response = "DAMAIAN_EDIT_V1\nSUMMARY: Update value\nFILE: src/app.js\nSTATUS: modified\nCONTENT:\nexport const value = 2;\nEND_FILE\nEND_PATCH\n";
+    let mut adapter = MockModelAdapter::new(response);
+    let proposal = engine
+        .edit_orchestrator
+        .propose_edit(&repo, "Update value", &[], &mut adapter)
+        .unwrap();
+
+    let rejected_path = engine
+        .edit_orchestrator
+        .reject_stored_patch(&proposal.patch.id, "tester")
+        .unwrap();
+
+    assert!(rejected_path.exists());
+    assert_eq!(
+        fs::read_to_string(repo.join("src/app.js")).unwrap(),
+        "export const value = 1;\n"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
 }
