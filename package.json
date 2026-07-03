@@ -9,7 +9,9 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --test"
+    "check": "node --test",
+    "desktop:dev": "cd crates/desktop-app && cargo tauri dev",
+    "desktop:build": "cd crates/desktop-app && cargo tauri build"
   },
   "engines": {
     "node": ">=24"
