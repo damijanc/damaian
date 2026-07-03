@@ -1,0 +1,168 @@
+use std::env;
+use std::path::Path;
+use workspace_engine::{CommandRisk, Config, SearchResult, WorkspaceEngine};
+
+fn usage() -> &'static str {
+    "Usage:
+  damaian index <repo>
+  damaian search <repo> <query>
+  damaian read <repo> <path>
+  damaian git-status <repo>
+  damaian git-diff <repo>
+  damaian detect-commands <repo>
+  damaian classify-command <command>
+"
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> workspace_engine::Result<()> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    let Some(command) = args.first().map(String::as_str) else {
+        print!("{}", usage());
+        return Ok(());
+    };
+    if command == "--help" || command == "-h" {
+        print!("{}", usage());
+        return Ok(());
+    }
+
+    let engine = WorkspaceEngine::new(Config::default());
+    match command {
+        "index" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let index = engine.indexer.index_repository(repo)?;
+            println!(
+                "{{\"repositoryId\":\"{}\",\"rootPath\":\"{}\",\"fileCount\":{},\"skippedCount\":{}}}",
+                escape(&index.repository_id),
+                escape(&index.root_path.to_string_lossy()),
+                index.files.len(),
+                index.skipped.len()
+            );
+        }
+        "search" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            if args.len() < 3 {
+                return Err(workspace_engine::ClientError::InvalidInput(
+                    "Missing <query>".to_string(),
+                ));
+            }
+            let query = args[2..].join(" ");
+            let index = engine.indexer.index_repository(repo)?;
+            let results = index.keyword_search(&query, 10);
+            println!("{}", search_results_json(&results));
+        }
+        "read" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let path = require_arg(&args, 2, "<path>")?;
+            let file = engine
+                .file_access
+                .read_file(repo, path, Some("cli"), Some(repo), false)?;
+            print!("{}", file.content);
+            if !file.content.ends_with('\n') {
+                println!();
+            }
+        }
+        "git-status" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let status = engine.git.status(repo)?;
+            println!(
+                "{{\"clean\":{},\"exitCode\":{},\"fileCount\":{}}}",
+                status.clean,
+                status.exit_code,
+                status.files.len()
+            );
+        }
+        "git-diff" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            print!("{}", engine.git.diff(repo, false)?);
+        }
+        "detect-commands" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let commands = engine
+                .command_policy
+                .detect_project_commands(Path::new(repo))?;
+            let body = commands
+                .iter()
+                .map(|command| {
+                    format!(
+                        "{{\"name\":\"{}\",\"command\":\"{}\",\"risk\":\"{}\"}}",
+                        escape(&command.name),
+                        escape(&command.command),
+                        risk_json(&command.risk)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            println!("[{body}]");
+        }
+        "classify-command" => {
+            if args.len() < 2 {
+                return Err(workspace_engine::ClientError::InvalidInput(
+                    "Missing <command>".to_string(),
+                ));
+            }
+            let classification = engine.command_policy.classify(&args[1..].join(" "));
+            println!(
+                "{{\"command\":\"{}\",\"risk\":\"{}\",\"blocked\":{},\"requiresApproval\":{},\"mayUseNetwork\":{}}}",
+                escape(&classification.command),
+                risk_json(&classification.risk),
+                classification.blocked,
+                classification.requires_approval,
+                classification.may_use_network
+            );
+        }
+        _ => {
+            return Err(workspace_engine::ClientError::InvalidInput(format!(
+                "Unknown command: {command}\n\n{}",
+                usage()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_arg<'a>(
+    args: &'a [String],
+    index: usize,
+    name: &str,
+) -> workspace_engine::Result<&'a str> {
+    args.get(index)
+        .map(String::as_str)
+        .ok_or_else(|| workspace_engine::ClientError::InvalidInput(format!("Missing {name}")))
+}
+
+fn search_results_json(results: &[SearchResult]) -> String {
+    let body = results
+        .iter()
+        .map(|result| {
+            format!(
+                "{{\"path\":\"{}\",\"language\":\"{}\",\"score\":{},\"snippet\":\"{}\"}}",
+                escape(&result.path),
+                escape(&result.language),
+                result.score,
+                escape(&result.snippet)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{body}]")
+}
+
+fn risk_json(risk: &CommandRisk) -> &'static str {
+    risk.as_str()
+}
+
+fn escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}

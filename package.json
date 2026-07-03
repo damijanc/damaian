@@ -1,0 +1,17 @@
+{
+  "name": "damaian-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first AI coding assistant client workspace engine",
+  "type": "module",
+  "bin": {
+    "damaian-client": "./bin/damaian-client.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --test"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
