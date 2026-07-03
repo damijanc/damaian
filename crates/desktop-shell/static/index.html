@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Damaian</title>
+    <link rel="stylesheet" href="/assets/style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="mark">D</div>
+          <div>
+            <h1>Damaian</h1>
+            <p id="repo-state">No repository selected</p>
+          </div>
+        </div>
+
+        <label class="field">
+          <span>Repository</span>
+          <input id="repo" type="text" placeholder="/Users/name/dev/project" />
+        </label>
+
+        <div class="toolbar">
+          <button id="status-btn" type="button">Status</button>
+          <button id="config-btn" type="button">Policy</button>
+        </div>
+
+        <label class="field">
+          <span>Search</span>
+          <input id="search-query" type="search" placeholder="auth token" />
+        </label>
+        <button id="search-btn" type="button">Search</button>
+        <div id="search-results" class="list"></div>
+      </aside>
+
+      <main class="workspace">
+        <nav class="tabs" aria-label="Workspace views">
+          <button class="tab active" data-tab="chat" type="button">Chat</button>
+          <button class="tab" data-tab="edits" type="button">Edits</button>
+          <button class="tab" data-tab="commands" type="button">Commands</button>
+          <button class="tab" data-tab="settings" type="button">Settings</button>
+        </nav>
+
+        <section id="chat" class="view active">
+          <div class="split">
+            <div class="pane">
+              <h2>Chat</h2>
+              <textarea id="chat-prompt" rows="5" placeholder="Ask about this repository"></textarea>
+              <textarea id="chat-mock" rows="4" placeholder="Mock response"></textarea>
+              <button id="ask-btn" type="button">Ask</button>
+            </div>
+            <div class="pane output">
+              <h2>Response</h2>
+              <pre id="chat-output"></pre>
+            </div>
+          </div>
+        </section>
+
+        <section id="edits" class="view">
+          <div class="split">
+            <div class="pane">
+              <h2>Edit Proposal</h2>
+              <textarea id="edit-prompt" rows="4" placeholder="Describe the change"></textarea>
+              <textarea id="edit-model-output" rows="12" placeholder="DAMAIAN_EDIT_V1&#10;SUMMARY: ...&#10;FILE: src/app.js&#10;STATUS: modified&#10;CONTENT:&#10;...&#10;END_FILE&#10;END_PATCH"></textarea>
+              <button id="propose-edit-btn" type="button">Preview</button>
+              <div class="inline-actions">
+                <button id="apply-patch-btn" type="button">Apply</button>
+                <button id="reject-patch-btn" type="button">Reject</button>
+              </div>
+            </div>
+            <div class="pane output">
+              <h2>Diff</h2>
+              <pre id="diff-output"></pre>
+            </div>
+          </div>
+        </section>
+
+        <section id="commands" class="view">
+          <div class="split">
+            <div class="pane">
+              <h2>Command Approval</h2>
+              <input id="command-input" type="text" placeholder="npm test" />
+              <button id="propose-command-btn" type="button">Propose</button>
+              <div class="inline-actions">
+                <button id="run-command-btn" type="button">Run</button>
+                <button id="reject-command-btn" type="button">Reject</button>
+              </div>
+            </div>
+            <div class="pane output">
+              <h2>Command Output</h2>
+              <pre id="command-output"></pre>
+            </div>
+          </div>
+        </section>
+
+        <section id="settings" class="view">
+          <div class="split">
+            <div class="pane">
+              <h2>Policy</h2>
+              <select id="config-scope">
+                <option value="user">User</option>
+                <option value="repo">Repository</option>
+              </select>
+              <input id="config-key" type="text" placeholder="command_allowlist" />
+              <input id="config-value" type="text" placeholder="npm test|cargo test" />
+              <button id="config-save-btn" type="button">Save</button>
+            </div>
+            <div class="pane output">
+              <h2>Effective Policy</h2>
+              <pre id="config-output"></pre>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <div id="toast" role="status"></div>
+    <script src="/assets/app.js"></script>
+  </body>
+</html>
