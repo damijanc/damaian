@@ -4,6 +4,7 @@ use crate::command_policy::CommandPolicy;
 use crate::command_runner::CommandRunner;
 use crate::config::Config;
 use crate::context_manager::ContextManager;
+use crate::edit::{EditOrchestrator, PatchStore};
 use crate::file_access::FileAccessController;
 use crate::git_service::GitService;
 use crate::indexer::ProjectIndexer;
@@ -27,6 +28,8 @@ pub struct WorkspaceEngine {
     pub patch_engine: PatchEngine,
     pub session_store: SessionStore,
     pub chat_orchestrator: ChatOrchestrator,
+    pub patch_store: PatchStore,
+    pub edit_orchestrator: EditOrchestrator,
 }
 
 impl WorkspaceEngine {
@@ -57,6 +60,7 @@ impl WorkspaceEngine {
             path_policy.clone(),
         );
         let session_store = SessionStore::new(&config.data_dir);
+        let patch_store = PatchStore::new(&config.data_dir);
         let chat_orchestrator = ChatOrchestrator::new(
             config.clone(),
             scanner.clone(),
@@ -64,6 +68,16 @@ impl WorkspaceEngine {
             indexer.clone(),
             context_manager.clone(),
             session_store.clone(),
+        );
+        let edit_orchestrator = EditOrchestrator::new(
+            config.clone(),
+            scanner.clone(),
+            audit_log.clone(),
+            indexer.clone(),
+            context_manager.clone(),
+            session_store.clone(),
+            patch_engine.clone(),
+            patch_store.clone(),
         );
 
         Self {
@@ -80,6 +94,8 @@ impl WorkspaceEngine {
             patch_engine,
             session_store,
             chat_orchestrator,
+            patch_store,
+            edit_orchestrator,
         }
     }
 }

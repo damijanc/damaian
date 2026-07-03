@@ -2,7 +2,7 @@ use std::env;
 use std::path::Path;
 use workspace_engine::{
     CommandRisk, Config, CurlModelTransport, MockModelAdapter, OpenAICompatibleAdapter,
-    SearchResult, WorkspaceEngine,
+    SearchResult, WorkspaceEngine, patch_diff_text,
 };
 
 fn usage() -> &'static str {
@@ -15,6 +15,9 @@ fn usage() -> &'static str {
   damaian detect-commands <repo>
   damaian classify-command <command>
   damaian ask <repo> <prompt>
+  damaian propose-edit <repo> <prompt>
+  damaian apply-patch <repo> <patch-id> [file...]
+  damaian reject-patch <patch-id>
 "
 }
 
@@ -162,6 +165,82 @@ fn run() -> workspace_engine::Result<()> {
                     .map(|path| escape(path))
                     .collect::<Vec<_>>()
                     .join(",")
+            );
+        }
+        "propose-edit" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            if args.len() < 3 {
+                return Err(workspace_engine::ClientError::InvalidInput(
+                    "Missing <prompt>".to_string(),
+                ));
+            }
+            let prompt = args[2..].join(" ");
+            let result = if let Ok(mock_response) = env::var("DAMAIAN_MOCK_MODEL_RESPONSE") {
+                let mut adapter = MockModelAdapter::new(mock_response);
+                engine
+                    .edit_orchestrator
+                    .propose_edit(repo, &prompt, &[], &mut adapter)?
+            } else {
+                let api_key = env::var(&engine.config.model_api_key_env).map_err(|_| {
+                    workspace_engine::ClientError::InvalidInput(format!(
+                        "{} is required for live model calls. Set DAMAIAN_MOCK_MODEL_RESPONSE for local smoke tests.",
+                        engine.config.model_api_key_env
+                    ))
+                })?;
+                let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
+                let mut adapter =
+                    OpenAICompatibleAdapter::new(&engine.config.model_name, transport);
+                engine
+                    .edit_orchestrator
+                    .propose_edit(repo, &prompt, &[], &mut adapter)?
+            };
+            print!("{}", patch_diff_text(&result.patch));
+            eprintln!("patch_id={}", result.patch.id);
+            eprintln!(
+                "context_files={}",
+                result
+                    .context_files
+                    .iter()
+                    .map(|path| escape(path))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+        "apply-patch" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let patch_id = require_arg(&args, 2, "<patch-id>")?;
+            let approved_paths = if args.len() > 3 {
+                Some(args[3..].to_vec())
+            } else {
+                None
+            };
+            let result = engine.edit_orchestrator.apply_stored_patch(
+                repo,
+                patch_id,
+                approved_paths.as_deref(),
+                "local_user",
+            )?;
+            println!(
+                "{{\"patchId\":\"{}\",\"appliedFiles\":[{}],\"warningCount\":{}}}",
+                escape(&result.patch_id),
+                result
+                    .applied_files
+                    .iter()
+                    .map(|path| format!("\"{}\"", escape(path)))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                result.warnings.len()
+            );
+        }
+        "reject-patch" => {
+            let patch_id = require_arg(&args, 1, "<patch-id>")?;
+            let path = engine
+                .edit_orchestrator
+                .reject_stored_patch(patch_id, "local_user")?;
+            println!(
+                "{{\"patchId\":\"{}\",\"status\":\"rejected\",\"path\":\"{}\"}}",
+                escape(patch_id),
+                escape(&path.to_string_lossy())
             );
         }
         _ => {
