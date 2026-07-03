@@ -1,7 +1,7 @@
 use std::env;
 use std::path::Path;
 use workspace_engine::{
-    CommandProposal, CommandRisk, Config, CurlModelTransport, MockModelAdapter,
+    CommandProposal, CommandRisk, Config, ConfigOverlay, CurlModelTransport, MockModelAdapter,
     OpenAICompatibleAdapter, SearchResult, WorkspaceEngine, command_approval_prompt,
     patch_diff_text,
 };
@@ -15,6 +15,10 @@ fn usage() -> &'static str {
   damaian git-diff <repo>
   damaian detect-commands <repo>
   damaian classify-command <command>
+  damaian config-show [repo]
+  damaian config-set user <key> <value>
+  damaian config-set repo <repo> <key> <value>
+  damaian config-set admin <key> <value>
   damaian propose-command <repo> <command>
   damaian propose-validations <repo>
   damaian run-command <proposal-id> --approve
@@ -44,10 +48,10 @@ fn run() -> workspace_engine::Result<()> {
         return Ok(());
     }
 
-    let engine = WorkspaceEngine::new(Config::default());
     match command {
         "index" => {
             let repo = require_arg(&args, 1, "<repo>")?;
+            let engine = engine_for_repo(repo)?;
             let index = engine.indexer.index_repository(repo)?;
             println!(
                 "{{\"repositoryId\":\"{}\",\"rootPath\":\"{}\",\"fileCount\":{},\"skippedCount\":{}}}",
@@ -59,6 +63,7 @@ fn run() -> workspace_engine::Result<()> {
         }
         "search" => {
             let repo = require_arg(&args, 1, "<repo>")?;
+            let engine = engine_for_repo(repo)?;
             if args.len() < 3 {
                 return Err(workspace_engine::ClientError::InvalidInput(
                     "Missing <query>".to_string(),
@@ -71,6 +76,7 @@ fn run() -> workspace_engine::Result<()> {
         }
         "read" => {
             let repo = require_arg(&args, 1, "<repo>")?;
+            let engine = engine_for_repo(repo)?;
             let path = require_arg(&args, 2, "<path>")?;
             let file = engine
                 .file_access
@@ -82,6 +88,7 @@ fn run() -> workspace_engine::Result<()> {
         }
         "git-status" => {
             let repo = require_arg(&args, 1, "<repo>")?;
+            let engine = engine_for_repo(repo)?;
             let status = engine.git.status(repo)?;
             println!(
                 "{{\"clean\":{},\"exitCode\":{},\"fileCount\":{}}}",
@@ -92,10 +99,12 @@ fn run() -> workspace_engine::Result<()> {
         }
         "git-diff" => {
             let repo = require_arg(&args, 1, "<repo>")?;
+            let engine = engine_for_repo(repo)?;
             print!("{}", engine.git.diff(repo, false)?);
         }
         "detect-commands" => {
             let repo = require_arg(&args, 1, "<repo>")?;
+            let engine = engine_for_repo(repo)?;
             let commands = engine
                 .command_policy
                 .detect_project_commands(Path::new(repo))?;
@@ -114,6 +123,7 @@ fn run() -> workspace_engine::Result<()> {
             println!("[{body}]");
         }
         "classify-command" => {
+            let engine = default_engine()?;
             if args.len() < 2 {
                 return Err(workspace_engine::ClientError::InvalidInput(
                     "Missing <command>".to_string(),
@@ -129,8 +139,20 @@ fn run() -> workspace_engine::Result<()> {
                 classification.may_use_network
             );
         }
+        "config-show" => {
+            let config = if let Some(repo) = args.get(1) {
+                Config::load_for_repository(Some(Path::new(repo)))?
+            } else {
+                Config::load_for_repository(None)?
+            };
+            print!("{}", config.to_policy_text());
+        }
+        "config-set" => {
+            set_config_value(&args)?;
+        }
         "propose-command" => {
             let repo = require_arg(&args, 1, "<repo>")?;
+            let engine = engine_for_repo(repo)?;
             if args.len() < 3 {
                 return Err(workspace_engine::ClientError::InvalidInput(
                     "Missing <command>".to_string(),
@@ -147,6 +169,7 @@ fn run() -> workspace_engine::Result<()> {
         }
         "propose-validations" => {
             let repo = require_arg(&args, 1, "<repo>")?;
+            let engine = engine_for_repo(repo)?;
             let proposals = engine
                 .validation_orchestrator
                 .propose_detected_validations(repo)?;
@@ -160,6 +183,7 @@ fn run() -> workspace_engine::Result<()> {
             );
         }
         "run-command" => {
+            let engine = default_engine()?;
             let proposal_id = require_arg(&args, 1, "<proposal-id>")?;
             let approved = args.iter().any(|arg| arg == "--approve");
             let record =
@@ -176,6 +200,7 @@ fn run() -> workspace_engine::Result<()> {
             );
         }
         "reject-command" => {
+            let engine = default_engine()?;
             let proposal_id = require_arg(&args, 1, "<proposal-id>")?;
             let path = engine
                 .validation_orchestrator
@@ -188,6 +213,7 @@ fn run() -> workspace_engine::Result<()> {
         }
         "ask" => {
             let repo = require_arg(&args, 1, "<repo>")?;
+            let engine = engine_for_repo(repo)?;
             if args.len() < 3 {
                 return Err(workspace_engine::ClientError::InvalidInput(
                     "Missing <prompt>".to_string(),
@@ -231,6 +257,7 @@ fn run() -> workspace_engine::Result<()> {
         }
         "propose-edit" => {
             let repo = require_arg(&args, 1, "<repo>")?;
+            let engine = engine_for_repo(repo)?;
             if args.len() < 3 {
                 return Err(workspace_engine::ClientError::InvalidInput(
                     "Missing <prompt>".to_string(),
@@ -270,6 +297,7 @@ fn run() -> workspace_engine::Result<()> {
         }
         "apply-patch" => {
             let repo = require_arg(&args, 1, "<repo>")?;
+            let engine = engine_for_repo(repo)?;
             let patch_id = require_arg(&args, 2, "<patch-id>")?;
             let approved_paths = if args.len() > 3 {
                 Some(args[3..].to_vec())
@@ -295,6 +323,7 @@ fn run() -> workspace_engine::Result<()> {
             );
         }
         "reject-patch" => {
+            let engine = default_engine()?;
             let patch_id = require_arg(&args, 1, "<patch-id>")?;
             let path = engine
                 .edit_orchestrator
@@ -323,6 +352,58 @@ fn require_arg<'a>(
     args.get(index)
         .map(String::as_str)
         .ok_or_else(|| workspace_engine::ClientError::InvalidInput(format!("Missing {name}")))
+}
+
+fn default_engine() -> workspace_engine::Result<WorkspaceEngine> {
+    Ok(WorkspaceEngine::new(Config::load_for_repository(None)?))
+}
+
+fn engine_for_repo(repo: &str) -> workspace_engine::Result<WorkspaceEngine> {
+    Ok(WorkspaceEngine::new(Config::load_for_repository(Some(
+        Path::new(repo),
+    ))?))
+}
+
+fn set_config_value(args: &[String]) -> workspace_engine::Result<()> {
+    let scope = require_arg(args, 1, "<scope>")?;
+    match scope {
+        "user" => {
+            let key = require_arg(args, 2, "<key>")?;
+            let value = require_arg(args, 3, "<value>")?;
+            let config = Config::load_for_repository(None)?;
+            let path = config.user_config_path();
+            let mut overlay = ConfigOverlay::load_or_default(&path)?;
+            overlay.set(key, value)?;
+            overlay.save(&path)?;
+            println!("wrote {}", path.to_string_lossy());
+        }
+        "repo" => {
+            let repo = require_arg(args, 2, "<repo>")?;
+            let key = require_arg(args, 3, "<key>")?;
+            let value = require_arg(args, 4, "<value>")?;
+            let path = Config::repository_config_path(repo);
+            let mut overlay = ConfigOverlay::load_or_default(&path)?;
+            overlay.set(key, value)?;
+            overlay.save(&path)?;
+            println!("wrote {}", path.to_string_lossy());
+        }
+        "admin" => {
+            let key = require_arg(args, 2, "<key>")?;
+            let value = require_arg(args, 3, "<value>")?;
+            let config = Config::load_for_repository(None)?;
+            let path = config.admin_config_path();
+            let mut overlay = ConfigOverlay::load_or_default(&path)?;
+            overlay.set(key, value)?;
+            overlay.save(&path)?;
+            println!("wrote {}", path.to_string_lossy());
+        }
+        _ => {
+            return Err(workspace_engine::ClientError::InvalidInput(
+                "config-set scope must be user, repo, or admin".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn search_results_json(results: &[SearchResult]) -> String {

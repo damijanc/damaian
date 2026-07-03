@@ -37,8 +37,13 @@ pub struct WorkspaceEngine {
 
 impl WorkspaceEngine {
     pub fn new(config: Config) -> Self {
-        let scanner = SecretScanner::default();
-        let audit_log = AuditLog::new(&config.data_dir, true, scanner.clone());
+        let scanner = SecretScanner::new(config.secret_patterns.clone());
+        let audit_log = AuditLog::with_retention(
+            &config.data_dir,
+            config.audit_enabled,
+            config.audit_retention_days,
+            scanner.clone(),
+        );
         let path_policy = PathPolicy::new(&config);
         let file_access = FileAccessController::new(
             config.clone(),
