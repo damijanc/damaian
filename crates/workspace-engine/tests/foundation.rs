@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, ClientError, CommandPolicy, CommandRisk, Config, MockModelAdapter, ModelMessage,
-    ModelRequest, PatchEngine, PathPolicy, ProjectIndexer, ProposedChange, SecretScanner,
-    SessionStore, WorkspaceEngine, extract_model_tokens, model_request_json, parse_generated_edit,
+    AuditLog, ClientError, CommandPolicy, CommandRisk, Config, ConfigOverlay, MockModelAdapter,
+    ModelMessage, ModelRequest, PatchEngine, PathPolicy, ProjectIndexer, ProposedChange,
+    SecretScanner, SessionStore, WorkspaceEngine, extract_model_tokens, model_request_json,
+    parse_generated_edit,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -559,6 +560,112 @@ fn rejects_stored_command_without_execution() {
         .unwrap();
 
     assert!(rejected_path.exists());
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn config_overlay_round_trips_policy_values() {
+    let root = temp_dir("config-overlay");
+    let path = root.join("user.conf");
+    let mut overlay = ConfigOverlay::default();
+    overlay
+        .set("command_allowlist", "npm test|cargo test")
+        .unwrap();
+    overlay.set("secret_patterns", "INTERNAL_TOKEN").unwrap();
+    overlay.set("audit_retention_days", "7").unwrap();
+    overlay.save(&path).unwrap();
+
+    let loaded = ConfigOverlay::load(&path).unwrap();
+    assert_eq!(
+        loaded.command_allowlist,
+        Some(vec!["npm test".to_string(), "cargo test".to_string()])
+    );
+    assert_eq!(
+        loaded.secret_patterns,
+        Some(vec!["INTERNAL_TOKEN".to_string()])
+    );
+    assert_eq!(loaded.audit_retention_days, Some(7));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn config_precedence_is_user_then_repo_then_admin() {
+    let root = temp_dir("config-precedence");
+    let user = root.join("user.conf");
+    let repo = root.join("repo.conf");
+    let admin = root.join("admin.conf");
+    fs::write(
+        &user,
+        "model_name=user-model\ncommand_allowlist=npm test\naudit_retention_days=30\n",
+    )
+    .unwrap();
+    fs::write(
+        &repo,
+        "model_name=repo-model\ncommand_allowlist=cargo test\nsecret_patterns=REPO_SECRET\n",
+    )
+    .unwrap();
+    fs::write(
+        &admin,
+        "model_name=admin-model\ncommand_blocklist=cargo test\naudit_retention_days=3\n",
+    )
+    .unwrap();
+    let base = Config {
+        data_dir: root.join("data"),
+        ..Config::default()
+    };
+
+    let merged =
+        Config::load_with_policy_paths(base, Some(&user), Some(&repo), Some(&admin)).unwrap();
+
+    assert_eq!(merged.model_name, "admin-model");
+    assert_eq!(merged.command_allowlist, vec!["cargo test"]);
+    assert_eq!(merged.command_blocklist, vec!["cargo test"]);
+    assert_eq!(merged.secret_patterns, vec!["REPO_SECRET"]);
+    assert_eq!(merged.audit_retention_days, 3);
+    assert_eq!(
+        CommandPolicy::new(merged).classify("cargo test").risk,
+        CommandRisk::Blocked
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn engine_uses_custom_secret_patterns_from_config() {
+    let repo = temp_dir("custom-secret-pattern");
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: repo.join(".damaian"),
+        secret_patterns: vec!["INTERNAL_TOKEN_123".to_string()],
+        ..Config::default()
+    });
+    let redaction = engine.scanner.redact("value=INTERNAL_TOKEN_123");
+
+    assert_eq!(redaction.findings.len(), 1);
+    assert_eq!(redaction.findings[0].category, "custom_secret");
+    assert!(redaction.text.contains("[REDACTED_CUSTOM_SECRET_"));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn audit_can_be_disabled_by_policy() {
+    let repo = temp_dir("audit-disabled");
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: repo.join(".damaian"),
+        audit_enabled: false,
+        ..Config::default()
+    });
+    engine
+        .audit_log
+        .record(
+            "test_event",
+            &[("token", "secret=supersecretvalue".to_string())],
+        )
+        .unwrap();
+
+    assert!(!repo.join(".damaian").join("audit").exists());
 
     fs::remove_dir_all(repo).unwrap();
 }

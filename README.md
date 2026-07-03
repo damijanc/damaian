@@ -23,6 +23,10 @@ npm test
 # Command-line Rust implementation
 cargo test
 cargo run -p damaian-cli -- search /path/to/repo "auth token"
+cargo run -p damaian-cli -- config-show /path/to/repo
+cargo run -p damaian-cli -- config-set user command_allowlist "npm test|cargo test"
+cargo run -p damaian-cli -- config-set repo /path/to/repo restricted_patterns ".env|*.pem|private/**"
+cargo run -p damaian-cli -- config-set admin audit_retention_days 30
 cargo run -p damaian-cli -- propose-command /path/to/repo "npm test"
 cargo run -p damaian-cli -- propose-validations /path/to/repo
 cargo run -p damaian-cli -- run-command command_proposal_id --approve

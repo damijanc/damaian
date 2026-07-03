@@ -4,20 +4,32 @@ use crate::secret_scanner::SecretScanner;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
 pub struct AuditLog {
     data_dir: PathBuf,
     enabled: bool,
+    retention_days: u64,
     scanner: SecretScanner,
     local_profile_id: String,
 }
 
 impl AuditLog {
     pub fn new(data_dir: impl AsRef<Path>, enabled: bool, scanner: SecretScanner) -> Self {
+        Self::with_retention(data_dir, enabled, 90, scanner)
+    }
+
+    pub fn with_retention(
+        data_dir: impl AsRef<Path>,
+        enabled: bool,
+        retention_days: u64,
+        scanner: SecretScanner,
+    ) -> Self {
         Self {
             data_dir: data_dir.as_ref().to_path_buf(),
             enabled,
+            retention_days,
             scanner,
             local_profile_id: "local_user".to_string(),
         }
@@ -45,6 +57,7 @@ impl AuditLog {
 
         let audit_dir = self.data_dir.join("audit");
         fs::create_dir_all(&audit_dir)?;
+        self.cleanup_retention()?;
         let log_path = audit_dir.join("events.jsonl");
         let mut file = OpenOptions::new()
             .create(true)
@@ -52,6 +65,35 @@ impl AuditLog {
             .open(log_path)?;
         writeln!(file, "{json}")?;
         Ok(json)
+    }
+
+    pub fn cleanup_retention(&self) -> Result<usize> {
+        if self.retention_days == 0 {
+            return Ok(0);
+        }
+        let audit_dir = self.data_dir.join("audit");
+        if !audit_dir.exists() {
+            return Ok(0);
+        }
+        let cutoff = SystemTime::now()
+            .checked_sub(Duration::from_secs(self.retention_days * 24 * 60 * 60))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut removed = 0;
+        for entry in fs::read_dir(audit_dir)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if !metadata.is_file() {
+                continue;
+            }
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            if modified < cutoff {
+                fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 }
 
