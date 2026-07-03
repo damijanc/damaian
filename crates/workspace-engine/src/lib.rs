@@ -18,6 +18,7 @@ pub mod patch_engine;
 pub mod path_policy;
 pub mod secret_scanner;
 pub mod session;
+pub mod validation;
 pub mod workspace_engine;
 
 pub use audit::AuditLog;
@@ -45,4 +46,8 @@ pub use patch_engine::{
 pub use path_policy::PathPolicy;
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{ChatMessage, Session, SessionStore, Task, TaskStatus};
+pub use validation::{
+    CommandProposal, CommandRunRecord, CommandStore, ValidationOrchestrator,
+    command_approval_prompt,
+};
 pub use workspace_engine::WorkspaceEngine;
