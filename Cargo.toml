@@ -1,7 +1,9 @@
 [workspace]
 members = [
   "crates/workspace-engine",
-  "crates/damaian-cli"
+  "crates/damaian-cli",
+  "crates/desktop-shell",
+  "crates/desktop-app"
 ]
 resolver = "3"
 
