@@ -470,3 +470,95 @@ fn rejects_stored_patch_without_modifying_workspace() {
 
     fs::remove_dir_all(repo).unwrap();
 }
+
+#[test]
+fn proposes_command_and_requires_approval_for_risky_execution() {
+    let repo = temp_dir("command-approval");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let proposal = engine
+        .validation_orchestrator
+        .propose_command(&repo, "npm test", "Run project tests")
+        .unwrap();
+
+    assert_eq!(proposal.risk, CommandRisk::Medium);
+    assert!(proposal.requires_approval);
+
+    let error = engine
+        .validation_orchestrator
+        .run_proposal(&proposal.id, false, "tester")
+        .expect_err("approval should be required");
+    assert!(matches!(error, ClientError::ApprovalRequired(_)));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn executes_stored_command_and_persists_redacted_output() {
+    let repo = temp_dir("command-run");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let proposal = engine
+        .validation_orchestrator
+        .propose_command(&repo, "printf token=supersecretvalue", "Capture output")
+        .unwrap();
+
+    let record = engine
+        .validation_orchestrator
+        .run_proposal(&proposal.id, true, "tester")
+        .unwrap();
+
+    assert_eq!(record.execution.exit_code, Some(0));
+    assert!(record.stdout_ref.exists());
+    let stdout = fs::read_to_string(record.stdout_ref).unwrap();
+    assert!(stdout.contains("[REDACTED_"));
+    assert!(!stdout.contains("supersecretvalue"));
+    assert!(record.summary_ref.exists());
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn proposes_detected_validation_commands() {
+    let repo = temp_dir("validation-plan");
+    write_fixture(
+        &repo,
+        "package.json",
+        "{\"scripts\":{\"test\":\"node --test\",\"lint\":\"eslint .\"}}\n",
+    );
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let proposals = engine
+        .validation_orchestrator
+        .propose_detected_validations(&repo)
+        .unwrap();
+
+    assert!(
+        proposals
+            .iter()
+            .any(|proposal| proposal.command == "npm test")
+    );
+    assert!(
+        proposals
+            .iter()
+            .any(|proposal| proposal.command == "npm run lint")
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn rejects_stored_command_without_execution() {
+    let repo = temp_dir("command-reject");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let proposal = engine
+        .validation_orchestrator
+        .propose_command(&repo, "pwd", "Inspect cwd")
+        .unwrap();
+
+    let rejected_path = engine
+        .validation_orchestrator
+        .reject_proposal(&proposal.id, "tester")
+        .unwrap();
+
+    assert!(rejected_path.exists());
+
+    fs::remove_dir_all(repo).unwrap();
+}

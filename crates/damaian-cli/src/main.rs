@@ -1,8 +1,9 @@
 use std::env;
 use std::path::Path;
 use workspace_engine::{
-    CommandRisk, Config, CurlModelTransport, MockModelAdapter, OpenAICompatibleAdapter,
-    SearchResult, WorkspaceEngine, patch_diff_text,
+    CommandProposal, CommandRisk, Config, CurlModelTransport, MockModelAdapter,
+    OpenAICompatibleAdapter, SearchResult, WorkspaceEngine, command_approval_prompt,
+    patch_diff_text,
 };
 
 fn usage() -> &'static str {
@@ -14,6 +15,10 @@ fn usage() -> &'static str {
   damaian git-diff <repo>
   damaian detect-commands <repo>
   damaian classify-command <command>
+  damaian propose-command <repo> <command>
+  damaian propose-validations <repo>
+  damaian run-command <proposal-id> --approve
+  damaian reject-command <proposal-id>
   damaian ask <repo> <prompt>
   damaian propose-edit <repo> <prompt>
   damaian apply-patch <repo> <patch-id> [file...]
@@ -122,6 +127,63 @@ fn run() -> workspace_engine::Result<()> {
                 classification.blocked,
                 classification.requires_approval,
                 classification.may_use_network
+            );
+        }
+        "propose-command" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            if args.len() < 3 {
+                return Err(workspace_engine::ClientError::InvalidInput(
+                    "Missing <command>".to_string(),
+                ));
+            }
+            let command = args[2..].join(" ");
+            let proposal = engine.validation_orchestrator.propose_command(
+                repo,
+                &command,
+                "User requested command proposal",
+            )?;
+            print!("{}", command_approval_prompt(&proposal));
+            println!("{}", command_proposal_json(&proposal));
+        }
+        "propose-validations" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let proposals = engine
+                .validation_orchestrator
+                .propose_detected_validations(repo)?;
+            println!(
+                "[{}]",
+                proposals
+                    .iter()
+                    .map(command_proposal_json)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+        "run-command" => {
+            let proposal_id = require_arg(&args, 1, "<proposal-id>")?;
+            let approved = args.iter().any(|arg| arg == "--approve");
+            let record =
+                engine
+                    .validation_orchestrator
+                    .run_proposal(proposal_id, approved, "local_user")?;
+            println!(
+                "{{\"proposalId\":\"{}\",\"commandId\":\"{}\",\"exitCode\":{},\"stdoutRef\":\"{}\",\"stderrRef\":\"{}\"}}",
+                escape(&record.proposal_id),
+                escape(&record.execution.id),
+                record.execution.exit_code.unwrap_or(-1),
+                escape(&record.stdout_ref.to_string_lossy()),
+                escape(&record.stderr_ref.to_string_lossy())
+            );
+        }
+        "reject-command" => {
+            let proposal_id = require_arg(&args, 1, "<proposal-id>")?;
+            let path = engine
+                .validation_orchestrator
+                .reject_proposal(proposal_id, "local_user")?;
+            println!(
+                "{{\"proposalId\":\"{}\",\"status\":\"rejected\",\"path\":\"{}\"}}",
+                escape(proposal_id),
+                escape(&path.to_string_lossy())
             );
         }
         "ask" => {
@@ -282,6 +344,20 @@ fn search_results_json(results: &[SearchResult]) -> String {
 
 fn risk_json(risk: &CommandRisk) -> &'static str {
     risk.as_str()
+}
+
+fn command_proposal_json(proposal: &CommandProposal) -> String {
+    format!(
+        "{{\"proposalId\":\"{}\",\"command\":\"{}\",\"workingDirectory\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"mayUseNetwork\":{},\"expectedEffects\":\"{}\"}}",
+        escape(&proposal.id),
+        escape(&proposal.command),
+        escape(&proposal.working_directory),
+        risk_json(&proposal.risk),
+        proposal.requires_approval,
+        proposal.blocked,
+        proposal.may_use_network,
+        escape(&proposal.expected_effects)
+    )
 }
 
 fn escape(value: &str) -> String {

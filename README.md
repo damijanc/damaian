@@ -23,6 +23,10 @@ npm test
 # Command-line Rust implementation
 cargo test
 cargo run -p damaian-cli -- search /path/to/repo "auth token"
+cargo run -p damaian-cli -- propose-command /path/to/repo "npm test"
+cargo run -p damaian-cli -- propose-validations /path/to/repo
+cargo run -p damaian-cli -- run-command command_proposal_id --approve
+cargo run -p damaian-cli -- reject-command command_proposal_id
 DAMAIAN_MOCK_MODEL_RESPONSE="Mock answer" cargo run -p damaian-cli -- ask /path/to/repo "What does auth do?"
 OPENAI_API_KEY=... cargo run -p damaian-cli -- ask /path/to/repo "Explain the project"
 DAMAIAN_MOCK_MODEL_RESPONSE=$'DAMAIAN_EDIT_V1\nSUMMARY: Update file\nFILE: src/app.js\nSTATUS: modified\nCONTENT:\n...\nEND_FILE\nEND_PATCH\n' cargo run -p damaian-cli -- propose-edit /path/to/repo "Make the change"
