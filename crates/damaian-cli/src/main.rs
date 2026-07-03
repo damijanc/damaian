@@ -1,6 +1,9 @@
 use std::env;
 use std::path::Path;
-use workspace_engine::{CommandRisk, Config, SearchResult, WorkspaceEngine};
+use workspace_engine::{
+    CommandRisk, Config, CurlModelTransport, MockModelAdapter, OpenAICompatibleAdapter,
+    SearchResult, WorkspaceEngine,
+};
 
 fn usage() -> &'static str {
     "Usage:
@@ -11,6 +14,7 @@ fn usage() -> &'static str {
   damaian git-diff <repo>
   damaian detect-commands <repo>
   damaian classify-command <command>
+  damaian ask <repo> <prompt>
 "
 }
 
@@ -115,6 +119,49 @@ fn run() -> workspace_engine::Result<()> {
                 classification.blocked,
                 classification.requires_approval,
                 classification.may_use_network
+            );
+        }
+        "ask" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            if args.len() < 3 {
+                return Err(workspace_engine::ClientError::InvalidInput(
+                    "Missing <prompt>".to_string(),
+                ));
+            }
+            let prompt = args[2..].join(" ");
+            let mut stdout_token = |token: &str| {
+                print!("{token}");
+            };
+            let result = if let Ok(mock_response) = env::var("DAMAIAN_MOCK_MODEL_RESPONSE") {
+                let mut adapter = MockModelAdapter::new(mock_response);
+                engine
+                    .chat_orchestrator
+                    .ask(repo, &prompt, &[], &mut adapter, &mut stdout_token)?
+            } else {
+                let api_key = env::var(&engine.config.model_api_key_env).map_err(|_| {
+                    workspace_engine::ClientError::InvalidInput(format!(
+                        "{} is required for live model calls. Set DAMAIAN_MOCK_MODEL_RESPONSE for local smoke tests.",
+                        engine.config.model_api_key_env
+                    ))
+                })?;
+                let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
+                let mut adapter =
+                    OpenAICompatibleAdapter::new(&engine.config.model_name, transport);
+                engine
+                    .chat_orchestrator
+                    .ask(repo, &prompt, &[], &mut adapter, &mut stdout_token)?
+            };
+            if !result.response.ends_with('\n') {
+                println!();
+            }
+            eprintln!(
+                "context_files={}",
+                result
+                    .context_files
+                    .iter()
+                    .map(|path| escape(path))
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
         }
         _ => {
