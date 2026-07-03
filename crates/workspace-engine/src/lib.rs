@@ -5,6 +5,7 @@ pub mod command_runner;
 pub mod config;
 pub mod context_manager;
 pub mod diff;
+pub mod edit;
 pub mod error;
 pub mod file_access;
 pub mod git_service;
@@ -25,6 +26,10 @@ pub use command_policy::{CommandClassification, CommandPolicy, CommandRisk};
 pub use command_runner::{CommandExecution, CommandRunner};
 pub use config::Config;
 pub use context_manager::{ContextItem, ContextManager, ContextPlan};
+pub use edit::{
+    EditOrchestrator, EditProposalResult, GeneratedEdit, PatchStore, parse_generated_edit,
+    patch_diff_text,
+};
 pub use error::{ClientError, Result};
 pub use file_access::{FileAccessController, FileRead};
 pub use git_service::{GitFileStatus, GitService, GitStatus};
