@@ -12,6 +12,7 @@ use crate::patch_engine::PatchEngine;
 use crate::path_policy::PathPolicy;
 use crate::secret_scanner::SecretScanner;
 use crate::session::SessionStore;
+use crate::validation::{CommandStore, ValidationOrchestrator};
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceEngine {
@@ -30,6 +31,8 @@ pub struct WorkspaceEngine {
     pub chat_orchestrator: ChatOrchestrator,
     pub patch_store: PatchStore,
     pub edit_orchestrator: EditOrchestrator,
+    pub command_store: CommandStore,
+    pub validation_orchestrator: ValidationOrchestrator,
 }
 
 impl WorkspaceEngine {
@@ -61,6 +64,7 @@ impl WorkspaceEngine {
         );
         let session_store = SessionStore::new(&config.data_dir);
         let patch_store = PatchStore::new(&config.data_dir);
+        let command_store = CommandStore::new(&config.data_dir);
         let chat_orchestrator = ChatOrchestrator::new(
             config.clone(),
             scanner.clone(),
@@ -79,6 +83,12 @@ impl WorkspaceEngine {
             patch_engine.clone(),
             patch_store.clone(),
         );
+        let validation_orchestrator = ValidationOrchestrator::new(
+            command_policy.clone(),
+            command_runner.clone(),
+            command_store.clone(),
+            audit_log.clone(),
+        );
 
         Self {
             config,
@@ -96,6 +106,8 @@ impl WorkspaceEngine {
             chat_orchestrator,
             patch_store,
             edit_orchestrator,
+            command_store,
+            validation_orchestrator,
         }
     }
 }
