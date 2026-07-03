@@ -1,4 +1,5 @@
 use crate::audit::AuditLog;
+use crate::chat::ChatOrchestrator;
 use crate::command_policy::CommandPolicy;
 use crate::command_runner::CommandRunner;
 use crate::config::Config;
@@ -9,6 +10,7 @@ use crate::indexer::ProjectIndexer;
 use crate::patch_engine::PatchEngine;
 use crate::path_policy::PathPolicy;
 use crate::secret_scanner::SecretScanner;
+use crate::session::SessionStore;
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceEngine {
@@ -23,6 +25,8 @@ pub struct WorkspaceEngine {
     pub command_runner: CommandRunner,
     pub git: GitService,
     pub patch_engine: PatchEngine,
+    pub session_store: SessionStore,
+    pub chat_orchestrator: ChatOrchestrator,
 }
 
 impl WorkspaceEngine {
@@ -52,6 +56,15 @@ impl WorkspaceEngine {
             scanner.clone(),
             path_policy.clone(),
         );
+        let session_store = SessionStore::new(&config.data_dir);
+        let chat_orchestrator = ChatOrchestrator::new(
+            config.clone(),
+            scanner.clone(),
+            audit_log.clone(),
+            indexer.clone(),
+            context_manager.clone(),
+            session_store.clone(),
+        );
 
         Self {
             config,
@@ -65,6 +78,8 @@ impl WorkspaceEngine {
             command_runner,
             git,
             patch_engine,
+            session_store,
+            chat_orchestrator,
         }
     }
 }
