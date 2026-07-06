@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Damaian</title>
-    <link rel="stylesheet" href="/assets/style.css" />
+    <link rel="stylesheet" href="style.css" />
   </head>
   <body>
     <div class="app">
@@ -28,14 +28,15 @@
         <div class="toolbar">
           <button id="status-btn" type="button">Status</button>
           <button id="config-btn" type="button">Policy</button>
+          <button
+            id="open-vscode-btn"
+            type="button"
+            aria-label="Open selected folder in Visual Studio Code"
+            title="Open selected folder in Visual Studio Code"
+          >
+            VS Code
+          </button>
         </div>
-
-        <label class="field">
-          <span>Search</span>
-          <input id="search-query" type="search" placeholder="auth token" />
-        </label>
-        <button id="search-btn" type="button">Search</button>
-        <div id="search-results" class="list"></div>
       </aside>
 
       <main class="workspace">
@@ -125,6 +126,6 @@
       </main>
     </div>
     <div id="toast" role="status"></div>
-    <script src="/assets/app.js"></script>
+    <script src="app.js"></script>
   </body>
 </html>
