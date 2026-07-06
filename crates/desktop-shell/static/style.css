@@ -340,6 +340,92 @@ button:disabled {
   white-space: nowrap;
 }
 
+.empty-state {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  padding: 14px;
+}
+
+.diff-list {
+  display: grid;
+  gap: 12px;
+}
+
+.diff-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: white;
+  overflow: hidden;
+}
+
+.diff-card.applied {
+  border-color: #8dbda5;
+}
+
+.diff-card.rejected {
+  border-color: #d89999;
+  opacity: 0.82;
+}
+
+.diff-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--line);
+  padding: 10px 12px;
+}
+
+.diff-file-select {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.diff-file-select span {
+  overflow: hidden;
+  color: inherit;
+  font-size: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-file-select input {
+  width: auto;
+  flex: 0 0 auto;
+}
+
+.diff-state {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 8px;
+  text-transform: uppercase;
+}
+
+.diff-card.applied .diff-state {
+  border-color: #8dbda5;
+  color: var(--ok);
+}
+
+.diff-card.rejected .diff-state {
+  border-color: #d89999;
+  color: var(--danger);
+}
+
+.diff-pre {
+  min-height: 0;
+  border-radius: 0;
+}
+
 pre {
   margin: 0;
   white-space: pre-wrap;

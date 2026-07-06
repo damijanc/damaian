@@ -84,13 +84,13 @@
               <textarea id="edit-model-output" rows="12" placeholder="DAMAIAN_EDIT_V1&#10;SUMMARY: ...&#10;FILE: src/app.js&#10;STATUS: modified&#10;CONTENT:&#10;...&#10;END_FILE&#10;END_PATCH"></textarea>
               <button id="propose-edit-btn" type="button">Preview</button>
               <div class="inline-actions">
-                <button id="apply-patch-btn" type="button">Apply</button>
-                <button id="reject-patch-btn" type="button">Reject</button>
+                <button id="apply-patch-btn" type="button">Apply Selected</button>
+                <button id="reject-patch-btn" type="button">Reject Selected</button>
               </div>
             </div>
             <div class="pane output">
               <h2>Diff</h2>
-              <pre id="diff-output"></pre>
+              <div id="diff-output" class="diff-list"></div>
             </div>
           </div>
         </section>
