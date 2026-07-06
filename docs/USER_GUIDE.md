@@ -10,7 +10,7 @@ This build is a developer preview. It is usable for local workflows, but it does
 2. Select `Choose` beside the `Repository` field.
 3. Pick the local Git repository or working folder you want Damaian to inspect.
 4. Select `Status` to confirm Damaian can inspect the repository.
-5. Use `Search` to verify indexing works for the selected project.
+5. Select `VS Code` when you want to open the same folder in Visual Studio Code.
 
 You can also enter an absolute path manually:
 
@@ -25,6 +25,10 @@ Damaian uses the selected working folder as the root for indexing, file reads, p
 In the packaged desktop app, use `Choose` to open the native macOS folder picker. In browser-only development mode, type the absolute path manually.
 
 If you switch folders, use `Status` to verify the new root before asking questions, applying edits, or running commands.
+
+Damaian remembers the last selected working folder in local app storage and restores it when the app restarts. Launch-time defaults such as `DAMAIAN_REPO` are used only when no previous selection has been saved.
+
+Use `VS Code` in the sidebar to open the selected working folder in Visual Studio Code. Damaian keeps AI orchestration, context assembly, patch preview, command approval, settings, and audit logging in the app; normal code navigation and IDE work happen outside Damaian in Visual Studio Code.
 
 ## Chat
 

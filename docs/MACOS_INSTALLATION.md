@@ -42,6 +42,8 @@ You can still enter an absolute path manually:
 
 Then select `Status` to confirm Damaian can inspect the repository.
 
+Select `VS Code` in the sidebar to open the selected working folder in Visual Studio Code. Damaian keeps AI orchestration and safety controls in the app while code navigation and IDE work happen in VS Code.
+
 ## Model API Key
 
 The packaged preview reads model credentials from the environment variable configured by `model_api_key_env`. The default is usually `OPENAI_API_KEY`.
@@ -60,7 +62,7 @@ The installer contains:
 
 - `Damaian.app`: Native Tauri desktop wrapper.
 - Local workspace engine: Repository indexing, file access, patch preview/apply, command approval, Git status, and audit logging.
-- Embedded static UI: Chat, search, edit preview, command approval, and settings views.
+- Embedded static UI: Chat, edit preview, command approval, settings, and Visual Studio Code handoff.
 
 ## Current Limitations
 

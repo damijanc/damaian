@@ -3,6 +3,9 @@ const $ = (id) => document.getElementById(id);
 let currentPatchId = "";
 let currentCommandProposalId = "";
 
+const localApiOrigin = "http://127.0.0.1:4765";
+const lastRepoStorageKey = "damaian:lastRepository";
+
 function repo() {
   return $("repo").value.trim();
 }
@@ -15,7 +18,7 @@ function toast(message) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, options);
+  const response = await fetch(apiUrl(path), options);
   const text = await response.text();
   let payload;
   try {
@@ -27,6 +30,12 @@ async function api(path, options = {}) {
     throw new Error(payload.error || response.statusText);
   }
   return payload;
+}
+
+function apiUrl(path) {
+  if (!path.startsWith("/api/")) return path;
+  if (window.location.origin === localApiOrigin) return path;
+  return `${localApiOrigin}${path}`;
 }
 
 function form(data) {
@@ -45,34 +54,20 @@ function requireRepo() {
   return value;
 }
 
-function renderResults(results) {
-  $("search-results").innerHTML = results
-    .map(
-      (item) => `
-        <div class="result">
-          <strong>${escapeHtml(item.path)}</strong>
-          <span>${escapeHtml(item.language)} · ${item.score}</span>
-          <p>${escapeHtml(item.snippet.slice(0, 180))}</p>
-        </div>
-      `,
-    )
-    .join("");
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
-
 function setRepoState(message) {
   $("repo-state").textContent = message;
 }
 
-function tauriInvoke() {
-  return window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
+function setRepository(value, persist = true) {
+  $("repo").value = value;
+  setRepoState(value ? "Repository selected" : "No repository selected");
+  if (persist && value) {
+    localStorage.setItem(lastRepoStorageKey, value);
+  }
+}
+
+function tauriDialogOpen() {
+  return window.__TAURI__?.dialog?.open;
 }
 
 function configScope() {
@@ -118,15 +113,24 @@ document.querySelectorAll(".tab").forEach((button) => {
   });
 });
 
+$("repo").addEventListener("change", () => {
+  const value = repo();
+  if (value) {
+    setRepository(value);
+  }
+});
+
 $("pick-folder-btn").addEventListener("click", async () => {
   try {
-    const invoke = tauriInvoke();
-    if (!invoke) throw new Error("Folder picker is available in the desktop app");
-    const selected = await invoke("pick_working_folder");
+    const open = tauriDialogOpen();
+    if (!open) throw new Error("Folder picker is available in the desktop app");
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: "Select Working Folder",
+    });
     if (selected) {
-      $("repo").value = selected;
-      setRepoState("Repository selected");
-      $("search-results").innerHTML = "";
+      setRepository(selected);
       toast("Working folder selected");
     }
   } catch (error) {
@@ -153,13 +157,10 @@ $("config-btn").addEventListener("click", async () => {
   }
 });
 
-$("search-btn").addEventListener("click", async () => {
+$("open-vscode-btn").addEventListener("click", async () => {
   try {
-    const q = $("search-query").value.trim();
-    const payload = await api(
-      `/api/search?repo=${encodeURIComponent(requireRepo())}&q=${encodeURIComponent(q)}`,
-    );
-    renderResults(payload.results);
+    const payload = await api("/api/open-vscode", form({ repo: requireRepo() }));
+    toast(`Opened ${payload.path}`);
   } catch (error) {
     toast(error.message);
   }
@@ -284,9 +285,11 @@ $("config-save-btn").addEventListener("click", async () => {
 
 api("/api/bootstrap")
   .then((payload) => {
-    if (payload.defaultRepo) {
-      $("repo").value = payload.defaultRepo;
-      setRepoState("Repository selected");
+    const lastRepo = localStorage.getItem(lastRepoStorageKey);
+    if (lastRepo) {
+      setRepository(lastRepo, false);
+    } else if (payload.defaultRepo) {
+      setRepository(payload.defaultRepo, false);
     }
   })
   .catch(() => {});

@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use workspace_engine::{
     Config, CurlModelTransport, MockModelAdapter, OpenAICompatibleAdapter, WorkspaceEngine,
     command_approval_prompt, patch_diff_text,
@@ -81,10 +82,10 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
     let request = read_request(stream)?;
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") => write_response(stream, 200, "text/html; charset=utf-8", INDEX_HTML),
-        ("GET", "/assets/style.css") => {
+        ("GET", "/style.css") | ("GET", "/assets/style.css") => {
             write_response(stream, 200, "text/css; charset=utf-8", STYLE_CSS)
         }
-        ("GET", "/assets/app.js") => {
+        ("GET", "/app.js") | ("GET", "/assets/app.js") => {
             write_response(stream, 200, "application/javascript; charset=utf-8", APP_JS)
         }
         ("GET", "/api/bootstrap") => {
@@ -169,33 +170,15 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 ),
             )
         }
-        ("GET", "/api/search") => {
-            let repo = required_param(&request, "repo")?;
-            let query = required_param(&request, "q")?;
-            let engine = engine_for_repo(&repo)?;
-            let index = engine
-                .indexer
-                .index_repository(&repo)
-                .map_err(|error| error.to_string())?;
-            let results = index
-                .keyword_search(&query, 12)
-                .iter()
-                .map(|result| {
-                    format!(
-                        "{{\"path\":\"{}\",\"language\":\"{}\",\"score\":{},\"snippet\":\"{}\"}}",
-                        escape_json(&result.path),
-                        escape_json(&result.language),
-                        result.score,
-                        escape_json(&result.snippet)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
+        ("POST", "/api/open-vscode") => {
+            let form = parse_form(&request.body);
+            let repo = required_form(&form, "repo")?;
+            let path = open_in_vscode(&repo)?;
             write_response(
                 stream,
                 200,
                 "application/json",
-                &format!("{{\"results\":[{}]}}", results),
+                &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
             )
         }
         ("POST", "/api/ask") => {
@@ -442,6 +425,53 @@ fn save_config_file(path: &Path, content: &str) -> Result<(), String> {
     fs::write(path, content).map_err(|error| error.to_string())
 }
 
+fn open_in_vscode(repo: &str) -> Result<PathBuf, String> {
+    let path = validate_working_folder(repo)?;
+    launch_vscode(&path)?;
+    Ok(path)
+}
+
+fn validate_working_folder(repo: &str) -> Result<PathBuf, String> {
+    let path = fs::canonicalize(repo)
+        .map_err(|error| format!("working folder does not exist: {error}"))?;
+    if !path.is_dir() {
+        return Err("working folder must be a directory".to_string());
+    }
+    Ok(path)
+}
+
+#[cfg(target_os = "macos")]
+fn launch_vscode(path: &Path) -> Result<(), String> {
+    let status = Command::new("open")
+        .arg("-a")
+        .arg("Visual Studio Code")
+        .arg(path)
+        .status()
+        .map_err(|error| format!("failed to launch Visual Studio Code: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Visual Studio Code launch failed with status {status}"
+        ))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launch_vscode(path: &Path) -> Result<(), String> {
+    let status = Command::new("code")
+        .arg(path)
+        .status()
+        .map_err(|error| format!("failed to launch Visual Studio Code: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Visual Studio Code launch failed with status {status}"
+        ))
+    }
+}
+
 fn update_config_overlay(
     path: std::path::PathBuf,
     key: &str,
@@ -610,7 +640,7 @@ fn write_response(
         _ => "OK",
     };
     let response = format!(
-        "HTTP/1.1 {status} {status_text}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {status_text}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\ncache-control: no-store\r\naccess-control-allow-origin: *\r\nconnection: close\r\n\r\n{body}",
         body.len()
     );
     stream
@@ -650,7 +680,7 @@ fn escape_json(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_form, percent_decode, save_config_file};
+    use super::{parse_form, percent_decode, save_config_file, validate_working_folder};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -691,6 +721,32 @@ mod tests {
         let error = save_config_file(&path, "unknown_key=value\n").unwrap_err();
         assert!(error.contains("Unknown config key"));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn validates_existing_working_folder() {
+        let path = temp_path("working-folder");
+        fs::create_dir_all(&path).unwrap();
+        let expected = fs::canonicalize(&path).unwrap();
+        assert_eq!(
+            validate_working_folder(path.to_str().unwrap()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn rejects_file_as_working_folder() {
+        let path = temp_path("working-file");
+        fs::write(&path, "not a directory").unwrap();
+        let error = validate_working_folder(path.to_str().unwrap()).unwrap_err();
+        assert_eq!(error, "working folder must be a directory");
+    }
+
+    #[test]
+    fn rejects_missing_working_folder() {
+        let path = temp_path("missing-folder");
+        let error = validate_working_folder(path.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("working folder does not exist"));
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
