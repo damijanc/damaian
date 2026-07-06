@@ -5,8 +5,12 @@ let currentPatchFiles = [];
 let currentCommandProposalId = "";
 let currentSessionId = "";
 let apiToken = "";
+let bootstrapPromise = null;
+let bootstrapError = null;
+let chatSubmitting = false;
 
 const localApiOrigin = "http://127.0.0.1:4765";
+const localApiHostnames = new Set(["127.0.0.1", "localhost"]);
 const apiTokenHeader = "x-damaian-api-token";
 const lastRepoStorageKey = "damaian:lastRepository";
 const inspectorCollapsedStorageKey = "damaian:inspectorCollapsed";
@@ -22,7 +26,10 @@ function toast(message) {
   setTimeout(() => el.classList.remove("show"), 2600);
 }
 
-async function api(path, options = {}) {
+async function api(path, options = {}, retriedAuth = false) {
+  if (isProtectedApiPath(path)) {
+    await ensureDesktopApiReady();
+  }
   const response = await fetch(apiUrl(path), withApiToken(path, options));
   const text = await response.text();
   let payload;
@@ -31,17 +38,28 @@ async function api(path, options = {}) {
   } catch {
     payload = { error: text };
   }
+  if (response.status === 401 && isProtectedApiPath(path) && !retriedAuth) {
+    apiToken = "";
+    bootstrapError = null;
+    bootstrapPromise = startBootstrap();
+    await ensureDesktopApiReady();
+    return api(path, options, true);
+  }
   if (!response.ok || payload.error) {
     throw new Error(payload.error || response.statusText);
   }
   return payload;
 }
 
+function isProtectedApiPath(path) {
+  return path.startsWith("/api/") && path !== "/api/bootstrap";
+}
+
 function withApiToken(path, options = {}) {
   const next = { ...options };
   const headers = new Headers(next.headers || {});
-  if (path.startsWith("/api/") && path !== "/api/bootstrap") {
-    if (!apiToken) throw new Error("Desktop API is not initialized");
+  if (isProtectedApiPath(path)) {
+    if (!apiToken) throw new Error("Desktop API is still starting. Try again in a moment.");
     headers.set(apiTokenHeader, apiToken);
   }
   next.headers = headers;
@@ -50,8 +68,51 @@ function withApiToken(path, options = {}) {
 
 function apiUrl(path) {
   if (!path.startsWith("/api/")) return path;
-  if (window.location.origin === localApiOrigin) return path;
+  if (isLocalShellOrigin()) return path;
   return `${localApiOrigin}${path}`;
+}
+
+function isLocalShellOrigin() {
+  return (
+    (window.location.protocol === "http:" || window.location.protocol === "https:") &&
+    localApiHostnames.has(window.location.hostname)
+  );
+}
+
+async function ensureDesktopApiReady() {
+  if (apiToken) return;
+  if (!bootstrapPromise || bootstrapError) {
+    bootstrapPromise = startBootstrap();
+  }
+  if (bootstrapPromise) await bootstrapPromise;
+  if (apiToken) return;
+  throw bootstrapError || new Error("Desktop API is still starting. Try again in a moment.");
+}
+
+function startBootstrap() {
+  bootstrapError = null;
+  return api("/api/bootstrap")
+    .then((payload) => {
+      if (!payload.apiToken) throw new Error("Desktop API token missing from bootstrap");
+      apiToken = payload.apiToken;
+      if (!chatSubmitting) $("ask-btn").disabled = false;
+      setInspectorCollapsed(localStorage.getItem(inspectorCollapsedStorageKey) === "true");
+      const lastRepo = localStorage.getItem(lastRepoStorageKey);
+      if (lastRepo) {
+        setRepository(lastRepo, false);
+      } else if (payload.defaultRepo) {
+        setRepository(payload.defaultRepo, false);
+      } else {
+        clearSessionList();
+        clearChat();
+      }
+    })
+    .catch((error) => {
+      bootstrapError = error;
+      if (!chatSubmitting) $("ask-btn").disabled = false;
+      setChatStatus("Desktop API unavailable", "error");
+      toast(`Desktop API unavailable: ${error.message}`);
+    });
 }
 
 function form(data) {
@@ -122,6 +183,12 @@ function configRepo() {
   return configScope() === "repo" ? requireRepo() : repo();
 }
 
+function renderConfigPolicy(payload) {
+  $("config-output").textContent = payload.effectiveError
+    ? `Effective policy could not be loaded:\n${payload.effectiveError}`
+    : payload.effectivePolicy;
+}
+
 async function loadConfigFile() {
   const payload = await api(
     `/api/config-file?scope=${encodeURIComponent(configScope())}&repo=${encodeURIComponent(
@@ -129,7 +196,7 @@ async function loadConfigFile() {
     )}`,
   );
   $("config-editor").value = payload.content;
-  $("config-output").textContent = payload.effectivePolicy;
+  renderConfigPolicy(payload);
   $("config-path").textContent = payload.exists ? payload.path : `${payload.path} (new)`;
   return payload;
 }
@@ -143,7 +210,7 @@ async function saveConfigFile() {
       content: $("config-editor").value,
     }),
   );
-  $("config-output").textContent = payload.effectivePolicy;
+  renderConfigPolicy(payload);
   $("config-path").textContent = payload.path;
   return payload;
 }
@@ -681,16 +748,19 @@ $("delete-session-btn").addEventListener("click", async () => {
   }
 });
 
-$("ask-btn").addEventListener("click", async () => {
+async function sendChatPrompt() {
   const button = $("ask-btn");
   let streamError = null;
+  if (chatSubmitting) return;
   try {
     const prompt = $("chat-prompt").value.trim();
     if (!prompt) throw new Error("Prompt is required");
+    chatSubmitting = true;
+    button.disabled = true;
+    await ensureDesktopApiReady();
     appendChatMessage("user", prompt);
     const assistantMessage = appendChatMessage("assistant", "");
     let assistantText = "";
-    button.disabled = true;
     setChatStatus("Thinking", "running");
 
     await streamChatRequest(
@@ -727,8 +797,17 @@ $("ask-btn").addEventListener("click", async () => {
     setChatStatus("Failed", "error");
     toast(error.message);
   } finally {
+    chatSubmitting = false;
     button.disabled = false;
   }
+}
+
+$("ask-btn").addEventListener("click", sendChatPrompt);
+
+$("chat-prompt").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+  event.preventDefault();
+  void sendChatPrompt();
 });
 
 $("propose-edit-btn").addEventListener("click", async () => {
@@ -842,19 +921,7 @@ $("inspector-toggle-btn").addEventListener("click", () => {
   setInspectorCollapsed(!document.body.classList.contains("inspector-collapsed"));
 });
 
-api("/api/bootstrap")
-  .then((payload) => {
-    if (!payload.apiToken) throw new Error("Desktop API token missing from bootstrap");
-    apiToken = payload.apiToken;
-    setInspectorCollapsed(localStorage.getItem(inspectorCollapsedStorageKey) === "true");
-    const lastRepo = localStorage.getItem(lastRepoStorageKey);
-    if (lastRepo) {
-      setRepository(lastRepo, false);
-    } else if (payload.defaultRepo) {
-      setRepository(payload.defaultRepo, false);
-    } else {
-      clearSessionList();
-      clearChat();
-    }
-  })
-  .catch(() => {});
+$("ask-btn").disabled = true;
+setChatStatus("Starting", "running");
+
+bootstrapPromise = startBootstrap();
