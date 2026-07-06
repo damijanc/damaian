@@ -88,5 +88,6 @@ The current package is unsigned and not notarized. macOS may require the `Privac
 
 - [Damaian User Guide](docs/USER_GUIDE.md)
 - [macOS Installation](docs/MACOS_INSTALLATION.md)
+- [Security Policy](SECURITY.md)
 
 No Node.js runtime is required to run the packaged macOS app.

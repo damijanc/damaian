@@ -42,13 +42,13 @@ You can still enter an absolute path manually:
 
 Then select `Status` to confirm Damaian can inspect the repository.
 
-Select `VS Code` in the sidebar to open the selected working folder in Visual Studio Code. Damaian keeps AI orchestration and safety controls in the app while code navigation and IDE work happen in VS Code.
+Select the Visual Studio Code icon in the conversation header to open the selected working folder in Visual Studio Code. Damaian keeps AI orchestration and safety controls in the app while code navigation and IDE work happen in VS Code.
 
 ## Model API Key
 
 The packaged preview reads model credentials from the environment variable configured by `model_api_key_env`. The default is usually `OPENAI_API_KEY`.
 
-For local testing, use the `Mock response` field in the app. For real model calls, launch Damaian from an environment where the key is available, or use the CLI while native Keychain storage is still pending.
+Desktop chat requires a configured model key. Launch Damaian from an environment where the key is available, or use the CLI mock-response mode for local engine testing while native Keychain storage is still pending.
 
 ## Uninstall
 

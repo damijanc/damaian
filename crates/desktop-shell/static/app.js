@@ -4,8 +4,10 @@ let currentPatchId = "";
 let currentPatchFiles = [];
 let currentCommandProposalId = "";
 let currentSessionId = "";
+let apiToken = "";
 
 const localApiOrigin = "http://127.0.0.1:4765";
+const apiTokenHeader = "x-damaian-api-token";
 const lastRepoStorageKey = "damaian:lastRepository";
 const inspectorCollapsedStorageKey = "damaian:inspectorCollapsed";
 
@@ -21,7 +23,7 @@ function toast(message) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(apiUrl(path), options);
+  const response = await fetch(apiUrl(path), withApiToken(path, options));
   const text = await response.text();
   let payload;
   try {
@@ -33,6 +35,17 @@ async function api(path, options = {}) {
     throw new Error(payload.error || response.statusText);
   }
   return payload;
+}
+
+function withApiToken(path, options = {}) {
+  const next = { ...options };
+  const headers = new Headers(next.headers || {});
+  if (path.startsWith("/api/") && path !== "/api/bootstrap") {
+    if (!apiToken) throw new Error("Desktop API is not initialized");
+    headers.set(apiTokenHeader, apiToken);
+  }
+  next.headers = headers;
+  return next;
 }
 
 function apiUrl(path) {
@@ -165,6 +178,38 @@ function renderInlineMarkdown(value) {
   return escapeHtml(value).replace(/`([^`]+)`/g, "<code>$1</code>");
 }
 
+function parseTableRow(line) {
+  let content = line.trim();
+  if (!content.includes("|")) return null;
+  if (content.startsWith("|")) content = content.slice(1);
+  if (content.endsWith("|")) content = content.slice(0, -1);
+  const cells = content.split("|").map((cell) => cell.trim());
+  return cells.length >= 2 ? cells : null;
+}
+
+function isTableSeparator(cells) {
+  return cells?.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s+/g, "")));
+}
+
+function normalizeTableCells(cells, length) {
+  return Array.from({ length }, (_, index) => cells[index] || "");
+}
+
+function renderTable(headers, rows) {
+  const headerHtml = normalizeTableCells(headers, headers.length)
+    .map((cell) => `<th>${renderInlineMarkdown(cell)}</th>`)
+    .join("");
+  const rowsHtml = rows
+    .map((row) => {
+      const cells = normalizeTableCells(row, headers.length)
+        .map((cell) => `<td>${renderInlineMarkdown(cell)}</td>`)
+        .join("");
+      return `<tr>${cells}</tr>`;
+    })
+    .join("");
+  return `<div class="table-wrap"><table><thead><tr>${headerHtml}</tr></thead><tbody>${rowsHtml}</tbody></table></div>`;
+}
+
 function renderMarkdown(markdown) {
   const lines = String(markdown || "").split(/\r?\n/);
   let html = "";
@@ -192,7 +237,8 @@ function renderMarkdown(markdown) {
     codeOpen = false;
   };
 
-  for (const line of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
     if (line.startsWith("```")) {
       if (codeOpen) {
         closeCode();
@@ -212,6 +258,28 @@ function renderMarkdown(markdown) {
     if (!trimmed) {
       closeParagraph();
       closeList();
+      continue;
+    }
+    const tableHeaders = parseTableRow(line);
+    const tableSeparator = parseTableRow(lines[index + 1] || "");
+    if (
+      tableHeaders &&
+      tableSeparator &&
+      tableHeaders.length === tableSeparator.length &&
+      isTableSeparator(tableSeparator)
+    ) {
+      closeParagraph();
+      closeList();
+      const rows = [];
+      index += 2;
+      while (index < lines.length) {
+        const row = parseTableRow(lines[index]);
+        if (!row) break;
+        rows.push(row);
+        index += 1;
+      }
+      index -= 1;
+      html += renderTable(tableHeaders, rows);
       continue;
     }
     const heading = /^(#{1,4})\s+(.+)$/.exec(trimmed);
@@ -451,7 +519,10 @@ async function loadSession(sessionId) {
 }
 
 async function streamChatRequest(data, handlers) {
-  const response = await fetch(apiUrl("/api/ask-stream"), form(data));
+  const response = await fetch(
+    apiUrl("/api/ask-stream"),
+    withApiToken("/api/ask-stream", form(data)),
+  );
   if (!response.ok) {
     throw new Error(await response.text());
   }
@@ -773,6 +844,8 @@ $("inspector-toggle-btn").addEventListener("click", () => {
 
 api("/api/bootstrap")
   .then((payload) => {
+    if (!payload.apiToken) throw new Error("Desktop API token missing from bootstrap");
+    apiToken = payload.apiToken;
     setInspectorCollapsed(localStorage.getItem(inspectorCollapsedStorageKey) === "true");
     const lastRepo = localStorage.getItem(lastRepoStorageKey);
     if (lastRepo) {

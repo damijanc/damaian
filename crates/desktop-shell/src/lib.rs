@@ -32,8 +32,12 @@ pub fn run_server(options: ShellOptions) -> Result<(), String> {
             Ok(mut stream) => {
                 let options = options.clone();
                 if let Err(error) = handle_connection(&mut stream, &options) {
-                    let _ =
-                        write_response(&mut stream, 500, "application/json", &json_error(&error));
+                    let _ = write_basic_response(
+                        &mut stream,
+                        500,
+                        "application/json",
+                        &json_error(&error),
+                    );
                 }
             }
             Err(error) => eprintln!("connection failed: {error}"),
@@ -46,11 +50,16 @@ pub fn run_server(options: ShellOptions) -> Result<(), String> {
 pub struct ShellOptions {
     pub port: u16,
     pub default_repo: Option<String>,
+    pub api_token: String,
 }
 
 impl ShellOptions {
     pub fn new(port: u16, default_repo: Option<String>) -> Self {
-        Self { port, default_repo }
+        Self {
+            port,
+            default_repo,
+            api_token: generate_api_token(),
+        }
     }
 
     pub fn from_args(args: Vec<String>) -> Self {
@@ -75,27 +84,60 @@ impl ShellOptions {
                 _ => index += 1,
             }
         }
-        Self { port, default_repo }
+        Self {
+            port,
+            default_repo,
+            api_token: generate_api_token(),
+        }
     }
 }
 
 fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(), String> {
     let request = read_request(stream)?;
+    if request.method == "OPTIONS" && request.path.starts_with("/api/") {
+        return write_preflight_response(stream, &request);
+    }
+    if request.path.starts_with("/api/") && request.path != "/api/bootstrap" {
+        if let Err(error) = require_api_token(&request, &options.api_token) {
+            return write_response(
+                stream,
+                &request,
+                401,
+                "application/json",
+                &json_error(&error),
+            );
+        }
+    }
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") => write_response(stream, 200, "text/html; charset=utf-8", INDEX_HTML),
+        ("GET", "/") => write_response(
+            stream,
+            &request,
+            200,
+            "text/html; charset=utf-8",
+            INDEX_HTML,
+        ),
         ("GET", "/style.css") | ("GET", "/assets/style.css") => {
-            write_response(stream, 200, "text/css; charset=utf-8", STYLE_CSS)
+            write_response(stream, &request, 200, "text/css; charset=utf-8", STYLE_CSS)
         }
-        ("GET", "/app.js") | ("GET", "/assets/app.js") => {
-            write_response(stream, 200, "application/javascript; charset=utf-8", APP_JS)
-        }
+        ("GET", "/app.js") | ("GET", "/assets/app.js") => write_response(
+            stream,
+            &request,
+            200,
+            "application/javascript; charset=utf-8",
+            APP_JS,
+        ),
         ("GET", "/api/bootstrap") => {
             let repo = options.default_repo.clone().unwrap_or_default();
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
-                &format!("{{\"defaultRepo\":\"{}\"}}", escape_json(&repo)),
+                &format!(
+                    "{{\"defaultRepo\":\"{}\",\"apiToken\":\"{}\"}}",
+                    escape_json(&repo),
+                    escape_json(&options.api_token)
+                ),
             )
         }
         ("GET", "/api/config") => {
@@ -104,6 +146,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!(
@@ -129,6 +172,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             .map_err(|error| error.to_string())?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!(
@@ -163,6 +207,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .join(",");
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!(
@@ -184,6 +229,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!("{{\"sessions\":[{}]}}", sessions_json(&sessions)),
@@ -205,6 +251,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!(
@@ -233,6 +280,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!("{{\"session\":{}}}", session_json(&session)),
@@ -249,6 +297,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!("{{\"session\":{}}}", session_json(&session)),
@@ -264,6 +313,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!(
@@ -278,6 +328,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             let path = open_in_vscode(&repo)?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
@@ -290,6 +341,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             let opened_path = open_workspace_path_in_vscode(&repo, &path)?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!(
@@ -303,7 +355,13 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             let form = parse_form(&request.body);
             let mut on_token = |_token: &str| {};
             let result = run_chat_request(&form, &mut on_token)?;
-            write_response(stream, 200, "application/json", &chat_result_json(&result))
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &chat_result_json(&result),
+            )
         }
         ("POST", "/api/propose-edit") => {
             let form = parse_form(&request.body);
@@ -318,6 +376,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!(
@@ -345,6 +404,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!(
@@ -367,6 +427,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!(
@@ -387,6 +448,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!(
@@ -407,6 +469,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!(
@@ -429,6 +492,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!(
@@ -451,6 +515,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!(
@@ -479,6 +544,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             };
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
@@ -499,6 +565,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             .map_err(|error| error.to_string())?;
             write_response(
                 stream,
+                &request,
                 200,
                 "application/json",
                 &format!(
@@ -508,13 +575,19 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 ),
             )
         }
-        _ => write_response(stream, 404, "application/json", &json_error("not found")),
+        _ => write_response(
+            stream,
+            &request,
+            404,
+            "application/json",
+            &json_error("not found"),
+        ),
     }
 }
 
 fn handle_ask_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
-    write_event_stream_headers(stream)?;
+    write_event_stream_headers(stream, request)?;
 
     let mut write_error = None;
     let result = {
@@ -550,20 +623,9 @@ fn run_chat_request(
         .map(String::as_str)
         .filter(|value| !value.is_empty());
     let engine = engine_for_repo(&repo)?;
-    if let Some(mock) = form.get("mock_response").filter(|value| !value.is_empty()) {
-        let mut adapter = MockModelAdapter::new(mock.clone());
-        return engine
-            .chat_orchestrator
-            .ask_with_session(&repo, &prompt, &[], session_id, &mut adapter, on_token)
-            .map_err(|error| error.to_string());
-    }
 
-    let api_key = env::var(&engine.config.model_api_key_env).map_err(|_| {
-        format!(
-            "{} is required, or provide a mock response",
-            engine.config.model_api_key_env
-        )
-    })?;
+    let api_key = env::var(&engine.config.model_api_key_env)
+        .map_err(|_| format!("{} is required", engine.config.model_api_key_env))?;
     let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
     let mut adapter = OpenAICompatibleAdapter::new(&engine.config.model_name, transport);
     engine
@@ -691,12 +753,19 @@ struct Request {
     method: String,
     path: String,
     query: HashMap<String, String>,
+    headers: HashMap<String, String>,
     body: String,
 }
 
 impl Request {
     fn param(&self, name: &str) -> Option<String> {
         self.query.get(name).cloned()
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
     }
 }
 
@@ -730,10 +799,13 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
     if parts.len() < 2 {
         return Err("malformed request line".to_string());
     }
-    let content_length = lines
+    let headers = lines
         .filter_map(|line| line.split_once(':'))
-        .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .map(|(key, value)| (key.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect::<HashMap<_, _>>();
+    let content_length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
     while buffer.len() < header_end + content_length {
         let read = stream.read(&mut temp).map_err(|error| error.to_string())?;
@@ -753,6 +825,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
         method: parts[0].to_string(),
         path,
         query,
+        headers,
         body,
     })
 }
@@ -835,18 +908,23 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 fn write_response(
     stream: &mut TcpStream,
+    request: &Request,
     status: u16,
     content_type: &str,
     body: &str,
 ) -> Result<(), String> {
-    let status_text = match status {
-        200 => "OK",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "OK",
-    };
+    write_response_with_extra_headers(stream, request, status, content_type, body, "")
+}
+
+fn write_basic_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+) -> Result<(), String> {
     let response = format!(
-        "HTTP/1.1 {status} {status_text}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\ncache-control: no-store\r\naccess-control-allow-origin: *\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n{body}",
+        status_text(status),
         body.len()
     );
     stream
@@ -854,11 +932,91 @@ fn write_response(
         .map_err(|error| error.to_string())
 }
 
-fn write_event_stream_headers(stream: &mut TcpStream) -> Result<(), String> {
-    let response = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-store\r\naccess-control-allow-origin: *\r\nconnection: close\r\n\r\n";
+fn write_preflight_response(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    if allowed_cors_origin(request).is_none() {
+        return write_response(
+            stream,
+            request,
+            403,
+            "application/json",
+            &json_error("forbidden"),
+        );
+    }
+    write_response_with_extra_headers(stream, request, 204, "text/plain; charset=utf-8", "", "")
+}
+
+fn write_response_with_extra_headers(
+    stream: &mut TcpStream,
+    request: &Request,
+    status: u16,
+    content_type: &str,
+    body: &str,
+    extra_headers: &str,
+) -> Result<(), String> {
+    let cors_headers = cors_headers(request);
+    let response = format!(
+        "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\ncache-control: no-store\r\n{cors_headers}{extra_headers}connection: close\r\n\r\n{body}",
+        status_text(status),
+        body.len()
+    );
     stream
         .write_all(response.as_bytes())
         .map_err(|error| error.to_string())
+}
+
+fn write_event_stream_headers(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let cors_headers = cors_headers(request);
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-store\r\n{cors_headers}connection: close\r\n\r\n"
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| error.to_string())
+}
+
+fn status_text(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        204 => "No Content",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "OK",
+    }
+}
+
+fn cors_headers(request: &Request) -> String {
+    allowed_cors_origin(request)
+        .map(|origin| {
+            format!(
+                "access-control-allow-origin: {origin}\r\naccess-control-allow-methods: GET, POST, OPTIONS\r\naccess-control-allow-headers: content-type, x-damaian-api-token\r\nvary: origin\r\n"
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn allowed_cors_origin(request: &Request) -> Option<&str> {
+    let origin = request.header("origin")?;
+    matches!(
+        origin,
+        "http://tauri.localhost" | "https://tauri.localhost" | "tauri://localhost"
+    )
+    .then_some(origin)
+}
+
+fn require_api_token(request: &Request, expected_token: &str) -> Result<(), String> {
+    if request.header("x-damaian-api-token") == Some(expected_token) {
+        Ok(())
+    } else {
+        Err("unauthorized API request".to_string())
+    }
+}
+
+fn generate_api_token() -> String {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).expect("secure random token generation failed");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn write_sse_event(stream: &mut TcpStream, event: &str, data: &str) -> Result<(), String> {
@@ -991,9 +1149,10 @@ fn escape_json(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_form, parse_path_list, percent_decode, save_config_file, validate_working_folder,
-        validate_workspace_path,
+        Request, allowed_cors_origin, parse_form, parse_path_list, percent_decode,
+        require_api_token, save_config_file, validate_working_folder, validate_workspace_path,
     };
+    use std::collections::HashMap;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1021,6 +1180,28 @@ mod tests {
     #[test]
     fn percent_decodes_malformed_unicode_adjacent_escape_literally() {
         assert_eq!(percent_decode("%aé"), "%aé");
+    }
+
+    #[test]
+    fn validates_desktop_api_token_header() {
+        let request = test_request_with_headers(&[("x-damaian-api-token", "secret")]);
+
+        assert!(require_api_token(&request, "secret").is_ok());
+        assert!(require_api_token(&request, "wrong").is_err());
+    }
+
+    #[test]
+    fn only_allows_tauri_cors_origins() {
+        let tauri_request = test_request_with_headers(&[("origin", "http://tauri.localhost")]);
+        let browser_request = test_request_with_headers(&[("origin", "https://example.test")]);
+        let same_origin_request = test_request_with_headers(&[]);
+
+        assert_eq!(
+            allowed_cors_origin(&tauri_request),
+            Some("http://tauri.localhost")
+        );
+        assert_eq!(allowed_cors_origin(&browser_request), None);
+        assert_eq!(allowed_cors_origin(&same_origin_request), None);
     }
 
     #[test]
@@ -1107,5 +1288,18 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("damaian-desktop-shell-{name}-{stamp}"))
+    }
+
+    fn test_request_with_headers(headers: &[(&str, &str)]) -> Request {
+        Request {
+            method: "GET".to_string(),
+            path: "/api/test".to_string(),
+            query: HashMap::new(),
+            headers: headers
+                .iter()
+                .map(|(key, value)| (key.to_ascii_lowercase(), value.to_string()))
+                .collect(),
+            body: String::new(),
+        }
     }
 }

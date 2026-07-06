@@ -7,3 +7,13 @@ target/
 .damaian/
 *.log
 tmp/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.damaian-debug/
+*.dmg
+*.app/

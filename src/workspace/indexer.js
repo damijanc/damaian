@@ -202,15 +202,11 @@ export class ProjectIndexer {
     }
 
     const content = buffer.toString('utf8');
-    const secretFindings = this.scanner.scan(content);
-    if (secretFindings.length > 0) {
-      skipped.push({ path: relativePath, reason: 'contains_secret', findingCount: secretFindings.length });
-      return;
-    }
+    const indexedContent = this.scanner.redact(content).text;
 
     const language = detectLanguage(relativePath);
-    const symbols = extractSymbols(content, language);
-    const imports = extractImports(content, language);
+    const symbols = extractSymbols(indexedContent, language);
+    const imports = extractImports(indexedContent, language);
     files.push({
       repositoryId: root,
       path: relativePath,
@@ -221,8 +217,8 @@ export class ProjectIndexer {
       included: true,
       symbols,
       imports,
-      terms: tokenize(`${relativePath} ${symbols.join(' ')} ${imports.join(' ')} ${content}`),
-      chunks: chunkText(content).map((chunk) => ({
+      terms: tokenize(`${relativePath} ${symbols.join(' ')} ${imports.join(' ')} ${indexedContent}`),
+      chunks: chunkText(indexedContent).map((chunk) => ({
         ...chunk,
         textHash: sha256(chunk.text)
       }))

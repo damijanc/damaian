@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Local-first AI coding assistant client workspace engine",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "damaian-client": "./bin/damaian-client.js"
