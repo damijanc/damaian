@@ -13,6 +13,7 @@ This repository currently implements the workspace-engine slice from the product
 - append-only local audit logs
 - provider-isolated model adapter interfaces
 - dependency-free local desktop shell prototype served over localhost
+- native Tauri desktop wrapper with macOS folder picker
 
 The macOS desktop shell can layer on top of these services without taking over file access, command execution, patching, or audit decisions.
 
@@ -51,6 +52,40 @@ node ./bin/damaian-client.js git-status /path/to/repo
 node ./bin/damaian-client.js classify-command "npm test"
 ```
 
-Set `DAMAIAN_DATA_DIR=.damaian` when you want CLI audit and rollback data to stay inside the current workspace during local development.
+By default, Damaian stores global app data under:
 
-No runtime dependencies are required for this first implementation slice.
+```text
+~/Library/Application Support/DamaianClient
+```
+
+Set `DAMAIAN_DATA_DIR` only when you want to override that location. For example, use `DAMAIAN_DATA_DIR=.damaian` to keep CLI audit and rollback data inside the current workspace during local development, or `DAMAIAN_DATA_DIR=~/.damaian` if you prefer a home-directory dotfolder.
+
+Repository-scoped config is separate from the global data directory and is stored at `.damaian/config.conf` inside the selected repository.
+
+Example override:
+
+```sh
+DAMAIAN_DATA_DIR=~/.damaian npm run desktop:dev
+```
+
+## Build macOS DMG
+
+Build the native macOS app and DMG installer with:
+
+```sh
+npm run desktop:build
+```
+
+The generated artifacts are written to:
+
+- `target/release/bundle/macos/Damaian.app`
+- `target/release/bundle/dmg/Damaian_0.1.0_aarch64.dmg`
+
+The current package is unsigned and not notarized. macOS may require the `Privacy & Security` `Open Anyway` flow described in [macOS Installation](docs/MACOS_INSTALLATION.md).
+
+## User Documentation
+
+- [Damaian User Guide](docs/USER_GUIDE.md)
+- [macOS Installation](docs/MACOS_INSTALLATION.md)
+
+No Node.js runtime is required to run the packaged macOS app.

@@ -85,6 +85,12 @@ label span {
   gap: 6px;
 }
 
+.repo-picker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
 input,
 textarea,
 select {

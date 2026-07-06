@@ -16,3 +16,4 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 desktop-shell = { path = "../desktop-shell" }
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
