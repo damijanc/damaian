@@ -7,6 +7,7 @@ let currentSessionId = "";
 
 const localApiOrigin = "http://127.0.0.1:4765";
 const lastRepoStorageKey = "damaian:lastRepository";
+const inspectorCollapsedStorageKey = "damaian:inspectorCollapsed";
 
 function repo() {
   return $("repo").value.trim();
@@ -83,6 +84,23 @@ function tauriDialogOpen() {
   return window.__TAURI__?.dialog?.open;
 }
 
+function setInspectorCollapsed(collapsed) {
+  document.body.classList.toggle("inspector-collapsed", collapsed);
+  localStorage.setItem(inspectorCollapsedStorageKey, collapsed ? "true" : "false");
+  const button = $("inspector-toggle-btn");
+  button.classList.toggle("is-collapsed", collapsed);
+  const label = collapsed ? "Show tools" : "Hide tools";
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.setAttribute("aria-expanded", collapsed ? "false" : "true");
+}
+
+function ensureInspectorVisible() {
+  if (document.body.classList.contains("inspector-collapsed")) {
+    setInspectorCollapsed(false);
+  }
+}
+
 function configScope() {
   return $("config-scope").value;
 }
@@ -119,6 +137,7 @@ async function saveConfigFile() {
 
 function clearSessionList() {
   $("session-select").innerHTML = '<option value="">New session</option>';
+  $("session-list").innerHTML = "";
   currentSessionId = "";
 }
 
@@ -271,6 +290,45 @@ function renderContextFiles(files = []) {
   });
 }
 
+function renderSessionList(sessions = []) {
+  const list = $("session-list");
+  list.innerHTML = "";
+  if (!sessions.length) {
+    const empty = document.createElement("p");
+    empty.className = "sidebar-empty";
+    empty.textContent = "No sessions yet";
+    list.append(empty);
+    return;
+  }
+  sessions.forEach((session) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "session-item";
+    button.dataset.sessionId = session.id;
+    if (session.id === currentSessionId) {
+      button.classList.add("active");
+    }
+    button.textContent = session.title;
+    button.title = session.title;
+    button.addEventListener("click", async () => {
+      try {
+        $("session-select").value = session.id;
+        await loadSession(session.id);
+        renderSessionList(sessions);
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+    list.append(button);
+  });
+}
+
+function syncSessionListActive() {
+  document.querySelectorAll(".session-item").forEach((button) => {
+    button.classList.toggle("active", button.dataset.sessionId === currentSessionId);
+  });
+}
+
 function renderPatchFiles() {
   const container = $("diff-output");
   container.innerHTML = "";
@@ -364,6 +422,7 @@ async function loadSessions(preferredSessionId = "", reloadSelected = false) {
     ? selectedSessionId
     : "";
   select.value = currentSessionId;
+  renderSessionList(payload.sessions);
   if (currentSessionId) {
     localStorage.setItem(lastSessionStorageKey(repoPath), currentSessionId);
     if (reloadSelected) {
@@ -384,6 +443,8 @@ async function loadSession(sessionId) {
   const payload = await api(`/api/session?session_id=${encodeURIComponent(sessionId)}`);
   currentSessionId = payload.session.id;
   localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+  $("session-select").value = currentSessionId;
+  syncSessionListActive();
   renderMessages(payload.messages);
   renderContextFiles();
   setChatStatus("Loaded");
@@ -438,6 +499,7 @@ function processSseEvent(raw, handlers) {
 
 document.querySelectorAll(".tab").forEach((button) => {
   button.addEventListener("click", () => {
+    ensureInspectorVisible();
     document.querySelectorAll(".tab").forEach((tab) => tab.classList.remove("active"));
     document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
     button.classList.add("active");
@@ -482,6 +544,7 @@ $("status-btn").addEventListener("click", async () => {
 
 $("config-btn").addEventListener("click", async () => {
   try {
+    ensureInspectorVisible();
     document.querySelector('[data-tab="settings"]').click();
     await loadConfigFile();
   } catch (error) {
@@ -510,6 +573,7 @@ $("new-session-btn").addEventListener("click", () => {
   currentSessionId = "";
   $("session-select").value = "";
   localStorage.removeItem(lastSessionStorageKey());
+  syncSessionListActive();
   clearChat();
   $("chat-prompt").focus();
 });
@@ -562,7 +626,6 @@ $("ask-btn").addEventListener("click", async () => {
       {
         repo: requireRepo(),
         prompt,
-        mock_response: $("chat-mock").value,
         session_id: currentSessionId,
       },
       {
@@ -704,8 +767,13 @@ $("config-save-btn").addEventListener("click", async () => {
   }
 });
 
+$("inspector-toggle-btn").addEventListener("click", () => {
+  setInspectorCollapsed(!document.body.classList.contains("inspector-collapsed"));
+});
+
 api("/api/bootstrap")
   .then((payload) => {
+    setInspectorCollapsed(localStorage.getItem(inspectorCollapsedStorageKey) === "true");
     const lastRepo = localStorage.getItem(lastRepoStorageKey);
     if (lastRepo) {
       setRepository(lastRepo, false);
