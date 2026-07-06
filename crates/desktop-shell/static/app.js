@@ -71,6 +71,10 @@ function setRepoState(message) {
   $("repo-state").textContent = message;
 }
 
+function tauriInvoke() {
+  return window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
+}
+
 document.querySelectorAll(".tab").forEach((button) => {
   button.addEventListener("click", () => {
     document.querySelectorAll(".tab").forEach((tab) => tab.classList.remove("active"));
@@ -78,6 +82,22 @@ document.querySelectorAll(".tab").forEach((button) => {
     button.classList.add("active");
     document.getElementById(button.dataset.tab).classList.add("active");
   });
+});
+
+$("pick-folder-btn").addEventListener("click", async () => {
+  try {
+    const invoke = tauriInvoke();
+    if (!invoke) throw new Error("Folder picker is available in the desktop app");
+    const selected = await invoke("pick_working_folder");
+    if (selected) {
+      $("repo").value = selected;
+      setRepoState("Repository selected");
+      $("search-results").innerHTML = "";
+      toast("Working folder selected");
+    }
+  } catch (error) {
+    toast(error.message);
+  }
 });
 
 $("status-btn").addEventListener("click", async () => {
