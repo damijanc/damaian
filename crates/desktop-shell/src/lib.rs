@@ -14,18 +14,31 @@ use workspace_engine::{
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const STYLE_CSS: &str = include_str!("../static/style.css");
 const APP_JS: &str = include_str!("../static/app.js");
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 
 pub fn run_from_env() -> Result<(), String> {
     run_server(ShellOptions::from_args(env::args().skip(1).collect()))
 }
 
 pub fn run_server(options: ShellOptions) -> Result<(), String> {
+    run_server_with_ready(options, |_| {})
+}
+
+pub fn run_server_with_ready<F>(options: ShellOptions, ready: F) -> Result<(), String>
+where
+    F: FnOnce(u16),
+{
     let bind = format!("127.0.0.1:{}", options.port);
     let listener = TcpListener::bind(&bind).map_err(|error| format!("bind {bind}: {error}"))?;
-    println!("Damaian desktop shell listening at http://{bind}");
+    let actual_port = listener
+        .local_addr()
+        .map_err(|error| format!("read listener address: {error}"))?
+        .port();
+    println!("Damaian desktop shell listening at http://127.0.0.1:{actual_port}");
     if let Some(repo) = &options.default_repo {
         println!("Default repository: {repo}");
     }
+    ready(actual_port);
 
     for stream in listener.incoming() {
         match stream {
@@ -164,23 +177,19 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             } else {
                 String::new()
             };
-            let config = Config::load_for_repository(if repo.is_empty() {
-                None
-            } else {
-                Some(Path::new(&repo))
-            })
-            .map_err(|error| error.to_string())?;
+            let (effective_policy, effective_error) = effective_policy_for_repo(&repo);
             write_response(
                 stream,
                 &request,
                 200,
                 "application/json",
                 &format!(
-                    "{{\"path\":\"{}\",\"exists\":{},\"content\":\"{}\",\"effectivePolicy\":\"{}\"}}",
+                    "{{\"path\":\"{}\",\"exists\":{},\"content\":\"{}\",\"effectivePolicy\":\"{}\",\"effectiveError\":\"{}\"}}",
                     escape_json(&path.to_string_lossy()),
                     path.exists(),
                     escape_json(&content),
-                    escape_json(&config.to_policy_text())
+                    escape_json(&effective_policy),
+                    escape_json(&effective_error)
                 ),
             )
         }
@@ -557,21 +566,17 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             let content = form.get("content").cloned().unwrap_or_default();
             let path = config_path_for_scope(&scope, &repo)?;
             save_config_file(&path, &content)?;
-            let config = Config::load_for_repository(if repo.is_empty() {
-                None
-            } else {
-                Some(Path::new(&repo))
-            })
-            .map_err(|error| error.to_string())?;
+            let (effective_policy, effective_error) = effective_policy_for_repo(&repo);
             write_response(
                 stream,
                 &request,
                 200,
                 "application/json",
                 &format!(
-                    "{{\"path\":\"{}\",\"effectivePolicy\":\"{}\"}}",
+                    "{{\"path\":\"{}\",\"effectivePolicy\":\"{}\",\"effectiveError\":\"{}\"}}",
                     escape_json(&path.to_string_lossy()),
-                    escape_json(&config.to_policy_text())
+                    escape_json(&effective_policy),
+                    escape_json(&effective_error)
                 ),
             )
         }
@@ -641,10 +646,7 @@ fn default_engine() -> Result<WorkspaceEngine, String> {
 
 fn config_path_for_scope(scope: &str, repo: &str) -> Result<PathBuf, String> {
     match scope {
-        "user" => {
-            let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
-            Ok(config.user_config_path())
-        }
+        "user" => Ok(Config::default().user_config_path()),
         "repo" => {
             if repo.is_empty() {
                 return Err("repository is required for repository config".to_string());
@@ -652,6 +654,17 @@ fn config_path_for_scope(scope: &str, repo: &str) -> Result<PathBuf, String> {
             Ok(Config::repository_config_path(repo))
         }
         _ => Err("scope must be user or repo".to_string()),
+    }
+}
+
+fn effective_policy_for_repo(repo: &str) -> (String, String) {
+    match Config::load_for_repository(if repo.is_empty() {
+        None
+    } else {
+        Some(Path::new(repo))
+    }) {
+        Ok(config) => (config.to_policy_text(), String::new()),
+        Err(error) => (String::new(), error.to_string()),
     }
 }
 
@@ -923,7 +936,7 @@ fn write_basic_response(
     body: &str,
 ) -> Result<(), String> {
     let response = format!(
-        "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\ncache-control: no-store\r\ncontent-security-policy: {CONTENT_SECURITY_POLICY}\r\nconnection: close\r\n\r\n{body}",
         status_text(status),
         body.len()
     );
@@ -955,7 +968,7 @@ fn write_response_with_extra_headers(
 ) -> Result<(), String> {
     let cors_headers = cors_headers(request);
     let response = format!(
-        "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\ncache-control: no-store\r\n{cors_headers}{extra_headers}connection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\ncache-control: no-store\r\ncontent-security-policy: {CONTENT_SECURITY_POLICY}\r\n{cors_headers}{extra_headers}connection: close\r\n\r\n{body}",
         status_text(status),
         body.len()
     );
@@ -998,11 +1011,15 @@ fn cors_headers(request: &Request) -> String {
 
 fn allowed_cors_origin(request: &Request) -> Option<&str> {
     let origin = request.header("origin")?;
-    matches!(
+    let allowed = matches!(
         origin,
-        "http://tauri.localhost" | "https://tauri.localhost" | "tauri://localhost"
-    )
-    .then_some(origin)
+        "http://tauri.localhost"
+            | "https://tauri.localhost"
+            | "tauri://localhost"
+            | "http://localhost:4765"
+            | "http://127.0.0.1:4765"
+    );
+    allowed.then_some(origin)
 }
 
 fn require_api_token(request: &Request, expected_token: &str) -> Result<(), String> {
@@ -1149,8 +1166,9 @@ fn escape_json(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Request, allowed_cors_origin, parse_form, parse_path_list, percent_decode,
-        require_api_token, save_config_file, validate_working_folder, validate_workspace_path,
+        Request, allowed_cors_origin, effective_policy_for_repo, parse_form, parse_path_list,
+        percent_decode, require_api_token, save_config_file, validate_working_folder,
+        validate_workspace_path,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -1193,12 +1211,17 @@ mod tests {
     #[test]
     fn only_allows_tauri_cors_origins() {
         let tauri_request = test_request_with_headers(&[("origin", "http://tauri.localhost")]);
+        let local_request = test_request_with_headers(&[("origin", "http://localhost:4765")]);
         let browser_request = test_request_with_headers(&[("origin", "https://example.test")]);
         let same_origin_request = test_request_with_headers(&[]);
 
         assert_eq!(
             allowed_cors_origin(&tauri_request),
             Some("http://tauri.localhost")
+        );
+        assert_eq!(
+            allowed_cors_origin(&local_request),
+            Some("http://localhost:4765")
         );
         assert_eq!(allowed_cors_origin(&browser_request), None);
         assert_eq!(allowed_cors_origin(&same_origin_request), None);
@@ -1224,6 +1247,22 @@ mod tests {
         let error = save_config_file(&path, "unknown_key=value\n").unwrap_err();
         assert!(error.contains("Unknown config key"));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn reports_effective_policy_load_errors_without_panicking() {
+        let repo = temp_path("invalid-effective-policy");
+        fs::create_dir_all(repo.join(".damaian")).unwrap();
+        fs::write(
+            repo.join(".damaian").join("config.conf"),
+            "unknown_key=value\n",
+        )
+        .unwrap();
+
+        let (policy, error) = effective_policy_for_repo(repo.to_str().unwrap());
+
+        assert!(policy.is_empty());
+        assert!(error.contains("Unknown config key"));
     }
 
     #[test]
