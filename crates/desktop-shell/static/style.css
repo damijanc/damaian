@@ -109,6 +109,14 @@ textarea {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
+#config-editor {
+  min-height: 320px;
+}
+
+.path-line {
+  word-break: break-word;
+}
+
 button {
   border: 1px solid #b9c3cf;
   border-radius: 6px;

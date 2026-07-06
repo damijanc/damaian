@@ -75,6 +75,40 @@ function tauriInvoke() {
   return window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
 }
 
+function configScope() {
+  return $("config-scope").value;
+}
+
+function configRepo() {
+  return configScope() === "repo" ? requireRepo() : repo();
+}
+
+async function loadConfigFile() {
+  const payload = await api(
+    `/api/config-file?scope=${encodeURIComponent(configScope())}&repo=${encodeURIComponent(
+      configRepo(),
+    )}`,
+  );
+  $("config-editor").value = payload.content;
+  $("config-output").textContent = payload.effectivePolicy;
+  $("config-path").textContent = payload.exists ? payload.path : `${payload.path} (new)`;
+  return payload;
+}
+
+async function saveConfigFile() {
+  const payload = await api(
+    "/api/config-file",
+    form({
+      scope: configScope(),
+      repo: configRepo(),
+      content: $("config-editor").value,
+    }),
+  );
+  $("config-output").textContent = payload.effectivePolicy;
+  $("config-path").textContent = payload.path;
+  return payload;
+}
+
 document.querySelectorAll(".tab").forEach((button) => {
   button.addEventListener("click", () => {
     document.querySelectorAll(".tab").forEach((tab) => tab.classList.remove("active"));
@@ -112,9 +146,8 @@ $("status-btn").addEventListener("click", async () => {
 
 $("config-btn").addEventListener("click", async () => {
   try {
-    const payload = await api(`/api/config?repo=${encodeURIComponent(repo())}`);
-    $("config-output").textContent = payload.policy;
     document.querySelector('[data-tab="settings"]').click();
+    await loadConfigFile();
   } catch (error) {
     toast(error.message);
   }
@@ -231,20 +264,19 @@ $("reject-command-btn").addEventListener("click", async () => {
   }
 });
 
+$("config-load-btn").addEventListener("click", async () => {
+  try {
+    const payload = await loadConfigFile();
+    toast(payload.path);
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
 $("config-save-btn").addEventListener("click", async () => {
   try {
-    const payload = await api(
-      "/api/config-set",
-      form({
-        scope: $("config-scope").value,
-        repo: repo(),
-        key: $("config-key").value,
-        value: $("config-value").value,
-      }),
-    );
+    const payload = await saveConfigFile();
     toast(payload.path);
-    const config = await api(`/api/config?repo=${encodeURIComponent(repo())}`);
-    $("config-output").textContent = config.policy;
   } catch (error) {
     toast(error.message);
   }

@@ -57,7 +57,9 @@ Destructive or shell-control-heavy commands are blocked or approval-gated by def
 
 ## Settings
 
-Use the `Settings` tab to inspect and update policy values.
+Use the `Settings` tab to inspect and edit configuration values. Choose `User` for global settings or `Repository` for settings stored in the selected working folder, then select `Load`.
+
+Configuration uses one `key=value` entry per line. Edit values directly and select `Save`. Delete a line and save to remove that override from the selected scope.
 
 Common keys:
 
