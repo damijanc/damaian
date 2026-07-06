@@ -34,6 +34,8 @@ Use the Visual Studio Code icon in the conversation header to open the selected 
 
 Use the `Chat` tab to ask questions about the selected repository. Damaian retrieves relevant local files, redacts detected secrets, streams the answer, and shows the context files used for the response.
 
+Press `Enter` to send a chat message. Press `Shift+Enter` to insert a new line.
+
 If you name a file in your prompt, such as `USER_GUIDE.md` or `docs/USER_GUIDE.md`, Damaian attempts to include that file in the model context. A filename without a directory must uniquely match one file in the selected repository.
 
 Use `New`, `Rename`, and `Delete` to manage project-scoped chat sessions. Selecting an existing session reloads its conversation and future questions continue with recent prior messages as context.
