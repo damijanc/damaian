@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
     AuditLog, ClientError, CommandPolicy, CommandRisk, Config, ConfigOverlay, MockModelAdapter,
-    ModelMessage, ModelRequest, PatchEngine, PathPolicy, ProjectIndexer, ProposedChange,
-    SecretScanner, SessionStore, WorkspaceEngine, extract_model_tokens, model_request_json,
-    parse_generated_edit,
+    MockModelTransport, ModelAdapter, ModelMessage, ModelRequest, OpenAICompatibleAdapter,
+    PatchEngine, PathPolicy, ProjectIndexer, ProposedChange, SecretScanner, SessionStore,
+    WorkspaceEngine, extract_model_tokens, model_request_json, parse_generated_edit,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -327,6 +327,20 @@ fn persists_session_tasks_and_messages() {
     assert_eq!(messages[0].role, "user");
     assert_eq!(messages[1].content, "Auth uses tokens — safely.");
 
+    let sessions = store.list_sessions(Some("repo_1")).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].title, "Explain auth flow");
+
+    let renamed = store.rename_session(&session.id, "Auth notes").unwrap();
+    assert_eq!(renamed.title, "Auth notes");
+    assert_eq!(
+        store.read_session(&session.id).unwrap().unwrap().title,
+        "Auth notes"
+    );
+
+    store.delete_session(&session.id).unwrap();
+    assert!(store.read_session(&session.id).unwrap().is_none());
+
     fs::remove_dir_all(repo).unwrap();
 }
 
@@ -383,6 +397,23 @@ fn builds_openai_request_json_and_extracts_stream_tokens() {
 
     let raw = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" repo — ok\"}}]}\n\ndata: [DONE]\n\n";
     assert_eq!(extract_model_tokens(raw), vec!["Hello", " repo — ok"]);
+}
+
+#[test]
+fn reports_openai_compatible_error_payloads() {
+    let request = ModelRequest {
+        provider: "openai-compatible".to_string(),
+        model: "test-model".to_string(),
+        messages: vec![ModelMessage::user("hello")],
+        temperature: Some("0".to_string()),
+        stream: true,
+    };
+    let transport = MockModelTransport::new("{\"error\":{\"message\":\"Rate limit exceeded\"}}\n");
+    let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
+    let error = adapter
+        .stream_response(&request, &mut |_token| {})
+        .unwrap_err();
+    assert!(error.to_string().contains("Rate limit exceeded"));
 }
 
 #[test]

@@ -32,9 +32,13 @@ Use `VS Code` in the sidebar to open the selected working folder in Visual Studi
 
 ## Chat
 
-Use the `Chat` tab to ask questions about the selected repository. Damaian retrieves relevant local files, redacts detected secrets, and sends the prompt plus context to the configured model provider.
+Use the `Chat` tab to ask questions about the selected repository. Damaian retrieves relevant local files, redacts detected secrets, streams the answer, and shows the context files used for the response.
 
 For local testing without a model key, enter text in `Mock response` and select `Ask`. The app will run the same orchestration path but return the mock response instead of calling a model API.
+
+Use `New`, `Rename`, and `Delete` to manage project-scoped chat sessions. Selecting an existing session reloads its conversation and future questions continue with recent prior messages as context.
+
+Context file buttons open the referenced file in Visual Studio Code.
 
 ## Edits
 
