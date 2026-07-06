@@ -1,6 +1,7 @@
 use crate::file_access::FileAccessController;
 use crate::indexer::RepositoryIndex;
 use crate::secret_scanner::SecretScanner;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 const PROJECT_RULES: &[&str] = &[
@@ -72,7 +73,14 @@ impl ContextManager {
             prompt,
         );
 
-        for path in explicit_paths {
+        let mut requested_paths = explicit_paths.to_vec();
+        for path in prompt_file_mentions(prompt, index) {
+            if !requested_paths.iter().any(|existing| existing == &path) {
+                requested_paths.push(path);
+            }
+        }
+
+        for path in &requested_paths {
             self.add_file(
                 repository_root.as_ref(),
                 repository_id,
@@ -197,4 +205,100 @@ fn add_text(
         },
     });
     true
+}
+
+fn prompt_file_mentions(prompt: &str, index: Option<&RepositoryIndex>) -> Vec<String> {
+    let Some(index) = index else {
+        return Vec::new();
+    };
+
+    let paths = index
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    let exact_paths = paths
+        .iter()
+        .map(|path| (path.to_lowercase(), path.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut basename_matches: HashMap<String, Vec<String>> = HashMap::new();
+    for path in &paths {
+        if let Some(name) = path.rsplit('/').next() {
+            basename_matches
+                .entry(name.to_lowercase())
+                .or_default()
+                .push(path.clone());
+        }
+    }
+
+    let mut mentioned = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in prompt_path_candidates(prompt) {
+        let lower = candidate.to_lowercase();
+        let resolved = if let Some(path) = exact_paths.get(&lower) {
+            Some(path.clone())
+        } else if !candidate.contains('/') {
+            basename_matches
+                .get(&lower)
+                .filter(|matches| matches.len() == 1)
+                .and_then(|matches| matches.first().cloned())
+        } else {
+            None
+        };
+
+        if let Some(path) = resolved {
+            if seen.insert(path.clone()) {
+                mentioned.push(path);
+            }
+        }
+    }
+
+    mentioned
+}
+
+fn prompt_path_candidates(prompt: &str) -> Vec<String> {
+    prompt
+        .split_whitespace()
+        .filter_map(|part| {
+            let candidate = part
+                .trim_matches(|character: char| {
+                    matches!(
+                        character,
+                        '`' | '"'
+                            | '\''
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                            | '<'
+                            | '>'
+                            | ','
+                            | ':'
+                            | ';'
+                    )
+                })
+                .trim_end_matches(|character: char| matches!(character, '.' | '?' | '!'))
+                .replace('\\', "/");
+
+            if candidate.is_empty()
+                || candidate.starts_with('/')
+                || candidate.starts_with("http://")
+                || candidate.starts_with("https://")
+                || candidate.contains("../")
+                || candidate == ".."
+                || candidate.ends_with('/')
+            {
+                return None;
+            }
+
+            let looks_like_path = candidate.contains('/')
+                || candidate
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.contains('.'));
+            looks_like_path.then_some(candidate)
+        })
+        .collect()
 }

@@ -300,7 +300,15 @@ button:disabled {
 }
 
 .vscode-button {
-  white-space: nowrap;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+}
+
+.vscode-icon {
+  display: block;
+  width: 22px;
+  height: 22px;
 }
 
 .status-badge {
@@ -410,6 +418,43 @@ button:disabled {
 
 .message-body li + li {
   margin-top: 4px;
+}
+
+.message-body .table-wrap {
+  max-width: 100%;
+  margin: 0 0 10px;
+  overflow-x: auto;
+}
+
+.message-body table {
+  width: 100%;
+  min-width: 520px;
+  border-collapse: collapse;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.message-body th,
+.message-body td {
+  border-bottom: 1px solid var(--line);
+  padding: 7px 9px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.message-body th {
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-weight: 750;
+}
+
+.message-body td {
+  color: var(--ink);
+}
+
+.message-body tr:last-child td {
+  border-bottom: 0;
 }
 
 .message-body code {

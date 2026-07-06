@@ -26,3 +26,22 @@ test('builds context from explicit and retrieved files with redaction', async ()
     assert.equal(context.items.some((item) => item.content.includes('[REDACTED_')), true);
   });
 });
+
+test('builds context from unique file names mentioned in the prompt', async () => {
+  await withTempDir('context-file-mentions', async (repo) => {
+    await writeFixture(repo, 'README.md', '# Project rules\n');
+    await writeFixture(repo, 'docs/USER_GUIDE.md', '# User guide\n\nDesktop setup notes.\n');
+
+    const engine = createDefaultEngine({ config: { dataDir: path.join(repo, '.damaian') } });
+    const index = await engine.indexer.indexRepository(repo);
+    const context = await engine.contextManager.buildContext({
+      repositoryRoot: repo,
+      repositoryId: index.repositoryId,
+      taskId: 'task_1',
+      prompt: 'Check USER_GUIDE.md for correctness against current implementation.',
+      index
+    });
+
+    assert.equal(context.files.includes('docs/USER_GUIDE.md'), true);
+  });
+});

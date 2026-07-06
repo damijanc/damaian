@@ -10,4 +10,5 @@ name = "damaian-desktop-shell"
 path = "src/main.rs"
 
 [dependencies]
+getrandom = "0.3"
 workspace-engine = { path = "../workspace-engine" }

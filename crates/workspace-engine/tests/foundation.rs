@@ -100,7 +100,7 @@ fn marks_restricted_dotenv_files() {
 }
 
 #[test]
-fn indexes_source_files_while_respecting_gitignore_and_secrets() {
+fn indexes_source_files_while_respecting_gitignore_and_redacting_secrets() {
     let repo = temp_dir("indexer");
     write_fixture(&repo, ".gitignore", "dist/\nignored.js\n");
     write_fixture(
@@ -129,12 +129,29 @@ fn indexes_source_files_while_respecting_gitignore_and_secrets() {
         .map(|file| file.path.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(files, vec!["src/auth.js"]);
+    assert_eq!(files, vec!["src/auth.js", "src/secret.js"]);
     assert!(
         index
             .skipped
             .iter()
-            .any(|file| file.path == "src/secret.js" && file.reason == "contains_secret")
+            .any(|file| file.path == "dist" || file.path == "dist/bundle.js")
+    );
+    let secret_file = index
+        .files
+        .iter()
+        .find(|file| file.path == "src/secret.js")
+        .expect("secret-bearing file should be indexed with redaction");
+    assert!(
+        secret_file
+            .chunks
+            .iter()
+            .all(|chunk| !chunk.text.contains("sk_test_12345678901234567890"))
+    );
+    assert!(
+        secret_file
+            .chunks
+            .iter()
+            .any(|chunk| chunk.text.contains("[REDACTED_"))
     );
     assert_eq!(index.keyword_search("login", 1)[0].path, "src/auth.js");
 
@@ -378,6 +395,40 @@ fn orchestrates_chat_with_indexed_context_and_mock_model() {
         .read_messages(&result.session.id)
         .unwrap();
     assert_eq!(messages.len(), 2);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn attaches_unique_file_mentions_to_chat_context() {
+    let repo = temp_dir("chat-file-mentions");
+    write_fixture(&repo, "README.md", "# Chat test\n");
+    write_fixture(
+        &repo,
+        "docs/USER_GUIDE.md",
+        "# User guide\n\nDesktop setup and runtime notes.\n",
+    );
+    let config = test_config(&repo);
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new("The guide is available in docs/USER_GUIDE.md.");
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Check USER_GUIDE.md for correctness against current implementation.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert!(
+        result
+            .context_files
+            .contains(&"docs/USER_GUIDE.md".to_string())
+    );
 
     fs::remove_dir_all(repo).unwrap();
 }

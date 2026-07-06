@@ -302,18 +302,12 @@ impl ProjectIndexer {
         }
 
         let content = String::from_utf8_lossy(&bytes).to_string();
-        let secret_findings = self.scanner.scan(&content);
-        if !secret_findings.is_empty() {
-            skipped.push(SkippedFile {
-                path: relative_path.to_string(),
-                reason: "contains_secret".to_string(),
-            });
-            return Ok(());
-        }
+        let redacted = self.scanner.redact(&content);
+        let indexed_content = redacted.text;
 
         let language = detect_language(relative_path).to_string();
-        let symbols = extract_symbols(&content, &language);
-        let imports = extract_imports(&content, &language);
+        let symbols = extract_symbols(&indexed_content, &language);
+        let imports = extract_imports(&indexed_content, &language);
         let modified_time_ms = metadata
             .modified()
             .ok()
@@ -330,8 +324,8 @@ impl ProjectIndexer {
             content_hash: sha256(&bytes),
             symbols,
             imports,
-            terms: tokenize(&format!("{relative_path} {content}")),
-            chunks: chunk_text(&content, 2400),
+            terms: tokenize(&format!("{relative_path} {indexed_content}")),
+            chunks: chunk_text(&indexed_content, 2400),
         });
         Ok(())
     }
