@@ -28,116 +28,151 @@
         <div class="toolbar">
           <button id="status-btn" type="button">Status</button>
           <button id="config-btn" type="button">Policy</button>
-          <button
-            id="open-vscode-btn"
-            type="button"
-            aria-label="Open selected folder in Visual Studio Code"
-            title="Open selected folder in Visual Studio Code"
-          >
-            VS Code
-          </button>
+        </div>
+
+        <div class="sidebar-section">
+          <div class="section-heading">
+            <h2>Sessions</h2>
+          </div>
+          <select
+            id="session-select"
+            class="session-select-hidden"
+            aria-label="Active session"
+          ></select>
+          <div id="session-list" class="session-list"></div>
+          <div class="session-actions">
+            <button id="new-session-btn" type="button">New</button>
+            <button id="rename-session-btn" type="button">Rename</button>
+            <button id="delete-session-btn" type="button">Delete</button>
+          </div>
         </div>
       </aside>
 
-      <main class="workspace">
-        <nav class="tabs" aria-label="Workspace views">
-          <button class="tab active" data-tab="chat" type="button">Chat</button>
-          <button class="tab" data-tab="edits" type="button">Edits</button>
+      <main class="conversation">
+        <header class="thread-header">
+          <div>
+            <p class="eyebrow">Workspace Agent</p>
+            <h2>Conversation</h2>
+          </div>
+          <div class="thread-actions">
+            <span id="chat-status" class="status-badge">Idle</span>
+            <button
+              id="open-vscode-btn"
+              class="topbar-button vscode-button"
+              type="button"
+              aria-label="Open selected folder in Visual Studio Code"
+              title="Open selected folder in Visual Studio Code"
+            >
+              VS Code
+            </button>
+            <button
+              id="inspector-toggle-btn"
+              class="icon-button"
+              type="button"
+              aria-controls="inspector"
+              aria-expanded="true"
+              aria-label="Hide tools"
+              title="Hide inspector"
+            >
+              <span class="panel-icon" aria-hidden="true"></span>
+            </button>
+          </div>
+        </header>
+
+        <section id="chat-log" class="chat-log" aria-live="polite"></section>
+
+        <footer class="composer">
+          <div class="prompt-box">
+            <textarea
+              id="chat-prompt"
+              rows="4"
+              placeholder="Ask about this repository"
+            ></textarea>
+            <button id="ask-btn" class="send-button" type="button" aria-label="Send message">
+              <span class="send-icon" aria-hidden="true"></span>
+            </button>
+          </div>
+        </footer>
+      </main>
+
+      <aside id="inspector" class="inspector">
+        <nav class="tabs inspector-tabs" aria-label="Inspector views">
+          <button class="tab active" data-tab="edits" type="button">Edits</button>
           <button class="tab" data-tab="commands" type="button">Commands</button>
           <button class="tab" data-tab="settings" type="button">Settings</button>
         </nav>
 
-        <section id="chat" class="view active">
-          <div class="split">
-            <div class="pane">
-              <h2>Chat</h2>
-              <label class="field">
-                <span>Session</span>
-                <select id="session-select"></select>
-              </label>
-              <div class="session-actions">
-                <button id="new-session-btn" type="button">New</button>
-                <button id="rename-session-btn" type="button">Rename</button>
-                <button id="delete-session-btn" type="button">Delete</button>
-              </div>
-              <textarea id="chat-prompt" rows="5" placeholder="Ask about this repository"></textarea>
-              <textarea id="chat-mock" rows="4" placeholder="Mock response"></textarea>
-              <button id="ask-btn" type="button">Ask</button>
-            </div>
-            <div class="pane output">
-              <div class="output-heading">
-                <h2>Conversation</h2>
-                <span id="chat-status" class="status-badge">Idle</span>
-              </div>
-              <div id="chat-log" class="chat-log"></div>
-              <h2>Context</h2>
-              <div id="chat-context" class="context-list"></div>
+        <section id="edits" class="view active">
+          <div class="inspector-section">
+            <h2>Edit Proposal</h2>
+            <textarea id="edit-prompt" rows="3" placeholder="Describe the change"></textarea>
+            <textarea
+              id="edit-model-output"
+              rows="9"
+              placeholder="DAMAIAN_EDIT_V1&#10;SUMMARY: ...&#10;FILE: src/app.js&#10;STATUS: modified&#10;CONTENT:&#10;...&#10;END_FILE&#10;END_PATCH"
+            ></textarea>
+            <button id="propose-edit-btn" type="button">Preview</button>
+            <div class="inline-actions">
+              <button id="apply-patch-btn" type="button">Apply Selected</button>
+              <button id="reject-patch-btn" type="button">Reject Selected</button>
             </div>
           </div>
-        </section>
-
-        <section id="edits" class="view">
-          <div class="split">
-            <div class="pane">
-              <h2>Edit Proposal</h2>
-              <textarea id="edit-prompt" rows="4" placeholder="Describe the change"></textarea>
-              <textarea id="edit-model-output" rows="12" placeholder="DAMAIAN_EDIT_V1&#10;SUMMARY: ...&#10;FILE: src/app.js&#10;STATUS: modified&#10;CONTENT:&#10;...&#10;END_FILE&#10;END_PATCH"></textarea>
-              <button id="propose-edit-btn" type="button">Preview</button>
-              <div class="inline-actions">
-                <button id="apply-patch-btn" type="button">Apply Selected</button>
-                <button id="reject-patch-btn" type="button">Reject Selected</button>
-              </div>
-            </div>
-            <div class="pane output">
-              <h2>Diff</h2>
-              <div id="diff-output" class="diff-list"></div>
-            </div>
+          <div class="inspector-section grow">
+            <h2>Diff</h2>
+            <div id="diff-output" class="diff-list"></div>
           </div>
         </section>
 
         <section id="commands" class="view">
-          <div class="split">
-            <div class="pane">
-              <h2>Command Approval</h2>
-              <input id="command-input" type="text" placeholder="npm test" />
-              <button id="propose-command-btn" type="button">Propose</button>
-              <div class="inline-actions">
-                <button id="run-command-btn" type="button">Run</button>
-                <button id="reject-command-btn" type="button">Reject</button>
-              </div>
+          <div class="inspector-section">
+            <h2>Command Approval</h2>
+            <input id="command-input" type="text" placeholder="npm test" />
+            <button id="propose-command-btn" type="button">Propose</button>
+            <div class="inline-actions">
+              <button id="run-command-btn" type="button">Run</button>
+              <button id="reject-command-btn" type="button">Reject</button>
             </div>
-            <div class="pane output">
-              <h2>Command Output</h2>
-              <pre id="command-output"></pre>
-            </div>
+          </div>
+          <div class="inspector-section grow">
+            <h2>Command Output</h2>
+            <pre id="command-output"></pre>
           </div>
         </section>
 
         <section id="settings" class="view">
-          <div class="split">
-            <div class="pane">
-              <h2>Configuration</h2>
-              <label class="field">
-                <span>Scope</span>
-                <select id="config-scope">
-                  <option value="user">User</option>
-                  <option value="repo">Repository</option>
-                </select>
-              </label>
-              <div class="inline-actions">
-                <button id="config-load-btn" type="button">Load</button>
-                <button id="config-save-btn" type="button">Save</button>
-              </div>
-              <p id="config-path" class="path-line"></p>
-              <textarea id="config-editor" rows="18" placeholder="model_base_url=https://api.openai.com&#10;model_name=gpt-4.1&#10;model_api_key_env=OPENAI_API_KEY"></textarea>
+          <div class="inspector-section">
+            <h2>Configuration</h2>
+            <label class="field">
+              <span>Scope</span>
+              <select id="config-scope">
+                <option value="user">User</option>
+                <option value="repo">Repository</option>
+              </select>
+            </label>
+            <div class="inline-actions">
+              <button id="config-load-btn" type="button">Load</button>
+              <button id="config-save-btn" type="button">Save</button>
             </div>
-            <div class="pane output">
-              <h2>Effective Policy</h2>
-              <pre id="config-output"></pre>
-            </div>
+            <p id="config-path" class="path-line"></p>
+            <textarea
+              id="config-editor"
+              rows="15"
+              placeholder="model_base_url=https://api.openai.com&#10;model_name=gpt-4.1&#10;model_api_key_env=OPENAI_API_KEY"
+            ></textarea>
+          </div>
+          <div class="inspector-section grow">
+            <h2>Effective Policy</h2>
+            <pre id="config-output"></pre>
           </div>
         </section>
-      </main>
+
+        <div class="inspector-section context-panel">
+          <div class="section-heading">
+            <h2>Context</h2>
+          </div>
+          <div id="chat-context" class="context-list"></div>
+        </div>
+      </aside>
     </div>
     <div id="toast" role="status"></div>
     <script src="app.js"></script>
