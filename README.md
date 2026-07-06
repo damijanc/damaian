@@ -14,6 +14,7 @@ This repository currently implements the workspace-engine slice from the product
 - provider-isolated model adapter interfaces
 - dependency-free local desktop shell prototype served over localhost
 - native Tauri desktop wrapper with macOS folder picker
+- one-click handoff from the selected working folder to Visual Studio Code
 
 The macOS desktop shell can layer on top of these services without taking over file access, command execution, patching, or audit decisions.
 
@@ -24,7 +25,6 @@ npm test
 
 # Command-line Rust implementation
 cargo test
-cargo run -p damaian-cli -- search /path/to/repo "auth token"
 cargo run -p damaian-cli -- config-show /path/to/repo
 cargo run -p damaian-cli -- config-set user command_allowlist "npm test|cargo test"
 cargo run -p damaian-cli -- config-set repo /path/to/repo restricted_patterns ".env|*.pem|private/**"
@@ -47,7 +47,6 @@ DAMAIAN_REPO=/path/to/repo npm run desktop:dev
 
 # Command-line Node reference implementation
 node ./bin/damaian-client.js index /path/to/repo
-node ./bin/damaian-client.js search /path/to/repo "auth token"
 node ./bin/damaian-client.js git-status /path/to/repo
 node ./bin/damaian-client.js classify-command "npm test"
 ```

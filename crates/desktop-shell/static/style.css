@@ -133,7 +133,12 @@ button:hover {
   color: var(--accent);
 }
 
-.toolbar,
+.toolbar {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
 .inline-actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -200,29 +205,6 @@ pre {
   padding: 14px;
   min-height: 220px;
   font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-
-.list {
-  display: grid;
-  gap: 8px;
-  overflow: auto;
-}
-
-.result {
-  border: 1px solid var(--line);
-  background: white;
-  border-radius: 6px;
-  padding: 10px;
-}
-
-.result strong {
-  display: block;
-  font-size: 12px;
-}
-
-.result span {
-  color: var(--muted);
-  font-size: 11px;
 }
 
 #toast {

@@ -6,26 +6,14 @@ use std::thread;
 use std::time::Duration;
 
 use desktop_shell::{ShellOptions, run_server};
-use tauri_plugin_dialog::DialogExt;
 
 const SHELL_PORT: u16 = 4765;
-
-#[tauri::command]
-fn pick_working_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
-    Ok(app
-        .dialog()
-        .file()
-        .set_title("Select Working Folder")
-        .blocking_pick_folder()
-        .map(|path| path.to_string()))
-}
 
 fn main() {
     let shell_options = ShellOptions::new(SHELL_PORT, repo_from_args_or_env());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![pick_working_folder])
         .setup(move |_app| {
             let options = shell_options.clone();
             thread::spawn(move || {
