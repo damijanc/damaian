@@ -101,14 +101,20 @@
         <section id="settings" class="view">
           <div class="split">
             <div class="pane">
-              <h2>Policy</h2>
-              <select id="config-scope">
-                <option value="user">User</option>
-                <option value="repo">Repository</option>
-              </select>
-              <input id="config-key" type="text" placeholder="command_allowlist" />
-              <input id="config-value" type="text" placeholder="npm test|cargo test" />
-              <button id="config-save-btn" type="button">Save</button>
+              <h2>Configuration</h2>
+              <label class="field">
+                <span>Scope</span>
+                <select id="config-scope">
+                  <option value="user">User</option>
+                  <option value="repo">Repository</option>
+                </select>
+              </label>
+              <div class="inline-actions">
+                <button id="config-load-btn" type="button">Load</button>
+                <button id="config-save-btn" type="button">Save</button>
+              </div>
+              <p id="config-path" class="path-line"></p>
+              <textarea id="config-editor" rows="18" placeholder="model_base_url=https://api.openai.com&#10;model_name=gpt-4.1&#10;model_api_key_env=OPENAI_API_KEY"></textarea>
             </div>
             <div class="pane output">
               <h2>Effective Policy</h2>

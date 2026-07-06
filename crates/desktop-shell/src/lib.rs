@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::env;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use workspace_engine::{
     Config, CurlModelTransport, MockModelAdapter, OpenAICompatibleAdapter, WorkspaceEngine,
     command_approval_prompt, patch_diff_text,
@@ -105,6 +106,34 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 "application/json",
                 &format!(
                     "{{\"policy\":\"{}\"}}",
+                    escape_json(&config.to_policy_text())
+                ),
+            )
+        }
+        ("GET", "/api/config-file") => {
+            let scope = required_param(&request, "scope")?;
+            let repo = request.param("repo").unwrap_or_default();
+            let path = config_path_for_scope(&scope, &repo)?;
+            let content = if path.exists() {
+                fs::read_to_string(&path).map_err(|error| error.to_string())?
+            } else {
+                String::new()
+            };
+            let config = Config::load_for_repository(if repo.is_empty() {
+                None
+            } else {
+                Some(Path::new(&repo))
+            })
+            .map_err(|error| error.to_string())?;
+            write_response(
+                stream,
+                200,
+                "application/json",
+                &format!(
+                    "{{\"path\":\"{}\",\"exists\":{},\"content\":\"{}\",\"effectivePolicy\":\"{}\"}}",
+                    escape_json(&path.to_string_lossy()),
+                    path.exists(),
+                    escape_json(&content),
                     escape_json(&config.to_policy_text())
                 ),
             )
@@ -361,8 +390,56 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
             )
         }
+        ("POST", "/api/config-file") => {
+            let form = parse_form(&request.body);
+            let scope = required_form(&form, "scope")?;
+            let repo = form.get("repo").cloned().unwrap_or_default();
+            let content = form.get("content").cloned().unwrap_or_default();
+            let path = config_path_for_scope(&scope, &repo)?;
+            save_config_file(&path, &content)?;
+            let config = Config::load_for_repository(if repo.is_empty() {
+                None
+            } else {
+                Some(Path::new(&repo))
+            })
+            .map_err(|error| error.to_string())?;
+            write_response(
+                stream,
+                200,
+                "application/json",
+                &format!(
+                    "{{\"path\":\"{}\",\"effectivePolicy\":\"{}\"}}",
+                    escape_json(&path.to_string_lossy()),
+                    escape_json(&config.to_policy_text())
+                ),
+            )
+        }
         _ => write_response(stream, 404, "application/json", &json_error("not found")),
     }
+}
+
+fn config_path_for_scope(scope: &str, repo: &str) -> Result<PathBuf, String> {
+    match scope {
+        "user" => {
+            let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
+            Ok(config.user_config_path())
+        }
+        "repo" => {
+            if repo.is_empty() {
+                return Err("repository is required for repository config".to_string());
+            }
+            Ok(Config::repository_config_path(repo))
+        }
+        _ => Err("scope must be user or repo".to_string()),
+    }
+}
+
+fn save_config_file(path: &Path, content: &str) -> Result<(), String> {
+    workspace_engine::ConfigOverlay::parse(content).map_err(|error| error.to_string())?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(path, content).map_err(|error| error.to_string())
 }
 
 fn update_config_overlay(
@@ -573,7 +650,9 @@ fn escape_json(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_form, percent_decode};
+    use super::{parse_form, percent_decode, save_config_file};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn decodes_forms() {
@@ -590,5 +669,35 @@ mod tests {
     #[test]
     fn percent_decodes_malformed_unicode_adjacent_escape_literally() {
         assert_eq!(percent_decode("%aé"), "%aé");
+    }
+
+    #[test]
+    fn saves_valid_config_file() {
+        let path = temp_path("valid").join("config").join("user.conf");
+        save_config_file(
+            &path,
+            "model_base_url=https://api.example.test\nmodel_name=test-model\n",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "model_base_url=https://api.example.test\nmodel_name=test-model\n"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_config_file_without_writing() {
+        let path = temp_path("invalid").join("config.conf");
+        let error = save_config_file(&path, "unknown_key=value\n").unwrap_err();
+        assert!(error.contains("Unknown config key"));
+        assert!(!path.exists());
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("damaian-desktop-shell-{name}-{stamp}"))
     }
 }
