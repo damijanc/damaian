@@ -76,6 +76,54 @@ impl PatchStore {
         Ok(rejected)
     }
 
+    pub fn mark_rejected_paths(
+        &self,
+        patch: &ProposedPatch,
+        rejected_paths: &[String],
+        rejected_by: &str,
+    ) -> Result<PathBuf> {
+        let known_paths = patch
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        let unknown = rejected_paths
+            .iter()
+            .find(|path| !known_paths.contains(&path.as_str()));
+        if let Some(path) = unknown {
+            return Err(ClientError::InvalidInput(format!(
+                "Selected patch file was not found: {path}"
+            )));
+        }
+        if rejected_paths.is_empty() {
+            return Err(ClientError::InvalidInput(
+                "No patch files selected for rejection".to_string(),
+            ));
+        }
+
+        let rejected = self.data_dir.join("patches").join("rejected").join(format!(
+            "{}-files-{}.dpatch",
+            patch.id,
+            create_id("reject")
+        ));
+        if let Some(parent) = rejected.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut content = serialize_patch(patch);
+        content.push_str(&format!(
+            "\nREJECTED_BY {}\n{}\nREJECTED_FILE_COUNT {}\n{}\n",
+            rejected_by.len(),
+            rejected_by,
+            rejected_paths.len().to_string().len(),
+            rejected_paths.len()
+        ));
+        for path in rejected_paths {
+            write_field(&mut content, "REJECTED_PATH", path);
+        }
+        fs::write(&rejected, content)?;
+        Ok(rejected)
+    }
+
     fn path_for(&self, patch_id: &str) -> PathBuf {
         self.data_dir
             .join("patches")
@@ -265,6 +313,29 @@ impl EditOrchestrator {
                 ("actor", "user".to_string()),
                 ("patchId", patch_id.to_string()),
                 ("rejectedBy", rejected_by.to_string()),
+                ("resourcePath", path.to_string_lossy().to_string()),
+            ],
+        )?;
+        Ok(path)
+    }
+
+    pub fn reject_stored_patch_files(
+        &self,
+        patch_id: &str,
+        rejected_paths: &[String],
+        rejected_by: &str,
+    ) -> Result<PathBuf> {
+        let patch = self.patch_store.load(patch_id)?;
+        let path = self
+            .patch_store
+            .mark_rejected_paths(&patch, rejected_paths, rejected_by)?;
+        self.audit_log.record(
+            "stored_patch_files_rejected",
+            &[
+                ("actor", "user".to_string()),
+                ("patchId", patch_id.to_string()),
+                ("rejectedBy", rejected_by.to_string()),
+                ("files", rejected_paths.join(",")),
                 ("resourcePath", path.to_string_lossy().to_string()),
             ],
         )?;
