@@ -15,6 +15,59 @@ function estimateTokens(text) {
   return Math.ceil(String(text).length / 4);
 }
 
+function promptPathCandidates(prompt) {
+  return String(prompt)
+    .split(/\s+/)
+    .map((part) =>
+      part
+        .trim()
+        .replace(/^[`"'()[\]{}<>,:;]+|[`"'()[\]{}<>,:;]+$/g, '')
+        .replace(/[.!?]+$/g, '')
+        .replaceAll('\\', '/')
+    )
+    .filter((candidate) => {
+      if (
+        !candidate ||
+        candidate.startsWith('/') ||
+        candidate.startsWith('http://') ||
+        candidate.startsWith('https://') ||
+        candidate.includes('../') ||
+        candidate === '..' ||
+        candidate.endsWith('/')
+      ) {
+        return false;
+      }
+      const name = candidate.split('/').at(-1) ?? '';
+      return candidate.includes('/') || name.includes('.');
+    });
+}
+
+function promptFileMentions(prompt, index) {
+  if (!index?.files) return [];
+
+  const exactPaths = new Map();
+  const basenameMatches = new Map();
+  for (const file of index.files) {
+    exactPaths.set(file.path.toLowerCase(), file.path);
+    const basename = file.path.split('/').at(-1).toLowerCase();
+    basenameMatches.set(basename, [...(basenameMatches.get(basename) ?? []), file.path]);
+  }
+
+  const mentioned = [];
+  const seen = new Set();
+  for (const candidate of promptPathCandidates(prompt)) {
+    const lower = candidate.toLowerCase();
+    const basename = lower.split('/').at(-1);
+    const matches = basenameMatches.get(basename) ?? [];
+    const resolved = exactPaths.get(lower) ?? (!candidate.includes('/') && matches.length === 1 ? matches[0] : undefined);
+    if (resolved && !seen.has(resolved)) {
+      seen.add(resolved);
+      mentioned.push(resolved);
+    }
+  }
+  return mentioned;
+}
+
 export class ContextManager {
   constructor({ fileAccess, scanner } = {}) {
     this.fileAccess = fileAccess;
@@ -62,7 +115,12 @@ export class ContextManager {
     addText('user_prompt', prompt);
     addText('session_summary', conversationSummary);
 
-    for (const explicitPath of explicitPaths) {
+    const requestedPaths = [...explicitPaths];
+    for (const path of promptFileMentions(prompt, index)) {
+      if (!requestedPaths.includes(path)) requestedPaths.push(path);
+    }
+
+    for (const explicitPath of requestedPaths) {
       await addFile(explicitPath, 'explicit_file');
     }
 

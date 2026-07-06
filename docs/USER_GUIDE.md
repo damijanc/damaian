@@ -10,7 +10,7 @@ This build is a developer preview. It is usable for local workflows, but it does
 2. Select `Choose` beside the `Repository` field.
 3. Pick the local Git repository or working folder you want Damaian to inspect.
 4. Select `Status` to confirm Damaian can inspect the repository.
-5. Select `VS Code` when you want to open the same folder in Visual Studio Code.
+5. Select the Visual Studio Code icon when you want to open the same folder in Visual Studio Code.
 
 You can also enter an absolute path manually:
 
@@ -28,13 +28,13 @@ If you switch folders, use `Status` to verify the new root before asking questio
 
 Damaian remembers the last selected working folder in local app storage and restores it when the app restarts. Launch-time defaults such as `DAMAIAN_REPO` are used only when no previous selection has been saved.
 
-Use `VS Code` in the sidebar to open the selected working folder in Visual Studio Code. Damaian keeps AI orchestration, context assembly, patch preview, command approval, settings, and audit logging in the app; normal code navigation and IDE work happen outside Damaian in Visual Studio Code.
+Use the Visual Studio Code icon in the conversation header to open the selected working folder in Visual Studio Code. Damaian keeps AI orchestration, context assembly, patch preview, command approval, settings, and audit logging in the app; normal code navigation and IDE work happen outside Damaian in Visual Studio Code.
 
 ## Chat
 
 Use the `Chat` tab to ask questions about the selected repository. Damaian retrieves relevant local files, redacts detected secrets, streams the answer, and shows the context files used for the response.
 
-For local testing without a model key, enter text in `Mock response` and select `Ask`. The app will run the same orchestration path but return the mock response instead of calling a model API.
+If you name a file in your prompt, such as `USER_GUIDE.md` or `docs/USER_GUIDE.md`, Damaian attempts to include that file in the model context. A filename without a directory must uniquely match one file in the selected repository.
 
 Use `New`, `Rename`, and `Delete` to manage project-scoped chat sessions. Selecting an existing session reloads its conversation and future questions continue with recent prior messages as context.
 
@@ -148,7 +148,7 @@ Damaian keeps the local app in control of important effects:
 
 If the app shows `Repository is required`, enter an absolute repository path in the sidebar.
 
-If model calls fail, use `Mock response` for local testing or confirm that `model_api_key_env` names an environment variable and that the variable is set before launching the app.
+If model calls fail, confirm that `model_api_key_env` names an environment variable and that the variable is set before launching the app.
 
 If a command is blocked, inspect the command proposal text. Update `command_allowlist` only for commands you trust in that repository.
 
