@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use workspace_engine::{
     ChatMessage, ChatTurnResult, Config, CurlModelTransport, MockModelAdapter,
-    OpenAICompatibleAdapter, Session, WorkspaceEngine, command_approval_prompt, patch_diff_text,
+    OpenAICompatibleAdapter, ProposedFilePatch, Session, WorkspaceEngine, command_approval_prompt,
+    patch_diff_text,
 };
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
@@ -320,9 +321,11 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 200,
                 "application/json",
                 &format!(
-                    "{{\"patchId\":\"{}\",\"diff\":\"{}\",\"contextFiles\":[{}]}}",
+                    "{{\"patchId\":\"{}\",\"summary\":\"{}\",\"diff\":\"{}\",\"files\":[{}],\"contextFiles\":[{}]}}",
                     escape_json(&result.patch.id),
+                    escape_json(&result.patch.summary),
                     escape_json(&patch_diff_text(&result.patch)),
+                    patch_files_json(&result.patch.files),
                     json_string_array(&result.context_files)
                 ),
             )
@@ -331,10 +334,14 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             let form = parse_form(&request.body);
             let repo = required_form(&form, "repo")?;
             let patch_id = required_form(&form, "patch_id")?;
+            let approved_paths = form
+                .get("paths")
+                .map(|value| parse_path_list(value))
+                .transpose()?;
             let engine = engine_for_repo(&repo)?;
             let result = engine
                 .edit_orchestrator
-                .apply_stored_patch(&repo, &patch_id, None, "desktop_user")
+                .apply_stored_patch(&repo, &patch_id, approved_paths.as_deref(), "desktop_user")
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
@@ -345,6 +352,28 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                     escape_json(&result.patch_id),
                     json_string_array(&result.applied_files),
                     result.warnings.len()
+                ),
+            )
+        }
+        ("POST", "/api/reject-patch-files") => {
+            let form = parse_form(&request.body);
+            let repo = required_form(&form, "repo")?;
+            let patch_id = required_form(&form, "patch_id")?;
+            let paths = parse_path_list(&required_form(&form, "paths")?)?;
+            let engine = engine_for_repo(&repo)?;
+            let path = engine
+                .edit_orchestrator
+                .reject_stored_patch_files(&patch_id, &paths, "desktop_user")
+                .map_err(|error| error.to_string())?;
+            write_response(
+                stream,
+                200,
+                "application/json",
+                &format!(
+                    "{{\"patchId\":\"{}\",\"rejectedFiles\":[{}],\"path\":\"{}\"}}",
+                    escape_json(&patch_id),
+                    json_string_array(&paths),
+                    escape_json(&path.to_string_lossy())
                 ),
             )
         }
@@ -747,6 +776,20 @@ fn required_form(form: &HashMap<String, String>, name: &str) -> Result<String, S
         .ok_or_else(|| format!("missing form field: {name}"))
 }
 
+fn parse_path_list(value: &str) -> Result<Vec<String>, String> {
+    let paths = value
+        .split(['\n', '|'])
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(|path| path.to_string())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        Err("at least one patch file must be selected".to_string())
+    } else {
+        Ok(paths)
+    }
+}
+
 fn parse_form(body: &str) -> HashMap<String, String> {
     body.split('&')
         .filter(|part| !part.is_empty())
@@ -836,6 +879,26 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         escape_json(&result.model_run.run_id),
         result.model_run.incomplete
     )
+}
+
+fn patch_files_json(files: &[ProposedFilePatch]) -> String {
+    files
+        .iter()
+        .map(|file| {
+            format!(
+                "{{\"path\":\"{}\",\"status\":\"{}\",\"baseHash\":{},\"newHash\":\"{}\",\"diff\":\"{}\"}}",
+                escape_json(&file.path),
+                escape_json(&file.status),
+                file.base_hash
+                    .as_ref()
+                    .map(|hash| format!("\"{}\"", escape_json(hash)))
+                    .unwrap_or_else(|| "null".to_string()),
+                escape_json(&file.new_hash),
+                escape_json(&file.diff)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn sessions_json(sessions: &[Session]) -> String {
@@ -928,7 +991,7 @@ fn escape_json(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_form, percent_decode, save_config_file, validate_working_folder,
+        parse_form, parse_path_list, percent_decode, save_config_file, validate_working_folder,
         validate_workspace_path,
     };
     use std::fs;
@@ -939,6 +1002,15 @@ mod tests {
         let form = parse_form("repo=%2Ftmp%2Fapp&prompt=hello+world");
         assert_eq!(form.get("repo").unwrap(), "/tmp/app");
         assert_eq!(form.get("prompt").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn parses_selected_patch_paths() {
+        assert_eq!(
+            parse_path_list("src/a.js\nsrc/b.js|src/c.js").unwrap(),
+            vec!["src/a.js", "src/b.js", "src/c.js"]
+        );
+        assert!(parse_path_list(" \n ").is_err());
     }
 
     #[test]

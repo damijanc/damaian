@@ -47,10 +47,11 @@ Use the `Edits` tab to preview and apply generated file changes.
 1. Enter a short request in `Describe the change`.
 2. Paste a model edit envelope into the larger text area.
 3. Select `Preview` to generate a diff.
-4. Review the diff.
-5. Select `Apply` to write the approved files, or `Reject` to record the rejection.
+4. Review each file diff.
+5. Keep checked only the files you want to act on.
+6. Select `Apply Selected` to write those files, or `Reject Selected` to record selected files as rejected without changing the workspace.
 
-Damaian checks file hashes before applying a stored patch. If a target file changed after preview, the patch is blocked instead of overwriting newer local work.
+Damaian checks file hashes before applying a stored patch. If a target file changed after preview, that file is blocked instead of overwriting newer local work.
 
 ## Commands
 
@@ -79,6 +80,36 @@ Common keys:
 - `model_api_key_env`: Environment variable name used for the API key.
 
 Repository-scoped settings are stored at `.damaian/config.conf` inside the selected repository. User-scoped settings apply across repositories.
+
+## Model Providers and API Keys
+
+Damaian uses OpenAI-compatible chat APIs. Configure the provider URL and model in Settings, but do not paste the API key into the configuration file.
+
+`model_api_key_env` must be the name of an environment variable that contains the key. It is not the key itself.
+
+Example DeepSeek configuration:
+
+```text
+model_provider=deepseek
+model_name=deepseek-v4-flash
+model_base_url=https://api.deepseek.com
+model_api_key_env=DEEPSEEK_API_KEY
+```
+
+Launch the app from a shell where that environment variable is set:
+
+```sh
+export DEEPSEEK_API_KEY="your-deepseek-api-key"
+npm run desktop:dev
+```
+
+Or set it for one launch:
+
+```sh
+DEEPSEEK_API_KEY="your-deepseek-api-key" npm run desktop:dev
+```
+
+The same pattern applies to OpenAI or any OpenAI-compatible provider. For example, use `model_api_key_env=OPENAI_API_KEY` and set `OPENAI_API_KEY` before launching.
 
 ## Local Data
 
@@ -117,7 +148,7 @@ Damaian keeps the local app in control of important effects:
 
 If the app shows `Repository is required`, enter an absolute repository path in the sidebar.
 
-If model calls fail, use `Mock response` for local testing or confirm that the environment variable named by `model_api_key_env` is set before launching the app.
+If model calls fail, use `Mock response` for local testing or confirm that `model_api_key_env` names an environment variable and that the variable is set before launching the app.
 
 If a command is blocked, inspect the command proposal text. Update `command_allowlist` only for commands you trust in that repository.
 

@@ -147,17 +147,33 @@ impl PatchEngine {
         let selected_paths = approved_paths
             .map(|paths| paths.to_vec())
             .unwrap_or_else(|| patch.files.iter().map(|file| file.path.clone()).collect());
+        if selected_paths.is_empty() {
+            return Err(ClientError::InvalidInput(
+                "No patch files selected for apply".to_string(),
+            ));
+        }
+        let patch_paths = patch
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        if let Some(path) = selected_paths
+            .iter()
+            .find(|path| !patch_paths.contains(&path.as_str()))
+        {
+            return Err(ClientError::InvalidInput(format!(
+                "Selected patch file was not found: {path}"
+            )));
+        }
         let selected = patch
             .files
             .iter()
             .filter(|file| selected_paths.contains(&file.path))
             .collect::<Vec<_>>();
         if selected.is_empty() {
-            return Ok(PatchApplyResult {
-                patch_id: patch.id.clone(),
-                applied_files: Vec::new(),
-                warnings: Vec::new(),
-            });
+            return Err(ClientError::InvalidInput(
+                "Selected patch files were not found in the stored patch".to_string(),
+            ));
         }
 
         let mut prepared = Vec::new();
@@ -169,9 +185,10 @@ impl PatchEngine {
             let current_content = read_existing(&target.absolute_path)?;
             let current_hash = current_content.as_ref().map(sha256);
             if current_hash != file.base_hash {
-                return Err(ClientError::PatchConflict(
-                    "Target file changed after patch generation".to_string(),
-                ));
+                return Err(ClientError::PatchConflict(format!(
+                    "Target file changed after patch generation: {}",
+                    file.path
+                )));
             }
 
             let findings = self.scanner.scan(&file.new_content);

@@ -1,6 +1,7 @@
 const $ = (id) => document.getElementById(id);
 
 let currentPatchId = "";
+let currentPatchFiles = [];
 let currentCommandProposalId = "";
 let currentSessionId = "";
 
@@ -270,6 +271,78 @@ function renderContextFiles(files = []) {
   });
 }
 
+function renderPatchFiles() {
+  const container = $("diff-output");
+  container.innerHTML = "";
+  if (!currentPatchFiles.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty-state";
+    empty.textContent = "No patch preview loaded.";
+    container.append(empty);
+    return;
+  }
+
+  currentPatchFiles.forEach((file) => {
+    const card = document.createElement("article");
+    card.className = `diff-card ${file.state}`;
+
+    const header = document.createElement("div");
+    header.className = "diff-card-header";
+
+    const label = document.createElement("label");
+    label.className = "diff-file-select";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = file.selected;
+    checkbox.disabled = file.state !== "pending";
+    checkbox.addEventListener("change", () => {
+      file.selected = checkbox.checked;
+    });
+    const name = document.createElement("span");
+    name.textContent = file.path;
+    label.append(checkbox, name);
+
+    const meta = document.createElement("span");
+    meta.className = "diff-state";
+    meta.textContent = file.state === "pending" ? file.status : file.state;
+
+    const pre = document.createElement("pre");
+    pre.className = "diff-pre";
+    pre.textContent = file.diff;
+
+    header.append(label, meta);
+    card.append(header, pre);
+    container.append(card);
+  });
+}
+
+function setPatchFiles(files = []) {
+  currentPatchFiles = files.map((file) => ({
+    path: file.path,
+    status: file.status,
+    diff: file.diff,
+    selected: true,
+    state: "pending",
+  }));
+  renderPatchFiles();
+}
+
+function selectedPendingPatchPaths() {
+  return currentPatchFiles
+    .filter((file) => file.state === "pending" && file.selected)
+    .map((file) => file.path);
+}
+
+function markPatchFiles(paths, state) {
+  currentPatchFiles.forEach((file) => {
+    if (paths.includes(file.path)) {
+      file.state = state;
+      file.selected = false;
+    }
+  });
+  renderPatchFiles();
+}
+
 async function loadSessions(preferredSessionId = "", reloadSelected = false) {
   const repoPath = repo();
   if (!repoPath) {
@@ -535,7 +608,7 @@ $("propose-edit-btn").addEventListener("click", async () => {
       }),
     );
     currentPatchId = payload.patchId;
-    $("diff-output").textContent = payload.diff;
+    setPatchFiles(payload.files || []);
     toast(`Patch ${payload.patchId}`);
   } catch (error) {
     toast(error.message);
@@ -545,11 +618,14 @@ $("propose-edit-btn").addEventListener("click", async () => {
 $("apply-patch-btn").addEventListener("click", async () => {
   try {
     if (!currentPatchId) throw new Error("No patch selected");
+    const paths = selectedPendingPatchPaths();
+    if (!paths.length) throw new Error("No pending patch files selected");
     const payload = await api(
       "/api/apply-patch",
-      form({ repo: requireRepo(), patch_id: currentPatchId }),
+      form({ repo: requireRepo(), patch_id: currentPatchId, paths: paths.join("\n") }),
     );
-    $("diff-output").textContent = JSON.stringify(payload, null, 2);
+    markPatchFiles(payload.appliedFiles || [], "applied");
+    toast(`Applied ${payload.appliedFiles.length} file(s)`);
   } catch (error) {
     toast(error.message);
   }
@@ -558,11 +634,14 @@ $("apply-patch-btn").addEventListener("click", async () => {
 $("reject-patch-btn").addEventListener("click", async () => {
   try {
     if (!currentPatchId) throw new Error("No patch selected");
+    const paths = selectedPendingPatchPaths();
+    if (!paths.length) throw new Error("No pending patch files selected");
     const payload = await api(
-      "/api/reject-patch",
-      form({ repo: requireRepo(), patch_id: currentPatchId }),
+      "/api/reject-patch-files",
+      form({ repo: requireRepo(), patch_id: currentPatchId, paths: paths.join("\n") }),
     );
-    $("diff-output").textContent = JSON.stringify(payload, null, 2);
+    markPatchFiles(payload.rejectedFiles || [], "rejected");
+    toast(`Rejected ${payload.rejectedFiles.length} file(s)`);
   } catch (error) {
     toast(error.message);
   }

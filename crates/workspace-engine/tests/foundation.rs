@@ -477,6 +477,78 @@ fn proposes_edit_stores_patch_and_applies_selected_files() {
 }
 
 #[test]
+fn rejects_selected_patch_files_without_modifying_workspace() {
+    let repo = temp_dir("edit-reject-selected");
+    write_fixture(&repo, "src/a.js", "export const a = 1;\n");
+    write_fixture(&repo, "src/b.js", "export const b = 1;\n");
+    let config = test_config(&repo);
+    let engine = WorkspaceEngine::new(config);
+    let response = "DAMAIAN_EDIT_V1\nSUMMARY: Update constants\nFILE: src/a.js\nSTATUS: modified\nCONTENT:\nexport const a = 2;\nEND_FILE\nFILE: src/b.js\nSTATUS: modified\nCONTENT:\nexport const b = 2;\nEND_FILE\nEND_PATCH\n";
+    let mut adapter = MockModelAdapter::new(response);
+    let proposal = engine
+        .edit_orchestrator
+        .propose_edit(&repo, "Update constants", &[], &mut adapter)
+        .unwrap();
+
+    let rejected = vec!["src/b.js".to_string()];
+    let rejected_path = engine
+        .edit_orchestrator
+        .reject_stored_patch_files(&proposal.patch.id, &rejected, "tester")
+        .unwrap();
+    let rejection_record = fs::read_to_string(rejected_path).unwrap();
+    assert!(rejection_record.contains("REJECTED_PATH"));
+    assert!(rejection_record.contains("src/b.js"));
+    assert_eq!(
+        fs::read_to_string(repo.join("src/a.js")).unwrap(),
+        "export const a = 1;\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("src/b.js")).unwrap(),
+        "export const b = 1;\n"
+    );
+
+    let approved = vec!["src/a.js".to_string()];
+    let result = engine
+        .edit_orchestrator
+        .apply_stored_patch(&repo, &proposal.patch.id, Some(&approved), "tester")
+        .unwrap();
+    assert_eq!(result.applied_files, vec!["src/a.js"]);
+    assert_eq!(
+        fs::read_to_string(repo.join("src/a.js")).unwrap(),
+        "export const a = 2;\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("src/b.js")).unwrap(),
+        "export const b = 1;\n"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn rejects_unknown_selected_patch_file() {
+    let repo = temp_dir("edit-unknown-selected");
+    write_fixture(&repo, "src/app.js", "export const value = 1;\n");
+    let config = test_config(&repo);
+    let engine = WorkspaceEngine::new(config);
+    let response = "DAMAIAN_EDIT_V1\nSUMMARY: Update value\nFILE: src/app.js\nSTATUS: modified\nCONTENT:\nexport const value = 2;\nEND_FILE\nEND_PATCH\n";
+    let mut adapter = MockModelAdapter::new(response);
+    let proposal = engine
+        .edit_orchestrator
+        .propose_edit(&repo, "Update value", &[], &mut adapter)
+        .unwrap();
+    let approved = vec!["src/app.js".to_string(), "src/missing.js".to_string()];
+
+    let error = engine
+        .edit_orchestrator
+        .apply_stored_patch(&repo, &proposal.patch.id, Some(&approved), "tester")
+        .unwrap_err();
+    assert!(matches!(error, ClientError::InvalidInput(_)));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
 fn rejects_stored_patch_without_modifying_workspace() {
     let repo = temp_dir("edit-reject");
     write_fixture(&repo, "src/app.js", "export const value = 1;\n");
