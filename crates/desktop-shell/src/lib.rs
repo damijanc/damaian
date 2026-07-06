@@ -6,8 +6,8 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use workspace_engine::{
-    Config, CurlModelTransport, MockModelAdapter, OpenAICompatibleAdapter, WorkspaceEngine,
-    command_approval_prompt, patch_diff_text,
+    ChatMessage, ChatTurnResult, Config, CurlModelTransport, MockModelAdapter,
+    OpenAICompatibleAdapter, Session, WorkspaceEngine, command_approval_prompt, patch_diff_text,
 };
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
@@ -170,6 +170,107 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 ),
             )
         }
+        ("GET", "/api/sessions") => {
+            let repo = required_param(&request, "repo")?;
+            let engine = engine_for_repo(&repo)?;
+            let repository_id = engine
+                .indexer
+                .repository_id_for_path(&repo)
+                .map_err(|error| error.to_string())?;
+            let sessions = engine
+                .session_store
+                .list_sessions(Some(&repository_id))
+                .map_err(|error| error.to_string())?;
+            write_response(
+                stream,
+                200,
+                "application/json",
+                &format!("{{\"sessions\":[{}]}}", sessions_json(&sessions)),
+            )
+        }
+        ("GET", "/api/session") => {
+            let session_id = required_param(&request, "session_id")?;
+            let engine = default_engine()?;
+            let Some(session) = engine
+                .session_store
+                .read_session(&session_id)
+                .map_err(|error| error.to_string())?
+            else {
+                return Err(format!("Unknown session: {session_id}"));
+            };
+            let messages = engine
+                .session_store
+                .read_messages(&session_id)
+                .map_err(|error| error.to_string())?;
+            write_response(
+                stream,
+                200,
+                "application/json",
+                &format!(
+                    "{{\"session\":{},\"messages\":[{}]}}",
+                    session_json(&session),
+                    messages_json(&messages)
+                ),
+            )
+        }
+        ("POST", "/api/session-create") => {
+            let form = parse_form(&request.body);
+            let repo = required_form(&form, "repo")?;
+            let title = form
+                .get("title")
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| "New session".to_string());
+            let engine = engine_for_repo(&repo)?;
+            let repository_id = engine
+                .indexer
+                .repository_id_for_path(&repo)
+                .map_err(|error| error.to_string())?;
+            let session = engine
+                .session_store
+                .create_session(&repository_id, &title)
+                .map_err(|error| error.to_string())?;
+            write_response(
+                stream,
+                200,
+                "application/json",
+                &format!("{{\"session\":{}}}", session_json(&session)),
+            )
+        }
+        ("POST", "/api/session-rename") => {
+            let form = parse_form(&request.body);
+            let session_id = required_form(&form, "session_id")?;
+            let title = required_form(&form, "title")?;
+            let engine = default_engine()?;
+            let session = engine
+                .session_store
+                .rename_session(&session_id, &title)
+                .map_err(|error| error.to_string())?;
+            write_response(
+                stream,
+                200,
+                "application/json",
+                &format!("{{\"session\":{}}}", session_json(&session)),
+            )
+        }
+        ("POST", "/api/session-delete") => {
+            let form = parse_form(&request.body);
+            let session_id = required_form(&form, "session_id")?;
+            let engine = default_engine()?;
+            engine
+                .session_store
+                .delete_session(&session_id)
+                .map_err(|error| error.to_string())?;
+            write_response(
+                stream,
+                200,
+                "application/json",
+                &format!(
+                    "{{\"sessionId\":\"{}\",\"status\":\"deleted\"}}",
+                    escape_json(&session_id)
+                ),
+            )
+        }
         ("POST", "/api/open-vscode") => {
             let form = parse_form(&request.body);
             let repo = required_form(&form, "repo")?;
@@ -181,46 +282,27 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
             )
         }
-        ("POST", "/api/ask") => {
+        ("POST", "/api/open-vscode-file") => {
             let form = parse_form(&request.body);
             let repo = required_form(&form, "repo")?;
-            let prompt = required_form(&form, "prompt")?;
-            let engine = engine_for_repo(&repo)?;
-            let mut streamed = String::new();
-            let mut on_token = |token: &str| streamed.push_str(token);
-            let result =
-                if let Some(mock) = form.get("mock_response").filter(|value| !value.is_empty()) {
-                    let mut adapter = MockModelAdapter::new(mock.clone());
-                    engine
-                        .chat_orchestrator
-                        .ask(&repo, &prompt, &[], &mut adapter, &mut on_token)
-                        .map_err(|error| error.to_string())?
-                } else {
-                    let api_key = env::var(&engine.config.model_api_key_env).map_err(|_| {
-                        format!(
-                            "{} is required, or provide a mock response",
-                            engine.config.model_api_key_env
-                        )
-                    })?;
-                    let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
-                    let mut adapter =
-                        OpenAICompatibleAdapter::new(&engine.config.model_name, transport);
-                    engine
-                        .chat_orchestrator
-                        .ask(&repo, &prompt, &[], &mut adapter, &mut on_token)
-                        .map_err(|error| error.to_string())?
-                };
+            let path = required_form(&form, "path")?;
+            let opened_path = open_workspace_path_in_vscode(&repo, &path)?;
             write_response(
                 stream,
                 200,
                 "application/json",
                 &format!(
-                    "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\"}}",
-                    escape_json(&result.response),
-                    json_string_array(&result.context_files),
-                    escape_json(&result.session.id)
+                    "{{\"path\":\"{}\"}}",
+                    escape_json(&opened_path.to_string_lossy())
                 ),
             )
+        }
+        ("POST", "/api/ask-stream") => handle_ask_stream(stream, &request),
+        ("POST", "/api/ask") => {
+            let form = parse_form(&request.body);
+            let mut on_token = |_token: &str| {};
+            let result = run_chat_request(&form, &mut on_token)?;
+            write_response(stream, 200, "application/json", &chat_result_json(&result))
         }
         ("POST", "/api/propose-edit") => {
             let form = parse_form(&request.body);
@@ -401,6 +483,71 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
     }
 }
 
+fn handle_ask_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    write_event_stream_headers(stream)?;
+
+    let mut write_error = None;
+    let result = {
+        let mut on_token = |token: &str| {
+            if write_error.is_none() {
+                let data = format!("{{\"token\":\"{}\"}}", escape_json(token));
+                if let Err(error) = write_sse_event(stream, "token", &data) {
+                    write_error = Some(error);
+                }
+            }
+        };
+        run_chat_request(&form, &mut on_token)
+    };
+
+    if let Some(error) = write_error {
+        return Err(error);
+    }
+
+    match result {
+        Ok(result) => write_sse_event(stream, "done", &chat_result_json(&result)),
+        Err(error) => write_sse_event(stream, "error", &json_error(&friendly_chat_error(&error))),
+    }
+}
+
+fn run_chat_request(
+    form: &HashMap<String, String>,
+    on_token: &mut dyn FnMut(&str),
+) -> Result<ChatTurnResult, String> {
+    let repo = required_form(form, "repo")?;
+    let prompt = required_form(form, "prompt")?;
+    let session_id = form
+        .get("session_id")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty());
+    let engine = engine_for_repo(&repo)?;
+    if let Some(mock) = form.get("mock_response").filter(|value| !value.is_empty()) {
+        let mut adapter = MockModelAdapter::new(mock.clone());
+        return engine
+            .chat_orchestrator
+            .ask_with_session(&repo, &prompt, &[], session_id, &mut adapter, on_token)
+            .map_err(|error| error.to_string());
+    }
+
+    let api_key = env::var(&engine.config.model_api_key_env).map_err(|_| {
+        format!(
+            "{} is required, or provide a mock response",
+            engine.config.model_api_key_env
+        )
+    })?;
+    let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
+    let mut adapter = OpenAICompatibleAdapter::new(&engine.config.model_name, transport);
+    engine
+        .chat_orchestrator
+        .ask_with_session(&repo, &prompt, &[], session_id, &mut adapter, on_token)
+        .map_err(|error| error.to_string())
+}
+
+fn default_engine() -> Result<WorkspaceEngine, String> {
+    let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
+    Ok(WorkspaceEngine::new(config))
+}
+
 fn config_path_for_scope(scope: &str, repo: &str) -> Result<PathBuf, String> {
     match scope {
         "user" => {
@@ -431,11 +578,27 @@ fn open_in_vscode(repo: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn open_workspace_path_in_vscode(repo: &str, relative_path: &str) -> Result<PathBuf, String> {
+    let path = validate_workspace_path(repo, relative_path)?;
+    launch_vscode(&path)?;
+    Ok(path)
+}
+
 fn validate_working_folder(repo: &str) -> Result<PathBuf, String> {
     let path = fs::canonicalize(repo)
         .map_err(|error| format!("working folder does not exist: {error}"))?;
     if !path.is_dir() {
         return Err("working folder must be a directory".to_string());
+    }
+    Ok(path)
+}
+
+fn validate_workspace_path(repo: &str, relative_path: &str) -> Result<PathBuf, String> {
+    let root = validate_working_folder(repo)?;
+    let path = fs::canonicalize(root.join(relative_path))
+        .map_err(|error| format!("workspace path does not exist: {error}"))?;
+    if !path.starts_with(&root) {
+        return Err("workspace path must stay inside the selected repository".to_string());
     }
     Ok(path)
 }
@@ -648,6 +811,90 @@ fn write_response(
         .map_err(|error| error.to_string())
 }
 
+fn write_event_stream_headers(stream: &mut TcpStream) -> Result<(), String> {
+    let response = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-store\r\naccess-control-allow-origin: *\r\nconnection: close\r\n\r\n";
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| error.to_string())
+}
+
+fn write_sse_event(stream: &mut TcpStream, event: &str, data: &str) -> Result<(), String> {
+    stream
+        .write_all(format!("event: {event}\ndata: {data}\n\n").as_bytes())
+        .and_then(|_| stream.flush())
+        .map_err(|error| error.to_string())
+}
+
+fn chat_result_json(result: &ChatTurnResult) -> String {
+    format!(
+        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{}}}",
+        escape_json(&result.response),
+        json_string_array(&result.context_files),
+        escape_json(&result.session.id),
+        escape_json(&result.task.id),
+        result.task.status.as_str(),
+        escape_json(&result.model_run.run_id),
+        result.model_run.incomplete
+    )
+}
+
+fn sessions_json(sessions: &[Session]) -> String {
+    sessions
+        .iter()
+        .map(session_json)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn session_json(session: &Session) -> String {
+    format!(
+        "{{\"id\":\"{}\",\"repositoryId\":\"{}\",\"title\":\"{}\",\"createdAtMs\":{},\"updatedAtMs\":{},\"summary\":\"{}\"}}",
+        escape_json(&session.id),
+        escape_json(&session.repository_id),
+        escape_json(&session.title),
+        session.created_at_ms,
+        session.updated_at_ms,
+        escape_json(&session.summary)
+    )
+}
+
+fn messages_json(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .map(message_json)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn message_json(message: &ChatMessage) -> String {
+    format!(
+        "{{\"id\":\"{}\",\"sessionId\":\"{}\",\"taskId\":{},\"role\":\"{}\",\"content\":\"{}\",\"createdAtMs\":{}}}",
+        escape_json(&message.id),
+        escape_json(&message.session_id),
+        message
+            .task_id
+            .as_ref()
+            .map(|value| format!("\"{}\"", escape_json(value)))
+            .unwrap_or_else(|| "null".to_string()),
+        escape_json(&message.role),
+        escape_json(&message.content),
+        message.created_at_ms
+    )
+}
+
+fn friendly_chat_error(error: &str) -> String {
+    let lower = error.to_lowercase();
+    if lower.contains("rate limit") || lower.contains("429") {
+        "Model provider rate limit. Wait for the provider retry window, then try again.".to_string()
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        "Model provider request timed out. Try again, or lower the context size.".to_string()
+    } else if lower.contains("connection") || lower.contains("could not resolve") {
+        "Model provider network request failed. Check connectivity and provider URL.".to_string()
+    } else {
+        error.to_string()
+    }
+}
+
 fn json_error(message: &str) -> String {
     format!("{{\"error\":\"{}\"}}", escape_json(message))
 }
@@ -680,7 +927,10 @@ fn escape_json(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_form, percent_decode, save_config_file, validate_working_folder};
+    use super::{
+        parse_form, percent_decode, save_config_file, validate_working_folder,
+        validate_workspace_path,
+    };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -747,6 +997,36 @@ mod tests {
         let path = temp_path("missing-folder");
         let error = validate_working_folder(path.to_str().unwrap()).unwrap_err();
         assert!(error.contains("working folder does not exist"));
+    }
+
+    #[test]
+    fn validates_workspace_path_inside_repo() {
+        let repo = temp_path("workspace-path");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let file = repo.join("src").join("main.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+        assert_eq!(
+            validate_workspace_path(repo.to_str().unwrap(), "src/main.rs").unwrap(),
+            fs::canonicalize(file).unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_workspace_path_outside_repo() {
+        let repo = temp_path("workspace-traversal");
+        fs::create_dir_all(&repo).unwrap();
+        let outside = repo.with_file_name(format!(
+            "{}-outside",
+            repo.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&outside, "secret").unwrap();
+        let relative = format!("../{}", outside.file_name().unwrap().to_string_lossy());
+        let error = validate_workspace_path(repo.to_str().unwrap(), &relative).unwrap_err();
+        assert_eq!(
+            error,
+            "workspace path must stay inside the selected repository"
+        );
+        fs::remove_file(outside).unwrap();
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {

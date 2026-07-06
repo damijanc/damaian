@@ -147,6 +147,64 @@ impl SessionStore {
         Ok(message)
     }
 
+    pub fn list_sessions(&self, repository_id: Option<&str>) -> Result<Vec<Session>> {
+        let sessions_dir = self.data_dir.join("sessions");
+        let Ok(entries) = fs::read_dir(sessions_dir) else {
+            return Ok(Vec::new());
+        };
+        let mut sessions = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let content = fs::read_to_string(entry.path())?;
+            if let Some(session) = parse_session_log(&content) {
+                if repository_id
+                    .map(|id| id == session.repository_id.as_str())
+                    .unwrap_or(true)
+                {
+                    sessions.push(session);
+                }
+            }
+        }
+        sessions.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then(left.title.cmp(&right.title))
+        });
+        Ok(sessions)
+    }
+
+    pub fn read_session(&self, session_id: &str) -> Result<Option<Session>> {
+        let path = self.session_log_path(session_id);
+        let Ok(content) = fs::read_to_string(path) else {
+            return Ok(None);
+        };
+        Ok(parse_session_log(&content))
+    }
+
+    pub fn rename_session(&self, session_id: &str, title: &str) -> Result<Session> {
+        let Some(mut session) = self.read_session(session_id)? else {
+            return Err(crate::error::ClientError::InvalidInput(format!(
+                "Unknown session: {session_id}"
+            )));
+        };
+        session.title = title.to_string();
+        session.updated_at_ms = now_millis();
+        self.append_session_event(session_id, "session_renamed", &session_json(&session))?;
+        Ok(session)
+    }
+
+    pub fn delete_session(&self, session_id: &str) -> Result<()> {
+        let path = self.session_log_path(session_id);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
     pub fn read_messages(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
         let path = self.session_log_path(session_id);
         let Ok(content) = fs::read_to_string(path) else {
@@ -230,6 +288,31 @@ fn message_json(message: &ChatMessage) -> String {
         escape_json(&message.content),
         message.created_at_ms
     )
+}
+
+fn parse_session_log(content: &str) -> Option<Session> {
+    let mut session = None;
+    for line in content.lines() {
+        if line.contains("\"eventType\":\"session_created\"")
+            || line.contains("\"eventType\":\"session_renamed\"")
+        {
+            session = parse_session_event(line);
+        }
+    }
+    session
+}
+
+fn parse_session_event(line: &str) -> Option<Session> {
+    let payload_start = line.find("\"payload\":")? + "\"payload\":".len();
+    let payload = &line[payload_start..line.len().checked_sub(1)?];
+    Some(Session {
+        id: json_string_field(payload, "id")?,
+        repository_id: json_string_field(payload, "repositoryId")?,
+        title: json_string_field(payload, "title")?,
+        created_at_ms: json_number_field(payload, "createdAtMs")?,
+        updated_at_ms: json_number_field(payload, "updatedAtMs")?,
+        summary: json_string_field(payload, "summary").unwrap_or_default(),
+    })
 }
 
 fn parse_message_event(line: &str) -> Option<ChatMessage> {

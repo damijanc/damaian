@@ -2,6 +2,7 @@ const $ = (id) => document.getElementById(id);
 
 let currentPatchId = "";
 let currentCommandProposalId = "";
+let currentSessionId = "";
 
 const localApiOrigin = "http://127.0.0.1:4765";
 const lastRepoStorageKey = "damaian:lastRepository";
@@ -58,11 +59,22 @@ function setRepoState(message) {
   $("repo-state").textContent = message;
 }
 
+function lastSessionStorageKey(repoPath = repo()) {
+  return `damaian:lastSession:${repoPath}`;
+}
+
 function setRepository(value, persist = true) {
   $("repo").value = value;
   setRepoState(value ? "Repository selected" : "No repository selected");
   if (persist && value) {
     localStorage.setItem(lastRepoStorageKey, value);
+  }
+  currentSessionId = "";
+  if (value) {
+    void loadSessions("", true).catch(() => {});
+  } else {
+    clearSessionList();
+    clearChat();
   }
 }
 
@@ -104,6 +116,253 @@ async function saveConfigFile() {
   return payload;
 }
 
+function clearSessionList() {
+  $("session-select").innerHTML = '<option value="">New session</option>';
+  currentSessionId = "";
+}
+
+function clearChat() {
+  $("chat-log").innerHTML = "";
+  $("chat-context").innerHTML = "";
+  setChatStatus("Idle");
+}
+
+function setChatStatus(message, state = "") {
+  const el = $("chat-status");
+  el.textContent = message;
+  el.dataset.state = state;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function renderInlineMarkdown(value) {
+  return escapeHtml(value).replace(/`([^`]+)`/g, "<code>$1</code>");
+}
+
+function renderMarkdown(markdown) {
+  const lines = String(markdown || "").split(/\r?\n/);
+  let html = "";
+  let paragraph = [];
+  let listOpen = false;
+  let codeOpen = false;
+  let codeLines = [];
+  let codeLanguage = "";
+
+  const closeParagraph = () => {
+    if (!paragraph.length) return;
+    html += `<p>${paragraph.map(renderInlineMarkdown).join("<br>")}</p>`;
+    paragraph = [];
+  };
+  const closeList = () => {
+    if (!listOpen) return;
+    html += "</ul>";
+    listOpen = false;
+  };
+  const closeCode = () => {
+    const languageClass = codeLanguage ? ` class="language-${escapeHtml(codeLanguage)}"` : "";
+    html += `<pre><code${languageClass}>${escapeHtml(codeLines.join("\n"))}</code></pre>`;
+    codeLines = [];
+    codeLanguage = "";
+    codeOpen = false;
+  };
+
+  for (const line of lines) {
+    if (line.startsWith("```")) {
+      if (codeOpen) {
+        closeCode();
+      } else {
+        closeParagraph();
+        closeList();
+        codeOpen = true;
+        codeLanguage = line.slice(3).trim().replace(/[^a-z0-9_-]/gi, "");
+      }
+      continue;
+    }
+    if (codeOpen) {
+      codeLines.push(line);
+      continue;
+    }
+    const trimmed = line.trim();
+    if (!trimmed) {
+      closeParagraph();
+      closeList();
+      continue;
+    }
+    const heading = /^(#{1,4})\s+(.+)$/.exec(trimmed);
+    if (heading) {
+      closeParagraph();
+      closeList();
+      const level = Math.min(heading[1].length + 2, 5);
+      html += `<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`;
+      continue;
+    }
+    const bullet = /^[-*]\s+(.+)$/.exec(trimmed);
+    if (bullet) {
+      closeParagraph();
+      if (!listOpen) {
+        html += "<ul>";
+        listOpen = true;
+      }
+      html += `<li>${renderInlineMarkdown(bullet[1])}</li>`;
+      continue;
+    }
+    paragraph.push(line);
+  }
+
+  if (codeOpen) closeCode();
+  closeParagraph();
+  closeList();
+  return html;
+}
+
+function appendChatMessage(role, content) {
+  const message = document.createElement("article");
+  message.className = `message ${role}`;
+
+  const label = document.createElement("div");
+  label.className = "message-role";
+  label.textContent = role === "assistant" ? "Assistant" : role === "user" ? "You" : "System";
+
+  const body = document.createElement("div");
+  body.className = "message-body";
+  body.innerHTML = renderMarkdown(content);
+
+  message.append(label, body);
+  $("chat-log").append(message);
+  $("chat-log").scrollTop = $("chat-log").scrollHeight;
+  return { message, body };
+}
+
+function updateChatMessage(target, content) {
+  target.body.innerHTML = renderMarkdown(content);
+  $("chat-log").scrollTop = $("chat-log").scrollHeight;
+}
+
+function renderMessages(messages) {
+  $("chat-log").innerHTML = "";
+  messages.forEach((message) => appendChatMessage(message.role, message.content));
+}
+
+function renderContextFiles(files = []) {
+  const container = $("chat-context");
+  container.innerHTML = "";
+  files.forEach((path) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "context-file";
+    button.textContent = path;
+    button.title = "Open in Visual Studio Code";
+    button.addEventListener("click", async () => {
+      try {
+        const payload = await api("/api/open-vscode-file", form({ repo: requireRepo(), path }));
+        toast(`Opened ${payload.path}`);
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+    container.append(button);
+  });
+}
+
+async function loadSessions(preferredSessionId = "", reloadSelected = false) {
+  const repoPath = repo();
+  if (!repoPath) {
+    clearSessionList();
+    return;
+  }
+  const payload = await api(`/api/sessions?repo=${encodeURIComponent(repoPath)}`);
+  const select = $("session-select");
+  const storedSessionId = localStorage.getItem(lastSessionStorageKey(repoPath)) || "";
+  const selectedSessionId = preferredSessionId || currentSessionId || storedSessionId;
+  select.innerHTML = '<option value="">New session</option>';
+  payload.sessions.forEach((session) => {
+    const option = document.createElement("option");
+    option.value = session.id;
+    option.textContent = session.title;
+    select.append(option);
+  });
+  currentSessionId = payload.sessions.some((session) => session.id === selectedSessionId)
+    ? selectedSessionId
+    : "";
+  select.value = currentSessionId;
+  if (currentSessionId) {
+    localStorage.setItem(lastSessionStorageKey(repoPath), currentSessionId);
+    if (reloadSelected) {
+      await loadSession(currentSessionId);
+    }
+  } else if (reloadSelected) {
+    clearChat();
+  }
+}
+
+async function loadSession(sessionId) {
+  if (!sessionId) {
+    currentSessionId = "";
+    localStorage.removeItem(lastSessionStorageKey());
+    clearChat();
+    return;
+  }
+  const payload = await api(`/api/session?session_id=${encodeURIComponent(sessionId)}`);
+  currentSessionId = payload.session.id;
+  localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+  renderMessages(payload.messages);
+  renderContextFiles();
+  setChatStatus("Loaded");
+}
+
+async function streamChatRequest(data, handlers) {
+  const response = await fetch(apiUrl("/api/ask-stream"), form(data));
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  if (!response.body) {
+    const payload = await api("/api/ask", form(data));
+    handlers.done(payload);
+    return;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let separator = buffer.indexOf("\n\n");
+    while (separator >= 0) {
+      processSseEvent(buffer.slice(0, separator), handlers);
+      buffer = buffer.slice(separator + 2);
+      separator = buffer.indexOf("\n\n");
+    }
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    processSseEvent(buffer, handlers);
+  }
+}
+
+function processSseEvent(raw, handlers) {
+  let event = "message";
+  const data = [];
+  raw.split(/\r?\n/).forEach((line) => {
+    if (line.startsWith("event:")) {
+      event = line.slice("event:".length).trim();
+    } else if (line.startsWith("data:")) {
+      data.push(line.slice("data:".length).trimStart());
+    }
+  });
+  const payload = data.length ? JSON.parse(data.join("\n")) : {};
+  if (event === "token") handlers.token(payload.token || "");
+  if (event === "done") handlers.done(payload);
+  if (event === "error") handlers.error(payload);
+}
+
 document.querySelectorAll(".tab").forEach((button) => {
   button.addEventListener("click", () => {
     document.querySelectorAll(".tab").forEach((tab) => tab.classList.remove("active"));
@@ -142,7 +401,7 @@ $("status-btn").addEventListener("click", async () => {
   try {
     const payload = await api(`/api/git-status?repo=${encodeURIComponent(requireRepo())}`);
     setRepoState(payload.clean ? "Clean workspace" : `${payload.files.length} changed paths`);
-    $("chat-output").textContent = JSON.stringify(payload, null, 2);
+    appendChatMessage("system", `\`\`\`json\n${JSON.stringify(payload, null, 2)}\n\`\`\``);
   } catch (error) {
     toast(error.message);
   }
@@ -166,19 +425,102 @@ $("open-vscode-btn").addEventListener("click", async () => {
   }
 });
 
-$("ask-btn").addEventListener("click", async () => {
+$("session-select").addEventListener("change", async () => {
   try {
-    const payload = await api(
-      "/api/ask",
-      form({
-        repo: requireRepo(),
-        prompt: $("chat-prompt").value,
-        mock_response: $("chat-mock").value,
-      }),
-    );
-    $("chat-output").textContent = `${payload.response}\n\nContext:\n${payload.contextFiles.join("\n")}`;
+    await loadSession($("session-select").value);
   } catch (error) {
     toast(error.message);
+  }
+});
+
+$("new-session-btn").addEventListener("click", () => {
+  currentSessionId = "";
+  $("session-select").value = "";
+  localStorage.removeItem(lastSessionStorageKey());
+  clearChat();
+  $("chat-prompt").focus();
+});
+
+$("rename-session-btn").addEventListener("click", async () => {
+  try {
+    if (!currentSessionId) throw new Error("No session selected");
+    const currentTitle = $("session-select").selectedOptions[0]?.textContent || "";
+    const title = window.prompt("Session name", currentTitle);
+    if (!title || !title.trim()) return;
+    const payload = await api(
+      "/api/session-rename",
+      form({ session_id: currentSessionId, title: title.trim() }),
+    );
+    await loadSessions(payload.session.id, false);
+    toast("Session renamed");
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$("delete-session-btn").addEventListener("click", async () => {
+  try {
+    if (!currentSessionId) throw new Error("No session selected");
+    if (!window.confirm("Delete this session?")) return;
+    await api("/api/session-delete", form({ session_id: currentSessionId }));
+    localStorage.removeItem(lastSessionStorageKey());
+    currentSessionId = "";
+    clearChat();
+    await loadSessions("", false);
+    toast("Session deleted");
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$("ask-btn").addEventListener("click", async () => {
+  const button = $("ask-btn");
+  let streamError = null;
+  try {
+    const prompt = $("chat-prompt").value.trim();
+    if (!prompt) throw new Error("Prompt is required");
+    appendChatMessage("user", prompt);
+    const assistantMessage = appendChatMessage("assistant", "");
+    let assistantText = "";
+    button.disabled = true;
+    setChatStatus("Thinking", "running");
+
+    await streamChatRequest(
+      {
+        repo: requireRepo(),
+        prompt,
+        mock_response: $("chat-mock").value,
+        session_id: currentSessionId,
+      },
+      {
+        token(token) {
+          assistantText += token;
+          updateChatMessage(assistantMessage, assistantText);
+          setChatStatus("Streaming", "running");
+        },
+        done(payload) {
+          currentSessionId = payload.sessionId;
+          localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+          if (payload.response && payload.response !== assistantText) {
+            assistantText = payload.response;
+            updateChatMessage(assistantMessage, assistantText);
+          }
+          renderContextFiles(payload.contextFiles || []);
+          setChatStatus(payload.incomplete ? "Incomplete" : "Complete", payload.incomplete ? "warn" : "ok");
+        },
+        error(payload) {
+          streamError = new Error(payload.error || "Model request failed");
+        },
+      },
+    );
+    if (streamError) throw streamError;
+    $("chat-prompt").value = "";
+    await loadSessions(currentSessionId, false);
+  } catch (error) {
+    setChatStatus("Failed", "error");
+    toast(error.message);
+  } finally {
+    button.disabled = false;
   }
 });
 
@@ -290,6 +632,9 @@ api("/api/bootstrap")
       setRepository(lastRepo, false);
     } else if (payload.defaultRepo) {
       setRepository(payload.defaultRepo, false);
+    } else {
+      clearSessionList();
+      clearChat();
     }
   })
   .catch(() => {});

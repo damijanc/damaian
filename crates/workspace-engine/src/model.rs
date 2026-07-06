@@ -1,7 +1,7 @@
 use crate::audit::escape_json as audit_escape_json;
 use crate::error::{ClientError, Result};
 use crate::hash::{create_id, now_millis};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +116,16 @@ impl ModelAdapter for MockModelAdapter {
 
 pub trait ModelTransport {
     fn send(&mut self, request_body: &str) -> Result<String>;
+
+    fn send_stream(
+        &mut self,
+        request_body: &str,
+        on_chunk: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        let raw = self.send(request_body)?;
+        on_chunk(&raw);
+        Ok(raw)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +145,14 @@ impl CurlModelTransport {
 
 impl ModelTransport for CurlModelTransport {
     fn send(&mut self, request_body: &str) -> Result<String> {
+        self.send_stream(request_body, &mut |_chunk| {})
+    }
+
+    fn send_stream(
+        &mut self,
+        request_body: &str,
+        on_chunk: &mut dyn FnMut(&str),
+    ) -> Result<String> {
         let url = format!("{}/v1/chat/completions", self.base_url);
         let mut child = Command::new("curl")
             .arg("-sS")
@@ -157,14 +175,32 @@ impl ModelTransport for CurlModelTransport {
             stdin.write_all(request_body.as_bytes())?;
         }
 
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
+        let mut raw = String::new();
+        if let Some(mut stdout) = child.stdout.take() {
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let read = stdout.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
+                raw.push_str(&chunk);
+                on_chunk(&chunk);
+            }
+        }
+
+        let status = child.wait()?;
+        let mut stderr = String::new();
+        if let Some(mut stderr_pipe) = child.stderr.take() {
+            stderr_pipe.read_to_string(&mut stderr)?;
+        }
+        if !status.success() {
             return Err(ClientError::Io(format!(
                 "Model provider transport failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                stderr
             )));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(raw)
     }
 }
 
@@ -217,15 +253,45 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
         let run_id = create_id("modelrun");
         let started_at_ms = now_millis();
         let body = model_request_json(request);
-        let raw = self.transport.send(&body)?;
-        let tokens = extract_model_tokens(&raw);
         let mut content = String::new();
-        for token in tokens {
+        let mut buffered_stream = String::new();
+        let mut saw_sse_stream = false;
+        let mut emit_token = |token: String| {
             if self.cancelled.contains(&run_id) {
-                break;
+                return;
             }
             content.push_str(&token);
             on_token(&token);
+        };
+        let raw = self.transport.send_stream(&body, &mut |chunk| {
+            buffered_stream.push_str(chunk);
+            if buffered_stream.contains("data:") || saw_sse_stream {
+                saw_sse_stream = true;
+                while let Some(line_end) = buffered_stream.find('\n') {
+                    let line = buffered_stream[..line_end].to_string();
+                    buffered_stream = buffered_stream[line_end + 1..].to_string();
+                    for token in extract_model_tokens(&line) {
+                        emit_token(token);
+                    }
+                }
+            }
+        })?;
+        if let Some(message) = extract_error_message(&raw) {
+            return Err(ClientError::Io(format!("Model provider error: {message}")));
+        }
+        if saw_sse_stream {
+            for token in extract_model_tokens(&buffered_stream) {
+                emit_token(token);
+            }
+        } else {
+            for token in extract_model_tokens(&raw) {
+                emit_token(token);
+            }
+        }
+        if content.is_empty() && !self.cancelled.contains(&run_id) {
+            return Err(ClientError::Io(
+                "Model provider returned no assistant content".to_string(),
+            ));
         }
 
         Ok(ModelRun {
@@ -328,6 +394,40 @@ fn extract_content_values(raw: &str) -> Vec<String> {
         }
     }
     values
+}
+
+fn extract_error_message(raw: &str) -> Option<String> {
+    if !raw.contains("\"error\"") {
+        return None;
+    }
+    extract_string_field(raw, "message")
+}
+
+fn extract_string_field(raw: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let bytes = raw.as_bytes();
+    let mut cursor = 0;
+    while cursor + needle.len() <= raw.len() {
+        let offset = find_bytes(&bytes[cursor..], needle.as_bytes())?;
+        let key_start = cursor + offset;
+        let mut index = key_start + needle.len();
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if bytes.get(index) != Some(&b':') {
+            cursor = key_start + needle.len();
+            continue;
+        }
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if bytes.get(index) != Some(&b'"') {
+            return None;
+        }
+        return parse_json_string(raw, index).map(|(value, _)| value);
+    }
+    None
 }
 
 fn parse_json_string(raw: &str, quote_start: usize) -> Option<(String, usize)> {

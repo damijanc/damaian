@@ -1,7 +1,7 @@
 use crate::audit::AuditLog;
 use crate::config::{Config, DEFAULT_IGNORE_PATTERNS};
 use crate::error::Result;
-use crate::hash::{create_id, now_millis, sha256};
+use crate::hash::{now_millis, sha256};
 use crate::ignore::{IgnoreRule, is_ignored_by_rules, parse_ignore_patterns};
 use crate::language::{detect_language, extract_imports, extract_symbols};
 use crate::secret_scanner::SecretScanner;
@@ -145,7 +145,7 @@ impl ProjectIndexer {
 
     pub fn index_repository(&self, root_path: impl AsRef<Path>) -> Result<RepositoryIndex> {
         let root = fs::canonicalize(root_path)?;
-        let repository_id = create_id("repo");
+        let repository_id = repository_id_for_root(&root);
         let mut files = Vec::new();
         let mut skipped = Vec::new();
         let default_patterns = if self.config.ignore_patterns.is_empty() {
@@ -186,6 +186,11 @@ impl ProjectIndexer {
             ],
         )?;
         Ok(index)
+    }
+
+    pub fn repository_id_for_path(&self, root_path: impl AsRef<Path>) -> Result<String> {
+        let root = fs::canonicalize(root_path)?;
+        Ok(repository_id_for_root(&root))
     }
 
     fn walk(
@@ -330,6 +335,11 @@ impl ProjectIndexer {
         });
         Ok(())
     }
+}
+
+fn repository_id_for_root(root: &Path) -> String {
+    let digest = sha256(root.to_string_lossy().as_bytes());
+    format!("repo_{}", &digest[..16])
 }
 
 fn tokenize(text: &str) -> Vec<String> {

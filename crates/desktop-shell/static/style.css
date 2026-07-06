@@ -145,6 +145,17 @@ button:hover {
   gap: 8px;
 }
 
+.session-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
 .workspace {
   min-width: 0;
   display: grid;
@@ -193,6 +204,140 @@ button:hover {
 .pane.output {
   border-right: 0;
   background: #fdfefe;
+}
+
+.output-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.status-badge {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  padding: 4px 9px;
+}
+
+.status-badge[data-state="running"] {
+  border-color: #8ba8b3;
+  color: var(--accent);
+}
+
+.status-badge[data-state="ok"] {
+  border-color: #8dbda5;
+  color: var(--ok);
+}
+
+.status-badge[data-state="warn"] {
+  border-color: #d7a66d;
+  color: var(--warn);
+}
+
+.status-badge[data-state="error"] {
+  border-color: #d89999;
+  color: var(--danger);
+}
+
+.chat-log {
+  min-height: 320px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-right: 2px;
+}
+
+.message {
+  display: grid;
+  gap: 6px;
+  max-width: 880px;
+}
+
+.message-role {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.message-body {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: white;
+  padding: 12px;
+}
+
+.message.user .message-body {
+  background: #f2f7f5;
+}
+
+.message.assistant .message-body {
+  background: #ffffff;
+}
+
+.message.system .message-body {
+  background: #f8f9fb;
+}
+
+.message-body h3,
+.message-body h4,
+.message-body h5,
+.message-body p,
+.message-body ul {
+  margin: 0 0 10px;
+}
+
+.message-body h3,
+.message-body h4,
+.message-body h5 {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.message-body ul {
+  padding-left: 20px;
+}
+
+.message-body li + li {
+  margin-top: 4px;
+}
+
+.message-body code {
+  border-radius: 4px;
+  background: #eef2f5;
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  padding: 1px 4px;
+}
+
+.message-body pre {
+  min-height: 0;
+  margin-bottom: 10px;
+}
+
+.message-body pre code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+
+.context-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.context-file {
+  max-width: 100%;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 pre {

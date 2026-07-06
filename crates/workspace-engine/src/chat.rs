@@ -1,12 +1,12 @@
 use crate::audit::AuditLog;
 use crate::config::Config;
 use crate::context_manager::ContextManager;
-use crate::error::Result;
+use crate::error::{ClientError, Result};
 use crate::hash::create_id;
 use crate::indexer::ProjectIndexer;
 use crate::model::{ModelAdapter, ModelMessage, ModelRequest, ModelRun};
 use crate::secret_scanner::SecretScanner;
-use crate::session::{Session, SessionStore, Task, TaskStatus};
+use crate::session::{ChatMessage, Session, SessionStore, Task, TaskStatus};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,10 +55,46 @@ impl ChatOrchestrator {
         model_adapter: &mut dyn ModelAdapter,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<ChatTurnResult> {
+        self.ask_with_session(
+            repository_root,
+            prompt,
+            explicit_paths,
+            None,
+            model_adapter,
+            on_token,
+        )
+    }
+
+    pub fn ask_with_session(
+        &self,
+        repository_root: impl AsRef<Path>,
+        prompt: &str,
+        explicit_paths: &[String],
+        session_id: Option<&str>,
+        model_adapter: &mut dyn ModelAdapter,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<ChatTurnResult> {
         let index = self.indexer.index_repository(&repository_root)?;
-        let session = self
-            .session_store
-            .create_session(&index.repository_id, &session_title(prompt))?;
+        let (session, prior_messages) = if let Some(session_id) = session_id {
+            let Some(session) = self.session_store.read_session(session_id)? else {
+                return Err(ClientError::InvalidInput(format!(
+                    "Unknown session: {session_id}"
+                )));
+            };
+            if session.repository_id != index.repository_id {
+                return Err(ClientError::AccessDenied(
+                    "Session belongs to a different repository".to_string(),
+                ));
+            }
+            let messages = self.session_store.read_messages(&session.id)?;
+            (session, messages)
+        } else {
+            (
+                self.session_store
+                    .create_session(&index.repository_id, &session_title(prompt))?,
+                Vec::new(),
+            )
+        };
         let mut task = self.session_store.create_task(
             &session.id,
             prompt,
@@ -80,7 +116,7 @@ impl ChatOrchestrator {
             explicit_paths,
             16_000,
         );
-        let model_prompt = build_model_prompt(prompt, &context.items);
+        let model_prompt = build_model_prompt(prompt, &context.items, &prior_messages);
         let request = ModelRequest {
             provider: self.config.model_provider.clone(),
             model: self.config.model_name.clone(),
@@ -152,8 +188,30 @@ fn system_prompt() -> String {
     "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.".to_string()
 }
 
-fn build_model_prompt(prompt: &str, items: &[crate::context_manager::ContextItem]) -> String {
+fn build_model_prompt(
+    prompt: &str,
+    items: &[crate::context_manager::ContextItem],
+    prior_messages: &[ChatMessage],
+) -> String {
     let mut output = String::new();
+    let recent_messages = prior_messages
+        .iter()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    if !recent_messages.is_empty() {
+        output.push_str("Recent conversation:\n");
+        for message in recent_messages {
+            output.push_str(&message.role);
+            output.push_str(": ");
+            output.push_str(&truncate_for_prompt(&message.content, 2_000));
+            output.push('\n');
+        }
+        output.push('\n');
+    }
     output.push_str("User request:\n");
     output.push_str(prompt);
     output.push_str("\n\nRepository context:\n");
@@ -169,6 +227,14 @@ fn build_model_prompt(prompt: &str, items: &[crate::context_manager::ContextItem
         if !item.content.ends_with('\n') {
             output.push('\n');
         }
+    }
+    output
+}
+
+fn truncate_for_prompt(value: &str, max_chars: usize) -> String {
+    let mut output = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        output.push_str("\n[truncated]");
     }
     output
 }

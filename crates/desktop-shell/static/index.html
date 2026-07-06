@@ -51,13 +51,27 @@
           <div class="split">
             <div class="pane">
               <h2>Chat</h2>
+              <label class="field">
+                <span>Session</span>
+                <select id="session-select"></select>
+              </label>
+              <div class="session-actions">
+                <button id="new-session-btn" type="button">New</button>
+                <button id="rename-session-btn" type="button">Rename</button>
+                <button id="delete-session-btn" type="button">Delete</button>
+              </div>
               <textarea id="chat-prompt" rows="5" placeholder="Ask about this repository"></textarea>
               <textarea id="chat-mock" rows="4" placeholder="Mock response"></textarea>
               <button id="ask-btn" type="button">Ask</button>
             </div>
             <div class="pane output">
-              <h2>Response</h2>
-              <pre id="chat-output"></pre>
+              <div class="output-heading">
+                <h2>Conversation</h2>
+                <span id="chat-status" class="status-badge">Idle</span>
+              </div>
+              <div id="chat-log" class="chat-log"></div>
+              <h2>Context</h2>
+              <div id="chat-context" class="context-list"></div>
             </div>
           </div>
         </section>
