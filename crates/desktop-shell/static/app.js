@@ -1128,6 +1128,26 @@ function renderColoredDiff(diff) {
   return view;
 }
 
+function renderGitStatusText(payload) {
+  if (payload.clean) {
+    return "Git status: clean workspace.";
+  }
+  const files = payload.files || [];
+  const visible = files
+    .slice(0, 12)
+    .map((file) => `- ${file.raw || "changed"} ${file.path || file}`)
+    .join("\n");
+  const hiddenCount = Math.max(0, files.length - 12);
+  const suffix = hiddenCount ? `\n- ... ${hiddenCount} more` : "";
+  return `Git status: ${files.length} changed path(s).\n${visible}${suffix}`;
+}
+
+async function appendGitStatusAfterChange(repoPath) {
+  const payload = await api(`/api/git-status?repo=${encodeURIComponent(repoPath)}`);
+  setRepoState(payload.clean ? projectName(repoPath) : `${projectName(repoPath)} - ${payload.files.length} changed`);
+  appendChatMessage("system", renderGitStatusText(payload));
+}
+
 function createPatchPreview(payload, patchRepo) {
   const state = {
     patchId: payload.patchId,
@@ -1250,6 +1270,11 @@ function createPatchPreview(payload, patchRepo) {
       const applied = result.appliedFiles || [];
       markFiles(applied, "applied");
       toast(`Applied ${applied.length} file(s)`);
+      if (applied.length) {
+        await appendGitStatusAfterChange(patchRepo).catch((error) => {
+          toast(`Status unavailable: ${error.message}`);
+        });
+      }
     } catch (error) {
       toast(error.message);
       render();
@@ -1423,26 +1448,6 @@ $("add-context-file-btn").addEventListener("click", async () => {
 
 $("clear-context-files-btn").addEventListener("click", () => {
   clearPinnedContextFiles();
-});
-
-$("status-btn").addEventListener("click", async () => {
-  try {
-    const payload = await api(`/api/git-status?repo=${encodeURIComponent(requireRepo())}`);
-    setRepoState(payload.clean ? "Clean workspace" : `${payload.files.length} changed paths`);
-    appendChatMessage("system", `\`\`\`json\n${JSON.stringify(payload, null, 2)}\n\`\`\``);
-  } catch (error) {
-    toast(error.message);
-  }
-});
-
-$("config-btn").addEventListener("click", async () => {
-  try {
-    ensureInspectorVisible();
-    $("settings").classList.add("active");
-    await loadConfigFile();
-  } catch (error) {
-    toast(error.message);
-  }
 });
 
 $("open-vscode-btn").addEventListener("click", async () => {

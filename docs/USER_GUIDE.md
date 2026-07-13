@@ -9,8 +9,7 @@ This build is a developer preview. It is usable for local workflows, but it does
 1. Open `Damaian.app`.
 2. Select `+` beside `Projects`.
 3. Pick the local Git repository or working folder you want Damaian to inspect.
-4. Select `Status` to confirm Damaian can inspect the repository.
-5. Select the Visual Studio Code icon when you want to open the same folder in Visual Studio Code, or the terminal icon to open the bottom terminal panel.
+4. Select the Visual Studio Code icon when you want to open the same folder in Visual Studio Code, or the terminal icon to open the bottom terminal panel.
 
 ## Working Folder
 
@@ -18,7 +17,7 @@ Damaian uses the selected working folder as the root for indexing, file reads, p
 
 Use `+` beside `Projects` to open the native macOS folder picker. The selected folder appears under `Projects` by folder name. Expand a project to see its sessions grouped underneath it. Use the `+` beside a project folder to start a new session for that project.
 
-Select a project folder in the sidebar to switch the active working folder. If you switch folders, use `Status` to verify the new root before asking questions or applying edits.
+Select a project folder in the sidebar to switch the active working folder.
 
 Damaian remembers the project list and the last selected working folder in local app storage. The last folder is restored when the app restarts. Launch-time defaults such as `DAMAIAN_REPO` are used only when no previous selection has been saved.
 
@@ -56,6 +55,8 @@ Use the conversation box to request file changes.
 4. Select `Apply Selected` to write those files, or `Reject Selected` to record selected files as rejected without changing the workspace.
 
 Damaian checks file hashes before applying a stored patch. If a target file changed after preview, that file is blocked instead of overwriting newer local work.
+
+After files are applied, Damaian prints a concise Git status summary in the conversation.
 
 ## Settings
 

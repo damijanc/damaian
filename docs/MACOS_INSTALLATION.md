@@ -34,8 +34,6 @@ Only do this for builds you created yourself or received from a trusted source.
 
 Select `+` beside `Projects` to open the native macOS folder picker. Pick the local Git repository or working folder you want Damaian to inspect. The folder appears under `Projects`, and its chat sessions are grouped underneath it. Use the `+` beside a project folder to start a new session for that project.
 
-Then select `Status` to confirm Damaian can inspect the repository.
-
 Select the Visual Studio Code icon in the conversation header to open the selected working folder in Visual Studio Code. Damaian keeps AI orchestration and safety controls in the app while code navigation and IDE work happen in VS Code.
 
 Select the terminal icon in the conversation header to open the bottom terminal panel. It starts in the selected working folder, or in your home directory when no folder is selected yet.
