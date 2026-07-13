@@ -46,9 +46,25 @@ Select the Visual Studio Code icon in the conversation header to open the select
 
 ## Model API Key
 
-The packaged preview reads model credentials from the environment variable configured by `model_api_key_env`. The default is usually `OPENAI_API_KEY`.
+The packaged desktop app can store model credentials in macOS Keychain from Settings.
 
-Desktop chat requires a configured model key. Launch Damaian from an environment where the key is available, or use the CLI mock-response mode for local engine testing while native Keychain storage is still pending.
+1. Open Settings.
+2. Configure `model_base_url` and `model_name`.
+3. Enter a Keychain account name such as `model-api-key`.
+4. Paste the API key into `API Key`.
+5. Select `Save Key`.
+
+Damaian stores the secret in Keychain and writes only a reference such as this to user config:
+
+```text
+model_api_key_env=keychain:model-api-key
+```
+
+Environment variables are still supported for CLI and development workflows. In that mode, set `model_api_key_env` to an environment variable name, such as `OPENAI_API_KEY`, before launching.
+
+Repository config can still be provided manually at `.damaian/config.conf`. If repository config sets `model_api_key_env`, it overrides the user Keychain reference shown above.
+
+Do not paste raw API keys into config files. `model_api_key_env` must be a Keychain reference or an environment variable name.
 
 ## Uninstall
 
@@ -68,5 +84,4 @@ The installer contains:
 
 - The package is unsigned and not notarized.
 - Repository selection uses a native folder picker, with manual path entry still available as a fallback.
-- Model API keys are not stored in Keychain yet.
 - The app uses a local in-process server on `127.0.0.1:4765` as the temporary bridge between Tauri and the workspace engine.

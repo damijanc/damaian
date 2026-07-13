@@ -101,6 +101,16 @@
         <section id="chat-log" class="chat-log" aria-live="polite"></section>
 
         <footer class="composer">
+          <div id="composer-context" class="composer-context">
+            <div class="composer-context-header">
+              <span>Context files</span>
+              <div class="composer-context-actions">
+                <button id="add-context-file-btn" type="button">+ File</button>
+                <button id="clear-context-files-btn" type="button">Clear</button>
+              </div>
+            </div>
+            <div id="pinned-context-files" class="pinned-context-files"></div>
+          </div>
           <div class="prompt-box">
             <textarea
               id="chat-prompt"
@@ -160,23 +170,43 @@
 
         <section id="settings" class="view">
           <div class="inspector-section">
-            <h2>Configuration</h2>
-            <label class="field">
-              <span>Scope</span>
-              <select id="config-scope">
-                <option value="user">User</option>
-                <option value="repo">Repository</option>
-              </select>
-            </label>
+            <h2>User Configuration</h2>
+            <p class="path-line">
+              Repository configuration is read from `.damaian/config.conf` and reflected in
+              Effective Policy.
+            </p>
             <div class="inline-actions">
               <button id="config-load-btn" type="button">Load</button>
               <button id="config-save-btn" type="button">Save</button>
             </div>
             <p id="config-path" class="path-line"></p>
+            <div class="model-key-panel">
+              <div class="section-heading">
+                <h2>Model API Key</h2>
+                <span id="model-key-status" class="key-status">Not checked</span>
+              </div>
+              <label class="field">
+                <span>Keychain Account</span>
+                <input id="model-key-account" type="text" value="model-api-key" />
+              </label>
+              <label class="field">
+                <span>API Key</span>
+                <input
+                  id="model-api-key"
+                  type="password"
+                  autocomplete="off"
+                  placeholder="Paste API key"
+                />
+              </label>
+              <div class="inline-actions">
+                <button id="model-key-save-btn" type="button">Save Key</button>
+                <button id="model-key-delete-btn" type="button">Remove Key</button>
+              </div>
+            </div>
             <textarea
               id="config-editor"
               rows="15"
-              placeholder="model_base_url=https://api.openai.com&#10;model_name=gpt-4.1&#10;model_api_key_env=OPENAI_API_KEY"
+              placeholder="model_base_url=https://api.openai.com&#10;model_name=gpt-4.1&#10;model_api_key_env=keychain:model-api-key"
             ></textarea>
           </div>
           <div class="inspector-section grow">

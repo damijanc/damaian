@@ -745,6 +745,29 @@ fn config_overlay_round_trips_policy_values() {
 }
 
 #[test]
+fn config_overlay_accepts_model_api_key_references() {
+    let env_overlay = ConfigOverlay::parse("model_api_key_env=DEEPSEEK_API_KEY\n").unwrap();
+    assert_eq!(
+        env_overlay.model_api_key_env,
+        Some("DEEPSEEK_API_KEY".to_string())
+    );
+
+    let keychain_overlay =
+        ConfigOverlay::parse("model_api_key_env=keychain: model-api-key\n").unwrap();
+    assert_eq!(
+        keychain_overlay.model_api_key_env,
+        Some("keychain:model-api-key".to_string())
+    );
+}
+
+#[test]
+fn config_overlay_rejects_literal_model_api_keys() {
+    let error = ConfigOverlay::parse("model_api_key_env=sk-test-secret\n").unwrap_err();
+
+    assert!(error.to_string().contains("do not paste the API key"));
+}
+
+#[test]
 fn config_precedence_is_user_then_repo_then_admin() {
     let root = temp_dir("config-precedence");
     let user = root.join("user.conf");

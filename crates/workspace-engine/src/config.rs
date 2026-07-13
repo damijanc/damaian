@@ -403,7 +403,9 @@ impl ConfigOverlay {
             "model_provider" => self.model_provider = Some(value.to_string()),
             "model_name" => self.model_name = Some(value.to_string()),
             "model_base_url" => self.model_base_url = Some(value.to_string()),
-            "model_api_key_env" => self.model_api_key_env = Some(value.to_string()),
+            "model_api_key_env" => {
+                self.model_api_key_env = Some(parse_model_api_key_reference(value)?)
+            }
             _ => {
                 return Err(ClientError::InvalidInput(format!(
                     "Unknown config key: {key}"
@@ -537,4 +539,37 @@ fn parse_u64(key: &str, value: &str) -> Result<u64> {
     value
         .parse()
         .map_err(|_| ClientError::InvalidInput(format!("{key} must be an unsigned integer")))
+}
+
+fn parse_model_api_key_reference(value: &str) -> Result<String> {
+    let value = value.trim();
+    if let Some(account) = value.strip_prefix("keychain:") {
+        let account = account.trim();
+        if account.is_empty() {
+            return Err(ClientError::InvalidInput(
+                "model_api_key_env keychain account is required".to_string(),
+            ));
+        }
+        if account.chars().any(char::is_control) {
+            return Err(ClientError::InvalidInput(
+                "model_api_key_env keychain account cannot contain control characters".to_string(),
+            ));
+        }
+        return Ok(format!("keychain:{account}"));
+    }
+
+    let mut chars = value.chars();
+    let starts_valid = chars
+        .next()
+        .map(|character| character == '_' || character.is_ascii_alphabetic())
+        .unwrap_or(false);
+    let rest_valid = chars.all(|character| character == '_' || character.is_ascii_alphanumeric());
+    if starts_valid && rest_valid {
+        return Ok(value.to_string());
+    }
+
+    Err(ClientError::InvalidInput(
+        "model_api_key_env must be an environment variable name or keychain:<account>; do not paste the API key into config"
+            .to_string(),
+    ))
 }

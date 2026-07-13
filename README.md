@@ -17,6 +17,7 @@ This repository currently implements the workspace-engine slice from the product
 - one-click handoff from the selected working folder to Visual Studio Code
 - session-aware desktop chat with streamed responses and context file links
 - per-file edit diff review with selected-file apply/reject
+- macOS Keychain-backed model API key storage from desktop settings
 
 The macOS desktop shell can layer on top of these services without taking over file access, command execution, patching, or audit decisions.
 
@@ -62,6 +63,18 @@ By default, Damaian stores global app data under:
 Set `DAMAIAN_DATA_DIR` only when you want to override that location. For example, use `DAMAIAN_DATA_DIR=.damaian` to keep CLI audit and rollback data inside the current workspace during local development, or `DAMAIAN_DATA_DIR=~/.damaian` if you prefer a home-directory dotfolder.
 
 Repository-scoped config is separate from the global data directory and is stored at `.damaian/config.conf` inside the selected repository.
+
+Desktop settings can store the model API key in macOS Keychain. The user config file stores only a reference:
+
+```text
+model_api_key_env=keychain:model-api-key
+```
+
+Environment-variable references such as `model_api_key_env=OPENAI_API_KEY` remain supported for CLI and development workflows.
+
+Repository config can still be provided manually at `.damaian/config.conf` and is reflected in the desktop Effective Policy view.
+
+Do not put raw API keys in config files. `model_api_key_env` must be a Keychain reference or an environment variable name.
 
 Example override:
 

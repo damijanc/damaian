@@ -11,6 +11,8 @@ use workspace_engine::{
     patch_diff_text,
 };
 
+mod keychain;
+
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const STYLE_CSS: &str = include_str!("../static/style.css");
 const APP_JS: &str = include_str!("../static/app.js");
@@ -169,9 +171,9 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             )
         }
         ("GET", "/api/config-file") => {
-            let scope = required_param(&request, "scope")?;
+            let scope = request.param("scope");
             let repo = request.param("repo").unwrap_or_default();
-            let path = config_path_for_scope(&scope, &repo)?;
+            let path = desktop_settings_config_path(scope.as_deref())?;
             let content = if path.exists() {
                 fs::read_to_string(&path).map_err(|error| error.to_string())?
             } else {
@@ -191,6 +193,16 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                     escape_json(&effective_policy),
                     escape_json(&effective_error)
                 ),
+            )
+        }
+        ("GET", "/api/model-key-status") => {
+            let repo = request.param("repo").unwrap_or_default();
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &model_key_status_json(&repo)?,
             )
         }
         ("GET", "/api/git-status") => {
@@ -341,6 +353,23 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 200,
                 "application/json",
                 &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
+            )
+        }
+        ("POST", "/api/context-file") => {
+            let form = parse_form(&request.body);
+            let repo = required_form(&form, "repo")?;
+            let path = required_form(&form, "path")?;
+            let engine = engine_for_repo(&repo)?;
+            let files = validate_context_files(&engine, &repo, &path)?;
+            let Some(path) = files.first() else {
+                return Err("context file is required".to_string());
+            };
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &format!("{{\"path\":\"{}\"}}", escape_json(path)),
             )
         }
         ("POST", "/api/open-vscode-file") => {
@@ -536,21 +565,11 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         }
         ("POST", "/api/config-set") => {
             let form = parse_form(&request.body);
-            let scope = required_form(&form, "scope")?;
+            let scope = form.get("scope").map(String::as_str);
             let key = required_form(&form, "key")?;
             let value = required_form(&form, "value")?;
-            let path = match scope.as_str() {
-                "user" => {
-                    let config =
-                        Config::load_for_repository(None).map_err(|error| error.to_string())?;
-                    update_config_overlay(config.user_config_path(), &key, &value)?
-                }
-                "repo" => {
-                    let repo = required_form(&form, "repo")?;
-                    update_config_overlay(Config::repository_config_path(&repo), &key, &value)?
-                }
-                _ => return Err("scope must be user or repo".to_string()),
-            };
+            let path = desktop_settings_config_path(scope)?;
+            let path = update_config_overlay(path, &key, &value)?;
             write_response(
                 stream,
                 &request,
@@ -561,10 +580,10 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         }
         ("POST", "/api/config-file") => {
             let form = parse_form(&request.body);
-            let scope = required_form(&form, "scope")?;
+            let scope = form.get("scope").map(String::as_str);
             let repo = form.get("repo").cloned().unwrap_or_default();
             let content = form.get("content").cloned().unwrap_or_default();
-            let path = config_path_for_scope(&scope, &repo)?;
+            let path = desktop_settings_config_path(scope)?;
             save_config_file(&path, &content)?;
             let (effective_policy, effective_error) = effective_policy_for_repo(&repo);
             write_response(
@@ -577,6 +596,48 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                     escape_json(&path.to_string_lossy()),
                     escape_json(&effective_policy),
                     escape_json(&effective_error)
+                ),
+            )
+        }
+        ("POST", "/api/model-key") => {
+            let form = parse_form(&request.body);
+            let scope = form.get("scope").map(String::as_str);
+            let repo = form.get("repo").cloned().unwrap_or_default();
+            let account = required_form(&form, "account")?;
+            let api_key = required_form(&form, "api_key")?;
+            let reference = keychain::reference_for_account(&account)?;
+            keychain::write_password(&account, &api_key)?;
+            let path = desktop_settings_config_path(scope)?;
+            update_config_overlay(path.clone(), "model_api_key_env", &reference)?;
+            let (effective_policy, effective_error) = effective_policy_for_repo(&repo);
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &format!(
+                    "{{\"path\":\"{}\",\"reference\":\"{}\",\"account\":\"{}\",\"configured\":true,\"effectivePolicy\":\"{}\",\"effectiveError\":\"{}\"}}",
+                    escape_json(&path.to_string_lossy()),
+                    escape_json(&reference),
+                    escape_json(account.trim()),
+                    escape_json(&effective_policy),
+                    escape_json(&effective_error)
+                ),
+            )
+        }
+        ("POST", "/api/model-key-delete") => {
+            let form = parse_form(&request.body);
+            let account = required_form(&form, "account")?;
+            let deleted = keychain::delete_password(&account)?;
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &format!(
+                    "{{\"account\":\"{}\",\"deleted\":{},\"configured\":false}}",
+                    escape_json(account.trim()),
+                    deleted
                 ),
             )
         }
@@ -628,14 +689,25 @@ fn run_chat_request(
         .map(String::as_str)
         .filter(|value| !value.is_empty());
     let engine = engine_for_repo(&repo)?;
+    let context_files = form
+        .get("context_files")
+        .map(|value| validate_context_files(&engine, &repo, value))
+        .transpose()?
+        .unwrap_or_default();
 
-    let api_key = env::var(&engine.config.model_api_key_env)
-        .map_err(|_| format!("{} is required", engine.config.model_api_key_env))?;
+    let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
     let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
     let mut adapter = OpenAICompatibleAdapter::new(&engine.config.model_name, transport);
     engine
         .chat_orchestrator
-        .ask_with_session(&repo, &prompt, &[], session_id, &mut adapter, on_token)
+        .ask_with_session(
+            &repo,
+            &prompt,
+            &context_files,
+            session_id,
+            &mut adapter,
+            on_token,
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -644,16 +716,14 @@ fn default_engine() -> Result<WorkspaceEngine, String> {
     Ok(WorkspaceEngine::new(config))
 }
 
-fn config_path_for_scope(scope: &str, repo: &str) -> Result<PathBuf, String> {
-    match scope {
+fn desktop_settings_config_path(scope: Option<&str>) -> Result<PathBuf, String> {
+    match scope.unwrap_or("user") {
         "user" => Ok(Config::default().user_config_path()),
-        "repo" => {
-            if repo.is_empty() {
-                return Err("repository is required for repository config".to_string());
-            }
-            Ok(Config::repository_config_path(repo))
-        }
-        _ => Err("scope must be user or repo".to_string()),
+        "repo" => Err(
+            "desktop settings only write user config; edit repository config in .damaian/config.conf"
+                .to_string(),
+        ),
+        _ => Err("scope must be user".to_string()),
     }
 }
 
@@ -666,6 +736,49 @@ fn effective_policy_for_repo(repo: &str) -> (String, String) {
         Ok(config) => (config.to_policy_text(), String::new()),
         Err(error) => (String::new(), error.to_string()),
     }
+}
+
+fn resolve_model_api_key(reference: &str) -> Result<String, String> {
+    if let Some(account) = keychain::account_from_reference(reference) {
+        keychain::read_password(account).map_err(|error| {
+            format!(
+                "Keychain API key '{}' is required. Open Settings and save the model API key. {error}",
+                account
+            )
+        })
+    } else {
+        env::var(reference).map_err(|_| format!("{reference} is required"))
+    }
+}
+
+fn model_key_status_json(repo: &str) -> Result<String, String> {
+    let config = Config::load_for_repository(if repo.is_empty() {
+        None
+    } else {
+        Some(Path::new(repo))
+    })
+    .map_err(|error| error.to_string())?;
+    let reference = config.model_api_key_env;
+    if let Some(account) = keychain::account_from_reference(&reference) {
+        let status = match keychain::password_exists(account) {
+            Ok(configured) => (configured, String::new()),
+            Err(error) => (false, error),
+        };
+        return Ok(format!(
+            "{{\"reference\":\"{}\",\"kind\":\"keychain\",\"account\":\"{}\",\"configured\":{},\"message\":\"{}\"}}",
+            escape_json(&reference),
+            escape_json(account),
+            status.0,
+            escape_json(&status.1)
+        ));
+    }
+
+    Ok(format!(
+        "{{\"reference\":\"{}\",\"kind\":\"environment\",\"account\":\"\",\"configured\":{},\"message\":\"{}\"}}",
+        escape_json(&reference),
+        env::var(&reference).is_ok(),
+        escape_json(&format!("Environment variable {reference}"))
+    ))
 }
 
 fn save_config_file(path: &Path, content: &str) -> Result<(), String> {
@@ -686,6 +799,35 @@ fn open_workspace_path_in_vscode(repo: &str, relative_path: &str) -> Result<Path
     let path = validate_workspace_path(repo, relative_path)?;
     launch_vscode(&path)?;
     Ok(path)
+}
+
+fn validate_context_files(
+    engine: &WorkspaceEngine,
+    repo: &str,
+    raw_paths: &str,
+) -> Result<Vec<String>, String> {
+    let mut files = Vec::new();
+    for path in parse_optional_path_list(raw_paths) {
+        let target = engine
+            .path_policy
+            .resolve_existing(repo, &path)
+            .map_err(|error| error.to_string())?;
+        engine
+            .path_policy
+            .assert_not_restricted(&target.relative_path, false)
+            .map_err(|error| error.to_string())?;
+        let metadata = fs::metadata(&target.absolute_path).map_err(|error| error.to_string())?;
+        if !metadata.is_file() {
+            return Err("context path must be a file".to_string());
+        }
+        if !files
+            .iter()
+            .any(|existing| existing == &target.relative_path)
+        {
+            files.push(target.relative_path);
+        }
+    }
+    Ok(files)
 }
 
 fn validate_working_folder(repo: &str) -> Result<PathBuf, String> {
@@ -863,17 +1005,21 @@ fn required_form(form: &HashMap<String, String>, name: &str) -> Result<String, S
 }
 
 fn parse_path_list(value: &str) -> Result<Vec<String>, String> {
-    let paths = value
-        .split(['\n', '|'])
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(|path| path.to_string())
-        .collect::<Vec<_>>();
+    let paths = parse_optional_path_list(value);
     if paths.is_empty() {
         Err("at least one patch file must be selected".to_string())
     } else {
         Ok(paths)
     }
+}
+
+fn parse_optional_path_list(value: &str) -> Vec<String> {
+    value
+        .split(['\n', '|'])
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(|path| path.to_string())
+        .collect()
 }
 
 fn parse_form(body: &str) -> HashMap<String, String> {
@@ -1166,13 +1312,14 @@ fn escape_json(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Request, allowed_cors_origin, effective_policy_for_repo, parse_form, parse_path_list,
-        percent_decode, require_api_token, save_config_file, validate_working_folder,
-        validate_workspace_path,
+        Request, allowed_cors_origin, desktop_settings_config_path, effective_policy_for_repo,
+        keychain, parse_form, parse_path_list, percent_decode, require_api_token, save_config_file,
+        validate_context_files, validate_working_folder, validate_workspace_path,
     };
     use std::collections::HashMap;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use workspace_engine::{Config, WorkspaceEngine};
 
     #[test]
     fn decodes_forms() {
@@ -1206,6 +1353,39 @@ mod tests {
 
         assert!(require_api_token(&request, "secret").is_ok());
         assert!(require_api_token(&request, "wrong").is_err());
+    }
+
+    #[test]
+    fn parses_keychain_api_key_references() {
+        assert_eq!(
+            keychain::account_from_reference("keychain:model-api-key"),
+            Some("model-api-key")
+        );
+        assert_eq!(keychain::account_from_reference("OPENAI_API_KEY"), None);
+        assert_eq!(keychain::account_from_reference("keychain:  "), None);
+        assert_eq!(
+            keychain::reference_for_account(" model-api-key ").unwrap(),
+            "keychain:model-api-key"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_keychain_account_names() {
+        assert!(keychain::validate_account("").is_err());
+        assert!(keychain::validate_account(" \n ").is_err());
+        assert!(keychain::validate_account("model-api-key").is_ok());
+    }
+
+    #[test]
+    fn desktop_settings_config_path_is_user_only() {
+        assert!(desktop_settings_config_path(None).is_ok());
+        assert!(desktop_settings_config_path(Some("user")).is_ok());
+
+        let repo_error = desktop_settings_config_path(Some("repo")).unwrap_err();
+        assert!(repo_error.contains("desktop settings only write user config"));
+
+        let unknown_error = desktop_settings_config_path(Some("admin")).unwrap_err();
+        assert_eq!(unknown_error, "scope must be user");
     }
 
     #[test]
@@ -1263,6 +1443,67 @@ mod tests {
 
         assert!(policy.is_empty());
         assert!(error.contains("Unknown config key"));
+    }
+
+    #[test]
+    fn validates_context_files_inside_repo() {
+        let repo = temp_path("context-file");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let file = repo.join("src").join("main.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+        let engine = WorkspaceEngine::new(Config::default());
+
+        assert_eq!(
+            validate_context_files(&engine, repo.to_str().unwrap(), "src/main.rs").unwrap(),
+            vec!["src/main.rs"]
+        );
+        assert_eq!(
+            validate_context_files(&engine, repo.to_str().unwrap(), file.to_str().unwrap())
+                .unwrap(),
+            vec!["src/main.rs"]
+        );
+    }
+
+    #[test]
+    fn rejects_context_directories() {
+        let repo = temp_path("context-directory");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let engine = WorkspaceEngine::new(Config::default());
+
+        let error = validate_context_files(&engine, repo.to_str().unwrap(), "src").unwrap_err();
+
+        assert_eq!(error, "context path must be a file");
+    }
+
+    #[test]
+    fn rejects_context_files_outside_repo() {
+        let repo = temp_path("context-outside");
+        fs::create_dir_all(&repo).unwrap();
+        let outside = repo.with_file_name(format!(
+            "{}-outside.txt",
+            repo.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&outside, "secret").unwrap();
+        let engine = WorkspaceEngine::new(Config::default());
+
+        let error =
+            validate_context_files(&engine, repo.to_str().unwrap(), outside.to_str().unwrap())
+                .unwrap_err();
+
+        assert!(error.contains("outside the selected repository"));
+        fs::remove_file(outside).unwrap();
+    }
+
+    #[test]
+    fn rejects_restricted_context_files() {
+        let repo = temp_path("context-restricted");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join(".env"), "API_KEY=secret\n").unwrap();
+        let engine = WorkspaceEngine::new(Config::default());
+
+        let error = validate_context_files(&engine, repo.to_str().unwrap(), ".env").unwrap_err();
+
+        assert!(error.contains("restricted by policy"));
     }
 
     #[test]

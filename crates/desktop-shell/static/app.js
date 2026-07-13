@@ -8,12 +8,14 @@ let apiToken = "";
 let bootstrapPromise = null;
 let bootstrapError = null;
 let chatSubmitting = false;
+let pinnedContextFiles = [];
 
 const localApiOrigin = "http://127.0.0.1:4765";
 const localApiHostnames = new Set(["127.0.0.1", "localhost"]);
 const apiTokenHeader = "x-damaian-api-token";
 const lastRepoStorageKey = "damaian:lastRepository";
 const inspectorCollapsedStorageKey = "damaian:inspectorCollapsed";
+const pinnedContextStoragePrefix = "damaian:pinnedContextFiles";
 
 function repo() {
   return $("repo").value.trim();
@@ -103,6 +105,7 @@ function startBootstrap() {
       } else if (payload.defaultRepo) {
         setRepository(payload.defaultRepo, false);
       } else {
+        loadPinnedContextFiles("");
         clearSessionList();
         clearChat();
       }
@@ -139,6 +142,80 @@ function lastSessionStorageKey(repoPath = repo()) {
   return `damaian:lastSession:${repoPath}`;
 }
 
+function pinnedContextStorageKey(sessionId = currentSessionId, repoPath = repo()) {
+  return `${pinnedContextStoragePrefix}:${repoPath}:${sessionId || "draft"}`;
+}
+
+function loadPinnedContextFiles(sessionId = currentSessionId) {
+  try {
+    const stored = JSON.parse(localStorage.getItem(pinnedContextStorageKey(sessionId)) || "[]");
+    pinnedContextFiles = Array.isArray(stored)
+      ? stored.filter((path) => typeof path === "string" && path.trim()).map((path) => path.trim())
+      : [];
+  } catch {
+    pinnedContextFiles = [];
+  }
+  renderPinnedContextFiles();
+}
+
+function savePinnedContextFiles(sessionId = currentSessionId) {
+  const key = pinnedContextStorageKey(sessionId);
+  if (pinnedContextFiles.length) {
+    localStorage.setItem(key, JSON.stringify(pinnedContextFiles));
+  } else {
+    localStorage.removeItem(key);
+  }
+}
+
+function persistPinnedContextForSession(sessionId) {
+  if (!sessionId) return;
+  savePinnedContextFiles(sessionId);
+  localStorage.removeItem(pinnedContextStorageKey("", repo()));
+}
+
+function addPinnedContextFile(path) {
+  const normalized = String(path || "").trim();
+  if (!normalized || pinnedContextFiles.includes(normalized)) return;
+  pinnedContextFiles.push(normalized);
+  savePinnedContextFiles();
+  renderPinnedContextFiles();
+}
+
+function removePinnedContextFile(path) {
+  pinnedContextFiles = pinnedContextFiles.filter((item) => item !== path);
+  savePinnedContextFiles();
+  renderPinnedContextFiles();
+}
+
+function clearPinnedContextFiles() {
+  pinnedContextFiles = [];
+  savePinnedContextFiles();
+  renderPinnedContextFiles();
+}
+
+function renderPinnedContextFiles() {
+  const container = $("pinned-context-files");
+  container.innerHTML = "";
+  $("clear-context-files-btn").disabled = pinnedContextFiles.length === 0;
+  if (!pinnedContextFiles.length) {
+    return;
+  }
+  pinnedContextFiles.forEach((path) => {
+    const chip = document.createElement("span");
+    chip.className = "context-chip";
+    chip.title = path;
+    const label = document.createElement("span");
+    label.textContent = path;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.setAttribute("aria-label", `Remove ${path} from context`);
+    remove.textContent = "×";
+    remove.addEventListener("click", () => removePinnedContextFile(path));
+    chip.append(label, remove);
+    container.append(chip);
+  });
+}
+
 function setRepository(value, persist = true) {
   $("repo").value = value;
   setRepoState(value ? "Repository selected" : "No repository selected");
@@ -146,6 +223,7 @@ function setRepository(value, persist = true) {
     localStorage.setItem(lastRepoStorageKey, value);
   }
   currentSessionId = "";
+  loadPinnedContextFiles("");
   if (value) {
     void loadSessions("", true).catch(() => {});
   } else {
@@ -156,6 +234,25 @@ function setRepository(value, persist = true) {
 
 function tauriDialogOpen() {
   return window.__TAURI__?.dialog?.open;
+}
+
+async function addContextFilesFromPicker() {
+  const open = tauriDialogOpen();
+  if (!open) throw new Error("File picker is available in the desktop app");
+  const selected = await open({
+    directory: false,
+    multiple: true,
+    title: "Add Context File",
+    defaultPath: requireRepo(),
+  });
+  const selectedFiles = Array.isArray(selected) ? selected : selected ? [selected] : [];
+  for (const path of selectedFiles) {
+    const payload = await api("/api/context-file", form({ repo: requireRepo(), path }));
+    addPinnedContextFile(payload.path);
+  }
+  if (selectedFiles.length) {
+    toast(`Added ${selectedFiles.length} context file(s)`);
+  }
 }
 
 function setInspectorCollapsed(collapsed) {
@@ -176,17 +273,82 @@ function ensureInspectorVisible() {
 }
 
 function configScope() {
-  return $("config-scope").value;
+  return "user";
 }
 
 function configRepo() {
-  return configScope() === "repo" ? requireRepo() : repo();
+  return repo();
 }
 
 function renderConfigPolicy(payload) {
   $("config-output").textContent = payload.effectiveError
     ? `Effective policy could not be loaded:\n${payload.effectiveError}`
     : payload.effectivePolicy;
+}
+
+function configValue(content, key) {
+  const prefix = `${key}=`;
+  const line = String(content || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .find((item) => item.startsWith(prefix));
+  return line ? line.slice(prefix.length).trim() : "";
+}
+
+function upsertConfigValue(content, key, value) {
+  const prefix = `${key}=`;
+  const lines = String(content || "").split(/\r?\n/);
+  let replaced = false;
+  const next = lines.map((line) => {
+    if (line.trim().startsWith(prefix)) {
+      replaced = true;
+      return `${key}=${value}`;
+    }
+    return line;
+  });
+  if (!replaced) {
+    if (next.length && next[next.length - 1].trim()) next.push("");
+    next.push(`${key}=${value}`);
+  }
+  return next.join("\n").replace(/\n*$/, "\n");
+}
+
+function modelKeyAccountFromReference(reference) {
+  return reference.startsWith("keychain:") ? reference.slice("keychain:".length).trim() : "";
+}
+
+function syncModelKeyAccountFromConfig(content) {
+  const account = modelKeyAccountFromReference(configValue(content, "model_api_key_env"));
+  if (account) {
+    $("model-key-account").value = account;
+  } else if (!$("model-key-account").value.trim()) {
+    $("model-key-account").value = "model-api-key";
+  }
+}
+
+function setModelKeyStatus(message, state = "") {
+  const el = $("model-key-status");
+  el.textContent = message;
+  el.dataset.state = state;
+}
+
+async function refreshModelKeyStatus() {
+  const payload = await api(`/api/model-key-status?repo=${encodeURIComponent(repo())}`);
+  if (payload.kind === "keychain") {
+    if (payload.account) $("model-key-account").value = payload.account;
+    setModelKeyStatus(payload.configured ? "Saved" : "Missing", payload.configured ? "ok" : "warn");
+  } else {
+    setModelKeyStatus(
+      payload.configured ? `${payload.reference} set` : `${payload.reference} missing`,
+      payload.configured ? "ok" : "warn",
+    );
+  }
+  return payload;
+}
+
+function keyOverrideWarning(savedReference, effectiveReference) {
+  if (!effectiveReference || effectiveReference === savedReference) return "";
+  return `Saved user key, but effective config still uses ${effectiveReference}. Remove or update the model_api_key_env override in repository or admin config.`;
 }
 
 async function loadConfigFile() {
@@ -196,8 +358,10 @@ async function loadConfigFile() {
     )}`,
   );
   $("config-editor").value = payload.content;
+  syncModelKeyAccountFromConfig(payload.content);
   renderConfigPolicy(payload);
   $("config-path").textContent = payload.exists ? payload.path : `${payload.path} (new)`;
+  void refreshModelKeyStatus().catch((error) => setModelKeyStatus(error.message, "error"));
   return payload;
 }
 
@@ -212,6 +376,49 @@ async function saveConfigFile() {
   );
   renderConfigPolicy(payload);
   $("config-path").textContent = payload.path;
+  syncModelKeyAccountFromConfig($("config-editor").value);
+  void refreshModelKeyStatus().catch((error) => setModelKeyStatus(error.message, "error"));
+  return payload;
+}
+
+async function saveModelApiKey() {
+  const account = $("model-key-account").value.trim();
+  const apiKey = $("model-api-key").value.trim();
+  if (!account) throw new Error("Keychain account is required");
+  if (!apiKey) throw new Error("API key is required");
+  const payload = await api(
+    "/api/model-key",
+    form({
+      scope: configScope(),
+      repo: configRepo(),
+      account,
+      api_key: apiKey,
+    }),
+  );
+  $("model-api-key").value = "";
+  renderConfigPolicy(payload);
+  $("config-path").textContent = payload.path;
+  $("config-editor").value = upsertConfigValue(
+    $("config-editor").value,
+    "model_api_key_env",
+    payload.reference,
+  );
+  syncModelKeyAccountFromConfig($("config-editor").value);
+  const status = await refreshModelKeyStatus();
+  const warning = keyOverrideWarning(payload.reference, status.reference);
+  if (warning) {
+    setModelKeyStatus("Overridden", "warn");
+    payload.warning = warning;
+  }
+  return payload;
+}
+
+async function deleteModelApiKey() {
+  const account = $("model-key-account").value.trim();
+  if (!account) throw new Error("Keychain account is required");
+  const payload = await api("/api/model-key-delete", form({ account }));
+  $("model-api-key").value = "";
+  await refreshModelKeyStatus();
   return payload;
 }
 
@@ -572,6 +779,7 @@ async function loadSession(sessionId) {
   if (!sessionId) {
     currentSessionId = "";
     localStorage.removeItem(lastSessionStorageKey());
+    loadPinnedContextFiles("");
     clearChat();
     return;
   }
@@ -580,6 +788,7 @@ async function loadSession(sessionId) {
   localStorage.setItem(lastSessionStorageKey(), currentSessionId);
   $("session-select").value = currentSessionId;
   syncSessionListActive();
+  loadPinnedContextFiles(currentSessionId);
   renderMessages(payload.messages);
   renderContextFiles();
   setChatStatus("Loaded");
@@ -670,6 +879,18 @@ $("pick-folder-btn").addEventListener("click", async () => {
   }
 });
 
+$("add-context-file-btn").addEventListener("click", async () => {
+  try {
+    await addContextFilesFromPicker();
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$("clear-context-files-btn").addEventListener("click", () => {
+  clearPinnedContextFiles();
+});
+
 $("status-btn").addEventListener("click", async () => {
   try {
     const payload = await api(`/api/git-status?repo=${encodeURIComponent(requireRepo())}`);
@@ -712,6 +933,7 @@ $("new-session-btn").addEventListener("click", () => {
   $("session-select").value = "";
   localStorage.removeItem(lastSessionStorageKey());
   syncSessionListActive();
+  loadPinnedContextFiles("");
   clearChat();
   $("chat-prompt").focus();
 });
@@ -768,6 +990,7 @@ async function sendChatPrompt() {
         repo: requireRepo(),
         prompt,
         session_id: currentSessionId,
+        context_files: pinnedContextFiles.join("\n"),
       },
       {
         token(token) {
@@ -778,6 +1001,7 @@ async function sendChatPrompt() {
         done(payload) {
           currentSessionId = payload.sessionId;
           localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+          persistPinnedContextForSession(currentSessionId);
           if (payload.response && payload.response !== assistantText) {
             assistantText = payload.response;
             updateChatMessage(assistantMessage, assistantText);
@@ -917,11 +1141,33 @@ $("config-save-btn").addEventListener("click", async () => {
   }
 });
 
+$("model-key-save-btn").addEventListener("click", async () => {
+  try {
+    const payload = await saveModelApiKey();
+    toast(payload.warning || "Model API key saved");
+  } catch (error) {
+    setModelKeyStatus("Failed", "error");
+    toast(error.message);
+  }
+});
+
+$("model-key-delete-btn").addEventListener("click", async () => {
+  try {
+    if (!window.confirm("Remove this stored API key from Keychain?")) return;
+    const payload = await deleteModelApiKey();
+    toast(payload.deleted ? "Model API key removed" : "No stored key found");
+  } catch (error) {
+    setModelKeyStatus("Failed", "error");
+    toast(error.message);
+  }
+});
+
 $("inspector-toggle-btn").addEventListener("click", () => {
   setInspectorCollapsed(!document.body.classList.contains("inspector-collapsed"));
 });
 
 $("ask-btn").disabled = true;
 setChatStatus("Starting", "running");
+renderPinnedContextFiles();
 
 bootstrapPromise = startBootstrap();
