@@ -11,6 +11,8 @@ This document covers installing the current Damaian developer-preview build on m
 
 ## Install From DMG
 
+Download the DMG from the GitHub Release page, or use a DMG you built locally.
+
 1. Open the `Damaian_0.1.0_*.dmg` file.
 2. Drag `Damaian.app` into `Applications`.
 3. Eject the mounted disk image.
