@@ -1,17 +1,27 @@
 const $ = (id) => document.getElementById(id);
 
-let currentCommandProposalId = "";
 let currentSessionId = "";
 let apiToken = "";
 let bootstrapPromise = null;
 let bootstrapError = null;
 let chatSubmitting = false;
 let pinnedContextFiles = [];
+let terminalCwd = "";
+let terminalOpen = false;
+let terminalBusy = false;
+let projectPaths = [];
+let expandedProjectPaths = new Set();
+let projectSessionsByPath = new Map();
+let projectSessionsLoading = new Set();
+let projectsCollapsed = false;
 
 const localApiOrigin = "http://127.0.0.1:4765";
 const localApiHostnames = new Set(["127.0.0.1", "localhost"]);
 const apiTokenHeader = "x-damaian-api-token";
 const lastRepoStorageKey = "damaian:lastRepository";
+const projectsStorageKey = "damaian:projects";
+const expandedProjectsStorageKey = "damaian:expandedProjects";
+const projectsCollapsedStorageKey = "damaian:projectsCollapsed";
 const inspectorCollapsedStorageKey = "damaian:inspectorCollapsed";
 const pinnedContextStoragePrefix = "damaian:pinnedContextFiles";
 
@@ -97,6 +107,7 @@ function startBootstrap() {
       apiToken = payload.apiToken;
       if (!chatSubmitting) $("ask-btn").disabled = false;
       setInspectorCollapsed(localStorage.getItem(inspectorCollapsedStorageKey) === "true");
+      loadProjectState();
       const lastRepo = localStorage.getItem(lastRepoStorageKey);
       if (lastRepo) {
         setRepository(lastRepo, false);
@@ -106,6 +117,7 @@ function startBootstrap() {
         loadPinnedContextFiles("");
         clearSessionList();
         clearChat();
+        renderProjectList();
       }
     })
     .catch((error) => {
@@ -134,6 +146,75 @@ function requireRepo() {
 
 function setRepoState(message) {
   $("repo-state").textContent = message;
+}
+
+function normalizeProjectPath(value) {
+  const path = String(value || "").trim();
+  if (path.length <= 1) return path;
+  return path.replace(/[\\/]+$/, "");
+}
+
+function projectName(projectPath) {
+  const normalized = normalizeProjectPath(projectPath);
+  if (!normalized) return "Untitled";
+  const parts = normalized.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || normalized;
+}
+
+function loadProjectState() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(projectsStorageKey) || "[]");
+    projectPaths = Array.isArray(stored)
+      ? stored.map(normalizeProjectPath).filter(Boolean)
+      : [];
+  } catch {
+    projectPaths = [];
+  }
+  const legacyRepo = normalizeProjectPath(localStorage.getItem(lastRepoStorageKey));
+  if (legacyRepo && !projectPaths.includes(legacyRepo)) {
+    projectPaths.push(legacyRepo);
+  }
+  projectPaths = [...new Set(projectPaths)];
+
+  try {
+    const storedExpanded = JSON.parse(localStorage.getItem(expandedProjectsStorageKey) || "[]");
+    expandedProjectPaths = new Set(
+      Array.isArray(storedExpanded)
+        ? storedExpanded.map(normalizeProjectPath).filter((path) => projectPaths.includes(path))
+        : [],
+    );
+  } catch {
+    expandedProjectPaths = new Set();
+  }
+  projectsCollapsed = localStorage.getItem(projectsCollapsedStorageKey) === "true";
+  setProjectsCollapsed(projectsCollapsed, false);
+}
+
+function saveProjectState() {
+  localStorage.setItem(projectsStorageKey, JSON.stringify(projectPaths));
+  localStorage.setItem(expandedProjectsStorageKey, JSON.stringify([...expandedProjectPaths]));
+}
+
+function rememberProject(projectPath) {
+  const normalized = normalizeProjectPath(projectPath);
+  if (!normalized) return "";
+  if (!projectPaths.includes(normalized)) {
+    projectPaths.push(normalized);
+  }
+  expandedProjectPaths.add(normalized);
+  saveProjectState();
+  return normalized;
+}
+
+function setProjectsCollapsed(collapsed, persist = true) {
+  projectsCollapsed = collapsed;
+  $("projects-toggle-btn").setAttribute("aria-expanded", collapsed ? "false" : "true");
+  $("projects-toggle-btn").classList.toggle("is-collapsed", collapsed);
+  document.querySelector(".projects-panel").classList.toggle("is-collapsed", collapsed);
+  if (persist) {
+    localStorage.setItem(projectsCollapsedStorageKey, collapsed ? "true" : "false");
+  }
+  renderProjectList();
 }
 
 function lastSessionStorageKey(repoPath = repo()) {
@@ -214,20 +295,45 @@ function renderPinnedContextFiles() {
   });
 }
 
-function setRepository(value, persist = true) {
-  $("repo").value = value;
-  setRepoState(value ? "Repository selected" : "No repository selected");
-  if (persist && value) {
-    localStorage.setItem(lastRepoStorageKey, value);
+function applyRepositoryState(value, persist = true) {
+  const projectPath = normalizeProjectPath(value);
+  $("repo").value = projectPath;
+  setRepoState(projectPath ? projectName(projectPath) : "No repository selected");
+  if (projectPath) {
+    rememberProject(projectPath);
+  }
+  if (persist && projectPath) {
+    localStorage.setItem(lastRepoStorageKey, projectPath);
   }
   currentSessionId = "";
   loadPinnedContextFiles("");
-  if (value) {
-    void loadSessions("", true).catch(() => {});
+  if (terminalOpen) {
+    void resetTerminalCwd().catch((error) => appendTerminalLine(error.message, "stderr"));
+  } else {
+    terminalCwd = "";
+  }
+  renderProjectList();
+  return projectPath;
+}
+
+function setRepository(value, persist = true) {
+  const projectPath = applyRepositoryState(value, persist);
+  if (projectPath) {
+    void loadSessions("", true).catch((error) => toast(error.message));
   } else {
     clearSessionList();
     clearChat();
   }
+}
+
+async function switchProject(projectPath, options = {}) {
+  const normalized = applyRepositoryState(projectPath, options.persist !== false);
+  if (!normalized) {
+    clearSessionList();
+    clearChat();
+    return;
+  }
+  await loadSessions(options.preferredSessionId || "", options.reloadSelected !== false);
 }
 
 function tauriDialogOpen() {
@@ -267,6 +373,110 @@ function setInspectorCollapsed(collapsed) {
 function ensureInspectorVisible() {
   if (document.body.classList.contains("inspector-collapsed")) {
     setInspectorCollapsed(false);
+  }
+}
+
+function setTerminalOpen(open) {
+  terminalOpen = open;
+  document.body.classList.toggle("terminal-open", open);
+  $("terminal-panel").hidden = !open;
+  const button = $("terminal-toggle-btn");
+  button.setAttribute("aria-pressed", open ? "true" : "false");
+  button.setAttribute("aria-label", open ? "Hide terminal" : "Show terminal");
+  button.title = open ? "Hide terminal" : "Show terminal";
+  if (open) {
+    void ensureTerminalReady()
+      .then(() => $("terminal-input").focus())
+      .catch((error) => {
+        appendTerminalLine(error.message, "stderr");
+        toast(error.message);
+      });
+  }
+}
+
+async function ensureTerminalReady() {
+  if (terminalCwd) {
+    renderTerminalPrompt();
+    return;
+  }
+  await resetTerminalCwd();
+}
+
+async function resetTerminalCwd() {
+  const payload = await api(`/api/terminal-cwd?repo=${encodeURIComponent(repo())}`);
+  terminalCwd = payload.cwd;
+  renderTerminalPrompt();
+  if (terminalOpen) {
+    appendTerminalLine(`cwd ${terminalCwd}`, "meta");
+  }
+}
+
+function renderTerminalPrompt() {
+  $("terminal-cwd").textContent = terminalCwd || "Not started";
+  $("terminal-title").textContent = terminalCwd ? terminalTitleForPath(terminalCwd) : "Terminal";
+  $("terminal-prompt").textContent = "$";
+}
+
+function terminalTitleForPath(path) {
+  const trimmed = String(path || "").replace(/[\\/]+$/, "");
+  if (!trimmed) return "/";
+  const parts = trimmed.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || trimmed || "Terminal";
+}
+
+function stripAnsi(value) {
+  return String(value || "").replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function appendTerminalLine(text, kind = "stdout") {
+  const output = $("terminal-output");
+  const clean = stripAnsi(text);
+  const lines = clean.endsWith("\n") ? clean.slice(0, -1).split(/\r?\n/) : clean.split(/\r?\n/);
+  lines.forEach((line) => {
+    const row = document.createElement("div");
+    row.className = `terminal-line ${kind}`;
+    row.textContent = line || " ";
+    output.append(row);
+  });
+  output.scrollTop = output.scrollHeight;
+}
+
+function appendTerminalCommand(command) {
+  appendTerminalLine(`${terminalCwd} $ ${command}`, "command");
+}
+
+async function runTerminalCommand(command) {
+  if (!command.trim() || terminalBusy) return;
+  if (command.trim() === "clear") {
+    $("terminal-output").innerHTML = "";
+    return;
+  }
+  terminalBusy = true;
+  $("terminal-input").disabled = true;
+  try {
+    await ensureTerminalReady();
+    appendTerminalCommand(command);
+    const payload = await api(
+      "/api/terminal-run",
+      form({
+        cwd: terminalCwd,
+        command,
+      }),
+    );
+    terminalCwd = payload.cwd || terminalCwd;
+    renderTerminalPrompt();
+    if (payload.stdout) appendTerminalLine(payload.stdout, "stdout");
+    if (payload.stderr) appendTerminalLine(payload.stderr, "stderr");
+    if (payload.exitCode !== 0) {
+      appendTerminalLine(`exit ${payload.exitCode}`, "meta");
+    }
+  } catch (error) {
+    appendTerminalLine(error.message, "stderr");
+    toast(error.message);
+  } finally {
+    terminalBusy = false;
+    $("terminal-input").disabled = false;
+    $("terminal-input").focus();
   }
 }
 
@@ -422,7 +632,8 @@ async function deleteModelApiKey() {
 
 function clearSessionList() {
   $("session-select").innerHTML = '<option value="">New session</option>';
-  $("session-list").innerHTML = "";
+  projectSessionsByPath.set(repo(), []);
+  renderProjectList();
   currentSessionId = "";
 }
 
@@ -630,42 +841,248 @@ function renderContextFiles(files = []) {
   });
 }
 
-function renderSessionList(sessions = []) {
-  const list = $("session-list");
+function renderProjectList() {
+  const list = $("project-list");
   list.innerHTML = "";
-  if (!sessions.length) {
+  if (projectsCollapsed) {
+    return;
+  }
+  if (!projectPaths.length) {
     const empty = document.createElement("p");
     empty.className = "sidebar-empty";
-    empty.textContent = "No sessions yet";
+    empty.textContent = "Use + to add a working folder";
     list.append(empty);
     return;
   }
-  sessions.forEach((session) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "session-item";
-    button.dataset.sessionId = session.id;
-    if (session.id === currentSessionId) {
-      button.classList.add("active");
-    }
-    button.textContent = session.title;
-    button.title = session.title;
-    button.addEventListener("click", async () => {
+
+  projectPaths.forEach((projectPath) => {
+    const expanded = expandedProjectPaths.has(projectPath);
+    const activeProject = projectPath === repo();
+    const group = document.createElement("section");
+    group.className = "project-group";
+    group.classList.toggle("active", activeProject);
+    group.classList.toggle("expanded", expanded);
+
+    const row = document.createElement("div");
+    row.className = "project-row";
+    row.title = projectPath;
+    row.dataset.projectPath = projectPath;
+    const projectButton = document.createElement("button");
+    projectButton.type = "button";
+    projectButton.className = "project-select-btn";
+    projectButton.innerHTML = `
+      <span class="folder-icon" aria-hidden="true"></span>
+      <span class="project-name"></span>
+      <span class="project-chevron" aria-hidden="true"></span>
+    `;
+    projectButton.querySelector(".project-name").textContent = projectName(projectPath);
+    projectButton.addEventListener("click", async () => {
       try {
-        $("session-select").value = session.id;
-        await loadSession(session.id);
-        renderSessionList(sessions);
+        if (activeProject && expanded) {
+          expandedProjectPaths.delete(projectPath);
+          saveProjectState();
+          renderProjectList();
+          return;
+        }
+        expandedProjectPaths.add(projectPath);
+        saveProjectState();
+        await switchProject(projectPath);
       } catch (error) {
         toast(error.message);
       }
     });
-    list.append(button);
+    const addSessionButton = document.createElement("button");
+    addSessionButton.type = "button";
+    addSessionButton.className = "project-session-add-btn";
+    addSessionButton.textContent = "+";
+    addSessionButton.title = `New session in ${projectName(projectPath)}`;
+    addSessionButton.setAttribute("aria-label", `New session in ${projectName(projectPath)}`);
+    addSessionButton.addEventListener("click", async () => {
+      try {
+        await startNewSession(projectPath);
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+    row.append(projectButton, addSessionButton);
+    group.append(row);
+
+    if (expanded) {
+      const sessions = projectSessionsByPath.get(projectPath);
+      const sessionsList = document.createElement("div");
+      sessionsList.className = "project-sessions";
+      if (!sessions && projectSessionsLoading.has(projectPath)) {
+        const loading = document.createElement("p");
+        loading.className = "project-session-empty";
+        loading.textContent = "Loading sessions...";
+        sessionsList.append(loading);
+      } else if (!sessions) {
+        const loading = document.createElement("p");
+        loading.className = "project-session-empty";
+        loading.textContent = "Loading sessions...";
+        sessionsList.append(loading);
+        void loadProjectSessions(projectPath)
+          .then(renderProjectList)
+          .catch((error) => {
+            projectSessionsByPath.set(projectPath, []);
+            toast(error.message);
+            renderProjectList();
+          });
+      } else if (!sessions.length) {
+        const empty = document.createElement("p");
+        empty.className = "project-session-empty";
+        empty.textContent = "No sessions yet";
+        sessionsList.append(empty);
+      } else {
+        sessions.forEach((session) => sessionsList.append(renderProjectSession(projectPath, session)));
+      }
+      group.append(sessionsList);
+    }
+
+    list.append(group);
   });
+}
+
+function renderProjectSession(projectPath, session) {
+  const row = document.createElement("div");
+  row.className = "session-item project-session-item";
+  row.dataset.sessionId = session.id;
+  row.dataset.projectPath = projectPath;
+  if (projectPath === repo() && session.id === currentSessionId) {
+    row.classList.add("active");
+  }
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "project-session-open";
+  button.textContent = session.title;
+  button.title = `${session.title} - double-click to rename`;
+  button.addEventListener("click", async () => {
+    try {
+      expandedProjectPaths.add(projectPath);
+      saveProjectState();
+      await switchProject(projectPath, { preferredSessionId: session.id, reloadSelected: false });
+      await loadSession(session.id);
+      renderProjectList();
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+  button.addEventListener("dblclick", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      await renameSessionForProject(projectPath, session);
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+
+  const deleteButton = document.createElement("button");
+  deleteButton.type = "button";
+  deleteButton.className = "project-session-delete";
+  deleteButton.textContent = "-";
+  deleteButton.title = `Delete ${session.title}`;
+  deleteButton.setAttribute("aria-label", `Delete ${session.title}`);
+  deleteButton.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    try {
+      await deleteSessionForProject(projectPath, session);
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+
+  row.append(button, deleteButton);
+  return row;
+}
+
+function renderSessionOptions(sessions = []) {
+  const select = $("session-select");
+  select.innerHTML = '<option value="">New session</option>';
+  sessions.forEach((session) => {
+    const option = document.createElement("option");
+    option.value = session.id;
+    option.textContent = session.title;
+    select.append(option);
+  });
+}
+
+function renderSessionList() {
+  renderProjectList();
+}
+
+async function loadProjectSessions(projectPath) {
+  const normalized = normalizeProjectPath(projectPath);
+  if (!normalized || projectSessionsLoading.has(normalized)) return;
+  projectSessionsLoading.add(normalized);
+  try {
+    const payload = await api(`/api/sessions?repo=${encodeURIComponent(normalized)}`);
+    projectSessionsByPath.set(normalized, payload.sessions || []);
+    if (normalized === repo()) {
+      renderSessionOptions(payload.sessions || []);
+    }
+  } finally {
+    projectSessionsLoading.delete(normalized);
+  }
+}
+
+async function startNewSession(projectPath = repo()) {
+  const normalized = normalizeProjectPath(projectPath);
+  if (!normalized) throw new Error("Repository is required");
+  expandedProjectPaths.add(normalized);
+  saveProjectState();
+  localStorage.removeItem(lastSessionStorageKey(normalized));
+  await switchProject(normalized, { preferredSessionId: "__new__", reloadSelected: false });
+  currentSessionId = "";
+  $("session-select").value = "";
+  loadPinnedContextFiles("");
+  clearChat();
+  renderProjectList();
+  $("chat-prompt").focus();
+}
+
+async function renameSessionForProject(projectPath, session) {
+  const title = window.prompt("Session name", session.title);
+  if (!title || !title.trim()) return;
+  const payload = await api(
+    "/api/session-rename",
+    form({ session_id: session.id, title: title.trim() }),
+  );
+  if (normalizeProjectPath(projectPath) === repo()) {
+    await loadSessions(payload.session.id, false);
+  } else {
+    await loadProjectSessions(projectPath);
+    renderProjectList();
+  }
+  toast("Session renamed");
+}
+
+async function deleteSessionForProject(projectPath, session) {
+  if (!window.confirm("Delete this session?")) return;
+  await api("/api/session-delete", form({ session_id: session.id }));
+  const normalized = normalizeProjectPath(projectPath);
+  if (normalized === repo() && currentSessionId === session.id) {
+    localStorage.removeItem(lastSessionStorageKey(normalized));
+    currentSessionId = "";
+    $("session-select").value = "";
+    loadPinnedContextFiles("");
+    clearChat();
+    await loadSessions("__new__", false);
+  } else if (normalized === repo()) {
+    await loadSessions(currentSessionId || "", false);
+  } else {
+    await loadProjectSessions(normalized);
+    renderProjectList();
+  }
+  toast("Session deleted");
 }
 
 function syncSessionListActive() {
   document.querySelectorAll(".session-item").forEach((button) => {
-    button.classList.toggle("active", button.dataset.sessionId === currentSessionId);
+    button.classList.toggle(
+      "active",
+      button.dataset.projectPath === repo() && button.dataset.sessionId === currentSessionId,
+    );
   });
 }
 
@@ -868,21 +1285,16 @@ async function loadSessions(preferredSessionId = "", reloadSelected = false) {
     return;
   }
   const payload = await api(`/api/sessions?repo=${encodeURIComponent(repoPath)}`);
-  const select = $("session-select");
+  const sessions = payload.sessions || [];
+  projectSessionsByPath.set(repoPath, sessions);
   const storedSessionId = localStorage.getItem(lastSessionStorageKey(repoPath)) || "";
   const selectedSessionId = preferredSessionId || currentSessionId || storedSessionId;
-  select.innerHTML = '<option value="">New session</option>';
-  payload.sessions.forEach((session) => {
-    const option = document.createElement("option");
-    option.value = session.id;
-    option.textContent = session.title;
-    select.append(option);
-  });
-  currentSessionId = payload.sessions.some((session) => session.id === selectedSessionId)
+  renderSessionOptions(sessions);
+  currentSessionId = sessions.some((session) => session.id === selectedSessionId)
     ? selectedSessionId
     : "";
-  select.value = currentSessionId;
-  renderSessionList(payload.sessions);
+  $("session-select").value = currentSessionId;
+  renderProjectList();
   if (currentSessionId) {
     localStorage.setItem(lastSessionStorageKey(repoPath), currentSessionId);
     if (reloadSelected) {
@@ -979,6 +1391,10 @@ $("repo").addEventListener("change", () => {
   }
 });
 
+$("projects-toggle-btn").addEventListener("click", () => {
+  setProjectsCollapsed(!projectsCollapsed);
+});
+
 $("pick-folder-btn").addEventListener("click", async () => {
   try {
     const open = tauriDialogOpen();
@@ -1022,7 +1438,7 @@ $("status-btn").addEventListener("click", async () => {
 $("config-btn").addEventListener("click", async () => {
   try {
     ensureInspectorVisible();
-    document.querySelector('[data-tab="settings"]').click();
+    $("settings").classList.add("active");
     await loadConfigFile();
   } catch (error) {
     toast(error.message);
@@ -1038,51 +1454,41 @@ $("open-vscode-btn").addEventListener("click", async () => {
   }
 });
 
+$("terminal-toggle-btn").addEventListener("click", () => {
+  setTerminalOpen(!terminalOpen);
+});
+
+$("terminal-close-btn").addEventListener("click", () => {
+  setTerminalOpen(false);
+});
+
+$("terminal-clear-btn").addEventListener("click", () => {
+  $("terminal-output").innerHTML = "";
+  $("terminal-input").focus();
+});
+
+$("terminal-new-btn").addEventListener("click", async () => {
+  try {
+    $("terminal-output").innerHTML = "";
+    terminalCwd = "";
+    await ensureTerminalReady();
+    $("terminal-input").focus();
+  } catch (error) {
+    appendTerminalLine(error.message, "stderr");
+    toast(error.message);
+  }
+});
+
+$("terminal-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const command = $("terminal-input").value;
+  $("terminal-input").value = "";
+  void runTerminalCommand(command);
+});
+
 $("session-select").addEventListener("change", async () => {
   try {
     await loadSession($("session-select").value);
-  } catch (error) {
-    toast(error.message);
-  }
-});
-
-$("new-session-btn").addEventListener("click", () => {
-  currentSessionId = "";
-  $("session-select").value = "";
-  localStorage.removeItem(lastSessionStorageKey());
-  syncSessionListActive();
-  loadPinnedContextFiles("");
-  clearChat();
-  $("chat-prompt").focus();
-});
-
-$("rename-session-btn").addEventListener("click", async () => {
-  try {
-    if (!currentSessionId) throw new Error("No session selected");
-    const currentTitle = $("session-select").selectedOptions[0]?.textContent || "";
-    const title = window.prompt("Session name", currentTitle);
-    if (!title || !title.trim()) return;
-    const payload = await api(
-      "/api/session-rename",
-      form({ session_id: currentSessionId, title: title.trim() }),
-    );
-    await loadSessions(payload.session.id, false);
-    toast("Session renamed");
-  } catch (error) {
-    toast(error.message);
-  }
-});
-
-$("delete-session-btn").addEventListener("click", async () => {
-  try {
-    if (!currentSessionId) throw new Error("No session selected");
-    if (!window.confirm("Delete this session?")) return;
-    await api("/api/session-delete", form({ session_id: currentSessionId }));
-    localStorage.removeItem(lastSessionStorageKey());
-    currentSessionId = "";
-    clearChat();
-    await loadSessions("", false);
-    toast("Session deleted");
   } catch (error) {
     toast(error.message);
   }
@@ -1189,45 +1595,6 @@ $("chat-prompt").addEventListener("keydown", (event) => {
   if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
   event.preventDefault();
   void sendChatPrompt();
-});
-
-$("propose-command-btn").addEventListener("click", async () => {
-  try {
-    const payload = await api(
-      "/api/propose-command",
-      form({ repo: requireRepo(), command: $("command-input").value }),
-    );
-    currentCommandProposalId = payload.proposalId;
-    $("command-output").textContent = payload.prompt;
-  } catch (error) {
-    toast(error.message);
-  }
-});
-
-$("run-command-btn").addEventListener("click", async () => {
-  try {
-    if (!currentCommandProposalId) throw new Error("No command proposal selected");
-    const payload = await api(
-      "/api/run-command",
-      form({ repo: requireRepo(), proposal_id: currentCommandProposalId }),
-    );
-    $("command-output").textContent = JSON.stringify(payload, null, 2);
-  } catch (error) {
-    toast(error.message);
-  }
-});
-
-$("reject-command-btn").addEventListener("click", async () => {
-  try {
-    if (!currentCommandProposalId) throw new Error("No command proposal selected");
-    const payload = await api(
-      "/api/reject-command",
-      form({ repo: requireRepo(), proposal_id: currentCommandProposalId }),
-    );
-    $("command-output").textContent = JSON.stringify(payload, null, 2);
-  } catch (error) {
-    toast(error.message);
-  }
 });
 
 $("config-load-btn").addEventListener("click", async () => {
