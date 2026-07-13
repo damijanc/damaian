@@ -99,6 +99,27 @@ The generated artifacts are written to:
 
 The current package is unsigned and not notarized. macOS may require the `Privacy & Security` `Open Anyway` flow described in [macOS Installation](docs/MACOS_INSTALLATION.md).
 
+## GitHub macOS Release Build
+
+The repository includes a GitHub Actions workflow at `.github/workflows/macos-dmg.yml`.
+
+To build DMGs manually:
+
+1. Open the repository on GitHub.
+2. Go to `Actions`.
+3. Select `Build macOS DMG`.
+4. Select `Run workflow`.
+5. Download the `Damaian-macOS-arm64-DMG` and `Damaian-macOS-x64-DMG` artifacts from the completed run.
+
+To create a GitHub Release with DMG assets, push a version tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow builds unsigned Apple Silicon and Intel DMGs, then attaches them to the GitHub Release for that tag.
+
 ## User Documentation
 
 - [Damaian User Guide](docs/USER_GUIDE.md)
