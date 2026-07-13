@@ -109,7 +109,7 @@ To build DMGs manually:
 2. Go to `Actions`.
 3. Select `Build macOS DMG`.
 4. Select `Run workflow`.
-5. Download the `Damaian-macOS-arm64-DMG` and `Damaian-macOS-x64-DMG` artifacts from the completed run.
+5. Download the `Damaian-macOS-arm64-DMG` artifact from the completed run.
 
 To create a GitHub Release with DMG assets, push a version tag:
 
@@ -118,7 +118,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The workflow builds unsigned Apple Silicon and Intel DMGs, then attaches them to the GitHub Release for that tag.
+The workflow builds an unsigned Apple Silicon DMG, then attaches it to the GitHub Release for that tag.
 
 ## User Documentation
 

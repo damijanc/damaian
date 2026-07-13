@@ -12,20 +12,10 @@ concurrency:
 
 jobs:
   build:
-    name: Build ${{ matrix.label }} DMG
-    runs-on: ${{ matrix.runner }}
+    name: Build Apple Silicon DMG
+    runs-on: macos-latest
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: Apple Silicon
-            runner: macos-latest
-            artifact: Damaian-macOS-arm64-DMG
-          - label: Intel
-            runner: macos-15-intel
-            artifact: Damaian-macOS-x64-DMG
 
     steps:
       - name: Check out repository
@@ -80,7 +70,7 @@ jobs:
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: Damaian-macOS-arm64-DMG
           path: target/release/bundle/dmg/*.dmg
           if-no-files-found: error
 
@@ -96,9 +86,8 @@ jobs:
       - name: Download DMG artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: Damaian-macOS-*-DMG
+          name: Damaian-macOS-arm64-DMG
           path: release-artifacts
-          merge-multiple: true
 
       - name: Publish release assets
         env:
