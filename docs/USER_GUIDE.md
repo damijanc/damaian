@@ -36,6 +36,8 @@ Use the `Chat` tab to ask questions about the selected repository. Damaian retri
 
 Press `Enter` to send a chat message. Press `Shift+Enter` to insert a new line.
 
+Questions stream read-only answers. Code and file change requests, such as `create a test file` or `update the README`, generate an inline patch preview in the conversation.
+
 Use `+ File` above the prompt to pin specific repository files into the next chat request. Pinned files appear as chips above the prompt and are included before automatic retrieval. Use the `x` on a chip to remove one file, or `Clear` to remove all pinned files.
 
 If you name a file in your prompt, such as `USER_GUIDE.md` or `docs/USER_GUIDE.md`, Damaian attempts to include that file in the model context. A filename without a directory must uniquely match one file in the selected repository.
@@ -44,16 +46,14 @@ Use `New`, `Rename`, and `Delete` to manage project-scoped chat sessions. Select
 
 Context file buttons open the referenced file in Visual Studio Code.
 
-## Edits
+## File Changes
 
-Use the `Edits` tab to preview and apply generated file changes.
+Use the conversation box to request file changes.
 
-1. Enter a short request in `Describe the change`.
-2. Paste a model edit envelope into the larger text area.
-3. Select `Preview` to generate a diff.
-4. Review each file diff.
-5. Keep checked only the files you want to act on.
-6. Select `Apply Selected` to write those files, or `Reject Selected` to record selected files as rejected without changing the workspace.
+1. Enter a request such as `create a test file for the config parser`.
+2. Review the inline patch preview returned by the assistant.
+3. Keep checked only the files you want to act on.
+4. Select `Apply Selected` to write those files, or `Reject Selected` to record selected files as rejected without changing the workspace.
 
 Damaian checks file hashes before applying a stored patch. If a target file changed after preview, that file is blocked instead of overwriting newer local work.
 

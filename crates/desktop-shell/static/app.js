@@ -1,7 +1,5 @@
 const $ = (id) => document.getElementById(id);
 
-let currentPatchId = "";
-let currentPatchFiles = [];
 let currentCommandProposalId = "";
 let currentSessionId = "";
 let apiToken = "";
@@ -671,76 +669,196 @@ function syncSessionListActive() {
   });
 }
 
-function renderPatchFiles() {
-  const container = $("diff-output");
-  container.innerHTML = "";
-  if (!currentPatchFiles.length) {
-    const empty = document.createElement("p");
-    empty.className = "empty-state";
-    empty.textContent = "No patch preview loaded.";
-    container.append(empty);
-    return;
+function diffStats(diff) {
+  return String(diff || "")
+    .split(/\r?\n/)
+    .reduce(
+      (stats, line) => {
+        if (line.startsWith("+") && !line.startsWith("+++")) stats.additions += 1;
+        if (line.startsWith("-") && !line.startsWith("---")) stats.deletions += 1;
+        return stats;
+      },
+      { additions: 0, deletions: 0 },
+    );
+}
+
+function diffLineClass(line) {
+  if (line.startsWith("@@")) return "hunk";
+  if (line.startsWith("diff --git") || line.startsWith("index ")) return "file";
+  if (line.startsWith("+++") || line.startsWith("---")) return "file";
+  if (line.startsWith("+")) return "addition";
+  if (line.startsWith("-")) return "deletion";
+  return "context";
+}
+
+function renderColoredDiff(diff) {
+  const view = document.createElement("div");
+  view.className = "diff-view";
+  const lines = String(diff || "").replace(/\n$/, "").split(/\r?\n/);
+  if (lines.length === 1 && !lines[0]) {
+    const empty = document.createElement("div");
+    empty.className = "diff-line context";
+    empty.textContent = "No textual diff.";
+    view.append(empty);
+    return view;
+  }
+  lines.forEach((line) => {
+    const row = document.createElement("div");
+    row.className = `diff-line ${diffLineClass(line)}`;
+    row.textContent = line || " ";
+    view.append(row);
+  });
+  return view;
+}
+
+function createPatchPreview(payload, patchRepo) {
+  const state = {
+    patchId: payload.patchId,
+    files: (payload.files || []).map((file) => {
+      const stats = diffStats(file.diff);
+      return {
+        path: file.path,
+        status: file.status,
+        diff: file.diff,
+        additions: stats.additions,
+        deletions: stats.deletions,
+        selected: true,
+        state: "pending",
+      };
+    }),
+  };
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "patch-preview";
+
+  const header = document.createElement("div");
+  header.className = "patch-preview-header";
+  const title = document.createElement("strong");
+  title.textContent = payload.summary || "Patch preview";
+  const meta = document.createElement("span");
+  meta.textContent = state.patchId;
+  header.append(title, meta);
+
+  const actions = document.createElement("div");
+  actions.className = "inline-actions patch-actions";
+  const applyButton = document.createElement("button");
+  applyButton.type = "button";
+  applyButton.textContent = "Apply Selected";
+  const rejectButton = document.createElement("button");
+  rejectButton.type = "button";
+  rejectButton.textContent = "Reject Selected";
+  actions.append(applyButton, rejectButton);
+
+  const list = document.createElement("div");
+  list.className = "diff-list";
+  wrapper.append(header, actions, list);
+
+  function selectedPendingPaths() {
+    return state.files
+      .filter((file) => file.state === "pending" && file.selected)
+      .map((file) => file.path);
   }
 
-  currentPatchFiles.forEach((file) => {
-    const card = document.createElement("article");
-    card.className = `diff-card ${file.state}`;
-
-    const header = document.createElement("div");
-    header.className = "diff-card-header";
-
-    const label = document.createElement("label");
-    label.className = "diff-file-select";
-    const checkbox = document.createElement("input");
-    checkbox.type = "checkbox";
-    checkbox.checked = file.selected;
-    checkbox.disabled = file.state !== "pending";
-    checkbox.addEventListener("change", () => {
-      file.selected = checkbox.checked;
+  function markFiles(paths, nextState) {
+    state.files.forEach((file) => {
+      if (paths.includes(file.path)) {
+        file.state = nextState;
+        file.selected = false;
+      }
     });
-    const name = document.createElement("span");
-    name.textContent = file.path;
-    label.append(checkbox, name);
+    render();
+  }
 
-    const meta = document.createElement("span");
-    meta.className = "diff-state";
-    meta.textContent = file.state === "pending" ? file.status : file.state;
+  function render() {
+    list.innerHTML = "";
+    if (!state.files.length) {
+      const empty = document.createElement("p");
+      empty.className = "empty-state";
+      empty.textContent = "No patch files returned.";
+      list.append(empty);
+    }
 
-    const pre = document.createElement("pre");
-    pre.className = "diff-pre";
-    pre.textContent = file.diff;
+    state.files.forEach((file) => {
+      const card = document.createElement("article");
+      card.className = `diff-card ${file.state}`;
 
-    header.append(label, meta);
-    card.append(header, pre);
-    container.append(card);
-  });
-}
+      const cardHeader = document.createElement("div");
+      cardHeader.className = "diff-card-header";
 
-function setPatchFiles(files = []) {
-  currentPatchFiles = files.map((file) => ({
-    path: file.path,
-    status: file.status,
-    diff: file.diff,
-    selected: true,
-    state: "pending",
-  }));
-  renderPatchFiles();
-}
+      const label = document.createElement("label");
+      label.className = "diff-file-select";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = file.selected;
+      checkbox.disabled = file.state !== "pending";
+      checkbox.addEventListener("change", () => {
+        file.selected = checkbox.checked;
+      });
+      const name = document.createElement("span");
+      name.textContent = file.path;
+      label.append(checkbox, name);
 
-function selectedPendingPatchPaths() {
-  return currentPatchFiles
-    .filter((file) => file.state === "pending" && file.selected)
-    .map((file) => file.path);
-}
+      const fileState = document.createElement("span");
+      fileState.className = "diff-state";
+      fileState.textContent = file.state === "pending" ? file.status : file.state;
 
-function markPatchFiles(paths, state) {
-  currentPatchFiles.forEach((file) => {
-    if (paths.includes(file.path)) {
-      file.state = state;
-      file.selected = false;
+      const stats = document.createElement("span");
+      stats.className = "diff-stats";
+      stats.textContent = `+${file.additions} -${file.deletions}`;
+
+      const meta = document.createElement("div");
+      meta.className = "diff-meta";
+      meta.append(stats, fileState);
+
+      cardHeader.append(label, meta);
+      card.append(cardHeader, renderColoredDiff(file.diff));
+      list.append(card);
+    });
+
+    const hasPending = state.files.some((file) => file.state === "pending");
+    applyButton.disabled = !hasPending;
+    rejectButton.disabled = !hasPending;
+    $("chat-log").scrollTop = $("chat-log").scrollHeight;
+  }
+
+  applyButton.addEventListener("click", async () => {
+    try {
+      const paths = selectedPendingPaths();
+      if (!paths.length) throw new Error("No pending patch files selected");
+      applyButton.disabled = true;
+      const result = await api(
+        "/api/apply-patch",
+        form({ repo: patchRepo, patch_id: state.patchId, paths: paths.join("\n") }),
+      );
+      const applied = result.appliedFiles || [];
+      markFiles(applied, "applied");
+      toast(`Applied ${applied.length} file(s)`);
+    } catch (error) {
+      toast(error.message);
+      render();
     }
   });
-  renderPatchFiles();
+
+  rejectButton.addEventListener("click", async () => {
+    try {
+      const paths = selectedPendingPaths();
+      if (!paths.length) throw new Error("No pending patch files selected");
+      rejectButton.disabled = true;
+      const result = await api(
+        "/api/reject-patch-files",
+        form({ repo: patchRepo, patch_id: state.patchId, paths: paths.join("\n") }),
+      );
+      const rejected = result.rejectedFiles || [];
+      markFiles(rejected, "rejected");
+      toast(`Rejected ${rejected.length} file(s)`);
+    } catch (error) {
+      toast(error.message);
+      render();
+    }
+  });
+
+  render();
+  return wrapper;
 }
 
 async function loadSessions(preferredSessionId = "", reloadSelected = false) {
@@ -970,6 +1088,40 @@ $("delete-session-btn").addEventListener("click", async () => {
   }
 });
 
+function looksLikeEditRequest(prompt) {
+  const text = prompt.trim().toLowerCase();
+  if (!text) return false;
+  if (/^(how\s+(do|can|would|should)\s+i|how\s+to|what\s+is|why\b|where\b)/.test(text)) {
+    return false;
+  }
+  const editVerb =
+    /\b(add|create|write|generate|implement|modify|update|change|fix|refactor|remove|delete|make)\b/;
+  const codeTarget =
+    /\b(file|test|code|function|component|class|module|endpoint|api|route|ui|layout|style|css|html|javascript|typescript|rust|readme|doc|docs|config|script|bug|issue|error)\b/;
+  return editVerb.test(text) && codeTarget.test(text);
+}
+
+async function proposePatchFromChat(prompt, assistantMessage) {
+  updateChatMessage(assistantMessage, "Generating a patch preview...");
+  setChatStatus("Generating patch", "running");
+  const patchRepo = requireRepo();
+  const payload = await api(
+    "/api/propose-edit",
+    form({
+      repo: patchRepo,
+      prompt,
+      context_files: pinnedContextFiles.join("\n"),
+    }),
+  );
+  updateChatMessage(
+    assistantMessage,
+    `Prepared a patch preview for \`${payload.patchId}\`. Review the diff and apply selected files when ready.`,
+  );
+  assistantMessage.body.append(createPatchPreview(payload, patchRepo));
+  renderContextFiles(payload.contextFiles || []);
+  setChatStatus("Patch ready", "warn");
+}
+
 async function sendChatPrompt() {
   const button = $("ask-btn");
   let streamError = null;
@@ -982,6 +1134,11 @@ async function sendChatPrompt() {
     await ensureDesktopApiReady();
     appendChatMessage("user", prompt);
     const assistantMessage = appendChatMessage("assistant", "");
+    if (looksLikeEditRequest(prompt)) {
+      await proposePatchFromChat(prompt, assistantMessage);
+      $("chat-prompt").value = "";
+      return;
+    }
     let assistantText = "";
     setChatStatus("Thinking", "running");
 
@@ -1032,56 +1189,6 @@ $("chat-prompt").addEventListener("keydown", (event) => {
   if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
   event.preventDefault();
   void sendChatPrompt();
-});
-
-$("propose-edit-btn").addEventListener("click", async () => {
-  try {
-    const payload = await api(
-      "/api/propose-edit",
-      form({
-        repo: requireRepo(),
-        prompt: $("edit-prompt").value,
-        model_output: $("edit-model-output").value,
-      }),
-    );
-    currentPatchId = payload.patchId;
-    setPatchFiles(payload.files || []);
-    toast(`Patch ${payload.patchId}`);
-  } catch (error) {
-    toast(error.message);
-  }
-});
-
-$("apply-patch-btn").addEventListener("click", async () => {
-  try {
-    if (!currentPatchId) throw new Error("No patch selected");
-    const paths = selectedPendingPatchPaths();
-    if (!paths.length) throw new Error("No pending patch files selected");
-    const payload = await api(
-      "/api/apply-patch",
-      form({ repo: requireRepo(), patch_id: currentPatchId, paths: paths.join("\n") }),
-    );
-    markPatchFiles(payload.appliedFiles || [], "applied");
-    toast(`Applied ${payload.appliedFiles.length} file(s)`);
-  } catch (error) {
-    toast(error.message);
-  }
-});
-
-$("reject-patch-btn").addEventListener("click", async () => {
-  try {
-    if (!currentPatchId) throw new Error("No patch selected");
-    const paths = selectedPendingPatchPaths();
-    if (!paths.length) throw new Error("No pending patch files selected");
-    const payload = await api(
-      "/api/reject-patch-files",
-      form({ repo: requireRepo(), patch_id: currentPatchId, paths: paths.join("\n") }),
-    );
-    markPatchFiles(payload.rejectedFiles || [], "rejected");
-    toast(`Rejected ${payload.rejectedFiles.length} file(s)`);
-  } catch (error) {
-    toast(error.message);
-  }
 });
 
 $("propose-command-btn").addEventListener("click", async () => {

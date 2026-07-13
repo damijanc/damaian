@@ -115,7 +115,7 @@
             <textarea
               id="chat-prompt"
               rows="4"
-              placeholder="Ask about this repository"
+              placeholder="Ask a question or request a file change"
             ></textarea>
             <button id="ask-btn" class="send-button" type="button" aria-label="Send message">
               <span class="send-icon" aria-hidden="true"></span>
@@ -126,33 +126,11 @@
 
       <aside id="inspector" class="inspector">
         <nav class="tabs inspector-tabs" aria-label="Inspector views">
-          <button class="tab active" data-tab="edits" type="button">Edits</button>
-          <button class="tab" data-tab="commands" type="button">Commands</button>
+          <button class="tab active" data-tab="commands" type="button">Commands</button>
           <button class="tab" data-tab="settings" type="button">Settings</button>
         </nav>
 
-        <section id="edits" class="view active">
-          <div class="inspector-section">
-            <h2>Edit Proposal</h2>
-            <textarea id="edit-prompt" rows="3" placeholder="Describe the change"></textarea>
-            <textarea
-              id="edit-model-output"
-              rows="9"
-              placeholder="DAMAIAN_EDIT_V1&#10;SUMMARY: ...&#10;FILE: src/app.js&#10;STATUS: modified&#10;CONTENT:&#10;...&#10;END_FILE&#10;END_PATCH"
-            ></textarea>
-            <button id="propose-edit-btn" type="button">Preview</button>
-            <div class="inline-actions">
-              <button id="apply-patch-btn" type="button">Apply Selected</button>
-              <button id="reject-patch-btn" type="button">Reject Selected</button>
-            </div>
-          </div>
-          <div class="inspector-section grow">
-            <h2>Diff</h2>
-            <div id="diff-output" class="diff-list"></div>
-          </div>
-        </section>
-
-        <section id="commands" class="view">
+        <section id="commands" class="view active">
           <div class="inspector-section">
             <h2>Command Approval</h2>
             <input id="command-input" type="text" placeholder="npm test" />

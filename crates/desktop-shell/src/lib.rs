@@ -6,9 +6,8 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use workspace_engine::{
-    ChatMessage, ChatTurnResult, Config, CurlModelTransport, MockModelAdapter,
-    OpenAICompatibleAdapter, ProposedFilePatch, Session, WorkspaceEngine, command_approval_prompt,
-    patch_diff_text,
+    ChatMessage, ChatTurnResult, Config, CurlModelTransport, OpenAICompatibleAdapter,
+    ProposedFilePatch, Session, WorkspaceEngine, command_approval_prompt, patch_diff_text,
 };
 
 mod keychain;
@@ -405,12 +404,18 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             let form = parse_form(&request.body);
             let repo = required_form(&form, "repo")?;
             let prompt = required_form(&form, "prompt")?;
-            let mock_response = required_form(&form, "model_output")?;
             let engine = engine_for_repo(&repo)?;
-            let mut adapter = MockModelAdapter::new(mock_response);
+            let context_files = form
+                .get("context_files")
+                .map(|value| validate_context_files(&engine, &repo, value))
+                .transpose()?
+                .unwrap_or_default();
+            let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
+            let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
+            let mut adapter = OpenAICompatibleAdapter::new(&engine.config.model_name, transport);
             let result = engine
                 .edit_orchestrator
-                .propose_edit(&repo, &prompt, &[], &mut adapter)
+                .propose_edit(&repo, &prompt, &context_files, &mut adapter)
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
