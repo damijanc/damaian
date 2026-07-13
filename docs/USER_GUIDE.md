@@ -2,7 +2,7 @@
 
 Damaian is a local-first AI coding assistant for macOS. It indexes a local Git repository, prepares focused context for coding questions, previews generated edits as diffs, runs approved commands, and records local audit data.
 
-This build is a developer preview. It is usable for local workflows, but it does not yet include Keychain-backed API key storage, automatic updates, code signing, or notarization.
+This build is a developer preview. It is usable for local workflows, but it does not yet include automatic updates, code signing, or notarization.
 
 ## First Run
 
@@ -36,6 +36,8 @@ Use the `Chat` tab to ask questions about the selected repository. Damaian retri
 
 Press `Enter` to send a chat message. Press `Shift+Enter` to insert a new line.
 
+Use `+ File` above the prompt to pin specific repository files into the next chat request. Pinned files appear as chips above the prompt and are included before automatic retrieval. Use the `x` on a chip to remove one file, or `Clear` to remove all pinned files.
+
 If you name a file in your prompt, such as `USER_GUIDE.md` or `docs/USER_GUIDE.md`, Damaian attempts to include that file in the model context. A filename without a directory must uniquely match one file in the selected repository.
 
 Use `New`, `Rename`, and `Delete` to manage project-scoped chat sessions. Selecting an existing session reloads its conversation and future questions continue with recent prior messages as context.
@@ -68,9 +70,11 @@ Destructive or shell-control-heavy commands are blocked or approval-gated by def
 
 ## Settings
 
-Use the `Settings` tab to inspect and edit configuration values. Choose `User` for global settings or `Repository` for settings stored in the selected working folder, then select `Load`.
+Use the `Settings` tab to inspect and edit user configuration values, then select `Load`.
 
-Configuration uses one `key=value` entry per line. Edit values directly and select `Save`. Delete a line and save to remove that override from the selected scope.
+Configuration uses one `key=value` entry per line. Edit values directly and select `Save`. Delete a line and save to remove that user-level override.
+
+`model_api_key_env` is a reference field. The app rejects raw API keys in this field; use the `Model API Key` controls to store the secret in Keychain.
 
 Common keys:
 
@@ -79,17 +83,42 @@ Common keys:
 - `audit_enabled`: Set to `true` or `false`.
 - `model_base_url`: OpenAI-compatible API base URL.
 - `model_name`: Model identifier.
-- `model_api_key_env`: Environment variable name used for the API key.
+- `model_api_key_env`: API key reference. Use `keychain:model-api-key` for the desktop Keychain flow, or an environment variable name for CLI/dev workflows.
 
-Repository-scoped settings are stored at `.damaian/config.conf` inside the selected repository. User-scoped settings apply across repositories.
+Repository-scoped settings are not edited from the UI. Put repository defaults in `.damaian/config.conf` inside the selected repository. Repository settings are included in `Effective Policy` and can override user settings.
 
 ## Model Providers and API Keys
 
 Damaian uses OpenAI-compatible chat APIs. Configure the provider URL and model in Settings, but do not paste the API key into the configuration file.
 
-`model_api_key_env` must be the name of an environment variable that contains the key. It is not the key itself.
+In the desktop app, use the `Model API Key` controls in Settings:
+
+1. Enter a Keychain account name, such as `model-api-key`.
+2. Paste the API key into `API Key`.
+3. Select `Save Key`.
+
+Damaian stores the secret in macOS Keychain and writes only this reference to config:
+
+```text
+model_api_key_env=keychain:model-api-key
+```
+
+Use `Remove Key` to delete the stored secret from Keychain. Saving a new key with the same account replaces the previous value.
+
+If `Effective Policy` still shows a different `model_api_key_env` after saving the key, a repository or admin config is overriding the user setting. Remove or update that override before retrying chat.
+
+Environment variables remain supported for CLI and development workflows. In that mode, `model_api_key_env` is the name of an environment variable that contains the key. It is not the key itself.
 
 Example DeepSeek configuration:
+
+```text
+model_provider=deepseek
+model_name=deepseek-v4-flash
+model_base_url=https://api.deepseek.com
+model_api_key_env=keychain:model-api-key
+```
+
+For environment-variable based development, use:
 
 ```text
 model_provider=deepseek
@@ -98,7 +127,7 @@ model_base_url=https://api.deepseek.com
 model_api_key_env=DEEPSEEK_API_KEY
 ```
 
-Launch the app from a shell where that environment variable is set:
+Then launch the app from a shell where that environment variable is set:
 
 ```sh
 export DEEPSEEK_API_KEY="your-deepseek-api-key"
@@ -111,7 +140,7 @@ Or set it for one launch:
 DEEPSEEK_API_KEY="your-deepseek-api-key" npm run desktop:dev
 ```
 
-The same pattern applies to OpenAI or any OpenAI-compatible provider. For example, use `model_api_key_env=OPENAI_API_KEY` and set `OPENAI_API_KEY` before launching.
+The same pattern applies to OpenAI or any OpenAI-compatible provider.
 
 ## Local Data
 
@@ -150,7 +179,7 @@ Damaian keeps the local app in control of important effects:
 
 If the app shows `Repository is required`, enter an absolute repository path in the sidebar.
 
-If model calls fail, confirm that `model_api_key_env` names an environment variable and that the variable is set before launching the app.
+If model calls fail, open Settings and confirm the `Model API Key` status is `Saved`, or confirm that `model_api_key_env` names an environment variable and that the variable is set before launching the app.
 
 If a command is blocked, inspect the command proposal text. Update `command_allowlist` only for commands you trust in that repository.
 

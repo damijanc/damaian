@@ -483,6 +483,80 @@ button:disabled {
   padding: 14px clamp(18px, 5vw, 72px) 18px;
 }
 
+.composer-context {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.composer-context-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.composer-context-header span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.composer-context-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.composer-context-actions button {
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+.pinned-context-files {
+  min-height: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.context-chip {
+  max-width: min(360px, 100%);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  color: var(--ink);
+  padding: 4px 7px 4px 9px;
+}
+
+.context-chip span {
+  overflow: hidden;
+  color: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.context-chip button {
+  width: 18px;
+  height: 18px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  padding: 0;
+}
+
+.context-chip button:hover {
+  background: var(--line);
+  color: var(--ink);
+}
+
 .prompt-box {
   position: relative;
 }
@@ -612,6 +686,39 @@ button:disabled {
 
 .path-line {
   word-break: break-word;
+}
+
+.model-key-panel {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 10px;
+}
+
+.key-status {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 8px;
+}
+
+.key-status[data-state="ok"] {
+  border-color: #8dbda5;
+  color: var(--ok);
+}
+
+.key-status[data-state="warn"] {
+  border-color: #d7a66d;
+  color: var(--warn);
+}
+
+.key-status[data-state="error"] {
+  border-color: #d89999;
+  color: var(--danger);
 }
 
 .context-list {
