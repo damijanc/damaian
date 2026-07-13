@@ -236,6 +236,36 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 ),
             )
         }
+        ("GET", "/api/terminal-cwd") => {
+            let repo = request.param("repo").unwrap_or_default();
+            let cwd = terminal_cwd_for_repo(&repo)?;
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &format!("{{\"cwd\":\"{}\"}}", escape_json(&cwd.to_string_lossy())),
+            )
+        }
+        ("POST", "/api/terminal-run") => {
+            let form = parse_form(&request.body);
+            let cwd = form.get("cwd").cloned().unwrap_or_default();
+            let command = required_form(&form, "command")?;
+            let result = run_terminal_command(&cwd, &command)?;
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &format!(
+                    "{{\"cwd\":\"{}\",\"exitCode\":{},\"stdout\":\"{}\",\"stderr\":\"{}\"}}",
+                    escape_json(&result.cwd.to_string_lossy()),
+                    result.exit_code,
+                    escape_json(&result.stdout),
+                    escape_json(&result.stderr)
+                ),
+            )
+        }
         ("GET", "/api/sessions") => {
             let repo = required_param(&request, "repo")?;
             let engine = engine_for_repo(&repo)?;
@@ -854,6 +884,135 @@ fn validate_workspace_path(repo: &str, relative_path: &str) -> Result<PathBuf, S
     Ok(path)
 }
 
+#[derive(Debug, Clone)]
+struct TerminalCommandResult {
+    cwd: PathBuf,
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+fn terminal_cwd_for_repo(repo: &str) -> Result<PathBuf, String> {
+    if repo.trim().is_empty() {
+        home_dir()
+    } else {
+        validate_working_folder(repo)
+    }
+}
+
+fn run_terminal_command(cwd: &str, command: &str) -> Result<TerminalCommandResult, String> {
+    let cwd = resolve_terminal_cwd(cwd)?;
+    let command = command.trim();
+    if command.is_empty() {
+        return Err("terminal command is required".to_string());
+    }
+
+    if let Some(target) = parse_terminal_cd(command) {
+        let cwd = resolve_terminal_target(&cwd, &target)?;
+        return Ok(TerminalCommandResult {
+            cwd,
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+    }
+
+    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let output = Command::new(shell)
+        .arg("-lc")
+        .arg(command)
+        .current_dir(&cwd)
+        .output()
+        .map_err(|error| format!("failed to run terminal command: {error}"))?;
+    Ok(TerminalCommandResult {
+        cwd,
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+fn parse_terminal_cd(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    if trimmed == "cd" {
+        return Some(String::new());
+    }
+    let target = trimmed.strip_prefix("cd ")?;
+    if target.contains(';')
+        || target.contains('|')
+        || target.contains("&&")
+        || target.contains("||")
+    {
+        return None;
+    }
+    Some(unquote_terminal_path(target.trim()))
+}
+
+fn unquote_terminal_path(value: &str) -> String {
+    let quoted = (value.starts_with('"') && value.ends_with('"'))
+        || (value.starts_with('\'') && value.ends_with('\''));
+    if quoted && value.len() >= 2 {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn resolve_terminal_cwd(cwd: &str) -> Result<PathBuf, String> {
+    if cwd.trim().is_empty() {
+        return home_dir();
+    }
+    let path =
+        fs::canonicalize(cwd).map_err(|error| format!("terminal cwd does not exist: {error}"))?;
+    if path.is_dir() {
+        Ok(path)
+    } else {
+        Err("terminal cwd must be a directory".to_string())
+    }
+}
+
+fn resolve_terminal_target(cwd: &Path, target: &str) -> Result<PathBuf, String> {
+    let target = target.trim();
+    let path = if target.is_empty() {
+        home_dir()?
+    } else {
+        let expanded = expand_home_path(target)?;
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            cwd.join(expanded)
+        }
+    };
+    let path = fs::canonicalize(path)
+        .map_err(|error| format!("terminal target does not exist: {error}"))?;
+    if path.is_dir() {
+        Ok(path)
+    } else {
+        Err("terminal target must be a directory".to_string())
+    }
+}
+
+fn expand_home_path(value: &str) -> Result<PathBuf, String> {
+    if value == "~" {
+        return home_dir();
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        return Ok(home_dir()?.join(rest));
+    }
+    Ok(PathBuf::from(value))
+}
+
+fn home_dir() -> Result<PathBuf, String> {
+    let home = env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    let path = fs::canonicalize(home)
+        .map_err(|error| format!("home directory is unavailable: {error}"))?;
+    if path.is_dir() {
+        Ok(path)
+    } else {
+        Err("HOME must point to a directory".to_string())
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn launch_vscode(path: &Path) -> Result<(), String> {
     let status = Command::new("open")
@@ -1318,8 +1477,9 @@ fn escape_json(value: &str) -> String {
 mod tests {
     use super::{
         Request, allowed_cors_origin, desktop_settings_config_path, effective_policy_for_repo,
-        keychain, parse_form, parse_path_list, percent_decode, require_api_token, save_config_file,
-        validate_context_files, validate_working_folder, validate_workspace_path,
+        keychain, parse_form, parse_path_list, percent_decode, require_api_token,
+        run_terminal_command, save_config_file, terminal_cwd_for_repo, validate_context_files,
+        validate_working_folder, validate_workspace_path,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -1565,6 +1725,39 @@ mod tests {
             "workspace path must stay inside the selected repository"
         );
         fs::remove_file(outside).unwrap();
+    }
+
+    #[test]
+    fn terminal_cwd_uses_selected_working_folder() {
+        let repo = temp_path("terminal-cwd");
+        fs::create_dir_all(&repo).unwrap();
+
+        assert_eq!(
+            terminal_cwd_for_repo(repo.to_str().unwrap()).unwrap(),
+            fs::canonicalize(&repo).unwrap()
+        );
+    }
+
+    #[test]
+    fn terminal_cd_updates_cwd_without_shelling_out() {
+        let repo = temp_path("terminal-cd");
+        fs::create_dir_all(repo.join("child")).unwrap();
+
+        let result = run_terminal_command(repo.to_str().unwrap(), "cd child").unwrap();
+
+        assert_eq!(result.cwd, fs::canonicalize(repo.join("child")).unwrap());
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.is_empty());
+    }
+
+    #[test]
+    fn terminal_rejects_missing_cwd() {
+        let cwd = temp_path("terminal-missing");
+
+        let error = run_terminal_command(cwd.to_str().unwrap(), "pwd").unwrap_err();
+
+        assert!(error.contains("terminal cwd does not exist"));
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
