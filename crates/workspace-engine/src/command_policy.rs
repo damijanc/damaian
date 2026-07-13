@@ -237,6 +237,8 @@ fn is_low_risk_read_only(command: &str) -> bool {
         || command.starts_with("git diff ")
         || command == "git log"
         || command.starts_with("git log ")
+        || command == "git show"
+        || command.starts_with("git show ")
 }
 
 fn is_validation_command(command: &str) -> bool {

@@ -68,14 +68,24 @@ pub trait ModelAdapter {
 
 #[derive(Debug, Clone)]
 pub struct MockModelAdapter {
-    response: String,
+    responses: Vec<String>,
+    next_response: usize,
     cancelled: Vec<String>,
 }
 
 impl MockModelAdapter {
     pub fn new(response: impl Into<String>) -> Self {
         Self {
-            response: response.into(),
+            responses: vec![response.into()],
+            next_response: 0,
+            cancelled: Vec::new(),
+        }
+    }
+
+    pub fn new_sequence(responses: Vec<String>) -> Self {
+        Self {
+            responses,
+            next_response: 0,
             cancelled: Vec::new(),
         }
     }
@@ -90,7 +100,16 @@ impl ModelAdapter for MockModelAdapter {
         let run_id = create_id("modelrun");
         let started_at_ms = now_millis();
         let mut content = String::new();
-        for chunk in self.response.as_bytes().chunks(24) {
+        let response = self
+            .responses
+            .get(self.next_response)
+            .or_else(|| self.responses.last())
+            .cloned()
+            .unwrap_or_default();
+        if self.next_response + 1 < self.responses.len() {
+            self.next_response += 1;
+        }
+        for chunk in response.as_bytes().chunks(24) {
             if self.cancelled.contains(&run_id) {
                 break;
             }
