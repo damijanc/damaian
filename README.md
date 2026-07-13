@@ -14,12 +14,14 @@ This repository currently implements the workspace-engine slice from the product
 - provider-isolated model adapter interfaces
 - dependency-free local desktop shell prototype served over localhost
 - native Tauri desktop wrapper with macOS folder picker
+- Projects sidebar with folder-grouped chat sessions
 - one-click handoff from the selected working folder to Visual Studio Code
+- embedded bottom terminal panel for user-run commands
 - session-aware desktop chat with streamed responses and context file links
 - per-file edit diff review with selected-file apply/reject
 - macOS Keychain-backed model API key storage from desktop settings
 
-The macOS desktop shell can layer on top of these services without taking over file access, command execution, patching, or audit decisions.
+The macOS desktop shell layers on top of these services while keeping AI file edits behind explicit preview/apply approval.
 
 ## Commands
 

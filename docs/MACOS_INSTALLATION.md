@@ -32,17 +32,13 @@ Only do this for builds you created yourself or received from a trusted source.
 
 ## Selecting a Working Folder
 
-Select `Choose` beside the `Repository` field to open the native macOS folder picker. Pick the local Git repository or working folder you want Damaian to inspect.
-
-You can still enter an absolute path manually:
-
-```text
-/Users/your-name/development/my-project
-```
+Select `+` beside `Projects` to open the native macOS folder picker. Pick the local Git repository or working folder you want Damaian to inspect. The folder appears under `Projects`, and its chat sessions are grouped underneath it. Use the `+` beside a project folder to start a new session for that project.
 
 Then select `Status` to confirm Damaian can inspect the repository.
 
 Select the Visual Studio Code icon in the conversation header to open the selected working folder in Visual Studio Code. Damaian keeps AI orchestration and safety controls in the app while code navigation and IDE work happen in VS Code.
+
+Select the terminal icon in the conversation header to open the bottom terminal panel. It starts in the selected working folder, or in your home directory when no folder is selected yet.
 
 ## Model API Key
 
@@ -77,11 +73,11 @@ Do not paste raw API keys into config files. `model_api_key_env` must be a Keych
 The installer contains:
 
 - `Damaian.app`: Native Tauri desktop wrapper.
-- Local workspace engine: Repository indexing, file access, patch preview/apply, command approval, Git status, and audit logging.
-- Embedded static UI: Chat, edit preview, command approval, settings, and Visual Studio Code handoff.
+- Local workspace engine: Repository indexing, file access, patch preview/apply, Git status, and audit logging.
+- Embedded static UI: Chat, inline patch preview, terminal panel, settings, and Visual Studio Code handoff.
 
 ## Current Limitations
 
 - The package is unsigned and not notarized.
-- Repository selection uses a native folder picker, with manual path entry still available as a fallback.
+- Repository selection uses a native folder picker from the Projects sidebar.
 - The app uses a local in-process server on `127.0.0.1:4765` as the temporary bridge between Tauri and the workspace engine.
