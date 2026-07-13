@@ -5,9 +5,12 @@ import { createDefaultConfig, CommandPolicy } from '../src/index.js';
 test('classifies read-only commands as low risk', () => {
   const policy = new CommandPolicy({ config: createDefaultConfig({ dataDir: '/tmp/damaian-test' }) });
   const result = policy.classify('git status --short');
+  const showResult = policy.classify('git show --stat');
 
   assert.equal(result.risk, 'low');
   assert.equal(result.blocked, false);
+  assert.equal(showResult.risk, 'low');
+  assert.equal(showResult.blocked, false);
 });
 
 test('requires approval for validation commands', () => {

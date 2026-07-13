@@ -22,7 +22,7 @@ pub mod validation;
 pub mod workspace_engine;
 
 pub use audit::AuditLog;
-pub use chat::{ChatOrchestrator, ChatTurnResult};
+pub use chat::{AgentCommandProposal, ChatOrchestrator, ChatTurnResult};
 pub use command_policy::{CommandClassification, CommandPolicy, CommandRisk};
 pub use command_runner::{CommandExecution, CommandRunner};
 pub use config::{Config, ConfigOverlay};
