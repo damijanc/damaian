@@ -70,6 +70,12 @@ impl WorkspaceEngine {
         let session_store = SessionStore::new(&config.data_dir);
         let patch_store = PatchStore::new(&config.data_dir);
         let command_store = CommandStore::new(&config.data_dir);
+        let validation_orchestrator = ValidationOrchestrator::new(
+            command_policy.clone(),
+            command_runner.clone(),
+            command_store.clone(),
+            audit_log.clone(),
+        );
         let chat_orchestrator = ChatOrchestrator::new(
             config.clone(),
             scanner.clone(),
@@ -77,6 +83,7 @@ impl WorkspaceEngine {
             indexer.clone(),
             context_manager.clone(),
             session_store.clone(),
+            validation_orchestrator.clone(),
         );
         let edit_orchestrator = EditOrchestrator::new(
             config.clone(),
@@ -88,13 +95,6 @@ impl WorkspaceEngine {
             patch_engine.clone(),
             patch_store.clone(),
         );
-        let validation_orchestrator = ValidationOrchestrator::new(
-            command_policy.clone(),
-            command_runner.clone(),
-            command_store.clone(),
-            audit_log.clone(),
-        );
-
         Self {
             config,
             scanner,

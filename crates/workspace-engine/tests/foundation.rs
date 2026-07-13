@@ -166,6 +166,7 @@ fn classifies_command_risk() {
     });
 
     assert_eq!(policy.classify("git status --short").risk, CommandRisk::Low);
+    assert_eq!(policy.classify("git show --stat").risk, CommandRisk::Low);
     assert_eq!(policy.classify("npm test").risk, CommandRisk::Medium);
     assert_eq!(policy.classify("rm -rf .").risk, CommandRisk::Blocked);
     assert_eq!(policy.classify("ls | head").risk, CommandRisk::High);
@@ -395,6 +396,66 @@ fn orchestrates_chat_with_indexed_context_and_mock_model() {
         .read_messages(&result.session.id)
         .unwrap();
     assert_eq!(messages.len(), 2);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn chat_runs_sandbox_command_requested_by_model() {
+    let repo = temp_dir("chat-sandbox-command");
+    write_fixture(&repo, "README.md", "# Chat command test\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new_sequence(vec![
+        "I need to inspect the working directory first.\n\nDAMAIAN_COMMAND_V1\nCOMMAND: pwd\nREASON: Inspect current working directory.\nEND_COMMAND\n"
+            .to_string(),
+        "The sandbox command completed and the repository path was inspected.".to_string(),
+    ]);
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "What directory is this project using?",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert!(result.command_proposal.is_none());
+    assert!(result.response.contains("sandbox command completed"));
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    assert_eq!(messages.len(), 2);
+    assert!(messages[1].content.contains("sandbox command completed"));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn chat_returns_command_approval_when_command_exits_sandbox() {
+    let repo = temp_dir("chat-command-approval");
+    write_fixture(&repo, "README.md", "# Chat command approval\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new(
+        "DAMAIAN_COMMAND_V1\nCOMMAND: npm test\nREASON: Run project tests.\nEND_COMMAND\n",
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(&repo, "Run the tests.", &[], &mut adapter, &mut on_token)
+        .unwrap();
+
+    let proposal = result
+        .command_proposal
+        .expect("approval-required command should create proposal metadata");
+    assert_eq!(proposal.command, "npm test");
+    assert!(proposal.requires_approval);
+    assert!(result.response.contains("approval"));
 
     fs::remove_dir_all(repo).unwrap();
 }

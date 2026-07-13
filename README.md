@@ -18,10 +18,11 @@ This repository currently implements the workspace-engine slice from the product
 - one-click handoff from the selected working folder to Visual Studio Code
 - embedded bottom terminal panel for user-run commands
 - session-aware desktop chat with streamed responses and context file links
+- sandbox-safe assistant command requests for local facts such as Git history
 - per-file edit diff review with selected-file apply/reject
 - macOS Keychain-backed model API key storage from desktop settings
 
-The macOS desktop shell layers on top of these services while keeping AI file edits behind explicit preview/apply approval.
+The macOS desktop shell layers on top of these services while keeping AI file edits behind explicit preview/apply approval. When the assistant needs local command output, Damaian only runs sandbox-safe read-only commands automatically. Commands outside that sandbox are shown in the conversation for user approval before execution.
 
 ## Commands
 
@@ -55,6 +56,14 @@ node ./bin/damaian-client.js index /path/to/repo
 node ./bin/damaian-client.js git-status /path/to/repo
 node ./bin/damaian-client.js classify-command "npm test"
 ```
+
+## Assistant Command Sandbox
+
+Chat providers do not receive direct shell access. If the assistant needs local facts that are not in the indexed file context, such as the latest Git commit or current uncommitted changes, it must request one command using Damaian's command envelope.
+
+Sandbox-safe read-only commands, including `pwd`, `ls`, `git status`, `git diff`, `git log`, and `git show`, can run automatically in the selected working folder. Damaian sends the redacted command output back to the model so it can answer the original question.
+
+Commands that cannot run in sandbox mode, such as validation scripts or commands with unknown side effects, require explicit user approval from an inline command card in the conversation. Policy-blocked destructive commands cannot be approved from the UI.
 
 By default, Damaian stores global app data under:
 

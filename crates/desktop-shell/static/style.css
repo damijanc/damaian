@@ -1158,6 +1158,63 @@ button:disabled {
   opacity: 0.82;
 }
 
+.command-approval {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.command-approval-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.command-approval-header strong,
+.command-approval-header span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.command-approval-header span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.command-approval-command {
+  display: block;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f6f7f7;
+  color: var(--ink);
+  padding: 8px 10px;
+  white-space: pre;
+}
+
+.command-approval-details,
+.command-approval-output {
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f6f7f7;
+  color: var(--ink);
+  font-size: 12px;
+  margin: 0;
+  padding: 9px 10px;
+  white-space: pre-wrap;
+}
+
+.command-approval-actions {
+  justify-content: flex-start;
+}
+
 .diff-card-header {
   display: flex;
   align-items: center;

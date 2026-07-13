@@ -41,6 +41,10 @@ Use `+ File` above the prompt to pin specific repository files into the next cha
 
 If you name a file in your prompt, such as `USER_GUIDE.md` or `docs/USER_GUIDE.md`, Damaian attempts to include that file in the model context. A filename without a directory must uniquely match one file in the selected repository.
 
+If the assistant needs a local command result to answer a question, it can request one command from Damaian. Sandbox-safe read-only commands, such as `pwd`, `ls`, `git status`, `git diff`, `git log`, and `git show`, run automatically in the selected working folder. Damaian redacts the output and sends it back to the model so it can finish answering.
+
+Commands that cannot run in sandbox mode appear as an approval card in the conversation. Review the command, risk, working directory, and reason, then select `Approve Run` or `Reject`. Destructive commands blocked by policy cannot be approved from the UI.
+
 Sessions are shown under their project folder in the sidebar. Select an existing session to reload its conversation. Double-click a session to rename it, or use the `-` beside a session to delete it.
 
 Context file buttons open the referenced file in Visual Studio Code.
@@ -91,6 +95,8 @@ Damaian stores the secret in macOS Keychain and writes only this reference to co
 ```text
 model_api_key_env=keychain:model-api-key
 ```
+
+Damaian keeps a process-local in-memory copy after a successful Keychain save or read. You may be asked by macOS the first time the app accesses the key after launch, but repeated chat, edit, or command-assisted answers in the same app run should not require another password prompt.
 
 Use `Remove Key` to delete the stored secret from Keychain. Saving a new key with the same account replaces the previous value.
 
@@ -160,6 +166,8 @@ Damaian keeps the local app in control of important effects:
 - The model does not read files directly.
 - The model does not write files directly.
 - File edits are previewed before application.
+- Sandbox-safe assistant command requests are limited to read-only local commands.
+- Commands outside the sandbox require user approval before execution.
 - Restricted files and detected secrets are redacted or blocked by policy.
 - Important actions are recorded in a local audit trail.
 

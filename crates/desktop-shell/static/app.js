@@ -1303,6 +1303,86 @@ function createPatchPreview(payload, patchRepo) {
   return wrapper;
 }
 
+function createCommandApprovalPreview(proposal, proposalRepo) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "command-approval";
+
+  const header = document.createElement("div");
+  header.className = "command-approval-header";
+  const title = document.createElement("strong");
+  title.textContent = "Command approval";
+  const meta = document.createElement("span");
+  meta.textContent = proposal.blocked ? "blocked" : proposal.risk || "review";
+  header.append(title, meta);
+
+  const command = document.createElement("code");
+  command.className = "command-approval-command";
+  command.textContent = proposal.command || "";
+
+  const details = document.createElement("pre");
+  details.className = "command-approval-details";
+  details.textContent = proposal.prompt || "";
+
+  const actions = document.createElement("div");
+  actions.className = "inline-actions command-approval-actions";
+  const runButton = document.createElement("button");
+  runButton.type = "button";
+  runButton.textContent = proposal.blocked ? "Blocked" : "Approve Run";
+  runButton.disabled = Boolean(proposal.blocked);
+  const rejectButton = document.createElement("button");
+  rejectButton.type = "button";
+  rejectButton.textContent = "Reject";
+  actions.append(runButton, rejectButton);
+
+  const output = document.createElement("pre");
+  output.className = "command-approval-output";
+  output.hidden = true;
+
+  runButton.addEventListener("click", async () => {
+    try {
+      runButton.disabled = true;
+      rejectButton.disabled = true;
+      const result = await api(
+        "/api/run-command",
+        form({ repo: proposalRepo, proposal_id: proposal.proposalId }),
+      );
+      output.hidden = false;
+      output.textContent = [
+        `exit ${result.exitCode}`,
+        result.stdout ? `\nstdout:\n${result.stdout}` : "",
+        result.stderr ? `\nstderr:\n${result.stderr}` : "",
+      ].join("");
+      appendChatMessage("system", `Approved command completed: \`${proposal.command}\``);
+      toast("Command completed");
+    } catch (error) {
+      runButton.disabled = false;
+      rejectButton.disabled = false;
+      toast(error.message);
+    }
+  });
+
+  rejectButton.addEventListener("click", async () => {
+    try {
+      runButton.disabled = true;
+      rejectButton.disabled = true;
+      const result = await api(
+        "/api/reject-command",
+        form({ repo: proposalRepo, proposal_id: proposal.proposalId }),
+      );
+      output.hidden = false;
+      output.textContent = `Rejected ${result.proposalId}`;
+      toast("Command rejected");
+    } catch (error) {
+      runButton.disabled = Boolean(proposal.blocked);
+      rejectButton.disabled = false;
+      toast(error.message);
+    }
+  });
+
+  wrapper.append(header, command, details, actions, output);
+  return wrapper;
+}
+
 async function loadSessions(preferredSessionId = "", reloadSelected = false) {
   const repoPath = repo();
   if (!repoPath) {
@@ -1543,6 +1623,7 @@ async function sendChatPrompt() {
     chatSubmitting = true;
     button.disabled = true;
     await ensureDesktopApiReady();
+    const chatRepo = requireRepo();
     appendChatMessage("user", prompt);
     const assistantMessage = appendChatMessage("assistant", "");
     if (looksLikeEditRequest(prompt)) {
@@ -1555,7 +1636,7 @@ async function sendChatPrompt() {
 
     await streamChatRequest(
       {
-        repo: requireRepo(),
+        repo: chatRepo,
         prompt,
         session_id: currentSessionId,
         context_files: pinnedContextFiles.join("\n"),
@@ -1573,6 +1654,9 @@ async function sendChatPrompt() {
           if (payload.response && payload.response !== assistantText) {
             assistantText = payload.response;
             updateChatMessage(assistantMessage, assistantText);
+          }
+          if (payload.commandProposal) {
+            assistantMessage.body.append(createCommandApprovalPreview(payload.commandProposal, chatRepo));
           }
           renderContextFiles(payload.contextFiles || []);
           setChatStatus(payload.incomplete ? "Incomplete" : "Complete", payload.incomplete ? "warn" : "ok");

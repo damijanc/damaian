@@ -6,7 +6,8 @@ const LOW_RISK_COMMANDS = [
   /^ls(?:\s+[-A-Za-z0-9_./]+)*$/,
   /^git\s+status(?:\s+[-A-Za-z0-9_./=]+)*$/,
   /^git\s+diff(?:\s+[-A-Za-z0-9_./=]+)*$/,
-  /^git\s+log(?:\s+[-A-Za-z0-9_./=]+)*$/
+  /^git\s+log(?:\s+[-A-Za-z0-9_./=]+)*$/,
+  /^git\s+show(?:\s+[-A-Za-z0-9_./=]+)*$/
 ];
 
 const VALIDATION_COMMANDS = [

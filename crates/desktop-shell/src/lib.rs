@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use workspace_engine::{
     ChatMessage, ChatTurnResult, Config, CurlModelTransport, OpenAICompatibleAdapter,
     ProposedFilePatch, Session, WorkspaceEngine, command_approval_prompt, patch_diff_text,
@@ -16,6 +17,7 @@ const INDEX_HTML: &str = include_str!("../static/index.html");
 const STYLE_CSS: &str = include_str!("../static/style.css");
 const APP_JS: &str = include_str!("../static/app.js");
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+static MODEL_API_KEY_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 pub fn run_from_env() -> Result<(), String> {
     run_server(ShellOptions::from_args(env::args().skip(1).collect()))
@@ -642,6 +644,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             let api_key = required_form(&form, "api_key")?;
             let reference = keychain::reference_for_account(&account)?;
             keychain::write_password(&account, &api_key)?;
+            remember_model_api_key(&account, &api_key);
             let path = desktop_settings_config_path(scope)?;
             update_config_overlay(path.clone(), "model_api_key_env", &reference)?;
             let (effective_policy, effective_error) = effective_policy_for_repo(&repo);
@@ -664,6 +667,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             let form = parse_form(&request.body);
             let account = required_form(&form, "account")?;
             let deleted = keychain::delete_password(&account)?;
+            forget_model_api_key(&account);
             write_response(
                 stream,
                 &request,
@@ -775,14 +779,42 @@ fn effective_policy_for_repo(repo: &str) -> (String, String) {
 
 fn resolve_model_api_key(reference: &str) -> Result<String, String> {
     if let Some(account) = keychain::account_from_reference(reference) {
-        keychain::read_password(account).map_err(|error| {
+        if let Some(api_key) = cached_model_api_key(account) {
+            return Ok(api_key);
+        }
+        let api_key = keychain::read_password(account).map_err(|error| {
             format!(
                 "Keychain API key '{}' is required. Open Settings and save the model API key. {error}",
                 account
             )
-        })
+        })?;
+        remember_model_api_key(account, &api_key);
+        Ok(api_key)
     } else {
         env::var(reference).map_err(|_| format!("{reference} is required"))
+    }
+}
+
+fn model_api_key_cache() -> &'static Mutex<HashMap<String, String>> {
+    MODEL_API_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_model_api_key(account: &str) -> Option<String> {
+    model_api_key_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(account.trim()).cloned())
+}
+
+fn remember_model_api_key(account: &str, api_key: &str) {
+    if let Ok(mut cache) = model_api_key_cache().lock() {
+        cache.insert(account.trim().to_string(), api_key.to_string());
+    }
+}
+
+fn forget_model_api_key(account: &str) {
+    if let Ok(mut cache) = model_api_key_cache().lock() {
+        cache.remove(account.trim());
     }
 }
 
@@ -1355,14 +1387,30 @@ fn write_sse_event(stream: &mut TcpStream, event: &str, data: &str) -> Result<()
 
 fn chat_result_json(result: &ChatTurnResult) -> String {
     format!(
-        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{}}}",
+        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"commandProposal\":{}}}",
         escape_json(&result.response),
         json_string_array(&result.context_files),
         escape_json(&result.session.id),
         escape_json(&result.task.id),
         result.task.status.as_str(),
         escape_json(&result.model_run.run_id),
-        result.model_run.incomplete
+        result.model_run.incomplete,
+        command_proposal_json(result)
+    )
+}
+
+fn command_proposal_json(result: &ChatTurnResult) -> String {
+    let Some(proposal) = &result.command_proposal else {
+        return "null".to_string();
+    };
+    format!(
+        "{{\"proposalId\":\"{}\",\"command\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{}}}",
+        escape_json(&proposal.id),
+        escape_json(&proposal.command),
+        escape_json(&proposal.prompt),
+        escape_json(&proposal.risk),
+        proposal.requires_approval,
+        proposal.blocked
     )
 }
 
@@ -1476,10 +1524,11 @@ fn escape_json(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Request, allowed_cors_origin, desktop_settings_config_path, effective_policy_for_repo,
-        keychain, parse_form, parse_path_list, percent_decode, require_api_token,
-        run_terminal_command, save_config_file, terminal_cwd_for_repo, validate_context_files,
-        validate_working_folder, validate_workspace_path,
+        Request, allowed_cors_origin, cached_model_api_key, desktop_settings_config_path,
+        effective_policy_for_repo, forget_model_api_key, keychain, parse_form, parse_path_list,
+        percent_decode, remember_model_api_key, require_api_token, run_terminal_command,
+        save_config_file, terminal_cwd_for_repo, validate_context_files, validate_working_folder,
+        validate_workspace_path,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -1539,6 +1588,21 @@ mod tests {
         assert!(keychain::validate_account("").is_err());
         assert!(keychain::validate_account(" \n ").is_err());
         assert!(keychain::validate_account("model-api-key").is_ok());
+    }
+
+    #[test]
+    fn caches_model_api_keys_for_current_process() {
+        let account = "test-process-cache-model-key";
+        forget_model_api_key(account);
+
+        assert_eq!(cached_model_api_key(account), None);
+        remember_model_api_key(account, "sk-test-value");
+        assert_eq!(
+            cached_model_api_key(" test-process-cache-model-key "),
+            Some("sk-test-value".to_string())
+        );
+        forget_model_api_key(account);
+        assert_eq!(cached_model_api_key(account), None);
     }
 
     #[test]
