@@ -106,7 +106,7 @@ The generated artifacts are written to:
 - `target/release/bundle/macos/Damaian.app`
 - `target/release/bundle/dmg/Damaian_0.1.0_aarch64.dmg`
 
-The current package is unsigned and not notarized. macOS may require the `Privacy & Security` `Open Anyway` flow described in [macOS Installation](docs/MACOS_INSTALLATION.md).
+The developer-preview package is ad-hoc signed for bundle integrity but is not Developer ID signed or notarized. macOS may require the `Privacy & Security` `Open Anyway` flow described in [macOS Installation](docs/MACOS_INSTALLATION.md).
 
 ## GitHub macOS Release Build
 

@@ -12,7 +12,7 @@
     "test": "node --test",
     "check": "node --test",
     "desktop:dev": "cd crates/desktop-app && cargo tauri dev",
-    "desktop:build": "cd crates/desktop-app && cargo tauri build"
+    "desktop:build": "cd crates/desktop-app && APPLE_SIGNING_IDENTITY=\"${APPLE_SIGNING_IDENTITY:--}\" cargo tauri build"
   },
   "engines": {
     "node": ">=24"
