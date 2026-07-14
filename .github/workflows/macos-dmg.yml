@@ -61,7 +61,14 @@ jobs:
         run: cargo test --locked
 
       - name: Build DMG
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
         run: npm run desktop:build
+
+      - name: Verify macOS bundle
+        run: |
+          codesign --verify --deep --strict --verbose=4 target/release/bundle/macos/Damaian.app
+          hdiutil verify target/release/bundle/dmg/*.dmg
 
       - name: Show bundle output
         run: |
