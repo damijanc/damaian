@@ -11,6 +11,7 @@
   "scripts": {
     "test": "node --test",
     "check": "node --test",
+    "version:sync": "node scripts/sync-version.mjs",
     "desktop:dev": "cd crates/desktop-app && cargo tauri dev",
     "desktop:build": "cd crates/desktop-app && APPLE_SIGNING_IDENTITY=\"${APPLE_SIGNING_IDENTITY:--}\" cargo tauri build"
   },

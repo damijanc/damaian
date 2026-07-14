@@ -101,10 +101,10 @@ Build the native macOS app and DMG installer with:
 npm run desktop:build
 ```
 
-The generated artifacts are written to:
+The generated artifacts are written to paths like:
 
 - `target/release/bundle/macos/Damaian.app`
-- `target/release/bundle/dmg/Damaian_0.1.0_aarch64.dmg`
+- `target/release/bundle/dmg/Damaian_<version>_aarch64.dmg`
 
 The developer-preview package is ad-hoc signed for bundle integrity but is not Developer ID signed or notarized. macOS may require the `Privacy & Security` `Open Anyway` flow described in [macOS Installation](docs/MACOS_INSTALLATION.md).
 
@@ -118,7 +118,8 @@ To build DMGs manually:
 2. Go to `Actions`.
 3. Select `Build macOS DMG`.
 4. Select `Run workflow`.
-5. Download the `Damaian-macOS-arm64-DMG` artifact from the completed run.
+5. Optionally enter a version such as `0.1.3`; this stamps the app About dialog and DMG filename.
+6. Download the `Damaian-macOS-arm64-DMG` artifact from the completed run.
 
 To create a GitHub Release with DMG assets, push a version tag:
 
@@ -127,7 +128,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The workflow builds an unsigned Apple Silicon DMG, then attaches it to the GitHub Release for that tag.
+The workflow builds an ad-hoc signed Apple Silicon DMG, then attaches it to the GitHub Release for that tag. For tag builds, the workflow derives the app version from the tag. For example, tag `v0.1.3` produces app metadata version `0.1.3` and a `Damaian_0.1.3_aarch64.dmg` asset.
 
 ## User Documentation
 
