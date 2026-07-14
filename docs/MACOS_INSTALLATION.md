@@ -18,9 +18,9 @@ Download the DMG from the GitHub Release page, or use a DMG you built locally.
 3. Eject the mounted disk image.
 4. Open `Damaian` from `Applications`.
 
-## Unsigned Build Warning
+## Developer Preview Signing
 
-The current package is not code signed or notarized. On first launch, macOS may show a warning that the app cannot be opened because the developer cannot be verified.
+The developer-preview package is ad-hoc signed for bundle integrity, but it is not Developer ID signed or notarized. On first launch, macOS may show a warning that the app cannot be opened because the developer cannot be verified.
 
 For this developer-preview package:
 
@@ -31,6 +31,8 @@ For this developer-preview package:
 5. Confirm the launch prompt.
 
 Only do this for builds you created yourself or received from a trusted source.
+
+If macOS says the application is damaged, verify that you are using a release built after the ad-hoc signing fix. Older DMGs had an invalid bundle signature and should be replaced by a new release build.
 
 ## Selecting a Working Folder
 
