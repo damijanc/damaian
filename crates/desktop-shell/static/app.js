@@ -1,7 +1,10 @@
 const $ = (id) => document.getElementById(id);
 
 let currentSessionId = "";
-let apiToken = "";
+const embeddedApiToken = document.body?.dataset.apiToken || "";
+const embeddedDefaultRepo = document.body?.dataset.defaultRepo || "";
+if (document.body) document.body.dataset.apiToken = "";
+let apiToken = embeddedApiToken;
 let bootstrapPromise = null;
 let bootstrapError = null;
 let chatSubmitting = false;
@@ -128,7 +131,7 @@ async function api(path, options = {}, retriedAuth = false) {
 }
 
 function isProtectedApiPath(path) {
-  return path.startsWith("/api/") && path !== "/api/bootstrap";
+  return path.startsWith("/api/");
 }
 
 function withApiToken(path, options = {}) {
@@ -167,17 +170,17 @@ async function ensureDesktopApiReady() {
 
 function startBootstrap() {
   bootstrapError = null;
-  return api("/api/bootstrap")
-    .then((payload) => {
-      if (!payload.apiToken) throw new Error("Desktop API token missing from bootstrap");
-      apiToken = payload.apiToken;
+  return Promise.resolve()
+    .then(() => {
+      if (!embeddedApiToken) throw new Error("Desktop API token missing from initial page");
+      apiToken = embeddedApiToken;
       if (!chatSubmitting) $("ask-btn").disabled = false;
       loadProjectState();
       const lastRepo = localStorage.getItem(lastRepoStorageKey);
       if (lastRepo) {
         setRepository(lastRepo, false);
-      } else if (payload.defaultRepo) {
-        setRepository(payload.defaultRepo, false);
+      } else if (embeddedDefaultRepo) {
+        setRepository(embeddedDefaultRepo, false);
       } else {
         loadPinnedContextFiles("");
         clearSessionList();
