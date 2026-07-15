@@ -438,9 +438,18 @@ async function addContextFilesFromPicker() {
 
 function scheduleUpdateCheck() {
   if (!isDesktopApp()) return;
+  resetUpdateButton("Check Updates");
   window.setTimeout(() => {
     void checkForAppUpdate(false);
   }, 1200);
+}
+
+function resetUpdateButton(title = "Check Updates") {
+  const button = $("update-app-btn");
+  button.hidden = false;
+  button.disabled = false;
+  button.textContent = "Check Updates";
+  button.title = title;
 }
 
 async function checkForAppUpdate(showCurrent = true) {
@@ -449,17 +458,20 @@ async function checkForAppUpdate(showCurrent = true) {
     if (showCurrent) toast("Updates are available in the desktop app");
     return null;
   }
+  const button = $("update-app-btn");
   try {
+    button.hidden = false;
+    button.disabled = true;
+    button.textContent = "Checking...";
     const result = await invoke("damaian_check_for_update");
-    const button = $("update-app-btn");
     if (!result.configured) {
-      button.hidden = true;
+      resetUpdateButton(result.message || "Updater is not configured in this build");
       appUpdateInfo = null;
       if (showCurrent) toast(result.message || "Updater is not configured in this build");
       return result;
     }
     if (!result.available) {
-      button.hidden = true;
+      resetUpdateButton(result.message || "Damaian is up to date");
       appUpdateInfo = null;
       if (showCurrent) toast(result.message || "Damaian is up to date");
       return result;
@@ -472,6 +484,7 @@ async function checkForAppUpdate(showCurrent = true) {
     toast(`Damaian ${result.version} is available`);
     return result;
   } catch (error) {
+    resetUpdateButton(`Update check failed: ${error.message}`);
     if (showCurrent) toast(`Update check failed: ${error.message}`);
     return null;
   }
@@ -501,7 +514,7 @@ async function installAppUpdate() {
   } catch (error) {
     appUpdateInstalling = false;
     button.disabled = false;
-    button.textContent = `Update ${appUpdateInfo?.version || ""}`.trim();
+    button.textContent = appUpdateInfo?.available ? `Update ${appUpdateInfo.version}` : "Check Updates";
     toast(`Update failed: ${error.message}`);
   }
 }
@@ -2312,6 +2325,9 @@ document.querySelectorAll(".settings-nav-item").forEach((button) => {
 $("settings-close-btn").addEventListener("click", closeSettings);
 
 window.addEventListener("damaian-open-settings", () => openSettings("providers"));
+window.addEventListener("damaian-check-for-updates", () => {
+  void installAppUpdate();
+});
 
 $("repo").addEventListener("change", () => {
   const value = repo();
