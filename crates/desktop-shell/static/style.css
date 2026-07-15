@@ -458,6 +458,16 @@ button:disabled {
   white-space: nowrap;
 }
 
+.update-button {
+  height: 30px;
+  border-color: #8dbda5;
+  background: #eef8f2;
+  color: var(--ok);
+  font-size: 12px;
+  font-weight: 800;
+  padding: 5px 10px;
+}
+
 .icon-button {
   width: 30px;
   height: 30px;

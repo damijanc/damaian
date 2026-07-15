@@ -14,6 +14,8 @@ let expandedProjectPaths = new Set();
 let projectSessionsByPath = new Map();
 let projectSessionsLoading = new Set();
 let projectsCollapsed = false;
+let appUpdateInfo = null;
+let appUpdateInstalling = false;
 
 const localApiOrigin = "http://127.0.0.1:4765";
 const localApiHostnames = new Set(["127.0.0.1", "localhost"]);
@@ -119,6 +121,7 @@ function startBootstrap() {
         clearChat();
         renderProjectList();
       }
+      scheduleUpdateCheck();
     })
     .catch((error) => {
       bootstrapError = error;
@@ -340,6 +343,14 @@ function tauriDialogOpen() {
   return window.__TAURI__?.dialog?.open;
 }
 
+function tauriInvoke() {
+  return window.__TAURI__?.core?.invoke;
+}
+
+function isDesktopApp() {
+  return Boolean(window.__TAURI__);
+}
+
 async function addContextFilesFromPicker() {
   const open = tauriDialogOpen();
   if (!open) throw new Error("File picker is available in the desktop app");
@@ -356,6 +367,76 @@ async function addContextFilesFromPicker() {
   }
   if (selectedFiles.length) {
     toast(`Added ${selectedFiles.length} context file(s)`);
+  }
+}
+
+function scheduleUpdateCheck() {
+  if (!isDesktopApp()) return;
+  window.setTimeout(() => {
+    void checkForAppUpdate(false);
+  }, 1200);
+}
+
+async function checkForAppUpdate(showCurrent = true) {
+  const invoke = tauriInvoke();
+  if (!invoke) {
+    if (showCurrent) toast("Updates are available in the desktop app");
+    return null;
+  }
+  try {
+    const result = await invoke("damaian_check_for_update");
+    const button = $("update-app-btn");
+    if (!result.configured) {
+      button.hidden = true;
+      appUpdateInfo = null;
+      if (showCurrent) toast(result.message || "Updater is not configured in this build");
+      return result;
+    }
+    if (!result.available) {
+      button.hidden = true;
+      appUpdateInfo = null;
+      if (showCurrent) toast(result.message || "Damaian is up to date");
+      return result;
+    }
+    appUpdateInfo = result;
+    button.hidden = false;
+    button.disabled = false;
+    button.textContent = `Update ${result.version}`;
+    button.title = `Install Damaian ${result.version}`;
+    toast(`Damaian ${result.version} is available`);
+    return result;
+  } catch (error) {
+    if (showCurrent) toast(`Update check failed: ${error.message}`);
+    return null;
+  }
+}
+
+async function installAppUpdate() {
+  if (appUpdateInstalling) return;
+  if (!appUpdateInfo?.available) {
+    await checkForAppUpdate(true);
+    if (!appUpdateInfo?.available) return;
+  }
+  const version = appUpdateInfo.version || "the latest version";
+  if (!window.confirm(`Install Damaian ${version}? The app will restart after the update.`)) return;
+  const invoke = tauriInvoke();
+  if (!invoke) {
+    toast("Updates are available in the desktop app");
+    return;
+  }
+  const button = $("update-app-btn");
+  try {
+    appUpdateInstalling = true;
+    button.disabled = true;
+    button.textContent = "Installing...";
+    toast("Downloading update...");
+    await invoke("damaian_install_update");
+    toast("Update installed. Restarting...");
+  } catch (error) {
+    appUpdateInstalling = false;
+    button.disabled = false;
+    button.textContent = `Update ${appUpdateInfo?.version || ""}`.trim();
+    toast(`Update failed: ${error.message}`);
   }
 }
 
@@ -1727,6 +1808,10 @@ $("model-key-delete-btn").addEventListener("click", async () => {
 
 $("inspector-toggle-btn").addEventListener("click", () => {
   setInspectorCollapsed(!document.body.classList.contains("inspector-collapsed"));
+});
+
+$("update-app-btn").addEventListener("click", () => {
+  void installAppUpdate();
 });
 
 $("ask-btn").disabled = true;
