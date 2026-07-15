@@ -24,6 +24,14 @@ This repository currently implements the workspace-engine slice from the product
 
 The macOS desktop shell layers on top of these services while keeping AI file edits behind explicit preview/apply approval. When the assistant needs local command output, Damaian only runs sandbox-safe read-only commands automatically. Commands outside that sandbox are shown in the conversation for user approval before execution.
 
+## Security Hardening Notes
+
+Recent hardening removed the old Node.js reference implementation so the Rust workspace-engine and macOS/Tauri desktop app are the sole maintained implementation. The command policy now treats allowlist entries as exact matches and always checks shell control characters, including embedded newlines and carriage returns.
+
+Patch creation rejects symlinked write targets that resolve outside the selected repository. Patch diffs, stored `.dpatch` diff fields, and Git diff output are redacted before they are returned to the UI or model. Secret scanning now covers JWTs, Google/GCP API keys, Azure account keys, and additional Slack token prefixes.
+
+The desktop shell is scoped to `http://127.0.0.1:4765`; startup refuses to fall back to a random port if that origin is occupied. The initial API token is embedded into the first app page load instead of being exposed through an unauthenticated bootstrap endpoint. Model API keys are no longer passed to `curl` as command-line arguments.
+
 ## Commands
 
 ```sh

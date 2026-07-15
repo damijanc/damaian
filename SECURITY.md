@@ -4,7 +4,7 @@ Damaian is a developer preview. It is designed to keep repository access, file w
 
 ## Supported Versions
 
-Security fixes target the current `main` branch. Published preview builds should be treated as experimental until code signing, notarization, and Keychain-backed credential storage are implemented.
+Security fixes target the current `main` branch. Published preview builds should be treated as experimental until Developer ID signing and notarization are in place.
 
 ## Reporting a Vulnerability
 
@@ -21,4 +21,16 @@ Useful reports include:
 
 ## Secret Handling
 
-Do not commit real API keys, provider tokens, certificates, private keys, or local `.damaian` data. Use environment variables for model provider keys, and keep real values out of examples, logs, screenshots, and test fixtures.
+Do not commit real API keys, provider tokens, certificates, private keys, or local `.damaian` data. Keep real values out of examples, logs, screenshots, and test fixtures.
+
+Damaian supports macOS Keychain-backed model API key storage from desktop settings. Config files should store Keychain references such as `keychain:model-api-key` or environment variable names for CLI/development workflows, never raw provider keys.
+
+Secret scanning redacts detected credentials from indexed context, command output, patch diffs, Git diff output, audit log fields, and model-visible command results. Generated file content is still checked before apply and is blocked by default when hardcoded secrets are detected.
+
+## Local App Boundary
+
+The desktop shell binds to loopback on the fixed app origin `http://127.0.0.1:4765`. Startup refuses to continue if that port is already occupied, and the Tauri capability is scoped to that exact localhost origin.
+
+The desktop API token is embedded in the initial app page load instead of being exposed by an unauthenticated bootstrap endpoint. Local `/api/*` requests require that token.
+
+Model provider requests use `curl --config -` so the provider API key is passed through the child process stdin configuration, not as a command-line argument.
