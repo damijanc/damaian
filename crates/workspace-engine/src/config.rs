@@ -57,6 +57,26 @@ pub struct Config {
     pub model_name: String,
     pub model_base_url: String,
     pub model_api_key_env: String,
+    pub model_reasoning_level: String,
+    pub model_providers: Vec<ModelProviderConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProviderConfig {
+    pub id: String,
+    pub label: String,
+    pub base_url: String,
+    pub api_key_env: String,
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelProviderConfigOverlay {
+    pub id: String,
+    pub label: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub models: Option<Vec<String>>,
 }
 
 impl Config {
@@ -177,8 +197,12 @@ impl Config {
         if let Some(value) = overlay.shell {
             self.shell = value;
         }
+        for provider in overlay.model_providers {
+            self.upsert_model_provider(provider);
+        }
         if let Some(value) = overlay.model_provider {
             self.model_provider = value;
+            self.apply_model_provider_defaults();
         }
         if let Some(value) = overlay.model_name {
             self.model_name = value;
@@ -189,6 +213,65 @@ impl Config {
         if let Some(value) = overlay.model_api_key_env {
             self.model_api_key_env = value;
         }
+        if let Some(value) = overlay.model_reasoning_level {
+            self.model_reasoning_level = value;
+        }
+    }
+
+    pub fn apply_model_provider_defaults(&mut self) {
+        if let Some(provider) = self
+            .model_provider_config(&self.model_provider)
+            .cloned()
+            .or_else(|| builtin_model_provider_config(&self.model_provider))
+        {
+            self.model_base_url = provider.base_url;
+            if provider.api_key_env.starts_with("keychain:")
+                || !is_builtin_model_provider(&provider.id)
+                || !is_keychain_reference(&self.model_api_key_env)
+            {
+                self.model_api_key_env = provider.api_key_env;
+            }
+            if let Some(model) = provider.models.first() {
+                self.model_name = model.clone();
+            }
+        }
+    }
+
+    pub fn model_provider_config(&self, id: &str) -> Option<&ModelProviderConfig> {
+        self.model_providers
+            .iter()
+            .find(|provider| provider.id == id)
+    }
+
+    fn upsert_model_provider(&mut self, overlay: ModelProviderConfigOverlay) {
+        if let Some(provider) = self
+            .model_providers
+            .iter_mut()
+            .find(|provider| provider.id == overlay.id)
+        {
+            if let Some(value) = overlay.label {
+                provider.label = value;
+            }
+            if let Some(value) = overlay.base_url {
+                provider.base_url = value;
+            }
+            if let Some(value) = overlay.api_key_env {
+                provider.api_key_env = value;
+            }
+            if let Some(value) = overlay.models {
+                provider.models = value;
+            }
+            return;
+        }
+
+        let id = overlay.id;
+        self.model_providers.push(ModelProviderConfig {
+            label: overlay.label.unwrap_or_else(|| id.clone()),
+            base_url: overlay.base_url.unwrap_or_default(),
+            api_key_env: overlay.api_key_env.unwrap_or_default(),
+            models: overlay.models.unwrap_or_default(),
+            id,
+        });
     }
 
     pub fn to_policy_text(&self) -> String {
@@ -269,6 +352,14 @@ impl Config {
         push_line(&mut output, "model_name", &self.model_name);
         push_line(&mut output, "model_base_url", &self.model_base_url);
         push_line(&mut output, "model_api_key_env", &self.model_api_key_env);
+        push_line(
+            &mut output,
+            "model_reasoning_level",
+            &self.model_reasoning_level,
+        );
+        for provider in &self.model_providers {
+            push_model_provider_config(&mut output, provider);
+        }
         output
     }
 }
@@ -298,12 +389,13 @@ impl Default for Config {
             audit_enabled: true,
             audit_retention_days: 90,
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()),
-            model_provider: "openai-compatible".to_string(),
-            model_name: std::env::var("OPENAI_MODEL")
-                .unwrap_or_else(|_| "configured-model".to_string()),
+            model_provider: "openai".to_string(),
+            model_name: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1".to_string()),
             model_base_url: std::env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com".to_string()),
             model_api_key_env: "OPENAI_API_KEY".to_string(),
+            model_reasoning_level: "default".to_string(),
+            model_providers: Vec::new(),
         }
     }
 }
@@ -330,6 +422,8 @@ pub struct ConfigOverlay {
     pub model_name: Option<String>,
     pub model_base_url: Option<String>,
     pub model_api_key_env: Option<String>,
+    pub model_reasoning_level: Option<String>,
+    pub model_providers: Vec<ModelProviderConfigOverlay>,
 }
 
 impl ConfigOverlay {
@@ -373,6 +467,9 @@ impl ConfigOverlay {
     }
 
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        if let Some(provider_key) = key.strip_prefix("model_provider.") {
+            return self.set_model_provider_config(provider_key, value);
+        }
         match key {
             "data_dir" => self.data_dir = Some(PathBuf::from(value)),
             "max_file_bytes" => self.max_file_bytes = Some(parse_u64(key, value)?),
@@ -400,15 +497,53 @@ impl ConfigOverlay {
             "audit_enabled" => self.audit_enabled = Some(parse_bool(key, value)?),
             "audit_retention_days" => self.audit_retention_days = Some(parse_u64(key, value)?),
             "shell" => self.shell = Some(value.to_string()),
-            "model_provider" => self.model_provider = Some(value.to_string()),
+            "model_provider" => self.model_provider = Some(normalize_model_provider(value)?),
             "model_name" => self.model_name = Some(value.to_string()),
             "model_base_url" => self.model_base_url = Some(value.to_string()),
             "model_api_key_env" => {
                 self.model_api_key_env = Some(parse_model_api_key_reference(value)?)
             }
+            "model_reasoning_level" => {
+                self.model_reasoning_level = Some(normalize_model_reasoning_level(value)?)
+            }
             _ => {
                 return Err(ClientError::InvalidInput(format!(
                     "Unknown config key: {key}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn set_model_provider_config(&mut self, provider_key: &str, value: &str) -> Result<()> {
+        let Some((raw_id, field)) = provider_key.rsplit_once('.') else {
+            return Err(ClientError::InvalidInput(format!(
+                "Invalid model provider config key: model_provider.{provider_key}"
+            )));
+        };
+        let id = normalize_model_provider(raw_id)?;
+        let index = if let Some(index) = self
+            .model_providers
+            .iter()
+            .position(|provider| provider.id == id)
+        {
+            index
+        } else {
+            self.model_providers.push(ModelProviderConfigOverlay {
+                id: id.clone(),
+                ..ModelProviderConfigOverlay::default()
+            });
+            self.model_providers.len() - 1
+        };
+        let provider = &mut self.model_providers[index];
+        match field {
+            "label" => provider.label = Some(value.to_string()),
+            "base_url" => provider.base_url = Some(value.trim_end_matches('/').to_string()),
+            "api_key_env" => provider.api_key_env = Some(parse_model_api_key_reference(value)?),
+            "models" => provider.models = Some(split_list(value)),
+            _ => {
+                return Err(ClientError::InvalidInput(format!(
+                    "Unknown model provider config key: model_provider.{provider_key}"
                 )));
             }
         }
@@ -489,7 +624,142 @@ impl ConfigOverlay {
         if let Some(value) = &self.model_api_key_env {
             push_line(&mut output, "model_api_key_env", value);
         }
+        if let Some(value) = &self.model_reasoning_level {
+            push_line(&mut output, "model_reasoning_level", value);
+        }
+        for provider in &self.model_providers {
+            push_model_provider_overlay(&mut output, provider);
+        }
         output
+    }
+}
+
+fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
+    match id {
+        "openai" => Some(ModelProviderConfig {
+            id: "openai".to_string(),
+            label: "OpenAI".to_string(),
+            base_url: std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com".to_string()),
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            models: vec![
+                std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1".to_string()),
+                "gpt-4.1-mini".to_string(),
+                "o4-mini".to_string(),
+            ],
+        }),
+        "deepseek" => Some(ModelProviderConfig {
+            id: "deepseek".to_string(),
+            label: "DeepSeek".to_string(),
+            base_url: std::env::var("DEEPSEEK_BASE_URL")
+                .unwrap_or_else(|_| "https://api.deepseek.com".to_string()),
+            api_key_env: "DEEPSEEK_API_KEY".to_string(),
+            models: vec![
+                std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string()),
+                "deepseek-reasoner".to_string(),
+            ],
+        }),
+        "openai-compatible" => Some(ModelProviderConfig {
+            id: "openai-compatible".to_string(),
+            label: "Custom".to_string(),
+            base_url: "https://api.openai.com".to_string(),
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            models: vec!["configured-model".to_string()],
+        }),
+        _ => None,
+    }
+}
+
+fn is_builtin_model_provider(id: &str) -> bool {
+    matches!(id, "openai" | "deepseek" | "openai-compatible")
+}
+
+fn push_model_provider_config(output: &mut String, provider: &ModelProviderConfig) {
+    push_line(
+        output,
+        &format!("model_provider.{}.label", provider.id),
+        &provider.label,
+    );
+    push_line(
+        output,
+        &format!("model_provider.{}.base_url", provider.id),
+        &provider.base_url,
+    );
+    push_line(
+        output,
+        &format!("model_provider.{}.api_key_env", provider.id),
+        &provider.api_key_env,
+    );
+    push_line(
+        output,
+        &format!("model_provider.{}.models", provider.id),
+        &join_list(&provider.models),
+    );
+}
+
+fn push_model_provider_overlay(output: &mut String, provider: &ModelProviderConfigOverlay) {
+    if let Some(value) = &provider.label {
+        push_line(
+            output,
+            &format!("model_provider.{}.label", provider.id),
+            value,
+        );
+    }
+    if let Some(value) = &provider.base_url {
+        push_line(
+            output,
+            &format!("model_provider.{}.base_url", provider.id),
+            value,
+        );
+    }
+    if let Some(value) = &provider.api_key_env {
+        push_line(
+            output,
+            &format!("model_provider.{}.api_key_env", provider.id),
+            value,
+        );
+    }
+    if let Some(value) = &provider.models {
+        push_line(
+            output,
+            &format!("model_provider.{}.models", provider.id),
+            &join_list(value),
+        );
+    }
+}
+
+pub fn normalize_model_provider(value: &str) -> Result<String> {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    let provider = match normalized.as_str() {
+        "open-ai" | "openai" => "openai".to_string(),
+        "deep-seek" | "deepseek" | "deedseek" => "deepseek".to_string(),
+        "custom" | "openai-compatible" | "open-ai-compatible" => "openai-compatible".to_string(),
+        "" => {
+            return Err(ClientError::InvalidInput(
+                "model_provider is required".to_string(),
+            ));
+        }
+        other => other.to_string(),
+    };
+    if provider
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '.'))
+    {
+        Ok(provider)
+    } else {
+        Err(ClientError::InvalidInput(
+            "model_provider can contain only letters, numbers, dots, and dashes".to_string(),
+        ))
+    }
+}
+
+pub fn normalize_model_reasoning_level(value: &str) -> Result<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "default" | "auto" => Ok("default".to_string()),
+        "minimal" | "low" | "medium" | "high" => Ok(value.trim().to_ascii_lowercase()),
+        _ => Err(ClientError::InvalidInput(
+            "model_reasoning_level must be default, minimal, low, medium, or high".to_string(),
+        )),
     }
 }
 
@@ -572,4 +842,8 @@ fn parse_model_api_key_reference(value: &str) -> Result<String> {
         "model_api_key_env must be an environment variable name or keychain:<account>; do not paste the API key into config"
             .to_string(),
     ))
+}
+
+fn is_keychain_reference(value: &str) -> bool {
+    value.trim_start().starts_with("keychain:")
 }

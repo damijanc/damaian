@@ -25,7 +25,10 @@ pub use audit::AuditLog;
 pub use chat::{AgentCommandProposal, ChatOrchestrator, ChatTurnResult};
 pub use command_policy::{CommandClassification, CommandPolicy, CommandRisk};
 pub use command_runner::{CommandExecution, CommandRunner};
-pub use config::{Config, ConfigOverlay};
+pub use config::{
+    Config, ConfigOverlay, ModelProviderConfig, ModelProviderConfigOverlay,
+    normalize_model_provider, normalize_model_reasoning_level,
+};
 pub use context_manager::{ContextItem, ContextManager, ContextPlan};
 pub use edit::{
     EditOrchestrator, EditProposalResult, GeneratedEdit, PatchStore, parse_generated_edit,

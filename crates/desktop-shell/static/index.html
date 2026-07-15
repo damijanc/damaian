@@ -104,21 +104,11 @@
             >
               <span class="terminal-icon" aria-hidden="true"></span>
             </button>
-            <button
-              id="inspector-toggle-btn"
-              class="icon-button"
-              type="button"
-              aria-controls="inspector"
-              aria-expanded="true"
-              aria-label="Hide tools"
-              title="Hide inspector"
-            >
-              <span class="panel-icon" aria-hidden="true"></span>
-            </button>
           </div>
         </header>
 
         <section id="chat-log" class="chat-log" aria-live="polite"></section>
+        <section id="chat-context" class="context-list chat-context-strip" aria-label="Context"></section>
 
         <footer class="composer">
           <div id="composer-context" class="composer-context">
@@ -137,6 +127,63 @@
               rows="4"
               placeholder="Ask a question or request a file change"
             ></textarea>
+            <input id="chat-provider" type="hidden" value="openai" />
+            <input id="chat-model" type="hidden" />
+            <input id="chat-reasoning" type="hidden" value="default" />
+            <div id="chat-model-menu" class="model-menu">
+              <button
+                id="chat-model-menu-btn"
+                class="model-menu-button"
+                type="button"
+                aria-haspopup="menu"
+                aria-expanded="false"
+                aria-controls="chat-model-popover"
+                title="Model options"
+              >
+                <span class="bolt-icon" aria-hidden="true"></span>
+                <span id="model-menu-summary" class="model-menu-summary"></span>
+                <span class="menu-caret" aria-hidden="true"></span>
+              </button>
+              <div id="chat-model-popover" class="model-popover" role="menu" hidden>
+                <div id="model-menu-root" class="model-menu-panel">
+                  <button id="model-reset-btn" class="model-reset-row" type="button">
+                    <span>Reset to default</span>
+                    <span class="reset-icon" aria-hidden="true"></span>
+                  </button>
+                  <button class="model-menu-row" type="button" data-panel="provider">
+                    <span>Provider</span>
+                    <strong id="model-provider-value"></strong>
+                    <span class="row-chevron" aria-hidden="true"></span>
+                  </button>
+                  <button class="model-menu-row" type="button" data-panel="model">
+                    <span>Model</span>
+                    <strong id="model-name-value"></strong>
+                    <span class="row-chevron" aria-hidden="true"></span>
+                  </button>
+                  <button class="model-menu-row" type="button" data-panel="reasoning">
+                    <span>Effort</span>
+                    <strong id="model-reasoning-value"></strong>
+                    <span class="row-chevron" aria-hidden="true"></span>
+                  </button>
+                </div>
+                <div id="model-menu-provider" class="model-menu-panel" hidden>
+                  <button class="model-menu-back" type="button" data-panel="root">Provider</button>
+                  <div id="model-provider-options" class="model-option-list"></div>
+                </div>
+                <div id="model-menu-model" class="model-menu-panel" hidden>
+                  <button class="model-menu-back" type="button" data-panel="root">Model</button>
+                  <div id="model-options" class="model-option-list"></div>
+                  <div class="custom-model-row">
+                    <input id="custom-model-input" type="text" autocomplete="off" placeholder="Custom model" />
+                    <button id="custom-model-apply-btn" type="button">Apply</button>
+                  </div>
+                </div>
+                <div id="model-menu-reasoning" class="model-menu-panel" hidden>
+                  <button class="model-menu-back" type="button" data-panel="root">Effort</button>
+                  <div id="model-reasoning-options" class="model-option-list"></div>
+                </div>
+              </div>
+            </div>
             <button id="ask-btn" class="send-button" type="button" aria-label="Send message">
               <span class="send-icon" aria-hidden="true"></span>
             </button>
@@ -175,23 +222,161 @@
           <div id="terminal-cwd" class="terminal-cwd">Not started</div>
         </section>
       </main>
+    </div>
+    <section id="settings-shell" class="settings-shell" aria-label="Settings" hidden>
+      <aside class="settings-sidebar">
+        <div>
+          <h2 class="settings-app-title">Desktop</h2>
+          <nav class="settings-nav" aria-label="Settings sections">
+            <button class="settings-nav-item" type="button" data-settings-page="general">
+              <span class="settings-nav-icon sliders-icon" aria-hidden="true"></span>
+              <span>General</span>
+            </button>
+            <button class="settings-nav-item" type="button" data-settings-page="shortcuts">
+              <span class="settings-nav-icon keyboard-icon" aria-hidden="true"></span>
+              <span>Shortcuts</span>
+            </button>
+            <p class="settings-nav-group">Server</p>
+            <button class="settings-nav-item" type="button" data-settings-page="servers">
+              <span class="settings-nav-icon server-icon" aria-hidden="true"></span>
+              <span>Servers</span>
+            </button>
+            <button class="settings-nav-item active" type="button" data-settings-page="providers">
+              <span class="settings-nav-icon provider-icon" aria-hidden="true"></span>
+              <span>Providers</span>
+            </button>
+            <button class="settings-nav-item" type="button" data-settings-page="models">
+              <span class="settings-nav-icon sparkle-icon" aria-hidden="true"></span>
+              <span>Models</span>
+            </button>
+          </nav>
+        </div>
+        <div class="settings-version">
+          <span>Damaian Desktop</span>
+        </div>
+      </aside>
+      <main class="settings-content">
+        <button
+          id="settings-close-btn"
+          class="settings-close-btn"
+          type="button"
+          aria-label="Close settings"
+          title="Close settings"
+        >
+          ×
+        </button>
 
-      <aside id="inspector" class="inspector">
-        <section id="settings" class="view active">
-          <div class="inspector-section">
-            <h2>User Configuration</h2>
-            <p class="path-line">
-              Repository configuration is read from `.damaian/config.conf` and reflected in
-              Effective Policy.
-            </p>
-            <div class="inline-actions">
-              <button id="config-load-btn" type="button">Load</button>
-              <button id="config-save-btn" type="button">Save</button>
+        <section id="settings-page-general" class="settings-page" data-page="general">
+          <h2 class="settings-page-title">General</h2>
+          <section class="settings-section">
+            <div class="section-heading">
+              <h3>User configuration</h3>
+              <div class="inline-actions compact-actions">
+                <button id="config-load-btn" type="button">Load</button>
+                <button id="config-save-btn" type="button">Save</button>
+              </div>
             </div>
             <p id="config-path" class="path-line"></p>
+            <textarea
+              id="config-editor"
+              rows="15"
+              placeholder="model_provider=openai&#10;model_name=gpt-4.1&#10;model_reasoning_level=default&#10;model_api_key_env=keychain:model-api-key&#10;model_provider.acme.label=Acme AI&#10;model_provider.acme.base_url=https://api.acme.test&#10;model_provider.acme.api_key_env=keychain:acme-ai-key&#10;model_provider.acme.models=acme-large|acme-fast"
+            ></textarea>
+          </section>
+          <section class="settings-section">
+            <h3>Effective policy</h3>
+            <pre id="config-output"></pre>
+          </section>
+        </section>
+
+        <section id="settings-page-shortcuts" class="settings-page" data-page="shortcuts">
+          <h2 class="settings-page-title">Shortcuts</h2>
+          <div class="settings-list-card">
+            <div class="settings-row">
+              <div>
+                <strong>Open Settings</strong>
+                <p>Application menu</p>
+              </div>
+              <kbd>⌘,</kbd>
+            </div>
+          </div>
+        </section>
+
+        <section id="settings-page-servers" class="settings-page" data-page="servers">
+          <h2 class="settings-page-title">Servers</h2>
+          <div class="settings-empty-card">No server configuration is required.</div>
+        </section>
+
+        <section id="settings-page-providers" class="settings-page active" data-page="providers">
+          <h2 class="settings-page-title">Providers</h2>
+          <section class="settings-section">
+            <div class="section-heading">
+              <h3>Configured providers</h3>
+              <button id="provider-new-btn" type="button">New</button>
+            </div>
+            <div id="connected-provider-list" class="provider-list-card"></div>
+          </section>
+
+          <section class="settings-section">
+            <h3>Popular providers</h3>
+            <div id="popular-provider-list" class="provider-list-card"></div>
+          </section>
+
+          <section class="settings-section settings-provider-editor">
+            <div class="section-heading">
+              <h3>Provider details</h3>
+            </div>
+            <div class="provider-config-panel">
+              <label class="field">
+                <span>Provider</span>
+                <select id="provider-config-select"></select>
+              </label>
+              <div class="provider-fields">
+                <label class="field">
+                  <span>Name</span>
+                  <input id="provider-label-input" type="text" placeholder="Acme AI" />
+                </label>
+                <label class="field">
+                  <span>ID</span>
+                  <input id="provider-id-input" type="text" placeholder="acme-ai" />
+                </label>
+              </div>
+              <label class="field">
+                <span>Base URL</span>
+                <input id="provider-base-url-input" type="url" placeholder="https://api.example.com" />
+              </label>
+              <label class="field">
+                <span>API Key Reference</span>
+                <input id="provider-key-ref-input" type="text" placeholder="keychain:acme-ai-key" />
+              </label>
+              <label class="field">
+                <span>API Key</span>
+                <input
+                  id="provider-api-key-input"
+                  type="password"
+                  autocomplete="off"
+                  placeholder="Optional, saved to Keychain when reference is keychain:*"
+                />
+              </label>
+              <label class="field">
+                <span>Models</span>
+                <textarea
+                  id="provider-models-input"
+                  rows="3"
+                  placeholder="model-large&#10;model-fast"
+                ></textarea>
+              </label>
+              <div class="inline-actions">
+                <button id="provider-save-btn" type="button">Save Provider</button>
+                <button id="provider-remove-btn" type="button">Remove</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-section">
             <div class="model-key-panel">
               <div class="section-heading">
-                <h2>Model API Key</h2>
+                <h3>Model API Key</h3>
                 <span id="model-key-status" class="key-status">Not checked</span>
               </div>
               <label class="field">
@@ -212,26 +397,15 @@
                 <button id="model-key-delete-btn" type="button">Remove Key</button>
               </div>
             </div>
-            <textarea
-              id="config-editor"
-              rows="15"
-              placeholder="model_base_url=https://api.openai.com&#10;model_name=gpt-4.1&#10;model_api_key_env=keychain:model-api-key"
-            ></textarea>
-          </div>
-          <div class="inspector-section grow">
-            <h2>Effective Policy</h2>
-            <pre id="config-output"></pre>
-          </div>
+          </section>
         </section>
 
-        <div class="inspector-section context-panel">
-          <div class="section-heading">
-            <h2>Context</h2>
-          </div>
-          <div id="chat-context" class="context-list"></div>
-        </div>
-      </aside>
-    </div>
+        <section id="settings-page-models" class="settings-page" data-page="models">
+          <h2 class="settings-page-title">Models</h2>
+          <div id="settings-model-list" class="settings-list-card"></div>
+        </section>
+      </main>
+    </section>
     <div id="toast" role="status"></div>
     <script src="app.js"></script>
   </body>

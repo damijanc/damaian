@@ -8,7 +8,8 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use workspace_engine::{
     ChatMessage, ChatTurnResult, Config, CurlModelTransport, OpenAICompatibleAdapter,
-    ProposedFilePatch, Session, WorkspaceEngine, command_approval_prompt, patch_diff_text,
+    ProposedFilePatch, Session, WorkspaceEngine, command_approval_prompt, normalize_model_provider,
+    normalize_model_reasoning_level, patch_diff_text,
 };
 
 mod keychain;
@@ -198,12 +199,13 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         }
         ("GET", "/api/model-key-status") => {
             let repo = request.param("repo").unwrap_or_default();
+            let model_provider = request.param("model_provider");
             write_response(
                 stream,
                 &request,
                 200,
                 "application/json",
-                &model_key_status_json(&repo)?,
+                &model_key_status_json(&repo, model_provider.as_deref())?,
             )
         }
         ("GET", "/api/git-status") => {
@@ -436,7 +438,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             let form = parse_form(&request.body);
             let repo = required_form(&form, "repo")?;
             let prompt = required_form(&form, "prompt")?;
-            let engine = engine_for_repo(&repo)?;
+            let engine = engine_for_repo_with_model_options(&repo, &form)?;
             let context_files = form
                 .get("context_files")
                 .map(|value| validate_context_files(&engine, &repo, value))
@@ -444,7 +446,11 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .unwrap_or_default();
             let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
             let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
-            let mut adapter = OpenAICompatibleAdapter::new(&engine.config.model_name, transport);
+            let mut adapter = OpenAICompatibleAdapter::with_provider(
+                &engine.config.model_provider,
+                &engine.config.model_name,
+                transport,
+            );
             let result = engine
                 .edit_orchestrator
                 .propose_edit(&repo, &prompt, &context_files, &mut adapter)
@@ -663,6 +669,25 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 ),
             )
         }
+        ("POST", "/api/provider-key") => {
+            let form = parse_form(&request.body);
+            let account = required_form(&form, "account")?;
+            let api_key = required_form(&form, "api_key")?;
+            let reference = keychain::reference_for_account(&account)?;
+            keychain::write_password(&account, &api_key)?;
+            remember_model_api_key(&account, &api_key);
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &format!(
+                    "{{\"reference\":\"{}\",\"account\":\"{}\",\"configured\":true}}",
+                    escape_json(&reference),
+                    escape_json(account.trim())
+                ),
+            )
+        }
         ("POST", "/api/model-key-delete") => {
             let form = parse_form(&request.body);
             let account = required_form(&form, "account")?;
@@ -727,7 +752,7 @@ fn run_chat_request(
         .get("session_id")
         .map(String::as_str)
         .filter(|value| !value.is_empty());
-    let engine = engine_for_repo(&repo)?;
+    let engine = engine_for_repo_with_model_options(&repo, form)?;
     let context_files = form
         .get("context_files")
         .map(|value| validate_context_files(&engine, &repo, value))
@@ -736,7 +761,11 @@ fn run_chat_request(
 
     let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
     let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
-    let mut adapter = OpenAICompatibleAdapter::new(&engine.config.model_name, transport);
+    let mut adapter = OpenAICompatibleAdapter::with_provider(
+        &engine.config.model_provider,
+        &engine.config.model_name,
+        transport,
+    );
     engine
         .chat_orchestrator
         .ask_with_session(
@@ -818,13 +847,8 @@ fn forget_model_api_key(account: &str) {
     }
 }
 
-fn model_key_status_json(repo: &str) -> Result<String, String> {
-    let config = Config::load_for_repository(if repo.is_empty() {
-        None
-    } else {
-        Some(Path::new(repo))
-    })
-    .map_err(|error| error.to_string())?;
+fn model_key_status_json(repo: &str, provider: Option<&str>) -> Result<String, String> {
+    let config = config_for_repo_with_provider(repo, provider)?;
     let reference = config.model_api_key_env;
     if let Some(account) = keychain::account_from_reference(&reference) {
         let status = match keychain::password_exists(account) {
@@ -1090,13 +1114,70 @@ fn update_config_overlay(
 }
 
 fn engine_for_repo(repo: &str) -> Result<WorkspaceEngine, String> {
+    let config = config_for_repo(repo)?;
+    Ok(WorkspaceEngine::new(config))
+}
+
+fn engine_for_repo_with_model_options(
+    repo: &str,
+    form: &HashMap<String, String>,
+) -> Result<WorkspaceEngine, String> {
+    let mut config = config_for_repo(repo)?;
+    apply_model_form_options(&mut config, form)?;
+    Ok(WorkspaceEngine::new(config))
+}
+
+fn config_for_repo(repo: &str) -> Result<Config, String> {
     let repo_path = if repo.is_empty() {
         None
     } else {
         Some(Path::new(repo))
     };
-    let config = Config::load_for_repository(repo_path).map_err(|error| error.to_string())?;
-    Ok(WorkspaceEngine::new(config))
+    Config::load_for_repository(repo_path).map_err(|error| error.to_string())
+}
+
+fn config_for_repo_with_provider(repo: &str, provider: Option<&str>) -> Result<Config, String> {
+    let mut config = config_for_repo(repo)?;
+    if let Some(provider) = provider.map(str::trim).filter(|value| !value.is_empty()) {
+        config.model_provider =
+            normalize_model_provider(provider).map_err(|error| error.to_string())?;
+        config.apply_model_provider_defaults();
+    }
+    Ok(config)
+}
+
+fn apply_model_form_options(
+    config: &mut Config,
+    form: &HashMap<String, String>,
+) -> Result<(), String> {
+    if let Some(provider) = form
+        .get("model_provider")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config.model_provider =
+            normalize_model_provider(provider).map_err(|error| error.to_string())?;
+        config.apply_model_provider_defaults();
+    }
+    if let Some(model) = form
+        .get("model")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config.model_name = model.to_string();
+    }
+    if let Some(reasoning_level) = form
+        .get("reasoning_level")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        config.model_reasoning_level =
+            normalize_model_reasoning_level(reasoning_level).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]

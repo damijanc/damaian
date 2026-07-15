@@ -106,7 +106,7 @@ The generated artifacts are written to paths like:
 - `target/release/bundle/macos/Damaian.app`
 - `target/release/bundle/dmg/Damaian_<version>_aarch64.dmg`
 
-The developer-preview package is ad-hoc signed for bundle integrity but is not Developer ID signed or notarized. macOS may require the `Privacy & Security` `Open Anyway` flow described in [macOS Installation](docs/MACOS_INSTALLATION.md).
+The developer-preview package is ad-hoc signed for bundle integrity but is not Developer ID signed or notarized. macOS may require the `Privacy & Security` `Open Anyway`, Finder Control-click `Open`, or local-build quarantine-removal flow described in [macOS Installation](docs/MACOS_INSTALLATION.md).
 
 ## Automatic Updates
 

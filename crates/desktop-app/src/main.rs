@@ -9,13 +9,15 @@ use std::time::Duration;
 
 use desktop_shell::{ShellOptions, run_server_with_ready};
 use serde::Serialize;
-use tauri::{Manager, Url};
+use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::{Manager, Runtime, Url};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 const SHELL_HOST: &str = "127.0.0.1";
 const PREFERRED_SHELL_PORT: u16 = 4765;
 const UPDATER_ENDPOINT: &str =
     "https://github.com/damijanc/damaian/releases/latest/download/latest.json";
+const SETTINGS_MENU_ID: &str = "damaian-settings";
 
 struct PendingUpdate(Mutex<Option<Update>>);
 
@@ -36,6 +38,12 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(PendingUpdate(Mutex::new(None)))
+        .menu(build_app_menu)
+        .on_menu_event(|app, event| {
+            if event.id() == SETTINGS_MENU_ID {
+                open_settings(app);
+            }
+        })
         .setup(move |app| {
             let options = shell_options.clone();
             let (ready_tx, ready_rx) = mpsc::channel();
@@ -76,6 +84,118 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Damaian desktop app");
+}
+
+fn build_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R>> {
+    #[cfg(target_os = "macos")]
+    {
+        build_macos_menu(app)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Menu::default(app)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn build_macos_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R>> {
+    let app_name = app.package_info().name.clone();
+    let about_metadata = AboutMetadata {
+        name: Some(app_name.clone()),
+        version: Some(app.package_info().version.to_string()),
+        ..Default::default()
+    };
+
+    let about = PredefinedMenuItem::about(app, None, Some(about_metadata))?;
+    let settings = MenuItem::with_id(
+        app,
+        SETTINGS_MENU_ID,
+        "Settings...",
+        true,
+        Some("CmdOrCtrl+,"),
+    )?;
+    let services = PredefinedMenuItem::services(app, None)?;
+    let hide = PredefinedMenuItem::hide(app, None)?;
+    let hide_others = PredefinedMenuItem::hide_others(app, None)?;
+    let show_all = PredefinedMenuItem::show_all(app, None)?;
+    let quit = PredefinedMenuItem::quit(app, None)?;
+    let app_menu = Submenu::with_items(
+        app,
+        app_name,
+        true,
+        &[
+            &about,
+            &PredefinedMenuItem::separator(app)?,
+            &settings,
+            &PredefinedMenuItem::separator(app)?,
+            &services,
+            &PredefinedMenuItem::separator(app)?,
+            &hide,
+            &hide_others,
+            &show_all,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
+    )?;
+
+    let close_window = PredefinedMenuItem::close_window(app, None)?;
+    let file_menu = Submenu::with_items(app, "File", true, &[&close_window])?;
+
+    let undo = PredefinedMenuItem::undo(app, None)?;
+    let redo = PredefinedMenuItem::redo(app, None)?;
+    let cut = PredefinedMenuItem::cut(app, None)?;
+    let copy = PredefinedMenuItem::copy(app, None)?;
+    let paste = PredefinedMenuItem::paste(app, None)?;
+    let select_all = PredefinedMenuItem::select_all(app, None)?;
+    let edit_menu = Submenu::with_items(
+        app,
+        "Edit",
+        true,
+        &[
+            &undo,
+            &redo,
+            &PredefinedMenuItem::separator(app)?,
+            &cut,
+            &copy,
+            &paste,
+            &PredefinedMenuItem::separator(app)?,
+            &select_all,
+        ],
+    )?;
+
+    let fullscreen = PredefinedMenuItem::fullscreen(app, None)?;
+    let view_menu = Submenu::with_items(app, "View", true, &[&fullscreen])?;
+
+    let minimize = PredefinedMenuItem::minimize(app, None)?;
+    let maximize = PredefinedMenuItem::maximize(app, None)?;
+    let close_window = PredefinedMenuItem::close_window(app, None)?;
+    let bring_all_to_front = PredefinedMenuItem::bring_all_to_front(app, None)?;
+    let window_menu = Submenu::with_items(
+        app,
+        "Window",
+        true,
+        &[
+            &minimize,
+            &maximize,
+            &PredefinedMenuItem::separator(app)?,
+            &close_window,
+            &PredefinedMenuItem::separator(app)?,
+            &bring_all_to_front,
+        ],
+    )?;
+
+    Menu::with_items(
+        app,
+        &[&app_menu, &file_menu, &edit_menu, &view_menu, &window_menu],
+    )
+}
+
+fn open_settings<R: Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.eval("window.dispatchEvent(new Event('damaian-open-settings'))");
+        let _ = window.set_focus();
+    }
 }
 
 fn shell_port() -> u16 {
