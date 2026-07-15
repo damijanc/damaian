@@ -173,6 +173,22 @@ fn classifies_command_risk() {
 }
 
 #[test]
+fn allowlist_does_not_bypass_shell_control_detection() {
+    let policy = CommandPolicy::new(Config {
+        data_dir: PathBuf::from("/tmp/damaian-test"),
+        command_allowlist: vec!["npm test".to_string()],
+        ..Config::default()
+    });
+
+    assert_eq!(policy.classify("npm test").risk, CommandRisk::Low);
+    for command in ["npm test; rm -rf ~", "npm test\ncat /etc/passwd"] {
+        let classification = policy.classify(command);
+        assert_eq!(classification.risk, CommandRisk::High);
+        assert!(classification.requires_approval);
+    }
+}
+
+#[test]
 fn creates_diff_and_applies_approved_changes_safely() {
     let repo = temp_dir("patch");
     write_fixture(&repo, "src/app.js", "export const value = 1;\n");
