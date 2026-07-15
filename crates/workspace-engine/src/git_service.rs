@@ -1,5 +1,6 @@
 use crate::audit::AuditLog;
 use crate::error::{ClientError, Result};
+use crate::secret_scanner::SecretScanner;
 use std::path::Path;
 use std::process::Command;
 
@@ -25,11 +26,12 @@ pub struct GitStatus {
 #[derive(Debug, Clone)]
 pub struct GitService {
     audit_log: AuditLog,
+    scanner: SecretScanner,
 }
 
 impl GitService {
-    pub fn new(audit_log: AuditLog) -> Self {
-        Self { audit_log }
+    pub fn new(audit_log: AuditLog, scanner: SecretScanner) -> Self {
+        Self { audit_log, scanner }
     }
 
     pub fn status(&self, root_path: impl AsRef<Path>) -> Result<GitStatus> {
@@ -101,7 +103,8 @@ impl GitService {
                 String::from_utf8_lossy(&output.stderr).to_string(),
             ));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        let raw_diff = String::from_utf8_lossy(&output.stdout);
+        Ok(self.scanner.redact(raw_diff.as_ref()).text)
     }
 
     pub fn suggest_commit_message(&self, summary: &str, changed_files: &[String]) -> String {

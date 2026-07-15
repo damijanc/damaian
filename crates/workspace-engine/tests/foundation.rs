@@ -1,15 +1,17 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
     AuditLog, ClientError, CommandPolicy, CommandRisk, Config, ConfigOverlay, MockModelAdapter,
     MockModelTransport, ModelAdapter, ModelMessage, ModelRequest, OpenAICompatibleAdapter,
-    PatchEngine, PathPolicy, ProjectIndexer, ProposedChange, SecretScanner, SessionStore,
-    WorkspaceEngine, extract_model_tokens, model_request_json, parse_generated_edit,
+    PatchEngine, PatchStore, PathPolicy, ProjectIndexer, ProposedChange, SecretScanner,
+    SessionStore, WorkspaceEngine, extract_model_tokens, model_request_json, parse_generated_edit,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
+const AWS_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 
 fn temp_dir(name: &str) -> PathBuf {
     let now = SystemTime::now()
@@ -28,6 +30,16 @@ fn write_fixture(root: &Path, relative_path: &str, content: &str) {
     let path = root.join(relative_path);
     fs::create_dir_all(path.parent().expect("fixture should have parent")).unwrap();
     fs::write(path, content).unwrap();
+}
+
+fn run_git(repo: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .expect("git should run");
+    assert!(status.success(), "git {:?} failed", args);
 }
 
 fn test_config(repo: &Path) -> Config {
@@ -373,6 +385,82 @@ fn blocks_generated_hardcoded_secrets_by_default() {
         .apply_patch(&repo, &patch, None, "tester", false)
         .expect_err("secret should block apply");
     assert!(matches!(error, ClientError::PolicyBlocked(_)));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn redacts_secrets_from_patch_diffs_before_storage() {
+    let repo = temp_dir("patch-diff-redaction");
+    write_fixture(
+        &repo,
+        "src/config.js",
+        &format!("export const awsKey = \"{AWS_ACCESS_KEY}\";\n"),
+    );
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+
+    let patch = engine
+        .create_patch(
+            &repo,
+            &[ProposedChange {
+                path: "src/config.js".to_string(),
+                new_content: "export const awsKey = \"\";\n".to_string(),
+                status: None,
+                allow_restricted: false,
+            }],
+            None,
+            "remove secret",
+        )
+        .unwrap();
+
+    assert!(patch.files[0].diff.contains("[REDACTED_AWS_ACCESS_KEY_"));
+    assert!(!patch.files[0].diff.contains(AWS_ACCESS_KEY));
+
+    let store = PatchStore::new(&config.data_dir);
+    let patch_path = store.save(&patch).unwrap();
+    let stored_patch = fs::read_to_string(patch_path).unwrap();
+    assert!(stored_patch.contains("[REDACTED_AWS_ACCESS_KEY_"));
+    assert!(!stored_patch.contains(AWS_ACCESS_KEY));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn redacts_secrets_from_git_diff_output() {
+    let repo = temp_dir("git-diff-redaction");
+    write_fixture(
+        &repo,
+        "src/config.js",
+        &format!("export const awsKey = \"{AWS_ACCESS_KEY}\";\n"),
+    );
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["add", "src/config.js"]);
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Damaian Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "baseline",
+        ],
+    );
+    fs::write(repo.join("src/config.js"), "export const awsKey = \"\";\n").unwrap();
+    let engine = WorkspaceEngine::new(test_config(&repo));
+
+    let diff = engine.git.diff(&repo, false).unwrap();
+
+    assert!(diff.contains("[REDACTED_AWS_ACCESS_KEY_"));
+    assert!(!diff.contains(AWS_ACCESS_KEY));
 
     fs::remove_dir_all(repo).unwrap();
 }

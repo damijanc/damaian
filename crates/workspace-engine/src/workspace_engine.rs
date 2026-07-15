@@ -60,7 +60,7 @@ impl WorkspaceEngine {
             audit_log.clone(),
             scanner.clone(),
         );
-        let git = GitService::new(audit_log.clone());
+        let git = GitService::new(audit_log.clone(), scanner.clone());
         let patch_engine = PatchEngine::new(
             config.clone(),
             audit_log.clone(),
