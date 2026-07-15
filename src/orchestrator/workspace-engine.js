@@ -48,6 +48,7 @@ export function createDefaultEngine(overrides = {}) {
   const git = overrides.git ?? new GitService({ auditLog });
   const patchEngine = overrides.patchEngine ?? new PatchEngine({ config, auditLog, scanner, pathPolicy });
   const modelAdapter = overrides.modelAdapter ?? new OpenAICompatibleAdapter({
+    provider: config.model.provider,
     baseUrl: config.model.baseUrl,
     apiKey: process.env[config.model.apiKeyEnv],
     model: config.model.model,

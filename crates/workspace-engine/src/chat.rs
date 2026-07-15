@@ -142,6 +142,7 @@ impl ChatOrchestrator {
                 ModelMessage::user(model_prompt),
             ],
             temperature: Some("0".to_string()),
+            reasoning_level: Some(self.config.model_reasoning_level.clone()),
             stream: true,
         };
 
@@ -223,6 +224,7 @@ impl ChatOrchestrator {
                             ModelMessage::user(follow_up_prompt),
                         ],
                         temperature: Some("0".to_string()),
+                        reasoning_level: Some(self.config.model_reasoning_level.clone()),
                         stream: true,
                     };
                     let model_run = model_adapter.stream_response(&follow_up_request, on_token)?;
