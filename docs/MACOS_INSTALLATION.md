@@ -34,6 +34,12 @@ Only do this for builds you created yourself or received from a trusted source.
 
 If macOS says the application is damaged, verify that you are using a release built after the ad-hoc signing fix. Older DMGs had an invalid bundle signature and should be replaced by a new release build.
 
+## Updates
+
+Damaian checks GitHub Releases for updates when the desktop app starts. If a newer signed release is available, an `Update <version>` button appears in the conversation header. Select it to download the update, verify its updater signature, install it, and restart the app.
+
+Automatic updates require a build that already includes the updater. If you installed an older developer-preview DMG before automatic updates were added, replace it manually with a newer DMG once.
+
 ## Selecting a Working Folder
 
 Select `+` beside `Projects` to open the native macOS folder picker. Pick the local Git repository or working folder you want Damaian to inspect. The folder appears under `Projects`, and its chat sessions are grouped underneath it. Use the `+` beside a project folder to start a new session for that project.
@@ -80,6 +86,6 @@ The installer contains:
 
 ## Current Limitations
 
-- The package is unsigned and not notarized.
+- The package is ad-hoc signed but not Developer ID signed or notarized.
 - Repository selection uses a native folder picker from the Projects sidebar.
 - The app uses a local in-process server on `127.0.0.1:4765` as the temporary bridge between Tauri and the workspace engine.

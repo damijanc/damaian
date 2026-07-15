@@ -108,9 +108,35 @@ The generated artifacts are written to paths like:
 
 The developer-preview package is ad-hoc signed for bundle integrity but is not Developer ID signed or notarized. macOS may require the `Privacy & Security` `Open Anyway` flow described in [macOS Installation](docs/MACOS_INSTALLATION.md).
 
+## Automatic Updates
+
+Packaged desktop builds can check GitHub Releases for updates at startup. When a newer signed release is available, Damaian shows an `Update <version>` button in the conversation header. Selecting it downloads the update, verifies its Tauri updater signature, installs it, and restarts the app.
+
+The updater uses this static manifest URL:
+
+```text
+https://github.com/damijanc/damaian/releases/latest/download/latest.json
+```
+
+The first installed build must already include the updater. Older DMGs built before this feature must be replaced manually once.
+
 ## GitHub macOS Release Build
 
 The repository includes a GitHub Actions workflow at `.github/workflows/macos-dmg.yml`.
+
+Before creating updater-capable releases, generate a Tauri updater signing key and add these GitHub repository secrets:
+
+- `TAURI_UPDATER_PUBKEY`: The public key printed by the signer command. This is compiled into the app.
+- `TAURI_UPDATER_PRIVATE_KEY`: The private key file contents. This is used only in GitHub Actions to sign updater artifacts.
+- `TAURI_UPDATER_PRIVATE_KEY_PASSWORD`: Optional, only if the private key was generated with a password.
+
+Example key generation:
+
+```sh
+cargo tauri signer generate -w ~/.tauri/damaian-updater.key
+```
+
+Keep the private key out of Git. If the private key is lost, existing updater-enabled clients cannot verify artifacts signed with a replacement key.
 
 To build DMGs manually:
 
@@ -118,7 +144,7 @@ To build DMGs manually:
 2. Go to `Actions`.
 3. Select `Build macOS DMG`.
 4. Select `Run workflow`.
-5. Optionally enter a version such as `0.1.3`; this stamps the app About dialog and DMG filename.
+5. Enter a version such as `0.1.3`; this stamps the app About dialog, DMG filename, and updater manifest.
 6. Download the `Damaian-macOS-arm64-DMG` artifact from the completed run.
 
 To create a GitHub Release with DMG assets, push a version tag:
@@ -128,7 +154,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The workflow builds an ad-hoc signed Apple Silicon DMG, then attaches it to the GitHub Release for that tag. For tag builds, the workflow derives the app version from the tag. For example, tag `v0.1.3` produces app metadata version `0.1.3` and a `Damaian_0.1.3_aarch64.dmg` asset.
+The workflow builds an ad-hoc signed Apple Silicon DMG, creates signed Tauri updater artifacts, then attaches all release assets to the GitHub Release for that tag. For tag builds, the workflow derives the app version from the tag. For example, tag `v0.1.3` produces app metadata version `0.1.3`, a `Damaian_0.1.3_aarch64.dmg` installer, a signed `Damaian.app.tar.gz` updater archive, its `.sig` file, and `latest.json`.
 
 ## User Documentation
 

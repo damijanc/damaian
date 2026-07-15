@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Optional app version for manual builds, for example 0.1.3"
-        required: false
+        description: "App version for manual builds, for example 0.1.3"
+        required: true
         type: string
   push:
     tags:
@@ -44,8 +44,12 @@ jobs:
           fi
           if [[ -n "${version}" ]]; then
             npm run version:sync -- "${version}"
+            echo "RELEASE_VERSION=${version}" >> "${GITHUB_ENV}"
+            echo "RELEASE_TAG=v${version}" >> "${GITHUB_ENV}"
           else
             echo "No release version provided; using repository metadata version."
+            echo "RELEASE_VERSION=" >> "${GITHUB_ENV}"
+            echo "RELEASE_TAG=" >> "${GITHUB_ENV}"
           fi
 
       - name: Set up Rust
@@ -68,21 +72,30 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-cargo-
 
       - name: Refresh Cargo lock for stamped version
-        env:
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
-          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          version="${INPUT_VERSION}"
-          if [[ -z "${version}" && "${REF_TYPE}" == "tag" ]]; then
-            version="${REF_NAME#v}"
-          fi
-          if [[ -n "${version}" ]]; then
+          if [[ -n "${RELEASE_VERSION}" ]]; then
             cargo update --workspace --offline
           else
             echo "No release version stamped; lockfile refresh not needed."
           fi
+
+      - name: Configure updater release artifacts
+        if: env.RELEASE_VERSION != ''
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+          TAURI_UPDATER_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TAURI_UPDATER_PUBKEY}" ]]; then
+            echo "Missing TAURI_UPDATER_PUBKEY repository secret."
+            exit 1
+          fi
+          if [[ -z "${TAURI_UPDATER_PRIVATE_KEY}" ]]; then
+            echo "Missing TAURI_UPDATER_PRIVATE_KEY repository secret."
+            exit 1
+          fi
+          npm run updater:enable-artifacts
 
       - name: Install Tauri CLI
         run: |
@@ -102,12 +115,23 @@ jobs:
       - name: Build DMG
         env:
           APPLE_SIGNING_IDENTITY: "-"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY_PASSWORD }}
+          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
         run: npm run desktop:build
 
       - name: Verify macOS bundle
         run: |
           codesign --verify --deep --strict --verbose=4 target/release/bundle/macos/Damaian.app
           hdiutil verify target/release/bundle/dmg/*.dmg
+
+      - name: Create updater manifest
+        if: env.RELEASE_VERSION != ''
+        env:
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
+          TAG_NAME: ${{ env.RELEASE_TAG }}
+        run: npm run updater:manifest
 
       - name: Show bundle output
         run: |
@@ -117,7 +141,11 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: Damaian-macOS-arm64-DMG
-          path: target/release/bundle/dmg/*.dmg
+          path: |
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/macos/*.app.tar.gz
+            target/release/bundle/macos/*.app.tar.gz.sig
+            target/release/bundle/updater/latest.json
           if-no-files-found: error
 
   publish-release:
@@ -143,10 +171,20 @@ jobs:
         run: |
           set -euo pipefail
           notes="Ad-hoc signed, not notarized macOS developer-preview DMG build for ${TAG_NAME}."
+          mapfile -t assets < <(find release-artifacts -type f \( \
+            -name "*.dmg" -o \
+            -name "*.app.tar.gz" -o \
+            -name "*.app.tar.gz.sig" -o \
+            -name "latest.json" \
+          \) -print)
+          if [[ "${#assets[@]}" -eq 0 ]]; then
+            echo "No release assets found."
+            exit 1
+          fi
           if gh release view "${TAG_NAME}" --repo "${GH_REPO}" >/dev/null 2>&1; then
-            gh release upload "${TAG_NAME}" release-artifacts/*.dmg --repo "${GH_REPO}" --clobber
+            gh release upload "${TAG_NAME}" "${assets[@]}" --repo "${GH_REPO}" --clobber
           else
-            gh release create "${TAG_NAME}" release-artifacts/*.dmg \
+            gh release create "${TAG_NAME}" "${assets[@]}" \
               --repo "${GH_REPO}" \
               --title "${TAG_NAME}" \
               --notes "${notes}"

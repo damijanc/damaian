@@ -11,6 +11,8 @@
   "scripts": {
     "test": "node --test",
     "check": "node --test",
+    "updater:enable-artifacts": "node scripts/enable-updater-artifacts.mjs",
+    "updater:manifest": "node scripts/create-updater-manifest.mjs",
     "version:sync": "node scripts/sync-version.mjs",
     "desktop:dev": "cd crates/desktop-app && cargo tauri dev",
     "desktop:build": "cd crates/desktop-app && APPLE_SIGNING_IDENTITY=\"${APPLE_SIGNING_IDENTITY:--}\" cargo tauri build"
