@@ -413,6 +413,12 @@ button:disabled {
   padding: 10px;
 }
 
+.sidebar-footer {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
 .inline-actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -452,13 +458,15 @@ button:disabled {
 }
 
 .update-button {
-  height: 30px;
+  width: 100%;
+  min-height: 34px;
   border-color: #8dbda5;
   background: #eef8f2;
   color: var(--ok);
   font-size: 12px;
   font-weight: 800;
-  padding: 5px 10px;
+  padding: 7px 10px;
+  text-align: center;
 }
 
 .icon-button {
@@ -1865,8 +1873,9 @@ pre {
 
 #toast {
   position: fixed;
+  z-index: 120;
+  top: 16px;
   right: 16px;
-  bottom: 16px;
   max-width: min(420px, calc(100vw - 32px));
   border-radius: 8px;
   background: var(--ink);
@@ -1874,8 +1883,11 @@ pre {
   padding: 10px 12px;
   opacity: 0;
   pointer-events: none;
-  transform: translateY(8px);
+  box-shadow: 0 14px 34px rgba(31, 36, 40, 0.24);
+  transform: translateY(-8px);
   transition: 150ms ease;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 #toast.show {

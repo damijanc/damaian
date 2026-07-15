@@ -38,7 +38,9 @@
   "plugins": {
     "updater": {
       "pubkey": "",
-      "endpoints": []
+      "endpoints": [
+        "https://github.com/damijanc/damaian/releases/latest/download/latest.json"
+      ]
     }
   }
 }
