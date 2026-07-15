@@ -39,6 +39,7 @@ pub struct ModelRequest {
     pub model: String,
     pub messages: Vec<ModelMessage>,
     pub temperature: Option<String>,
+    pub reasoning_level: Option<String>,
     pub stream: bool,
 }
 
@@ -254,8 +255,16 @@ pub struct OpenAICompatibleAdapter<T: ModelTransport> {
 
 impl<T: ModelTransport> OpenAICompatibleAdapter<T> {
     pub fn new(model: impl Into<String>, transport: T) -> Self {
+        Self::with_provider("openai-compatible", model, transport)
+    }
+
+    pub fn with_provider(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        transport: T,
+    ) -> Self {
         Self {
-            provider: "openai-compatible".to_string(),
+            provider: provider.into(),
             model: model.into(),
             transport,
             cancelled: Vec::new(),
@@ -355,8 +364,35 @@ pub fn model_request_json(request: &ModelRequest) -> String {
     if let Some(temperature) = &request.temperature {
         body.push_str(&format!(",\"temperature\":{}", temperature));
     }
+    if let Some(reasoning_effort) =
+        api_reasoning_effort(&request.provider, &request.reasoning_level)
+    {
+        body.push_str(&format!(
+            ",\"reasoning_effort\":\"{}\"",
+            audit_escape_json(reasoning_effort)
+        ));
+    }
     body.push('}');
     body
+}
+
+fn api_reasoning_effort<'a>(
+    provider: &str,
+    reasoning_level: &'a Option<String>,
+) -> Option<&'a str> {
+    let supports_reasoning_effort = matches!(
+        provider,
+        "openai" | "openai-compatible" | "open-ai-compatible"
+    );
+    if !supports_reasoning_effort {
+        return None;
+    }
+    let level = reasoning_level.as_deref()?.trim();
+    match level {
+        "" | "default" | "auto" => None,
+        "minimal" | "low" | "medium" | "high" => Some(level),
+        _ => None,
+    }
 }
 
 pub fn extract_model_tokens(raw: &str) -> Vec<String> {

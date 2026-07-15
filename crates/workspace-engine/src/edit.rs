@@ -207,6 +207,7 @@ impl EditOrchestrator {
                 ModelMessage::user(build_edit_prompt(prompt, &context.items)),
             ],
             temperature: Some("0".to_string()),
+            reasoning_level: Some(self.config.model_reasoning_level.clone()),
             stream: true,
         };
 

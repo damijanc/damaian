@@ -38,7 +38,38 @@ export function defaultDataDir(appName = 'DamaianClient') {
   return path.join(os.homedir(), 'Library', 'Application Support', appName);
 }
 
+function providerDefaults(provider) {
+  switch (provider) {
+    case 'deepseek':
+    case 'deedseek':
+      return {
+        provider: 'deepseek',
+        model: process.env.DEEPSEEK_MODEL ?? 'deepseek-chat',
+        baseUrl: process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com',
+        apiKeyEnv: 'DEEPSEEK_API_KEY'
+      };
+    case 'openai-compatible':
+    case 'custom':
+      return {
+        provider: 'openai-compatible',
+        model: 'configured-model',
+        baseUrl: 'https://api.openai.com',
+        apiKeyEnv: 'OPENAI_API_KEY'
+      };
+    case 'openai':
+    default:
+      return {
+        provider: 'openai',
+        model: process.env.OPENAI_MODEL ?? 'gpt-4.1',
+        baseUrl: process.env.OPENAI_BASE_URL ?? 'https://api.openai.com',
+        apiKeyEnv: 'OPENAI_API_KEY'
+      };
+  }
+}
+
 export function createDefaultConfig(overrides = {}) {
+  const modelProvider = overrides.model?.provider ?? 'openai';
+  const modelDefaults = providerDefaults(modelProvider);
   return {
     dataDir: overrides.dataDir ?? process.env.DAMAIAN_DATA_DIR ?? defaultDataDir(),
     maxFileBytes: overrides.maxFileBytes ?? 1024 * 1024,
@@ -59,10 +90,11 @@ export function createDefaultConfig(overrides = {}) {
       debugPayloads: overrides.audit?.debugPayloads ?? false
     },
     model: {
-      provider: overrides.model?.provider ?? 'openai-compatible',
-      model: overrides.model?.model ?? 'configured-model',
-      baseUrl: overrides.model?.baseUrl ?? 'https://api.openai.com',
-      apiKeyEnv: overrides.model?.apiKeyEnv ?? 'OPENAI_API_KEY',
+      provider: modelDefaults.provider,
+      model: overrides.model?.model ?? modelDefaults.model,
+      baseUrl: overrides.model?.baseUrl ?? modelDefaults.baseUrl,
+      apiKeyEnv: overrides.model?.apiKeyEnv ?? modelDefaults.apiKeyEnv,
+      reasoningLevel: overrides.model?.reasoningLevel ?? 'default',
       timeoutMs: overrides.model?.timeoutMs ?? 60_000
     },
     secretPatterns: overrides.secretPatterns ?? []

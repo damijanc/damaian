@@ -236,8 +236,11 @@ fn run() -> workspace_engine::Result<()> {
                     ))
                 })?;
                 let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
-                let mut adapter =
-                    OpenAICompatibleAdapter::new(&engine.config.model_name, transport);
+                let mut adapter = OpenAICompatibleAdapter::with_provider(
+                    &engine.config.model_provider,
+                    &engine.config.model_name,
+                    transport,
+                );
                 engine
                     .chat_orchestrator
                     .ask(repo, &prompt, &[], &mut adapter, &mut stdout_token)?
@@ -277,8 +280,11 @@ fn run() -> workspace_engine::Result<()> {
                     ))
                 })?;
                 let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
-                let mut adapter =
-                    OpenAICompatibleAdapter::new(&engine.config.model_name, transport);
+                let mut adapter = OpenAICompatibleAdapter::with_provider(
+                    &engine.config.model_provider,
+                    &engine.config.model_name,
+                    transport,
+                );
                 engine
                     .edit_orchestrator
                     .propose_edit(repo, &prompt, &[], &mut adapter)?

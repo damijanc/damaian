@@ -497,15 +497,17 @@ fn attaches_unique_file_mentions_to_chat_context() {
 #[test]
 fn builds_openai_request_json_and_extracts_stream_tokens() {
     let request = ModelRequest {
-        provider: "openai-compatible".to_string(),
+        provider: "openai".to_string(),
         model: "test-model".to_string(),
         messages: vec![ModelMessage::user("hello \"repo\"")],
         temperature: Some("0".to_string()),
+        reasoning_level: Some("high".to_string()),
         stream: true,
     };
     let body = model_request_json(&request);
     assert!(body.contains("\"model\":\"test-model\""));
     assert!(body.contains("hello \\\"repo\\\""));
+    assert!(body.contains("\"reasoning_effort\":\"high\""));
 
     let raw = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" repo — ok\"}}]}\n\ndata: [DONE]\n\n";
     assert_eq!(extract_model_tokens(raw), vec!["Hello", " repo — ok"]);
@@ -514,12 +516,15 @@ fn builds_openai_request_json_and_extracts_stream_tokens() {
 #[test]
 fn reports_openai_compatible_error_payloads() {
     let request = ModelRequest {
-        provider: "openai-compatible".to_string(),
+        provider: "deepseek".to_string(),
         model: "test-model".to_string(),
         messages: vec![ModelMessage::user("hello")],
         temperature: Some("0".to_string()),
+        reasoning_level: Some("high".to_string()),
         stream: true,
     };
+    let body = model_request_json(&request);
+    assert!(!body.contains("reasoning_effort"));
     let transport = MockModelTransport::new("{\"error\":{\"message\":\"Rate limit exceeded\"}}\n");
     let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
     let error = adapter
@@ -818,6 +823,73 @@ fn config_overlay_accepts_model_api_key_references() {
     assert_eq!(
         keychain_overlay.model_api_key_env,
         Some("keychain:model-api-key".to_string())
+    );
+}
+
+#[test]
+fn config_overlay_applies_provider_defaults_and_reasoning_level() {
+    let overlay =
+        ConfigOverlay::parse("model_provider=deedseek\nmodel_reasoning_level=High\n").unwrap();
+    assert_eq!(overlay.model_provider, Some("deepseek".to_string()));
+    assert_eq!(overlay.model_reasoning_level, Some("high".to_string()));
+
+    let mut config = Config::default();
+    config.apply_overlay(overlay);
+
+    assert_eq!(config.model_provider, "deepseek");
+    assert_eq!(config.model_base_url, "https://api.deepseek.com");
+    assert_eq!(config.model_api_key_env, "DEEPSEEK_API_KEY");
+    assert_eq!(config.model_name, "deepseek-chat");
+    assert_eq!(config.model_reasoning_level, "high");
+}
+
+#[test]
+fn default_config_has_no_configured_model_providers() {
+    let config = Config::default();
+
+    assert!(config.model_providers.is_empty());
+    assert!(!config.to_policy_text().contains("model_provider.openai."));
+    assert!(!config.to_policy_text().contains("model_provider.deepseek."));
+}
+
+#[test]
+fn provider_defaults_preserve_keychain_references() {
+    let overlay =
+        ConfigOverlay::parse("model_api_key_env=keychain:model-api-key\nmodel_provider=deepseek\n")
+            .unwrap();
+    let mut config = Config::default();
+    config.apply_overlay(overlay);
+
+    assert_eq!(config.model_api_key_env, "keychain:model-api-key");
+}
+
+#[test]
+fn config_overlay_supports_custom_model_providers() {
+    let overlay = ConfigOverlay::parse(
+        "model_provider.acme.label=Acme AI\n\
+         model_provider.acme.base_url=https://api.acme.test\n\
+         model_provider.acme.api_key_env=keychain:acme-ai-key\n\
+         model_provider.acme.models=acme-large|acme-fast\n\
+         model_provider=acme\n",
+    )
+    .unwrap();
+
+    let mut config = Config::default();
+    config.apply_overlay(overlay.clone());
+
+    assert_eq!(overlay.model_providers.len(), 1);
+    assert_eq!(config.model_provider, "acme");
+    assert_eq!(config.model_base_url, "https://api.acme.test");
+    assert_eq!(config.model_api_key_env, "keychain:acme-ai-key");
+    assert_eq!(config.model_name, "acme-large");
+    assert_eq!(
+        config.model_provider_config("acme").unwrap().models.clone(),
+        vec!["acme-large".to_string(), "acme-fast".to_string()]
+    );
+    assert!(
+        config
+            .to_policy_text()
+            .contains("model_provider.acme.base_url=https://api.acme.test")
     );
 }
 

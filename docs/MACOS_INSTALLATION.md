@@ -32,6 +32,22 @@ For this developer-preview package:
 
 Only do this for builds you created yourself or received from a trusted source.
 
+You can also open a trusted developer-preview build from Finder:
+
+1. Open `Applications` in Finder.
+2. Control-click `Damaian.app`.
+3. Select `Open`.
+4. Confirm the launch prompt.
+
+For a local build you created yourself, you can remove the quarantine attribute from Terminal:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Damaian.app
+open /Applications/Damaian.app
+```
+
+Do not remove quarantine from apps downloaded from sources you do not trust.
+
 If macOS says the application is damaged, verify that you are using a release built after the ad-hoc signing fix. Older DMGs had an invalid bundle signature and should be replaced by a new release build.
 
 ## Updates

@@ -16,6 +16,7 @@ let projectSessionsLoading = new Set();
 let projectsCollapsed = false;
 let appUpdateInfo = null;
 let appUpdateInstalling = false;
+let currentPolicyModelOptions = null;
 
 const localApiOrigin = "http://127.0.0.1:4765";
 const localApiHostnames = new Set(["127.0.0.1", "localhost"]);
@@ -24,8 +25,71 @@ const lastRepoStorageKey = "damaian:lastRepository";
 const projectsStorageKey = "damaian:projects";
 const expandedProjectsStorageKey = "damaian:expandedProjects";
 const projectsCollapsedStorageKey = "damaian:projectsCollapsed";
-const inspectorCollapsedStorageKey = "damaian:inspectorCollapsed";
 const pinnedContextStoragePrefix = "damaian:pinnedContextFiles";
+const chatModelPrefsStoragePrefix = "damaian:chatModelPrefs";
+
+const builtInProviderIds = ["openai", "deepseek", "openai-compatible"];
+const builtInProviderIdSet = new Set(builtInProviderIds);
+const builtInModelProviderPresets = {
+  openai: {
+    label: "OpenAI",
+    baseUrl: "https://api.openai.com",
+    apiKeyEnv: "OPENAI_API_KEY",
+    defaultModel: "gpt-4.1",
+    models: ["gpt-4.1", "gpt-4.1-mini", "o4-mini"],
+  },
+  deepseek: {
+    label: "DeepSeek",
+    baseUrl: "https://api.deepseek.com",
+    apiKeyEnv: "DEEPSEEK_API_KEY",
+    defaultModel: "deepseek-chat",
+    models: ["deepseek-chat", "deepseek-reasoner"],
+  },
+  "openai-compatible": {
+    label: "Custom",
+    baseUrl: "https://api.openai.com",
+    apiKeyEnv: "OPENAI_API_KEY",
+    defaultModel: "configured-model",
+    models: ["configured-model"],
+  },
+};
+const modelProviderPresets = {};
+const configuredProviderIds = new Set();
+
+const validReasoningLevels = new Set(["default", "minimal", "low", "medium", "high"]);
+const providerLabels = {};
+const reasoningLabels = {
+  default: "Default",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "Extra High",
+};
+const popularProviderPresets = [
+  {
+    id: "openai",
+    label: "OpenAI",
+    description: "GPT and reasoning models",
+  },
+  {
+    id: "deepseek",
+    label: "DeepSeek",
+    description: "DeepSeek chat and reasoning models",
+  },
+  {
+    id: "openai-compatible",
+    label: "OpenAI compatible",
+    description: "Custom hosted compatible endpoint",
+  },
+  {
+    id: "ollama",
+    label: "Ollama",
+    description: "Local OpenAI-compatible runtime",
+    baseUrl: "http://localhost:11434/v1",
+    apiKeyEnv: "keychain:ollama-api-key",
+    models: ["llama3.1", "qwen2.5-coder"],
+  },
+];
 
 function repo() {
   return $("repo").value.trim();
@@ -108,7 +172,6 @@ function startBootstrap() {
       if (!payload.apiToken) throw new Error("Desktop API token missing from bootstrap");
       apiToken = payload.apiToken;
       if (!chatSubmitting) $("ask-btn").disabled = false;
-      setInspectorCollapsed(localStorage.getItem(inspectorCollapsedStorageKey) === "true");
       loadProjectState();
       const lastRepo = localStorage.getItem(lastRepoStorageKey);
       if (lastRepo) {
@@ -120,6 +183,7 @@ function startBootstrap() {
         clearSessionList();
         clearChat();
         renderProjectList();
+        void loadConfigFile().catch((error) => setModelKeyStatus(error.message, "error"));
       }
       scheduleUpdateCheck();
     })
@@ -327,6 +391,7 @@ function setRepository(value, persist = true) {
     clearSessionList();
     clearChat();
   }
+  void loadConfigFile().catch((error) => setModelKeyStatus(error.message, "error"));
 }
 
 async function switchProject(projectPath, options = {}) {
@@ -337,6 +402,7 @@ async function switchProject(projectPath, options = {}) {
     return;
   }
   await loadSessions(options.preferredSessionId || "", options.reloadSelected !== false);
+  void loadConfigFile().catch((error) => setModelKeyStatus(error.message, "error"));
 }
 
 function tauriDialogOpen() {
@@ -440,21 +506,31 @@ async function installAppUpdate() {
   }
 }
 
-function setInspectorCollapsed(collapsed) {
-  document.body.classList.toggle("inspector-collapsed", collapsed);
-  localStorage.setItem(inspectorCollapsedStorageKey, collapsed ? "true" : "false");
-  const button = $("inspector-toggle-btn");
-  button.classList.toggle("is-collapsed", collapsed);
-  const label = collapsed ? "Show tools" : "Hide tools";
-  button.title = label;
-  button.setAttribute("aria-label", label);
-  button.setAttribute("aria-expanded", collapsed ? "false" : "true");
+function setSettingsPage(page) {
+  const target = ["general", "shortcuts", "servers", "providers", "models"].includes(page)
+    ? page
+    : "providers";
+  document.querySelectorAll(".settings-nav-item").forEach((button) => {
+    button.classList.toggle("active", button.dataset.settingsPage === target);
+  });
+  document.querySelectorAll(".settings-page").forEach((section) => {
+    section.classList.toggle("active", section.dataset.page === target);
+  });
+  if (target === "models") renderSettingsModels();
 }
 
-function ensureInspectorVisible() {
-  if (document.body.classList.contains("inspector-collapsed")) {
-    setInspectorCollapsed(false);
-  }
+function openSettings(page = "providers") {
+  setSettingsPage(page);
+  $("settings-shell").hidden = false;
+  document.body.classList.add("settings-open");
+  renderSettingsProviderLists();
+  renderSettingsModels();
+  void loadConfigFile().catch((error) => setModelKeyStatus(error.message, "error"));
+}
+
+function closeSettings() {
+  $("settings-shell").hidden = true;
+  document.body.classList.remove("settings-open");
 }
 
 function setTerminalOpen(open) {
@@ -573,6 +649,12 @@ function renderConfigPolicy(payload) {
   $("config-output").textContent = payload.effectiveError
     ? `Effective policy could not be loaded:\n${payload.effectiveError}`
     : payload.effectivePolicy;
+  if (!payload.effectiveError) {
+    syncProviderCatalogFromPolicy(payload.effectivePolicy);
+    currentPolicyModelOptions = modelOptionsFromPolicy(payload.effectivePolicy);
+    syncChatModelControlsFromPolicy(payload.effectivePolicy);
+    renderProviderConfigSelect();
+  }
 }
 
 function configValue(content, key) {
@@ -582,6 +664,663 @@ function configValue(content, key) {
     .map((item) => item.trim())
     .find((item) => item.startsWith(prefix));
   return line ? line.slice(prefix.length).trim() : "";
+}
+
+function configEntries(content) {
+  return String(content || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+    .map((line) => {
+      const index = line.indexOf("=");
+      return index >= 0 ? [line.slice(0, index).trim(), line.slice(index + 1).trim()] : null;
+    })
+    .filter(Boolean);
+}
+
+function normalizeChatProvider(value) {
+  const provider = String(value || "").trim().toLowerCase().replaceAll("_", "-");
+  if (provider === "open-ai" || provider === "openai") return "openai";
+  if (provider === "deep-seek" || provider === "deepseek" || provider === "deedseek") {
+    return "deepseek";
+  }
+  if (provider === "custom" || provider === "open-ai-compatible" || provider === "openai-compatible") {
+    return "openai-compatible";
+  }
+  return /^[a-z0-9.-]+$/.test(provider) ? provider : "openai-compatible";
+}
+
+function normalizeChatReasoning(value) {
+  const reasoning = String(value || "").trim().toLowerCase();
+  return validReasoningLevels.has(reasoning) ? reasoning : "default";
+}
+
+function chatModelPrefsStorageKey() {
+  return `${chatModelPrefsStoragePrefix}:${repo() || "global"}`;
+}
+
+function readChatModelPrefs() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(chatModelPrefsStorageKey()) || "{}");
+    if (!stored || typeof stored !== "object") return {};
+    const prefs = {};
+    if (stored.provider) prefs.provider = normalizeChatProvider(stored.provider);
+    if (typeof stored.model === "string" && stored.model.trim()) prefs.model = stored.model.trim();
+    if (stored.reasoning) prefs.reasoning = normalizeChatReasoning(stored.reasoning);
+    return prefs;
+  } catch {
+    return {};
+  }
+}
+
+function selectedChatModelOptions() {
+  const provider = normalizeChatProvider($("chat-provider").value);
+  const preset = modelProviderPresets[provider] || modelProviderPresets["openai-compatible"];
+  return {
+    provider,
+    model: $("chat-model").value.trim() || preset.defaultModel,
+    reasoning: normalizeChatReasoning($("chat-reasoning").value),
+  };
+}
+
+function saveChatModelPrefs() {
+  localStorage.setItem(chatModelPrefsStorageKey(), JSON.stringify(selectedChatModelOptions()));
+}
+
+function providerIds() {
+  const ids = Object.keys(modelProviderPresets);
+  return [
+    ...builtInProviderIds.filter((id) => ids.includes(id)),
+    ...ids.filter((id) => !builtInProviderIdSet.has(id)).sort((a, b) => a.localeCompare(b)),
+  ];
+}
+
+function configuredProviderList() {
+  return [
+    ...builtInProviderIds.filter((id) => configuredProviderIds.has(id)),
+    ...[...configuredProviderIds]
+      .filter((id) => !builtInProviderIdSet.has(id))
+      .sort((a, b) => a.localeCompare(b)),
+  ];
+}
+
+function splitModelList(value) {
+  return String(value || "")
+    .split(/[\n,|]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function syncConfiguredProvidersFromConfig(content) {
+  configuredProviderIds.clear();
+  configEntries(content).forEach(([key]) => {
+    const match = key.match(/^model_provider\.([a-zA-Z0-9_.-]+)\.(label|base_url|api_key_env|models)$/);
+    if (match) configuredProviderIds.add(normalizeChatProvider(match[1]));
+  });
+}
+
+function syncProviderCatalogFromPolicy(policyText) {
+  Object.keys(modelProviderPresets).forEach((key) => delete modelProviderPresets[key]);
+  Object.keys(providerLabels).forEach((key) => delete providerLabels[key]);
+  Object.entries(builtInModelProviderPresets).forEach(([id, preset]) => {
+    modelProviderPresets[id] = { ...preset, models: [...preset.models] };
+  });
+
+  const providers = {};
+  configEntries(policyText).forEach(([key, value]) => {
+    const match = key.match(/^model_provider\.([a-zA-Z0-9_.-]+)\.(label|base_url|api_key_env|models)$/);
+    if (!match) return;
+    const id = normalizeChatProvider(match[1]);
+    providers[id] = providers[id] || { id };
+    const field = match[2];
+    if (field === "label") providers[id].label = value;
+    if (field === "base_url") providers[id].baseUrl = value;
+    if (field === "api_key_env") providers[id].apiKeyEnv = value;
+    if (field === "models") providers[id].models = splitModelList(value);
+  });
+
+  Object.entries(providers).forEach(([id, provider]) => {
+    const existing = modelProviderPresets[id] || {};
+    const models = provider.models?.length ? provider.models : existing.models || [];
+    modelProviderPresets[id] = {
+      label: provider.label || existing.label || id,
+      baseUrl: provider.baseUrl || existing.baseUrl || "",
+      apiKeyEnv: provider.apiKeyEnv || existing.apiKeyEnv || "",
+      defaultModel: models[0] || existing.defaultModel || "",
+      models,
+    };
+  });
+
+  Object.entries(modelProviderPresets).forEach(([id, provider]) => {
+    providerLabels[id] = provider.label || id;
+  });
+}
+
+function modelOptionsFromPolicy(policyText) {
+  const provider = normalizeChatProvider(configValue(policyText, "model_provider") || "openai");
+  const preset = modelProviderPresets[provider] || modelProviderPresets["openai-compatible"];
+  return {
+    provider,
+    model: configValue(policyText, "model_name") || preset.defaultModel,
+    reasoning: normalizeChatReasoning(configValue(policyText, "model_reasoning_level")),
+  };
+}
+
+function applyChatModelOptions(options, { resetModel = false, persist = false } = {}) {
+  const provider = normalizeChatProvider(options.provider);
+  const preset = modelProviderPresets[provider] || modelProviderPresets["openai-compatible"];
+  $("chat-provider").value = provider;
+  if (resetModel || options.model !== undefined || !$("chat-model").value.trim()) {
+    $("chat-model").value = options.model || preset.defaultModel;
+  }
+  $("chat-reasoning").value = normalizeChatReasoning(options.reasoning);
+  if (persist) saveChatModelPrefs();
+  renderChatModelMenu();
+}
+
+function syncChatModelControlsFromPolicy(policyText) {
+  const policyOptions = modelOptionsFromPolicy(policyText);
+  const storedOptions = readChatModelPrefs();
+  applyChatModelOptions({ ...policyOptions, ...storedOptions });
+}
+
+function chatModelFormFields() {
+  const options = selectedChatModelOptions();
+  return {
+    model_provider: options.provider,
+    model: options.model,
+    reasoning_level: options.reasoning,
+  };
+}
+
+function modelSummaryLabel(options = selectedChatModelOptions()) {
+  const model = options.model || "Configured";
+  return `${model} ${reasoningLabels[options.reasoning] || "Default"}`;
+}
+
+function modelOptionValues(provider) {
+  const preset = modelProviderPresets[provider] || modelProviderPresets["openai-compatible"];
+  const selected = selectedChatModelOptions().model;
+  return [...new Set([...preset.models, selected].filter(Boolean))];
+}
+
+function renderChatModelMenu() {
+  const options = selectedChatModelOptions();
+  $("model-menu-summary").textContent = modelSummaryLabel(options);
+  $("model-provider-value").textContent = providerLabels[options.provider] || options.provider;
+  $("model-name-value").textContent = options.model || "Configured";
+  $("model-reasoning-value").textContent = reasoningLabels[options.reasoning] || "Default";
+  $("custom-model-input").value = options.model;
+  renderProviderOptions(options.provider);
+  renderModelOptions(options.provider, options.model);
+  renderReasoningOptions(options.reasoning);
+}
+
+function renderProviderOptions(selectedProvider) {
+  const container = $("model-provider-options");
+  container.innerHTML = "";
+  providerIds().forEach((provider) => {
+    container.append(
+      modelOptionButton(providerLabels[provider], selectedProvider === provider, () => {
+        const preset = modelProviderPresets[provider] || modelProviderPresets["openai-compatible"];
+        const fallbackModel = preset.defaultModel || $("chat-model").value.trim();
+        applyChatModelOptions(
+          {
+            provider,
+            model: fallbackModel,
+            reasoning: $("chat-reasoning").value,
+          },
+          { resetModel: true, persist: true },
+        );
+        showModelMenuPanel("root");
+        void refreshModelKeyStatus().catch((error) => setModelKeyStatus(error.message, "error"));
+      }),
+    );
+  });
+}
+
+function renderModelOptions(provider, selectedModel) {
+  const container = $("model-options");
+  container.innerHTML = "";
+  const models = modelOptionValues(provider);
+  if (!models.length) {
+    const empty = document.createElement("div");
+    empty.className = "model-empty-state";
+    empty.textContent = "Use a custom model name.";
+    container.append(empty);
+  }
+  models.forEach((model) => {
+    container.append(
+      modelOptionButton(model, selectedModel === model, () => {
+        applyChatModelOptions(
+          {
+            provider,
+            model,
+            reasoning: $("chat-reasoning").value,
+          },
+          { persist: true },
+        );
+        showModelMenuPanel("root");
+      }),
+    );
+  });
+}
+
+function renderReasoningOptions(selectedReasoning) {
+  const container = $("model-reasoning-options");
+  container.innerHTML = "";
+  ["default", "minimal", "low", "medium", "high"].forEach((reasoning) => {
+    container.append(
+      modelOptionButton(reasoningLabels[reasoning], selectedReasoning === reasoning, () => {
+        applyChatModelOptions(
+          {
+            provider: $("chat-provider").value,
+            model: $("chat-model").value,
+            reasoning,
+          },
+          { persist: true },
+        );
+        showModelMenuPanel("root");
+      }),
+    );
+  });
+}
+
+function modelOptionButton(label, selected, onClick) {
+  const button = document.createElement("button");
+  button.className = "model-option";
+  button.type = "button";
+  button.dataset.selected = selected ? "true" : "false";
+  const text = document.createElement("span");
+  text.textContent = label;
+  button.append(text);
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function toggleModelMenu() {
+  if ($("chat-model-popover").hidden) {
+    openModelMenu();
+  } else {
+    closeModelMenu();
+  }
+}
+
+function openModelMenu(panel = "root") {
+  renderChatModelMenu();
+  $("chat-model-popover").hidden = false;
+  $("chat-model-menu-btn").setAttribute("aria-expanded", "true");
+  showModelMenuPanel(panel);
+}
+
+function closeModelMenu() {
+  $("chat-model-popover").hidden = true;
+  $("chat-model-menu-btn").setAttribute("aria-expanded", "false");
+}
+
+function showModelMenuPanel(panel) {
+  document.querySelectorAll(".model-menu-panel").forEach((element) => {
+    element.hidden = element.id !== `model-menu-${panel}`;
+  });
+}
+
+function resetChatModelPrefs() {
+  localStorage.removeItem(chatModelPrefsStorageKey());
+  applyChatModelOptions(currentPolicyModelOptions || modelOptionsFromPolicy(""), {
+    resetModel: true,
+  });
+  showModelMenuPanel("root");
+  void refreshModelKeyStatus().catch((error) => setModelKeyStatus(error.message, "error"));
+}
+
+function applyCustomModel() {
+  const model = $("custom-model-input").value.trim();
+  if (!model) return;
+  applyChatModelOptions(
+    {
+      provider: $("chat-provider").value,
+      model,
+      reasoning: $("chat-reasoning").value,
+    },
+    { persist: true },
+  );
+  showModelMenuPanel("root");
+}
+
+function providerSlug(value) {
+  const slug = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_\s]+/g, "-")
+    .replace(/[^a-z0-9.-]/g, "")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return slug ? normalizeChatProvider(slug) : "";
+}
+
+function providerConfigFromForm() {
+  const label = $("provider-label-input").value.trim();
+  const id = providerSlug($("provider-id-input").value || label);
+  const baseUrl = $("provider-base-url-input").value.trim().replace(/\/+$/, "");
+  const apiKeyEnv = $("provider-key-ref-input").value.trim();
+  const models = splitModelList($("provider-models-input").value);
+  if (!label) throw new Error("Provider name is required");
+  if (!id) throw new Error("Provider ID is required");
+  if (!baseUrl) throw new Error("Provider base URL is required");
+  if (!apiKeyEnv) throw new Error("Provider API key reference is required");
+  if (apiKeyEnv === "keychain:") throw new Error("Keychain account is required");
+  if (!models.length) throw new Error("At least one model is required");
+  return { id, label, baseUrl, apiKeyEnv, models };
+}
+
+function renderProviderConfigSelect(selectedId = $("provider-config-select").value) {
+  const select = $("provider-config-select");
+  if (!select) return;
+  const ids = configuredProviderList();
+  select.innerHTML = "";
+  select.disabled = !ids.length;
+  if (!ids.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "No configured providers";
+    select.append(option);
+    clearProviderConfigForm();
+    renderSettingsProviderLists();
+    renderSettingsModels();
+    return;
+  }
+  ids.forEach((id) => {
+    const option = document.createElement("option");
+    option.value = id;
+    option.textContent = providerLabels[id] || id;
+    select.append(option);
+  });
+  const nextId = ids.includes(selectedId) ? selectedId : ids[0];
+  select.value = nextId;
+  renderProviderConfigForm(nextId);
+  renderSettingsProviderLists();
+  renderSettingsModels();
+}
+
+function renderProviderConfigForm(providerId = $("provider-config-select").value) {
+  const id = normalizeChatProvider(providerId || "openai");
+  const provider = modelProviderPresets[id] || {
+    label: "",
+    baseUrl: "",
+    apiKeyEnv: "",
+    models: [],
+  };
+  $("provider-config-select").value = providerId;
+  $("provider-label-input").value = provider.label || "";
+  $("provider-id-input").value = id;
+  $("provider-id-input").disabled = builtInProviderIdSet.has(id);
+  $("provider-id-input").dataset.originalId = id;
+  $("provider-base-url-input").value = provider.baseUrl || "";
+  $("provider-key-ref-input").value = provider.apiKeyEnv || `keychain:${id}-api-key`;
+  $("provider-api-key-input").value = "";
+  $("provider-models-input").value = (provider.models || []).join("\n");
+  $("provider-remove-btn").disabled = !configuredProviderIds.has(id);
+}
+
+function clearProviderConfigForm() {
+  $("provider-config-select").value = "";
+  $("provider-label-input").value = "";
+  $("provider-id-input").value = "";
+  $("provider-id-input").disabled = false;
+  $("provider-id-input").dataset.originalId = "";
+  $("provider-base-url-input").value = "";
+  $("provider-key-ref-input").value = "keychain:";
+  $("provider-api-key-input").value = "";
+  $("provider-models-input").value = "";
+  $("provider-remove-btn").disabled = true;
+}
+
+function newProviderConfigForm() {
+  clearProviderConfigForm();
+  $("provider-config-select").disabled = configuredProviderList().length === 0;
+  $("provider-label-input").focus();
+}
+
+function providerBadge(provider) {
+  return provider.apiKeyEnv?.startsWith("keychain:") ? "API key" : "Env";
+}
+
+function providerDescription(provider) {
+  const models = provider.models || [];
+  if (!models.length) return provider.baseUrl || "Custom provider";
+  return models.slice(0, 3).join(", ");
+}
+
+function providerMark(label) {
+  return String(label || "?").trim().slice(0, 1).toUpperCase() || "?";
+}
+
+function renderSettingsProviderLists() {
+  renderConnectedProviders();
+  renderPopularProviders();
+}
+
+function renderConnectedProviders() {
+  const container = $("connected-provider-list");
+  if (!container) return;
+  container.innerHTML = "";
+  const ids = configuredProviderList();
+  if (!ids.length) {
+    const empty = document.createElement("div");
+    empty.className = "provider-empty-row";
+    empty.textContent = "No providers configured.";
+    container.append(empty);
+    return;
+  }
+  ids.forEach((id) => {
+    const provider = modelProviderPresets[id];
+    if (!provider) return;
+    const row = document.createElement("div");
+    row.className = "provider-list-row";
+    row.dataset.provider = id;
+
+    const identity = document.createElement("div");
+    identity.className = "provider-identity";
+    const mark = document.createElement("span");
+    mark.className = "provider-mark";
+    mark.textContent = providerMark(provider.label || id);
+    const copy = document.createElement("div");
+    const title = document.createElement("div");
+    title.className = "provider-title";
+    const name = document.createElement("strong");
+    name.textContent = provider.label || id;
+    const badge = document.createElement("span");
+    badge.className = "provider-badge";
+    badge.textContent = providerBadge(provider);
+    title.append(name, badge);
+    const description = document.createElement("p");
+    description.textContent = providerDescription(provider);
+    copy.append(title, description);
+    identity.append(mark, copy);
+
+    const actions = document.createElement("div");
+    actions.className = "provider-row-actions";
+    const editButton = document.createElement("button");
+    editButton.type = "button";
+    editButton.textContent = "Configure";
+    editButton.addEventListener("click", () => {
+      renderProviderConfigForm(id);
+      $("provider-label-input").focus();
+    });
+    actions.append(editButton);
+
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.textContent = "Disconnect";
+    removeButton.addEventListener("click", async () => {
+      if (!window.confirm(`Remove provider ${id}?`)) return;
+      renderProviderConfigForm(id);
+      try {
+        await removeProviderConfigFromSettings();
+        toast("LLM provider removed");
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+    actions.append(removeButton);
+
+    row.append(identity, actions);
+    container.append(row);
+  });
+}
+
+function renderPopularProviders() {
+  const container = $("popular-provider-list");
+  if (!container) return;
+  container.innerHTML = "";
+  const presets = popularProviderPresets.filter((preset) => !configuredProviderIds.has(preset.id));
+  if (!presets.length) {
+    const empty = document.createElement("div");
+    empty.className = "provider-empty-row";
+    empty.textContent = "All popular providers are configured.";
+    container.append(empty);
+    return;
+  }
+  presets.forEach((preset) => {
+    const row = document.createElement("div");
+    row.className = "provider-list-row";
+    const identity = document.createElement("div");
+    identity.className = "provider-identity";
+    const mark = document.createElement("span");
+    mark.className = "provider-mark";
+    mark.textContent = providerMark(preset.label);
+    const copy = document.createElement("div");
+    const title = document.createElement("div");
+    title.className = "provider-title";
+    const name = document.createElement("strong");
+    name.textContent = preset.label;
+    title.append(name);
+    const description = document.createElement("p");
+    description.textContent = preset.description;
+    copy.append(title, description);
+    identity.append(mark, copy);
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "provider-connect-btn";
+    button.textContent = "+ Connect";
+    button.addEventListener("click", () => connectPopularProvider(preset));
+
+    row.append(identity, button);
+    container.append(row);
+  });
+}
+
+function connectPopularProvider(preset) {
+  if (configuredProviderIds.has(preset.id)) {
+    renderProviderConfigForm(preset.id);
+  } else {
+    const provider = {
+      ...(builtInModelProviderPresets[preset.id] || {}),
+      ...preset,
+    };
+    newProviderConfigForm();
+    $("provider-label-input").value = provider.label;
+    $("provider-id-input").value = provider.id;
+    $("provider-id-input").disabled = builtInProviderIdSet.has(provider.id);
+    $("provider-base-url-input").value = provider.baseUrl || "";
+    $("provider-key-ref-input").value = provider.apiKeyEnv || `keychain:${provider.id}-api-key`;
+    $("provider-models-input").value = (provider.models || []).join("\n");
+  }
+  $("provider-label-input").focus();
+}
+
+function renderSettingsModels() {
+  const container = $("settings-model-list");
+  if (!container) return;
+  container.innerHTML = "";
+  const ids = configuredProviderList();
+  if (!ids.length) {
+    const empty = document.createElement("div");
+    empty.className = "provider-empty-row";
+    empty.textContent = "No configured models.";
+    container.append(empty);
+    return;
+  }
+  ids.forEach((id) => {
+    const provider = modelProviderPresets[id];
+    if (!provider) return;
+    const row = document.createElement("div");
+    row.className = "settings-row";
+    const copy = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = provider.label || id;
+    const description = document.createElement("p");
+    description.textContent = (provider.models || []).join(", ") || "No models configured";
+    copy.append(title, description);
+    const configureButton = document.createElement("button");
+    configureButton.type = "button";
+    configureButton.textContent = "Configure";
+    configureButton.addEventListener("click", () => {
+      setSettingsPage("providers");
+      renderProviderConfigForm(id);
+      $("provider-label-input").focus();
+    });
+    row.append(copy, configureButton);
+    container.append(row);
+  });
+}
+
+async function saveProviderConfig() {
+  let provider = providerConfigFromForm();
+  const apiKey = $("provider-api-key-input").value.trim();
+  if (apiKey) {
+    if (!provider.apiKeyEnv.startsWith("keychain:")) {
+      throw new Error("API key can only be saved when the reference starts with keychain:");
+    }
+    const account = provider.apiKeyEnv.slice("keychain:".length).trim();
+    if (!account) throw new Error("Keychain account is required");
+    const payload = await api("/api/provider-key", form({ account, api_key: apiKey }));
+    provider = { ...provider, apiKeyEnv: payload.reference };
+  }
+
+  const originalId = $("provider-id-input").dataset.originalId;
+  let content = $("config-editor").value;
+  if (originalId && originalId !== provider.id) {
+    content = removeProviderConfig(content, originalId);
+  }
+  content = upsertProviderConfig(content, provider);
+  $("config-editor").value = content;
+  const payload = await saveConfigFile();
+  $("provider-api-key-input").value = "";
+  renderProviderConfigSelect(provider.id);
+  return payload;
+}
+
+async function removeProviderConfigFromSettings() {
+  const id = normalizeChatProvider($("provider-id-input").dataset.originalId || $("provider-id-input").value);
+  if (!id || !configuredProviderIds.has(id)) return;
+  $("config-editor").value = removeProviderConfig($("config-editor").value, id);
+  if (selectedChatModelOptions().provider === id) {
+    localStorage.removeItem(chatModelPrefsStorageKey());
+    applyChatModelOptions(modelOptionsFromPolicy(""), { resetModel: true, persist: true });
+  }
+  const payload = await saveConfigFile();
+  renderProviderConfigSelect();
+  return payload;
+}
+
+function upsertProviderConfig(content, provider) {
+  let next = removeProviderConfig(content, provider.id);
+  next = upsertConfigValue(next, `model_provider.${provider.id}.label`, provider.label);
+  next = upsertConfigValue(next, `model_provider.${provider.id}.base_url`, provider.baseUrl);
+  next = upsertConfigValue(next, `model_provider.${provider.id}.api_key_env`, provider.apiKeyEnv);
+  next = upsertConfigValue(next, `model_provider.${provider.id}.models`, provider.models.join("|"));
+  return next;
+}
+
+function removeProviderConfig(content, providerId) {
+  const prefix = `model_provider.${providerId}.`;
+  return String(content || "")
+    .split(/\r?\n/)
+    .filter((line) => !line.trim().startsWith(prefix))
+    .join("\n")
+    .replace(/\n*$/, "\n");
 }
 
 function upsertConfigValue(content, key, value) {
@@ -622,7 +1361,10 @@ function setModelKeyStatus(message, state = "") {
 }
 
 async function refreshModelKeyStatus() {
-  const payload = await api(`/api/model-key-status?repo=${encodeURIComponent(repo())}`);
+  const provider = encodeURIComponent(selectedChatModelOptions().provider);
+  const payload = await api(
+    `/api/model-key-status?repo=${encodeURIComponent(repo())}&model_provider=${provider}`,
+  );
   if (payload.kind === "keychain") {
     if (payload.account) $("model-key-account").value = payload.account;
     setModelKeyStatus(payload.configured ? "Saved" : "Missing", payload.configured ? "ok" : "warn");
@@ -647,6 +1389,7 @@ async function loadConfigFile() {
     )}`,
   );
   $("config-editor").value = payload.content;
+  syncConfiguredProvidersFromConfig(payload.content);
   syncModelKeyAccountFromConfig(payload.content);
   renderConfigPolicy(payload);
   $("config-path").textContent = payload.exists ? payload.path : `${payload.path} (new)`;
@@ -655,12 +1398,14 @@ async function loadConfigFile() {
 }
 
 async function saveConfigFile() {
+  const content = $("config-editor").value;
+  syncConfiguredProvidersFromConfig(content);
   const payload = await api(
     "/api/config-file",
     form({
       scope: configScope(),
       repo: configRepo(),
-      content: $("config-editor").value,
+      content,
     }),
   );
   renderConfigPolicy(payload);
@@ -1560,15 +2305,13 @@ function processSseEvent(raw, handlers) {
   if (event === "error") handlers.error(payload);
 }
 
-document.querySelectorAll(".tab").forEach((button) => {
-  button.addEventListener("click", () => {
-    ensureInspectorVisible();
-    document.querySelectorAll(".tab").forEach((tab) => tab.classList.remove("active"));
-    document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
-    button.classList.add("active");
-    document.getElementById(button.dataset.tab).classList.add("active");
-  });
+document.querySelectorAll(".settings-nav-item").forEach((button) => {
+  button.addEventListener("click", () => setSettingsPage(button.dataset.settingsPage));
 });
+
+$("settings-close-btn").addEventListener("click", closeSettings);
+
+window.addEventListener("damaian-open-settings", () => openSettings("providers"));
 
 $("repo").addEventListener("change", () => {
   const value = repo();
@@ -1683,6 +2426,7 @@ async function proposePatchFromChat(prompt, assistantMessage) {
       repo: patchRepo,
       prompt,
       context_files: pinnedContextFiles.join("\n"),
+      ...chatModelFormFields(),
     }),
   );
   updateChatMessage(
@@ -1721,6 +2465,7 @@ async function sendChatPrompt() {
         prompt,
         session_id: currentSessionId,
         context_files: pinnedContextFiles.join("\n"),
+        ...chatModelFormFields(),
       },
       {
         token(token) {
@@ -1767,6 +2512,78 @@ $("chat-prompt").addEventListener("keydown", (event) => {
   void sendChatPrompt();
 });
 
+$("chat-model-menu-btn").addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleModelMenu();
+});
+
+$("chat-model-popover").addEventListener("click", (event) => {
+  event.stopPropagation();
+});
+
+document.addEventListener("click", (event) => {
+  if (!$("chat-model-menu").contains(event.target)) closeModelMenu();
+});
+
+document.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === ",") {
+    event.preventDefault();
+    openSettings("providers");
+    return;
+  }
+  if (event.key === "Escape") {
+    if (!$("settings-shell").hidden) {
+      closeSettings();
+      return;
+    }
+    closeModelMenu();
+  }
+});
+
+document.querySelectorAll("[data-panel]").forEach((button) => {
+  button.addEventListener("click", () => showModelMenuPanel(button.dataset.panel));
+});
+
+$("model-reset-btn").addEventListener("click", resetChatModelPrefs);
+$("custom-model-apply-btn").addEventListener("click", applyCustomModel);
+$("custom-model-input").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  applyCustomModel();
+});
+
+$("provider-config-select").addEventListener("change", () => {
+  renderProviderConfigForm($("provider-config-select").value);
+});
+
+$("provider-new-btn").addEventListener("click", newProviderConfigForm);
+
+$("provider-label-input").addEventListener("input", () => {
+  if (!$("provider-id-input").disabled && !$("provider-id-input").value.trim()) {
+    $("provider-key-ref-input").value = `keychain:${providerSlug($("provider-label-input").value)}-api-key`;
+  }
+});
+
+$("provider-save-btn").addEventListener("click", async () => {
+  try {
+    await saveProviderConfig();
+    toast("LLM provider saved");
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$("provider-remove-btn").addEventListener("click", async () => {
+  try {
+    const id = $("provider-id-input").dataset.originalId || $("provider-id-input").value;
+    if (!id || !window.confirm(`Remove provider ${id}?`)) return;
+    await removeProviderConfigFromSettings();
+    toast("LLM provider removed");
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
 $("config-load-btn").addEventListener("click", async () => {
   try {
     const payload = await loadConfigFile();
@@ -1806,16 +2623,15 @@ $("model-key-delete-btn").addEventListener("click", async () => {
   }
 });
 
-$("inspector-toggle-btn").addEventListener("click", () => {
-  setInspectorCollapsed(!document.body.classList.contains("inspector-collapsed"));
-});
-
 $("update-app-btn").addEventListener("click", () => {
   void installAppUpdate();
 });
 
 $("ask-btn").disabled = true;
 setChatStatus("Starting", "running");
+syncProviderCatalogFromPolicy("");
+applyChatModelOptions(modelOptionsFromPolicy(""));
+renderProviderConfigSelect();
 renderPinnedContextFiles();
 
 bootstrapPromise = startBootstrap();

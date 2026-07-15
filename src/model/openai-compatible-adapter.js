@@ -16,8 +16,9 @@ function parseSseChunks(buffer) {
 }
 
 export class OpenAICompatibleAdapter extends ModelAdapter {
-  constructor({ baseUrl, apiKey, model, timeoutMs = 60_000, fetchImpl = globalThis.fetch } = {}) {
+  constructor({ provider = 'openai-compatible', baseUrl, apiKey, model, timeoutMs = 60_000, fetchImpl = globalThis.fetch } = {}) {
     super();
+    this.provider = provider;
     this.baseUrl = baseUrl?.replace(/\/$/, '');
     this.apiKey = apiKey;
     this.model = model;
@@ -46,6 +47,7 @@ export class OpenAICompatibleAdapter extends ModelAdapter {
           messages: request.messages,
           tools: request.tools,
           temperature: request.temperature,
+          reasoning_effort: apiReasoningEffort(request.provider ?? this.provider, request.reasoningLevel),
           stream: true
         })
       });
@@ -77,7 +79,7 @@ export class OpenAICompatibleAdapter extends ModelAdapter {
 
       const result = {
         runId,
-        provider: 'openai-compatible',
+        provider: request.provider ?? this.provider,
         model: request.model ?? this.model,
         startedAt,
         completedAt: nowIso(),
@@ -103,14 +105,15 @@ export class OpenAICompatibleAdapter extends ModelAdapter {
         model: request.model ?? this.model,
         messages: request.messages,
         response_format: schema ? { type: 'json_object' } : undefined,
-        temperature: request.temperature ?? 0
+        temperature: request.temperature ?? 0,
+        reasoning_effort: apiReasoningEffort(request.provider ?? this.provider, request.reasoningLevel)
       })
     });
     if (!response.ok) throw new Error(`Model provider error ${response.status}: ${await response.text()}`);
     const payload = await response.json();
     const content = payload.choices?.[0]?.message?.content ?? '{}';
     return {
-      provider: 'openai-compatible',
+      provider: request.provider ?? this.provider,
       model: request.model ?? this.model,
       raw: payload,
       value: JSON.parse(content)
@@ -120,4 +123,10 @@ export class OpenAICompatibleAdapter extends ModelAdapter {
   cancel(runId) {
     this.controllers.get(runId)?.abort();
   }
+}
+
+function apiReasoningEffort(provider, reasoningLevel) {
+  if (!['openai', 'openai-compatible'].includes(provider)) return undefined;
+  const level = String(reasoningLevel || '').trim().toLowerCase();
+  return ['minimal', 'low', 'medium', 'high'].includes(level) ? level : undefined;
 }
