@@ -93,6 +93,47 @@ fn denies_symlink_traversal_outside_selected_repository() {
 }
 
 #[test]
+fn rejects_patch_creation_for_symlink_write_target_outside_repository() {
+    let root = temp_dir("patch-symlink");
+    let repo = root.join("repo");
+    let outside = root.join("outside");
+    write_fixture(&repo, "src/app.js", "console.log(\"ok\");");
+    write_fixture(&outside, "secret.txt", "password=supersecret");
+    std::os::unix::fs::symlink(outside.join("secret.txt"), repo.join("linked-secret.txt")).unwrap();
+
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let path_policy = PathPolicy::new(&config);
+    let error = path_policy
+        .resolve_for_write(&repo, "linked-secret.txt")
+        .expect_err("symlink write target should be denied");
+    assert!(matches!(error, ClientError::AccessDenied(_)));
+
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        path_policy,
+    );
+    let error = engine
+        .create_patch(
+            &repo,
+            &[ProposedChange {
+                path: "linked-secret.txt".to_string(),
+                new_content: "safe replacement\n".to_string(),
+                status: None,
+                allow_restricted: false,
+            }],
+            None,
+            "replace linked file",
+        )
+        .expect_err("patch creation should not read through symlink");
+    assert!(matches!(error, ClientError::AccessDenied(_)));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn marks_restricted_dotenv_files() {
     let policy = PathPolicy::unrestricted();
     assert!(policy.is_restricted(".env", false));
