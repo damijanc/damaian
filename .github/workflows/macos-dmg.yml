@@ -75,7 +75,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -n "${RELEASE_VERSION}" ]]; then
-            cargo update --workspace --offline
+            cargo update --workspace
           else
             echo "No release version stamped; lockfile refresh not needed."
           fi
