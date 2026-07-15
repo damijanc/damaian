@@ -5,12 +5,7 @@
   "description": "Local-first AI coding assistant client workspace engine",
   "license": "MIT",
   "type": "module",
-  "bin": {
-    "damaian-client": "./bin/damaian-client.js"
-  },
   "scripts": {
-    "test": "node --test",
-    "check": "node --test",
     "updater:enable-artifacts": "node scripts/enable-updater-artifacts.mjs",
     "updater:manifest": "node scripts/create-updater-manifest.mjs",
     "version:sync": "node scripts/sync-version.mjs",
