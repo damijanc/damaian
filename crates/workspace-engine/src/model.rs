@@ -161,6 +161,23 @@ impl CurlModelTransport {
             api_key: api_key.into(),
         }
     }
+
+    fn curl_args() -> [&'static str; 4] {
+        ["-sS", "--no-buffer", "--config", "-"]
+    }
+
+    fn chat_completions_url(&self) -> String {
+        format!("{}/v1/chat/completions", self.base_url)
+    }
+
+    fn curl_config(&self, request_body: &str) -> String {
+        format!(
+            "request = \"POST\"\nurl = \"{}\"\nheader = \"content-type: application/json\"\nheader = \"authorization: Bearer {}\"\ndata-binary = \"{}\"\n",
+            escape_curl_config_value(&self.chat_completions_url()),
+            escape_curl_config_value(&self.api_key),
+            escape_curl_config_value(request_body)
+        )
+    }
 }
 
 impl ModelTransport for CurlModelTransport {
@@ -173,26 +190,15 @@ impl ModelTransport for CurlModelTransport {
         request_body: &str,
         on_chunk: &mut dyn FnMut(&str),
     ) -> Result<String> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
         let mut child = Command::new("curl")
-            .arg("-sS")
-            .arg("--no-buffer")
-            .arg("-X")
-            .arg("POST")
-            .arg(url)
-            .arg("-H")
-            .arg("content-type: application/json")
-            .arg("-H")
-            .arg(format!("authorization: Bearer {}", self.api_key))
-            .arg("-d")
-            .arg("@-")
+            .args(Self::curl_args())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
 
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(request_body.as_bytes())?;
+            stdin.write_all(self.curl_config(request_body).as_bytes())?;
         }
 
         let mut raw = String::new();
@@ -222,6 +228,24 @@ impl ModelTransport for CurlModelTransport {
         }
         Ok(raw)
     }
+}
+
+fn escape_curl_config_value(value: &str) -> String {
+    let mut escaped = String::new();
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                escaped.push_str(&format!("\\u{:04x}", character as u32));
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 #[derive(Debug, Clone)]
@@ -537,4 +561,25 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn curl_transport_does_not_put_api_key_in_argv() {
+        let api_key = "sk_test_12345678901234567890";
+        let transport = CurlModelTransport::new("https://api.example.test/", api_key);
+        let args = CurlModelTransport::curl_args();
+
+        assert!(!args.iter().any(|arg| arg.contains(api_key)));
+        assert_eq!(args, ["-sS", "--no-buffer", "--config", "-"]);
+
+        let config = transport.curl_config("{\"model\":\"test\",\"messages\":[]}");
+        assert!(config.contains(&format!("authorization: Bearer {api_key}")));
+        assert!(
+            config.contains("data-binary = \"{\\\"model\\\":\\\"test\\\",\\\"messages\\\":[]}\"")
+        );
+    }
 }
