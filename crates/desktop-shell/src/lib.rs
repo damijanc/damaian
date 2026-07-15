@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use workspace_engine::{
     ChatMessage, ChatTurnResult, Config, CurlModelTransport, OpenAICompatibleAdapter,
     ProposedFilePatch, Session, WorkspaceEngine, command_approval_prompt, normalize_model_provider,
@@ -68,15 +68,12 @@ pub struct ShellOptions {
     pub port: u16,
     pub default_repo: Option<String>,
     pub api_token: String,
+    bootstrap_token: Arc<Mutex<Option<String>>>,
 }
 
 impl ShellOptions {
     pub fn new(port: u16, default_repo: Option<String>) -> Self {
-        Self {
-            port,
-            default_repo,
-            api_token: generate_api_token(),
-        }
+        Self::with_generated_token(port, default_repo)
     }
 
     pub fn from_args(args: Vec<String>) -> Self {
@@ -101,10 +98,16 @@ impl ShellOptions {
                 _ => index += 1,
             }
         }
+        Self::with_generated_token(port, default_repo)
+    }
+
+    fn with_generated_token(port: u16, default_repo: Option<String>) -> Self {
+        let api_token = generate_api_token();
         Self {
             port,
             default_repo,
-            api_token: generate_api_token(),
+            bootstrap_token: Arc::new(Mutex::new(Some(api_token.clone()))),
+            api_token,
         }
     }
 }
@@ -114,7 +117,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
     if request.method == "OPTIONS" && request.path.starts_with("/api/") {
         return write_preflight_response(stream, &request);
     }
-    if request.path.starts_with("/api/") && request.path != "/api/bootstrap" {
+    if api_request_requires_token(&request.path) {
         if let Err(error) = require_api_token(&request, &options.api_token) {
             return write_response(
                 stream,
@@ -131,7 +134,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             &request,
             200,
             "text/html; charset=utf-8",
-            INDEX_HTML,
+            &index_html(options)?,
         ),
         ("GET", "/style.css") | ("GET", "/assets/style.css") => {
             write_response(stream, &request, 200, "text/css; charset=utf-8", STYLE_CSS)
@@ -150,11 +153,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 &request,
                 200,
                 "application/json",
-                &format!(
-                    "{{\"defaultRepo\":\"{}\",\"apiToken\":\"{}\"}}",
-                    escape_json(&repo),
-                    escape_json(&options.api_token)
-                ),
+                &format!("{{\"defaultRepo\":\"{}\"}}", escape_json(&repo)),
             )
         }
         ("GET", "/api/config") => {
@@ -1281,6 +1280,10 @@ fn required_form(form: &HashMap<String, String>, name: &str) -> Result<String, S
         .ok_or_else(|| format!("missing form field: {name}"))
 }
 
+fn api_request_requires_token(path: &str) -> bool {
+    path.starts_with("/api/")
+}
+
 fn parse_path_list(value: &str) -> Result<Vec<String>, String> {
     let paths = parse_optional_path_list(value);
     if paths.is_empty() {
@@ -1340,6 +1343,25 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+fn index_html(options: &ShellOptions) -> Result<String, String> {
+    let api_token = options
+        .bootstrap_token
+        .lock()
+        .map_err(|_| "bootstrap token is unavailable".to_string())?
+        .take()
+        .unwrap_or_default();
+    let default_repo = options.default_repo.clone().unwrap_or_default();
+    Ok(INDEX_HTML.replacen(
+        "<body>",
+        &format!(
+            "<body data-api-token=\"{}\" data-default-repo=\"{}\">",
+            escape_html_attr(&api_token),
+            escape_html_attr(&default_repo)
+        ),
+        1,
+    ))
 }
 
 fn write_response(
@@ -1602,13 +1624,31 @@ fn escape_json(value: &str) -> String {
     escaped
 }
 
+fn escape_html_attr(value: &str) -> String {
+    let mut escaped = String::new();
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '"' => escaped.push_str("&quot;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            character if character.is_control() => {
+                escaped.push_str(&format!("&#x{:x};", character as u32));
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Request, allowed_cors_origin, cached_model_api_key, desktop_settings_config_path,
-        effective_policy_for_repo, forget_model_api_key, keychain, parse_form, parse_path_list,
-        percent_decode, remember_model_api_key, require_api_token, run_terminal_command,
-        save_config_file, terminal_cwd_for_repo, validate_context_files, validate_working_folder,
+        Request, ShellOptions, allowed_cors_origin, api_request_requires_token,
+        cached_model_api_key, desktop_settings_config_path, effective_policy_for_repo,
+        forget_model_api_key, index_html, keychain, parse_form, parse_path_list, percent_decode,
+        remember_model_api_key, require_api_token, run_terminal_command, save_config_file,
+        terminal_cwd_for_repo, validate_context_files, validate_working_folder,
         validate_workspace_path,
     };
     use std::collections::HashMap;
@@ -1648,6 +1688,27 @@ mod tests {
 
         assert!(require_api_token(&request, "secret").is_ok());
         assert!(require_api_token(&request, "wrong").is_err());
+    }
+
+    #[test]
+    fn bootstrap_api_is_not_a_bare_token_oracle() {
+        let options = ShellOptions::new(0, Some("/tmp/damaian-repo".to_string()));
+        let token = options.api_token.clone();
+
+        let bare_bootstrap_request = test_request("/api/bootstrap", &[]);
+        assert!(api_request_requires_token(&bare_bootstrap_request.path));
+        assert!(require_api_token(&bare_bootstrap_request, &token).is_err());
+
+        let first_page = index_html(&options).unwrap();
+        assert!(first_page.contains(&format!("data-api-token=\"{token}\"")));
+        assert!(first_page.contains("data-default-repo=\"/tmp/damaian-repo\""));
+
+        let second_page = index_html(&options).unwrap();
+        assert!(!second_page.contains(&token));
+
+        let authenticated_bootstrap_request =
+            test_request("/api/bootstrap", &[("x-damaian-api-token", &token)]);
+        assert!(require_api_token(&authenticated_bootstrap_request, &token).is_ok());
     }
 
     #[test]
@@ -1914,9 +1975,13 @@ mod tests {
     }
 
     fn test_request_with_headers(headers: &[(&str, &str)]) -> Request {
+        test_request("/api/test", headers)
+    }
+
+    fn test_request(path: &str, headers: &[(&str, &str)]) -> Request {
         Request {
             method: "GET".to_string(),
-            path: "/api/test".to_string(),
+            path: path.to_string(),
             query: HashMap::new(),
             headers: headers
                 .iter()
