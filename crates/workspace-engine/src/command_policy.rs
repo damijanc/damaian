@@ -211,6 +211,7 @@ fn contains_shell_control(command: &str) -> bool {
         || command.contains('<')
         || command.contains('>')
         || command.contains('\n')
+        || command.contains('\r')
         || command.contains("$(")
 }
 
@@ -306,4 +307,15 @@ fn may_use_network(command: &str) -> bool {
     ]
     .iter()
     .any(|needle| command.contains(needle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_shell_control;
+
+    #[test]
+    fn detects_line_breaks_as_shell_control() {
+        assert!(contains_shell_control("npm test\ncat /etc/passwd"));
+        assert!(contains_shell_control("npm test\rcat /etc/passwd"));
+    }
 }
