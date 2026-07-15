@@ -67,18 +67,6 @@ impl CommandPolicy {
             };
         }
 
-        if configured_prefix_matches(&self.config.command_allowlist, &normalized) {
-            return CommandClassification {
-                command: normalized,
-                risk: CommandRisk::Low,
-                blocked: false,
-                requires_approval: self.config.require_approval_for_all_commands,
-                reasons: vec!["Command matches configured allowlist".to_string()],
-                expected_effects: "Configured safe command".to_string(),
-                may_use_network: false,
-            };
-        }
-
         if contains_shell_control(&normalized) {
             return CommandClassification {
                 command: normalized,
@@ -90,6 +78,18 @@ impl CommandPolicy {
                 ],
                 expected_effects: "Potential chained or redirected command effects".to_string(),
                 may_use_network: may_use_network(command),
+            };
+        }
+
+        if configured_exact_matches(&self.config.command_allowlist, &normalized) {
+            return CommandClassification {
+                command: normalized,
+                risk: CommandRisk::Low,
+                blocked: false,
+                requires_approval: self.config.require_approval_for_all_commands,
+                reasons: vec!["Command matches configured allowlist".to_string()],
+                expected_effects: "Configured safe command".to_string(),
+                may_use_network: false,
             };
         }
 
@@ -199,6 +199,10 @@ fn configured_prefix_matches(patterns: &[String], command: &str) -> bool {
     patterns.iter().any(|pattern| command.starts_with(pattern))
 }
 
+fn configured_exact_matches(patterns: &[String], command: &str) -> bool {
+    patterns.iter().any(|pattern| pattern.trim() == command)
+}
+
 fn contains_shell_control(command: &str) -> bool {
     command.contains(';')
         || command.contains('&')
@@ -206,6 +210,7 @@ fn contains_shell_control(command: &str) -> bool {
         || command.contains('`')
         || command.contains('<')
         || command.contains('>')
+        || command.contains('\n')
         || command.contains("$(")
 }
 
