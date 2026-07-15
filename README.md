@@ -27,8 +27,6 @@ The macOS desktop shell layers on top of these services while keeping AI file ed
 ## Commands
 
 ```sh
-npm test
-
 # Command-line Rust implementation
 cargo test
 cargo run -p damaian-cli -- config-show /path/to/repo
@@ -50,11 +48,6 @@ cargo run -p desktop-shell -- --repo /path/to/repo --port 4765
 
 # Native Tauri desktop wrapper
 DAMAIAN_REPO=/path/to/repo npm run desktop:dev
-
-# Command-line Node reference implementation
-node ./bin/damaian-client.js index /path/to/repo
-node ./bin/damaian-client.js git-status /path/to/repo
-node ./bin/damaian-client.js classify-command "npm test"
 ```
 
 ## Assistant Command Sandbox

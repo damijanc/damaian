@@ -106,9 +106,6 @@ jobs:
       - name: Check desktop JavaScript
         run: node --check crates/desktop-shell/static/app.js
 
-      - name: Run Node tests
-        run: npm test
-
       - name: Run Rust tests
         run: cargo test --locked
 
