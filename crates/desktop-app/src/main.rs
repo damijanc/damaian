@@ -33,7 +33,11 @@ struct UpdateCheckResult {
 }
 
 fn main() {
-    let shell_options = ShellOptions::new(shell_port(), repo_from_args_or_env());
+    let shell_port = shell_port().unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+    let shell_options = ShellOptions::new(shell_port, repo_from_args_or_env());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -218,11 +222,17 @@ fn check_for_updates<R: Runtime>(app: &tauri::AppHandle<R>) {
     }
 }
 
-fn shell_port() -> u16 {
-    if TcpStream::connect((SHELL_HOST, PREFERRED_SHELL_PORT)).is_ok() {
-        0
+fn shell_port() -> Result<u16, String> {
+    shell_port_for_status(TcpStream::connect((SHELL_HOST, PREFERRED_SHELL_PORT)).is_ok())
+}
+
+fn shell_port_for_status(preferred_port_in_use: bool) -> Result<u16, String> {
+    if preferred_port_in_use {
+        Err(format!(
+            "Damaian desktop shell refuses to start because {SHELL_HOST}:{PREFERRED_SHELL_PORT} is already in use. The Tauri capability is scoped to that exact origin; stop the conflicting process and restart Damaian."
+        ))
     } else {
-        PREFERRED_SHELL_PORT
+        Ok(PREFERRED_SHELL_PORT)
     }
 }
 
@@ -236,6 +246,24 @@ fn repo_from_args_or_env() -> Option<String> {
     env::var("DAMAIAN_REPO")
         .ok()
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_port_uses_preferred_port_when_available() {
+        assert_eq!(shell_port_for_status(false), Ok(PREFERRED_SHELL_PORT));
+    }
+
+    #[test]
+    fn shell_port_refuses_fallback_when_preferred_port_is_busy() {
+        let error = shell_port_for_status(true).expect_err("busy port should refuse startup");
+
+        assert!(error.contains("already in use"));
+        assert!(error.contains("4765"));
+    }
 }
 
 #[tauri::command]

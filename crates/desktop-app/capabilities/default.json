@@ -3,7 +3,7 @@
   "identifier": "default",
   "description": "Default Damaian window permissions",
   "remote": {
-    "urls": ["http://127.0.0.1:*", "http://localhost:*"]
+    "urls": ["http://127.0.0.1:4765", "http://localhost:4765"]
   },
   "windows": ["main"],
   "permissions": ["core:default", "dialog:default"]
