@@ -31,6 +31,9 @@ impl SecretScanner {
         self.scan_bearer_tokens(text, &mut findings);
         self.scan_database_passwords(text, &mut findings);
         self.scan_credential_assignments(text, &mut findings);
+        self.scan_jwts(text, &mut findings);
+        self.scan_gcp_api_keys(text, &mut findings);
+        self.scan_azure_keys(text, &mut findings);
         self.scan_generic_tokens(text, &mut findings);
         self.scan_custom_patterns(text, &mut findings);
         remove_overlaps(findings)
@@ -227,6 +230,64 @@ impl SecretScanner {
         }
     }
 
+    fn scan_jwts(&self, text: &str, findings: &mut Vec<SecretFinding>) {
+        let mut cursor = 0;
+        while let Some(index) = text[cursor..].find("eyJ") {
+            let start = cursor + index;
+            if start > 0 && is_jwt_token_byte(text.as_bytes()[start - 1]) {
+                cursor = start + 3;
+                continue;
+            }
+            let end = take_while(text, start, is_jwt_token_byte);
+            let candidate = &text[start..end];
+            if is_jwt_candidate(candidate) {
+                Self::add_finding(findings, "jwt", start, end, candidate);
+            }
+            cursor = end.max(start + 3);
+        }
+    }
+
+    fn scan_gcp_api_keys(&self, text: &str, findings: &mut Vec<SecretFinding>) {
+        for (start, _) in text.match_indices("AIza") {
+            if start > 0 && is_gcp_api_key_byte(text.as_bytes()[start - 1]) {
+                continue;
+            }
+            let end = take_while(text, start, is_gcp_api_key_byte);
+            let next_is_key_byte = text
+                .as_bytes()
+                .get(end)
+                .is_some_and(|byte| is_gcp_api_key_byte(*byte));
+            if end - start == 39 && !next_is_key_byte {
+                Self::add_finding(findings, "gcp_api_key", start, end, &text[start..end]);
+            }
+        }
+    }
+
+    fn scan_azure_keys(&self, text: &str, findings: &mut Vec<SecretFinding>) {
+        let lower = text.to_ascii_lowercase();
+        for marker in ["accountkey=", "sharedaccesskey="] {
+            let mut cursor = 0;
+            while let Some(index) = lower[cursor..].find(marker) {
+                let marker_start = cursor + index;
+                let mut value_start = marker_start + marker.len();
+                if matches!(text.as_bytes().get(value_start), Some(b'"' | b'\'')) {
+                    value_start += 1;
+                }
+                let value_end = take_while(text, value_start, is_base64_token_byte);
+                if value_end - value_start >= 40 {
+                    Self::add_finding(
+                        findings,
+                        "azure_account_key",
+                        value_start,
+                        value_end,
+                        &text[value_start..value_end],
+                    );
+                }
+                cursor = value_end.max(marker_start + marker.len());
+            }
+        }
+    }
+
     fn scan_generic_tokens(&self, text: &str, findings: &mut Vec<SecretFinding>) {
         let prefixes = [
             b"sk".as_slice(),
@@ -236,10 +297,13 @@ impl SecretScanner {
             b"github_pat".as_slice(),
             b"xoxb".as_slice(),
             b"xoxp".as_slice(),
+            b"xoxa-".as_slice(),
+            b"xoxr-".as_slice(),
+            b"xoxs-".as_slice(),
         ];
         let bytes = text.as_bytes();
         for index in 0..bytes.len() {
-            if index > 0 && is_token_byte(bytes[index - 1]) {
+            if index > 0 && is_embedded_token_byte(bytes[index - 1]) {
                 continue;
             }
             for prefix in prefixes {
@@ -293,6 +357,40 @@ fn skip_spaces(text: &str, start: usize) -> usize {
 
 fn is_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'~' | b'+' | b'/' | b'=')
+}
+
+fn is_embedded_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'~' | b'+' | b'/')
+}
+
+fn is_jwt_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+}
+
+fn is_base64_url_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn is_jwt_candidate(candidate: &str) -> bool {
+    let parts = candidate.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts[0].starts_with("eyJ")
+        && parts[0].len() >= 8
+        && parts[1].len() >= 8
+        && parts[2].len() >= 16
+        && parts.iter().all(|part| is_base64_url_segment(part))
+}
+
+fn is_gcp_api_key_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+fn is_base64_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
 }
 
 fn remove_overlaps(mut findings: Vec<SecretFinding>) -> Vec<SecretFinding> {
