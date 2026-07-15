@@ -20,6 +20,7 @@ let projectsCollapsed = false;
 let appUpdateInfo = null;
 let appUpdateInstalling = false;
 let currentPolicyModelOptions = null;
+let toastTimer = null;
 
 const localApiOrigin = "http://127.0.0.1:4765";
 const localApiHostnames = new Set(["127.0.0.1", "localhost"]);
@@ -98,11 +99,43 @@ function repo() {
   return $("repo").value.trim();
 }
 
-function toast(message) {
+function errorMessage(error, fallback = "Unexpected error") {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === "string" && error.trim()) return error.trim();
+  if (error && typeof error === "object") {
+    if (typeof error.message === "string" && error.message.trim()) return error.message.trim();
+    if (typeof error.error === "string" && error.error.trim()) return error.error.trim();
+    try {
+      const serialized = JSON.stringify(error);
+      if (serialized && serialized !== "{}") return serialized;
+    } catch {
+      // Fall through to fallback.
+    }
+  }
+  return fallback;
+}
+
+function updaterErrorMessage(error) {
+  const message = errorMessage(error, "Unable to check for updates");
+  if (/no endpoint|endpoint.*not.*set|endpoint.*not.*configured/i.test(message)) {
+    return "Updater endpoint is not configured for this build";
+  }
+  if (/pubkey|public key|signature/i.test(message)) {
+    return "Updater signing public key is not configured for this build";
+  }
+  return message;
+}
+
+function toast(message, { duration } = {}) {
   const el = $("toast");
-  el.textContent = message;
+  const text = String(message || "Unexpected error");
+  el.textContent = text;
   el.classList.add("show");
-  setTimeout(() => el.classList.remove("show"), 2600);
+  if (toastTimer) window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(
+    () => el.classList.remove("show"),
+    duration || Math.min(7000, Math.max(3200, text.length * 70)),
+  );
 }
 
 async function api(path, options = {}, retriedAuth = false) {
@@ -412,8 +445,8 @@ function tauriDialogOpen() {
   return window.__TAURI__?.dialog?.open;
 }
 
-function tauriInvoke() {
-  return window.__TAURI__?.core?.invoke;
+function tauriUpdater() {
+  return window.__TAURI__?.updater;
 }
 
 function isDesktopApp() {
@@ -448,6 +481,7 @@ function scheduleUpdateCheck() {
 }
 
 function resetUpdateButton(title = "Check Updates") {
+  $("update-app-footer").hidden = false;
   const button = $("update-app-btn");
   button.hidden = false;
   button.disabled = false;
@@ -456,9 +490,9 @@ function resetUpdateButton(title = "Check Updates") {
 }
 
 async function checkForAppUpdate(showCurrent = true) {
-  const invoke = tauriInvoke();
-  if (!invoke) {
-    if (showCurrent) toast("Updates are available in the desktop app");
+  const updater = tauriUpdater();
+  if (!updater?.check) {
+    if (showCurrent) toast("Updater is not available in this build");
     return null;
   }
   const button = $("update-app-btn");
@@ -466,29 +500,35 @@ async function checkForAppUpdate(showCurrent = true) {
     button.hidden = false;
     button.disabled = true;
     button.textContent = "Checking...";
-    const result = await invoke("damaian_check_for_update");
-    if (!result.configured) {
-      resetUpdateButton(result.message || "Updater is not configured in this build");
-      appUpdateInfo = null;
-      if (showCurrent) toast(result.message || "Updater is not configured in this build");
-      return result;
+    const update = await updater.check();
+    if (update !== null && typeof update !== "object") {
+      throw new Error("Updater returned an invalid response");
     }
-    if (!result.available) {
-      resetUpdateButton(result.message || "Damaian is up to date");
+    if (!update) {
+      resetUpdateButton("Damaian is up to date");
       appUpdateInfo = null;
-      if (showCurrent) toast(result.message || "Damaian is up to date");
-      return result;
+      if (showCurrent) toast("Damaian is up to date");
+      return null;
     }
-    appUpdateInfo = result;
+    const version = update.version || "";
+    appUpdateInfo = {
+      available: true,
+      currentVersion: update.currentVersion || "",
+      version,
+      update,
+    };
+    const versionLabel = version || "latest version";
     button.hidden = false;
     button.disabled = false;
-    button.textContent = `Update ${result.version}`;
-    button.title = `Install Damaian ${result.version}`;
-    toast(`Damaian ${result.version} is available`);
-    return result;
+    button.textContent = version ? `Update ${version}` : "Update";
+    button.title = `Install Damaian ${versionLabel}`;
+    toast(`Damaian ${versionLabel} is available`);
+    return appUpdateInfo;
   } catch (error) {
-    resetUpdateButton(`Update check failed: ${error.message}`);
-    if (showCurrent) toast(`Update check failed: ${error.message}`);
+    const message = updaterErrorMessage(error);
+    appUpdateInfo = null;
+    resetUpdateButton(`Update check failed: ${message}`);
+    if (showCurrent) toast(`Update check failed: ${message}`, { duration: 7000 });
     return null;
   }
 }
@@ -500,10 +540,12 @@ async function installAppUpdate() {
     if (!appUpdateInfo?.available) return;
   }
   const version = appUpdateInfo.version || "the latest version";
-  if (!window.confirm(`Install Damaian ${version}? The app will restart after the update.`)) return;
-  const invoke = tauriInvoke();
-  if (!invoke) {
-    toast("Updates are available in the desktop app");
+  if (!window.confirm(`Install Damaian ${version}? Restart Damaian after the update to finish.`)) {
+    return;
+  }
+  const update = appUpdateInfo.update;
+  if (!update?.downloadAndInstall) {
+    toast("Updater is not available in this build");
     return;
   }
   const button = $("update-app-btn");
@@ -512,13 +554,20 @@ async function installAppUpdate() {
     button.disabled = true;
     button.textContent = "Installing...";
     toast("Downloading update...");
-    await invoke("damaian_install_update");
-    toast("Update installed. Restarting...");
+    await update.downloadAndInstall();
+    appUpdateInstalling = false;
+    appUpdateInfo = null;
+    resetUpdateButton("Restart Damaian to finish the update");
+    toast("Update installed. Restart Damaian to finish.", { duration: 7000 });
   } catch (error) {
     appUpdateInstalling = false;
     button.disabled = false;
-    button.textContent = appUpdateInfo?.available ? `Update ${appUpdateInfo.version}` : "Check Updates";
-    toast(`Update failed: ${error.message}`);
+    button.textContent = appUpdateInfo?.available
+      ? appUpdateInfo.version
+        ? `Update ${appUpdateInfo.version}`
+        : "Update"
+      : "Check Updates";
+    toast(`Update failed: ${updaterErrorMessage(error)}`, { duration: 7000 });
   }
 }
 
