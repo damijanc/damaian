@@ -2,7 +2,7 @@
 
 Damaian is a local-first AI coding assistant for macOS. It indexes a local Git repository, prepares focused context for coding questions, previews generated edits as diffs, and records local audit data.
 
-This build is a developer preview. It is usable for local workflows, but it does not yet include automatic updates, code signing, or notarization.
+This build is a developer preview. It is usable for local workflows and can offer signed in-app updates from GitHub Releases, but it is not yet Developer ID signed or notarized.
 
 ## First Run
 
@@ -10,6 +10,12 @@ This build is a developer preview. It is usable for local workflows, but it does
 2. Select `+` beside `Projects`.
 3. Pick the local Git repository or working folder you want Damaian to inspect.
 4. Select the Visual Studio Code icon when you want to open the same folder in Visual Studio Code, or the terminal icon to open the bottom terminal panel.
+
+## Updates
+
+Damaian checks for updates when the desktop app starts. If a newer GitHub Release is available, an `Update <version>` button appears in the conversation header. Select it to download the signed update, install it, and restart the app.
+
+The first installed version must already include the updater. If you installed an older developer-preview DMG before automatic updates were added, download and install one newer DMG manually once.
 
 ## Working Folder
 
