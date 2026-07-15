@@ -74,6 +74,75 @@ fn detects_private_keys() {
 }
 
 #[test]
+fn redacts_jwts() {
+    let scanner = SecretScanner::default();
+    let jwt = concat!(
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.",
+        "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkRhbWFpYW4iLCJpYXQiOjE1MTYyMzkwMjJ9.",
+        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+    );
+    let result = scanner.redact(&format!("jwt={jwt}"));
+
+    assert!(result.text.contains("[REDACTED_JWT_"));
+    assert!(!result.text.contains(jwt));
+    assert_eq!(result.findings[0].category, "jwt");
+}
+
+#[test]
+fn redacts_gcp_api_keys() {
+    let scanner = SecretScanner::default();
+    let key = "AIza12345678901234567890123456789012345";
+    let result = scanner.redact(&format!("gcp={key}"));
+
+    assert!(result.text.contains("[REDACTED_GCP_API_KEY_"));
+    assert!(!result.text.contains(key));
+    assert_eq!(result.findings[0].category, "gcp_api_key");
+}
+
+#[test]
+fn redacts_azure_account_keys() {
+    let scanner = SecretScanner::default();
+    let key = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/abcd==";
+    let result = scanner.redact(&format!(
+        "DefaultEndpointsProtocol=https;AccountName=test;AccountKey={key};EndpointSuffix=core.windows.net"
+    ));
+
+    assert!(result.text.contains("[REDACTED_AZURE_ACCOUNT_KEY_"));
+    assert!(!result.text.contains(key));
+    assert_eq!(result.findings[0].category, "azure_account_key");
+}
+
+#[test]
+fn redacts_slack_xoxa_tokens() {
+    let scanner = SecretScanner::default();
+    let token = "xoxa-2-123456789012-123456789012-abcdefghijklmnopqrstuvwx";
+    let result = scanner.redact(&format!("slack={token}"));
+
+    assert!(result.text.contains("[REDACTED_GENERIC_API_KEY_"));
+    assert!(!result.text.contains(token));
+}
+
+#[test]
+fn redacts_slack_xoxr_tokens() {
+    let scanner = SecretScanner::default();
+    let token = "xoxr-2-123456789012-123456789012-abcdefghijklmnopqrstuvwx";
+    let result = scanner.redact(&format!("slack={token}"));
+
+    assert!(result.text.contains("[REDACTED_GENERIC_API_KEY_"));
+    assert!(!result.text.contains(token));
+}
+
+#[test]
+fn redacts_slack_xoxs_tokens() {
+    let scanner = SecretScanner::default();
+    let token = "xoxs-2-123456789012-123456789012-abcdefghijklmnopqrstuvwx";
+    let result = scanner.redact(&format!("slack={token}"));
+
+    assert!(result.text.contains("[REDACTED_GENERIC_API_KEY_"));
+    assert!(!result.text.contains(token));
+}
+
+#[test]
 fn scans_non_ascii_text_without_panicking() {
     let scanner = SecretScanner::default();
     let result = scanner.redact("AI Coding Assistant Client — Must-Have Features");
