@@ -90,16 +90,18 @@ impl PatchEngine {
                         .unwrap_or_else(|| "modified".to_string())
                 })
                 .unwrap_or_else(|| "added".to_string());
+            let diff = create_unified_diff(
+                old_content.as_deref().unwrap_or_default(),
+                &change.new_content,
+                &target.relative_path,
+            );
+            let diff = self.scanner.redact(&diff).text;
             files.push(ProposedFilePatch {
                 path: target.relative_path.clone(),
                 status,
                 base_hash: old_content.as_ref().map(sha256),
                 new_hash: sha256(change.new_content.as_bytes()),
-                diff: create_unified_diff(
-                    old_content.as_deref().unwrap_or_default(),
-                    &change.new_content,
-                    &target.relative_path,
-                ),
+                diff,
                 new_content: change.new_content.clone(),
             });
         }
