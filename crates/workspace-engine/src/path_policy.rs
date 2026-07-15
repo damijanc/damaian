@@ -97,12 +97,28 @@ impl PathPolicy {
             ));
         }
 
-        let ancestor = nearest_existing_ancestor(&absolute_path, &root)?;
-        if !is_inside(&root, &ancestor) {
-            return Err(ClientError::AccessDenied(
-                "Write target resolves outside the selected repository".to_string(),
-            ));
-        }
+        let absolute_path = match fs::symlink_metadata(&absolute_path) {
+            Ok(_) => {
+                let resolved = fs::canonicalize(&absolute_path)?;
+                if !is_inside(&root, &resolved) {
+                    return Err(ClientError::AccessDenied(
+                        "Write target resolves outside the selected repository".to_string(),
+                    ));
+                }
+                resolved
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let ancestor = nearest_existing_ancestor(&absolute_path, &root)?;
+                if !is_inside(&root, &ancestor) {
+                    return Err(ClientError::AccessDenied(
+                        "Write target resolves outside the selected repository".to_string(),
+                    ));
+                }
+                assert_existing_components_stay_inside(&root, &absolute_path)?;
+                absolute_path
+            }
+            Err(error) => return Err(ClientError::from(error)),
+        };
 
         Ok(ResolvedPath {
             relative_path: relative_path(&root, &absolute_path)?,
@@ -149,4 +165,29 @@ fn nearest_existing_ancestor(target: &Path, root: &Path) -> Result<PathBuf> {
             Err(error) => return Err(ClientError::from(error)),
         }
     }
+}
+
+fn assert_existing_components_stay_inside(root: &Path, target: &Path) -> Result<()> {
+    let relative = target
+        .strip_prefix(root)
+        .map_err(|error| ClientError::AccessDenied(error.to_string()))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    let resolved = fs::canonicalize(&current)?;
+                    if !is_inside(root, &resolved) {
+                        return Err(ClientError::AccessDenied(
+                            "Write target resolves outside the selected repository".to_string(),
+                        ));
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(ClientError::from(error)),
+        }
+    }
+    Ok(())
 }
