@@ -18,6 +18,7 @@ const PREFERRED_SHELL_PORT: u16 = 4765;
 const UPDATER_ENDPOINT: &str =
     "https://github.com/damijanc/damaian/releases/latest/download/latest.json";
 const SETTINGS_MENU_ID: &str = "damaian-settings";
+const CHECK_FOR_UPDATES_MENU_ID: &str = "damaian-check-for-updates";
 
 struct PendingUpdate(Mutex<Option<Update>>);
 
@@ -42,6 +43,9 @@ fn main() {
         .on_menu_event(|app, event| {
             if event.id() == SETTINGS_MENU_ID {
                 open_settings(app);
+            }
+            if event.id() == CHECK_FOR_UPDATES_MENU_ID {
+                check_for_updates(app);
             }
         })
         .setup(move |app| {
@@ -108,6 +112,13 @@ fn build_macos_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu
     };
 
     let about = PredefinedMenuItem::about(app, None, Some(about_metadata))?;
+    let check_for_updates = MenuItem::with_id(
+        app,
+        CHECK_FOR_UPDATES_MENU_ID,
+        "Check for Updates...",
+        true,
+        None::<&str>,
+    )?;
     let settings = MenuItem::with_id(
         app,
         SETTINGS_MENU_ID,
@@ -126,6 +137,8 @@ fn build_macos_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu
         true,
         &[
             &about,
+            &PredefinedMenuItem::separator(app)?,
+            &check_for_updates,
             &PredefinedMenuItem::separator(app)?,
             &settings,
             &PredefinedMenuItem::separator(app)?,
@@ -194,6 +207,13 @@ fn build_macos_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu
 fn open_settings<R: Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.eval("window.dispatchEvent(new Event('damaian-open-settings'))");
+        let _ = window.set_focus();
+    }
+}
+
+fn check_for_updates<R: Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.eval("window.dispatchEvent(new Event('damaian-check-for-updates'))");
         let _ = window.set_focus();
     }
 }
