@@ -193,6 +193,44 @@ impl ProjectIndexer {
         Ok(repository_id_for_root(&root))
     }
 
+    /// Re-indexes a single file, for incremental updates driven by a
+    /// filesystem watcher. Returns `Ok(None)` if the path is no longer a
+    /// regular file (deleted, replaced by a directory) or is ignored, in
+    /// which case the caller should drop any existing record for it.
+    ///
+    /// Unlike `index_repository`'s full walk, this only checks the default
+    /// and configured ignore patterns — not per-directory `.gitignore` files
+    /// — to stay cheap on the hot path; the periodic full rescan in
+    /// `IndexCache` corrects any drift this simplification causes.
+    pub fn index_single_file(
+        &self,
+        repository_id: &str,
+        root: &Path,
+        relative_path: &str,
+    ) -> Result<Option<FileRecord>> {
+        let absolute_path = root.join(relative_path);
+        if !absolute_path.is_file() {
+            return Ok(None);
+        }
+        let default_patterns = if self.config.ignore_patterns.is_empty() {
+            DEFAULT_IGNORE_PATTERNS
+                .iter()
+                .map(|pattern| pattern.to_string())
+                .collect::<Vec<_>>()
+        } else {
+            self.config.ignore_patterns.clone()
+        };
+        let rules = parse_ignore_patterns(&default_patterns, "");
+        if is_ignored_by_rules(&rules, relative_path, false) {
+            return Ok(None);
+        }
+
+        let mut files = Vec::new();
+        let mut skipped = Vec::new();
+        self.add_file(repository_id, &absolute_path, relative_path, &mut files, &mut skipped)?;
+        Ok(files.into_iter().next())
+    }
+
     fn walk(
         &self,
         root: &Path,

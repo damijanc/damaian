@@ -5,7 +5,7 @@ use crate::context_manager::ContextManager;
 use crate::error::{ClientError, Result};
 use crate::hash::create_id;
 use crate::indexer::ProjectIndexer;
-use crate::model::{ModelAdapter, ModelMessage, ModelRequest, ModelRun};
+use crate::model::{ModelAdapter, ModelMessage, ModelRequest, ModelRun, ToolCall, ToolDefinition};
 use crate::secret_scanner::SecretScanner;
 use crate::session::{ChatMessage, Session, SessionStore, Task, TaskStatus};
 use crate::validation::{CommandProposal, ValidationOrchestrator, command_approval_prompt};
@@ -91,7 +91,7 @@ impl ChatOrchestrator {
         on_token: &mut dyn FnMut(&str),
     ) -> Result<ChatTurnResult> {
         let repository_root = repository_root.as_ref();
-        let index = self.indexer.index_repository(repository_root)?;
+        let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
         let (session, prior_messages) = if let Some(session_id) = session_id {
             let Some(session) = self.session_store.read_session(session_id)? else {
                 return Err(ClientError::InvalidInput(format!(
@@ -144,6 +144,10 @@ impl ChatOrchestrator {
             temperature: Some("0".to_string()),
             reasoning_level: Some(self.config.model_reasoning_level.clone()),
             stream: true,
+            tools: self
+                .config
+                .supports_native_tools()
+                .then(|| vec![run_command_tool_definition()]),
         };
 
         self.audit_log.record(
@@ -162,7 +166,12 @@ impl ChatOrchestrator {
         match run_result {
             Ok(model_run) => {
                 let first_response = self.scanner.redact(&model_run.content).text;
-                if let Some(command_request) = parse_command_request(&first_response) {
+                let command_request = model_run
+                    .tool_calls
+                    .iter()
+                    .find_map(command_request_from_tool_call)
+                    .or_else(|| parse_command_request(&first_response));
+                if let Some(command_request) = command_request {
                     let proposal = self.validation_orchestrator.propose_command(
                         repository_root,
                         &command_request.command,
@@ -226,6 +235,7 @@ impl ChatOrchestrator {
                         temperature: Some("0".to_string()),
                         reasoning_level: Some(self.config.model_reasoning_level.clone()),
                         stream: true,
+                        tools: None,
                     };
                     let model_run = model_adapter.stream_response(&follow_up_request, on_token)?;
                     let response = self.scanner.redact(&model_run.content).text;
@@ -366,6 +376,37 @@ fn build_model_prompt(
 struct CommandRequest {
     command: String,
     reason: String,
+}
+
+/// The one tool offered to providers configured with
+/// `supports_native_tools`. Mirrors the `DAMAIAN_COMMAND_V1` envelope's
+/// capability (propose a sandboxed read-only command) through a real
+/// `tools`/`tool_calls` contract instead of a text convention.
+fn run_command_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "run_command".to_string(),
+        description: "Run a read-only local shell command (e.g. git status, git log, git diff, ls, pwd) in the repository sandbox to help answer the user's question.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The shell command to run\"},\"reason\":{\"type\":\"string\",\"description\":\"Why this command is needed\"}},\"required\":[\"command\"]}".to_string(),
+    }
+}
+
+fn command_request_from_tool_call(call: &ToolCall) -> Option<CommandRequest> {
+    if call.name != "run_command" {
+        return None;
+    }
+    let arguments: serde_json::Value = serde_json::from_str(&call.arguments_json).ok()?;
+    let command = arguments.get("command")?.as_str()?.trim().to_string();
+    if command.is_empty() {
+        return None;
+    }
+    let reason = arguments
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Assistant requested a local command")
+        .to_string();
+    Some(CommandRequest { command, reason })
 }
 
 fn parse_command_request(value: &str) -> Option<CommandRequest> {

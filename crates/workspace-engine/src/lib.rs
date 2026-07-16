@@ -11,6 +11,7 @@ pub mod file_access;
 pub mod git_service;
 pub mod hash;
 pub mod ignore;
+pub mod index_cache;
 pub mod indexer;
 pub mod language;
 pub mod model;
@@ -30,6 +31,7 @@ pub use config::{
     normalize_model_provider, normalize_model_reasoning_level,
 };
 pub use context_manager::{ContextItem, ContextManager, ContextPlan};
+pub use diff::{DiffLine, Hunk, create_unified_diff, diff_file, reconstruct_content};
 pub use edit::{
     EditOrchestrator, EditProposalResult, GeneratedEdit, PatchStore, parse_generated_edit,
     patch_diff_text,
@@ -37,14 +39,16 @@ pub use edit::{
 pub use error::{ClientError, Result};
 pub use file_access::{FileAccessController, FileRead};
 pub use git_service::{GitFileStatus, GitService, GitStatus};
+pub use index_cache::IndexCache;
 pub use indexer::{ProjectIndexer, RepositoryIndex, SearchResult};
 pub use model::{
     CurlModelTransport, MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage,
-    ModelRequest, ModelRun, ModelTransport, OpenAICompatibleAdapter, extract_model_tokens,
-    model_request_json,
+    ModelRequest, ModelRun, ModelTransport, OpenAICompatibleAdapter, ToolCall, ToolDefinition,
+    extract_model_tokens, model_request_json,
 };
 pub use patch_engine::{
-    PatchApplyResult, PatchEngine, ProposedChange, ProposedFilePatch, ProposedPatch,
+    PatchApplyResult, PatchEngine, PatchRollbackResult, ProposedChange, ProposedFilePatch,
+    ProposedPatch,
 };
 pub use path_policy::PathPolicy;
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
