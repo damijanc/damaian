@@ -8,8 +8,12 @@ use crate::indexer::ProjectIndexer;
 use crate::model::{ModelAdapter, ModelMessage, ModelRequest, ModelRun, ToolCall, ToolDefinition};
 use crate::secret_scanner::SecretScanner;
 use crate::session::{ChatMessage, Session, SessionStore, Task, TaskStatus};
-use crate::validation::{CommandProposal, ValidationOrchestrator, command_approval_prompt};
-use std::path::Path;
+use crate::validation::{
+    CommandProposal, CommandStore, ValidationOrchestrator, command_approval_prompt,
+};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCommandProposal {
@@ -40,6 +44,8 @@ pub struct ChatOrchestrator {
     context_manager: ContextManager,
     session_store: SessionStore,
     validation_orchestrator: ValidationOrchestrator,
+    command_store: CommandStore,
+    pending_commands: PendingCommandStore,
 }
 
 impl ChatOrchestrator {
@@ -51,7 +57,9 @@ impl ChatOrchestrator {
         context_manager: ContextManager,
         session_store: SessionStore,
         validation_orchestrator: ValidationOrchestrator,
+        command_store: CommandStore,
     ) -> Self {
+        let pending_commands = PendingCommandStore::new(&config.data_dir);
         Self {
             config,
             scanner,
@@ -60,6 +68,8 @@ impl ChatOrchestrator {
             context_manager,
             session_store,
             validation_orchestrator,
+            command_store,
+            pending_commands,
         }
     }
 
@@ -134,21 +144,132 @@ impl ChatOrchestrator {
             16_000,
         );
         let model_prompt = build_model_prompt(prompt, &context.items, &prior_messages, None);
-        let native_tools = self
-            .config
-            .supports_native_tools()
-            .then(|| vec![run_command_tool_definition()]);
-        let mut messages = vec![
+        let messages = vec![
             ModelMessage::system(system_prompt()),
             ModelMessage::user(model_prompt),
         ];
 
-        // Agentic loop: keep offering the model tools across multiple rounds
-        // (rather than a single shot) so it can chain reads like `git log`
-        // followed by `git show <sha>` within one user turn. Bounded so a
-        // provider that never stops requesting commands can't run forever;
-        // the final round always drops `tools`, forcing a plain answer.
-        let mut round: u32 = 0;
+        self.run_agentic_turn(
+            repository_root,
+            session,
+            task,
+            context.files,
+            messages,
+            0,
+            model_adapter,
+            on_token,
+        )
+    }
+
+    /// Continues a chat turn that stopped to ask the user whether a proposed
+    /// command may run. Executes (or rejects) the command, feeds the result
+    /// back to the model, and lets the agentic loop keep going from there —
+    /// previously approving a risky command just ran it in isolation and the
+    /// model never got to use the result to answer the user's question.
+    pub fn resume_after_command_decision(
+        &self,
+        proposal_id: &str,
+        approved: bool,
+        approved_by: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<ChatTurnResult> {
+        let pending = self.pending_commands.take(proposal_id)?;
+        let repository_root = PathBuf::from(&pending.repository_root);
+        let mut messages = pending.messages;
+        let proposal = self.command_store.load_proposal(proposal_id)?;
+        let command_request = CommandRequest {
+            command: proposal.command.clone(),
+            reason: proposal.reason.clone(),
+        };
+
+        let tool_result_content = if approved {
+            let record = self
+                .validation_orchestrator
+                .run_proposal(proposal_id, true, approved_by)?;
+            sandbox_command_context(&record.execution)
+        } else {
+            self.validation_orchestrator
+                .reject_proposal(proposal_id, approved_by)?;
+            format!(
+                "The user declined to run `{}`. Do not request it again; answer using what you already know, noting the limitation if it matters.",
+                command_request.command
+            )
+        };
+
+        self.session_store.append_message(
+            &pending.session.id,
+            Some(&pending.task.id),
+            "assistant",
+            &tool_call_summary(&command_request),
+        )?;
+        self.session_store.append_message(
+            &pending.session.id,
+            Some(&pending.task.id),
+            "tool",
+            &tool_result_content,
+        )?;
+
+        if let Some(call) = &pending.matched_tool_call {
+            messages.push(ModelMessage::assistant_with_tool_calls(
+                pending.last_content.clone(),
+                vec![call.clone()],
+            ));
+            messages.push(ModelMessage::tool(call.id.clone(), tool_result_content));
+        } else {
+            messages.push(ModelMessage::assistant(pending.last_content.clone()));
+            messages.push(ModelMessage::user(format!(
+                "Command result:\n{tool_result_content}"
+            )));
+        }
+
+        let task =
+            self.session_store
+                .update_task_status(&pending.task, TaskStatus::Running, None)?;
+
+        self.run_agentic_turn(
+            &repository_root,
+            pending.session,
+            task,
+            pending.context_files,
+            messages,
+            pending.round + 1,
+            model_adapter,
+            on_token,
+        )
+    }
+
+    /// Whether `proposal_id` was raised by a chat turn (and so should be
+    /// resumed via [`Self::resume_after_command_decision`]) as opposed to a
+    /// standalone command proposal from outside the chat flow.
+    pub fn has_pending_chat_command(&self, proposal_id: &str) -> bool {
+        self.pending_commands.has(proposal_id)
+    }
+
+    /// Runs the model in a loop, letting it request sandboxed commands
+    /// across multiple rounds (e.g. `git log` followed by `git show <sha>`)
+    /// instead of stopping after one. Bounded by `MAX_TOOL_ROUNDS` so a
+    /// provider that never stops requesting commands can't run forever; the
+    /// final round always drops `tools`, forcing a plain answer. If the
+    /// model proposes a command that needs human approval, the in-flight
+    /// conversation state is persisted so the turn can be resumed later via
+    /// [`Self::resume_after_command_decision`].
+    fn run_agentic_turn(
+        &self,
+        repository_root: &Path,
+        session: Session,
+        mut task: Task,
+        context_files: Vec<String>,
+        mut messages: Vec<ModelMessage>,
+        mut round: u32,
+        model_adapter: &mut dyn ModelAdapter,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<ChatTurnResult> {
+        let native_tools = self
+            .config
+            .supports_native_tools()
+            .then(|| vec![run_command_tool_definition()]);
+
         let (final_run, response, command_proposal) = loop {
             let force_final = round >= MAX_TOOL_ROUNDS;
             let tools = if force_final {
@@ -166,15 +287,20 @@ impl ChatOrchestrator {
                 tools,
             };
 
+            let token_estimate: usize = messages
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>()
+                .div_ceil(4);
             self.audit_log.record(
                 "model_request_prepared",
                 &[
                     ("actor", "system".to_string()),
                     ("sessionId", session.id.clone()),
                     ("taskId", task.id.clone()),
-                    ("repositoryId", index.repository_id.clone()),
-                    ("contextFiles", context.files.join(",")),
-                    ("tokenEstimate", context.token_estimate.to_string()),
+                    ("repositoryId", session.repository_id.clone()),
+                    ("contextFiles", context_files.join(",")),
+                    ("tokenEstimate", token_estimate.to_string()),
                     ("toolRound", round.to_string()),
                 ],
             )?;
@@ -218,6 +344,17 @@ impl ChatOrchestrator {
 
             if proposal.requires_approval || proposal.blocked {
                 let response = command_proposal_response(&proposal);
+                self.pending_commands.save(&PendingChatTurn {
+                    proposal_id: proposal.id.clone(),
+                    session: session.clone(),
+                    task: task.clone(),
+                    repository_root: repository_root.to_string_lossy().to_string(),
+                    context_files: context_files.clone(),
+                    round,
+                    messages: messages.clone(),
+                    matched_tool_call: matched_tool_call.clone(),
+                    last_content: redacted.clone(),
+                })?;
                 let mut proposal_run = model_run;
                 proposal_run.content = response.clone();
                 break (
@@ -264,15 +401,16 @@ impl ChatOrchestrator {
             round += 1;
         };
 
-        self.session_store.append_message(
-            &session.id,
-            Some(&task.id),
-            "assistant",
-            &response,
-        )?;
+        self.session_store
+            .append_message(&session.id, Some(&task.id), "assistant", &response)?;
+        let final_status = if command_proposal.is_some() {
+            TaskStatus::WaitingForApproval
+        } else {
+            TaskStatus::Complete
+        };
         task = self
             .session_store
-            .update_task_status(&task, TaskStatus::Complete, None)?;
+            .update_task_status(&task, final_status, None)?;
         self.audit_log.record(
             "model_response_completed",
             &[
@@ -297,10 +435,78 @@ impl ChatOrchestrator {
             session,
             task,
             model_run: final_run,
-            context_files: context.files,
+            context_files,
             response,
             command_proposal,
         })
+    }
+}
+
+/// Conversation state saved when a chat turn pauses on a command that needs
+/// human approval, so [`ChatOrchestrator::resume_after_command_decision`]
+/// can pick the turn back up once the user decides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingChatTurn {
+    proposal_id: String,
+    session: Session,
+    task: Task,
+    repository_root: String,
+    context_files: Vec<String>,
+    round: u32,
+    messages: Vec<ModelMessage>,
+    matched_tool_call: Option<ToolCall>,
+    last_content: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCommandStore {
+    data_dir: PathBuf,
+}
+
+impl PendingCommandStore {
+    fn new(data_dir: impl AsRef<Path>) -> Self {
+        Self {
+            data_dir: data_dir.as_ref().to_path_buf(),
+        }
+    }
+
+    fn path_for(&self, proposal_id: &str) -> PathBuf {
+        self.data_dir
+            .join("chat")
+            .join("pending")
+            .join(format!("{proposal_id}.json"))
+    }
+
+    fn has(&self, proposal_id: &str) -> bool {
+        self.path_for(proposal_id).exists()
+    }
+
+    fn save(&self, pending: &PendingChatTurn) -> Result<()> {
+        let path = self.path_for(&pending.proposal_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string(pending).map_err(|error| {
+            ClientError::InvalidInput(format!("Failed to serialize pending chat turn: {error}"))
+        })?;
+        fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Loads and removes the pending state — a command decision can only be
+    /// resumed once.
+    fn take(&self, proposal_id: &str) -> Result<PendingChatTurn> {
+        let path = self.path_for(proposal_id);
+        let content = fs::read_to_string(&path).map_err(|_| {
+            ClientError::InvalidInput(format!(
+                "No pending chat turn for proposal: {proposal_id}"
+            ))
+        })?;
+        let pending: PendingChatTurn = serde_json::from_str(&content).map_err(|error| {
+            ClientError::InvalidInput(format!("Failed to parse pending chat turn: {error}"))
+        })?;
+        let _ = fs::remove_file(&path);
+        Ok(pending)
     }
 }
 

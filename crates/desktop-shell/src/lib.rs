@@ -419,6 +419,9 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             )
         }
         ("POST", "/api/ask-stream") => handle_ask_stream(stream, &request),
+        ("POST", "/api/resume-command-stream") => {
+            handle_resume_command_stream(stream, &request)
+        }
         ("POST", "/api/ask") => {
             let form = parse_form(&request.body);
             let mut on_token = |_token: &str| {};
@@ -601,44 +604,79 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             let form = parse_form(&request.body);
             let proposal_id = required_form(&form, "proposal_id")?;
             let engine = engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
-            let record = engine
-                .validation_orchestrator
-                .run_proposal(&proposal_id, true, "desktop_user")
-                .map_err(|error| error.to_string())?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"proposalId\":\"{}\",\"commandId\":\"{}\",\"exitCode\":{},\"stdout\":\"{}\",\"stderr\":\"{}\"}}",
-                    escape_json(&record.proposal_id),
-                    escape_json(&record.execution.id),
-                    record.execution.exit_code.unwrap_or(-1),
-                    escape_json(&record.execution.stdout),
-                    escape_json(&record.execution.stderr)
-                ),
-            )
+
+            if engine
+                .chat_orchestrator
+                .has_pending_chat_command(&proposal_id)
+            {
+                // This proposal paused a chat turn awaiting approval — run
+                // the command and feed the result back to the model so it
+                // can actually answer, instead of just executing it in
+                // isolation and leaving the user without a synthesized
+                // response.
+                let result = resume_chat_command(&engine, &proposal_id, true)?;
+                write_response(
+                    stream,
+                    &request,
+                    200,
+                    "application/json",
+                    &chat_result_json(&result),
+                )
+            } else {
+                let record = engine
+                    .validation_orchestrator
+                    .run_proposal(&proposal_id, true, "desktop_user")
+                    .map_err(|error| error.to_string())?;
+                write_response(
+                    stream,
+                    &request,
+                    200,
+                    "application/json",
+                    &format!(
+                        "{{\"proposalId\":\"{}\",\"commandId\":\"{}\",\"exitCode\":{},\"stdout\":\"{}\",\"stderr\":\"{}\"}}",
+                        escape_json(&record.proposal_id),
+                        escape_json(&record.execution.id),
+                        record.execution.exit_code.unwrap_or(-1),
+                        escape_json(&record.execution.stdout),
+                        escape_json(&record.execution.stderr)
+                    ),
+                )
+            }
         }
         ("POST", "/api/reject-command") => {
             let form = parse_form(&request.body);
             let proposal_id = required_form(&form, "proposal_id")?;
             let engine = engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
-            let path = engine
-                .validation_orchestrator
-                .reject_proposal(&proposal_id, "desktop_user")
-                .map_err(|error| error.to_string())?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"proposalId\":\"{}\",\"status\":\"rejected\",\"path\":\"{}\"}}",
-                    escape_json(&proposal_id),
-                    escape_json(&path.to_string_lossy())
-                ),
-            )
+
+            if engine
+                .chat_orchestrator
+                .has_pending_chat_command(&proposal_id)
+            {
+                let result = resume_chat_command(&engine, &proposal_id, false)?;
+                write_response(
+                    stream,
+                    &request,
+                    200,
+                    "application/json",
+                    &chat_result_json(&result),
+                )
+            } else {
+                let path = engine
+                    .validation_orchestrator
+                    .reject_proposal(&proposal_id, "desktop_user")
+                    .map_err(|error| error.to_string())?;
+                write_response(
+                    stream,
+                    &request,
+                    200,
+                    "application/json",
+                    &format!(
+                        "{{\"proposalId\":\"{}\",\"status\":\"rejected\",\"path\":\"{}\"}}",
+                        escape_json(&proposal_id),
+                        escape_json(&path.to_string_lossy())
+                    ),
+                )
+            }
         }
         ("POST", "/api/config-set") => {
             let form = parse_form(&request.body);
@@ -776,6 +814,70 @@ fn handle_ask_stream(stream: &mut TcpStream, request: &Request) -> Result<(), St
     }
 }
 
+fn handle_resume_command_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    write_event_stream_headers(stream, request)?;
+
+    let mut write_error = None;
+    let result = {
+        let mut on_token = |token: &str| {
+            if write_error.is_none() {
+                let data = format!("{{\"token\":\"{}\"}}", escape_json(token));
+                if let Err(error) = write_sse_event(stream, "token", &data) {
+                    write_error = Some(error);
+                }
+            }
+        };
+        run_resume_command_request(&form, &mut on_token)
+    };
+
+    if let Some(error) = write_error {
+        return Err(error);
+    }
+
+    match result {
+        Ok(result) => write_sse_event(stream, "done", &chat_result_json(&result)),
+        Err(error) => write_sse_event(stream, "error", &json_error(&friendly_chat_error(&error))),
+    }
+}
+
+fn run_resume_command_request(
+    form: &HashMap<String, String>,
+    on_token: &mut dyn FnMut(&str),
+) -> Result<ChatTurnResult, String> {
+    let repo = required_form(form, "repo")?;
+    let proposal_id = required_form(form, "proposal_id")?;
+    let approved = form.get("approved").map(String::as_str) == Some("true");
+    let engine = engine_for_repo(&repo)?;
+
+    if !engine
+        .chat_orchestrator
+        .has_pending_chat_command(&proposal_id)
+    {
+        return Err(format!(
+            "No pending chat command for proposal: {proposal_id}"
+        ));
+    }
+
+    let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
+    let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
+    let mut adapter = OpenAICompatibleAdapter::with_provider(
+        &engine.config.model_provider,
+        &engine.config.model_name,
+        transport,
+    );
+    engine
+        .chat_orchestrator
+        .resume_after_command_decision(
+            &proposal_id,
+            approved,
+            "desktop_user",
+            &mut adapter,
+            on_token,
+        )
+        .map_err(|error| error.to_string())
+}
+
 fn run_chat_request(
     form: &HashMap<String, String>,
     on_token: &mut dyn FnMut(&str),
@@ -809,6 +911,36 @@ fn run_chat_request(
             session_id,
             &mut adapter,
             on_token,
+        )
+        .map_err(|error| error.to_string())
+}
+
+/// Continues a chat turn that paused on a command approval, once the user
+/// approves or rejects it via `/api/run-command` or `/api/reject-command`.
+/// Tokens aren't streamed back here (these endpoints are plain JSON POSTs,
+/// not SSE), so they're discarded; the final answer still comes back in the
+/// response body.
+fn resume_chat_command(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    approved: bool,
+) -> Result<ChatTurnResult, String> {
+    let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
+    let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
+    let mut adapter = OpenAICompatibleAdapter::with_provider(
+        &engine.config.model_provider,
+        &engine.config.model_name,
+        transport,
+    );
+    let mut on_token = |_token: &str| {};
+    engine
+        .chat_orchestrator
+        .resume_after_command_decision(
+            proposal_id,
+            approved,
+            "desktop_user",
+            &mut adapter,
+            &mut on_token,
         )
         .map_err(|error| error.to_string())
 }

@@ -1085,6 +1085,113 @@ fn chat_returns_command_approval_when_command_exits_sandbox() {
     assert_eq!(proposal.command, "npm test");
     assert!(proposal.requires_approval);
     assert!(result.response.contains("approval"));
+    // The task is paused awaiting a human decision, not finished — a prior
+    // bug marked it Complete even though the model never got to answer.
+    assert_eq!(result.task.status.as_str(), "waiting_for_approval");
+    assert!(
+        engine
+            .chat_orchestrator
+            .has_pending_chat_command(&proposal.id)
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn chat_resumes_after_command_approval_and_answers_using_the_result() {
+    let repo = temp_dir("chat-resume-approve");
+    write_fixture(&repo, "README.md", "# Chat resume test\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    // A generic, unclassified command lands in the policy's catch-all
+    // bucket (`requires_approval: true` regardless of config flags) while
+    // still being something every test machine can actually execute.
+    let mut adapter = MockModelAdapter::new_sequence(vec![
+        "DAMAIAN_COMMAND_V1\nCOMMAND: echo hello-from-sandbox\nREASON: Verify sandbox execution.\nEND_COMMAND\n"
+            .to_string(),
+        "The sandbox printed the expected marker.".to_string(),
+    ]);
+    let mut on_token = |_token: &str| {};
+
+    let first = engine
+        .chat_orchestrator
+        .ask(&repo, "Print a marker.", &[], &mut adapter, &mut on_token)
+        .unwrap();
+    let proposal = first
+        .command_proposal
+        .expect("unclassified command should require approval");
+    assert!(proposal.requires_approval);
+
+    let resumed = engine
+        .chat_orchestrator
+        .resume_after_command_decision(&proposal.id, true, "tester", &mut adapter, &mut on_token)
+        .unwrap();
+
+    assert!(resumed.command_proposal.is_none());
+    assert!(resumed.response.contains("expected marker"));
+    assert_eq!(resumed.task.status.as_str(), "complete");
+    assert!(
+        !engine
+            .chat_orchestrator
+            .has_pending_chat_command(&proposal.id)
+    );
+
+    let messages = engine
+        .session_store
+        .read_messages(&resumed.session.id)
+        .unwrap();
+    // user, "needs approval" notice (from the first turn), tool-call
+    // summary, tool result, final assistant answer (from the resumed turn).
+    assert_eq!(messages.len(), 5);
+    assert_eq!(messages[0].role, "user");
+    assert!(messages[1].content.contains("approval"));
+    assert_eq!(messages[3].role, "tool");
+    assert!(messages[3].content.contains("hello-from-sandbox"));
+    assert_eq!(messages[4].content, resumed.response);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn chat_resumes_after_command_rejection_and_answers_without_it() {
+    let repo = temp_dir("chat-resume-reject");
+    write_fixture(&repo, "README.md", "# Chat resume reject test\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new_sequence(vec![
+        "DAMAIAN_COMMAND_V1\nCOMMAND: echo hello-from-sandbox\nREASON: Verify sandbox execution.\nEND_COMMAND\n"
+            .to_string(),
+        "Understood, I'll answer without running that command.".to_string(),
+    ]);
+    let mut on_token = |_token: &str| {};
+
+    let first = engine
+        .chat_orchestrator
+        .ask(&repo, "Print a marker.", &[], &mut adapter, &mut on_token)
+        .unwrap();
+    let proposal = first
+        .command_proposal
+        .expect("unclassified command should require approval");
+
+    let resumed = engine
+        .chat_orchestrator
+        .resume_after_command_decision(&proposal.id, false, "tester", &mut adapter, &mut on_token)
+        .unwrap();
+
+    assert!(resumed.command_proposal.is_none());
+    assert!(resumed.response.contains("answer without running"));
+    assert_eq!(resumed.task.status.as_str(), "complete");
+    assert!(
+        !engine
+            .chat_orchestrator
+            .has_pending_chat_command(&proposal.id)
+    );
+
+    let messages = engine
+        .session_store
+        .read_messages(&resumed.session.id)
+        .unwrap();
+    assert_eq!(messages.len(), 5);
+    assert_eq!(messages[3].role, "tool");
+    assert!(messages[3].content.contains("declined"));
 
     fs::remove_dir_all(repo).unwrap();
 }
