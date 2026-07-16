@@ -502,6 +502,52 @@ fn redacts_secrets_from_patch_diffs_before_storage() {
 }
 
 #[test]
+fn redacts_secrets_from_rollback_snapshots() {
+    let repo = temp_dir("rollback-redaction");
+    write_fixture(
+        &repo,
+        "src/config.js",
+        &format!("export const awsKey = \"{AWS_ACCESS_KEY}\";\n"),
+    );
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+    let patch = engine
+        .create_patch(
+            &repo,
+            &[ProposedChange {
+                path: "src/config.js".to_string(),
+                new_content: "export const awsKey = \"\";\n".to_string(),
+                status: None,
+                allow_restricted: false,
+            }],
+            None,
+            "remove secret",
+        )
+        .unwrap();
+
+    engine
+        .apply_patch(&repo, &patch, None, "tester", false)
+        .unwrap();
+
+    let rollback_path = config
+        .data_dir
+        .join("rollback")
+        .join(&patch.id)
+        .join("src__config.js");
+    let rollback_snapshot = fs::read_to_string(rollback_path).unwrap();
+    assert!(rollback_snapshot.contains("[REDACTED_AWS_ACCESS_KEY_"));
+    assert!(!rollback_snapshot.contains(AWS_ACCESS_KEY));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
 fn redacts_secrets_from_git_diff_output() {
     let repo = temp_dir("git-diff-redaction");
     write_fixture(
