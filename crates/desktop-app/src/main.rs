@@ -7,6 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use desktop_shell::{ShellOptions, run_server_with_ready};
+use serde::Serialize;
 use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{Manager, Runtime, Url};
 
@@ -15,16 +16,28 @@ const PREFERRED_SHELL_PORT: u16 = 4765;
 const SETTINGS_MENU_ID: &str = "damaian-settings";
 const CHECK_FOR_UPDATES_MENU_ID: &str = "damaian-check-for-updates";
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopBootstrap {
+    api_token: String,
+    default_repo: Option<String>,
+}
+
 fn main() {
     let shell_port = shell_port().unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(1);
     });
     let shell_options = ShellOptions::new(shell_port, repo_from_args_or_env());
+    let bootstrap = DesktopBootstrap {
+        api_token: shell_options.api_token.clone(),
+        default_repo: shell_options.default_repo.clone(),
+    };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(bootstrap)
         .menu(build_app_menu)
         .on_menu_event(|app, event| {
             if event.id() == SETTINGS_MENU_ID {
@@ -68,8 +81,14 @@ fn main() {
             }
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![damaian_desktop_bootstrap])
         .run(tauri::generate_context!())
         .expect("error while running Damaian desktop app");
+}
+
+#[tauri::command]
+fn damaian_desktop_bootstrap(bootstrap: tauri::State<'_, DesktopBootstrap>) -> DesktopBootstrap {
+    bootstrap.inner().clone()
 }
 
 fn build_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R>> {
