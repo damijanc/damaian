@@ -174,7 +174,7 @@ impl EditOrchestrator {
         explicit_paths: &[String],
         model_adapter: &mut dyn ModelAdapter,
     ) -> Result<EditProposalResult> {
-        let index = self.indexer.index_repository(&repository_root)?;
+        let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, &repository_root)?;
         let session = self
             .session_store
             .create_session(&index.repository_id, &edit_session_title(prompt))?;
@@ -209,6 +209,7 @@ impl EditOrchestrator {
             temperature: Some("0".to_string()),
             reasoning_level: Some(self.config.model_reasoning_level.clone()),
             stream: true,
+            tools: None,
         };
 
         self.audit_log.record(
@@ -284,6 +285,7 @@ impl EditOrchestrator {
         repository_root: impl AsRef<Path>,
         patch_id: &str,
         approved_paths: Option<&[String]>,
+        hunk_selection: Option<&std::collections::HashMap<String, Vec<String>>>,
         approved_by: &str,
     ) -> Result<PatchApplyResult> {
         let patch = self.patch_store.load(patch_id)?;
@@ -291,6 +293,7 @@ impl EditOrchestrator {
             repository_root,
             &patch,
             approved_paths,
+            hunk_selection,
             approved_by,
             false,
         )?;
@@ -301,6 +304,30 @@ impl EditOrchestrator {
                 ("patchId", patch_id.to_string()),
                 ("approvedBy", approved_by.to_string()),
                 ("files", result.applied_files.join(",")),
+            ],
+        )?;
+        Ok(result)
+    }
+
+    pub fn rollback_stored_patch(
+        &self,
+        repository_root: impl AsRef<Path>,
+        patch_id: &str,
+        selected_paths: Option<&[String]>,
+        approved_by: &str,
+    ) -> Result<crate::patch_engine::PatchRollbackResult> {
+        let patch = self.patch_store.load(patch_id)?;
+        let result =
+            self.patch_engine
+                .rollback_patch(repository_root, &patch, selected_paths, approved_by)?;
+        self.audit_log.record(
+            "stored_patch_rolled_back",
+            &[
+                ("actor", "user".to_string()),
+                ("patchId", patch_id.to_string()),
+                ("approvedBy", approved_by.to_string()),
+                ("restoredFiles", result.restored_files.join(",")),
+                ("deletedFiles", result.deleted_files.join(",")),
             ],
         )?;
         Ok(result)
@@ -509,6 +536,11 @@ fn serialize_patch(patch: &ProposedPatch) -> String {
         write_field(&mut output, "NEW_HASH", &file.new_hash);
         write_field(&mut output, "NEW_CONTENT", &file.new_content);
         write_field(&mut output, "DIFF", &file.diff);
+        write_field(
+            &mut output,
+            "HUNKS",
+            &serde_json::to_string(&file.hunks).unwrap_or_default(),
+        );
         output.push_str("END_FILE\n");
     }
     output.push_str("END_PATCH\n");
@@ -538,6 +570,8 @@ fn deserialize_patch(raw: &str) -> Result<ProposedPatch> {
         let new_hash = cursor.read_field("NEW_HASH")?;
         let new_content = cursor.read_field("NEW_CONTENT")?;
         let diff = cursor.read_field("DIFF")?;
+        let hunks: Vec<crate::diff::Hunk> =
+            serde_json::from_str(&cursor.read_field("HUNKS")?).unwrap_or_default();
         cursor.expect_line("END_FILE")?;
         files.push(crate::patch_engine::ProposedFilePatch {
             path,
@@ -546,6 +580,7 @@ fn deserialize_patch(raw: &str) -> Result<ProposedPatch> {
             new_content,
             new_hash,
             diff,
+            hunks,
         });
     }
     Ok(ProposedPatch {

@@ -17,7 +17,7 @@ mod keychain;
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const STYLE_CSS: &str = include_str!("../static/style.css");
 const APP_JS: &str = include_str!("../static/app.js");
-const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 static MODEL_API_KEY_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 pub fn run_from_env() -> Result<(), String> {
@@ -475,10 +475,20 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .get("paths")
                 .map(|value| parse_path_list(value))
                 .transpose()?;
+            let hunk_selection = form
+                .get("hunk_selection")
+                .map(|value| parse_hunk_selection(value))
+                .transpose()?;
             let engine = engine_for_repo(&repo)?;
             let result = engine
                 .edit_orchestrator
-                .apply_stored_patch(&repo, &patch_id, approved_paths.as_deref(), "desktop_user")
+                .apply_stored_patch(
+                    &repo,
+                    &patch_id,
+                    approved_paths.as_deref(),
+                    hunk_selection.as_ref(),
+                    "desktop_user",
+                )
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,
@@ -490,6 +500,33 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                     escape_json(&result.patch_id),
                     json_string_array(&result.applied_files),
                     result.warnings.len()
+                ),
+            )
+        }
+        ("POST", "/api/rollback-patch") => {
+            let form = parse_form(&request.body);
+            let repo = required_form(&form, "repo")?;
+            let patch_id = required_form(&form, "patch_id")?;
+            let selected_paths = form
+                .get("paths")
+                .map(|value| parse_path_list(value))
+                .transpose()?;
+            let engine = engine_for_repo(&repo)?;
+            let result = engine
+                .edit_orchestrator
+                .rollback_stored_patch(&repo, &patch_id, selected_paths.as_deref(), "desktop_user")
+                .map_err(|error| error.to_string())?;
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &format!(
+                    "{{\"patchId\":\"{}\",\"restoredFiles\":[{}],\"deletedFiles\":[{}],\"warnings\":[{}]}}",
+                    escape_json(&result.patch_id),
+                    json_string_array(&result.restored_files),
+                    json_string_array(&result.deleted_files),
+                    json_string_array(&result.warnings)
                 ),
             )
         }
@@ -1300,6 +1337,12 @@ fn parse_optional_path_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parses the `hunk_selection` form field: a JSON object mapping file path to
+/// an array of accepted hunk ids, e.g. `{"src/app.js":["hunk_0","hunk_1"]}`.
+fn parse_hunk_selection(value: &str) -> Result<HashMap<String, Vec<String>>, String> {
+    serde_json::from_str(value).map_err(|error| format!("Invalid hunk selection: {error}"))
+}
+
 fn parse_form(body: &str) -> HashMap<String, String> {
     body.split('&')
         .filter(|part| !part.is_empty())
@@ -1505,7 +1548,7 @@ fn patch_files_json(files: &[ProposedFilePatch]) -> String {
         .iter()
         .map(|file| {
             format!(
-                "{{\"path\":\"{}\",\"status\":\"{}\",\"baseHash\":{},\"newHash\":\"{}\",\"diff\":\"{}\"}}",
+                "{{\"path\":\"{}\",\"status\":\"{}\",\"baseHash\":{},\"newHash\":\"{}\",\"diff\":\"{}\",\"hunks\":{}}}",
                 escape_json(&file.path),
                 escape_json(&file.status),
                 file.base_hash
@@ -1513,7 +1556,8 @@ fn patch_files_json(files: &[ProposedFilePatch]) -> String {
                     .map(|hash| format!("\"{}\"", escape_json(hash)))
                     .unwrap_or_else(|| "null".to_string()),
                 escape_json(&file.new_hash),
-                escape_json(&file.diff)
+                escape_json(&file.diff),
+                serde_json::to_string(&file.hunks).unwrap_or_else(|_| "[]".to_string())
             )
         })
         .collect::<Vec<_>>()
@@ -1566,14 +1610,15 @@ fn message_json(message: &ChatMessage) -> String {
 
 fn friendly_chat_error(error: &str) -> String {
     let lower = error.to_lowercase();
+    if !workspace_engine::error::is_retryable_message(error) {
+        return error.to_string();
+    }
     if lower.contains("rate limit") || lower.contains("429") {
         "Model provider rate limit. Wait for the provider retry window, then try again.".to_string()
     } else if lower.contains("timeout") || lower.contains("timed out") {
         "Model provider request timed out. Try again, or lower the context size.".to_string()
-    } else if lower.contains("connection") || lower.contains("could not resolve") {
-        "Model provider network request failed. Check connectivity and provider URL.".to_string()
     } else {
-        error.to_string()
+        "Model provider network request failed. Check connectivity and provider URL.".to_string()
     }
 }
 

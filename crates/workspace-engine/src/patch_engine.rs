@@ -1,10 +1,11 @@
 use crate::audit::AuditLog;
 use crate::config::Config;
-use crate::diff::create_unified_diff;
+use crate::diff::{Hunk, diff_file, reconstruct_content};
 use crate::error::{ClientError, Result};
 use crate::hash::{create_id, file_hash, now_millis, sha256};
 use crate::path_policy::PathPolicy;
 use crate::secret_scanner::SecretScanner;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +17,7 @@ pub struct ProposedFilePatch {
     pub new_content: String,
     pub new_hash: String,
     pub diff: String,
+    pub hunks: Vec<Hunk>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +35,39 @@ pub struct PatchApplyResult {
     pub patch_id: String,
     pub applied_files: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchRollbackResult {
+    pub patch_id: String,
+    pub restored_files: Vec<String>,
+    pub deleted_files: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Pre-apply per-file snapshot used to roll back an applied patch. `content`
+/// has already passed through secret redaction at capture time (see
+/// `apply_patch`), so a genuine secret value that existed before the patch
+/// can never be restored from this snapshot alone — rollback is best-effort
+/// and surfaces a warning for any file whose restored content still contains
+/// a redaction placeholder.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RollbackSnapshot {
+    path: String,
+    base_hash: String,
+    /// Whether the file existed before the patch was applied. When false,
+    /// the file was newly created by the patch, so rollback deletes it
+    /// instead of writing back `content`.
+    existed: bool,
+    captured_at_ms: u128,
+    content: String,
+    /// Hash of the content actually written to disk when the patch was
+    /// applied (which may differ from `ProposedFilePatch::new_hash` if only
+    /// some hunks were accepted). Rollback's conflict check compares against
+    /// this instead of `new_hash` so partial-hunk applies can still be
+    /// safely rolled back.
+    applied_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,18 +125,20 @@ impl PatchEngine {
                         .unwrap_or_else(|| "modified".to_string())
                 })
                 .unwrap_or_else(|| "added".to_string());
-            let diff = create_unified_diff(
+            let file_diff = diff_file(
                 old_content.as_deref().unwrap_or_default(),
                 &change.new_content,
                 &target.relative_path,
             );
-            let diff = self.scanner.redact(&diff).text;
+            let diff = self.scanner.redact(&file_diff.text).text;
+            let hunks = self.redact_hunks(file_diff.hunks);
             files.push(ProposedFilePatch {
                 path: target.relative_path.clone(),
                 status,
                 base_hash: old_content.as_ref().map(sha256),
                 new_hash: sha256(change.new_content.as_bytes()),
                 diff,
+                hunks,
                 new_content: change.new_content.clone(),
             });
         }
@@ -138,11 +175,34 @@ impl PatchEngine {
         Ok(patch)
     }
 
+    /// Redacts the display text of each hunk's lines. Position metadata
+    /// (`old_start`/`old_lines`/`new_start`/`new_lines`) is left untouched
+    /// since `reconstruct_content` only ever uses those offsets against
+    /// freshly-recomputed, unredacted content at apply time — never the
+    /// stored (possibly redacted) line text.
+    fn redact_hunks(&self, hunks: Vec<Hunk>) -> Vec<Hunk> {
+        hunks
+            .into_iter()
+            .map(|hunk| Hunk {
+                lines: hunk
+                    .lines
+                    .into_iter()
+                    .map(|line| crate::diff::DiffLine {
+                        text: self.scanner.redact(&line.text).text,
+                        ..line
+                    })
+                    .collect(),
+                ..hunk
+            })
+            .collect()
+    }
+
     pub fn apply_patch(
         &self,
         root_path: impl AsRef<Path>,
         patch: &ProposedPatch,
         approved_paths: Option<&[String]>,
+        hunk_selection: Option<&HashMap<String, Vec<String>>>,
         approved_by: &str,
         allow_generated_secrets: bool,
     ) -> Result<PatchApplyResult> {
@@ -193,7 +253,21 @@ impl PatchEngine {
                 )));
             }
 
-            let findings = self.scanner.scan(&file.new_content);
+            let content_to_write = if file.status == "deleted" {
+                String::new()
+            } else {
+                match hunk_selection.and_then(|selection| selection.get(&file.path)) {
+                    Some(accepted_hunk_ids) => reconstruct_content(
+                        current_content.as_deref().unwrap_or_default(),
+                        &file.new_content,
+                        &file.hunks,
+                        accepted_hunk_ids,
+                    ),
+                    None => file.new_content.clone(),
+                }
+            };
+
+            let findings = self.scanner.scan(&content_to_write);
             if !findings.is_empty() {
                 warnings.push(format!(
                     "{}: generated_secret:{}",
@@ -206,32 +280,34 @@ impl PatchEngine {
                     ));
                 }
             }
-            prepared.push((file, target.absolute_path, current_content));
+            prepared.push((file, target.absolute_path, current_content, content_to_write));
         }
 
         let rollback_dir = self.config.data_dir.join("rollback").join(&patch.id);
         fs::create_dir_all(&rollback_dir)?;
         let mut applied_files = Vec::new();
 
-        for (file, absolute_path, current_content) in prepared {
+        for (file, absolute_path, current_content, content_to_write) in prepared {
             let rollback_path = rollback_dir.join(file.path.replace('/', "__"));
             let rollback_content = self
                 .scanner
                 .redact(current_content.as_deref().unwrap_or_default())
                 .text;
-            fs::write(
-                &rollback_path,
-                format!(
-                    "{{\"path\":\"{}\",\"baseHash\":\"{}\",\"capturedAtMs\":\"{}\",\"content\":\"{}\"}}",
-                    file.path,
-                    file.base_hash.clone().unwrap_or_default(),
-                    now_millis(),
-                    rollback_content
-                        .replace('\\', "\\\\")
-                        .replace('"', "\\\"")
-                        .replace('\n', "\\n")
-                ),
-            )?;
+            let snapshot = RollbackSnapshot {
+                path: file.path.clone(),
+                base_hash: file.base_hash.clone().unwrap_or_default(),
+                existed: current_content.is_some(),
+                captured_at_ms: now_millis(),
+                content: rollback_content,
+                applied_hash: if file.status == "deleted" {
+                    String::new()
+                } else {
+                    sha256(content_to_write.as_bytes())
+                },
+            };
+            let serialized = serde_json::to_string(&snapshot)
+                .map_err(|error| ClientError::Io(format!("Failed to write rollback snapshot: {error}")))?;
+            fs::write(&rollback_path, serialized)?;
 
             if file.status == "deleted" {
                 if current_content.is_none() {
@@ -245,7 +321,7 @@ impl PatchEngine {
                     fs::create_dir_all(parent)?;
                 }
                 let temp_path = temp_path_for(&absolute_path);
-                fs::write(&temp_path, &file.new_content)?;
+                fs::write(&temp_path, &content_to_write)?;
                 fs::rename(&temp_path, &absolute_path)?;
             }
 
@@ -289,6 +365,154 @@ impl PatchEngine {
         Ok(PatchApplyResult {
             patch_id: patch.id.clone(),
             applied_files,
+            warnings,
+        })
+    }
+
+    /// Restores the workspace to its pre-apply state using the redacted
+    /// snapshot captured in `apply_patch`. Refuses per-file if the target has
+    /// changed since the patch was applied (mirroring the conflict check in
+    /// `apply_patch`), so an unrelated later edit is never clobbered.
+    pub fn rollback_patch(
+        &self,
+        root_path: impl AsRef<Path>,
+        patch: &ProposedPatch,
+        selected_paths: Option<&[String]>,
+        approved_by: &str,
+    ) -> Result<PatchRollbackResult> {
+        let rollback_dir = self.config.data_dir.join("rollback").join(&patch.id);
+        if !rollback_dir.exists() {
+            return Err(ClientError::InvalidInput(format!(
+                "No rollback snapshot found for patch {}",
+                patch.id
+            )));
+        }
+        if let Some(paths) = selected_paths {
+            let patch_paths = patch
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>();
+            if let Some(path) = paths.iter().find(|path| !patch_paths.contains(&path.as_str())) {
+                return Err(ClientError::InvalidInput(format!(
+                    "Selected patch file was not found: {path}"
+                )));
+            }
+        }
+
+        self.audit_log.record(
+            "patch_rollback_started",
+            &[
+                ("actor", "user".to_string()),
+                ("taskId", patch.task_id.clone().unwrap_or_default()),
+                ("patchId", patch.id.clone()),
+                ("approvedBy", approved_by.to_string()),
+            ],
+        )?;
+
+        let mut restored_files = Vec::new();
+        let mut deleted_files = Vec::new();
+        let mut warnings = Vec::new();
+
+        let files_to_roll_back = patch
+            .files
+            .iter()
+            .filter(|file| selected_paths.is_none_or(|paths| paths.contains(&file.path)));
+
+        for file in files_to_roll_back {
+            let rollback_path = rollback_dir.join(file.path.replace('/', "__"));
+            if !rollback_path.exists() {
+                warnings.push(format!(
+                    "{}: no rollback snapshot available, skipped",
+                    file.path
+                ));
+                continue;
+            }
+            let raw_snapshot = fs::read_to_string(&rollback_path)?;
+            let snapshot: RollbackSnapshot = serde_json::from_str(&raw_snapshot).map_err(|error| {
+                ClientError::Io(format!(
+                    "Corrupt rollback snapshot for {}: {error}",
+                    file.path
+                ))
+            })?;
+
+            let target = self.path_policy.resolve_for_write(&root_path, &file.path)?;
+            self.path_policy
+                .assert_not_restricted(&target.relative_path, false)?;
+            let current_content = read_existing(&target.absolute_path)?;
+
+            let conflict = if file.status == "deleted" {
+                // apply_patch removed this file; its reappearance means something
+                // else recreated it after the patch was applied.
+                current_content.is_some()
+            } else {
+                // Compare against what was actually written (`applied_hash`), not
+                // `file.new_hash`, since a partial hunk accept writes content that
+                // differs from the patch's full proposed `new_content`.
+                current_content.as_ref().map(sha256).as_deref() != Some(snapshot.applied_hash.as_str())
+            };
+            if conflict {
+                return Err(ClientError::PatchConflict(format!(
+                    "Target file changed since the patch was applied, refusing rollback: {}",
+                    file.path
+                )));
+            }
+
+            if snapshot.existed {
+                if let Some(parent) = target.absolute_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let temp_path = temp_path_for(&target.absolute_path);
+                fs::write(&temp_path, &snapshot.content)?;
+                fs::rename(&temp_path, &target.absolute_path)?;
+                restored_files.push(file.path.clone());
+            } else if target.absolute_path.exists() {
+                fs::remove_file(&target.absolute_path)?;
+                deleted_files.push(file.path.clone());
+            } else {
+                deleted_files.push(file.path.clone());
+            }
+
+            if snapshot.content.contains("[REDACTED_") {
+                warnings.push(format!(
+                    "{}: original content contained secrets that were redacted before rollback capture and cannot be restored",
+                    file.path
+                ));
+            }
+
+            self.audit_log.record(
+                "file_restored",
+                &[
+                    ("actor", "user".to_string()),
+                    ("taskId", patch.task_id.clone().unwrap_or_default()),
+                    ("patchId", patch.id.clone()),
+                    ("approvedBy", approved_by.to_string()),
+                    ("resourcePath", file.path.clone()),
+                    (
+                        "status",
+                        if snapshot.existed { "restored" } else { "deleted" }.to_string(),
+                    ),
+                ],
+            )?;
+        }
+
+        self.audit_log.record(
+            "patch_rolled_back",
+            &[
+                ("actor", "user".to_string()),
+                ("taskId", patch.task_id.clone().unwrap_or_default()),
+                ("patchId", patch.id.clone()),
+                ("approvedBy", approved_by.to_string()),
+                ("restoredFiles", restored_files.join(",")),
+                ("deletedFiles", deleted_files.join(",")),
+                ("warningCount", warnings.len().to_string()),
+            ],
+        )?;
+
+        Ok(PatchRollbackResult {
+            patch_id: patch.id.clone(),
+            restored_files,
+            deleted_files,
             warnings,
         })
     }

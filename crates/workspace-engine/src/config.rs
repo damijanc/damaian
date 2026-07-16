@@ -68,6 +68,11 @@ pub struct ModelProviderConfig {
     pub base_url: String,
     pub api_key_env: String,
     pub models: Vec<String>,
+    /// Opt-in: whether to use the provider's native `tools`/`tool_calls`
+    /// contract instead of the `DAMAIAN_COMMAND_V1` text envelope. Defaults
+    /// to false so existing providers are unaffected until explicitly
+    /// enabled.
+    pub supports_native_tools: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -77,6 +82,7 @@ pub struct ModelProviderConfigOverlay {
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     pub models: Option<Vec<String>>,
+    pub supports_native_tools: Option<bool>,
 }
 
 impl Config {
@@ -218,6 +224,18 @@ impl Config {
         }
     }
 
+    /// Whether the active model provider is configured to use native
+    /// `tools`/`tool_calls` instead of the `DAMAIAN_COMMAND_V1` text
+    /// envelope. Defaults to false for any provider that hasn't explicitly
+    /// opted in.
+    pub fn supports_native_tools(&self) -> bool {
+        self.model_provider_config(&self.model_provider)
+            .cloned()
+            .or_else(|| builtin_model_provider_config(&self.model_provider))
+            .map(|provider| provider.supports_native_tools)
+            .unwrap_or(false)
+    }
+
     pub fn apply_model_provider_defaults(&mut self) {
         if let Some(provider) = self
             .model_provider_config(&self.model_provider)
@@ -261,6 +279,9 @@ impl Config {
             if let Some(value) = overlay.models {
                 provider.models = value;
             }
+            if let Some(value) = overlay.supports_native_tools {
+                provider.supports_native_tools = value;
+            }
             return;
         }
 
@@ -270,6 +291,7 @@ impl Config {
             base_url: overlay.base_url.unwrap_or_default(),
             api_key_env: overlay.api_key_env.unwrap_or_default(),
             models: overlay.models.unwrap_or_default(),
+            supports_native_tools: overlay.supports_native_tools.unwrap_or(false),
             id,
         });
     }
@@ -541,6 +563,9 @@ impl ConfigOverlay {
             "base_url" => provider.base_url = Some(value.trim_end_matches('/').to_string()),
             "api_key_env" => provider.api_key_env = Some(parse_model_api_key_reference(value)?),
             "models" => provider.models = Some(split_list(value)),
+            "supports_native_tools" => {
+                provider.supports_native_tools = Some(parse_bool(field, value)?)
+            }
             _ => {
                 return Err(ClientError::InvalidInput(format!(
                     "Unknown model provider config key: model_provider.{provider_key}"
@@ -647,6 +672,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
                 "gpt-4.1-mini".to_string(),
                 "o4-mini".to_string(),
             ],
+            supports_native_tools: false,
         }),
         "deepseek" => Some(ModelProviderConfig {
             id: "deepseek".to_string(),
@@ -658,6 +684,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
                 std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string()),
                 "deepseek-reasoner".to_string(),
             ],
+            supports_native_tools: false,
         }),
         "openai-compatible" => Some(ModelProviderConfig {
             id: "openai-compatible".to_string(),
@@ -665,6 +692,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             base_url: "https://api.openai.com".to_string(),
             api_key_env: "OPENAI_API_KEY".to_string(),
             models: vec!["configured-model".to_string()],
+            supports_native_tools: false,
         }),
         _ => None,
     }
@@ -695,6 +723,11 @@ fn push_model_provider_config(output: &mut String, provider: &ModelProviderConfi
         &format!("model_provider.{}.models", provider.id),
         &join_list(&provider.models),
     );
+    push_line(
+        output,
+        &format!("model_provider.{}.supports_native_tools", provider.id),
+        &provider.supports_native_tools.to_string(),
+    );
 }
 
 fn push_model_provider_overlay(output: &mut String, provider: &ModelProviderConfigOverlay) {
@@ -724,6 +757,13 @@ fn push_model_provider_overlay(output: &mut String, provider: &ModelProviderConf
             output,
             &format!("model_provider.{}.models", provider.id),
             &join_list(value),
+        );
+    }
+    if let Some(value) = provider.supports_native_tools {
+        push_line(
+            output,
+            &format!("model_provider.{}.supports_native_tools", provider.id),
+            &value.to_string(),
         );
     }
 }

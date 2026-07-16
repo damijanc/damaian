@@ -1685,6 +1685,11 @@ button:disabled {
   opacity: 0.82;
 }
 
+.diff-card.rolled_back {
+  border-color: var(--line);
+  opacity: 0.82;
+}
+
 .command-approval {
   display: grid;
   gap: 10px;
@@ -1813,6 +1818,28 @@ button:disabled {
   color: var(--danger);
 }
 
+.diff-card.rolled_back .diff-state {
+  border-color: var(--line);
+  color: var(--muted);
+}
+
+.diff-rollback {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 10px;
+}
+
+.diff-rollback:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
 .diff-view {
   max-height: min(540px, 54vh);
   overflow: auto;
@@ -1857,6 +1884,22 @@ button:disabled {
 .diff-line.context {
   background: #ffffff;
   color: #3f4945;
+}
+
+.diff-hunk + .diff-hunk {
+  border-top: 1px solid var(--line);
+}
+
+.diff-hunk-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.diff-hunk-header input {
+  width: auto;
+  flex: 0 0 auto;
 }
 
 pre {
