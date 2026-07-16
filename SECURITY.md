@@ -31,6 +31,8 @@ Secret scanning redacts detected credentials from indexed context, command outpu
 
 The desktop shell binds to loopback on the fixed app origin `http://127.0.0.1:4765`. Startup refuses to continue if that port is already occupied, and the Tauri capability is scoped to that exact localhost origin.
 
-The desktop API token is embedded in the initial app page load instead of being exposed by an unauthenticated bootstrap endpoint. Local `/api/*` requests require that token.
+The desktop API token is never served over HTTP. It is delivered to the webview through a Tauri IPC command (`damaian_desktop_bootstrap`), which only the app's own webview process can invoke, so no local HTTP request against the shell server can retrieve it. Local `/api/*` requests require that token.
 
 Model provider requests use `curl --config -` so the provider API key is passed through the child process stdin configuration, not as a command-line argument.
+
+Patch rollback snapshots are redacted through the same secret scanner used for diffs and Git output before being written to disk, so pre-edit file content captured for rollback does not retain hardcoded credentials.
