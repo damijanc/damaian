@@ -8,6 +8,11 @@ use std::process::{Command, Stdio};
 pub struct ModelMessage {
     pub role: String,
     pub content: String,
+    /// Set on a `tool` role message to link it back to the assistant's
+    /// tool call, per the OpenAI function-calling contract.
+    pub tool_call_id: Option<String>,
+    /// Set on an `assistant` role message that requested tool calls.
+    pub tool_calls: Vec<ToolCall>,
 }
 
 impl ModelMessage {
@@ -15,6 +20,8 @@ impl ModelMessage {
         Self {
             role: "system".to_string(),
             content: content.into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -22,6 +29,8 @@ impl ModelMessage {
         Self {
             role: "user".to_string(),
             content: content.into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -29,6 +38,32 @@ impl ModelMessage {
         Self {
             role: "assistant".to_string(),
             content: content.into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// An assistant turn that requested one or more native tool calls,
+    /// carried alongside any content the model emitted before/instead of
+    /// the call so both sides of the exchange round-trip back to the
+    /// provider on the next request.
+    pub fn assistant_with_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls,
+        }
+    }
+
+    /// A `tool` role message carrying the result of a specific tool call
+    /// back to the model, keyed by `tool_call_id`.
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".to_string(),
+            content: content.into(),
+            tool_call_id: Some(tool_call_id.into()),
+            tool_calls: Vec::new(),
         }
     }
 }
@@ -475,17 +510,52 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
     }
 }
 
+fn message_json(message: &ModelMessage) -> String {
+    let mut object = format!("{{\"role\":\"{}\"", audit_escape_json(&message.role));
+    if message.tool_calls.is_empty() {
+        object.push_str(&format!(
+            ",\"content\":\"{}\"",
+            audit_escape_json(&message.content)
+        ));
+    } else {
+        if message.content.is_empty() {
+            object.push_str(",\"content\":null");
+        } else {
+            object.push_str(&format!(
+                ",\"content\":\"{}\"",
+                audit_escape_json(&message.content)
+            ));
+        }
+        let tool_calls_json = message
+            .tool_calls
+            .iter()
+            .map(|call| {
+                format!(
+                    "{{\"id\":\"{}\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{}\"}}}}",
+                    audit_escape_json(&call.id),
+                    audit_escape_json(&call.name),
+                    audit_escape_json(&call.arguments_json)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        object.push_str(&format!(",\"tool_calls\":[{tool_calls_json}]"));
+    }
+    if let Some(tool_call_id) = &message.tool_call_id {
+        object.push_str(&format!(
+            ",\"tool_call_id\":\"{}\"",
+            audit_escape_json(tool_call_id)
+        ));
+    }
+    object.push('}');
+    object
+}
+
 pub fn model_request_json(request: &ModelRequest) -> String {
     let messages = request
         .messages
         .iter()
-        .map(|message| {
-            format!(
-                "{{\"role\":\"{}\",\"content\":\"{}\"}}",
-                audit_escape_json(&message.role),
-                audit_escape_json(&message.content)
-            )
-        })
+        .map(message_json)
         .collect::<Vec<_>>()
         .join(",");
     let mut body = format!(

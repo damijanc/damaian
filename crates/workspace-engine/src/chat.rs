@@ -134,190 +134,182 @@ impl ChatOrchestrator {
             16_000,
         );
         let model_prompt = build_model_prompt(prompt, &context.items, &prior_messages, None);
-        let request = ModelRequest {
-            provider: self.config.model_provider.clone(),
-            model: self.config.model_name.clone(),
-            messages: vec![
-                ModelMessage::system(system_prompt()),
-                ModelMessage::user(model_prompt),
-            ],
-            temperature: Some("0".to_string()),
-            reasoning_level: Some(self.config.model_reasoning_level.clone()),
-            stream: true,
-            tools: self
-                .config
-                .supports_native_tools()
-                .then(|| vec![run_command_tool_definition()]),
+        let native_tools = self
+            .config
+            .supports_native_tools()
+            .then(|| vec![run_command_tool_definition()]);
+        let mut messages = vec![
+            ModelMessage::system(system_prompt()),
+            ModelMessage::user(model_prompt),
+        ];
+
+        // Agentic loop: keep offering the model tools across multiple rounds
+        // (rather than a single shot) so it can chain reads like `git log`
+        // followed by `git show <sha>` within one user turn. Bounded so a
+        // provider that never stops requesting commands can't run forever;
+        // the final round always drops `tools`, forcing a plain answer.
+        let mut round: u32 = 0;
+        let (final_run, response, command_proposal) = loop {
+            let force_final = round >= MAX_TOOL_ROUNDS;
+            let tools = if force_final {
+                None
+            } else {
+                native_tools.clone()
+            };
+            let request = ModelRequest {
+                provider: self.config.model_provider.clone(),
+                model: self.config.model_name.clone(),
+                messages: messages.clone(),
+                temperature: Some("0".to_string()),
+                reasoning_level: Some(self.config.model_reasoning_level.clone()),
+                stream: true,
+                tools,
+            };
+
+            self.audit_log.record(
+                "model_request_prepared",
+                &[
+                    ("actor", "system".to_string()),
+                    ("sessionId", session.id.clone()),
+                    ("taskId", task.id.clone()),
+                    ("repositoryId", index.repository_id.clone()),
+                    ("contextFiles", context.files.join(",")),
+                    ("tokenEstimate", context.token_estimate.to_string()),
+                    ("toolRound", round.to_string()),
+                ],
+            )?;
+
+            let model_run = match model_adapter.stream_response(&request, on_token) {
+                Ok(model_run) => model_run,
+                Err(error) => {
+                    let _ = self.session_store.update_task_status(
+                        &task,
+                        TaskStatus::Failed,
+                        Some(&error.to_string()),
+                    );
+                    return Err(error);
+                }
+            };
+            let redacted = self.scanner.redact(&model_run.content).text;
+
+            if force_final {
+                break (model_run, redacted, None);
+            }
+
+            let matched_tool_call: Option<ToolCall> = model_run
+                .tool_calls
+                .iter()
+                .find(|call| command_request_from_tool_call(call).is_some())
+                .cloned();
+            let command_request = matched_tool_call
+                .as_ref()
+                .and_then(|call| command_request_from_tool_call(call))
+                .or_else(|| parse_command_request(&redacted));
+
+            let Some(command_request) = command_request else {
+                break (model_run, redacted, None);
+            };
+
+            let proposal = self.validation_orchestrator.propose_command(
+                repository_root,
+                &command_request.command,
+                &command_request.reason,
+            )?;
+
+            if proposal.requires_approval || proposal.blocked {
+                let response = command_proposal_response(&proposal);
+                let mut proposal_run = model_run;
+                proposal_run.content = response.clone();
+                break (
+                    proposal_run,
+                    response,
+                    Some(agent_command_proposal(&proposal)),
+                );
+            }
+
+            let record = self
+                .validation_orchestrator
+                .run_proposal(&proposal.id, false, "sandbox")?;
+            let command_context = sandbox_command_context(&record.execution);
+
+            // Persist the tool call and its result so later turns in this
+            // session can still see that a command ran (previously this
+            // context was discarded once the turn finished).
+            self.session_store.append_message(
+                &session.id,
+                Some(&task.id),
+                "assistant",
+                &tool_call_summary(&command_request),
+            )?;
+            self.session_store.append_message(
+                &session.id,
+                Some(&task.id),
+                "tool",
+                &command_context,
+            )?;
+
+            if let Some(call) = &matched_tool_call {
+                messages.push(ModelMessage::assistant_with_tool_calls(
+                    redacted.clone(),
+                    vec![call.clone()],
+                ));
+                messages.push(ModelMessage::tool(call.id.clone(), command_context));
+            } else {
+                messages.push(ModelMessage::assistant(redacted.clone()));
+                messages.push(ModelMessage::user(format!(
+                    "Command result:\n{command_context}"
+                )));
+            }
+
+            round += 1;
         };
 
+        self.session_store.append_message(
+            &session.id,
+            Some(&task.id),
+            "assistant",
+            &response,
+        )?;
+        task = self
+            .session_store
+            .update_task_status(&task, TaskStatus::Complete, None)?;
         self.audit_log.record(
-            "model_request_prepared",
+            "model_response_completed",
             &[
-                ("actor", "system".to_string()),
+                ("actor", "model".to_string()),
                 ("sessionId", session.id.clone()),
                 ("taskId", task.id.clone()),
-                ("repositoryId", index.repository_id.clone()),
-                ("contextFiles", context.files.join(",")),
-                ("tokenEstimate", context.token_estimate.to_string()),
+                ("provider", final_run.provider.clone()),
+                ("model", final_run.model.clone()),
+                (
+                    "status",
+                    if command_proposal.is_some() {
+                        "command_approval_required".to_string()
+                    } else if round > 0 {
+                        "complete_with_sandbox_command".to_string()
+                    } else {
+                        "complete".to_string()
+                    },
+                ),
             ],
         )?;
-
-        let run_result = model_adapter.stream_response(&request, on_token);
-        match run_result {
-            Ok(model_run) => {
-                let first_response = self.scanner.redact(&model_run.content).text;
-                let command_request = model_run
-                    .tool_calls
-                    .iter()
-                    .find_map(command_request_from_tool_call)
-                    .or_else(|| parse_command_request(&first_response));
-                if let Some(command_request) = command_request {
-                    let proposal = self.validation_orchestrator.propose_command(
-                        repository_root,
-                        &command_request.command,
-                        &command_request.reason,
-                    )?;
-                    if proposal.requires_approval || proposal.blocked {
-                        let response = command_proposal_response(&proposal);
-                        self.session_store.append_message(
-                            &session.id,
-                            Some(&task.id),
-                            "assistant",
-                            &response,
-                        )?;
-                        task = self.session_store.update_task_status(
-                            &task,
-                            TaskStatus::Complete,
-                            None,
-                        )?;
-                        let mut proposal_run = model_run;
-                        proposal_run.content = response.clone();
-                        self.audit_log.record(
-                            "model_response_completed",
-                            &[
-                                ("actor", "model".to_string()),
-                                ("sessionId", session.id.clone()),
-                                ("taskId", task.id.clone()),
-                                ("provider", proposal_run.provider.clone()),
-                                ("model", proposal_run.model.clone()),
-                                ("status", "command_approval_required".to_string()),
-                            ],
-                        )?;
-                        return Ok(ChatTurnResult {
-                            session,
-                            task,
-                            model_run: proposal_run,
-                            context_files: context.files,
-                            response,
-                            command_proposal: Some(agent_command_proposal(&proposal)),
-                        });
-                    }
-
-                    let record = self.validation_orchestrator.run_proposal(
-                        &proposal.id,
-                        false,
-                        "sandbox",
-                    )?;
-                    let command_context = sandbox_command_context(&record.execution);
-                    let follow_up_prompt = build_model_prompt(
-                        prompt,
-                        &context.items,
-                        &prior_messages,
-                        Some(&command_context),
-                    );
-                    let follow_up_request = ModelRequest {
-                        provider: self.config.model_provider.clone(),
-                        model: self.config.model_name.clone(),
-                        messages: vec![
-                            ModelMessage::system(system_prompt_after_command()),
-                            ModelMessage::user(follow_up_prompt),
-                        ],
-                        temperature: Some("0".to_string()),
-                        reasoning_level: Some(self.config.model_reasoning_level.clone()),
-                        stream: true,
-                        tools: None,
-                    };
-                    let model_run = model_adapter.stream_response(&follow_up_request, on_token)?;
-                    let response = self.scanner.redact(&model_run.content).text;
-                    self.session_store.append_message(
-                        &session.id,
-                        Some(&task.id),
-                        "assistant",
-                        &response,
-                    )?;
-                    task =
-                        self.session_store
-                            .update_task_status(&task, TaskStatus::Complete, None)?;
-                    self.audit_log.record(
-                        "model_response_completed",
-                        &[
-                            ("actor", "model".to_string()),
-                            ("sessionId", session.id.clone()),
-                            ("taskId", task.id.clone()),
-                            ("provider", model_run.provider.clone()),
-                            ("model", model_run.model.clone()),
-                            ("status", "complete_with_sandbox_command".to_string()),
-                        ],
-                    )?;
-                    return Ok(ChatTurnResult {
-                        session,
-                        task,
-                        model_run,
-                        context_files: context.files,
-                        response,
-                        command_proposal: None,
-                    });
-                }
-
-                let response = first_response;
-                self.session_store.append_message(
-                    &session.id,
-                    Some(&task.id),
-                    "assistant",
-                    &response,
-                )?;
-                task = self
-                    .session_store
-                    .update_task_status(&task, TaskStatus::Complete, None)?;
-                self.audit_log.record(
-                    "model_response_completed",
-                    &[
-                        ("actor", "model".to_string()),
-                        ("sessionId", session.id.clone()),
-                        ("taskId", task.id.clone()),
-                        ("provider", model_run.provider.clone()),
-                        ("model", model_run.model.clone()),
-                        ("status", "complete".to_string()),
-                    ],
-                )?;
-                Ok(ChatTurnResult {
-                    session,
-                    task,
-                    model_run,
-                    context_files: context.files,
-                    response,
-                    command_proposal: None,
-                })
-            }
-            Err(error) => {
-                let _ = self.session_store.update_task_status(
-                    &task,
-                    TaskStatus::Failed,
-                    Some(&error.to_string()),
-                );
-                Err(error)
-            }
-        }
+        Ok(ChatTurnResult {
+            session,
+            task,
+            model_run: final_run,
+            context_files: context.files,
+            response,
+            command_proposal,
+        })
     }
 }
 
+/// Upper bound on how many sandboxed commands the model can chain within a
+/// single user turn before it's forced to answer with what it has.
+const MAX_TOOL_ROUNDS: u32 = 6;
+
 fn system_prompt() -> String {
     "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nIf the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd. The app will run sandbox-safe commands automatically. Commands outside the sandbox require user approval."
-        .to_string()
-}
-
-fn system_prompt_after_command() -> String {
-    "You are a local-first coding assistant. A sandboxed command result is included in the prompt. Answer the user's request using that result and the repository context. Do not request another command. Do not expose secrets."
         .to_string()
 }
 
@@ -461,6 +453,13 @@ fn agent_command_proposal(proposal: &CommandProposal) -> AgentCommandProposal {
         requires_approval: proposal.requires_approval,
         blocked: proposal.blocked,
     }
+}
+
+fn tool_call_summary(command_request: &CommandRequest) -> String {
+    format!(
+        "Ran `{}` — {}",
+        command_request.command, command_request.reason
+    )
 }
 
 fn sandbox_command_context(execution: &CommandExecution) -> String {
