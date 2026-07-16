@@ -2326,43 +2326,79 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
   output.className = "command-approval-output";
   output.hidden = true;
 
+  // Approving or rejecting resumes the chat turn that raised this proposal:
+  // the model sees the command's result (or the rejection) and streams back
+  // an actual answer, same as a normal chat reply.
+  async function resolveCommandProposal(approved) {
+    runButton.disabled = true;
+    rejectButton.disabled = true;
+    output.hidden = false;
+    output.textContent = approved ? "Running…" : "Rejecting…";
+
+    const assistantMessage = appendChatMessage("assistant", "");
+    let assistantText = "";
+    let streamError = null;
+    await streamResumeCommandRequest(
+      {
+        repo: proposalRepo,
+        proposal_id: proposal.proposalId,
+        approved: approved ? "true" : "false",
+      },
+      {
+        token(token) {
+          assistantText += token;
+          updateChatMessage(assistantMessage, assistantText);
+          setChatStatus("Streaming", "running");
+        },
+        done(payload) {
+          if (payload.response && payload.response !== assistantText) {
+            assistantText = payload.response;
+            updateChatMessage(assistantMessage, assistantText);
+          }
+          if (payload.commandProposal) {
+            assistantMessage.body.append(
+              createCommandApprovalPreview(payload.commandProposal, proposalRepo),
+            );
+          }
+          if (payload.sessionId) {
+            currentSessionId = payload.sessionId;
+            localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+          }
+          renderContextFiles(payload.contextFiles || []);
+          setChatStatus(payload.incomplete ? "Incomplete" : "Complete", payload.incomplete ? "warn" : "ok");
+        },
+        error(payload) {
+          streamError = new Error(payload.error || "Command resume failed");
+        },
+      },
+    );
+    if (streamError) throw streamError;
+    output.textContent = approved
+      ? "Command approved — see the assistant's answer above."
+      : "Command rejected — see the assistant's answer above.";
+    await loadSessions(currentSessionId, false);
+  }
+
   runButton.addEventListener("click", async () => {
     try {
-      runButton.disabled = true;
-      rejectButton.disabled = true;
-      const result = await api(
-        "/api/run-command",
-        form({ repo: proposalRepo, proposal_id: proposal.proposalId }),
-      );
-      output.hidden = false;
-      output.textContent = [
-        `exit ${result.exitCode}`,
-        result.stdout ? `\nstdout:\n${result.stdout}` : "",
-        result.stderr ? `\nstderr:\n${result.stderr}` : "",
-      ].join("");
-      appendChatMessage("system", `Approved command completed: \`${proposal.command}\``);
+      await resolveCommandProposal(true);
       toast("Command completed");
     } catch (error) {
       runButton.disabled = false;
       rejectButton.disabled = false;
+      output.textContent = error.message;
       toast(error.message);
     }
   });
 
   rejectButton.addEventListener("click", async () => {
     try {
-      runButton.disabled = true;
-      rejectButton.disabled = true;
-      const result = await api(
-        "/api/reject-command",
-        form({ repo: proposalRepo, proposal_id: proposal.proposalId }),
-      );
-      output.hidden = false;
-      output.textContent = `Rejected ${result.proposalId}`;
+      await resolveCommandProposal(false);
       toast("Command rejected");
     } catch (error) {
       runButton.disabled = Boolean(proposal.blocked);
       rejectButton.disabled = false;
+      output.textContent = error.message;
       toast(error.message);
     }
   });
@@ -2418,15 +2454,21 @@ async function loadSession(sessionId) {
 }
 
 async function streamChatRequest(data, handlers) {
-  const response = await fetch(
-    apiUrl("/api/ask-stream"),
-    withApiToken("/api/ask-stream", form(data)),
-  );
+  return streamRequest("/api/ask-stream", "/api/ask", data, handlers);
+}
+
+async function streamResumeCommandRequest(data, handlers) {
+  const fallbackPath = data.approved === "true" ? "/api/run-command" : "/api/reject-command";
+  return streamRequest("/api/resume-command-stream", fallbackPath, data, handlers);
+}
+
+async function streamRequest(streamPath, fallbackPath, data, handlers) {
+  const response = await fetch(apiUrl(streamPath), withApiToken(streamPath, form(data)));
   if (!response.ok) {
     throw new Error(await response.text());
   }
   if (!response.body) {
-    const payload = await api("/api/ask", form(data));
+    const payload = await api(fallbackPath, form(data));
     handlers.done(payload);
     return;
   }

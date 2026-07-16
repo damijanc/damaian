@@ -1,10 +1,11 @@
 use crate::audit::escape_json as audit_escape_json;
 use crate::error::{ClientError, Result};
 use crate::hash::{create_id, now_millis};
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelMessage {
     pub role: String,
     pub content: String,
@@ -82,7 +83,7 @@ pub struct ToolDefinition {
 /// A tool call the model asked to make, extracted from either a
 /// non-streaming response or a streamed one (fragmented `arguments` deltas
 /// are concatenated by tool-call index before being surfaced here).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,

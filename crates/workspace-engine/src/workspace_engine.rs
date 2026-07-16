@@ -84,6 +84,7 @@ impl WorkspaceEngine {
             context_manager.clone(),
             session_store.clone(),
             validation_orchestrator.clone(),
+            command_store.clone(),
         );
         let edit_orchestrator = EditOrchestrator::new(
             config.clone(),
