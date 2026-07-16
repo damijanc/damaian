@@ -926,8 +926,17 @@ fn chat_runs_sandbox_command_requested_by_model() {
         .session_store
         .read_messages(&result.session.id)
         .unwrap();
-    assert_eq!(messages.len(), 2);
-    assert!(messages[1].content.contains("sandbox command completed"));
+    // The tool call and its sandboxed result are now persisted alongside the
+    // user prompt and final answer, so a follow-up turn in this session can
+    // still see that a command ran.
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[1].role, "assistant");
+    assert!(messages[1].content.contains("pwd"));
+    assert_eq!(messages[2].role, "tool");
+    assert!(messages[2].content.contains("Command: pwd"));
+    assert_eq!(messages[3].role, "assistant");
+    assert!(messages[3].content.contains("sandbox command completed"));
 
     fs::remove_dir_all(repo).unwrap();
 }
@@ -976,6 +985,81 @@ fn chat_dispatches_native_tool_call_when_provider_supports_it() {
 
     assert!(result.command_proposal.is_none());
     assert!(result.response.contains("native tool call"));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn chat_chains_multiple_native_tool_calls_within_one_turn() {
+    let repo = temp_dir("chat-multi-tool-call");
+    write_fixture(&repo, "README.md", "# Chat multi tool call test\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(ModelProviderConfig {
+        id: "openai".to_string(),
+        label: "OpenAI".to_string(),
+        base_url: String::new(),
+        api_key_env: String::new(),
+        models: Vec::new(),
+        supports_native_tools: true,
+    });
+    let engine = WorkspaceEngine::new(config);
+    // The model asks to run `pwd`, then—after seeing that result—asks to
+    // run `ls`, before finally answering. This only works if the client
+    // keeps tools available across rounds instead of stopping after one.
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            String::new(),
+            "Both commands ran; the repo root contains a README.".to_string(),
+        ],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "run_command".to_string(),
+                arguments_json:
+                    "{\"command\":\"pwd\",\"reason\":\"Inspect working directory\"}".to_string(),
+            }],
+            vec![ToolCall {
+                id: "call_2".to_string(),
+                name: "run_command".to_string(),
+                arguments_json:
+                    "{\"command\":\"ls\",\"reason\":\"List repository contents\"}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "What does this project contain?",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert!(result.command_proposal.is_none());
+    assert!(result.response.contains("Both commands ran"));
+
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    // user, (assistant summary + tool result) for `pwd`, (assistant summary
+    // + tool result) for `ls`, final assistant answer.
+    assert_eq!(messages.len(), 6);
+    assert_eq!(messages[0].role, "user");
+    assert!(messages[1].content.contains("pwd"));
+    assert_eq!(messages[2].role, "tool");
+    assert!(messages[2].content.contains("Command: pwd"));
+    assert!(messages[3].content.contains("ls"));
+    assert_eq!(messages[4].role, "tool");
+    assert!(messages[4].content.contains("Command: ls"));
+    assert_eq!(messages[5].role, "assistant");
+    assert!(messages[5].content.contains("Both commands ran"));
 
     fs::remove_dir_all(repo).unwrap();
 }
