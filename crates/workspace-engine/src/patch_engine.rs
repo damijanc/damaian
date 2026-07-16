@@ -215,6 +215,10 @@ impl PatchEngine {
 
         for (file, absolute_path, current_content) in prepared {
             let rollback_path = rollback_dir.join(file.path.replace('/', "__"));
+            let rollback_content = self
+                .scanner
+                .redact(current_content.as_deref().unwrap_or_default())
+                .text;
             fs::write(
                 &rollback_path,
                 format!(
@@ -222,9 +226,7 @@ impl PatchEngine {
                     file.path,
                     file.base_hash.clone().unwrap_or_default(),
                     now_millis(),
-                    current_content
-                        .clone()
-                        .unwrap_or_default()
+                    rollback_content
                         .replace('\\', "\\\\")
                         .replace('"', "\\\"")
                         .replace('\n', "\\n")
