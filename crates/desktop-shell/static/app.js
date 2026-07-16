@@ -1,10 +1,7 @@
 const $ = (id) => document.getElementById(id);
 
 let currentSessionId = "";
-const embeddedApiToken = document.body?.dataset.apiToken || "";
-const embeddedDefaultRepo = document.body?.dataset.defaultRepo || "";
-if (document.body) document.body.dataset.apiToken = "";
-let apiToken = embeddedApiToken;
+let apiToken = "";
 let bootstrapPromise = null;
 let bootstrapError = null;
 let chatSubmitting = false;
@@ -204,16 +201,20 @@ async function ensureDesktopApiReady() {
 function startBootstrap() {
   bootstrapError = null;
   return Promise.resolve()
-    .then(() => {
-      if (!embeddedApiToken) throw new Error("Desktop API token missing from initial page");
-      apiToken = embeddedApiToken;
+    .then(async () => {
+      const invoke = tauriInvoke();
+      if (!invoke) throw new Error("Desktop API bootstrap is available in the desktop app");
+      const bootstrap = await invoke("damaian_desktop_bootstrap");
+      const token = bootstrap?.apiToken || "";
+      if (!token) throw new Error("Desktop API token missing from Tauri bootstrap");
+      apiToken = token;
       if (!chatSubmitting) $("ask-btn").disabled = false;
       loadProjectState();
       const lastRepo = localStorage.getItem(lastRepoStorageKey);
       if (lastRepo) {
         setRepository(lastRepo, false);
-      } else if (embeddedDefaultRepo) {
-        setRepository(embeddedDefaultRepo, false);
+      } else if (bootstrap.defaultRepo) {
+        setRepository(bootstrap.defaultRepo, false);
       } else {
         loadPinnedContextFiles("");
         clearSessionList();
@@ -443,6 +444,10 @@ async function switchProject(projectPath, options = {}) {
 
 function tauriDialogOpen() {
   return window.__TAURI__?.dialog?.open;
+}
+
+function tauriInvoke() {
+  return window.__TAURI__?.core?.invoke;
 }
 
 function tauriUpdater() {

@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use workspace_engine::{
     ChatMessage, ChatTurnResult, Config, CurlModelTransport, OpenAICompatibleAdapter,
     ProposedFilePatch, Session, WorkspaceEngine, command_approval_prompt, normalize_model_provider,
@@ -68,7 +68,6 @@ pub struct ShellOptions {
     pub port: u16,
     pub default_repo: Option<String>,
     pub api_token: String,
-    bootstrap_token: Arc<Mutex<Option<String>>>,
 }
 
 impl ShellOptions {
@@ -106,7 +105,6 @@ impl ShellOptions {
         Self {
             port,
             default_repo,
-            bootstrap_token: Arc::new(Mutex::new(Some(api_token.clone()))),
             api_token,
         }
     }
@@ -134,7 +132,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             &request,
             200,
             "text/html; charset=utf-8",
-            &index_html(options)?,
+            &index_html(),
         ),
         ("GET", "/style.css") | ("GET", "/assets/style.css") => {
             write_response(stream, &request, 200, "text/css; charset=utf-8", STYLE_CSS)
@@ -1345,23 +1343,8 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn index_html(options: &ShellOptions) -> Result<String, String> {
-    let api_token = options
-        .bootstrap_token
-        .lock()
-        .map_err(|_| "bootstrap token is unavailable".to_string())?
-        .take()
-        .unwrap_or_default();
-    let default_repo = options.default_repo.clone().unwrap_or_default();
-    Ok(INDEX_HTML.replacen(
-        "<body>",
-        &format!(
-            "<body data-api-token=\"{}\" data-default-repo=\"{}\">",
-            escape_html_attr(&api_token),
-            escape_html_attr(&default_repo)
-        ),
-        1,
-    ))
+fn index_html() -> String {
+    INDEX_HTML.to_string()
 }
 
 fn write_response(
@@ -1624,23 +1607,6 @@ fn escape_json(value: &str) -> String {
     escaped
 }
 
-fn escape_html_attr(value: &str) -> String {
-    let mut escaped = String::new();
-    for character in value.chars() {
-        match character {
-            '&' => escaped.push_str("&amp;"),
-            '"' => escaped.push_str("&quot;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            character if character.is_control() => {
-                escaped.push_str(&format!("&#x{:x};", character as u32));
-            }
-            character => escaped.push(character),
-        }
-    }
-    escaped
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1691,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_api_is_not_a_bare_token_oracle() {
+    fn http_server_never_serves_desktop_api_token() {
         let options = ShellOptions::new(0, Some("/tmp/damaian-repo".to_string()));
         let token = options.api_token.clone();
 
@@ -1699,11 +1665,14 @@ mod tests {
         assert!(api_request_requires_token(&bare_bootstrap_request.path));
         assert!(require_api_token(&bare_bootstrap_request, &token).is_err());
 
-        let first_page = index_html(&options).unwrap();
-        assert!(first_page.contains(&format!("data-api-token=\"{token}\"")));
-        assert!(first_page.contains("data-default-repo=\"/tmp/damaian-repo\""));
+        let first_page = index_html();
+        assert!(!first_page.contains(&token));
+        assert!(!first_page.contains("data-api-token"));
+        assert!(!first_page.contains("data-default-repo"));
+        assert!(!first_page.contains("/tmp/damaian-repo"));
 
-        let second_page = index_html(&options).unwrap();
+        let second_page = index_html();
+        assert_eq!(first_page, second_page);
         assert!(!second_page.contains(&token));
 
         let authenticated_bootstrap_request =
