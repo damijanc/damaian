@@ -314,6 +314,7 @@ fn run() -> workspace_engine::Result<()> {
                 repo,
                 patch_id,
                 approved_paths.as_deref(),
+                None,
                 "local_user",
             )?;
             println!(

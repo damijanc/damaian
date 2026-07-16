@@ -4,10 +4,11 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, ClientError, CommandPolicy, CommandRisk, Config, ConfigOverlay, MockModelAdapter,
-    MockModelTransport, ModelAdapter, ModelMessage, ModelRequest, OpenAICompatibleAdapter,
-    PatchEngine, PatchStore, PathPolicy, ProjectIndexer, ProposedChange, SecretScanner,
-    SessionStore, WorkspaceEngine, extract_model_tokens, model_request_json, parse_generated_edit,
+    AuditLog, ClientError, CommandPolicy, CommandRisk, Config, ConfigOverlay, IndexCache,
+    MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage, ModelProviderConfig,
+    ModelRequest, OpenAICompatibleAdapter, PatchEngine, PatchStore, PathPolicy, ProjectIndexer,
+    ProposedChange, SecretScanner, SessionStore, ToolCall, WorkspaceEngine, extract_model_tokens,
+    model_request_json, parse_generated_edit,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -281,6 +282,46 @@ fn indexes_source_files_while_respecting_gitignore_and_redacting_secrets() {
 }
 
 #[test]
+fn index_cache_picks_up_file_changes_via_watcher_without_full_rescan() {
+    let repo = temp_dir("index-cache-watcher");
+    write_fixture(&repo, "src/app.js", "export const value = \"original\";\n");
+
+    let scanner = SecretScanner::default();
+    let indexer = ProjectIndexer::new(
+        test_config(&repo),
+        scanner.clone(),
+        test_audit(&repo, scanner),
+    );
+
+    let first = IndexCache::get_or_build(&indexer, &repo).unwrap();
+    assert_eq!(first.keyword_search("original", 1).len(), 1);
+
+    // Modify the file on disk after the index was built; the background
+    // watcher (not the 5-minute periodic rescan) is responsible for picking
+    // this up, so poll with a short bounded timeout rather than sleeping for
+    // the rescan interval.
+    fs::write(repo.join("src/app.js"), "export const value = \"updated\";\n").unwrap();
+
+    let mut picked_up = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let refreshed = IndexCache::get_or_build(&indexer, &repo).unwrap();
+        if refreshed.keyword_search("updated", 1).len() == 1
+            && refreshed.keyword_search("original", 1).is_empty()
+        {
+            picked_up = true;
+            break;
+        }
+    }
+    assert!(
+        picked_up,
+        "expected the watcher to reindex the changed file within 5 seconds"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
 fn classifies_command_risk() {
     let policy = CommandPolicy::new(Config {
         data_dir: PathBuf::from("/tmp/damaian-test"),
@@ -340,7 +381,7 @@ fn creates_diff_and_applies_approved_changes_safely() {
     assert!(patch.files[0].diff.contains("+export const value = 2;"));
 
     let result = engine
-        .apply_patch(&repo, &patch, None, "tester", false)
+        .apply_patch(&repo, &patch, None, None, "tester", false)
         .unwrap();
     assert_eq!(result.applied_files, vec!["src/app.js"]);
     assert_eq!(
@@ -377,12 +418,77 @@ fn supports_adding_files_in_new_directories() {
         .unwrap();
 
     let result = engine
-        .apply_patch(&repo, &patch, None, "tester", false)
+        .apply_patch(&repo, &patch, None, None, "tester", false)
         .unwrap();
     assert_eq!(result.applied_files, vec!["src/features/new-file.js"]);
     assert_eq!(
         fs::read_to_string(repo.join("src/features/new-file.js")).unwrap(),
         "export const ready = true;\n"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn applies_only_selected_hunk_and_allows_rollback_afterward() {
+    let repo = temp_dir("patch-partial-hunk");
+    let old_content: String = (1..=30).map(|n| format!("line{n}\n")).collect();
+    write_fixture(&repo, "src/app.js", &old_content);
+    let mut new_lines: Vec<String> = (1..=30).map(|n| format!("line{n}\n")).collect();
+    new_lines[1] = "CHANGED_2\n".to_string();
+    new_lines[27] = "CHANGED_28\n".to_string();
+    let new_content = new_lines.concat();
+
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+    let patch = engine
+        .create_patch(
+            &repo,
+            &[ProposedChange {
+                path: "src/app.js".to_string(),
+                new_content: new_content.clone(),
+                status: None,
+                allow_restricted: false,
+            }],
+            None,
+            "two separate changes",
+        )
+        .unwrap();
+    assert_eq!(patch.files[0].hunks.len(), 2);
+
+    // Accept only the second hunk.
+    let accepted_hunk_id = patch.files[0].hunks[1].id.clone();
+    let mut hunk_selection = std::collections::HashMap::new();
+    hunk_selection.insert("src/app.js".to_string(), vec![accepted_hunk_id]);
+
+    let result = engine
+        .apply_patch(&repo, &patch, None, Some(&hunk_selection), "tester", false)
+        .unwrap();
+    assert_eq!(result.applied_files, vec!["src/app.js"]);
+
+    let mut expected_lines: Vec<String> = (1..=30).map(|n| format!("line{n}\n")).collect();
+    expected_lines[27] = "CHANGED_28\n".to_string();
+    let expected_content = expected_lines.concat();
+    assert_eq!(
+        fs::read_to_string(repo.join("src/app.js")).unwrap(),
+        expected_content
+    );
+    assert_ne!(expected_content, new_content);
+
+    // Rollback should still work: the conflict check must compare against
+    // what was actually written (the partial-accept content), not the
+    // patch's full `new_hash`.
+    let rollback = engine.rollback_patch(&repo, &patch, None, "tester").unwrap();
+    assert_eq!(rollback.restored_files, vec!["src/app.js"]);
+    assert_eq!(
+        fs::read_to_string(repo.join("src/app.js")).unwrap(),
+        old_content
     );
 
     fs::remove_dir_all(repo).unwrap();
@@ -416,7 +522,7 @@ fn blocks_apply_when_target_changes_after_patch_creation() {
     fs::write(repo.join("src/app.js"), "user edit\n").unwrap();
 
     let error = engine
-        .apply_patch(&repo, &patch, None, "tester", false)
+        .apply_patch(&repo, &patch, None, None, "tester", false)
         .expect_err("conflict should block apply");
     assert!(matches!(error, ClientError::PatchConflict(_)));
 
@@ -451,7 +557,7 @@ fn blocks_generated_hardcoded_secrets_by_default() {
         .unwrap();
 
     let error = engine
-        .apply_patch(&repo, &patch, None, "tester", false)
+        .apply_patch(&repo, &patch, None, None, "tester", false)
         .expect_err("secret should block apply");
     assert!(matches!(error, ClientError::PolicyBlocked(_)));
 
@@ -532,7 +638,7 @@ fn redacts_secrets_from_rollback_snapshots() {
         .unwrap();
 
     engine
-        .apply_patch(&repo, &patch, None, "tester", false)
+        .apply_patch(&repo, &patch, None, None, "tester", false)
         .unwrap();
 
     let rollback_path = config
@@ -543,6 +649,137 @@ fn redacts_secrets_from_rollback_snapshots() {
     let rollback_snapshot = fs::read_to_string(rollback_path).unwrap();
     assert!(rollback_snapshot.contains("[REDACTED_AWS_ACCESS_KEY_"));
     assert!(!rollback_snapshot.contains(AWS_ACCESS_KEY));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn rollback_restores_modified_file_and_warns_about_lost_secret() {
+    let repo = temp_dir("rollback-restore-modified");
+    write_fixture(
+        &repo,
+        "src/config.js",
+        &format!("export const awsKey = \"{AWS_ACCESS_KEY}\";\n"),
+    );
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+    let patch = engine
+        .create_patch(
+            &repo,
+            &[ProposedChange {
+                path: "src/config.js".to_string(),
+                new_content: "export const awsKey = \"\";\n".to_string(),
+                status: None,
+                allow_restricted: false,
+            }],
+            None,
+            "remove secret",
+        )
+        .unwrap();
+    engine
+        .apply_patch(&repo, &patch, None, None, "tester", false)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(repo.join("src/config.js")).unwrap(),
+        "export const awsKey = \"\";\n"
+    );
+
+    let result = engine.rollback_patch(&repo, &patch, None, "tester").unwrap();
+
+    assert_eq!(result.restored_files, vec!["src/config.js"]);
+    assert!(result.deleted_files.is_empty());
+    assert_eq!(result.warnings.len(), 1);
+    assert!(result.warnings[0].contains("src/config.js"));
+    let restored = fs::read_to_string(repo.join("src/config.js")).unwrap();
+    assert!(restored.contains("[REDACTED_AWS_ACCESS_KEY_"));
+    assert!(!restored.contains(AWS_ACCESS_KEY));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn rollback_deletes_file_that_patch_added() {
+    let repo = temp_dir("rollback-delete-added");
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+    let patch = engine
+        .create_patch(
+            &repo,
+            &[ProposedChange {
+                path: "src/new-file.js".to_string(),
+                new_content: "export const ready = true;\n".to_string(),
+                status: None,
+                allow_restricted: false,
+            }],
+            None,
+            "add file",
+        )
+        .unwrap();
+    engine
+        .apply_patch(&repo, &patch, None, None, "tester", false)
+        .unwrap();
+    assert!(repo.join("src/new-file.js").exists());
+
+    let result = engine.rollback_patch(&repo, &patch, None, "tester").unwrap();
+
+    assert_eq!(result.deleted_files, vec!["src/new-file.js"]);
+    assert!(result.restored_files.is_empty());
+    assert!(result.warnings.is_empty());
+    assert!(!repo.join("src/new-file.js").exists());
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn rollback_refuses_when_file_changed_after_apply() {
+    let repo = temp_dir("rollback-conflict");
+    write_fixture(&repo, "src/app.js", "one\n");
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+    let patch = engine
+        .create_patch(
+            &repo,
+            &[ProposedChange {
+                path: "src/app.js".to_string(),
+                new_content: "two\n".to_string(),
+                status: None,
+                allow_restricted: false,
+            }],
+            None,
+            "change",
+        )
+        .unwrap();
+    engine
+        .apply_patch(&repo, &patch, None, None, "tester", false)
+        .unwrap();
+    fs::write(repo.join("src/app.js"), "independent edit\n").unwrap();
+
+    let error = engine
+        .rollback_patch(&repo, &patch, None, "tester")
+        .expect_err("conflict should block rollback");
+    assert!(matches!(error, ClientError::PatchConflict(_)));
+    assert_eq!(
+        fs::read_to_string(repo.join("src/app.js")).unwrap(),
+        "independent edit\n"
+    );
 
     fs::remove_dir_all(repo).unwrap();
 }
@@ -696,6 +933,54 @@ fn chat_runs_sandbox_command_requested_by_model() {
 }
 
 #[test]
+fn chat_dispatches_native_tool_call_when_provider_supports_it() {
+    let repo = temp_dir("chat-native-tool-call");
+    write_fixture(&repo, "README.md", "# Chat native tool call test\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(ModelProviderConfig {
+        id: "openai".to_string(),
+        label: "OpenAI".to_string(),
+        base_url: String::new(),
+        api_key_env: String::new(),
+        models: Vec::new(),
+        supports_native_tools: true,
+    });
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            "The sandbox command completed via a native tool call.".to_string(),
+        ],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "run_command".to_string(),
+                arguments_json:
+                    "{\"command\":\"pwd\",\"reason\":\"Inspect working directory\"}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "What directory is this project using?",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert!(result.command_proposal.is_none());
+    assert!(result.response.contains("native tool call"));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
 fn chat_returns_command_approval_when_command_exits_sandbox() {
     let repo = temp_dir("chat-command-approval");
     write_fixture(&repo, "README.md", "# Chat command approval\n");
@@ -763,6 +1048,7 @@ fn builds_openai_request_json_and_extracts_stream_tokens() {
         temperature: Some("0".to_string()),
         reasoning_level: Some("high".to_string()),
         stream: true,
+        tools: None,
     };
     let body = model_request_json(&request);
     assert!(body.contains("\"model\":\"test-model\""));
@@ -782,6 +1068,7 @@ fn reports_openai_compatible_error_payloads() {
         temperature: Some("0".to_string()),
         reasoning_level: Some("high".to_string()),
         stream: true,
+        tools: None,
     };
     let body = model_request_json(&request);
     assert!(!body.contains("reasoning_effort"));
@@ -837,7 +1124,7 @@ fn proposes_edit_stores_patch_and_applies_selected_files() {
     let approved = vec!["src/a.js".to_string()];
     let result = engine
         .edit_orchestrator
-        .apply_stored_patch(&repo, &proposal.patch.id, Some(&approved), "tester")
+        .apply_stored_patch(&repo, &proposal.patch.id, Some(&approved), None, "tester")
         .unwrap();
 
     assert_eq!(result.applied_files, vec!["src/a.js"]);
@@ -887,7 +1174,7 @@ fn rejects_selected_patch_files_without_modifying_workspace() {
     let approved = vec!["src/a.js".to_string()];
     let result = engine
         .edit_orchestrator
-        .apply_stored_patch(&repo, &proposal.patch.id, Some(&approved), "tester")
+        .apply_stored_patch(&repo, &proposal.patch.id, Some(&approved), None, "tester")
         .unwrap();
     assert_eq!(result.applied_files, vec!["src/a.js"]);
     assert_eq!(
@@ -918,7 +1205,7 @@ fn rejects_unknown_selected_patch_file() {
 
     let error = engine
         .edit_orchestrator
-        .apply_stored_patch(&repo, &proposal.patch.id, Some(&approved), "tester")
+        .apply_stored_patch(&repo, &proposal.patch.id, Some(&approved), None, "tester")
         .unwrap_err();
     assert!(matches!(error, ClientError::InvalidInput(_)));
 

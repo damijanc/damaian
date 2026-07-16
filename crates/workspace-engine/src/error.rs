@@ -25,6 +25,29 @@ impl ClientError {
             Self::InvalidInput(_) => "invalid_input",
         }
     }
+
+    /// True for transient failures worth retrying: provider rate limits, timeouts,
+    /// and network/DNS-level connection failures. False for anything else (auth,
+    /// malformed requests, policy decisions), where retrying can't help.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Io(message) => is_retryable_message(message),
+            _ => false,
+        }
+    }
+}
+
+/// Shared classifier for transient-vs-permanent error messages, used both by
+/// `ClientError::is_retryable` and by user-facing message mapping so retry
+/// decisions and displayed messages never drift out of sync.
+pub fn is_retryable_message(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("rate limit")
+        || lower.contains("429")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("connection")
+        || lower.contains("could not resolve")
 }
 
 impl Display for ClientError {

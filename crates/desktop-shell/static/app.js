@@ -2024,6 +2024,52 @@ function renderColoredDiff(diff) {
   return view;
 }
 
+function hunkLineClass(tag) {
+  if (tag === "insert") return "addition";
+  if (tag === "delete") return "deletion";
+  return "context";
+}
+
+function renderHunks(file, onToggle) {
+  const view = document.createElement("div");
+  view.className = "diff-view";
+  if (!file.hunks.length) {
+    return renderColoredDiff(file.diff);
+  }
+
+  file.hunks.forEach((hunk) => {
+    const group = document.createElement("div");
+    group.className = "diff-hunk";
+
+    const hunkHeader = document.createElement("label");
+    hunkHeader.className = "diff-hunk-header diff-line hunk";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = hunk.selected;
+    checkbox.disabled = file.state !== "pending";
+    checkbox.addEventListener("change", () => {
+      hunk.selected = checkbox.checked;
+      onToggle?.();
+    });
+    const label = document.createElement("span");
+    label.textContent = `@@ -${hunk.oldStart + 1},${hunk.oldLines} +${hunk.newStart + 1},${hunk.newLines} @@`;
+    hunkHeader.append(checkbox, label);
+    group.append(hunkHeader);
+
+    hunk.lines.forEach((line) => {
+      const row = document.createElement("div");
+      row.className = `diff-line ${hunkLineClass(line.tag)}`;
+      const prefix = line.tag === "insert" ? "+" : line.tag === "delete" ? "-" : " ";
+      row.textContent = `${prefix}${line.text}` || " ";
+      group.append(row);
+    });
+
+    view.append(group);
+  });
+
+  return view;
+}
+
 function renderGitStatusText(payload) {
   if (payload.clean) {
     return "Git status: clean workspace.";
@@ -2053,6 +2099,7 @@ function createPatchPreview(payload, patchRepo) {
         path: file.path,
         status: file.status,
         diff: file.diff,
+        hunks: (file.hunks || []).map((hunk) => ({ ...hunk, selected: true })),
         additions: stats.additions,
         deletions: stats.deletions,
         selected: true,
@@ -2143,8 +2190,42 @@ function createPatchPreview(payload, patchRepo) {
       meta.className = "diff-meta";
       meta.append(stats, fileState);
 
+      if (file.state === "applied") {
+        const rollbackButton = document.createElement("button");
+        rollbackButton.type = "button";
+        rollbackButton.className = "diff-rollback";
+        rollbackButton.textContent = "Rollback";
+        rollbackButton.addEventListener("click", async () => {
+          try {
+            rollbackButton.disabled = true;
+            const result = await api(
+              "/api/rollback-patch",
+              form({ repo: patchRepo, patch_id: state.patchId, paths: file.path }),
+            );
+            (result.warnings || []).forEach((warning) => toast(warning));
+            if (result.restoredFiles?.includes(file.path)) {
+              file.state = "rolled_back";
+              toast(`Restored ${file.path}`);
+            } else if (result.deletedFiles?.includes(file.path)) {
+              file.state = "rolled_back";
+              toast(`Deleted ${file.path}`);
+            } else {
+              toast(`Nothing to roll back for ${file.path}`);
+            }
+            render();
+            await appendGitStatusAfterChange(patchRepo).catch((error) => {
+              toast(`Status unavailable: ${error.message}`);
+            });
+          } catch (error) {
+            rollbackButton.disabled = false;
+            toast(error.message);
+          }
+        });
+        meta.append(rollbackButton);
+      }
+
       cardHeader.append(label, meta);
-      card.append(cardHeader, renderColoredDiff(file.diff));
+      card.append(cardHeader, renderHunks(file));
       list.append(card);
     });
 
@@ -2159,9 +2240,20 @@ function createPatchPreview(payload, patchRepo) {
       const paths = selectedPendingPaths();
       if (!paths.length) throw new Error("No pending patch files selected");
       applyButton.disabled = true;
+      const hunkSelection = {};
+      state.files.forEach((file) => {
+        if (paths.includes(file.path) && file.hunks.length) {
+          hunkSelection[file.path] = file.hunks.filter((hunk) => hunk.selected).map((hunk) => hunk.id);
+        }
+      });
       const result = await api(
         "/api/apply-patch",
-        form({ repo: patchRepo, patch_id: state.patchId, paths: paths.join("\n") }),
+        form({
+          repo: patchRepo,
+          patch_id: state.patchId,
+          paths: paths.join("\n"),
+          hunk_selection: JSON.stringify(hunkSelection),
+        }),
       );
       const applied = result.appliedFiles || [];
       markFiles(applied, "applied");
