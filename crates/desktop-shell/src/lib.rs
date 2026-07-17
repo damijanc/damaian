@@ -1685,7 +1685,7 @@ fn write_sse_event(stream: &mut TcpStream, event: &str, data: &str) -> Result<()
 
 fn chat_result_json(result: &ChatTurnResult) -> String {
     format!(
-        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"commandProposal\":{}}}",
+        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"commandProposal\":{},\"patchProposal\":{}}}",
         escape_json(&result.response),
         json_string_array(&result.context_files),
         escape_json(&result.session.id),
@@ -1693,7 +1693,8 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         result.task.status.as_str(),
         escape_json(&result.model_run.run_id),
         result.model_run.incomplete,
-        command_proposal_json(result)
+        command_proposal_json(result),
+        patch_proposal_json(result)
     )
 }
 
@@ -1709,6 +1710,22 @@ fn command_proposal_json(result: &ChatTurnResult) -> String {
         escape_json(&proposal.risk),
         proposal.requires_approval,
         proposal.blocked
+    )
+}
+
+/// Shaped identically to `/api/propose-edit`'s response (`patchId` +
+/// `summary` + `files`) so the frontend can render both with the exact same
+/// `createPatchPreview` component regardless of whether the patch came from
+/// a `propose_patch` tool call mid-chat or the dedicated one-shot edit flow.
+fn patch_proposal_json(result: &ChatTurnResult) -> String {
+    let Some(proposal) = &result.patch_proposal else {
+        return "null".to_string();
+    };
+    format!(
+        "{{\"patchId\":\"{}\",\"summary\":\"{}\",\"files\":[{}]}}",
+        escape_json(&proposal.patch_id),
+        escape_json(&proposal.summary),
+        patch_files_json(&proposal.files)
     )
 }
 

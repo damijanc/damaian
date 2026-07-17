@@ -26,7 +26,7 @@ pub mod vector_index;
 pub mod workspace_engine;
 
 pub use audit::AuditLog;
-pub use chat::{AgentCommandProposal, ChatOrchestrator, ChatTurnResult};
+pub use chat::{AgentCommandProposal, AgentPatchProposal, ChatOrchestrator, ChatTurnResult};
 pub use command_policy::{CommandClassification, CommandPolicy, CommandRisk};
 pub use command_runner::{CommandExecution, CommandRunner};
 pub use config::{

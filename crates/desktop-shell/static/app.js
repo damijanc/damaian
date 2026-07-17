@@ -3106,6 +3106,9 @@ async function sendChatPrompt() {
           if (payload.commandProposal) {
             assistantMessage.body.append(createCommandApprovalPreview(payload.commandProposal, chatRepo));
           }
+          if (payload.patchProposal) {
+            assistantMessage.body.append(createPatchPreview(payload.patchProposal, chatRepo));
+          }
           renderContextFiles(payload.contextFiles || []);
           setChatStatus(payload.incomplete ? "Incomplete" : "Complete", payload.incomplete ? "warn" : "ok");
         },

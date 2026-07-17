@@ -1129,6 +1129,333 @@ fn chat_chains_multiple_native_tool_calls_within_one_turn() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+fn native_tool_provider() -> ModelProviderConfig {
+    ModelProviderConfig {
+        id: "openai".to_string(),
+        label: "OpenAI".to_string(),
+        base_url: String::new(),
+        api_key_env: String::new(),
+        models: Vec::new(),
+        supports_native_tools: true,
+    }
+}
+
+#[test]
+fn chat_dispatches_propose_patch_tool_call_and_returns_reviewable_patch() {
+    let repo = temp_dir("chat-propose-patch");
+    write_fixture(&repo, "README.md", "# Chat propose patch test\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "I've prepared the patch for review.".to_string()],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "propose_patch".to_string(),
+                arguments_json: "{\"summary\":\"Add greeting helper\",\"files\":[{\"path\":\"src/greeting.rs\",\"content\":\"pub fn greet() -> &'static str { \\\"hi\\\" }\\n\"}]}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Add a greeting helper function",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    let proposal = result.patch_proposal.expect("expected a patch proposal");
+    assert_eq!(proposal.summary, "Add greeting helper");
+    assert_eq!(proposal.files.len(), 1);
+    assert_eq!(proposal.files[0].path, "src/greeting.rs");
+    assert_eq!(result.task.status.as_str(), "waiting_for_approval");
+    assert!(result.command_proposal.is_none());
+
+    // The tool-call path must produce a patch that applies exactly like one
+    // from the text-envelope `propose_edit` flow.
+    let apply_result = engine
+        .edit_orchestrator
+        .apply_stored_patch(&repo, &proposal.patch_id, None, None, "test_user")
+        .unwrap();
+    assert_eq!(
+        apply_result.applied_files,
+        vec!["src/greeting.rs".to_string()]
+    );
+    let written = fs::read_to_string(repo.join("src/greeting.rs")).unwrap();
+    assert!(written.contains("pub fn greet"));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn chat_propose_patch_tool_call_with_restricted_path_feeds_error_back_for_retry() {
+    let repo = temp_dir("chat-propose-patch-restricted");
+    write_fixture(&repo, "README.md", "# Chat propose patch restricted test\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            String::new(),
+            "Wrote the change to an allowed file instead.".to_string(),
+        ],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "propose_patch".to_string(),
+                arguments_json: "{\"summary\":\"Store a secret\",\"files\":[{\"path\":\".env\",\"content\":\"SECRET=1\\n\"}]}".to_string(),
+            }],
+            vec![ToolCall {
+                id: "call_2".to_string(),
+                name: "propose_patch".to_string(),
+                arguments_json: "{\"summary\":\"Add config helper\",\"files\":[{\"path\":\"src/config.rs\",\"content\":\"pub const NAME: &str = \\\"demo\\\";\\n\"}]}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Add a config helper",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    let proposal = result
+        .patch_proposal
+        .expect("expected a patch proposal from the corrected retry");
+    assert_eq!(proposal.files[0].path, "src/config.rs");
+
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    assert!(messages.iter().any(|message| {
+        message.role == "tool" && message.content.contains("Cannot propose that patch")
+    }));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn chat_dispatches_read_file_tool_call_and_feeds_content_back() {
+    let repo = temp_dir("chat-read-file");
+    write_fixture(&repo, "docs/notes.md", "The answer is 42.\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "The notes say the answer is 42.".to_string()],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments_json: "{\"path\":\"docs/notes.md\"}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "What do the notes say?",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert!(result.response.contains("42"));
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    assert!(messages.iter().any(|message| {
+        message.role == "tool" && message.content.contains("The answer is 42")
+    }));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn chat_read_file_tool_call_on_restricted_path_feeds_error_back() {
+    let repo = temp_dir("chat-read-file-restricted");
+    write_fixture(&repo, ".env", "SECRET=1\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "I can't access that file.".to_string()],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments_json: "{\"path\":\".env\"}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "What's in the .env file?",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.role == "tool" && message.content.contains("Cannot read"))
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn chat_dispatches_search_codebase_tool_call() {
+    let repo = temp_dir("chat-search-codebase");
+    write_fixture(&repo, "src/auth.rs", "fn login() {}\n");
+    write_fixture(&repo, "src/other.rs", "fn unrelated() {}\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Login logic is in src/auth.rs.".to_string()],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "search_codebase".to_string(),
+                arguments_json: "{\"query\":\"login\"}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Where is login handled?",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert!(result.response.contains("src/auth.rs"));
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.role == "tool" && message.content.contains("auth.rs"))
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn chat_dispatches_git_status_and_git_diff_tool_calls() {
+    let repo = temp_dir("chat-git-tools");
+    write_fixture(&repo, "README.md", "hello\n");
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["add", "README.md"]);
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Damaian Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "baseline",
+        ],
+    );
+    fs::write(repo.join("README.md"), "hello world\n").unwrap();
+
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            String::new(),
+            "README.md has uncommitted changes.".to_string(),
+        ],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_git_status".to_string(),
+                arguments_json: "{}".to_string(),
+            }],
+            vec![ToolCall {
+                id: "call_2".to_string(),
+                name: "read_git_diff".to_string(),
+                arguments_json: "{\"staged\":false}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "What changed in the working tree?",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert!(result.response.contains("README.md"));
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.role == "tool" && message.content.contains("README.md"))
+    );
+    assert!(messages.iter().any(|message| {
+        message.role == "tool" && message.content.contains("+hello world")
+    }));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 #[test]
 fn chat_returns_command_approval_when_command_exits_sandbox() {
     let repo = temp_dir("chat-command-approval");
