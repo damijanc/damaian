@@ -426,11 +426,37 @@ button:disabled {
 }
 
 .conversation {
+  position: relative;
   min-width: 0;
   min-height: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto auto auto;
   background: var(--surface);
+}
+
+.chat-drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  border: 2px dashed var(--ok);
+  background: rgba(31, 36, 40, 0.06);
+  pointer-events: none;
+}
+
+.chat-drop-overlay[hidden] {
+  display: none;
+}
+
+.chat-drop-overlay-inner {
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.95);
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 700;
+  padding: 10px 18px;
+  box-shadow: 0 18px 40px rgba(31, 36, 40, 0.14), 0 2px 7px rgba(31, 36, 40, 0.08);
 }
 
 .thread-header {
