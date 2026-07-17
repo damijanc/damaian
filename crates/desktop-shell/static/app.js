@@ -11,6 +11,7 @@ let terminalCwd = "";
 let terminalOpen = false;
 let terminalBusy = false;
 let projectPaths = [];
+let projectDisplayNames = new Map();
 let expandedProjectPaths = new Set();
 let projectSessionsByPath = new Map();
 let projectSessionsLoading = new Set();
@@ -25,6 +26,7 @@ const localApiHostnames = new Set(["127.0.0.1", "localhost"]);
 const apiTokenHeader = "x-damaian-api-token";
 const lastRepoStorageKey = "damaian:lastRepository";
 const projectsStorageKey = "damaian:projects";
+const projectDisplayNamesStorageKey = "damaian:projectDisplayNames";
 const expandedProjectsStorageKey = "damaian:expandedProjects";
 const projectsCollapsedStorageKey = "damaian:projectsCollapsed";
 const pinnedContextStoragePrefix = "damaian:pinnedContextFiles";
@@ -262,6 +264,8 @@ function normalizeProjectPath(value) {
 function projectName(projectPath) {
   const normalized = normalizeProjectPath(projectPath);
   if (!normalized) return "Untitled";
+  const customName = projectDisplayNames.get(normalized);
+  if (customName) return customName;
   const parts = normalized.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] || normalized;
 }
@@ -291,6 +295,16 @@ function loadProjectState() {
   } catch {
     expandedProjectPaths = new Set();
   }
+  try {
+    const storedNames = JSON.parse(localStorage.getItem(projectDisplayNamesStorageKey) || "{}");
+    projectDisplayNames = new Map(
+      Object.entries(storedNames || {})
+        .map(([path, name]) => [normalizeProjectPath(path), String(name || "").trim()])
+        .filter(([path, name]) => path && name && projectPaths.includes(path)),
+    );
+  } catch {
+    projectDisplayNames = new Map();
+  }
   projectsCollapsed = localStorage.getItem(projectsCollapsedStorageKey) === "true";
   setProjectsCollapsed(projectsCollapsed, false);
 }
@@ -298,6 +312,10 @@ function loadProjectState() {
 function saveProjectState() {
   localStorage.setItem(projectsStorageKey, JSON.stringify(projectPaths));
   localStorage.setItem(expandedProjectsStorageKey, JSON.stringify([...expandedProjectPaths]));
+  localStorage.setItem(
+    projectDisplayNamesStorageKey,
+    JSON.stringify(Object.fromEntries(projectDisplayNames)),
+  );
 }
 
 function rememberProject(projectPath) {
@@ -310,6 +328,182 @@ function rememberProject(projectPath) {
   saveProjectState();
   return normalized;
 }
+
+// Renames a project within damaian only: it changes `projectName()`'s
+// display label via `projectDisplayNames`, never the folder on disk.
+function renameProject(projectPath) {
+  const normalized = normalizeProjectPath(projectPath);
+  if (!normalized) return;
+  const current = projectName(normalized);
+  const nextName = window.prompt("Rename project", current);
+  if (nextName === null) return;
+  const trimmed = nextName.trim();
+  if (!trimmed) {
+    projectDisplayNames.delete(normalized);
+  } else {
+    projectDisplayNames.set(normalized, trimmed);
+  }
+  saveProjectState();
+  renderProjectList();
+}
+
+// Removes a project from damaian's sidebar only: it never touches the
+// folder or any files on disk, and the folder can always be re-added later
+// by picking it again.
+function forgetProject(projectPath) {
+  const normalized = normalizeProjectPath(projectPath);
+  if (!normalized) return;
+  const label = projectName(normalized);
+  const confirmed = window.confirm(
+    `Remove "${label}" from damaian? This only removes it from the project list — nothing is deleted on disk.`,
+  );
+  if (!confirmed) return;
+
+  projectPaths = projectPaths.filter((path) => path !== normalized);
+  expandedProjectPaths.delete(normalized);
+  projectDisplayNames.delete(normalized);
+  projectSessionsByPath.delete(normalized);
+  saveProjectState();
+
+  if (normalizeProjectPath(repo()) === normalized) {
+    currentSessionId = "";
+    localStorage.removeItem(lastSessionStorageKey());
+    localStorage.removeItem(lastRepoStorageKey);
+    $("repo").value = "";
+    loadPinnedContextFiles("");
+    clearChat();
+    renderContextFiles();
+  }
+  renderProjectList();
+}
+
+// A single reusable popover shared by every project row (rows are fully
+// re-rendered on every `renderProjectList()` call, so per-row popovers
+// would never keep stable open/closed state). Anchored via `position:
+// fixed` against the trigger button's own rect rather than a CSS-relative
+// ancestor, since rows live inside a scrollable list.
+let projectMenuEl = null;
+let projectMenuTargetPath = null;
+
+function ensureProjectMenu() {
+  if (projectMenuEl) return projectMenuEl;
+  const el = document.createElement("div");
+  el.className = "context-menu-popover";
+  el.setAttribute("role", "menu");
+  el.hidden = true;
+  el.innerHTML = `
+    <div class="context-menu-panel" data-panel="root">
+      <button type="button" class="context-menu-row" data-action="open-in">
+        <span>Open in</span>
+        <span class="context-menu-caret" aria-hidden="true"></span>
+      </button>
+      <button type="button" class="context-menu-row" data-action="rename">Rename</button>
+      <button type="button" class="context-menu-row context-menu-row-danger" data-action="delete">Delete</button>
+    </div>
+    <div class="context-menu-panel" data-panel="open-in" hidden>
+      <button type="button" class="context-menu-back" data-action="back">Open in</button>
+      <button type="button" class="context-menu-row" data-action="open-vscode">VS Code</button>
+      <button type="button" class="context-menu-row" data-action="open-finder">Finder</button>
+    </div>
+  `;
+  el.addEventListener("click", (event) => {
+    event.stopPropagation();
+    handleProjectMenuAction(event);
+  });
+  document.body.append(el);
+  projectMenuEl = el;
+  return el;
+}
+
+function showProjectMenuPanel(panel) {
+  const el = ensureProjectMenu();
+  el.querySelectorAll(".context-menu-panel").forEach((panelEl) => {
+    panelEl.hidden = panelEl.dataset.panel !== panel;
+  });
+}
+
+function toggleProjectMenu(projectPath, anchorEl) {
+  const el = ensureProjectMenu();
+  const alreadyOpenForThisRow = !el.hidden && projectMenuTargetPath === projectPath;
+  if (alreadyOpenForThisRow) {
+    closeProjectMenu();
+    return;
+  }
+  projectMenuTargetPath = projectPath;
+  showProjectMenuPanel("root");
+  el.hidden = false;
+  positionProjectMenu(anchorEl);
+}
+
+function positionProjectMenu(anchorEl) {
+  const el = ensureProjectMenu();
+  const rect = anchorEl.getBoundingClientRect();
+  const width = el.offsetWidth || 200;
+  const left = Math.min(
+    Math.max(8, rect.right - width),
+    window.innerWidth - width - 8,
+  );
+  const top = Math.min(rect.bottom + 4, window.innerHeight - el.offsetHeight - 8);
+  el.style.left = `${left}px`;
+  el.style.top = `${top}px`;
+}
+
+function closeProjectMenu() {
+  if (!projectMenuEl) return;
+  projectMenuEl.hidden = true;
+  projectMenuTargetPath = null;
+}
+
+async function handleProjectMenuAction(event) {
+  const button = event.target.closest("button[data-action]");
+  if (!button) return;
+  const action = button.dataset.action;
+  const projectPath = projectMenuTargetPath;
+
+  if (action === "open-in") {
+    showProjectMenuPanel("open-in");
+    return;
+  }
+  if (action === "back") {
+    showProjectMenuPanel("root");
+    return;
+  }
+  if (!projectPath) return;
+  if (action === "rename") {
+    closeProjectMenu();
+    renameProject(projectPath);
+    return;
+  }
+  if (action === "delete") {
+    closeProjectMenu();
+    forgetProject(projectPath);
+    return;
+  }
+  if (action === "open-vscode") {
+    closeProjectMenu();
+    try {
+      const payload = await api("/api/open-vscode", form({ repo: projectPath }));
+      toast(`Opened ${payload.path}`);
+    } catch (error) {
+      toast(error.message);
+    }
+    return;
+  }
+  if (action === "open-finder") {
+    closeProjectMenu();
+    try {
+      const payload = await api("/api/reveal-in-finder", form({ repo: projectPath }));
+      toast(`Revealed ${payload.path}`);
+    } catch (error) {
+      toast(error.message);
+    }
+  }
+}
+
+document.addEventListener("click", () => closeProjectMenu());
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeProjectMenu();
+});
 
 function setProjectsCollapsed(collapsed, persist = true) {
   projectsCollapsed = collapsed;
@@ -1893,6 +2087,18 @@ function renderProjectList() {
         toast(error.message);
       }
     });
+    const menuButton = document.createElement("button");
+    menuButton.type = "button";
+    menuButton.className = "project-menu-btn";
+    menuButton.title = "More options";
+    menuButton.setAttribute("aria-label", `More options for ${projectName(projectPath)}`);
+    menuButton.setAttribute("aria-haspopup", "menu");
+    menuButton.innerHTML = '<span class="dots-icon" aria-hidden="true"></span>';
+    menuButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleProjectMenu(projectPath, menuButton);
+    });
+
     const addSessionButton = document.createElement("button");
     addSessionButton.type = "button";
     addSessionButton.className = "project-session-add-btn";
@@ -1906,7 +2112,7 @@ function renderProjectList() {
         toast(error.message);
       }
     });
-    row.append(projectButton, addSessionButton);
+    row.append(projectButton, menuButton, addSessionButton);
     group.append(row);
 
     if (expanded) {
