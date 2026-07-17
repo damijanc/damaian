@@ -140,7 +140,9 @@ impl ValidationOrchestrator {
         command: &str,
         reason: &str,
     ) -> Result<CommandProposal> {
-        let classification = self.command_policy.classify(command);
+        let classification = self
+            .command_policy
+            .classify(command, working_directory.as_ref());
         let proposal =
             proposal_from_classification(working_directory.as_ref(), reason, classification);
         self.command_store.save_proposal(&proposal)?;

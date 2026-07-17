@@ -59,6 +59,7 @@ impl PathPolicy {
         &self,
         root_path: impl AsRef<Path>,
         requested_path: impl AsRef<Path>,
+        allow_outside_root: bool,
     ) -> Result<ResolvedPath> {
         let root = self.canonical_root(root_path)?;
         let candidate = if requested_path.as_ref().is_absolute() {
@@ -68,9 +69,16 @@ impl PathPolicy {
         };
         let absolute_path = fs::canonicalize(candidate)?;
         if !is_inside(&root, &absolute_path) {
-            return Err(ClientError::AccessDenied(
-                "Path resolves outside the selected repository".to_string(),
-            ));
+            if !allow_outside_root {
+                return Err(ClientError::AccessDenied(
+                    "Path resolves outside the selected repository".to_string(),
+                ));
+            }
+            return Ok(ResolvedPath {
+                relative_path: absolute_path.to_string_lossy().replace('\\', "/"),
+                root,
+                absolute_path,
+            });
         }
         Ok(ResolvedPath {
             relative_path: relative_path(&root, &absolute_path)?,

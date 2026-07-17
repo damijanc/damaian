@@ -47,10 +47,11 @@ impl FileAccessController {
         task_id: Option<&str>,
         repository_id: Option<&str>,
         allow_restricted: bool,
+        allow_outside_root: bool,
     ) -> Result<FileRead> {
-        let target = self
-            .path_policy
-            .resolve_existing(root_path, requested_path)?;
+        let target =
+            self.path_policy
+                .resolve_existing(root_path, requested_path, allow_outside_root)?;
         self.path_policy
             .assert_not_restricted(&target.relative_path, allow_restricted)?;
         let metadata = fs::metadata(&target.absolute_path)?;

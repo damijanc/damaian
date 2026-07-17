@@ -167,9 +167,37 @@ fn denies_symlink_traversal_outside_selected_repository() {
     };
     let policy = PathPolicy::new(&config);
     let error = policy
-        .resolve_existing(&repo, "linked-secret.txt")
+        .resolve_existing(&repo, "linked-secret.txt", false)
         .expect_err("symlink should be denied");
     assert!(matches!(error, ClientError::AccessDenied(_)));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn allows_path_outside_repository_when_explicitly_permitted() {
+    let root = temp_dir("path-policy-permitted");
+    let repo = root.join("repo");
+    let outside = root.join("outside");
+    write_fixture(&repo, "src/app.js", "console.log(\"ok\");");
+    write_fixture(&outside, "notes.txt", "pinned by the user");
+
+    let config = Config {
+        allowed_roots: vec![repo.clone()],
+        data_dir: repo.join(".damaian"),
+        ..Config::default()
+    };
+    let policy = PathPolicy::new(&config);
+    let resolved = policy
+        .resolve_existing(&repo, outside.join("notes.txt"), true)
+        .expect("explicitly permitted path outside the repo should resolve");
+    assert_eq!(
+        resolved.relative_path,
+        fs::canonicalize(outside.join("notes.txt"))
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -328,11 +356,18 @@ fn classifies_command_risk() {
         ..Config::default()
     });
 
-    assert_eq!(policy.classify("git status --short").risk, CommandRisk::Low);
-    assert_eq!(policy.classify("git show --stat").risk, CommandRisk::Low);
-    assert_eq!(policy.classify("npm test").risk, CommandRisk::Medium);
-    assert_eq!(policy.classify("rm -rf .").risk, CommandRisk::Blocked);
-    assert_eq!(policy.classify("ls | head").risk, CommandRisk::High);
+    let root = Path::new("/tmp/damaian-test");
+    assert_eq!(
+        policy.classify("git status --short", root).risk,
+        CommandRisk::Low
+    );
+    assert_eq!(
+        policy.classify("git show --stat", root).risk,
+        CommandRisk::Low
+    );
+    assert_eq!(policy.classify("npm test", root).risk, CommandRisk::Medium);
+    assert_eq!(policy.classify("rm -rf .", root).risk, CommandRisk::Blocked);
+    assert_eq!(policy.classify("ls | head", root).risk, CommandRisk::High);
 }
 
 #[test]
@@ -343,12 +378,42 @@ fn allowlist_does_not_bypass_shell_control_detection() {
         ..Config::default()
     });
 
-    assert_eq!(policy.classify("npm test").risk, CommandRisk::Low);
+    let root = Path::new("/tmp/damaian-test");
+    assert_eq!(policy.classify("npm test", root).risk, CommandRisk::Low);
     for command in ["npm test; rm -rf ~", "npm test\ncat /etc/passwd"] {
-        let classification = policy.classify(command);
+        let classification = policy.classify(command, root);
         assert_eq!(classification.risk, CommandRisk::High);
         assert!(classification.requires_approval);
     }
+}
+
+#[test]
+fn escalates_approval_for_commands_referencing_paths_outside_repo() {
+    let policy = CommandPolicy::new(Config {
+        data_dir: PathBuf::from("/tmp/damaian-test"),
+        ..Config::default()
+    });
+    let root = Path::new("/Users/example/project");
+
+    let classification = policy.classify("ls ../outside", root);
+    assert_eq!(classification.risk, CommandRisk::Medium);
+    assert!(classification.requires_approval);
+    assert!(
+        classification
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("outside the selected repository"))
+    );
+
+    let inside = policy.classify("ls src", root);
+    assert_eq!(inside.risk, CommandRisk::Low);
+    assert!(!inside.requires_approval);
+    assert!(
+        !inside
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("outside the selected repository"))
+    );
 }
 
 #[test]
@@ -1673,7 +1738,9 @@ fn config_precedence_is_user_then_repo_then_admin() {
     assert_eq!(merged.secret_patterns, vec!["REPO_SECRET"]);
     assert_eq!(merged.audit_retention_days, 3);
     assert_eq!(
-        CommandPolicy::new(merged).classify("cargo test").risk,
+        CommandPolicy::new(merged)
+            .classify("cargo test", &root)
+            .risk,
         CommandRisk::Blocked
     );
 
