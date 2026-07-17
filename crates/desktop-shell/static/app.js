@@ -468,8 +468,21 @@ function tauriUpdater() {
   return window.__TAURI__?.updater;
 }
 
+function tauriWebview() {
+  return window.__TAURI__?.webview;
+}
+
 function isDesktopApp() {
   return Boolean(window.__TAURI__);
+}
+
+async function pinContextFilePaths(paths) {
+  const selectedFiles = Array.isArray(paths) ? paths : paths ? [paths] : [];
+  for (const path of selectedFiles) {
+    const payload = await api("/api/context-file", form({ repo: requireRepo(), path }));
+    addPinnedContextFile(payload.path);
+  }
+  return selectedFiles.length;
 }
 
 async function addContextFilesFromPicker() {
@@ -481,14 +494,36 @@ async function addContextFilesFromPicker() {
     title: "Add Context File",
     defaultPath: requireRepo(),
   });
-  const selectedFiles = Array.isArray(selected) ? selected : selected ? [selected] : [];
-  for (const path of selectedFiles) {
-    const payload = await api("/api/context-file", form({ repo: requireRepo(), path }));
-    addPinnedContextFile(payload.path);
+  const count = await pinContextFilePaths(selected);
+  if (count) {
+    toast(`Added ${count} context file(s)`);
   }
-  if (selectedFiles.length) {
-    toast(`Added ${selectedFiles.length} context file(s)`);
-  }
+}
+
+function setChatDropActive(active) {
+  $("chat-drop-overlay").hidden = !active;
+}
+
+async function setupContextFileDragDrop() {
+  const getCurrentWebview = tauriWebview()?.getCurrentWebview;
+  if (!getCurrentWebview) return;
+  const webview = getCurrentWebview();
+  await webview.onDragDropEvent((event) => {
+    const payload = event.payload || {};
+    if (payload.type === "enter" || payload.type === "over") {
+      setChatDropActive(true);
+      return;
+    }
+    setChatDropActive(false);
+    if (payload.type !== "drop") return;
+    const paths = Array.isArray(payload.paths) ? payload.paths : [];
+    if (!paths.length) return;
+    void pinContextFilePaths(paths)
+      .then((count) => {
+        if (count) toast(`Added ${count} context file(s)`);
+      })
+      .catch((error) => toast(error.message));
+  });
 }
 
 function scheduleUpdateCheck() {
@@ -2887,3 +2922,4 @@ renderProviderConfigSelect();
 renderPinnedContextFiles();
 
 bootstrapPromise = startBootstrap();
+void setupContextFileDragDrop();
