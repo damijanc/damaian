@@ -6,6 +6,7 @@ let bootstrapPromise = null;
 let bootstrapError = null;
 let chatSubmitting = false;
 let pinnedContextFiles = [];
+let contextChipsDismissed = false;
 let terminalCwd = "";
 let terminalOpen = false;
 let terminalBusy = false;
@@ -338,6 +339,7 @@ function loadPinnedContextFiles(sessionId = currentSessionId) {
   } catch {
     pinnedContextFiles = [];
   }
+  contextChipsDismissed = false;
   renderPinnedContextFiles();
 }
 
@@ -358,9 +360,12 @@ function persistPinnedContextForSession(sessionId) {
 
 function addPinnedContextFile(path) {
   const normalized = String(path || "").trim();
-  if (!normalized || pinnedContextFiles.includes(normalized)) return;
-  pinnedContextFiles.push(normalized);
-  savePinnedContextFiles();
+  if (!normalized) return;
+  contextChipsDismissed = false;
+  if (!pinnedContextFiles.includes(normalized)) {
+    pinnedContextFiles.push(normalized);
+    savePinnedContextFiles();
+  }
   renderPinnedContextFiles();
 }
 
@@ -370,33 +375,42 @@ function removePinnedContextFile(path) {
   renderPinnedContextFiles();
 }
 
-function clearPinnedContextFiles() {
-  pinnedContextFiles = [];
-  savePinnedContextFiles();
-  renderPinnedContextFiles();
+function fileBaseName(path) {
+  const parts = String(path || "").split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || path;
 }
 
 function renderPinnedContextFiles() {
+  const wrapper = $("composer-context");
   const container = $("pinned-context-files");
   container.innerHTML = "";
-  $("clear-context-files-btn").disabled = pinnedContextFiles.length === 0;
-  if (!pinnedContextFiles.length) {
-    return;
-  }
+  const visible = !contextChipsDismissed && pinnedContextFiles.length > 0;
+  wrapper.hidden = !visible;
+  if (!visible) return;
   pinnedContextFiles.forEach((path) => {
     const chip = document.createElement("span");
     chip.className = "context-chip";
     chip.title = path;
+    const icon = document.createElement("span");
+    icon.className = "context-chip-icon";
+    icon.setAttribute("aria-hidden", "true");
     const label = document.createElement("span");
-    label.textContent = path;
+    label.className = "context-chip-label";
+    label.textContent = fileBaseName(path);
     const remove = document.createElement("button");
     remove.type = "button";
     remove.setAttribute("aria-label", `Remove ${path} from context`);
     remove.textContent = "×";
     remove.addEventListener("click", () => removePinnedContextFile(path));
-    chip.append(label, remove);
+    chip.append(icon, label, remove);
     container.append(chip);
   });
+}
+
+function dismissContextChips() {
+  if (!pinnedContextFiles.length || contextChipsDismissed) return;
+  contextChipsDismissed = true;
+  renderPinnedContextFiles();
 }
 
 function applyRepositoryState(value, persist = true) {
@@ -1026,6 +1040,24 @@ function openModelMenu(panel = "root") {
 function closeModelMenu() {
   $("chat-model-popover").hidden = true;
   $("chat-model-menu-btn").setAttribute("aria-expanded", "false");
+}
+
+function toggleAttachMenu() {
+  if ($("composer-attach-popover").hidden) {
+    openAttachMenu();
+  } else {
+    closeAttachMenu();
+  }
+}
+
+function openAttachMenu() {
+  $("composer-attach-popover").hidden = false;
+  $("composer-attach-btn").setAttribute("aria-expanded", "true");
+}
+
+function closeAttachMenu() {
+  $("composer-attach-popover").hidden = true;
+  $("composer-attach-btn").setAttribute("aria-expanded", "false");
 }
 
 function showModelMenuPanel(panel) {
@@ -2549,7 +2581,17 @@ $("pick-folder-btn").addEventListener("click", async () => {
   }
 });
 
-$("add-context-file-btn").addEventListener("click", async () => {
+$("composer-attach-btn").addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleAttachMenu();
+});
+
+$("composer-attach-popover").addEventListener("click", (event) => {
+  event.stopPropagation();
+});
+
+$("attach-add-file-btn").addEventListener("click", async () => {
+  closeAttachMenu();
   try {
     await addContextFilesFromPicker();
   } catch (error) {
@@ -2557,8 +2599,8 @@ $("add-context-file-btn").addEventListener("click", async () => {
   }
 });
 
-$("clear-context-files-btn").addEventListener("click", () => {
-  clearPinnedContextFiles();
+document.addEventListener("click", (event) => {
+  if (!$("composer-attach-menu").contains(event.target)) closeAttachMenu();
 });
 
 $("open-vscode-btn").addEventListener("click", async () => {
@@ -2661,6 +2703,7 @@ async function sendChatPrompt() {
     if (looksLikeEditRequest(prompt)) {
       await proposePatchFromChat(prompt, assistantMessage);
       $("chat-prompt").value = "";
+      dismissContextChips();
       return;
     }
     let assistantText = "";
@@ -2701,6 +2744,7 @@ async function sendChatPrompt() {
     );
     if (streamError) throw streamError;
     $("chat-prompt").value = "";
+    dismissContextChips();
     await loadSessions(currentSessionId, false);
   } catch (error) {
     setChatStatus("Failed", "error");
@@ -2744,6 +2788,7 @@ document.addEventListener("keydown", (event) => {
       return;
     }
     closeModelMenu();
+    closeAttachMenu();
   }
 });
 

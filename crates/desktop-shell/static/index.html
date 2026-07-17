@@ -114,14 +114,7 @@
         <section id="chat-context" class="context-list chat-context-strip" aria-label="Context"></section>
 
         <footer class="composer">
-          <div id="composer-context" class="composer-context">
-            <div class="composer-context-header">
-              <span>Context files</span>
-              <div class="composer-context-actions">
-                <button id="add-context-file-btn" type="button">+ File</button>
-                <button id="clear-context-files-btn" type="button">Clear</button>
-              </div>
-            </div>
+          <div id="composer-context" class="composer-context" hidden>
             <div id="pinned-context-files" class="pinned-context-files"></div>
           </div>
           <div class="prompt-box">
@@ -133,6 +126,35 @@
             <input id="chat-provider" type="hidden" value="openai" />
             <input id="chat-model" type="hidden" />
             <input id="chat-reasoning" type="hidden" value="default" />
+            <div id="composer-attach-menu" class="attach-menu">
+              <button
+                id="composer-attach-btn"
+                class="attach-menu-button"
+                type="button"
+                aria-haspopup="menu"
+                aria-expanded="false"
+                aria-controls="composer-attach-popover"
+                title="Add to context"
+              >
+                <span class="attach-icon" aria-hidden="true"></span>
+              </button>
+              <div id="composer-attach-popover" class="model-popover attach-popover" role="menu" hidden>
+                <button id="attach-add-file-btn" class="attach-menu-row" type="button" role="menuitem">
+                  <span>Add file</span>
+                </button>
+                <button
+                  id="attach-add-folder-btn"
+                  class="attach-menu-row"
+                  type="button"
+                  role="menuitem"
+                  disabled
+                  title="Coming soon"
+                >
+                  <span>Add folder</span>
+                  <span class="attach-menu-soon">Soon</span>
+                </button>
+              </div>
+            </div>
             <div id="chat-model-menu" class="model-menu">
               <button
                 id="chat-model-menu-btn"
