@@ -329,13 +329,96 @@ function rememberProject(projectPath) {
   return normalized;
 }
 
+// `window.prompt`/`window.confirm` do not work in this app's Tauri WebView
+// on macOS (a known WKWebView limitation — the JS call returns without ever
+// showing a dialog), so text-input and yes/no confirmations use this small
+// in-app modal instead. Single reusable element, promise-based like the
+// project menu above.
+let appDialogEl = null;
+
+function ensureAppDialog() {
+  if (appDialogEl) return appDialogEl;
+  const backdrop = document.createElement("div");
+  backdrop.className = "app-dialog-backdrop";
+  backdrop.hidden = true;
+  backdrop.innerHTML = `
+    <div class="app-dialog" role="dialog" aria-modal="true">
+      <p class="app-dialog-title"></p>
+      <p class="app-dialog-message" hidden></p>
+      <input type="text" class="app-dialog-input" hidden />
+      <div class="app-dialog-actions">
+        <button type="button" class="app-dialog-btn app-dialog-cancel">Cancel</button>
+        <button type="button" class="app-dialog-btn app-dialog-confirm">OK</button>
+      </div>
+    </div>
+  `;
+  document.body.append(backdrop);
+  appDialogEl = backdrop;
+  return backdrop;
+}
+
+// Resolves to the entered string (or `null` if cancelled) when `inputValue`
+// is given; otherwise behaves like `confirm` and resolves to a boolean.
+function showAppDialog({ title, message = "", inputValue = null, confirmLabel = "OK", danger = false }) {
+  return new Promise((resolve) => {
+    const backdrop = ensureAppDialog();
+    const titleEl = backdrop.querySelector(".app-dialog-title");
+    const messageEl = backdrop.querySelector(".app-dialog-message");
+    const inputEl = backdrop.querySelector(".app-dialog-input");
+    const confirmBtn = backdrop.querySelector(".app-dialog-confirm");
+    const cancelBtn = backdrop.querySelector(".app-dialog-cancel");
+    const usesInput = inputValue !== null;
+
+    titleEl.textContent = title;
+    messageEl.hidden = !message;
+    messageEl.textContent = message;
+    inputEl.hidden = !usesInput;
+    inputEl.value = usesInput ? inputValue : "";
+    confirmBtn.textContent = confirmLabel;
+    confirmBtn.classList.toggle("app-dialog-btn-danger", danger);
+
+    const cleanup = (result) => {
+      backdrop.hidden = true;
+      confirmBtn.removeEventListener("click", onConfirm);
+      cancelBtn.removeEventListener("click", onCancel);
+      backdrop.removeEventListener("keydown", onKeydown);
+      resolve(result);
+    };
+    const onConfirm = () => cleanup(usesInput ? inputEl.value : true);
+    const onCancel = () => cleanup(usesInput ? null : false);
+    const onKeydown = (event) => {
+      if (event.key === "Escape") onCancel();
+      if (event.key === "Enter" && usesInput) onConfirm();
+    };
+
+    confirmBtn.addEventListener("click", onConfirm);
+    cancelBtn.addEventListener("click", onCancel);
+    backdrop.addEventListener("keydown", onKeydown);
+    backdrop.hidden = false;
+    if (usesInput) {
+      inputEl.focus();
+      inputEl.select();
+    } else {
+      confirmBtn.focus();
+    }
+  });
+}
+
+function promptDialog(title, initialValue) {
+  return showAppDialog({ title, inputValue: initialValue ?? "" });
+}
+
+function confirmDialog(title, message, { danger = false, confirmLabel = "Delete" } = {}) {
+  return showAppDialog({ title, message, confirmLabel, danger });
+}
+
 // Renames a project within damaian only: it changes `projectName()`'s
 // display label via `projectDisplayNames`, never the folder on disk.
-function renameProject(projectPath) {
+async function renameProject(projectPath) {
   const normalized = normalizeProjectPath(projectPath);
   if (!normalized) return;
   const current = projectName(normalized);
-  const nextName = window.prompt("Rename project", current);
+  const nextName = await promptDialog("Rename project", current);
   if (nextName === null) return;
   const trimmed = nextName.trim();
   if (!trimmed) {
@@ -350,12 +433,14 @@ function renameProject(projectPath) {
 // Removes a project from damaian's sidebar only: it never touches the
 // folder or any files on disk, and the folder can always be re-added later
 // by picking it again.
-function forgetProject(projectPath) {
+async function forgetProject(projectPath) {
   const normalized = normalizeProjectPath(projectPath);
   if (!normalized) return;
   const label = projectName(normalized);
-  const confirmed = window.confirm(
+  const confirmed = await confirmDialog(
+    "Remove project?",
     `Remove "${label}" from damaian? This only removes it from the project list — nothing is deleted on disk.`,
+    { danger: true, confirmLabel: "Delete" },
   );
   if (!confirmed) return;
 
@@ -471,12 +556,12 @@ async function handleProjectMenuAction(event) {
   if (!projectPath) return;
   if (action === "rename") {
     closeProjectMenu();
-    renameProject(projectPath);
+    await renameProject(projectPath);
     return;
   }
   if (action === "delete") {
     closeProjectMenu();
-    forgetProject(projectPath);
+    await forgetProject(projectPath);
     return;
   }
   if (action === "open-vscode") {
@@ -788,7 +873,12 @@ async function installAppUpdate() {
     if (!appUpdateInfo?.available) return;
   }
   const version = appUpdateInfo.version || "the latest version";
-  if (!window.confirm(`Install Damaian ${version}? Restart Damaian after the update to finish.`)) {
+  const confirmed = await confirmDialog(
+    "Install update?",
+    `Install Damaian ${version}? Restart Damaian after the update to finish.`,
+    { confirmLabel: "Install" },
+  );
+  if (!confirmed) {
     return;
   }
   const update = appUpdateInfo.update;
@@ -1484,7 +1574,7 @@ function renderConnectedProviders() {
     removeButton.type = "button";
     removeButton.textContent = "Disconnect";
     removeButton.addEventListener("click", async () => {
-      if (!window.confirm(`Remove provider ${id}?`)) return;
+      if (!(await confirmDialog("Remove provider?", `Remove provider ${id}?`))) return;
       renderProviderConfigForm(id);
       try {
         await removeProviderConfigFromSettings();
@@ -2112,7 +2202,7 @@ function renderProjectList() {
         toast(error.message);
       }
     });
-    row.append(projectButton, menuButton, addSessionButton);
+    row.append(projectButton, addSessionButton, menuButton);
     group.append(row);
 
     if (expanded) {
@@ -2250,7 +2340,7 @@ async function startNewSession(projectPath = repo()) {
 }
 
 async function renameSessionForProject(projectPath, session) {
-  const title = window.prompt("Session name", session.title);
+  const title = await promptDialog("Session name", session.title);
   if (!title || !title.trim()) return;
   const payload = await api(
     "/api/session-rename",
@@ -2266,7 +2356,7 @@ async function renameSessionForProject(projectPath, session) {
 }
 
 async function deleteSessionForProject(projectPath, session) {
-  if (!window.confirm("Delete this session?")) return;
+  if (!(await confirmDialog("Delete this session?", ""))) return;
   await api("/api/session-delete", form({ session_id: session.id }));
   const normalized = normalizeProjectPath(projectPath);
   if (normalized === repo() && currentSessionId === session.id) {
@@ -3110,7 +3200,7 @@ $("provider-save-btn").addEventListener("click", async () => {
 $("provider-remove-btn").addEventListener("click", async () => {
   try {
     const id = $("provider-id-input").dataset.originalId || $("provider-id-input").value;
-    if (!id || !window.confirm(`Remove provider ${id}?`)) return;
+    if (!id || !(await confirmDialog("Remove provider?", `Remove provider ${id}?`))) return;
     await removeProviderConfigFromSettings();
     toast("LLM provider removed");
   } catch (error) {
@@ -3148,7 +3238,7 @@ $("model-key-save-btn").addEventListener("click", async () => {
 
 $("model-key-delete-btn").addEventListener("click", async () => {
   try {
-    if (!window.confirm("Remove this stored API key from Keychain?")) return;
+    if (!(await confirmDialog("Remove API key?", "Remove this stored API key from Keychain?"))) return;
     const payload = await deleteModelApiKey();
     toast(payload.deleted ? "Model API key removed" : "No stored key found");
   } catch (error) {

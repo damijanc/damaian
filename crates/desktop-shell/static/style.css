@@ -348,6 +348,7 @@ button:disabled {
 .dots-icon::before,
 .dots-icon::after {
   position: absolute;
+  left: 0;
   width: 3px;
   height: 3px;
   border-radius: 50%;
@@ -356,11 +357,11 @@ button:disabled {
 }
 
 .dots-icon::before {
-  left: -6px;
+  top: -6px;
 }
 
 .dots-icon::after {
-  left: 6px;
+  top: 6px;
 }
 
 .folder-icon {
@@ -2152,6 +2153,94 @@ pre {
   white-space: pre-wrap;
   word-break: break-word;
   font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.app-dialog-backdrop {
+  position: fixed;
+  z-index: 150;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(31, 36, 40, 0.32);
+}
+
+.app-dialog-backdrop[hidden] {
+  display: none;
+}
+
+.app-dialog {
+  width: min(360px, calc(100vw - 32px));
+  display: grid;
+  gap: 10px;
+  border: 1px solid #dededb;
+  border-radius: 14px;
+  background: var(--surface);
+  padding: 18px;
+  box-shadow: 0 24px 60px rgba(31, 36, 40, 0.28), 0 4px 12px rgba(31, 36, 40, 0.1);
+}
+
+.app-dialog-title {
+  margin: 0;
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.app-dialog-message {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.app-dialog-input {
+  width: 100%;
+  height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 10px;
+  font-size: 13px;
+}
+
+.app-dialog-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.app-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.app-dialog-btn {
+  min-height: 34px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 7px 14px;
+}
+
+.app-dialog-btn:hover {
+  background: #eeeeea;
+}
+
+.app-dialog-confirm {
+  background: var(--accent);
+  color: #fff;
+}
+
+.app-dialog-confirm:hover {
+  background: var(--accent);
+  opacity: 0.9;
+}
+
+.app-dialog-confirm.app-dialog-btn-danger {
+  background: var(--danger);
+  color: #fff;
 }
 
 #toast {
