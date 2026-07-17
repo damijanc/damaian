@@ -90,6 +90,10 @@ impl WorkspaceEngine {
             session_store.clone(),
             validation_orchestrator.clone(),
             command_store.clone(),
+            file_access.clone(),
+            git.clone(),
+            patch_engine.clone(),
+            patch_store.clone(),
         );
         let edit_orchestrator = EditOrchestrator::new(
             config.clone(),
