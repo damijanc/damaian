@@ -73,14 +73,17 @@ impl ContextManager {
             prompt,
         );
 
-        let mut requested_paths = explicit_paths.to_vec();
+        let mut requested_paths: Vec<(String, bool)> = explicit_paths
+            .iter()
+            .map(|path| (path.clone(), true))
+            .collect();
         for path in prompt_file_mentions(prompt, index) {
-            if !requested_paths.iter().any(|existing| existing == &path) {
-                requested_paths.push(path);
+            if !requested_paths.iter().any(|(existing, _)| existing == &path) {
+                requested_paths.push((path, false));
             }
         }
 
-        for path in &requested_paths {
+        for (path, allow_outside_root) in &requested_paths {
             self.add_file(
                 repository_root.as_ref(),
                 repository_id,
@@ -91,6 +94,7 @@ impl ContextManager {
                 &mut items,
                 &mut token_estimate,
                 token_budget,
+                *allow_outside_root,
             );
         }
 
@@ -105,6 +109,7 @@ impl ContextManager {
                 &mut items,
                 &mut token_estimate,
                 token_budget,
+                false,
             );
         }
 
@@ -122,6 +127,7 @@ impl ContextManager {
                     &mut items,
                     &mut token_estimate,
                     token_budget,
+                    false,
                 );
             }
         }
@@ -147,6 +153,7 @@ impl ContextManager {
         items: &mut Vec<ContextItem>,
         token_estimate: &mut usize,
         token_budget: usize,
+        allow_outside_root: bool,
     ) {
         if files.iter().any(|existing| existing == path) {
             return;
@@ -157,6 +164,7 @@ impl ContextManager {
             Some(task_id),
             Some(repository_id),
             false,
+            allow_outside_root,
         ) else {
             return;
         };

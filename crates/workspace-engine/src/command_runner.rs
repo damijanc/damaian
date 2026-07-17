@@ -53,7 +53,7 @@ impl CommandRunner {
         approved_by: Option<&str>,
         task_id: Option<&str>,
     ) -> Result<CommandExecution> {
-        let classification = self.command_policy.classify(command);
+        let classification = self.command_policy.classify(command, cwd.as_ref());
         self.audit_log.record(
             "command_proposed",
             &[

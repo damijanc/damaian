@@ -80,7 +80,7 @@ fn run() -> workspace_engine::Result<()> {
             let path = require_arg(&args, 2, "<path>")?;
             let file = engine
                 .file_access
-                .read_file(repo, path, Some("cli"), Some(repo), false)?;
+                .read_file(repo, path, Some("cli"), Some(repo), false, false)?;
             print!("{}", file.content);
             if !file.content.ends_with('\n') {
                 println!();
@@ -129,7 +129,10 @@ fn run() -> workspace_engine::Result<()> {
                     "Missing <command>".to_string(),
                 ));
             }
-            let classification = engine.command_policy.classify(&args[1..].join(" "));
+            let cwd = std::env::current_dir()?;
+            let classification = engine
+                .command_policy
+                .classify(&args[1..].join(" "), &cwd);
             println!(
                 "{{\"command\":\"{}\",\"risk\":\"{}\",\"blocked\":{},\"requiresApproval\":{},\"mayUseNetwork\":{}}}",
                 escape(&classification.command),

@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::error::Result;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandRisk {
@@ -50,7 +50,23 @@ impl CommandPolicy {
         Self { config }
     }
 
-    pub fn classify(&self, command: &str) -> CommandClassification {
+    pub fn classify(&self, command: &str, working_directory: &Path) -> CommandClassification {
+        let mut classification = self.classify_pattern(command);
+        if !classification.blocked
+            && references_path_outside_root(&classification.command, working_directory)
+        {
+            classification.requires_approval = true;
+            if classification.risk == CommandRisk::Low {
+                classification.risk = CommandRisk::Medium;
+            }
+            classification.reasons.push(
+                "Command references a path outside the selected repository".to_string(),
+            );
+        }
+        classification
+    }
+
+    fn classify_pattern(&self, command: &str) -> CommandClassification {
         let normalized = command.trim().to_string();
 
         if configured_prefix_matches(&self.config.command_blocklist, &normalized)
@@ -160,7 +176,7 @@ impl CommandPolicy {
                     let command = format!("npm run {name}");
                     commands.push(ProjectCommand {
                         name: name.to_string(),
-                        risk: self.classify(&command).risk,
+                        risk: self.classify(&command, root).risk,
                         command,
                     });
                 }
@@ -169,7 +185,7 @@ impl CommandPolicy {
                 commands.push(ProjectCommand {
                     name: "test-shortcut".to_string(),
                     command: "npm test".to_string(),
-                    risk: self.classify("npm test").risk,
+                    risk: self.classify("npm test", root).risk,
                 });
             }
         }
@@ -186,7 +202,7 @@ impl CommandPolicy {
                 commands.push(ProjectCommand {
                     name: file_name.to_string(),
                     command: command.to_string(),
-                    risk: self.classify(command).risk,
+                    risk: self.classify(command, root).risk,
                 });
             }
         }
@@ -309,13 +325,87 @@ fn may_use_network(command: &str) -> bool {
     .any(|needle| command.contains(needle))
 }
 
+// Heuristic, not a security boundary: shell commands aren't sandboxed by path, so this only
+// flags likely out-of-repo path arguments for the approval prompt shown to the user.
+fn references_path_outside_root(command: &str, working_directory: &Path) -> bool {
+    command
+        .split_whitespace()
+        .flat_map(|token| {
+            let token = token.trim_matches(|character| matches!(character, '\'' | '"'));
+            match token.split_once('=') {
+                Some((_, value)) if !value.is_empty() => vec![token, value],
+                _ => vec![token],
+            }
+        })
+        .any(|token| token_escapes_root(token, working_directory))
+}
+
+fn token_escapes_root(token: &str, working_directory: &Path) -> bool {
+    if token.is_empty() || token.starts_with('-') {
+        return false;
+    }
+    if !token.contains('/') && !token.contains("..") {
+        return false;
+    }
+    if token.starts_with('~') {
+        return true;
+    }
+    let candidate = Path::new(token);
+    let absolute = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        working_directory.join(candidate)
+    };
+    !normalize_lexically(&absolute).starts_with(normalize_lexically(working_directory))
+}
+
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                result.pop();
+            }
+            Component::CurDir => {}
+            other => result.push(other.as_os_str()),
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
-    use super::contains_shell_control;
+    use super::{contains_shell_control, references_path_outside_root};
+    use std::path::Path;
 
     #[test]
     fn detects_line_breaks_as_shell_control() {
         assert!(contains_shell_control("npm test\ncat /etc/passwd"));
         assert!(contains_shell_control("npm test\rcat /etc/passwd"));
+    }
+
+    #[test]
+    fn detects_relative_traversal_outside_root() {
+        let root = Path::new("/Users/example/project");
+        assert!(references_path_outside_root("cat ../secrets/id_rsa", root));
+        assert!(references_path_outside_root("ls ../../other-project", root));
+    }
+
+    #[test]
+    fn detects_absolute_path_outside_root() {
+        let root = Path::new("/Users/example/project");
+        assert!(references_path_outside_root("cat /etc/passwd", root));
+        assert!(references_path_outside_root("cat ~/secrets.txt", root));
+    }
+
+    #[test]
+    fn does_not_flag_paths_inside_root() {
+        let root = Path::new("/Users/example/project");
+        assert!(!references_path_outside_root("cat src/main.rs", root));
+        assert!(!references_path_outside_root(
+            "cat /Users/example/project/src/main.rs",
+            root
+        ));
+        assert!(!references_path_outside_root("git status --short", root));
     }
 }
