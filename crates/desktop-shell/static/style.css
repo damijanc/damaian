@@ -768,6 +768,55 @@ button:disabled {
   padding: 0;
 }
 
+.message-body pre.code-block {
+  overflow-x: auto;
+}
+
+.message-body strong {
+  color: var(--ink);
+}
+
+.message-body a {
+  color: var(--accent);
+}
+
+/* Syntax-highlighting token colors for `pre.code-block` (see
+   workspace-engine's `render_markdown_to_html`, which emits `hl-*` classes
+   from syntect's scope names). Tuned against the dark `--code` background
+   already used for `pre` elements. */
+.hl-comment {
+  color: #7a8590;
+  font-style: italic;
+}
+
+.hl-string {
+  color: #9fca8d;
+}
+
+.hl-constant {
+  color: #d19a66;
+}
+
+.hl-keyword {
+  color: #c68add;
+}
+
+.hl-storage {
+  color: #7fb4d9;
+}
+
+.hl-entity {
+  color: #e5c07b;
+}
+
+.hl-support {
+  color: #56b6c2;
+}
+
+.hl-punctuation {
+  color: #9099a3;
+}
+
 .composer {
   border-top: 1px solid var(--line);
   background: var(--surface);

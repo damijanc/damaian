@@ -6,6 +6,7 @@ pub mod config;
 pub mod context_manager;
 pub mod diff;
 pub mod edit;
+pub mod embeddings;
 pub mod error;
 pub mod file_access;
 pub mod git_service;
@@ -17,9 +18,11 @@ pub mod language;
 pub mod model;
 pub mod patch_engine;
 pub mod path_policy;
+pub mod render;
 pub mod secret_scanner;
 pub mod session;
 pub mod validation;
+pub mod vector_index;
 pub mod workspace_engine;
 
 pub use audit::AuditLog;
@@ -51,6 +54,7 @@ pub use patch_engine::{
     ProposedPatch,
 };
 pub use path_policy::PathPolicy;
+pub use render::{render_markdown_to_ansi, render_markdown_to_html};
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{ChatMessage, Session, SessionStore, Task, TaskStatus};
 pub use validation::{

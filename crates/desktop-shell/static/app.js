@@ -1621,7 +1621,26 @@ function escapeHtml(value) {
 }
 
 function renderInlineMarkdown(value) {
-  return escapeHtml(value).replace(/`([^`]+)`/g, "<code>$1</code>");
+  var PLACEHOLDER = "\uE000";
+  var escaped = escapeHtml(value);
+  var codeSpans = [];
+  // Pull code spans out first so bold/italic/link patterns below never match
+  // characters inside inline code (e.g. `a**b` should not become a<strong>).
+  // PLACEHOLDER is a private-use-area character that cannot occur in
+  // escaped HTML text, so it cannot collide with real content.
+  var withoutCode = escaped.replace(/`([^`]+)`/g, function (_match, code) {
+    codeSpans.push(code);
+    return PLACEHOLDER + (codeSpans.length - 1) + PLACEHOLDER;
+  });
+  var withInline = withoutCode
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/__([^_]+)__/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>");
+  var codePattern = new RegExp(PLACEHOLDER + "(\\d+)" + PLACEHOLDER, "g");
+  return withInline.replace(codePattern, function (_match, index) {
+    return "<code>" + codeSpans[Number(index)] + "</code>";
+  });
 }
 
 function parseTableRow(line) {
@@ -1778,9 +1797,29 @@ function updateChatMessage(target, content) {
   $("chat-log").scrollTop = $("chat-log").scrollHeight;
 }
 
+// Re-renders a finished message server-side (workspace-engine's
+// `render_markdown_to_html`) to get real syntax-highlighted code blocks,
+// which the fast client-side `renderMarkdown` above does not attempt. Only
+// call this once a message's content is final (stream complete, or loaded
+// from history) since it replaces the bubble's entire innerHTML.
+async function finalizeChatMessage(target, content) {
+  try {
+    const payload = await api("/api/render-markdown", form({ content }));
+    target.body.innerHTML = payload.html;
+  } catch (error) {
+    target.body.innerHTML = renderMarkdown(content);
+  }
+  $("chat-log").scrollTop = $("chat-log").scrollHeight;
+}
+
 function renderMessages(messages) {
   $("chat-log").innerHTML = "";
-  messages.forEach((message) => appendChatMessage(message.role, message.content));
+  messages.forEach((message) => {
+    const bubble = appendChatMessage(message.role, message.content);
+    if (message.role === "assistant") {
+      void finalizeChatMessage(bubble, message.content);
+    }
+  });
 }
 
 function renderContextFiles(files = []) {
@@ -2758,14 +2797,16 @@ async function sendChatPrompt() {
           updateChatMessage(assistantMessage, assistantText);
           setChatStatus("Streaming", "running");
         },
-        done(payload) {
+        async done(payload) {
           currentSessionId = payload.sessionId;
           localStorage.setItem(lastSessionStorageKey(), currentSessionId);
           persistPinnedContextForSession(currentSessionId);
           if (payload.response && payload.response !== assistantText) {
             assistantText = payload.response;
-            updateChatMessage(assistantMessage, assistantText);
           }
+          // Awaited so the command-approval preview appended below survives
+          // finalize's innerHTML replacement instead of being wiped by it.
+          await finalizeChatMessage(assistantMessage, assistantText);
           if (payload.commandProposal) {
             assistantMessage.body.append(createCommandApprovalPreview(payload.commandProposal, chatRepo));
           }

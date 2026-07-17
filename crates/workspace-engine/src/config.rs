@@ -52,6 +52,10 @@ pub struct Config {
     pub block_generated_secrets: bool,
     pub audit_enabled: bool,
     pub audit_retention_days: u64,
+    /// Off by default: enabling local semantic search downloads a small
+    /// embedding model on first use (a one-time network fetch), which the
+    /// user should opt into rather than have happen implicitly.
+    pub enable_semantic_search: bool,
     pub shell: String,
     pub model_provider: String,
     pub model_name: String,
@@ -199,6 +203,9 @@ impl Config {
         }
         if let Some(value) = overlay.audit_retention_days {
             self.audit_retention_days = value;
+        }
+        if let Some(value) = overlay.enable_semantic_search {
+            self.enable_semantic_search = value;
         }
         if let Some(value) = overlay.shell {
             self.shell = value;
@@ -369,6 +376,11 @@ impl Config {
             "audit_retention_days",
             &self.audit_retention_days.to_string(),
         );
+        push_line(
+            &mut output,
+            "enable_semantic_search",
+            &self.enable_semantic_search.to_string(),
+        );
         push_line(&mut output, "shell", &self.shell);
         push_line(&mut output, "model_provider", &self.model_provider);
         push_line(&mut output, "model_name", &self.model_name);
@@ -410,6 +422,7 @@ impl Default for Config {
             block_generated_secrets: true,
             audit_enabled: true,
             audit_retention_days: 90,
+            enable_semantic_search: false,
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()),
             model_provider: "openai".to_string(),
             model_name: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1".to_string()),
@@ -439,6 +452,7 @@ pub struct ConfigOverlay {
     pub block_generated_secrets: Option<bool>,
     pub audit_enabled: Option<bool>,
     pub audit_retention_days: Option<u64>,
+    pub enable_semantic_search: Option<bool>,
     pub shell: Option<String>,
     pub model_provider: Option<String>,
     pub model_name: Option<String>,
@@ -518,6 +532,9 @@ impl ConfigOverlay {
             }
             "audit_enabled" => self.audit_enabled = Some(parse_bool(key, value)?),
             "audit_retention_days" => self.audit_retention_days = Some(parse_u64(key, value)?),
+            "enable_semantic_search" => {
+                self.enable_semantic_search = Some(parse_bool(key, value)?)
+            }
             "shell" => self.shell = Some(value.to_string()),
             "model_provider" => self.model_provider = Some(normalize_model_provider(value)?),
             "model_name" => self.model_name = Some(value.to_string()),
@@ -633,6 +650,9 @@ impl ConfigOverlay {
         }
         if let Some(value) = self.audit_retention_days {
             push_line(&mut output, "audit_retention_days", &value.to_string());
+        }
+        if let Some(value) = self.enable_semantic_search {
+            push_line(&mut output, "enable_semantic_search", &value.to_string());
         }
         if let Some(value) = &self.shell {
             push_line(&mut output, "shell", value);

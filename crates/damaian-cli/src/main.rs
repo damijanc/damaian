@@ -1,13 +1,16 @@
 use std::env;
+use std::io::IsTerminal;
 use std::path::Path;
 use workspace_engine::{
     CommandProposal, CommandRisk, Config, ConfigOverlay, CurlModelTransport, MockModelAdapter,
     OpenAICompatibleAdapter, SearchResult, WorkspaceEngine, command_approval_prompt,
-    patch_diff_text,
+    patch_diff_text, render_markdown_to_ansi,
 };
 
 fn usage() -> &'static str {
     "Usage:
+  damaian [--no-color] <command> [args...]
+
   damaian index <repo>
   damaian search <repo> <query>
   damaian read <repo> <path>
@@ -38,7 +41,8 @@ fn main() {
 }
 
 fn run() -> workspace_engine::Result<()> {
-    let args = env::args().skip(1).collect::<Vec<_>>();
+    let mut args = env::args().skip(1).collect::<Vec<_>>();
+    let no_color_flag = take_flag(&mut args, "--no-color");
     let Some(command) = args.first().map(String::as_str) else {
         print!("{}", usage());
         return Ok(());
@@ -223,14 +227,15 @@ fn run() -> workspace_engine::Result<()> {
                 ));
             }
             let prompt = args[2..].join(" ");
-            let mut stdout_token = |token: &str| {
-                print!("{token}");
-            };
+            // Formatting (colors, syntax highlighting) requires the whole
+            // response, so tokens are collected silently instead of printed
+            // live; the rendered text is printed once streaming completes.
+            let mut on_token = |_token: &str| {};
             let result = if let Ok(mock_response) = env::var("DAMAIAN_MOCK_MODEL_RESPONSE") {
                 let mut adapter = MockModelAdapter::new(mock_response);
                 engine
                     .chat_orchestrator
-                    .ask(repo, &prompt, &[], &mut adapter, &mut stdout_token)?
+                    .ask(repo, &prompt, &[], &mut adapter, &mut on_token)?
             } else {
                 let api_key = env::var(&engine.config.model_api_key_env).map_err(|_| {
                     workspace_engine::ClientError::InvalidInput(format!(
@@ -246,8 +251,13 @@ fn run() -> workspace_engine::Result<()> {
                 );
                 engine
                     .chat_orchestrator
-                    .ask(repo, &prompt, &[], &mut adapter, &mut stdout_token)?
+                    .ask(repo, &prompt, &[], &mut adapter, &mut on_token)?
             };
+            if use_color(no_color_flag) {
+                print!("{}", render_markdown_to_ansi(&result.response));
+            } else {
+                print!("{}", result.response);
+            }
             if !result.response.ends_with('\n') {
                 println!();
             }
@@ -362,6 +372,27 @@ fn require_arg<'a>(
     args.get(index)
         .map(String::as_str)
         .ok_or_else(|| workspace_engine::ClientError::InvalidInput(format!("Missing {name}")))
+}
+
+/// Removes `flag` from `args` if present, returning whether it was found.
+/// Used for global flags (e.g. `--no-color`) that can appear anywhere and
+/// shouldn't be treated as a positional argument by subcommands.
+fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
+    match args.iter().position(|arg| arg == flag) {
+        Some(index) => {
+            args.remove(index);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Whether ANSI-formatted output should be printed: respects an explicit
+/// `--no-color` flag and the `NO_COLOR` convention (https://no-color.org/),
+/// and otherwise only colors output when stdout is an interactive terminal
+/// so piped/redirected output stays plain text.
+fn use_color(no_color_flag: bool) -> bool {
+    !no_color_flag && env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
 }
 
 fn default_engine() -> workspace_engine::Result<WorkspaceEngine> {

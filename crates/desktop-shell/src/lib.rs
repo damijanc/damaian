@@ -418,6 +418,18 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 ),
             )
         }
+        ("POST", "/api/render-markdown") => {
+            let form = parse_form(&request.body);
+            let content = required_form(&form, "content")?;
+            let html = workspace_engine::render_markdown_to_html(&content);
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &format!("{{\"html\":\"{}\"}}", escape_json(&html)),
+            )
+        }
         ("POST", "/api/ask-stream") => handle_ask_stream(stream, &request),
         ("POST", "/api/resume-command-stream") => {
             handle_resume_command_stream(stream, &request)
@@ -1789,12 +1801,14 @@ mod tests {
     use super::{
         Request, ShellOptions, allowed_cors_origin, api_request_requires_token,
         cached_model_api_key, desktop_settings_config_path, effective_policy_for_repo,
-        forget_model_api_key, index_html, keychain, parse_form, parse_path_list, percent_decode,
-        remember_model_api_key, require_api_token, run_terminal_command, save_config_file,
-        terminal_cwd_for_repo, validate_context_files, validate_working_folder,
-        validate_workspace_path,
+        forget_model_api_key, handle_connection, index_html, keychain, parse_form,
+        parse_path_list, percent_decode, remember_model_api_key, require_api_token,
+        run_terminal_command, save_config_file, terminal_cwd_for_repo, validate_context_files,
+        validate_working_folder, validate_workspace_path,
     };
     use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
     use workspace_engine::{Config, WorkspaceEngine};
@@ -1855,6 +1869,36 @@ mod tests {
         let authenticated_bootstrap_request =
             test_request("/api/bootstrap", &[("x-damaian-api-token", &token)]);
         assert!(require_api_token(&authenticated_bootstrap_request, &token).is_ok());
+    }
+
+    #[test]
+    fn render_markdown_endpoint_returns_syntax_highlighted_html() {
+        let options = ShellOptions::new(0, None);
+        let token = options.api_token.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let _ = handle_connection(&mut stream, &options);
+            }
+        });
+
+        let body = "content=%23%20Title%0A%0A%60%60%60rust%0Afn%20main()%20%7B%7D%0A%60%60%60";
+        let request = format!(
+            "POST /api/render-markdown HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/x-www-form-urlencoded\r\nx-damaian-api-token: {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to test server");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+
+        assert!(response.starts_with("HTTP/1.1 200"), "unexpected response: {response}");
+        assert!(response.contains("<h1>Title</h1>"));
+        assert!(response.contains("hl-"));
+        assert!(!response.contains("<script>"));
     }
 
     #[test]
