@@ -1067,7 +1067,7 @@ fn validate_context_files(
     for path in parse_optional_path_list(raw_paths) {
         let target = engine
             .path_policy
-            .resolve_existing(repo, &path)
+            .resolve_existing(repo, &path, true)
             .map_err(|error| error.to_string())?;
         engine
             .path_policy
@@ -1993,21 +1993,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_context_files_outside_repo() {
+    fn allows_context_files_outside_repo() {
         let repo = temp_path("context-outside");
         fs::create_dir_all(&repo).unwrap();
         let outside = repo.with_file_name(format!(
             "{}-outside.txt",
             repo.file_name().unwrap().to_string_lossy()
         ));
-        fs::write(&outside, "secret").unwrap();
+        fs::write(&outside, "notes").unwrap();
         let engine = WorkspaceEngine::new(Config::default());
 
-        let error =
+        let expected = fs::canonicalize(&outside)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert_eq!(
             validate_context_files(&engine, repo.to_str().unwrap(), outside.to_str().unwrap())
-                .unwrap_err();
-
-        assert!(error.contains("outside the selected repository"));
+                .unwrap(),
+            vec![expected]
+        );
         fs::remove_file(outside).unwrap();
     }
 
@@ -2021,6 +2025,24 @@ mod tests {
         let error = validate_context_files(&engine, repo.to_str().unwrap(), ".env").unwrap_err();
 
         assert!(error.contains("restricted by policy"));
+    }
+
+    #[test]
+    fn rejects_restricted_context_files_outside_repo() {
+        let repo = temp_path("context-restricted-outside-repo");
+        fs::create_dir_all(&repo).unwrap();
+        let outside_dir = temp_path("context-restricted-outside-dir");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside = outside_dir.join("id_rsa");
+        fs::write(&outside, "-----BEGIN PRIVATE KEY-----").unwrap();
+        let engine = WorkspaceEngine::new(Config::default());
+
+        let error =
+            validate_context_files(&engine, repo.to_str().unwrap(), outside.to_str().unwrap())
+                .unwrap_err();
+
+        assert!(error.contains("restricted by policy"));
+        fs::remove_dir_all(outside_dir).unwrap();
     }
 
     #[test]
