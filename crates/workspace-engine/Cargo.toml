@@ -9,7 +9,14 @@ authors.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+bincode = "1"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
 notify = "8.2.0"
+pulldown-cmark = "0.13.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 similar = "3.1.1"
+syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "html", "parsing", "regex-fancy"] }
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
