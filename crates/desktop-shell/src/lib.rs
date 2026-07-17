@@ -385,6 +385,18 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
             )
         }
+        ("POST", "/api/reveal-in-finder") => {
+            let form = parse_form(&request.body);
+            let repo = required_form(&form, "repo")?;
+            let path = reveal_in_finder(&repo)?;
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
+            )
+        }
         ("POST", "/api/context-file") => {
             let form = parse_form(&request.body);
             let repo = required_form(&form, "repo")?;
@@ -1062,6 +1074,19 @@ fn open_in_vscode(repo: &str) -> Result<PathBuf, String> {
     let path = validate_working_folder(repo)?;
     launch_vscode(&path)?;
     Ok(path)
+}
+
+fn reveal_in_finder(repo: &str) -> Result<PathBuf, String> {
+    let path = validate_working_folder(repo)?;
+    let status = Command::new("open")
+        .arg(&path)
+        .status()
+        .map_err(|error| format!("failed to open Finder: {error}"))?;
+    if status.success() {
+        Ok(path)
+    } else {
+        Err(format!("Finder launch failed with status {status}"))
+    }
 }
 
 fn open_workspace_path_in_vscode(repo: &str, relative_path: &str) -> Result<PathBuf, String> {
@@ -1869,6 +1894,41 @@ mod tests {
         let authenticated_bootstrap_request =
             test_request("/api/bootstrap", &[("x-damaian-api-token", &token)]);
         assert!(require_api_token(&authenticated_bootstrap_request, &token).is_ok());
+    }
+
+    /// Actually launches Finder, so this is excluded from normal `cargo
+    /// test` runs (same reasoning as there being no test for
+    /// `open_in_vscode`/`launch_vscode`, which also has a real side effect).
+    /// Run manually with `cargo test -p desktop-shell -- --ignored
+    /// reveal_in_finder_endpoint_opens_the_requested_repository_root` to
+    /// verify end-to-end.
+    #[test]
+    #[ignore]
+    fn reveal_in_finder_endpoint_opens_the_requested_repository_root() {
+        let options = ShellOptions::new(0, None);
+        let token = options.api_token.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let _ = handle_connection(&mut stream, &options);
+            }
+        });
+
+        let repo = std::env::temp_dir();
+        let body = format!("repo={}", repo.to_string_lossy());
+        let request = format!(
+            "POST /api/reveal-in-finder HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/x-www-form-urlencoded\r\nx-damaian-api-token: {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to test server");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+
+        assert!(response.starts_with("HTTP/1.1 200"), "unexpected response: {response}");
     }
 
     #[test]

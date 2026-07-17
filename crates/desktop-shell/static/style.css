@@ -266,7 +266,7 @@ button:disabled {
   width: 100%;
   min-height: 34px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 28px;
+  grid-template-columns: minmax(0, 1fr) 28px 28px;
   align-items: center;
   gap: 2px;
   border-radius: 8px;
@@ -310,7 +310,8 @@ button:disabled {
 }
 
 .project-session-add-btn,
-.project-session-delete {
+.project-session-delete,
+.project-menu-btn {
   width: 26px;
   height: 26px;
   border: 0;
@@ -324,9 +325,42 @@ button:disabled {
 }
 
 .project-session-add-btn:hover,
-.project-session-delete:hover {
+.project-session-delete:hover,
+.project-menu-btn:hover {
   background: rgba(255, 255, 255, 0.85);
   color: var(--ink);
+}
+
+.project-menu-btn {
+  display: grid;
+  place-items: center;
+  padding: 0;
+}
+
+.dots-icon {
+  position: relative;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.dots-icon::before,
+.dots-icon::after {
+  position: absolute;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: currentColor;
+  content: "";
+}
+
+.dots-icon::before {
+  left: -6px;
+}
+
+.dots-icon::after {
+  left: 6px;
 }
 
 .folder-icon {
@@ -1205,11 +1239,8 @@ button:disabled {
   transform: rotate(45deg) translateY(-2px);
 }
 
-.model-popover {
-  position: absolute;
-  right: -50px;
-  bottom: 48px;
-  width: min(264px, calc(100vw - 32px));
+.model-popover,
+.context-menu-popover {
   overflow: hidden;
   border: 1px solid #dededb;
   border-radius: 12px;
@@ -1217,12 +1248,28 @@ button:disabled {
   box-shadow: 0 18px 40px rgba(31, 36, 40, 0.14), 0 2px 7px rgba(31, 36, 40, 0.08);
 }
 
+.model-popover {
+  position: absolute;
+  right: -50px;
+  bottom: 48px;
+  width: min(264px, calc(100vw - 32px));
+}
+
+.context-menu-popover {
+  position: fixed;
+  z-index: 60;
+  width: min(200px, calc(100vw - 32px));
+}
+
 .model-popover[hidden],
-.model-menu-panel[hidden] {
+.model-menu-panel[hidden],
+.context-menu-popover[hidden],
+.context-menu-panel[hidden] {
   display: none;
 }
 
-.model-menu-panel {
+.model-menu-panel,
+.context-menu-panel {
   display: grid;
   padding: 6px;
 }
@@ -1230,7 +1277,9 @@ button:disabled {
 .model-reset-row,
 .model-menu-row,
 .model-menu-back,
-.model-option {
+.model-option,
+.context-menu-row,
+.context-menu-back {
   min-height: 34px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
@@ -1244,6 +1293,18 @@ button:disabled {
   font-weight: 500;
   padding: 7px 9px;
   text-align: left;
+}
+
+.context-menu-row-danger {
+  color: var(--danger);
+}
+
+.context-menu-caret {
+  width: 8px;
+  height: 8px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
 }
 
 .model-reset-row {
@@ -1266,7 +1327,9 @@ button:disabled {
 .model-reset-row:hover,
 .model-menu-row:hover,
 .model-menu-back:hover,
-.model-option:hover {
+.model-option:hover,
+.context-menu-row:hover,
+.context-menu-back:hover {
   background: #f4f4f1;
 }
 
@@ -1296,7 +1359,8 @@ button:disabled {
   transform: rotate(-45deg);
 }
 
-.model-menu-back {
+.model-menu-back,
+.context-menu-back {
   grid-template-columns: auto minmax(0, 1fr);
   color: #7b7f82;
   border-bottom: 1px solid #eeeeeb;
@@ -1304,7 +1368,8 @@ button:disabled {
   margin: -1px -1px 5px;
 }
 
-.model-menu-back::before {
+.model-menu-back::before,
+.context-menu-back::before {
   width: 8px;
   height: 8px;
   border-left: 1.5px solid currentColor;
