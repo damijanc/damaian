@@ -52,7 +52,12 @@ impl WorkspaceEngine {
             path_policy.clone(),
         );
         let indexer = ProjectIndexer::new(config.clone(), scanner.clone(), audit_log.clone());
-        let context_manager = ContextManager::new(file_access.clone(), scanner.clone());
+        let context_manager = ContextManager::new(
+            file_access.clone(),
+            scanner.clone(),
+            config.data_dir.clone(),
+            config.enable_semantic_search,
+        );
         let command_policy = CommandPolicy::new(config.clone());
         let command_runner = CommandRunner::new(
             config.clone(),

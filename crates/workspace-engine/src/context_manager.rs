@@ -1,8 +1,9 @@
 use crate::file_access::FileAccessController;
 use crate::indexer::RepositoryIndex;
 use crate::secret_scanner::SecretScanner;
+use crate::vector_index::VectorIndexCache;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const PROJECT_RULES: &[&str] = &[
     "AGENTS.md",
@@ -39,13 +40,22 @@ pub struct ContextPlan {
 pub struct ContextManager {
     file_access: FileAccessController,
     scanner: SecretScanner,
+    data_dir: PathBuf,
+    enable_semantic_search: bool,
 }
 
 impl ContextManager {
-    pub fn new(file_access: FileAccessController, scanner: SecretScanner) -> Self {
+    pub fn new(
+        file_access: FileAccessController,
+        scanner: SecretScanner,
+        data_dir: PathBuf,
+        enable_semantic_search: bool,
+    ) -> Self {
         Self {
             file_access,
             scanner,
+            data_dir,
+            enable_semantic_search,
         }
     }
 
@@ -115,7 +125,11 @@ impl ContextManager {
 
         if let Some(index) = index {
             let mut results = index.keyword_search(prompt, 8);
-            results.extend(index.semantic_search(prompt, 8));
+            results.extend(if self.enable_semantic_search {
+                VectorIndexCache::semantic_search(&self.data_dir, index, prompt, 8)
+            } else {
+                index.semantic_search(prompt, 8)
+            });
             for result in results {
                 self.add_file(
                     repository_root.as_ref(),
