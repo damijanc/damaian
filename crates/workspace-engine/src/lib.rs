@@ -37,7 +37,7 @@ pub use context_manager::{ContextItem, ContextManager, ContextPlan};
 pub use diff::{DiffLine, Hunk, create_unified_diff, diff_file, reconstruct_content};
 pub use edit::{
     EditOrchestrator, EditProposalResult, GeneratedEdit, PatchStore, parse_generated_edit,
-    patch_diff_text,
+    patch_diff_text, patch_hunk_summary,
 };
 pub use error::{ClientError, Result};
 pub use file_access::{FileAccessController, FileRead};
@@ -51,7 +51,7 @@ pub use model::{
 };
 pub use patch_engine::{
     PatchApplyResult, PatchEngine, PatchRollbackResult, ProposedChange, ProposedFilePatch,
-    ProposedPatch,
+    ProposedPatch, parse_hunk_selection,
 };
 pub use path_policy::PathPolicy;
 pub use render::{render_markdown_to_ansi, render_markdown_to_html};

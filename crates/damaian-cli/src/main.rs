@@ -4,7 +4,7 @@ use std::path::Path;
 use workspace_engine::{
     CommandProposal, CommandRisk, Config, ConfigOverlay, CurlModelTransport, MockModelAdapter,
     OpenAICompatibleAdapter, SearchResult, WorkspaceEngine, command_approval_prompt,
-    patch_diff_text, render_markdown_to_ansi,
+    parse_hunk_selection, patch_diff_text, patch_hunk_summary, render_markdown_to_ansi,
 };
 
 fn usage() -> &'static str {
@@ -28,7 +28,8 @@ fn usage() -> &'static str {
   damaian reject-command <proposal-id>
   damaian ask <repo> <prompt>
   damaian propose-edit <repo> <prompt>
-  damaian apply-patch <repo> <patch-id> [file...]
+  damaian show-patch <repo> <patch-id>
+  damaian apply-patch <repo> <patch-id> [file...] [--hunk-selection <json>]
   damaian reject-patch <patch-id>
 "
 }
@@ -43,6 +44,9 @@ fn main() {
 fn run() -> workspace_engine::Result<()> {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     let no_color_flag = take_flag(&mut args, "--no-color");
+    // Global so positional parsing below never sees the flag or its value;
+    // only `apply-patch` reads it.
+    let hunk_selection_arg = take_option(&mut args, "--hunk-selection");
     let Some(command) = args.first().map(String::as_str) else {
         print!("{}", usage());
         return Ok(());
@@ -314,6 +318,14 @@ fn run() -> workspace_engine::Result<()> {
                     .join(",")
             );
         }
+        "show-patch" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let engine = engine_for_repo(repo)?;
+            let patch_id = require_arg(&args, 2, "<patch-id>")?;
+            let patch = engine.patch_store.load(patch_id)?;
+            print!("{}", patch_diff_text(&patch));
+            print!("{}", patch_hunk_summary(&patch));
+        }
         "apply-patch" => {
             let repo = require_arg(&args, 1, "<repo>")?;
             let engine = engine_for_repo(repo)?;
@@ -323,11 +335,15 @@ fn run() -> workspace_engine::Result<()> {
             } else {
                 None
             };
+            let hunk_selection = hunk_selection_arg
+                .as_deref()
+                .map(parse_hunk_selection)
+                .transpose()?;
             let result = engine.edit_orchestrator.apply_stored_patch(
                 repo,
                 patch_id,
                 approved_paths.as_deref(),
-                None,
+                hunk_selection.as_ref(),
                 "local_user",
             )?;
             println!(
@@ -384,6 +400,22 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// Removes `flag` and its following value from `args` if present, returning
+/// the value. Like [`take_flag`] but for `--name <value>` options, so
+/// positional-argument parsing never sees either token.
+fn take_option(args: &mut Vec<String>, flag: &str) -> Option<String> {
+    let index = args.iter().position(|arg| arg == flag)?;
+    if index + 1 < args.len() {
+        let value = args.remove(index + 1);
+        args.remove(index);
+        Some(value)
+    } else {
+        // Flag with no value: drop it and behave as if it wasn't passed.
+        args.remove(index);
+        None
     }
 }
 

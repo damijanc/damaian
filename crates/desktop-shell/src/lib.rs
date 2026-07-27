@@ -9,7 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use workspace_engine::{
     ChatMessage, ChatTurnResult, Config, CurlModelTransport, OpenAICompatibleAdapter,
     ProposedFilePatch, Session, WorkspaceEngine, command_approval_prompt, normalize_model_provider,
-    normalize_model_reasoning_level, patch_diff_text,
+    normalize_model_reasoning_level, parse_hunk_selection, patch_diff_text,
 };
 
 mod keychain;
@@ -504,7 +504,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .transpose()?;
             let hunk_selection = form
                 .get("hunk_selection")
-                .map(|value| parse_hunk_selection(value))
+                .map(|value| parse_hunk_selection(value).map_err(|error| error.to_string()))
                 .transpose()?;
             let engine = engine_for_repo(&repo)?;
             let result = engine
@@ -1504,12 +1504,6 @@ fn parse_optional_path_list(value: &str) -> Vec<String> {
         .filter(|path| !path.is_empty())
         .map(|path| path.to_string())
         .collect()
-}
-
-/// Parses the `hunk_selection` form field: a JSON object mapping file path to
-/// an array of accepted hunk ids, e.g. `{"src/app.js":["hunk_0","hunk_1"]}`.
-fn parse_hunk_selection(value: &str) -> Result<HashMap<String, Vec<String>>, String> {
-    serde_json::from_str(value).map_err(|error| format!("Invalid hunk selection: {error}"))
 }
 
 fn parse_form(body: &str) -> HashMap<String, String> {

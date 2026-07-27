@@ -1,6 +1,6 @@
 # Feature Spec: CLI Parity for Hunk-Level Patch Apply
 
-Status: Not started
+Status: Done
 Order: 4 of 5
 Related spec sections: `ai_coding_assistant_specification.md` §7.7 (Diff and Patch Engine — "Support hunk-level acceptance when feasible"), §13 (MVP Release Scope — "Basic hunk-level support if implementation cost is acceptable").
 
@@ -58,3 +58,15 @@ In `PatchEngine::apply_patch` (`patch_engine.rs:200`), when `hunk_selection` is 
 
 - Preferred CLI syntax for specifying hunk selection (repeated `--hunks path=ids` flags vs a single `--hunk-selection <json>` blob) — recommend the JSON form for exact parity with the existing desktop wire format and to avoid inventing a second grammar.
 - Whether the "excluded hunks" audit event should fire only for CLI-driven applies (to close the gap) or be added uniformly for both entry points — recommend uniformly, since the desktop path has the same silent gap today.
+
+## 7. Implementation Notes (as built)
+
+Both open questions were resolved as recommended (JSON `--hunk-selection` blob; audit event added uniformly in `PatchEngine::apply_patch` so it covers desktop and CLI alike).
+
+- **Shared parser**: `parse_hunk_selection` moved out of `desktop-shell/src/lib.rs` into `workspace-engine`'s `patch_engine.rs` (returning `ClientError` instead of `String`), re-exported from the crate root. `desktop-shell` now calls the shared version (`.map_err(|e| e.to_string())` at the route boundary); the CLI calls it directly. One parser, one wire format, two entry points.
+- **CLI apply**: `damaian apply-patch <repo> <patch-id> [file...] --hunk-selection <json>` — the JSON is `{path: [hunkId, ...]}`, identical to the desktop `/api/apply-patch` `hunk_selection` field. Parsed via a new global `take_option` helper (mirrors the existing `take_flag` for `--no-color`) so the flag+value are stripped before positional path parsing, letting `--hunk-selection` coexist with the optional `[file...]` args.
+- **Hunk-id viewer**: new `damaian show-patch <repo> <patch-id>` command loads the stored patch (`WorkspaceEngine.patch_store.load`) and prints `patch_diff_text` followed by a new `patch_hunk_summary` (added to `edit.rs`, re-exported) that lists each file's hunk ids next to its 1-based `@@ ... @@` header — e.g. `[hunk_0] @@ -1,5 +1,5 @@`. This is the discovery step the spec flagged as a prerequisite; `patch_diff_text` itself was left unchanged (it's the raw unified diff, also embedded in `/api/propose-edit`'s response).
+- **Audit event**: `PatchEngine::apply_patch` now records a `patch_hunks_rejected` event (actor `user`, with `resourcePath` + comma-joined excluded `hunks`) for each applied file whose `hunk_selection` excluded a strict subset of its hunks. Fires only when something was actually excluded, after the successful `patch_applied` record, so a fully-accepted apply logs nothing extra and a failed apply (e.g. conflict) logs no rejection.
+- No changes to `reconstruct_content`, rollback, or the desktop UI — all reused unchanged, so on-disk output for a given hunk selection is identical across CLI and desktop by construction.
+
+**Verification**: 3 new tests in `crates/workspace-engine/tests/foundation.rs` — a partial-hunk apply that asserts the `patch_hunks_rejected` audit line names the excluded hunk id and path; a full-hunk apply that asserts *no* rejection event fires; and a `parse_hunk_selection` round-trip/error test. Plus a manual end-to-end CLI run: `propose-edit` → `show-patch` (saw `hunk_0`/`hunk_1`) → `apply-patch --hunk-selection '{"app.txt":["hunk_1"]}'`, confirmed on disk that only the second change landed (line 2 untouched, line 28 changed) and that the real audit log recorded `patch_hunks_rejected` with `hunks: hunk_0`. `workspace-engine` test count: 65 → 68; full `cargo test --workspace` green, zero regressions.

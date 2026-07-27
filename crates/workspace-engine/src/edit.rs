@@ -467,6 +467,36 @@ pub fn patch_diff_text(patch: &ProposedPatch) -> String {
     output
 }
 
+/// Lists each file's hunk ids alongside its `@@ ... @@` header, so a CLI
+/// user can see the hunk ids to pass to `apply-patch --hunk-selection`.
+/// Line numbers are 1-based to match the desktop hunk headers and standard
+/// unified-diff convention.
+pub fn patch_hunk_summary(patch: &ProposedPatch) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "Patch: {}\nSummary: {}\n",
+        patch.id, patch.summary
+    ));
+    for file in &patch.files {
+        output.push_str(&format!("\nFile: {} ({})\n", file.path, file.status));
+        if file.hunks.is_empty() {
+            output.push_str("  (no selectable hunks)\n");
+            continue;
+        }
+        for hunk in &file.hunks {
+            output.push_str(&format!(
+                "  [{}] @@ -{},{} +{},{} @@\n",
+                hunk.id,
+                hunk.old_start + 1,
+                hunk.old_lines,
+                hunk.new_start + 1,
+                hunk.new_lines
+            ));
+        }
+    }
+    output
+}
+
 fn edit_system_prompt() -> String {
     format!(
         "You are a coding assistant that proposes edits only. Return exactly this format:\n{EDIT_FORMAT_HEADER}\nSUMMARY: short summary\nFILE: relative/path.ext\nSTATUS: modified\nCONTENT:\nfull replacement file content\nEND_FILE\nEND_PATCH\nDo not include Markdown fences. Do not include secrets. Use repository-relative paths only."
