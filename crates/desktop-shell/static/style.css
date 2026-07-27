@@ -1872,6 +1872,37 @@ button:disabled {
   min-height: 82px;
 }
 
+.settings-page-hint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0 0 14px;
+  max-width: 60ch;
+}
+
+.field-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.field-checkbox input {
+  width: auto;
+  margin: 0;
+}
+
+.mcp-stdio-fields,
+.mcp-http-fields {
+  display: grid;
+  gap: 10px;
+}
+
+#mcp-test-result:empty {
+  display: none;
+}
+
 .key-status {
   border: 1px solid var(--line);
   border-radius: 999px;

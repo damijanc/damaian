@@ -63,6 +63,13 @@ pub struct Config {
     pub model_api_key_env: String,
     pub model_reasoning_level: String,
     pub model_providers: Vec<ModelProviderConfig>,
+    /// Global kill-switch for MCP. Defaults to true; an admin overlay can set
+    /// it false to disable all MCP servers regardless of user config.
+    pub mcp_enabled: bool,
+    /// Admin-oriented allowlist of permitted MCP server ids. When non-empty,
+    /// only listed servers are offered even if the user enabled others.
+    pub mcp_server_allowlist: Vec<String>,
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +94,66 @@ pub struct ModelProviderConfigOverlay {
     pub api_key_env: Option<String>,
     pub models: Option<Vec<String>>,
     pub supports_native_tools: Option<bool>,
+}
+
+/// How the client talks to an MCP server. `Stdio` spawns a local subprocess
+/// and speaks newline-delimited JSON-RPC over its stdin/stdout; `Http` posts
+/// JSON-RPC to a remote Streamable-HTTP endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    Http,
+}
+
+impl McpTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            McpTransport::Stdio => "stdio",
+            McpTransport::Http => "http",
+        }
+    }
+}
+
+/// A user-configured MCP server. Mirrors [`ModelProviderConfig`] in how it is
+/// parsed, overlaid (upsert-by-id), and serialized. Secrets (`auth_token_env`)
+/// are keychain references, never plaintext — same rule as model API keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerConfig {
+    pub id: String,
+    pub label: String,
+    pub transport: McpTransport,
+    /// stdio only: the executable to spawn.
+    pub command: String,
+    /// stdio only: arguments passed to `command`.
+    pub args: Vec<String>,
+    /// stdio only: extra environment variables (`KEY=VALUE`) for the child.
+    pub env: Vec<(String, String)>,
+    /// http only: the Streamable-HTTP endpoint URL.
+    pub url: String,
+    /// http only: `keychain:<account>` (or env var name) resolving to a bearer
+    /// token sent as `Authorization: Bearer <token>`. Empty means no auth.
+    pub auth_token_env: String,
+    /// Off by default: a newly added server is only offered to the model once
+    /// the user turns it on.
+    pub enabled: bool,
+    /// On by default: gate every `tools/call` on this server through the
+    /// approval flow, since MCP tools can have arbitrary external side effects.
+    pub require_approval: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpServerConfigOverlay {
+    pub id: String,
+    pub label: Option<String>,
+    pub transport: Option<McpTransport>,
+    pub command: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub env: Option<Vec<(String, String)>>,
+    pub url: Option<String>,
+    pub auth_token_env: Option<String>,
+    pub enabled: Option<bool>,
+    pub require_approval: Option<bool>,
 }
 
 impl Config {
@@ -229,6 +296,15 @@ impl Config {
         if let Some(value) = overlay.model_reasoning_level {
             self.model_reasoning_level = value;
         }
+        if let Some(value) = overlay.mcp_enabled {
+            self.mcp_enabled = value;
+        }
+        if let Some(value) = overlay.mcp_server_allowlist {
+            self.mcp_server_allowlist = value;
+        }
+        for server in overlay.mcp_servers {
+            self.upsert_mcp_server(server);
+        }
     }
 
     /// Whether the active model provider is configured to use native
@@ -299,6 +375,78 @@ impl Config {
             api_key_env: overlay.api_key_env.unwrap_or_default(),
             models: overlay.models.unwrap_or_default(),
             supports_native_tools: overlay.supports_native_tools.unwrap_or(false),
+            id,
+        });
+    }
+
+    pub fn mcp_server_config(&self, id: &str) -> Option<&McpServerConfig> {
+        self.mcp_servers.iter().find(|server| server.id == id)
+    }
+
+    /// The MCP servers whose tools should actually be offered to the model:
+    /// requires the global switch on, the server enabled, and — when an admin
+    /// allowlist is set — the server to appear on it.
+    pub fn active_mcp_servers(&self) -> Vec<&McpServerConfig> {
+        if !self.mcp_enabled {
+            return Vec::new();
+        }
+        self.mcp_servers
+            .iter()
+            .filter(|server| server.enabled)
+            .filter(|server| {
+                self.mcp_server_allowlist.is_empty()
+                    || self.mcp_server_allowlist.contains(&server.id)
+            })
+            .collect()
+    }
+
+    fn upsert_mcp_server(&mut self, overlay: McpServerConfigOverlay) {
+        if let Some(server) = self
+            .mcp_servers
+            .iter_mut()
+            .find(|server| server.id == overlay.id)
+        {
+            if let Some(value) = overlay.label {
+                server.label = value;
+            }
+            if let Some(value) = overlay.transport {
+                server.transport = value;
+            }
+            if let Some(value) = overlay.command {
+                server.command = value;
+            }
+            if let Some(value) = overlay.args {
+                server.args = value;
+            }
+            if let Some(value) = overlay.env {
+                server.env = value;
+            }
+            if let Some(value) = overlay.url {
+                server.url = value;
+            }
+            if let Some(value) = overlay.auth_token_env {
+                server.auth_token_env = value;
+            }
+            if let Some(value) = overlay.enabled {
+                server.enabled = value;
+            }
+            if let Some(value) = overlay.require_approval {
+                server.require_approval = value;
+            }
+            return;
+        }
+
+        let id = overlay.id;
+        self.mcp_servers.push(McpServerConfig {
+            label: overlay.label.unwrap_or_else(|| id.clone()),
+            transport: overlay.transport.unwrap_or_default(),
+            command: overlay.command.unwrap_or_default(),
+            args: overlay.args.unwrap_or_default(),
+            env: overlay.env.unwrap_or_default(),
+            url: overlay.url.unwrap_or_default(),
+            auth_token_env: overlay.auth_token_env.unwrap_or_default(),
+            enabled: overlay.enabled.unwrap_or(false),
+            require_approval: overlay.require_approval.unwrap_or(true),
             id,
         });
     }
@@ -394,6 +542,17 @@ impl Config {
         for provider in &self.model_providers {
             push_model_provider_config(&mut output, provider);
         }
+        push_line(&mut output, "mcp_enabled", &self.mcp_enabled.to_string());
+        if !self.mcp_server_allowlist.is_empty() {
+            push_line(
+                &mut output,
+                "mcp_server_allowlist",
+                &join_list(&self.mcp_server_allowlist),
+            );
+        }
+        for server in &self.mcp_servers {
+            push_mcp_server_config(&mut output, server);
+        }
         output
     }
 }
@@ -431,6 +590,9 @@ impl Default for Config {
             model_api_key_env: "OPENAI_API_KEY".to_string(),
             model_reasoning_level: "default".to_string(),
             model_providers: Vec::new(),
+            mcp_enabled: true,
+            mcp_server_allowlist: Vec::new(),
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -460,6 +622,9 @@ pub struct ConfigOverlay {
     pub model_api_key_env: Option<String>,
     pub model_reasoning_level: Option<String>,
     pub model_providers: Vec<ModelProviderConfigOverlay>,
+    pub mcp_enabled: Option<bool>,
+    pub mcp_server_allowlist: Option<Vec<String>>,
+    pub mcp_servers: Vec<McpServerConfigOverlay>,
 }
 
 impl ConfigOverlay {
@@ -506,6 +671,9 @@ impl ConfigOverlay {
         if let Some(provider_key) = key.strip_prefix("model_provider.") {
             return self.set_model_provider_config(provider_key, value);
         }
+        if let Some(server_key) = key.strip_prefix("mcp_server.") {
+            return self.set_mcp_server_config(server_key, value);
+        }
         match key {
             "data_dir" => self.data_dir = Some(PathBuf::from(value)),
             "max_file_bytes" => self.max_file_bytes = Some(parse_u64(key, value)?),
@@ -544,6 +712,15 @@ impl ConfigOverlay {
             }
             "model_reasoning_level" => {
                 self.model_reasoning_level = Some(normalize_model_reasoning_level(value)?)
+            }
+            "mcp_enabled" => self.mcp_enabled = Some(parse_bool(key, value)?),
+            "mcp_server_allowlist" => {
+                self.mcp_server_allowlist = Some(
+                    split_list(value)
+                        .iter()
+                        .map(|id| normalize_mcp_server_id(id))
+                        .collect::<Result<Vec<_>>>()?,
+                )
             }
             _ => {
                 return Err(ClientError::InvalidInput(format!(
@@ -586,6 +763,44 @@ impl ConfigOverlay {
             _ => {
                 return Err(ClientError::InvalidInput(format!(
                     "Unknown model provider config key: model_provider.{provider_key}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn set_mcp_server_config(&mut self, server_key: &str, value: &str) -> Result<()> {
+        let Some((raw_id, field)) = server_key.rsplit_once('.') else {
+            return Err(ClientError::InvalidInput(format!(
+                "Invalid mcp server config key: mcp_server.{server_key}"
+            )));
+        };
+        let id = normalize_mcp_server_id(raw_id)?;
+        let index = if let Some(index) = self.mcp_servers.iter().position(|server| server.id == id) {
+            index
+        } else {
+            self.mcp_servers.push(McpServerConfigOverlay {
+                id: id.clone(),
+                ..McpServerConfigOverlay::default()
+            });
+            self.mcp_servers.len() - 1
+        };
+        let server = &mut self.mcp_servers[index];
+        match field {
+            "label" => server.label = Some(value.to_string()),
+            "transport" => server.transport = Some(parse_mcp_transport(value)?),
+            "command" => server.command = Some(value.to_string()),
+            "args" => server.args = Some(split_list(value)),
+            "env" => server.env = Some(split_env(value)),
+            "url" => server.url = Some(value.trim_end_matches('/').to_string()),
+            "auth_token_env" => {
+                server.auth_token_env = Some(parse_model_api_key_reference(value)?)
+            }
+            "enabled" => server.enabled = Some(parse_bool(field, value)?),
+            "require_approval" => server.require_approval = Some(parse_bool(field, value)?),
+            _ => {
+                return Err(ClientError::InvalidInput(format!(
+                    "Unknown mcp server config key: mcp_server.{server_key}"
                 )));
             }
         }
@@ -674,6 +889,15 @@ impl ConfigOverlay {
         }
         for provider in &self.model_providers {
             push_model_provider_overlay(&mut output, provider);
+        }
+        if let Some(value) = self.mcp_enabled {
+            push_line(&mut output, "mcp_enabled", &value.to_string());
+        }
+        if let Some(value) = &self.mcp_server_allowlist {
+            push_line(&mut output, "mcp_server_allowlist", &join_list(value));
+        }
+        for server in &self.mcp_servers {
+            push_mcp_server_overlay(&mut output, server);
         }
         output
     }
@@ -786,6 +1010,141 @@ fn push_model_provider_overlay(output: &mut String, provider: &ModelProviderConf
             &value.to_string(),
         );
     }
+}
+
+fn push_mcp_server_config(output: &mut String, server: &McpServerConfig) {
+    let id = &server.id;
+    push_line(output, &format!("mcp_server.{id}.label"), &server.label);
+    push_line(
+        output,
+        &format!("mcp_server.{id}.transport"),
+        server.transport.as_str(),
+    );
+    match server.transport {
+        McpTransport::Stdio => {
+            push_line(output, &format!("mcp_server.{id}.command"), &server.command);
+            push_line(
+                output,
+                &format!("mcp_server.{id}.args"),
+                &join_list(&server.args),
+            );
+            push_line(
+                output,
+                &format!("mcp_server.{id}.env"),
+                &join_env(&server.env),
+            );
+        }
+        McpTransport::Http => {
+            push_line(output, &format!("mcp_server.{id}.url"), &server.url);
+            push_line(
+                output,
+                &format!("mcp_server.{id}.auth_token_env"),
+                &server.auth_token_env,
+            );
+        }
+    }
+    push_line(
+        output,
+        &format!("mcp_server.{id}.enabled"),
+        &server.enabled.to_string(),
+    );
+    push_line(
+        output,
+        &format!("mcp_server.{id}.require_approval"),
+        &server.require_approval.to_string(),
+    );
+}
+
+fn push_mcp_server_overlay(output: &mut String, server: &McpServerConfigOverlay) {
+    let id = &server.id;
+    if let Some(value) = &server.label {
+        push_line(output, &format!("mcp_server.{id}.label"), value);
+    }
+    if let Some(value) = server.transport {
+        push_line(output, &format!("mcp_server.{id}.transport"), value.as_str());
+    }
+    if let Some(value) = &server.command {
+        push_line(output, &format!("mcp_server.{id}.command"), value);
+    }
+    if let Some(value) = &server.args {
+        push_line(output, &format!("mcp_server.{id}.args"), &join_list(value));
+    }
+    if let Some(value) = &server.env {
+        push_line(output, &format!("mcp_server.{id}.env"), &join_env(value));
+    }
+    if let Some(value) = &server.url {
+        push_line(output, &format!("mcp_server.{id}.url"), value);
+    }
+    if let Some(value) = &server.auth_token_env {
+        push_line(output, &format!("mcp_server.{id}.auth_token_env"), value);
+    }
+    if let Some(value) = server.enabled {
+        push_line(
+            output,
+            &format!("mcp_server.{id}.enabled"),
+            &value.to_string(),
+        );
+    }
+    if let Some(value) = server.require_approval {
+        push_line(
+            output,
+            &format!("mcp_server.{id}.require_approval"),
+            &value.to_string(),
+        );
+    }
+}
+
+/// Validates and normalizes an MCP server id. Kept to the same charset as
+/// model-provider ids (lowercase alphanumeric plus `-`/`.`); notably `_` is
+/// disallowed so the `mcp__<id>__<tool>` tool namespace stays unambiguous to
+/// split on `__`.
+pub fn normalize_mcp_server_id(value: &str) -> Result<String> {
+    let id = value.trim().to_ascii_lowercase();
+    if id.is_empty() {
+        return Err(ClientError::InvalidInput(
+            "mcp server id is required".to_string(),
+        ));
+    }
+    if id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '.'))
+    {
+        Ok(id)
+    } else {
+        Err(ClientError::InvalidInput(
+            "mcp server id can contain only letters, numbers, dots, and dashes".to_string(),
+        ))
+    }
+}
+
+pub fn parse_mcp_transport(value: &str) -> Result<McpTransport> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "stdio" | "local" => Ok(McpTransport::Stdio),
+        "http" | "https" | "sse" | "streamable-http" | "remote" => Ok(McpTransport::Http),
+        _ => Err(ClientError::InvalidInput(
+            "mcp server transport must be stdio or http".to_string(),
+        )),
+    }
+}
+
+fn split_env(value: &str) -> Vec<(String, String)> {
+    value
+        .split('|')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .filter_map(|item| {
+            item.split_once('=')
+                .map(|(key, val)| (key.trim().to_string(), val.trim().to_string()))
+        })
+        .collect()
+}
+
+fn join_env(values: &[(String, String)]) -> String {
+    values
+        .iter()
+        .map(|(key, val)| format!("{key}={val}"))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 pub fn normalize_model_provider(value: &str) -> Result<String> {

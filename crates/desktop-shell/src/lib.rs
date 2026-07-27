@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use workspace_engine::{
-    ChatMessage, ChatTurnResult, Config, CurlModelTransport, OpenAICompatibleAdapter,
-    ProposedFilePatch, Session, WorkspaceEngine, command_approval_prompt, normalize_model_provider,
-    normalize_model_reasoning_level, parse_hunk_selection, patch_diff_text,
+    ChatMessage, ChatTurnResult, Config, CurlModelTransport, McpClient, McpServerConfig,
+    McpTokenResolver, McpTransport, OpenAICompatibleAdapter, ProposedFilePatch, Session,
+    WorkspaceEngine, command_approval_prompt, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
 };
 
 mod keychain;
@@ -803,6 +804,20 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 ),
             )
         }
+        ("POST", "/api/mcp-test") => {
+            let form = parse_form(&request.body);
+            let body = match mcp_test_connection(&form) {
+                Ok(tools) => format!(
+                    "{{\"ok\":true,\"toolCount\":{},\"tools\":[{}]}}",
+                    tools.len(),
+                    json_string_array(&tools)
+                ),
+                Err(error) => {
+                    format!("{{\"ok\":false,\"error\":\"{}\"}}", escape_json(&error))
+                }
+            };
+            write_response(stream, &request, 200, "application/json", &body)
+        }
         _ => write_response(
             stream,
             &request,
@@ -874,7 +889,10 @@ fn run_resume_command_request(
     let repo = required_form(form, "repo")?;
     let proposal_id = required_form(form, "proposal_id")?;
     let approved = form.get("approved").map(String::as_str) == Some("true");
-    let engine = engine_for_repo(&repo)?;
+    let mut engine = engine_for_repo(&repo)?;
+    engine
+        .chat_orchestrator
+        .set_mcp_token_resolver(mcp_token_resolver());
 
     if !engine
         .chat_orchestrator
@@ -914,7 +932,10 @@ fn run_chat_request(
         .get("session_id")
         .map(String::as_str)
         .filter(|value| !value.is_empty());
-    let engine = engine_for_repo_with_model_options(&repo, form)?;
+    let mut engine = engine_for_repo_with_model_options(&repo, form)?;
+    engine
+        .chat_orchestrator
+        .set_mcp_token_resolver(mcp_token_resolver());
     let context_files = form
         .get("context_files")
         .map(|value| validate_context_files(&engine, &repo, value))
@@ -1014,6 +1035,120 @@ fn resolve_model_api_key(reference: &str) -> Result<String, String> {
     } else {
         env::var(reference).map_err(|_| format!("{reference} is required"))
     }
+}
+
+/// Resolver handed to the chat orchestrator so it can turn an MCP server's
+/// `auth_token_env` reference into a bearer token via the keychain (or an
+/// environment variable), without the engine ever touching the keychain
+/// directly. Mirrors [`resolve_model_api_key`], but returns `None` instead of
+/// erroring so a missing token just means "no auth header".
+fn mcp_token_resolver() -> McpTokenResolver {
+    McpTokenResolver::new(|reference| resolve_mcp_token(reference))
+}
+
+fn resolve_mcp_token(reference: &str) -> Option<String> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return None;
+    }
+    if let Some(account) = keychain::account_from_reference(reference) {
+        if let Some(token) = cached_model_api_key(account) {
+            return Some(token);
+        }
+        if let Ok(token) = keychain::read_password(account) {
+            remember_model_api_key(account, &token);
+            return Some(token);
+        }
+        return None;
+    }
+    env::var(reference).ok()
+}
+
+/// Builds a one-off [`McpServerConfig`] (plus resolved token) from the MCP
+/// editor form, for the Test-connection endpoint. Accepts either a raw
+/// `auth_token` (typed but not yet saved) or an `auth_token_env` reference to
+/// resolve from the keychain.
+fn mcp_config_from_form(
+    form: &HashMap<String, String>,
+) -> Result<(McpServerConfig, Option<String>), String> {
+    let raw_id = form
+        .get("id")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("test");
+    let id = normalize_mcp_server_id(raw_id).map_err(|error| error.to_string())?;
+    let transport = parse_mcp_transport(
+        form.get("transport").map(String::as_str).unwrap_or("stdio"),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let split = |value: &str| {
+        value
+            .split('|')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let env = form
+        .get("env")
+        .map(|value| {
+            value
+                .split('|')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .filter_map(|item| {
+                    item.split_once('=')
+                        .map(|(key, val)| (key.trim().to_string(), val.trim().to_string()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let auth_token_env = form.get("auth_token_env").cloned().unwrap_or_default();
+    let token = if let Some(raw) = form
+        .get("auth_token")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        Some(raw)
+    } else if !auth_token_env.trim().is_empty() {
+        resolve_mcp_token(&auth_token_env)
+    } else {
+        None
+    };
+
+    let config = McpServerConfig {
+        label: form.get("label").cloned().unwrap_or_else(|| id.clone()),
+        transport,
+        command: form.get("command").cloned().unwrap_or_default(),
+        args: form.get("args").map(|value| split(value)).unwrap_or_default(),
+        env,
+        url: form
+            .get("url")
+            .map(|value| value.trim_end_matches('/').to_string())
+            .unwrap_or_default(),
+        auth_token_env,
+        enabled: true,
+        require_approval: true,
+        id,
+    };
+    Ok((config, token))
+}
+
+/// Connects to the server described by the form and lists its tools. Returns
+/// the discovered tool names on success.
+fn mcp_test_connection(form: &HashMap<String, String>) -> Result<Vec<String>, String> {
+    let (config, token) = mcp_config_from_form(form)?;
+    if config.transport == McpTransport::Stdio && config.command.trim().is_empty() {
+        return Err("A command is required for a local (stdio) server.".to_string());
+    }
+    if config.transport == McpTransport::Http && config.url.trim().is_empty() {
+        return Err("A URL is required for a remote (http) server.".to_string());
+    }
+    let mut client = McpClient::connect(&config, token).map_err(|error| error.to_string())?;
+    let tools = client.list_tools().map_err(|error| error.to_string())?;
+    Ok(tools.into_iter().map(|tool| tool.name).collect())
 }
 
 fn model_api_key_cache() -> &'static Mutex<HashMap<String, String>> {

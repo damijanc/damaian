@@ -15,6 +15,7 @@ pub mod ignore;
 pub mod index_cache;
 pub mod indexer;
 pub mod language;
+pub mod mcp;
 pub mod model;
 pub mod patch_engine;
 pub mod path_policy;
@@ -26,12 +27,15 @@ pub mod vector_index;
 pub mod workspace_engine;
 
 pub use audit::AuditLog;
-pub use chat::{AgentCommandProposal, AgentPatchProposal, ChatOrchestrator, ChatTurnResult};
+pub use chat::{
+    AgentCommandProposal, AgentPatchProposal, ChatOrchestrator, ChatTurnResult, McpTokenResolver,
+};
 pub use command_policy::{CommandClassification, CommandPolicy, CommandRisk};
 pub use command_runner::{CommandExecution, CommandRunner};
 pub use config::{
-    Config, ConfigOverlay, ModelProviderConfig, ModelProviderConfigOverlay,
-    normalize_model_provider, normalize_model_reasoning_level,
+    Config, ConfigOverlay, McpServerConfig, McpServerConfigOverlay, McpTransport,
+    ModelProviderConfig, ModelProviderConfigOverlay, normalize_mcp_server_id,
+    normalize_model_provider, normalize_model_reasoning_level, parse_mcp_transport,
 };
 pub use context_manager::{ContextItem, ContextManager, ContextPlan};
 pub use diff::{DiffLine, Hunk, create_unified_diff, diff_file, reconstruct_content};
@@ -43,6 +47,10 @@ pub use error::{ClientError, Result};
 pub use file_access::{FileAccessController, FileRead};
 pub use git_service::{GitFileStatus, GitService, GitStatus};
 pub use index_cache::IndexCache;
+pub use mcp::{
+    McpClient, McpRuntime, McpServerRuntime, McpTool, McpToolResult, namespaced_tool_name,
+    parse_namespaced_tool_name,
+};
 pub use indexer::{ProjectIndexer, RepositoryIndex, SearchResult};
 pub use model::{
     CurlModelTransport, MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage,

@@ -1,6 +1,6 @@
 use crate::audit::AuditLog;
 use crate::command_runner::CommandExecution;
-use crate::config::Config;
+use crate::config::{Config, McpTransport};
 use crate::context_manager::ContextManager;
 use crate::edit::{GeneratedEdit, PatchStore};
 use crate::error::{ClientError, Result};
@@ -8,6 +8,7 @@ use crate::file_access::FileAccessController;
 use crate::git_service::{GitService, GitStatus};
 use crate::hash::create_id;
 use crate::indexer::{ProjectIndexer, SearchResult};
+use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
 use crate::model::{ModelAdapter, ModelMessage, ModelRequest, ModelRun, ToolCall, ToolDefinition};
 use crate::patch_engine::{PatchEngine, ProposedChange, ProposedFilePatch, ProposedPatch};
 use crate::secret_scanner::SecretScanner;
@@ -19,6 +20,30 @@ use crate::vector_index::VectorIndexCache;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// Resolves an MCP server's `auth_token_env` reference (`keychain:<account>`
+/// or an environment variable name) to the actual bearer token. The engine
+/// never reads the keychain itself; the desktop shell injects a resolver that
+/// does. Wrapped so [`ChatOrchestrator`] can stay `Debug`/`Clone`.
+#[derive(Clone)]
+pub struct McpTokenResolver(Arc<dyn Fn(&str) -> Option<String> + Send + Sync>);
+
+impl McpTokenResolver {
+    pub fn new(resolver: impl Fn(&str) -> Option<String> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(resolver))
+    }
+
+    fn resolve(&self, reference: &str) -> Option<String> {
+        (self.0)(reference)
+    }
+}
+
+impl std::fmt::Debug for McpTokenResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("McpTokenResolver(..)")
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCommandProposal {
@@ -69,6 +94,7 @@ pub struct ChatOrchestrator {
     git: GitService,
     patch_engine: PatchEngine,
     patch_store: PatchStore,
+    mcp_token_resolver: Option<McpTokenResolver>,
 }
 
 impl ChatOrchestrator {
@@ -101,7 +127,60 @@ impl ChatOrchestrator {
             git,
             patch_engine,
             patch_store,
+            mcp_token_resolver: None,
         }
+    }
+
+    /// Injects the resolver used to turn MCP `auth_token_env` references into
+    /// bearer tokens. The desktop shell calls this with a keychain-backed
+    /// resolver; callers that don't wire MCP (or use only stdio servers) can
+    /// leave it unset.
+    pub fn set_mcp_token_resolver(&mut self, resolver: McpTokenResolver) {
+        self.mcp_token_resolver = Some(resolver);
+    }
+
+    /// Builds the per-turn MCP runtime from the active server config, resolving
+    /// each HTTP server's auth token up front. Returns an inert runtime when no
+    /// servers are active (the common case), so there's zero overhead and no
+    /// behavior change for users who don't configure MCP.
+    fn build_mcp_runtime(&self) -> McpRuntime {
+        let servers: Vec<McpServerRuntime> = self
+            .config
+            .active_mcp_servers()
+            .into_iter()
+            .map(|server| {
+                let auth_token = if server.transport == McpTransport::Http {
+                    self.resolve_mcp_token(&server.auth_token_env)
+                } else {
+                    None
+                };
+                McpServerRuntime {
+                    config: server.clone(),
+                    auth_token,
+                }
+            })
+            .collect();
+        if servers.is_empty() {
+            McpRuntime::disabled()
+        } else {
+            McpRuntime::new(servers, self.audit_log.clone())
+        }
+    }
+
+    fn resolve_mcp_token(&self, reference: &str) -> Option<String> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return None;
+        }
+        if let Some(resolver) = &self.mcp_token_resolver {
+            return resolver.resolve(reference);
+        }
+        // Fallback with no injected resolver: only plain env vars can be read;
+        // keychain references require the desktop shell's resolver.
+        if reference.starts_with("keychain:") {
+            return None;
+        }
+        std::env::var(reference).ok()
     }
 
     pub fn ask(
@@ -208,31 +287,62 @@ impl ChatOrchestrator {
         let pending = self.pending_commands.take(proposal_id)?;
         let repository_root = PathBuf::from(&pending.repository_root);
         let mut messages = pending.messages;
-        let proposal = self.command_store.load_proposal(proposal_id)?;
-        let command_request = CommandRequest {
-            command: proposal.command.clone(),
-            reason: proposal.reason.clone(),
-        };
 
-        let tool_result_content = if approved {
-            let record = self
-                .validation_orchestrator
-                .run_proposal(proposal_id, true, approved_by)?;
-            sandbox_command_context(&record.execution)
+        // Two kinds of paused action resume through here: a paused MCP tool
+        // call (identified by `mcp_call`) or the original shell-command path.
+        let (assistant_summary, tool_result_content) = if let Some(mcp_call) = &pending.mcp_call {
+            let summary = mcp_call_summary(&mcp_call.server_id, &mcp_call.tool_name);
+            let content = if approved {
+                let mut mcp = self.build_mcp_runtime();
+                match mcp.call_tool(
+                    &mcp_call.server_id,
+                    &mcp_call.tool_name,
+                    &mcp_call.arguments_json,
+                ) {
+                    Ok(result) => {
+                        let text = self.scanner.redact(&result.text).text;
+                        if result.is_error {
+                            format!("MCP tool reported an error:\n{text}")
+                        } else {
+                            text
+                        }
+                    }
+                    Err(error) => format!("MCP tool call failed: {error}"),
+                }
+            } else {
+                format!(
+                    "The user declined to run the MCP tool `{}` on server `{}`. Do not request it again; answer using what you already know, noting the limitation if it matters.",
+                    mcp_call.tool_name, mcp_call.server_id
+                )
+            };
+            (summary, content)
         } else {
-            self.validation_orchestrator
-                .reject_proposal(proposal_id, approved_by)?;
-            format!(
-                "The user declined to run `{}`. Do not request it again; answer using what you already know, noting the limitation if it matters.",
-                command_request.command
-            )
+            let proposal = self.command_store.load_proposal(proposal_id)?;
+            let command_request = CommandRequest {
+                command: proposal.command.clone(),
+                reason: proposal.reason.clone(),
+            };
+            let content = if approved {
+                let record = self
+                    .validation_orchestrator
+                    .run_proposal(proposal_id, true, approved_by)?;
+                sandbox_command_context(&record.execution)
+            } else {
+                self.validation_orchestrator
+                    .reject_proposal(proposal_id, approved_by)?;
+                format!(
+                    "The user declined to run `{}`. Do not request it again; answer using what you already know, noting the limitation if it matters.",
+                    command_request.command
+                )
+            };
+            (tool_call_summary(&command_request), content)
         };
 
         self.session_store.append_message(
             &pending.session.id,
             Some(&pending.task.id),
             "assistant",
-            &tool_call_summary(&command_request),
+            &assistant_summary,
         )?;
         self.session_store.append_message(
             &pending.session.id,
@@ -296,15 +406,22 @@ impl ChatOrchestrator {
         model_adapter: &mut dyn ModelAdapter,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<ChatTurnResult> {
+        // Per-turn MCP runtime: connects lazily, caches tool lists and
+        // connections for this turn, and tears everything down on drop.
+        let mut mcp = self.build_mcp_runtime();
         let native_tools = self.config.supports_native_tools().then(|| {
-            vec![
+            let mut tools = vec![
                 run_command_tool_definition(),
                 propose_patch_tool_definition(),
                 read_file_tool_definition(),
                 search_codebase_tool_definition(),
                 read_git_status_tool_definition(),
                 read_git_diff_tool_definition(),
-            ]
+            ];
+            // Best-effort: discovered MCP tools are namespaced (mcp__<server>__<tool>)
+            // and appended; a server that fails to connect is simply skipped.
+            tools.extend(mcp.tool_definitions());
+            tools
         });
 
         let (final_run, response, command_proposal, patch_proposal) = loop {
@@ -398,6 +515,7 @@ impl ChatOrchestrator {
                             messages: messages.clone(),
                             matched_tool_call: matched_tool_call.clone(),
                             last_content: redacted.clone(),
+                            mcp_call: None,
                         })?;
                         let mut proposal_run = model_run;
                         proposal_run.content = response.clone();
@@ -503,6 +621,61 @@ impl ChatOrchestrator {
                         content,
                     )
                 }
+                ToolAction::McpCall {
+                    server_id,
+                    tool_name,
+                    arguments_json,
+                } => {
+                    // MCP tools reach an external service and can have side
+                    // effects, so unless the server is marked no-approval we
+                    // pause the turn exactly like a command needing approval:
+                    // persist state keyed by a fresh proposal id and hand the
+                    // user a proposal to accept or decline.
+                    if mcp.requires_approval(&server_id) {
+                        let proposal_id = create_id("mcp");
+                        let proposal = mcp_approval_proposal(
+                            &proposal_id,
+                            &server_id,
+                            &tool_name,
+                            &arguments_json,
+                        );
+                        let response = proposal.prompt.clone();
+                        self.pending_commands.save(&PendingChatTurn {
+                            proposal_id,
+                            session: session.clone(),
+                            task: task.clone(),
+                            repository_root: repository_root.to_string_lossy().to_string(),
+                            context_files: context_files.clone(),
+                            round,
+                            messages: messages.clone(),
+                            matched_tool_call: matched_tool_call.clone(),
+                            last_content: redacted.clone(),
+                            mcp_call: Some(PendingMcpCall {
+                                server_id,
+                                tool_name,
+                                arguments_json,
+                            }),
+                        })?;
+                        let mut proposal_run = model_run;
+                        proposal_run.content = response.clone();
+                        break (proposal_run, response, Some(proposal), None);
+                    }
+
+                    // No approval required: run it now and feed the result back.
+                    let summary = mcp_call_summary(&server_id, &tool_name);
+                    let content = match mcp.call_tool(&server_id, &tool_name, &arguments_json) {
+                        Ok(result) => {
+                            let text = self.scanner.redact(&result.text).text;
+                            if result.is_error {
+                                format!("MCP tool reported an error:\n{text}")
+                            } else {
+                                text
+                            }
+                        }
+                        Err(error) => format!("MCP tool call failed: {error}"),
+                    };
+                    (summary, content)
+                }
             };
 
             // Persist the tool call and its result so later turns in this
@@ -594,6 +767,18 @@ struct PendingChatTurn {
     messages: Vec<ModelMessage>,
     matched_tool_call: Option<ToolCall>,
     last_content: String,
+    /// Present when the paused action is an MCP tool call rather than a shell
+    /// command; carries everything needed to execute it on resume. `#[serde(default)]`
+    /// keeps older on-disk pending turns (which predate MCP) loadable.
+    #[serde(default)]
+    mcp_call: Option<PendingMcpCall>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingMcpCall {
+    server_id: String,
+    tool_name: String,
+    arguments_json: String,
 }
 
 #[derive(Debug, Clone)]
@@ -733,6 +918,11 @@ enum ToolAction {
     ReadGitDiff {
         staged: bool,
     },
+    McpCall {
+        server_id: String,
+        tool_name: String,
+        arguments_json: String,
+    },
 }
 
 /// The tools offered to providers configured with `supports_native_tools`.
@@ -836,7 +1026,13 @@ fn tool_action_from_call(call: &ToolCall) -> Option<ToolAction> {
                 .unwrap_or(false);
             Some(ToolAction::ReadGitDiff { staged })
         }
-        _ => None,
+        name => parse_namespaced_tool_name(name).map(|(server_id, tool_name)| {
+            ToolAction::McpCall {
+                server_id,
+                tool_name,
+                arguments_json: call.arguments_json.clone(),
+            }
+        }),
     }
 }
 
@@ -953,6 +1149,34 @@ fn agent_command_proposal(proposal: &CommandProposal) -> AgentCommandProposal {
         risk: proposal.risk.as_str().to_string(),
         requires_approval: proposal.requires_approval,
         blocked: proposal.blocked,
+    }
+}
+
+fn mcp_call_summary(server_id: &str, tool_name: &str) -> String {
+    format!("Called MCP tool `{tool_name}` on server `{server_id}`")
+}
+
+/// Builds the approval proposal surfaced to the user for a pending MCP tool
+/// call, reusing the same [`AgentCommandProposal`] shape the command-approval
+/// UI already renders. The arguments are truncated so a large payload can't
+/// blow up the prompt.
+fn mcp_approval_proposal(
+    proposal_id: &str,
+    server_id: &str,
+    tool_name: &str,
+    arguments_json: &str,
+) -> AgentCommandProposal {
+    let arguments = truncate_for_prompt(arguments_json.trim(), 500);
+    let prompt = format!(
+        "The assistant wants to call the MCP tool `{tool_name}` on server `{server_id}` with arguments:\n{arguments}\n\nThis runs outside the local sandbox and may have side effects. Approve to run it, or decline."
+    );
+    AgentCommandProposal {
+        id: proposal_id.to_string(),
+        command: format!("{server_id}/{tool_name}"),
+        prompt,
+        risk: "mcp".to_string(),
+        requires_approval: true,
+        blocked: false,
     }
 }
 

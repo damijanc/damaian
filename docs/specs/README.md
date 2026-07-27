@@ -14,5 +14,6 @@ These specs describe features that close gaps between the product specification 
 | 3 | [03_structured_tool_calling.md](03_structured_tool_calling.md) | **Done.** Replaces fragile text-envelope parsing (`DAMAIAN_EDIT_V1`, `DAMAIAN_COMMAND_V1`) with native tool schemas. Best done before #4, since hunk-level apply will want a clean tool-call surface for patch actions. |
 | 4 | [04_hunk_level_patch_apply.md](04_hunk_level_patch_apply.md) | **Done.** Correction: hunk-level apply already existed end-to-end in the desktop app. This spec was narrowly scoped to CLI parity + an audit gap. |
 | 5 | [05_clickable_file_references.md](05_clickable_file_references.md) | **Done.** Smallest, most independent change; benefits from #1's markdown renderer being in place first. |
+| 6 | [06_mcp_support.md](06_mcp_support.md) | **Done.** New capability (not a gap-closer): lets users add local/remote MCP servers whose tools plug into the native tool-call loop from #3. Depends on #3's structured tool-calling surface being in place. |
 
 Each spec's status is tracked at the top of its file: `Not started`, `In progress`, or `Done`.
