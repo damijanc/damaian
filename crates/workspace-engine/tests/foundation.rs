@@ -4,11 +4,11 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, ClientError, CommandPolicy, CommandRisk, Config, ConfigOverlay, IndexCache,
-    MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage, ModelProviderConfig,
-    ModelRequest, OpenAICompatibleAdapter, PatchEngine, PatchStore, PathPolicy, ProjectIndexer,
-    ProposedChange, SecretScanner, SessionStore, ToolCall, WorkspaceEngine, extract_model_tokens,
-    model_request_json, parse_generated_edit,
+    AuditLog, ClientError, CommandPolicy, CommandRisk, Config, ConfigOverlay, IndexCache, McpClient,
+    McpServerConfig, McpTransport, MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage,
+    ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter, PatchEngine, PatchStore, PathPolicy,
+    ProjectIndexer, ProposedChange, SecretScanner, SessionStore, ToolCall, WorkspaceEngine,
+    extract_model_tokens, model_request_json, parse_generated_edit,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -2135,6 +2135,149 @@ fn config_overlay_supports_custom_model_providers() {
             .to_policy_text()
             .contains("model_provider.acme.base_url=https://api.acme.test")
     );
+}
+
+#[test]
+fn mcp_server_config_round_trips_through_overlay() {
+    let overlay = ConfigOverlay::parse(
+        "mcp_server.filesystem.transport=stdio\n\
+         mcp_server.filesystem.command=npx\n\
+         mcp_server.filesystem.args=-y|@modelcontextprotocol/server-filesystem|/tmp\n\
+         mcp_server.filesystem.env=LOG_LEVEL=warn|NODE_ENV=production\n\
+         mcp_server.filesystem.enabled=true\n\
+         mcp_server.sentry.transport=http\n\
+         mcp_server.sentry.url=https://mcp.sentry.example/mcp\n\
+         mcp_server.sentry.auth_token_env=keychain:mcp-sentry-token\n\
+         mcp_server.sentry.enabled=false\n",
+    )
+    .unwrap();
+
+    let mut config = Config::default();
+    config.apply_overlay(overlay);
+
+    let filesystem = config.mcp_server_config("filesystem").unwrap();
+    assert_eq!(filesystem.transport, McpTransport::Stdio);
+    assert_eq!(filesystem.command, "npx");
+    assert_eq!(
+        filesystem.args,
+        vec![
+            "-y".to_string(),
+            "@modelcontextprotocol/server-filesystem".to_string(),
+            "/tmp".to_string()
+        ]
+    );
+    assert_eq!(
+        filesystem.env,
+        vec![
+            ("LOG_LEVEL".to_string(), "warn".to_string()),
+            ("NODE_ENV".to_string(), "production".to_string())
+        ]
+    );
+    assert!(filesystem.enabled);
+    // Defaults: approval required unless explicitly disabled.
+    assert!(filesystem.require_approval);
+
+    let sentry = config.mcp_server_config("sentry").unwrap();
+    assert_eq!(sentry.transport, McpTransport::Http);
+    assert_eq!(sentry.url, "https://mcp.sentry.example/mcp");
+    assert_eq!(sentry.auth_token_env, "keychain:mcp-sentry-token");
+    assert!(!sentry.enabled);
+
+    // Only the enabled server is offered.
+    let active: Vec<&str> = config
+        .active_mcp_servers()
+        .iter()
+        .map(|server| server.id.as_str())
+        .collect();
+    assert_eq!(active, vec!["filesystem"]);
+
+    // Serialization is loadable again and preserves the transport-specific keys.
+    let policy = config.to_policy_text();
+    assert!(policy.contains("mcp_server.filesystem.command=npx"));
+    assert!(policy.contains("mcp_server.sentry.url=https://mcp.sentry.example/mcp"));
+    let reparsed = ConfigOverlay::parse(&policy).unwrap();
+    let mut reloaded = Config::default();
+    reloaded.apply_overlay(reparsed);
+    assert_eq!(
+        reloaded.mcp_server_config("filesystem"),
+        config.mcp_server_config("filesystem")
+    );
+}
+
+#[test]
+fn mcp_stdio_client_handshakes_lists_and_calls_tools() {
+    // A tiny stdio MCP server: reads newline-delimited JSON-RPC requests and
+    // replies with canned results, echoing back the request id.
+    let root = temp_dir("mcp-stdio");
+    fs::create_dir_all(&root).unwrap();
+    let script = root.join("server.sh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake","version":"0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echoes text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echoed: hi"}]}}\n' "$id" ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+
+    let config = McpServerConfig {
+        id: "fake".to_string(),
+        label: "Fake".to_string(),
+        transport: McpTransport::Stdio,
+        command: "sh".to_string(),
+        args: vec![script.to_string_lossy().to_string()],
+        env: Vec::new(),
+        url: String::new(),
+        auth_token_env: String::new(),
+        enabled: true,
+        require_approval: true,
+    };
+
+    let mut client = McpClient::connect(&config, None).expect("connect + initialize");
+    let tools = client.list_tools().expect("tools/list");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "echo");
+    assert_eq!(tools[0].to_tool_definition("fake").name, "mcp__fake__echo");
+
+    let result = client
+        .call_tool("echo", "{\"text\":\"hi\"}")
+        .expect("tools/call");
+    assert!(!result.is_error);
+    assert_eq!(result.text, "echoed: hi");
+}
+
+#[test]
+fn mcp_kill_switch_and_allowlist_gate_active_servers() {
+    let base = "mcp_server.a.command=a-cmd\n\
+                mcp_server.a.enabled=true\n\
+                mcp_server.b.command=b-cmd\n\
+                mcp_server.b.enabled=true\n";
+
+    // Admin allowlist narrows the active set to listed ids only.
+    let mut allowlisted = Config::default();
+    allowlisted.apply_overlay(
+        ConfigOverlay::parse(&format!("{base}mcp_server_allowlist=a\n")).unwrap(),
+    );
+    let active: Vec<&str> = allowlisted
+        .active_mcp_servers()
+        .iter()
+        .map(|server| server.id.as_str())
+        .collect();
+    assert_eq!(active, vec!["a"]);
+
+    // The global kill-switch disables everything regardless of per-server state.
+    let mut disabled = Config::default();
+    disabled.apply_overlay(ConfigOverlay::parse(&format!("{base}mcp_enabled=false\n")).unwrap());
+    assert!(disabled.active_mcp_servers().is_empty());
 }
 
 #[test]

@@ -910,9 +910,10 @@ async function installAppUpdate() {
 }
 
 function setSettingsPage(page) {
-  const target = ["general", "shortcuts", "servers", "providers", "models"].includes(page)
+  const target = ["general", "shortcuts", "mcp", "providers", "models"].includes(page)
     ? page
     : "providers";
+  if (target === "mcp") renderMcpConfigSelect();
   document.querySelectorAll(".settings-nav-item").forEach((button) => {
     button.classList.toggle("active", button.dataset.settingsPage === target);
   });
@@ -1762,6 +1763,315 @@ function upsertConfigValue(content, key, value) {
   return next.join("\n").replace(/\n*$/, "\n");
 }
 
+// ---------------------------------------------------------------------------
+// MCP servers
+// ---------------------------------------------------------------------------
+
+// Parsed from the config-editor content; the config file is the source of
+// truth (same approach as LLM providers).
+let mcpServers = {};
+
+const mcpServerFieldPattern =
+  /^mcp_server\.([a-z0-9.-]+)\.(label|transport|command|args|env|url|auth_token_env|enabled|require_approval)$/;
+
+function mcpSlug(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9.-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function syncMcpServersFromConfig(content) {
+  const servers = {};
+  configEntries(content).forEach(([key, value]) => {
+    const match = key.match(mcpServerFieldPattern);
+    if (!match) return;
+    const id = match[1];
+    const server = servers[id] || (servers[id] = { id, transport: "stdio", requireApproval: true });
+    const field = match[2];
+    if (field === "label") server.label = value;
+    else if (field === "transport") server.transport = value === "http" ? "http" : "stdio";
+    else if (field === "command") server.command = value;
+    else if (field === "args") server.args = value;
+    else if (field === "env") server.env = value;
+    else if (field === "url") server.url = value;
+    else if (field === "auth_token_env") server.authTokenEnv = value;
+    else if (field === "enabled") server.enabled = value === "true";
+    else if (field === "require_approval") server.requireApproval = value === "true";
+  });
+  mcpServers = servers;
+}
+
+function mcpServerIds() {
+  return Object.keys(mcpServers).sort((a, b) => a.localeCompare(b));
+}
+
+// Config stores list values `|`-joined; the editor shows one per line.
+function pipeToLines(value) {
+  return String(value || "")
+    .split("|")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function linesToPipe(value) {
+  return String(value || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .join("|");
+}
+
+function updateMcpTransportFields() {
+  const isHttp = $("mcp-transport-select").value === "http";
+  document.querySelectorAll(".mcp-http-fields").forEach((el) => (el.hidden = !isHttp));
+  document.querySelectorAll(".mcp-stdio-fields").forEach((el) => (el.hidden = isHttp));
+}
+
+function mcpServerFromForm() {
+  const label = $("mcp-label-input").value.trim();
+  const id = mcpSlug($("mcp-id-input").value || label);
+  const transport = $("mcp-transport-select").value === "http" ? "http" : "stdio";
+  if (!label) throw new Error("Server name is required");
+  if (!id) throw new Error("Server ID is required");
+  const server = {
+    id,
+    label,
+    transport,
+    command: $("mcp-command-input").value.trim(),
+    args: linesToPipe($("mcp-args-input").value),
+    env: linesToPipe($("mcp-env-input").value),
+    url: $("mcp-url-input").value.trim().replace(/\/+$/, ""),
+    authTokenEnv: $("mcp-token-ref-input").value.trim(),
+    enabled: $("mcp-enabled-input").checked,
+    requireApproval: $("mcp-approval-input").checked,
+  };
+  if (transport === "stdio" && !server.command) {
+    throw new Error("A command is required for a local (stdio) server");
+  }
+  if (transport === "http" && !server.url) {
+    throw new Error("A URL is required for a remote (http) server");
+  }
+  return server;
+}
+
+function renderMcpConfigSelect(selectedId = $("mcp-config-select").value) {
+  const select = $("mcp-config-select");
+  if (!select) return;
+  const ids = mcpServerIds();
+  select.innerHTML = "";
+  select.disabled = !ids.length;
+  if (!ids.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "No configured servers";
+    select.append(option);
+    clearMcpConfigForm();
+    renderMcpServerList();
+    return;
+  }
+  ids.forEach((id) => {
+    const option = document.createElement("option");
+    option.value = id;
+    option.textContent = mcpServers[id].label || id;
+    select.append(option);
+  });
+  const nextId = ids.includes(selectedId) ? selectedId : ids[0];
+  select.value = nextId;
+  renderMcpConfigForm(nextId);
+  renderMcpServerList();
+}
+
+function renderMcpConfigForm(serverId = $("mcp-config-select").value) {
+  const server = mcpServers[serverId] || {
+    id: serverId || "",
+    label: "",
+    transport: "stdio",
+    requireApproval: true,
+  };
+  $("mcp-config-select").value = serverId || "";
+  $("mcp-label-input").value = server.label || "";
+  $("mcp-id-input").value = server.id || "";
+  $("mcp-id-input").dataset.originalId = server.id || "";
+  $("mcp-transport-select").value = server.transport === "http" ? "http" : "stdio";
+  $("mcp-command-input").value = server.command || "";
+  $("mcp-args-input").value = pipeToLines(server.args);
+  $("mcp-env-input").value = pipeToLines(server.env);
+  $("mcp-url-input").value = server.url || "";
+  $("mcp-token-ref-input").value = server.authTokenEnv || `keychain:mcp-${server.id || "server"}-token`;
+  $("mcp-token-input").value = "";
+  $("mcp-enabled-input").checked = server.enabled === true;
+  $("mcp-approval-input").checked = server.requireApproval !== false;
+  $("mcp-remove-btn").disabled = !mcpServers[server.id];
+  setMcpTestResult("", "");
+  updateMcpTransportFields();
+}
+
+function clearMcpConfigForm() {
+  $("mcp-config-select").value = "";
+  $("mcp-label-input").value = "";
+  $("mcp-id-input").value = "";
+  $("mcp-id-input").dataset.originalId = "";
+  $("mcp-transport-select").value = "stdio";
+  $("mcp-command-input").value = "";
+  $("mcp-args-input").value = "";
+  $("mcp-env-input").value = "";
+  $("mcp-url-input").value = "";
+  $("mcp-token-ref-input").value = "keychain:";
+  $("mcp-token-input").value = "";
+  $("mcp-enabled-input").checked = true;
+  $("mcp-approval-input").checked = true;
+  $("mcp-remove-btn").disabled = true;
+  setMcpTestResult("", "");
+  updateMcpTransportFields();
+}
+
+function newMcpConfigForm() {
+  clearMcpConfigForm();
+  $("mcp-label-input").focus();
+}
+
+function setMcpTestResult(message, state = "") {
+  const el = $("mcp-test-result");
+  if (!el) return;
+  el.textContent = message;
+  el.dataset.state = state;
+}
+
+function renderMcpServerList() {
+  const container = $("mcp-server-list");
+  if (!container) return;
+  container.innerHTML = "";
+  const ids = mcpServerIds();
+  if (!ids.length) {
+    const empty = document.createElement("div");
+    empty.className = "provider-empty-row";
+    empty.textContent = "No MCP servers configured.";
+    container.append(empty);
+    return;
+  }
+  ids.forEach((id) => {
+    const server = mcpServers[id];
+    const row = document.createElement("div");
+    row.className = "settings-row";
+    const copy = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = server.label || id;
+    const description = document.createElement("p");
+    const transportLabel = server.transport === "http" ? "HTTP" : "stdio";
+    const state = server.enabled ? "enabled" : "disabled";
+    const detail = server.transport === "http" ? server.url || "" : server.command || "";
+    description.textContent = `${transportLabel} · ${state}${detail ? ` · ${detail}` : ""}`;
+    copy.append(title, description);
+    const configureButton = document.createElement("button");
+    configureButton.type = "button";
+    configureButton.textContent = "Configure";
+    configureButton.addEventListener("click", () => {
+      setSettingsPage("mcp");
+      renderMcpConfigForm(id);
+      $("mcp-label-input").focus();
+    });
+    row.append(copy, configureButton);
+    container.append(row);
+  });
+}
+
+function upsertMcpConfig(content, server) {
+  let next = removeMcpConfig(content, server.id);
+  const set = (field, value) =>
+    (next = upsertConfigValue(next, `mcp_server.${server.id}.${field}`, value));
+  set("label", server.label);
+  set("transport", server.transport);
+  if (server.transport === "http") {
+    set("url", server.url);
+    if (server.authTokenEnv) set("auth_token_env", server.authTokenEnv);
+  } else {
+    set("command", server.command);
+    if (server.args) set("args", server.args);
+    if (server.env) set("env", server.env);
+  }
+  set("enabled", server.enabled ? "true" : "false");
+  set("require_approval", server.requireApproval ? "true" : "false");
+  return next;
+}
+
+function removeMcpConfig(content, serverId) {
+  const prefix = `mcp_server.${serverId}.`;
+  return String(content || "")
+    .split(/\r?\n/)
+    .filter((line) => !line.trim().startsWith(prefix))
+    .join("\n")
+    .replace(/\n*$/, "\n");
+}
+
+async function saveMcpServer() {
+  const server = mcpServerFromForm();
+  const token = $("mcp-token-input").value.trim();
+  if (server.transport === "http" && token) {
+    if (!server.authTokenEnv.startsWith("keychain:")) {
+      throw new Error("A token can only be saved when the reference starts with keychain:");
+    }
+    const account = server.authTokenEnv.slice("keychain:".length).trim();
+    if (!account) throw new Error("Keychain account is required");
+    const payload = await api("/api/provider-key", form({ account, api_key: token }));
+    server.authTokenEnv = payload.reference;
+  }
+
+  const originalId = $("mcp-id-input").dataset.originalId;
+  let content = $("config-editor").value;
+  if (originalId && originalId !== server.id) {
+    content = removeMcpConfig(content, originalId);
+  }
+  content = upsertMcpConfig(content, server);
+  $("config-editor").value = content;
+  const payload = await saveConfigFile();
+  $("mcp-token-input").value = "";
+  renderMcpConfigSelect(server.id);
+  return payload;
+}
+
+async function removeMcpServerFromSettings() {
+  const id = mcpSlug($("mcp-id-input").dataset.originalId || $("mcp-id-input").value);
+  if (!id || !mcpServers[id]) return;
+  $("config-editor").value = removeMcpConfig($("config-editor").value, id);
+  await saveConfigFile();
+  renderMcpConfigSelect();
+}
+
+async function testMcpServer() {
+  const server = mcpServerFromForm();
+  const token = $("mcp-token-input").value.trim();
+  setMcpTestResult("Connecting…", "");
+  const payload = await api(
+    "/api/mcp-test",
+    form({
+      id: server.id,
+      transport: server.transport,
+      command: server.command,
+      args: server.args,
+      env: server.env,
+      url: server.url,
+      auth_token_env: server.authTokenEnv,
+      auth_token: token,
+    }),
+  );
+  if (payload.ok) {
+    const names = (payload.tools || []).slice(0, 8).join(", ");
+    const more = (payload.tools || []).length > 8 ? "…" : "";
+    setMcpTestResult(
+      `Connected — ${payload.toolCount} tool${payload.toolCount === 1 ? "" : "s"}${
+        names ? `: ${names}${more}` : ""
+      }`,
+      "ok",
+    );
+  } else {
+    setMcpTestResult(payload.error || "Connection failed", "error");
+  }
+  return payload;
+}
+
 function modelKeyAccountFromReference(reference) {
   return reference.startsWith("keychain:") ? reference.slice("keychain:".length).trim() : "";
 }
@@ -1811,6 +2121,7 @@ async function loadConfigFile() {
   );
   $("config-editor").value = payload.content;
   syncConfiguredProvidersFromConfig(payload.content);
+  syncMcpServersFromConfig(payload.content);
   syncModelKeyAccountFromConfig(payload.content);
   renderConfigPolicy(payload);
   $("config-path").textContent = payload.exists ? payload.path : `${payload.path} (new)`;
@@ -1821,6 +2132,7 @@ async function loadConfigFile() {
 async function saveConfigFile() {
   const content = $("config-editor").value;
   syncConfiguredProvidersFromConfig(content);
+  syncMcpServersFromConfig(content);
   const payload = await api(
     "/api/config-file",
     form({
@@ -3238,6 +3550,49 @@ $("provider-remove-btn").addEventListener("click", async () => {
     if (!id || !(await confirmDialog("Remove provider?", `Remove provider ${id}?`))) return;
     await removeProviderConfigFromSettings();
     toast("LLM provider removed");
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$("mcp-config-select").addEventListener("change", () => {
+  renderMcpConfigForm($("mcp-config-select").value);
+});
+
+$("mcp-transport-select").addEventListener("change", updateMcpTransportFields);
+
+$("mcp-new-btn").addEventListener("click", newMcpConfigForm);
+
+$("mcp-label-input").addEventListener("input", () => {
+  if (!$("mcp-id-input").value.trim()) {
+    $("mcp-token-ref-input").value = `keychain:mcp-${mcpSlug($("mcp-label-input").value)}-token`;
+  }
+});
+
+$("mcp-save-btn").addEventListener("click", async () => {
+  try {
+    await saveMcpServer();
+    toast("MCP server saved");
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$("mcp-test-btn").addEventListener("click", async () => {
+  try {
+    await testMcpServer();
+  } catch (error) {
+    setMcpTestResult(error.message, "error");
+    toast(error.message);
+  }
+});
+
+$("mcp-remove-btn").addEventListener("click", async () => {
+  try {
+    const id = $("mcp-id-input").dataset.originalId || $("mcp-id-input").value;
+    if (!id || !(await confirmDialog("Remove server?", `Remove MCP server ${id}?`))) return;
+    await removeMcpServerFromSettings();
+    toast("MCP server removed");
   } catch (error) {
     toast(error.message);
   }

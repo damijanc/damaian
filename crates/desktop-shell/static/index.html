@@ -264,10 +264,10 @@
               <span class="settings-nav-icon keyboard-icon" aria-hidden="true"></span>
               <span>Shortcuts</span>
             </button>
-            <p class="settings-nav-group">Server</p>
-            <button class="settings-nav-item" type="button" data-settings-page="servers">
+            <p class="settings-nav-group">MCP</p>
+            <button class="settings-nav-item" type="button" data-settings-page="mcp">
               <span class="settings-nav-icon server-icon" aria-hidden="true"></span>
-              <span>Servers</span>
+              <span>MCP Servers</span>
             </button>
             <button class="settings-nav-item active" type="button" data-settings-page="providers">
               <span class="settings-nav-icon provider-icon" aria-hidden="true"></span>
@@ -330,9 +330,109 @@
           </div>
         </section>
 
-        <section id="settings-page-servers" class="settings-page" data-page="servers">
-          <h2 class="settings-page-title">Servers</h2>
-          <div class="settings-empty-card">No server configuration is required.</div>
+        <section id="settings-page-mcp" class="settings-page" data-page="mcp">
+          <h2 class="settings-page-title">MCP Servers</h2>
+          <p class="settings-page-hint">
+            Connect local (stdio) or remote (HTTP) Model Context Protocol servers. Their tools are
+            offered to the assistant alongside the built-in ones. Requires a model provider with
+            native tool-calling enabled.
+          </p>
+
+          <section class="settings-section">
+            <div class="section-heading">
+              <h3>Configured servers</h3>
+              <button id="mcp-new-btn" type="button">New</button>
+            </div>
+            <div id="mcp-server-list" class="provider-list-card"></div>
+          </section>
+
+          <section class="settings-section settings-provider-editor">
+            <div class="section-heading">
+              <h3>Server details</h3>
+            </div>
+            <div class="provider-config-panel">
+              <label class="field">
+                <span>Configured server</span>
+                <select id="mcp-config-select"></select>
+              </label>
+              <div class="provider-fields">
+                <label class="field">
+                  <span>Name</span>
+                  <input id="mcp-label-input" type="text" placeholder="Filesystem" />
+                </label>
+                <label class="field">
+                  <span>ID</span>
+                  <input id="mcp-id-input" type="text" placeholder="filesystem" />
+                </label>
+              </div>
+              <label class="field">
+                <span>Transport</span>
+                <select id="mcp-transport-select">
+                  <option value="stdio">Local (stdio)</option>
+                  <option value="http">Remote (HTTP)</option>
+                </select>
+              </label>
+
+              <div class="mcp-stdio-fields">
+                <label class="field">
+                  <span>Command</span>
+                  <input id="mcp-command-input" type="text" placeholder="npx" />
+                </label>
+                <label class="field">
+                  <span>Arguments</span>
+                  <textarea
+                    id="mcp-args-input"
+                    rows="3"
+                    placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/Users/me/projects"
+                  ></textarea>
+                </label>
+                <label class="field">
+                  <span>Environment</span>
+                  <textarea
+                    id="mcp-env-input"
+                    rows="2"
+                    placeholder="LOG_LEVEL=warn&#10;NODE_ENV=production"
+                  ></textarea>
+                </label>
+              </div>
+
+              <div class="mcp-http-fields" hidden>
+                <label class="field">
+                  <span>URL</span>
+                  <input id="mcp-url-input" type="url" placeholder="https://mcp.example.com/mcp" />
+                </label>
+                <label class="field">
+                  <span>Auth Token Reference</span>
+                  <input id="mcp-token-ref-input" type="text" placeholder="keychain:mcp-example-token" />
+                </label>
+                <label class="field">
+                  <span>Auth Token</span>
+                  <input
+                    id="mcp-token-input"
+                    type="password"
+                    autocomplete="off"
+                    placeholder="Optional, saved to Keychain when reference is keychain:*"
+                  />
+                </label>
+              </div>
+
+              <label class="field-checkbox">
+                <input id="mcp-enabled-input" type="checkbox" />
+                <span>Enabled — offer this server's tools to the assistant</span>
+              </label>
+              <label class="field-checkbox">
+                <input id="mcp-approval-input" type="checkbox" checked />
+                <span>Require approval before each tool call</span>
+              </label>
+
+              <div class="inline-actions">
+                <button id="mcp-save-btn" type="button">Save Server</button>
+                <button id="mcp-test-btn" type="button">Test Connection</button>
+                <button id="mcp-remove-btn" type="button">Remove</button>
+              </div>
+              <p id="mcp-test-result" class="key-status" data-state=""></p>
+            </div>
+          </section>
         </section>
 
         <section id="settings-page-providers" class="settings-page active" data-page="providers">

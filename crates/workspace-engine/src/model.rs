@@ -323,7 +323,7 @@ impl ModelTransport for CurlModelTransport {
     }
 }
 
-fn escape_curl_config_value(value: &str) -> String {
+pub(crate) fn escape_curl_config_value(value: &str) -> String {
     let mut escaped = String::new();
     for character in value.chars() {
         match character {
