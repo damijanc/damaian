@@ -815,6 +815,28 @@ button:disabled {
   color: var(--accent);
 }
 
+/* In-text file references the server renderer verified against the repo.
+   Styled as inline links; the inline-code variant keeps monospace. */
+.message-body .file-reference {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.message-body code.file-reference {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.message-body .file-reference:hover {
+  opacity: 0.8;
+}
+
 /* Syntax-highlighting token colors for `pre.code-block` (see
    workspace-engine's `render_markdown_to_html`, which emits `hl-*` classes
    from syntect's scope names). Tuned against the dark `--code` background

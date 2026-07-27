@@ -1,6 +1,6 @@
 # Feature Spec: Clickable In-Text File References
 
-Status: Not started
+Status: Done
 Order: 5 of 5
 Related spec sections: `ai_coding_assistant_specification.md` §7.1 (Chat Interface — "File reference links that open the local file in the app or configured editor").
 
@@ -59,3 +59,15 @@ Check whether `open_workspace_path_in_vscode` / the `code` command invocation (`
 
 - Whether detection/verification should re-run on every render (cheap for message-length text) or be cached per message once computed, given messages are immutable after streaming completes.
 - Whether to support absolute paths in addition to repository-relative ones, given the existing context-file chips and `FileAccessController` are scoped to selected repository roots (§7.3) — recommend repository-relative only, consistent with that existing scope.
+
+## 7. Implementation Notes (as built)
+
+Both open questions resolved as recommended: detection re-runs on every finalize render (no caching — it only runs once per message, on stream-complete or history load, and is cheap); only repository-relative paths are linked (the verifier passes `allow_outside_root: false`).
+
+- **Detection (server-side, `render.rs`)**: added `render_markdown_to_html_with_file_links(markdown, verifier)` alongside the existing `render_markdown_to_html` (which now delegates to a shared core with a no-op verifier, so its behavior and all prior callers/tests are unchanged). During the pulldown-cmark event walk, `Event::Text` outside fenced code blocks and inline `Event::Code` spans are scanned for path-like tokens; fenced code block content is never scanned (per Non-Goals). A token qualifies via a conservative `looks_like_path` (no whitespace, and either contains `/` or ends in a short alphanumeric extension — deliberately rejecting bare words and extensionless dotfiles like `.env`), after peeling an optional `:line` / `:line:col` suffix. Surrounding punctuation (`()[]{}"'`\`.,;!?`) is split off as literal text so unlinked prose round-trips verbatim; when no link is found in a text run, the original text is emitted unchanged.
+- **Verification (desktop-shell)**: the verifier closure runs through the repo's existing `path_policy.resolve_existing(..., allow_outside_root=false)` + `assert_not_restricted` + an `is_file` check — the same access-control boundary as context-file chips — so nonexistent paths, paths outside the repo, and restricted files (`.env`, credentials) are never linked. `/api/render-markdown` now takes an optional `repo`; without a valid one it falls back to the plain link-free render rather than erroring.
+- **Rendering**: verified prose refs become `<button class="file-reference" data-path data-line data-col>`; verified inline-code refs become `<code class="file-reference" role="button" tabindex="0" ...>` (keeping monospace). Both escape the display text and use the verifier's canonical relative path for `data-path`.
+- **Opening at a line**: `/api/open-vscode-file` now accepts optional `line`/`col`; `launch_vscode` gained line/col params. Since macOS `open -a` can't jump to a line, it tries `code --goto path:line[:col]` first and falls back to `open -a` (opening the file without the line) when the `code` CLI isn't on PATH. `open_in_vscode` (whole-repo) passes `None, None`.
+- **Frontend (`app.js`)**: `finalizeChatMessage` passes the current repo to `/api/render-markdown` and calls a new `wireFileReferences` that attaches click (and Enter/Space for the `<code>` variant) handlers, POSTing `path` + `line` + `col` to `/api/open-vscode-file` — reusing the exact endpoint the context-file chips use. New `.file-reference` CSS styles both variants as accent-colored underlined links.
+
+**Verification**: 7 new `render.rs` unit tests (prose link, `:line:col` → data attrs, unverified path not linked, path inside fenced block not linked, inline-code link, trailing-punctuation stripping, and default render never links); 1 new `desktop-shell` test driving `render_markdown_with_optional_file_links` against a real temp repo (real file linked with line; missing path and restricted `.env` left as plain text; no-repo → no links). Browser-verified end-to-end at the wiring level: the rendered `.file-reference` displays as an accent underlined link, and clicking it POSTs `repo=…&path=src/auth.rs&line=12` to `/api/open-vscode-file`. The actual VS Code launch and the full Tauri chat round-trip weren't browser-exercised (the desktop UI's API token comes from a Tauri-only bootstrap unavailable to a plain browser). `workspace-engine` lib tests 26 → 33; full `cargo test --workspace` green, zero regressions.
