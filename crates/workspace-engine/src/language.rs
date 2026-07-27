@@ -142,12 +142,15 @@ fn take_identifier(value: &str) -> String {
 }
 
 fn first_quoted(value: &str) -> Option<String> {
-    for quote in ['"', '\''] {
-        let start = value.find(quote)?;
-        let end = value[start + 1..].find(quote)?;
-        return Some(value[start + 1..start + 1 + end].to_string());
-    }
-    None
+    // Extract the first single- or double-quoted string. Find whichever quote
+    // character appears first, then its matching close — the previous version
+    // short-circuited on `"` and so missed single-quoted imports entirely.
+    let (start, quote) = value
+        .char_indices()
+        .find(|(_, character)| matches!(character, '"' | '\''))?;
+    let rest = &value[start + quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
 }
 
 fn quoted_after(value: &str, marker: &str) -> Option<String> {
@@ -163,4 +166,31 @@ fn dedupe(values: Vec<String>) -> Vec<String> {
         }
     }
     unique
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_quoted_handles_both_quote_styles() {
+        assert_eq!(first_quoted("import \"foo\"").as_deref(), Some("foo"));
+        // Regression: single-quoted literals were previously dropped because
+        // the double-quote lookup short-circuited the whole function.
+        assert_eq!(first_quoted("import 'bar'").as_deref(), Some("bar"));
+        assert_eq!(first_quoted("no quotes here"), None);
+    }
+
+    #[test]
+    fn extract_imports_reads_single_and_double_quoted_js_imports() {
+        let source = "import a from \"./double\";\nimport b from './single';\nconst c = require('./req');\n";
+        assert_eq!(
+            extract_imports(source, "javascript"),
+            vec![
+                "./double".to_string(),
+                "./single".to_string(),
+                "./req".to_string()
+            ]
+        );
+    }
 }
