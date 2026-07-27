@@ -2087,13 +2087,45 @@ function updateChatMessage(target, content) {
 // call this once a message's content is final (stream complete, or loaded
 // from history) since it replaces the bubble's entire innerHTML.
 async function finalizeChatMessage(target, content) {
+  const chatRepo = repo();
   try {
-    const payload = await api("/api/render-markdown", form({ content }));
+    const payload = await api("/api/render-markdown", form({ content, repo: chatRepo || "" }));
     target.body.innerHTML = payload.html;
   } catch (error) {
     target.body.innerHTML = renderMarkdown(content);
   }
+  wireFileReferences(target.body, chatRepo);
   $("chat-log").scrollTop = $("chat-log").scrollHeight;
+}
+
+// Wires click/Enter on the `.file-reference` elements the server-side
+// renderer produced for verified in-text file paths, opening each in VS
+// Code (at its line/column when present) via the same endpoint the
+// context-file chips use.
+function wireFileReferences(container, chatRepo) {
+  if (!chatRepo) return;
+  container.querySelectorAll(".file-reference").forEach((el) => {
+    const open = async () => {
+      try {
+        const fields = { repo: chatRepo, path: el.dataset.path };
+        if (el.dataset.line) fields.line = el.dataset.line;
+        if (el.dataset.col) fields.col = el.dataset.col;
+        const payload = await api("/api/open-vscode-file", form(fields));
+        toast(`Opened ${payload.path}`);
+      } catch (error) {
+        toast(error.message);
+      }
+    };
+    el.addEventListener("click", open);
+    // Inline-code refs render as <code role="button">, not <button>, so
+    // give them keyboard activation too.
+    el.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        void open();
+      }
+    });
+  });
 }
 
 function renderMessages(messages) {
