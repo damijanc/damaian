@@ -54,7 +54,9 @@ pub use patch_engine::{
     ProposedPatch, parse_hunk_selection,
 };
 pub use path_policy::PathPolicy;
-pub use render::{render_markdown_to_ansi, render_markdown_to_html};
+pub use render::{
+    render_markdown_to_ansi, render_markdown_to_html, render_markdown_to_html_with_file_links,
+};
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{ChatMessage, Session, SessionStore, Task, TaskStatus};
 pub use validation::{

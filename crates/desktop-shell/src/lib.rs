@@ -418,7 +418,9 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             let form = parse_form(&request.body);
             let repo = required_form(&form, "repo")?;
             let path = required_form(&form, "path")?;
-            let opened_path = open_workspace_path_in_vscode(&repo, &path)?;
+            let line = form.get("line").and_then(|value| value.parse::<u32>().ok());
+            let col = form.get("col").and_then(|value| value.parse::<u32>().ok());
+            let opened_path = open_workspace_path_in_vscode(&repo, &path, line, col)?;
             write_response(
                 stream,
                 &request,
@@ -433,7 +435,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/render-markdown") => {
             let form = parse_form(&request.body);
             let content = required_form(&form, "content")?;
-            let html = workspace_engine::render_markdown_to_html(&content);
+            let html = render_markdown_with_optional_file_links(&content, form.get("repo"));
             write_response(
                 stream,
                 &request,
@@ -1070,9 +1072,34 @@ fn save_config_file(path: &Path, content: &str) -> Result<(), String> {
     fs::write(path, content).map_err(|error| error.to_string())
 }
 
+/// Renders assistant markdown to HTML, upgrading in-text file references to
+/// clickable links when a valid `repo` is supplied. Verification goes
+/// through the repo's `path_policy` so restricted files (`.env`, etc.) and
+/// paths outside the repo never become links. Any failure to build the
+/// per-repo engine falls back to a plain (link-free) render rather than
+/// erroring, so message rendering is never blocked by it.
+fn render_markdown_with_optional_file_links(content: &str, repo: Option<&String>) -> String {
+    let Some(repo) = repo.filter(|value| !value.is_empty()) else {
+        return workspace_engine::render_markdown_to_html(content);
+    };
+    let Ok(engine) = engine_for_repo(repo) else {
+        return workspace_engine::render_markdown_to_html(content);
+    };
+    let verifier = |candidate: &str| -> Option<String> {
+        let target = engine.path_policy.resolve_existing(repo, candidate, false).ok()?;
+        engine
+            .path_policy
+            .assert_not_restricted(&target.relative_path, false)
+            .ok()?;
+        let metadata = fs::metadata(&target.absolute_path).ok()?;
+        metadata.is_file().then_some(target.relative_path)
+    };
+    workspace_engine::render_markdown_to_html_with_file_links(content, &verifier)
+}
+
 fn open_in_vscode(repo: &str) -> Result<PathBuf, String> {
     let path = validate_working_folder(repo)?;
-    launch_vscode(&path)?;
+    launch_vscode(&path, None, None)?;
     Ok(path)
 }
 
@@ -1089,9 +1116,14 @@ fn reveal_in_finder(repo: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn open_workspace_path_in_vscode(repo: &str, relative_path: &str) -> Result<PathBuf, String> {
+fn open_workspace_path_in_vscode(
+    repo: &str,
+    relative_path: &str,
+    line: Option<u32>,
+    col: Option<u32>,
+) -> Result<PathBuf, String> {
     let path = validate_workspace_path(repo, relative_path)?;
-    launch_vscode(&path)?;
+    launch_vscode(&path, line, col)?;
     Ok(path)
 }
 
@@ -1272,8 +1304,35 @@ fn home_dir() -> Result<PathBuf, String> {
     }
 }
 
+/// Builds the `code --goto` target string `path[:line[:col]]`, preserving
+/// the path's bytes (which may contain spaces) since it's passed as a single
+/// argv entry, not through a shell.
+fn goto_target(path: &Path, line: u32, col: Option<u32>) -> std::ffi::OsString {
+    let mut target = path.as_os_str().to_os_string();
+    target.push(format!(":{line}"));
+    if let Some(col) = col {
+        target.push(format!(":{col}"));
+    }
+    target
+}
+
 #[cfg(target_os = "macos")]
-fn launch_vscode(path: &Path) -> Result<(), String> {
+fn launch_vscode(path: &Path, line: Option<u32>, col: Option<u32>) -> Result<(), String> {
+    // `open -a` cannot jump to a line, so when one is requested try the
+    // `code` CLI's `--goto` first. If `code` isn't on PATH (the user never
+    // installed the shell command) fall back to `open -a`, which still opens
+    // the file — just not at the exact line.
+    if let Some(line) = line {
+        if let Ok(status) = Command::new("code")
+            .arg("--goto")
+            .arg(goto_target(path, line, col))
+            .status()
+        {
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
     let status = Command::new("open")
         .arg("-a")
         .arg("Visual Studio Code")
@@ -1290,9 +1349,17 @@ fn launch_vscode(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn launch_vscode(path: &Path) -> Result<(), String> {
-    let status = Command::new("code")
-        .arg(path)
+fn launch_vscode(path: &Path, line: Option<u32>, col: Option<u32>) -> Result<(), String> {
+    let mut command = Command::new("code");
+    match line {
+        Some(line) => {
+            command.arg("--goto").arg(goto_target(path, line, col));
+        }
+        None => {
+            command.arg(path);
+        }
+    }
+    let status = command
         .status()
         .map_err(|error| format!("failed to launch Visual Studio Code: {error}"))?;
     if status.success() {
@@ -1838,9 +1905,10 @@ mod tests {
         Request, ShellOptions, allowed_cors_origin, api_request_requires_token,
         cached_model_api_key, desktop_settings_config_path, effective_policy_for_repo,
         forget_model_api_key, handle_connection, index_html, keychain, parse_form,
-        parse_path_list, percent_decode, remember_model_api_key, require_api_token,
-        run_terminal_command, save_config_file, terminal_cwd_for_repo, validate_context_files,
-        validate_working_folder, validate_workspace_path,
+        parse_path_list, percent_decode, remember_model_api_key,
+        render_markdown_with_optional_file_links, require_api_token, run_terminal_command,
+        save_config_file, terminal_cwd_for_repo, validate_context_files, validate_working_folder,
+        validate_workspace_path,
     };
     use std::collections::HashMap;
     use std::io::{Read, Write};
@@ -1970,6 +2038,34 @@ mod tests {
         assert!(response.contains("<h1>Title</h1>"));
         assert!(response.contains("hl-"));
         assert!(!response.contains("<script>"));
+    }
+
+    #[test]
+    fn render_markdown_links_only_real_non_restricted_files() {
+        let repo = temp_path("render-file-links");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/auth.rs"), "fn login() {}\n").unwrap();
+        fs::write(repo.join(".env"), "SECRET=1\n").unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+
+        let content = "The fix is in src/auth.rs:12, not in src/missing.rs, and never .env.";
+        let html = render_markdown_with_optional_file_links(content, Some(&repo_str));
+
+        // Real, allowed file becomes a link with its line number.
+        assert!(html.contains("class=\"file-reference\""));
+        assert!(html.contains("data-path=\"src/auth.rs\""));
+        assert!(html.contains("data-line=\"12\""));
+        // Nonexistent path and the restricted .env are left as plain text.
+        assert!(html.contains("src/missing.rs"));
+        assert!(!html.contains("data-path=\"src/missing.rs\""));
+        assert!(!html.contains(".env<"));
+        assert!(!html.contains("data-path=\".env\""));
+
+        // Without a repo, nothing is linked.
+        let plain = render_markdown_with_optional_file_links(content, None);
+        assert!(!plain.contains("file-reference"));
+
+        fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]
