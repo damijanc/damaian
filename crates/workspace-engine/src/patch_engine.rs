@@ -9,6 +9,15 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Parses a hunk-selection JSON object mapping each file path to the list of
+/// accepted hunk ids, e.g. `{"src/app.js":["hunk_0","hunk_1"]}`. Shared by
+/// the desktop `/api/apply-patch` route and the CLI's `--hunk-selection`
+/// flag so both entry points accept exactly the same wire format.
+pub fn parse_hunk_selection(value: &str) -> Result<HashMap<String, Vec<String>>> {
+    serde_json::from_str(value)
+        .map_err(|error| ClientError::InvalidInput(format!("Invalid hunk selection: {error}")))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposedFilePatch {
     pub path: String,
@@ -240,6 +249,10 @@ impl PatchEngine {
 
         let mut prepared = Vec::new();
         let mut warnings = Vec::new();
+        // Per file, the hunk ids present in the patch but excluded by the
+        // caller's `hunk_selection`. Recorded as an audit event after apply
+        // so the trail reflects what was left out, not only what was applied.
+        let mut excluded_hunks: Vec<(String, Vec<String>)> = Vec::new();
         for file in selected {
             let target = self.path_policy.resolve_for_write(&root_path, &file.path)?;
             self.path_policy
@@ -257,12 +270,23 @@ impl PatchEngine {
                 String::new()
             } else {
                 match hunk_selection.and_then(|selection| selection.get(&file.path)) {
-                    Some(accepted_hunk_ids) => reconstruct_content(
-                        current_content.as_deref().unwrap_or_default(),
-                        &file.new_content,
-                        &file.hunks,
-                        accepted_hunk_ids,
-                    ),
+                    Some(accepted_hunk_ids) => {
+                        let excluded = file
+                            .hunks
+                            .iter()
+                            .filter(|hunk| !accepted_hunk_ids.contains(&hunk.id))
+                            .map(|hunk| hunk.id.clone())
+                            .collect::<Vec<_>>();
+                        if !excluded.is_empty() {
+                            excluded_hunks.push((file.path.clone(), excluded));
+                        }
+                        reconstruct_content(
+                            current_content.as_deref().unwrap_or_default(),
+                            &file.new_content,
+                            &file.hunks,
+                            accepted_hunk_ids,
+                        )
+                    }
                     None => file.new_content.clone(),
                 }
             };
@@ -361,6 +385,20 @@ impl PatchEngine {
                 ("warningCount", warnings.len().to_string()),
             ],
         )?;
+
+        for (path, hunk_ids) in &excluded_hunks {
+            self.audit_log.record(
+                "patch_hunks_rejected",
+                &[
+                    ("actor", "user".to_string()),
+                    ("taskId", patch.task_id.clone().unwrap_or_default()),
+                    ("patchId", patch.id.clone()),
+                    ("approvedBy", approved_by.to_string()),
+                    ("resourcePath", path.clone()),
+                    ("hunks", hunk_ids.join(",")),
+                ],
+            )?;
+        }
 
         Ok(PatchApplyResult {
             patch_id: patch.id.clone(),

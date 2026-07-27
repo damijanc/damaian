@@ -560,6 +560,120 @@ fn applies_only_selected_hunk_and_allows_rollback_afterward() {
 }
 
 #[test]
+fn partial_hunk_apply_records_excluded_hunks_in_audit_log() {
+    let repo = temp_dir("patch-hunk-audit");
+    let old_content: String = (1..=30).map(|n| format!("line{n}\n")).collect();
+    write_fixture(&repo, "src/app.js", &old_content);
+    let mut new_lines: Vec<String> = (1..=30).map(|n| format!("line{n}\n")).collect();
+    new_lines[1] = "CHANGED_2\n".to_string();
+    new_lines[27] = "CHANGED_28\n".to_string();
+    let new_content = new_lines.concat();
+
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+    let patch = engine
+        .create_patch(
+            &repo,
+            &[ProposedChange {
+                path: "src/app.js".to_string(),
+                new_content,
+                status: None,
+                allow_restricted: false,
+            }],
+            None,
+            "two separate changes",
+        )
+        .unwrap();
+    assert_eq!(patch.files[0].hunks.len(), 2);
+
+    let excluded_hunk_id = patch.files[0].hunks[0].id.clone();
+    let accepted_hunk_id = patch.files[0].hunks[1].id.clone();
+    let mut hunk_selection = std::collections::HashMap::new();
+    hunk_selection.insert("src/app.js".to_string(), vec![accepted_hunk_id]);
+
+    engine
+        .apply_patch(&repo, &patch, None, Some(&hunk_selection), "tester", false)
+        .unwrap();
+
+    let audit_log =
+        fs::read_to_string(repo.join(".damaian").join("audit").join("events.jsonl")).unwrap();
+    let rejection_line = audit_log
+        .lines()
+        .find(|line| line.contains("patch_hunks_rejected"))
+        .expect("expected a patch_hunks_rejected audit event");
+    assert!(rejection_line.contains(&excluded_hunk_id));
+    assert!(rejection_line.contains("src/app.js"));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn full_hunk_apply_records_no_excluded_hunks_audit_event() {
+    let repo = temp_dir("patch-hunk-audit-full");
+    let old_content: String = (1..=30).map(|n| format!("line{n}\n")).collect();
+    write_fixture(&repo, "src/app.js", &old_content);
+    let mut new_lines: Vec<String> = (1..=30).map(|n| format!("line{n}\n")).collect();
+    new_lines[1] = "CHANGED_2\n".to_string();
+    new_lines[27] = "CHANGED_28\n".to_string();
+    let new_content = new_lines.concat();
+
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+    let patch = engine
+        .create_patch(
+            &repo,
+            &[ProposedChange {
+                path: "src/app.js".to_string(),
+                new_content,
+                status: None,
+                allow_restricted: false,
+            }],
+            None,
+            "two separate changes",
+        )
+        .unwrap();
+
+    // Accept every hunk: no exclusions, so no rejection event should fire.
+    let all_hunk_ids: Vec<String> = patch.files[0].hunks.iter().map(|h| h.id.clone()).collect();
+    let mut hunk_selection = std::collections::HashMap::new();
+    hunk_selection.insert("src/app.js".to_string(), all_hunk_ids);
+
+    engine
+        .apply_patch(&repo, &patch, None, Some(&hunk_selection), "tester", false)
+        .unwrap();
+
+    let audit_log =
+        fs::read_to_string(repo.join(".damaian").join("audit").join("events.jsonl")).unwrap();
+    assert!(!audit_log.contains("patch_hunks_rejected"));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn parses_shared_hunk_selection_json() {
+    let selection =
+        workspace_engine::parse_hunk_selection("{\"src/app.js\":[\"hunk_0\",\"hunk_1\"]}").unwrap();
+    assert_eq!(
+        selection.get("src/app.js"),
+        Some(&vec!["hunk_0".to_string(), "hunk_1".to_string()])
+    );
+
+    assert!(workspace_engine::parse_hunk_selection("not json").is_err());
+}
+
+#[test]
 fn blocks_apply_when_target_changes_after_patch_creation() {
     let repo = temp_dir("patch-conflict");
     write_fixture(&repo, "src/app.js", "one\n");
