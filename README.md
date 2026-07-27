@@ -1,6 +1,8 @@
 # Damaian Client
-
 Local-first AI coding assistant client foundation.
+
+![image](./docs/screenshots/UI-screen.png)
+
 
 This repository currently implements the workspace-engine slice from the product specification:
 
