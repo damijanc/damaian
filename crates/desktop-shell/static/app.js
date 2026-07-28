@@ -7,9 +7,13 @@ let bootstrapError = null;
 let chatSubmitting = false;
 let pinnedContextFiles = [];
 let contextChipsDismissed = false;
-let terminalCwd = "";
 let terminalOpen = false;
-let terminalBusy = false;
+let term = null;
+let termFit = null;
+let termId = "";
+let termSessionSeq = 0;
+let termResizeObserver = null;
+let termInputChain = Promise.resolve();
 let projectPaths = [];
 let projectDisplayNames = new Map();
 let expandedProjectPaths = new Set();
@@ -704,10 +708,11 @@ function applyRepositoryState(value, persist = true) {
   }
   currentSessionId = "";
   loadPinnedContextFiles("");
+  // Switching repositories restarts the shell in the new working folder.
   if (terminalOpen) {
-    void resetTerminalCwd().catch((error) => appendTerminalLine(error.message, "stderr"));
+    void restartTerminal().catch((error) => toast(error.message));
   } else {
-    terminalCwd = "";
+    void closeTerminalSession();
   }
   renderProjectList();
   return projectPath;
@@ -937,6 +942,30 @@ function closeSettings() {
   document.body.classList.remove("settings-open");
 }
 
+const TERMINAL_THEME = {
+  background: "#ffffff",
+  foreground: "#1f2428",
+  cursor: "#1f2428",
+  cursorAccent: "#ffffff",
+  selectionBackground: "rgba(31, 36, 40, 0.18)",
+  black: "#1f2428",
+  red: "#a33737",
+  green: "#2e7d32",
+  yellow: "#8a6d00",
+  blue: "#1565c0",
+  magenta: "#8e24aa",
+  cyan: "#00838f",
+  white: "#d8d8d4",
+  brightBlack: "#5c6672",
+  brightRed: "#c62828",
+  brightGreen: "#388e3c",
+  brightYellow: "#a97b00",
+  brightBlue: "#1976d2",
+  brightMagenta: "#ab47bc",
+  brightCyan: "#0097a7",
+  brightWhite: "#1f2428",
+};
+
 function setTerminalOpen(open) {
   terminalOpen = open;
   document.body.classList.toggle("terminal-open", open);
@@ -946,36 +975,223 @@ function setTerminalOpen(open) {
   button.setAttribute("aria-label", open ? "Hide terminal" : "Show terminal");
   button.title = open ? "Hide terminal" : "Show terminal";
   if (open) {
-    void ensureTerminalReady()
-      .then(() => $("terminal-input").focus())
-      .catch((error) => {
-        appendTerminalLine(error.message, "stderr");
-        toast(error.message);
-      });
+    void ensureTerminal().catch((error) => toast(error.message));
   }
 }
 
-async function ensureTerminalReady() {
-  if (terminalCwd) {
-    renderTerminalPrompt();
+// Lazily build the xterm.js instance and wire it to the pty transport.
+function createTerminalInstance() {
+  if (term) return;
+  term = new Terminal({
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    fontSize: 13,
+    cursorBlink: true,
+    scrollback: 5000,
+    theme: TERMINAL_THEME,
+  });
+  termFit = new FitAddon.FitAddon();
+  term.loadAddon(termFit);
+  term.open($("terminal-xterm"));
+  // Every keystroke, escape sequence and paste flows straight to the shell.
+  term.onData((data) => sendTerminalInput(data));
+  // Some webviews deliver keydown events with keyCode 0 / empty `code`, which
+  // stops xterm from mapping special keys (arrows, Ctrl+<letter>, Tab, …) even
+  // though plain letters still work. When we see that, translate the key from
+  // `event.key` ourselves. Environments that report a real keyCode fall
+  // through to xterm unchanged, so there is no double-send or regression.
+  term.attachCustomKeyEventHandler((event) => {
+    if (event.type !== "keydown") return true;
+    // Ctrl+<letter> maps to a fixed control byte (0x01–0x1a) in every terminal
+    // mode, so handle it ourselves unconditionally — this makes Ctrl+R, Ctrl+C,
+    // etc. work even if the webview swallows the shortcut or drops keyCode.
+    // Returning false stops xterm from also sending it.
+    if (
+      event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      event.key &&
+      event.key.length === 1
+    ) {
+      const code = event.key.toLowerCase().charCodeAt(0);
+      if (code >= 97 && code <= 122) {
+        event.preventDefault();
+        sendTerminalInput(String.fromCharCode(code - 96));
+        return false;
+      }
+    }
+    // For other special keys (arrows, Tab, …) only step in when the webview
+    // failed to populate keyCode, so xterm couldn't map them. When keyCode is
+    // present, xterm handles them (preserving application-cursor mode, etc.).
+    if (event.keyCode) return true;
+    const seq = terminalKeySequence(event);
+    if (seq == null) return true;
+    event.preventDefault();
+    sendTerminalInput(seq);
+    return false;
+  });
+  // Keep the pty window size in step with the visible viewport.
+  termResizeObserver = new ResizeObserver(() => fitTerminal());
+  termResizeObserver.observe($("terminal-xterm"));
+  // Any click in the terminal area focuses the shell so the cursor shows and
+  // keys reach the pty — the webview doesn't always route the click to xterm's
+  // own handler on its own.
+  const body = $("terminal-xterm").closest(".terminal-body") || $("terminal-xterm");
+  body.addEventListener("mousedown", () => {
+    if (term) requestAnimationFrame(() => term.focus());
+  });
+}
+
+// Byte sequence a terminal expects for a special key, derived from
+// `event.key` (used only when the webview fails to populate `keyCode`).
+function terminalKeySequence(event) {
+  if (event.metaKey || event.altKey) return null;
+  const key = event.key;
+  if (event.ctrlKey) {
+    if (key && key.length === 1) {
+      const code = key.toLowerCase().charCodeAt(0);
+      if (code >= 97 && code <= 122) return String.fromCharCode(code - 96); // Ctrl+A..Z
+    }
+    return null;
+  }
+  switch (key) {
+    case "ArrowUp":
+      return "\x1b[A";
+    case "ArrowDown":
+      return "\x1b[B";
+    case "ArrowRight":
+      return "\x1b[C";
+    case "ArrowLeft":
+      return "\x1b[D";
+    case "Home":
+      return "\x1b[H";
+    case "End":
+      return "\x1b[F";
+    case "Delete":
+      return "\x1b[3~";
+    case "PageUp":
+      return "\x1b[5~";
+    case "PageDown":
+      return "\x1b[6~";
+    case "Tab":
+      return event.shiftKey ? "\x1b[Z" : "\t";
+    case "Enter":
+      return "\r";
+    case "Backspace":
+      return "\x7f";
+    case "Escape":
+      return "\x1b";
+    default:
+      return null; // printable characters go through xterm's normal path
+  }
+}
+
+async function ensureTerminal() {
+  createTerminalInstance();
+  fitTerminal();
+  if (!termId) {
+    await startTerminalSession();
+  }
+  focusTerminalSoon();
+}
+
+// Focus after layout settles — on a freshly-shown panel the element may not be
+// focusable in the same frame it becomes visible.
+function focusTerminalSoon() {
+  if (!term) return;
+  term.focus();
+  requestAnimationFrame(() => term && term.focus());
+  setTimeout(() => term && term.focus(), 60);
+}
+
+async function startTerminalSession() {
+  const invoke = tauriInvoke();
+  const Channel = window.__TAURI__?.core?.Channel;
+  if (!invoke || !Channel) {
+    term.write(
+      "\r\n\x1b[33mThe terminal is only available in the Damaian desktop app.\x1b[0m\r\n",
+    );
     return;
   }
-  await resetTerminalCwd();
+
+  // A fresh sequence per session lets a late message from a torn-down shell
+  // be ignored after the terminal has been restarted.
+  const seq = ++termSessionSeq;
+  const channel = new Channel();
+  channel.onmessage = (message) => {
+    if (seq !== termSessionSeq || !term) return;
+    if (message.type === "output") {
+      term.write(base64ToBytes(message.data));
+    } else if (message.type === "exit") {
+      term.write("\r\n\x1b[90m[process exited]\x1b[0m\r\n");
+      termId = "";
+    }
+  };
+
+  const payload = await invoke("terminal_open", {
+    repo: repo(),
+    cols: term.cols || 80,
+    rows: term.rows || 24,
+    onOutput: channel,
+  });
+  termId = payload.id;
+  $("terminal-cwd").textContent = payload.cwd || "";
+  $("terminal-title").textContent = payload.cwd ? terminalTitleForPath(payload.cwd) : "Terminal";
 }
 
-async function resetTerminalCwd() {
-  const payload = await api(`/api/terminal-cwd?repo=${encodeURIComponent(repo())}`);
-  terminalCwd = payload.cwd;
-  renderTerminalPrompt();
-  if (terminalOpen) {
-    appendTerminalLine(`cwd ${terminalCwd}`, "meta");
+function base64ToBytes(value) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+// Keystrokes go straight to the pty over IPC. Chain the invokes so bytes
+// always reach the shell in the order they were typed.
+function sendTerminalInput(data) {
+  if (!termId) return;
+  const invoke = tauriInvoke();
+  if (!invoke) return;
+  const id = termId;
+  termInputChain = termInputChain
+    .then(() => invoke("terminal_write", { id, data }))
+    .catch(() => {});
+}
+
+function fitTerminal() {
+  if (!term || !termFit || !terminalOpen) return;
+  try {
+    termFit.fit();
+  } catch {
+    return;
+  }
+  const invoke = tauriInvoke();
+  if (termId && invoke) {
+    void invoke("terminal_resize", { id: termId, cols: term.cols, rows: term.rows }).catch(
+      () => {},
+    );
   }
 }
 
-function renderTerminalPrompt() {
-  $("terminal-cwd").textContent = terminalCwd || "Not started";
-  $("terminal-title").textContent = terminalCwd ? terminalTitleForPath(terminalCwd) : "Terminal";
-  $("terminal-prompt").textContent = "$";
+async function closeTerminalSession() {
+  const id = termId;
+  termId = "";
+  termSessionSeq += 1;
+  const invoke = tauriInvoke();
+  if (id && invoke) {
+    try {
+      await invoke("terminal_close", { id });
+    } catch {
+      // best effort — the shell is reaped when its pty master is dropped
+    }
+  }
+}
+
+async function restartTerminal() {
+  await closeTerminalSession();
+  if (term) term.reset();
+  await ensureTerminal();
 }
 
 function terminalTitleForPath(path) {
@@ -983,62 +1199,6 @@ function terminalTitleForPath(path) {
   if (!trimmed) return "/";
   const parts = trimmed.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] || trimmed || "Terminal";
-}
-
-function stripAnsi(value) {
-  return String(value || "").replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
-}
-
-function appendTerminalLine(text, kind = "stdout") {
-  const output = $("terminal-output");
-  const clean = stripAnsi(text);
-  const lines = clean.endsWith("\n") ? clean.slice(0, -1).split(/\r?\n/) : clean.split(/\r?\n/);
-  lines.forEach((line) => {
-    const row = document.createElement("div");
-    row.className = `terminal-line ${kind}`;
-    row.textContent = line || " ";
-    output.append(row);
-  });
-  output.scrollTop = output.scrollHeight;
-}
-
-function appendTerminalCommand(command) {
-  appendTerminalLine(`${terminalCwd} $ ${command}`, "command");
-}
-
-async function runTerminalCommand(command) {
-  if (!command.trim() || terminalBusy) return;
-  if (command.trim() === "clear") {
-    $("terminal-output").innerHTML = "";
-    return;
-  }
-  terminalBusy = true;
-  $("terminal-input").disabled = true;
-  try {
-    await ensureTerminalReady();
-    appendTerminalCommand(command);
-    const payload = await api(
-      "/api/terminal-run",
-      form({
-        cwd: terminalCwd,
-        command,
-      }),
-    );
-    terminalCwd = payload.cwd || terminalCwd;
-    renderTerminalPrompt();
-    if (payload.stdout) appendTerminalLine(payload.stdout, "stdout");
-    if (payload.stderr) appendTerminalLine(payload.stderr, "stderr");
-    if (payload.exitCode !== 0) {
-      appendTerminalLine(`exit ${payload.exitCode}`, "meta");
-    }
-  } catch (error) {
-    appendTerminalLine(error.message, "stderr");
-    toast(error.message);
-  } finally {
-    terminalBusy = false;
-    $("terminal-input").disabled = false;
-    $("terminal-input").focus();
-  }
 }
 
 function configScope() {
@@ -3350,27 +3510,26 @@ $("terminal-close-btn").addEventListener("click", () => {
 });
 
 $("terminal-clear-btn").addEventListener("click", () => {
-  $("terminal-output").innerHTML = "";
-  $("terminal-input").focus();
+  if (term) {
+    term.clear();
+    term.focus();
+  }
 });
 
 $("terminal-new-btn").addEventListener("click", async () => {
   try {
-    $("terminal-output").innerHTML = "";
-    terminalCwd = "";
-    await ensureTerminalReady();
-    $("terminal-input").focus();
+    await restartTerminal();
   } catch (error) {
-    appendTerminalLine(error.message, "stderr");
     toast(error.message);
   }
 });
 
-$("terminal-form").addEventListener("submit", (event) => {
-  event.preventDefault();
-  const command = $("terminal-input").value;
-  $("terminal-input").value = "";
-  void runTerminalCommand(command);
+// Tear the shell down when the window goes away (the pty is also reaped by
+// SIGHUP when its master is dropped on app exit, so this is best-effort).
+window.addEventListener("beforeunload", () => {
+  if (!termId) return;
+  const invoke = tauriInvoke();
+  if (invoke) void invoke("terminal_close", { id: termId });
 });
 
 $("session-select").addEventListener("change", async () => {

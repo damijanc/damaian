@@ -14,11 +14,18 @@ use workspace_engine::{
 };
 
 mod keychain;
+pub mod terminal;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const STYLE_CSS: &str = include_str!("../static/style.css");
 const APP_JS: &str = include_str!("../static/app.js");
-const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+const XTERM_JS: &str = include_str!("../static/xterm.js");
+const XTERM_CSS: &str = include_str!("../static/xterm.css");
+const XTERM_ADDON_FIT_JS: &str = include_str!("../static/xterm-addon-fit.js");
+// `style-src` allows 'unsafe-inline' because xterm.js's DOM renderer injects a
+// <style> element to colour the cursor and size cells; without it the cursor is
+// invisible. `script-src` stays strict ('self' only).
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 static MODEL_API_KEY_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 pub fn run_from_env() -> Result<(), String> {
@@ -145,6 +152,23 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             "application/javascript; charset=utf-8",
             APP_JS,
         ),
+        ("GET", "/xterm.js") | ("GET", "/assets/xterm.js") => write_response(
+            stream,
+            &request,
+            200,
+            "application/javascript; charset=utf-8",
+            XTERM_JS,
+        ),
+        ("GET", "/xterm-addon-fit.js") | ("GET", "/assets/xterm-addon-fit.js") => write_response(
+            stream,
+            &request,
+            200,
+            "application/javascript; charset=utf-8",
+            XTERM_ADDON_FIT_JS,
+        ),
+        ("GET", "/xterm.css") | ("GET", "/assets/xterm.css") => {
+            write_response(stream, &request, 200, "text/css; charset=utf-8", XTERM_CSS)
+        }
         ("GET", "/api/bootstrap") => {
             let repo = options.default_repo.clone().unwrap_or_default();
             write_response(
@@ -882,6 +906,33 @@ fn handle_resume_command_stream(stream: &mut TcpStream, request: &Request) -> Re
     }
 }
 
+/// Encode raw pty bytes for transport across the IPC boundary as UTF-8-safe
+/// text. Shared with the desktop app's terminal commands.
+pub fn base64_encode(input: &[u8]) -> String {
+    const CHARS: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(CHARS[((n >> 18) & 63) as usize] as char);
+        out.push(CHARS[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            CHARS[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            CHARS[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 fn run_resume_command_request(
     form: &HashMap<String, String>,
     on_token: &mut dyn FnMut(&str),
@@ -1318,7 +1369,7 @@ struct TerminalCommandResult {
     stderr: String,
 }
 
-fn terminal_cwd_for_repo(repo: &str) -> Result<PathBuf, String> {
+pub fn terminal_cwd_for_repo(repo: &str) -> Result<PathBuf, String> {
     if repo.trim().is_empty() {
         home_dir()
     } else {
@@ -2503,5 +2554,40 @@ mod tests {
                 .collect(),
             body: String::new(),
         }
+    }
+
+    /// End-to-end check of the real pty terminal driven directly through the
+    /// `terminal` module (the same entry points the desktop app's Tauri
+    /// commands call): open a shell, type a command and confirm the shell's
+    /// output comes back over the session's output channel, then resize and
+    /// close. Spawns a real login shell, so it is excluded from the default
+    /// run.
+    #[test]
+    #[ignore]
+    fn terminal_pty_round_trips_shell_output() {
+        let cwd = super::terminal_cwd_for_repo("").expect("resolve terminal cwd");
+        let id = super::terminal::open(&cwd, 80, 24).expect("open pty session");
+        let receiver = super::terminal::take_output(&id).expect("take output channel");
+
+        let marker = "pty_marker_9931";
+        super::terminal::write_input(&id, format!("echo {marker}\n").as_bytes())
+            .expect("write to pty");
+
+        let mut decoded = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while std::time::Instant::now() < deadline && !decoded.contains(marker) {
+            match receiver.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(chunk) => decoded.push_str(&String::from_utf8_lossy(&chunk)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(
+            decoded.contains(marker),
+            "expected shell output to contain {marker}, got: {decoded:?}"
+        );
+
+        super::terminal::resize(&id, 120, 40).expect("resize pty");
+        assert!(super::terminal::close(&id).is_some(), "close should reap the shell");
     }
 }
