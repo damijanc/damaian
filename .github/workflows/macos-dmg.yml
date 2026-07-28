@@ -154,11 +154,48 @@ jobs:
       contents: write
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
       - name: Download DMG artifacts
         uses: actions/download-artifact@v8
         with:
           name: Damaian-macOS-arm64-DMG
           path: release-artifacts
+
+      - name: Build release notes from commit history
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          prev_tag="$(git describe --tags --abbrev=0 "${TAG_NAME}^" 2>/dev/null || true)"
+          if [[ -n "${prev_tag}" ]]; then
+            range="${prev_tag}..${TAG_NAME}"
+            echo "Generating notes for range ${range}"
+          else
+            range="${TAG_NAME}"
+            echo "No previous tag found; using all commits up to ${TAG_NAME}"
+          fi
+          changelog="$(git log "${range}" --no-merges --pretty=format:'- %s (%h)')"
+          {
+            echo "Ad-hoc signed, not notarized macOS developer-preview DMG build for ${TAG_NAME}."
+            echo ""
+            if [[ -n "${prev_tag}" ]]; then
+              echo "## What's Changed since ${prev_tag}"
+            else
+              echo "## What's Changed"
+            fi
+            echo ""
+            if [[ -n "${changelog}" ]]; then
+              echo "${changelog}"
+            else
+              echo "- No changes recorded."
+            fi
+          } > release-notes.md
+          echo "Release notes:"
+          cat release-notes.md
 
       - name: Publish release assets
         env:
@@ -167,7 +204,6 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          notes="${TAG_NAME}."
           mapfile -t assets < <(find release-artifacts -type f \( \
             -name "*.dmg" -o \
             -name "*.app.tar.gz" -o \
@@ -180,9 +216,10 @@ jobs:
           fi
           if gh release view "${TAG_NAME}" --repo "${GH_REPO}" >/dev/null 2>&1; then
             gh release upload "${TAG_NAME}" "${assets[@]}" --repo "${GH_REPO}" --clobber
+            gh release edit "${TAG_NAME}" --repo "${GH_REPO}" --notes-file release-notes.md
           else
             gh release create "${TAG_NAME}" "${assets[@]}" \
               --repo "${GH_REPO}" \
               --title "${TAG_NAME}" \
-              --notes "${notes}"
+              --notes-file release-notes.md
           fi
