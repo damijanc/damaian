@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-terminal-close"
+description = "Enables the terminal_close command without any pre-configured scope."
+commands.allow = ["terminal_close"]
+
+[[permission]]
+identifier = "deny-terminal-close"
+description = "Denies the terminal_close command without any pre-configured scope."
+commands.deny = ["terminal_close"]

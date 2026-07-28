@@ -1025,64 +1025,19 @@ button:disabled {
 }
 
 .terminal-body {
+  position: relative;
   min-height: 0;
-  display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  background: #ffffff;
 }
 
-.terminal-output {
-  min-height: 0;
-  overflow: auto;
-  padding: 12px 28px 8px;
-  font: 15px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+.terminal-xterm {
+  position: absolute;
+  inset: 8px 12px;
 }
 
-.terminal-line {
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.terminal-line.command {
-  color: #1f2428;
-}
-
-.terminal-line.stdout {
-  color: #1f2428;
-}
-
-.terminal-line.stderr {
-  color: #a33737;
-}
-
-.terminal-line.meta {
-  color: var(--muted);
-}
-
-.terminal-input-row {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-  gap: 8px;
-  padding: 4px 28px 12px;
-  font: 15px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-
-#terminal-prompt {
-  color: var(--ink);
-  font-weight: 500;
-}
-
-#terminal-input {
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  color: var(--ink);
-  font: inherit;
-  padding: 0;
-}
-
-#terminal-input:focus {
-  box-shadow: none;
+/* xterm draws its own scrollbar; keep the app chrome out of its way. */
+.terminal-xterm .xterm-viewport {
+  background-color: transparent !important;
 }
 
 .terminal-cwd {

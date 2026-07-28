@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use desktop_shell::{ShellOptions, run_server_with_ready};
 use serde::Serialize;
+use tauri::ipc::Channel;
 use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{Manager, Runtime, Url};
 
@@ -81,7 +82,13 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![damaian_desktop_bootstrap])
+        .invoke_handler(tauri::generate_handler![
+            damaian_desktop_bootstrap,
+            terminal_open,
+            terminal_write,
+            terminal_resize,
+            terminal_close
+        ])
         .run(tauri::generate_context!())
         .expect("error while running Damaian desktop app");
 }
@@ -89,6 +96,68 @@ fn main() {
 #[tauri::command]
 fn damaian_desktop_bootstrap(bootstrap: tauri::State<'_, DesktopBootstrap>) -> DesktopBootstrap {
     bootstrap.inner().clone()
+}
+
+/// Streamed pty output/lifecycle messages pushed to the webview over an IPC
+/// channel — the low-latency path that replaced HTTP-per-keystroke.
+#[derive(Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum TerminalEvent {
+    Output { data: String },
+    Exit { code: i32 },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalOpened {
+    id: String,
+    cwd: String,
+}
+
+#[tauri::command]
+fn terminal_open(
+    repo: String,
+    cols: u16,
+    rows: u16,
+    on_output: Channel<TerminalEvent>,
+) -> Result<TerminalOpened, String> {
+    let cwd = desktop_shell::terminal_cwd_for_repo(&repo)?;
+    let id = desktop_shell::terminal::open(&cwd, cols, rows)?;
+    let receiver = desktop_shell::terminal::take_output(&id)?;
+
+    // Forward pty output to the webview until the shell exits or the channel
+    // is gone, then reap the session and report the exit code.
+    let forward_id = id.clone();
+    thread::spawn(move || {
+        for chunk in receiver.iter() {
+            let data = desktop_shell::base64_encode(&chunk);
+            if on_output.send(TerminalEvent::Output { data }).is_err() {
+                break;
+            }
+        }
+        let code = desktop_shell::terminal::close(&forward_id).unwrap_or(-1);
+        let _ = on_output.send(TerminalEvent::Exit { code });
+    });
+
+    Ok(TerminalOpened {
+        id,
+        cwd: cwd.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+fn terminal_write(id: String, data: String) -> Result<(), String> {
+    desktop_shell::terminal::write_input(&id, data.as_bytes())
+}
+
+#[tauri::command]
+fn terminal_resize(id: String, cols: u16, rows: u16) -> Result<(), String> {
+    desktop_shell::terminal::resize(&id, cols, rows)
+}
+
+#[tauri::command]
+fn terminal_close(id: String) {
+    desktop_shell::terminal::close(&id);
 }
 
 fn build_app_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu<R>> {

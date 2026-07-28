@@ -10,6 +10,10 @@
     "core:default",
     "dialog:default",
     "updater:default",
-    "allow-damaian-desktop-bootstrap"
+    "allow-damaian-desktop-bootstrap",
+    "allow-terminal-open",
+    "allow-terminal-write",
+    "allow-terminal-resize",
+    "allow-terminal-close"
   ]
 }

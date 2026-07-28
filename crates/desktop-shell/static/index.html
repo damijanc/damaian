@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Damaian</title>
+    <link rel="stylesheet" href="xterm.css" />
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
@@ -234,18 +235,7 @@
             </button>
           </div>
           <div class="terminal-body">
-            <div id="terminal-output" class="terminal-output" role="log" aria-live="polite"></div>
-            <form id="terminal-form" class="terminal-input-row">
-              <span id="terminal-prompt">$</span>
-              <input
-                id="terminal-input"
-                type="text"
-                autocomplete="off"
-                autocapitalize="off"
-                spellcheck="false"
-                aria-label="Terminal command"
-              />
-            </form>
+            <div id="terminal-xterm" class="terminal-xterm"></div>
           </div>
           <div id="terminal-cwd" class="terminal-cwd">Not started</div>
         </section>
@@ -547,6 +537,8 @@
       </main>
     </section>
     <div id="toast" role="status"></div>
+    <script src="xterm.js"></script>
+    <script src="xterm-addon-fit.js"></script>
     <script src="app.js"></script>
   </body>
 </html>
