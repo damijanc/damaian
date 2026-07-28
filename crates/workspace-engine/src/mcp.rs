@@ -48,6 +48,52 @@ pub fn parse_namespaced_tool_name(name: &str) -> Option<(String, String)> {
     Some((server_id.to_string(), tool_name.to_string()))
 }
 
+/// Splits a command line into tokens the way a shell would for the simple
+/// cases: whitespace separates arguments, and single or double quotes (plus a
+/// backslash escape) group a token so paths with spaces survive. Not a full
+/// POSIX parser — just enough to let a pasted `python /path/server.py` line be
+/// launched correctly.
+fn shell_split(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut has_token = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = input.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' if !in_single => {
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                    has_token = true;
+                }
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                has_token = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                has_token = true;
+            }
+            character if character.is_whitespace() && !in_single && !in_double => {
+                if has_token {
+                    tokens.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            character => {
+                current.push(character);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        tokens.push(current);
+    }
+    tokens
+}
+
 /// A tool discovered from a server's `tools/list`.
 #[derive(Debug, Clone)]
 pub struct McpTool {
@@ -246,8 +292,23 @@ impl StdioTransport {
                 "MCP stdio server requires a command".to_string(),
             ));
         }
-        let mut command = Command::new(&config.command);
-        command.args(&config.args);
+        // Tolerate a whole command line pasted into `command` (e.g. copied from
+        // an opencode-style `"command": ["python", "server.py"]` array). When
+        // no separate args are configured, shell-split `command` into the
+        // executable plus its arguments; quotes protect paths with spaces.
+        let (program, args) = if config.args.is_empty() {
+            let mut tokens = shell_split(&config.command).into_iter();
+            let Some(program) = tokens.next() else {
+                return Err(ClientError::InvalidInput(
+                    "MCP stdio server requires a command".to_string(),
+                ));
+            };
+            (program, tokens.collect::<Vec<_>>())
+        } else {
+            (config.command.clone(), config.args.clone())
+        };
+        let mut command = Command::new(&program);
+        command.args(&args);
         // Only the explicitly configured environment reaches the child — no
         // ambient secrets are inherited beyond what the user opted in to.
         for (key, value) in &config.env {
@@ -674,6 +735,29 @@ mod tests {
         let (server, tool) = parse_namespaced_tool_name(&name).unwrap();
         assert_eq!(server, "sentry");
         assert_eq!(tool, "search_issues");
+    }
+
+    #[test]
+    fn shell_split_handles_plain_args_and_quoted_paths() {
+        assert_eq!(
+            shell_split("/venv/bin/python /path/server.py"),
+            vec!["/venv/bin/python".to_string(), "/path/server.py".to_string()]
+        );
+        assert_eq!(
+            shell_split("npx -y @scope/pkg /tmp"),
+            vec![
+                "npx".to_string(),
+                "-y".to_string(),
+                "@scope/pkg".to_string(),
+                "/tmp".to_string()
+            ]
+        );
+        // A quoted path with a space stays a single token.
+        assert_eq!(
+            shell_split("\"/Applications/My App/bin/tool\" --flag"),
+            vec!["/Applications/My App/bin/tool".to_string(), "--flag".to_string()]
+        );
+        assert!(shell_split("   ").is_empty());
     }
 
     #[test]
