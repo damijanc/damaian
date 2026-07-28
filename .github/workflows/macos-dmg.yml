@@ -167,7 +167,7 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          notes="Ad-hoc signed, not notarized macOS developer-preview DMG build for ${TAG_NAME}."
+          notes="${TAG_NAME}."
           mapfile -t assets < <(find release-artifacts -type f \( \
             -name "*.dmg" -o \
             -name "*.app.tar.gz" -o \
