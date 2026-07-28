@@ -1880,6 +1880,12 @@ button:disabled {
   max-width: 60ch;
 }
 
+.field-note {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .field-checkbox {
   display: flex;
   align-items: center;

@@ -1158,7 +1158,9 @@ function splitModelList(value) {
 function syncConfiguredProvidersFromConfig(content) {
   configuredProviderIds.clear();
   configEntries(content).forEach(([key]) => {
-    const match = key.match(/^model_provider\.([a-zA-Z0-9_.-]+)\.(label|base_url|api_key_env|models)$/);
+    const match = key.match(
+      /^model_provider\.([a-zA-Z0-9_.-]+)\.(label|base_url|api_key_env|models|supports_native_tools)$/,
+    );
     if (match) configuredProviderIds.add(normalizeChatProvider(match[1]));
   });
 }
@@ -1172,7 +1174,9 @@ function syncProviderCatalogFromPolicy(policyText) {
 
   const providers = {};
   configEntries(policyText).forEach(([key, value]) => {
-    const match = key.match(/^model_provider\.([a-zA-Z0-9_.-]+)\.(label|base_url|api_key_env|models)$/);
+    const match = key.match(
+      /^model_provider\.([a-zA-Z0-9_.-]+)\.(label|base_url|api_key_env|models|supports_native_tools)$/,
+    );
     if (!match) return;
     const id = normalizeChatProvider(match[1]);
     providers[id] = providers[id] || { id };
@@ -1181,6 +1185,7 @@ function syncProviderCatalogFromPolicy(policyText) {
     if (field === "base_url") providers[id].baseUrl = value;
     if (field === "api_key_env") providers[id].apiKeyEnv = value;
     if (field === "models") providers[id].models = splitModelList(value);
+    if (field === "supports_native_tools") providers[id].supportsNativeTools = value === "true";
   });
 
   Object.entries(providers).forEach(([id, provider]) => {
@@ -1192,6 +1197,8 @@ function syncProviderCatalogFromPolicy(policyText) {
       apiKeyEnv: provider.apiKeyEnv || existing.apiKeyEnv || "",
       defaultModel: models[0] || existing.defaultModel || "",
       models,
+      supportsNativeTools:
+        provider.supportsNativeTools ?? existing.supportsNativeTools ?? false,
     };
   });
 
@@ -1426,13 +1433,14 @@ function providerConfigFromForm() {
   const baseUrl = $("provider-base-url-input").value.trim().replace(/\/+$/, "");
   const apiKeyEnv = $("provider-key-ref-input").value.trim();
   const models = splitModelList($("provider-models-input").value);
+  const supportsNativeTools = $("provider-native-tools-input").checked;
   if (!label) throw new Error("Provider name is required");
   if (!id) throw new Error("Provider ID is required");
   if (!baseUrl) throw new Error("Provider base URL is required");
   if (!apiKeyEnv) throw new Error("Provider API key reference is required");
   if (apiKeyEnv === "keychain:") throw new Error("Keychain account is required");
   if (!models.length) throw new Error("At least one model is required");
-  return { id, label, baseUrl, apiKeyEnv, models };
+  return { id, label, baseUrl, apiKeyEnv, models, supportsNativeTools };
 }
 
 function renderProviderConfigSelect(selectedId = $("provider-config-select").value) {
@@ -1481,6 +1489,7 @@ function renderProviderConfigForm(providerId = $("provider-config-select").value
   $("provider-key-ref-input").value = provider.apiKeyEnv || `keychain:${id}-api-key`;
   $("provider-api-key-input").value = "";
   $("provider-models-input").value = (provider.models || []).join("\n");
+  $("provider-native-tools-input").checked = provider.supportsNativeTools === true;
   $("provider-remove-btn").disabled = !configuredProviderIds.has(id);
 }
 
@@ -1494,6 +1503,7 @@ function clearProviderConfigForm() {
   $("provider-key-ref-input").value = "keychain:";
   $("provider-api-key-input").value = "";
   $("provider-models-input").value = "";
+  $("provider-native-tools-input").checked = false;
   $("provider-remove-btn").disabled = true;
 }
 
@@ -1733,6 +1743,11 @@ function upsertProviderConfig(content, provider) {
   next = upsertConfigValue(next, `model_provider.${provider.id}.base_url`, provider.baseUrl);
   next = upsertConfigValue(next, `model_provider.${provider.id}.api_key_env`, provider.apiKeyEnv);
   next = upsertConfigValue(next, `model_provider.${provider.id}.models`, provider.models.join("|"));
+  next = upsertConfigValue(
+    next,
+    `model_provider.${provider.id}.supports_native_tools`,
+    provider.supportsNativeTools ? "true" : "false",
+  );
   return next;
 }
 

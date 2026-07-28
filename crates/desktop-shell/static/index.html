@@ -376,7 +376,15 @@
               <div class="mcp-stdio-fields">
                 <label class="field">
                   <span>Command</span>
-                  <input id="mcp-command-input" type="text" placeholder="npx" />
+                  <input
+                    id="mcp-command-input"
+                    type="text"
+                    placeholder="/path/.venv/bin/python /path/server.py"
+                  />
+                  <small class="field-note"
+                    >The executable, or a full command line. Leave Arguments empty to paste the
+                    whole command here; quote paths that contain spaces.</small
+                  >
                 </label>
                 <label class="field">
                   <span>Arguments</span>
@@ -493,6 +501,10 @@
                   rows="3"
                   placeholder="model-large&#10;model-fast"
                 ></textarea>
+              </label>
+              <label class="field-checkbox">
+                <input id="provider-native-tools-input" type="checkbox" />
+                <span>Native tool-calling — required for MCP tools and agentic actions</span>
               </label>
               <div class="inline-actions">
                 <button id="provider-save-btn" type="button">Save Provider</button>
