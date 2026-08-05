@@ -1171,6 +1171,66 @@ fn chat_dispatches_native_tool_call_when_provider_supports_it() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+/// Regression: a reasoning model in thinking mode returns `reasoning_content`
+/// alongside its tool call, and DeepSeek then *requires* that reasoning back on
+/// the assistant message in every later request of the turn — otherwise the
+/// follow-up round fails with `Model provider error: The `reasoning_content` in
+/// the thinking mode must be passed back to the API.` and the whole task dies.
+/// Dropping it here is what broke scaffolding: the model called
+/// `read_git_status`, and the very next round was rejected.
+#[test]
+fn chat_replays_reasoning_content_on_native_tool_call_rounds() {
+    let repo = temp_dir("chat-reasoning-replay");
+    write_fixture(&repo, "README.md", "# Reasoning replay test\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            "The working tree is clean.".to_string(),
+        ],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_git_status".to_string(),
+                arguments_json: "{}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    )
+    .with_reasoning_content(vec![
+        Some("I should check git status before scaffolding.".to_string()),
+        None,
+    ]);
+    let mut on_token = |_token: &str| {};
+
+    engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "create the project scaffolding",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    let follow_up = &adapter.requests[1];
+    let echoed = follow_up
+        .messages
+        .iter()
+        .find(|message| !message.tool_calls.is_empty())
+        .expect("the follow-up round must echo the assistant's tool-call message");
+    assert_eq!(
+        echoed.reasoning_content.as_deref(),
+        Some("I should check git status before scaffolding."),
+        "reasoning_content must be replayed on the tool-call turn"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 #[test]
 fn chat_chains_multiple_native_tool_calls_within_one_turn() {
     let repo = temp_dir("chat-multi-tool-call");

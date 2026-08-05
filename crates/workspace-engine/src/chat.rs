@@ -355,6 +355,7 @@ impl ChatOrchestrator {
             messages.push(ModelMessage::assistant_with_tool_calls(
                 pending.last_content.clone(),
                 vec![call.clone()],
+                pending.reasoning_content.clone(),
             ));
             messages.push(ModelMessage::tool(call.id.clone(), tool_result_content));
         } else {
@@ -551,6 +552,7 @@ impl ChatOrchestrator {
                             messages: messages.clone(),
                             matched_tool_call: matched_tool_call.clone(),
                             last_content: redacted.clone(),
+                            reasoning_content: model_run.reasoning_content.clone(),
                             mcp_call: None,
                         })?;
                         let mut proposal_run = model_run;
@@ -686,6 +688,7 @@ impl ChatOrchestrator {
                             messages: messages.clone(),
                             matched_tool_call: matched_tool_call.clone(),
                             last_content: redacted.clone(),
+                            reasoning_content: model_run.reasoning_content.clone(),
                             mcp_call: Some(PendingMcpCall {
                                 server_id,
                                 tool_name,
@@ -730,6 +733,7 @@ impl ChatOrchestrator {
                 messages.push(ModelMessage::assistant_with_tool_calls(
                     redacted.clone(),
                     vec![call.clone()],
+                    model_run.reasoning_content.clone(),
                 ));
                 messages.push(ModelMessage::tool(call.id.clone(), tool_result_text));
             } else {
@@ -803,6 +807,13 @@ struct PendingChatTurn {
     messages: Vec<ModelMessage>,
     matched_tool_call: Option<ToolCall>,
     last_content: String,
+    /// Thinking-mode reasoning behind `matched_tool_call`, which must be
+    /// replayed with it when the turn resumes — a pause for human approval
+    /// must not lose it, or the resumed request is rejected outright.
+    /// `#[serde(default)]` keeps pending turns written before this field
+    /// existed loadable.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     /// Present when the paused action is an MCP tool call rather than a shell
     /// command; carries everything needed to execute it on resume. `#[serde(default)]`
     /// keeps older on-disk pending turns (which predate MCP) loadable.
