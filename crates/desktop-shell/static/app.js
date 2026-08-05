@@ -3075,6 +3075,22 @@ async function appendGitStatusAfterChange(repoPath) {
   appendChatMessage("system", renderGitStatusText(payload));
 }
 
+// Appends whatever proposals a finished chat turn carries. Shared by every
+// `done` handler: a turn can end with a command awaiting approval, a patch
+// awaiting review, or neither, and each handler must treat all of them the
+// same. Keeping this in one place is deliberate — the resume-after-approval
+// handler previously rendered only `commandProposal`, so a patch proposed
+// after the user approved a command was silently dropped and could never be
+// reviewed.
+function appendProposals(message, payload, repo) {
+  if (payload.commandProposal) {
+    message.body.append(createCommandApprovalPreview(payload.commandProposal, repo));
+  }
+  if (payload.patchProposal) {
+    message.body.append(createPatchPreview(payload.patchProposal, repo));
+  }
+}
+
 function createPatchPreview(payload, patchRepo) {
   const state = {
     patchId: payload.patchId,
@@ -3340,11 +3356,7 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
             assistantText = payload.response;
             updateChatMessage(assistantMessage, assistantText);
           }
-          if (payload.commandProposal) {
-            assistantMessage.body.append(
-              createCommandApprovalPreview(payload.commandProposal, proposalRepo),
-            );
-          }
+          appendProposals(assistantMessage, payload, proposalRepo);
           if (payload.sessionId) {
             currentSessionId = payload.sessionId;
             localStorage.setItem(lastSessionStorageKey(), currentSessionId);
@@ -3685,12 +3697,7 @@ async function sendChatPrompt() {
           // Awaited so the command-approval preview appended below survives
           // finalize's innerHTML replacement instead of being wiped by it.
           await finalizeChatMessage(assistantMessage, assistantText);
-          if (payload.commandProposal) {
-            assistantMessage.body.append(createCommandApprovalPreview(payload.commandProposal, chatRepo));
-          }
-          if (payload.patchProposal) {
-            assistantMessage.body.append(createPatchPreview(payload.patchProposal, chatRepo));
-          }
+          appendProposals(assistantMessage, payload, chatRepo);
           renderContextFiles(payload.contextFiles || []);
           setChatStatus(payload.incomplete ? "Incomplete" : "Complete", payload.incomplete ? "warn" : "ok");
         },
