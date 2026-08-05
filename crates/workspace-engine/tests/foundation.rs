@@ -1682,6 +1682,71 @@ fn chat_returns_command_approval_when_command_exits_sandbox() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+// The exact shape that reached the UI as "the agent made a patch but I can't
+// review it": the model asks for a command, the user approves, and the resumed
+// turn proposes a patch. The resumed result must carry that proposal — it is
+// the only way the patch reaches the review UI, and a turn that ends this way
+// is otherwise indistinguishable from one that simply finished talking.
+#[test]
+fn chat_resume_after_command_approval_surfaces_a_patch_proposal() {
+    let repo = temp_dir("chat-resume-patch-proposal");
+    write_fixture(&repo, "README.md", "# Chat resume patch test\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            "DAMAIAN_COMMAND_V1\nCOMMAND: echo checking-repo\nREASON: Inspect before scaffolding.\nEND_COMMAND\n"
+                .to_string(),
+            "I've prepared the scaffold for review.".to_string(),
+        ],
+        vec![
+            Vec::new(),
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "propose_patch".to_string(),
+                arguments_json:
+                    "{\"summary\":\"Scaffold entry point\",\"files\":[{\"path\":\"index.html\",\"content\":\"<!doctype html>\\n\"}]}"
+                        .to_string(),
+            }],
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let first = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Scaffold the project.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+    let proposal = first
+        .command_proposal
+        .expect("unclassified command should require approval");
+
+    let resumed = engine
+        .chat_orchestrator
+        .resume_after_command_decision(&proposal.id, true, "tester", &mut adapter, &mut on_token)
+        .unwrap();
+
+    let patch = resumed
+        .patch_proposal
+        .expect("resumed turn must surface the patch it proposed");
+    assert_eq!(patch.summary, "Scaffold entry point");
+    assert_eq!(patch.files.len(), 1);
+    assert_eq!(patch.files[0].path, "index.html");
+    assert_eq!(resumed.task.status.as_str(), "waiting_for_approval");
+
+    // Nothing is written until the user approves the patch itself; approving
+    // the command must not be mistaken for approving the file change.
+    assert!(!repo.join("index.html").exists());
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 #[test]
 fn chat_resumes_after_command_approval_and_answers_using_the_result() {
     let repo = temp_dir("chat-resume-approve");
