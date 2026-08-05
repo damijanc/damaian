@@ -160,13 +160,12 @@ impl SessionStore {
                 continue;
             }
             let content = fs::read_to_string(entry.path())?;
-            if let Some(session) = parse_session_log(&content) {
-                if repository_id
+            if let Some(session) = parse_session_log(&content)
+                && repository_id
                     .map(|id| id == session.repository_id.as_str())
                     .unwrap_or(true)
-                {
-                    sessions.push(session);
-                }
+            {
+                sessions.push(session);
             }
         }
         sessions.sort_by(|left, right| {

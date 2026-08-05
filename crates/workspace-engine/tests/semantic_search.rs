@@ -126,10 +126,16 @@ fn vector_index_cache_finds_semantically_related_code_that_keyword_search_misses
 
     // Re-running the same search against an unchanged index should not
     // rewrite the persisted file (nothing to re-embed).
-    let modified_before = fs::metadata(&vector_index_path).unwrap().modified().unwrap();
+    let modified_before = fs::metadata(&vector_index_path)
+        .unwrap()
+        .modified()
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(20));
     let _ = VectorIndexCache::semantic_search(&config.data_dir, &index, query, 5);
-    let modified_after = fs::metadata(&vector_index_path).unwrap().modified().unwrap();
+    let modified_after = fs::metadata(&vector_index_path)
+        .unwrap()
+        .modified()
+        .unwrap();
     assert_eq!(
         modified_before, modified_after,
         "expected an unchanged index to skip re-writing the vector store"

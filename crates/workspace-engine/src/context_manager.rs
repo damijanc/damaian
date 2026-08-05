@@ -59,6 +59,10 @@ impl ContextManager {
         }
     }
 
+    // Each argument is an independent input to the context plan; a params
+    // struct would be constructed at the single call site and immediately
+    // destructured here.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_context(
         &self,
         repository_root: impl AsRef<Path>,
@@ -88,7 +92,10 @@ impl ContextManager {
             .map(|path| (path.clone(), true))
             .collect();
         for path in prompt_file_mentions(prompt, index) {
-            if !requested_paths.iter().any(|(existing, _)| existing == &path) {
+            if !requested_paths
+                .iter()
+                .any(|(existing, _)| existing == &path)
+            {
                 requested_paths.push((path, false));
             }
         }
@@ -268,10 +275,10 @@ fn prompt_file_mentions(prompt: &str, index: Option<&RepositoryIndex>) -> Vec<St
             None
         };
 
-        if let Some(path) = resolved {
-            if seen.insert(path.clone()) {
-                mentioned.push(path);
-            }
+        if let Some(path) = resolved
+            && seen.insert(path.clone())
+        {
+            mentioned.push(path);
         }
     }
 
@@ -301,7 +308,7 @@ fn prompt_path_candidates(prompt: &str) -> Vec<String> {
                             | ';'
                     )
                 })
-                .trim_end_matches(|character: char| matches!(character, '.' | '?' | '!'))
+                .trim_end_matches(['.', '?', '!'])
                 .replace('\\', "/");
 
             if candidate.is_empty()

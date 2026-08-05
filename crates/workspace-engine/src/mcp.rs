@@ -195,8 +195,7 @@ impl McpClient {
     }
 
     pub fn call_tool(&mut self, tool_name: &str, arguments_json: &str) -> Result<McpToolResult> {
-        let arguments: Value =
-            serde_json::from_str(arguments_json).unwrap_or_else(|_| json!({}));
+        let arguments: Value = serde_json::from_str(arguments_json).unwrap_or_else(|_| json!({}));
         let params = json!({ "name": tool_name, "arguments": arguments });
         let result = self.request("tools/call", params, CALL_TIMEOUT)?;
         Ok(flatten_tool_result(&result))
@@ -253,10 +252,10 @@ fn flatten_tool_result(result: &Value) -> McpToolResult {
             }
         }
     }
-    if text.is_empty() {
-        if let Some(structured) = result.get("structuredContent") {
-            text = structured.to_string();
-        }
+    if text.is_empty()
+        && let Some(structured) = result.get("structuredContent")
+    {
+        text = structured.to_string();
     }
     if text.is_empty() {
         text = result.to_string();
@@ -618,7 +617,9 @@ impl McpRuntime {
     }
 
     fn server(&self, server_id: &str) -> Option<&McpServerRuntime> {
-        self.servers.iter().find(|server| server.config.id == server_id)
+        self.servers
+            .iter()
+            .find(|server| server.config.id == server_id)
     }
 
     pub fn requires_approval(&self, server_id: &str) -> bool {
@@ -741,7 +742,10 @@ mod tests {
     fn shell_split_handles_plain_args_and_quoted_paths() {
         assert_eq!(
             shell_split("/venv/bin/python /path/server.py"),
-            vec!["/venv/bin/python".to_string(), "/path/server.py".to_string()]
+            vec![
+                "/venv/bin/python".to_string(),
+                "/path/server.py".to_string()
+            ]
         );
         assert_eq!(
             shell_split("npx -y @scope/pkg /tmp"),
@@ -755,7 +759,10 @@ mod tests {
         // A quoted path with a space stays a single token.
         assert_eq!(
             shell_split("\"/Applications/My App/bin/tool\" --flag"),
-            vec!["/Applications/My App/bin/tool".to_string(), "--flag".to_string()]
+            vec![
+                "/Applications/My App/bin/tool".to_string(),
+                "--flag".to_string()
+            ]
         );
         assert!(shell_split("   ").is_empty());
     }
@@ -807,7 +814,10 @@ mod tests {
     fn splits_headers_from_body() {
         let raw = "HTTP/1.1 200 OK\r\nMcp-Session-Id: abc123\r\ncontent-type: application/json\r\n\r\n{\"result\":1}";
         let (headers, body) = split_headers_body(raw);
-        assert_eq!(header_value(headers, "mcp-session-id").as_deref(), Some("abc123"));
+        assert_eq!(
+            header_value(headers, "mcp-session-id").as_deref(),
+            Some("abc123")
+        );
         assert_eq!(body, "{\"result\":1}");
     }
 }

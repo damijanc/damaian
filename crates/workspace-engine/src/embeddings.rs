@@ -47,11 +47,13 @@ impl EmbeddingModel {
         // (or previously downloaded) from a fixed, known model repository,
         // not attacker-controlled input.
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[&weights_path], DTYPE, &device)
-                .map_err(|error| ClientError::Io(format!("Failed to load model weights: {error}")))?
+            VarBuilder::from_mmaped_safetensors(&[&weights_path], DTYPE, &device).map_err(
+                |error| ClientError::Io(format!("Failed to load model weights: {error}")),
+            )?
         };
-        let model = BertModel::load(vb, &config)
-            .map_err(|error| ClientError::Io(format!("Failed to build embedding model: {error}")))?;
+        let model = BertModel::load(vb, &config).map_err(|error| {
+            ClientError::Io(format!("Failed to build embedding model: {error}"))
+        })?;
 
         Ok(Self {
             model,

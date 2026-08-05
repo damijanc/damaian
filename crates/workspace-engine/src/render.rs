@@ -222,16 +222,17 @@ fn file_ref_events(text: &str, verifier: &FileLinkVerifier<'_>) -> Vec<Event<'st
 
 fn inline_code_event(code: &str, verifier: &FileLinkVerifier<'_>) -> Event<'static> {
     let trimmed = code.trim();
-    if let Some(file_ref) = detect_file_ref(trimmed, verifier) {
-        if file_ref.prefix.is_empty() && file_ref.suffix.is_empty() {
-            return Event::Html(CowStr::from(file_ref_html(
-                &file_ref.rel_path,
-                file_ref.line,
-                file_ref.col,
-                &file_ref.display,
-                true,
-            )));
-        }
+    if let Some(file_ref) = detect_file_ref(trimmed, verifier)
+        && file_ref.prefix.is_empty()
+        && file_ref.suffix.is_empty()
+    {
+        return Event::Html(CowStr::from(file_ref_html(
+            &file_ref.rel_path,
+            file_ref.line,
+            file_ref.col,
+            &file_ref.display,
+            true,
+        )));
     }
     Event::Code(CowStr::from(code.to_string()))
 }
@@ -243,8 +244,12 @@ fn file_ref_html(
     display: &str,
     inline_code: bool,
 ) -> String {
-    let line_attr = line.map(|l| format!(" data-line=\"{l}\"")).unwrap_or_default();
-    let col_attr = col.map(|c| format!(" data-col=\"{c}\"")).unwrap_or_default();
+    let line_attr = line
+        .map(|l| format!(" data-line=\"{l}\""))
+        .unwrap_or_default();
+    let col_attr = col
+        .map(|c| format!(" data-col=\"{c}\""))
+        .unwrap_or_default();
     if inline_code {
         format!(
             "<code class=\"file-reference\" role=\"button\" tabindex=\"0\" data-path=\"{}\"{}{}>{}</code>",
@@ -380,7 +385,11 @@ fn highlight_code_block_ansi(lang: &str, code: &str) -> String {
     let syntax = ss
         .find_syntax_by_token(lang.trim())
         .unwrap_or_else(|| ss.find_syntax_plain_text());
-    let Some(theme) = ts.themes.get(CLI_THEME).or_else(|| ts.themes.values().next()) else {
+    let Some(theme) = ts
+        .themes
+        .get(CLI_THEME)
+        .or_else(|| ts.themes.values().next())
+    else {
         return code.to_string();
     };
     let mut highlighter = HighlightLines::new(syntax, theme);
@@ -478,7 +487,8 @@ mod tests {
 
     #[test]
     fn passes_line_and_column_suffix_as_data_attributes() {
-        let html = render_markdown_to_html_with_file_links("see src/auth.rs:42:7 now", &rs_verifier);
+        let html =
+            render_markdown_to_html_with_file_links("see src/auth.rs:42:7 now", &rs_verifier);
         assert!(html.contains("data-path=\"src/auth.rs\""));
         assert!(html.contains("data-line=\"42\""));
         assert!(html.contains("data-col=\"7\""));
@@ -495,10 +505,8 @@ mod tests {
 
     #[test]
     fn does_not_link_paths_inside_fenced_code_blocks() {
-        let html = render_markdown_to_html_with_file_links(
-            "```\nedit src/auth.rs now\n```",
-            &rs_verifier,
-        );
+        let html =
+            render_markdown_to_html_with_file_links("```\nedit src/auth.rs now\n```", &rs_verifier);
         assert!(!html.contains("file-reference"));
         assert!(html.contains("src/auth.rs"));
     }
@@ -514,8 +522,7 @@ mod tests {
 
     #[test]
     fn strips_trailing_punctuation_when_linking() {
-        let html =
-            render_markdown_to_html_with_file_links("look at (src/auth.rs).", &rs_verifier);
+        let html = render_markdown_to_html_with_file_links("look at (src/auth.rs).", &rs_verifier);
         assert!(html.contains(">src/auth.rs</button>"));
         // The parenthesis and period stay as literal text around the link.
         assert!(html.contains("("));

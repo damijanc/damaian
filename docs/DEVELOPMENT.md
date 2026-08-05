@@ -4,8 +4,12 @@ Technical reference for building, running, and releasing Damaian. For end-user
 instructions see the [Damaian User Guide](USER_GUIDE.md).
 
 Damaian is a Rust workspace with a native Tauri desktop app. No Node.js runtime
-is required to run the packaged macOS app; Node is only used for the build and
-release scripts below.
+is required to run the packaged macOS app; Node is only used for the build,
+release, and lint scripts below.
+
+If you are working with a coding agent, point it at [AGENTS.md](../AGENTS.md) —
+it records the conventions, security boundaries, and pitfalls specific to this
+repository.
 
 ## Workspace layout
 
@@ -28,6 +32,40 @@ DAMAIAN_REPO=/path/to/repo npm run desktop:dev
 # Local desktop shell prototype (no Tauri wrapper)
 cargo run -p desktop-shell -- --repo /path/to/repo --port 4765
 ```
+
+## Quality checks
+
+Every pull request and every push to `main` runs
+[`.github/workflows/quality.yml`](../.github/workflows/quality.yml). The same
+checks run locally:
+
+```sh
+cargo fmt --all -- --check                                   # formatting
+cargo clippy --workspace --all-targets --locked -- -D warnings  # lints (warnings fail)
+cargo test --workspace --locked                              # test suite
+npm run lint:web                                             # app.js / style.css
+cargo deny check                                             # advisories + licenses
+```
+
+`npm run lint:web:fix` applies the web-asset fixes automatically. `npm ci` first
+if you have not installed the Node dev dependencies; Biome is the only one, and
+it is pinned in `package-lock.json`.
+
+Two tools are needed only for the last check and are installed on demand in CI:
+
+```sh
+cargo install cargo-deny --locked
+cargo install typos-cli --locked   # spell check, also run in CI
+```
+
+Configuration lives in [`deny.toml`](../deny.toml) (scoped to
+`aarch64-apple-darwin`, the only shipped target), [`biome.json`](../biome.json),
+and [`_typos.toml`](../_typos.toml). The vendored `xterm*` files under
+`crates/desktop-shell/static/` are excluded from all of it.
+
+The workflow splits into a fast Linux job for the checks that do not compile
+Rust and a macOS job for Clippy and tests, since `desktop-app` only builds
+against the macOS webview.
 
 ## CLI
 

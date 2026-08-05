@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
     AuditLog, ClientError, CommandPolicy, CommandRisk, Config, ConfigOverlay,
-    DEFAULT_CONTEXT_TOKEN_BUDGET, IndexCache, McpClient,
-    McpServerConfig, McpTransport, MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage,
-    ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter, PatchEngine, PatchStore, PathPolicy,
-    ProjectIndexer, ProposedChange, SecretScanner, SessionStore, ToolCall, WorkspaceEngine,
-    extract_model_tokens, model_request_json, parse_generated_edit,
+    DEFAULT_CONTEXT_TOKEN_BUDGET, IndexCache, McpClient, McpServerConfig, McpTransport,
+    MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage, ModelProviderConfig,
+    ModelRequest, OpenAICompatibleAdapter, PatchEngine, PatchStore, PathPolicy, ProjectIndexer,
+    ProposedChange, SecretScanner, SessionStore, ToolCall, WorkspaceEngine, extract_model_tokens,
+    model_request_json, parse_generated_edit,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -329,7 +329,11 @@ fn index_cache_picks_up_file_changes_via_watcher_without_full_rescan() {
     // watcher (not the 5-minute periodic rescan) is responsible for picking
     // this up, so poll with a short bounded timeout rather than sleeping for
     // the rescan interval.
-    fs::write(repo.join("src/app.js"), "export const value = \"updated\";\n").unwrap();
+    fs::write(
+        repo.join("src/app.js"),
+        "export const value = \"updated\";\n",
+    )
+    .unwrap();
 
     let mut picked_up = false;
     for _ in 0..50 {
@@ -550,7 +554,9 @@ fn applies_only_selected_hunk_and_allows_rollback_afterward() {
     // Rollback should still work: the conflict check must compare against
     // what was actually written (the partial-accept content), not the
     // patch's full `new_hash`.
-    let rollback = engine.rollback_patch(&repo, &patch, None, "tester").unwrap();
+    let rollback = engine
+        .rollback_patch(&repo, &patch, None, "tester")
+        .unwrap();
     assert_eq!(rollback.restored_files, vec!["src/app.js"]);
     assert_eq!(
         fs::read_to_string(repo.join("src/app.js")).unwrap(),
@@ -870,7 +876,9 @@ fn rollback_restores_modified_file_and_warns_about_lost_secret() {
         "export const awsKey = \"\";\n"
     );
 
-    let result = engine.rollback_patch(&repo, &patch, None, "tester").unwrap();
+    let result = engine
+        .rollback_patch(&repo, &patch, None, "tester")
+        .unwrap();
 
     assert_eq!(result.restored_files, vec!["src/config.js"]);
     assert!(result.deleted_files.is_empty());
@@ -912,7 +920,9 @@ fn rollback_deletes_file_that_patch_added() {
         .unwrap();
     assert!(repo.join("src/new-file.js").exists());
 
-    let result = engine.rollback_patch(&repo, &patch, None, "tester").unwrap();
+    let result = engine
+        .rollback_patch(&repo, &patch, None, "tester")
+        .unwrap();
 
     assert_eq!(result.deleted_files, vec!["src/new-file.js"]);
     assert!(result.restored_files.is_empty());
@@ -1146,8 +1156,8 @@ fn chat_dispatches_native_tool_call_when_provider_supports_it() {
             vec![ToolCall {
                 id: "call_1".to_string(),
                 name: "run_command".to_string(),
-                arguments_json:
-                    "{\"command\":\"pwd\",\"reason\":\"Inspect working directory\"}".to_string(),
+                arguments_json: "{\"command\":\"pwd\",\"reason\":\"Inspect working directory\"}"
+                    .to_string(),
             }],
             Vec::new(),
         ],
@@ -1186,10 +1196,7 @@ fn chat_replays_reasoning_content_on_native_tool_call_rounds() {
     config.model_providers.push(native_tool_provider());
     let engine = WorkspaceEngine::new(config);
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
-        vec![
-            String::new(),
-            "The working tree is clean.".to_string(),
-        ],
+        vec![String::new(), "The working tree is clean.".to_string()],
         vec![
             vec![ToolCall {
                 id: "call_1".to_string(),
@@ -1260,14 +1267,14 @@ fn chat_chains_multiple_native_tool_calls_within_one_turn() {
             vec![ToolCall {
                 id: "call_1".to_string(),
                 name: "run_command".to_string(),
-                arguments_json:
-                    "{\"command\":\"pwd\",\"reason\":\"Inspect working directory\"}".to_string(),
+                arguments_json: "{\"command\":\"pwd\",\"reason\":\"Inspect working directory\"}"
+                    .to_string(),
             }],
             vec![ToolCall {
                 id: "call_2".to_string(),
                 name: "run_command".to_string(),
-                arguments_json:
-                    "{\"command\":\"ls\",\"reason\":\"List repository contents\"}".to_string(),
+                arguments_json: "{\"command\":\"ls\",\"reason\":\"List repository contents\"}"
+                    .to_string(),
             }],
             Vec::new(),
         ],
@@ -1539,9 +1546,11 @@ fn chat_dispatches_read_file_tool_call_and_feeds_content_back() {
         .session_store
         .read_messages(&result.session.id)
         .unwrap();
-    assert!(messages.iter().any(|message| {
-        message.role == "tool" && message.content.contains("The answer is 42")
-    }));
+    assert!(
+        messages.iter().any(|message| {
+            message.role == "tool" && message.content.contains("The answer is 42")
+        })
+    );
 
     fs::remove_dir_all(repo).unwrap();
 }
@@ -1702,9 +1711,11 @@ fn chat_dispatches_git_status_and_git_diff_tool_calls() {
             .iter()
             .any(|message| message.role == "tool" && message.content.contains("README.md"))
     );
-    assert!(messages.iter().any(|message| {
-        message.role == "tool" && message.content.contains("+hello world")
-    }));
+    assert!(
+        messages
+            .iter()
+            .any(|message| { message.role == "tool" && message.content.contains("+hello world") })
+    );
 
     fs::remove_dir_all(repo).unwrap();
 }
@@ -2622,9 +2633,8 @@ fn mcp_kill_switch_and_allowlist_gate_active_servers() {
 
     // Admin allowlist narrows the active set to listed ids only.
     let mut allowlisted = Config::default();
-    allowlisted.apply_overlay(
-        ConfigOverlay::parse(&format!("{base}mcp_server_allowlist=a\n")).unwrap(),
-    );
+    allowlisted
+        .apply_overlay(ConfigOverlay::parse(&format!("{base}mcp_server_allowlist=a\n")).unwrap());
     let active: Vec<&str> = allowlisted
         .active_mcp_servers()
         .iter()

@@ -19,7 +19,7 @@ static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[inline]
 fn rotr(value: u32, bits: u32) -> u32 {
-    (value >> bits) | (value << (32 - bits))
+    value.rotate_right(bits)
 }
 
 pub fn sha256_hex(input: &[u8]) -> String {

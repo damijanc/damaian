@@ -772,7 +772,11 @@ fn extract_tool_calls(raw: &str) -> Vec<ToolCall> {
             let tool_calls = choice
                 .get("delta")
                 .and_then(|delta| delta.get("tool_calls"))
-                .or_else(|| choice.get("message").and_then(|message| message.get("tool_calls")))
+                .or_else(|| {
+                    choice
+                        .get("message")
+                        .and_then(|message| message.get("tool_calls"))
+                })
                 .and_then(|tool_calls| tool_calls.as_array());
             let Some(tool_calls) = tool_calls else {
                 continue;
@@ -794,7 +798,8 @@ fn extract_tool_calls(raw: &str) -> Vec<ToolCall> {
                     if let Some(name) = function.get("name").and_then(|name| name.as_str()) {
                         call.name = name.to_string();
                     }
-                    if let Some(arguments) = function.get("arguments").and_then(|value| value.as_str())
+                    if let Some(arguments) =
+                        function.get("arguments").and_then(|value| value.as_str())
                     {
                         call.arguments_json.push_str(arguments);
                     }
@@ -835,18 +840,14 @@ fn extract_tool_calls(raw: &str) -> Vec<ToolCall> {
 /// it. It is never shown to the user.
 fn extract_reasoning_content(raw: &str) -> Option<String> {
     fn chunk_reasoning(value: &serde_json::Value) -> Option<&str> {
-        value
-            .get("choices")?
-            .as_array()?
-            .iter()
-            .find_map(|choice| {
-                // A stream carries `delta`, a whole response `message`.
-                choice
-                    .get("delta")
-                    .or_else(|| choice.get("message"))?
-                    .get("reasoning_content")?
-                    .as_str()
-            })
+        value.get("choices")?.as_array()?.iter().find_map(|choice| {
+            // A stream carries `delta`, a whole response `message`.
+            choice
+                .get("delta")
+                .or_else(|| choice.get("message"))?
+                .get("reasoning_content")?
+                .as_str()
+        })
     }
 
     let mut reasoning = String::new();
@@ -1031,7 +1032,8 @@ mod tests {
 
     #[test]
     fn retries_transient_failure_before_any_token_then_succeeds() {
-        let transport = MockModelTransport::failing("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}", 2);
+        let transport =
+            MockModelTransport::failing("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}", 2);
         let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
         let mut tokens = Vec::new();
         let run = adapter
@@ -1104,8 +1106,9 @@ mod tests {
         request.tools = Some(vec![ToolDefinition {
             name: "run_command".to_string(),
             description: "Run a shell command".to_string(),
-            parameters_json: "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}"
-                .to_string(),
+            parameters_json:
+                "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}"
+                    .to_string(),
         }]);
         let body = model_request_json(&request);
 
@@ -1162,7 +1165,10 @@ mod tests {
         );
         assert_eq!(message["role"].as_str(), Some("assistant"));
         assert!(message["tool_calls"].is_array());
-        assert!(parsed["reasoning_content"].is_null(), "must not leak to root");
+        assert!(
+            parsed["reasoning_content"].is_null(),
+            "must not leak to root"
+        );
     }
 
     #[test]

@@ -147,9 +147,21 @@ mod tests {
 
         assert_eq!(result.hunks.len(), 1);
         let hunk = &result.hunks[0];
-        assert!(hunk.lines.iter().any(|line| line.tag == "delete" && line.text == "three"));
-        assert!(hunk.lines.iter().any(|line| line.tag == "insert" && line.text == "CHANGED"));
-        assert!(hunk.lines.iter().any(|line| line.tag == "context" && line.text == "two"));
+        assert!(
+            hunk.lines
+                .iter()
+                .any(|line| line.tag == "delete" && line.text == "three")
+        );
+        assert!(
+            hunk.lines
+                .iter()
+                .any(|line| line.tag == "insert" && line.text == "CHANGED")
+        );
+        assert!(
+            hunk.lines
+                .iter()
+                .any(|line| line.tag == "context" && line.text == "two")
+        );
         assert!(result.text.contains("@@"));
         assert!(result.text.contains("-three"));
         assert!(result.text.contains("+CHANGED"));

@@ -59,9 +59,9 @@ impl CommandPolicy {
             if classification.risk == CommandRisk::Low {
                 classification.risk = CommandRisk::Medium;
             }
-            classification.reasons.push(
-                "Command references a path outside the selected repository".to_string(),
-            );
+            classification
+                .reasons
+                .push("Command references a path outside the selected repository".to_string());
         }
         classification
     }
