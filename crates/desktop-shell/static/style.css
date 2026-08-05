@@ -698,7 +698,16 @@ button:disabled {
   margin-top: 12px;
 }
 
+/* `min-width: 0` is load-bearing, not cosmetic. Without it this flex row's
+   automatic minimum size is the *untruncated* width of the summary + patch id,
+   because both children are `white-space: nowrap`. That minimum propagates up
+   through `.patch-preview` and `.message-body` and forces the `.message` grid
+   track past its `min(880px, 100%)`, so the whole card grows wider than the
+   conversation column: `.chat-log` gains a horizontal scrollbar and the
+   per-file state badge and Rollback button sit off-screen. Flooring the
+   container at 0 is also what lets the ellipsis below actually engage. */
 .patch-preview-header {
+  min-width: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
