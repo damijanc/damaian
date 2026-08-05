@@ -14,6 +14,14 @@ pub struct ModelMessage {
     pub tool_call_id: Option<String>,
     /// Set on an `assistant` role message that requested tool calls.
     pub tool_calls: Vec<ToolCall>,
+    /// The hidden reasoning a thinking-mode model produced for this assistant
+    /// turn. Must be replayed verbatim on any assistant message that carries
+    /// `tool_calls`: DeepSeek's thinking mode rejects the next request outright
+    /// (`The `reasoning_content` in the thinking mode must be passed back to
+    /// the API.`) when it's missing. `#[serde(default)]` keeps pending chat
+    /// turns written before this field existed loadable.
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
 }
 
 impl ModelMessage {
@@ -23,6 +31,7 @@ impl ModelMessage {
             content: content.into(),
             tool_call_id: None,
             tool_calls: Vec::new(),
+            reasoning_content: None,
         }
     }
 
@@ -32,6 +41,7 @@ impl ModelMessage {
             content: content.into(),
             tool_call_id: None,
             tool_calls: Vec::new(),
+            reasoning_content: None,
         }
     }
 
@@ -41,6 +51,7 @@ impl ModelMessage {
             content: content.into(),
             tool_call_id: None,
             tool_calls: Vec::new(),
+            reasoning_content: None,
         }
     }
 
@@ -48,12 +59,23 @@ impl ModelMessage {
     /// carried alongside any content the model emitted before/instead of
     /// the call so both sides of the exchange round-trip back to the
     /// provider on the next request.
-    pub fn assistant_with_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+    ///
+    /// `reasoning_content` is the thinking-mode reasoning behind the call, and
+    /// is mandatory for DeepSeek reasoning models — see
+    /// [`ModelMessage::reasoning_content`]. Pass the originating
+    /// [`ModelRun::reasoning_content`] straight through; `None` is correct only
+    /// when the provider returned none.
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+        reasoning_content: Option<String>,
+    ) -> Self {
         Self {
             role: "assistant".to_string(),
             content: content.into(),
             tool_call_id: None,
             tool_calls,
+            reasoning_content,
         }
     }
 
@@ -65,6 +87,7 @@ impl ModelMessage {
             content: content.into(),
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: Vec::new(),
+            reasoning_content: None,
         }
     }
 }
@@ -125,6 +148,10 @@ pub struct ModelRun {
     /// structured in this run — most importantly a tool call's `arguments`
     /// JSON — may be cut off mid-token and fail to parse.
     pub truncated: bool,
+    /// Hidden thinking-mode reasoning, when the provider returned any. Not for
+    /// display: its only use is being replayed on the assistant message that
+    /// carries [`Self::tool_calls`] — see [`ModelMessage::reasoning_content`].
+    pub reasoning_content: Option<String>,
 }
 
 pub trait ModelAdapter {
@@ -147,8 +174,14 @@ pub struct MockModelAdapter {
     /// Per-response `finish_reason: "length"` simulation, matched by index.
     /// Empty (the default) means no response is truncated.
     truncated: Vec<bool>,
+    /// Per-response thinking-mode reasoning, matched by index. Empty (the
+    /// default) means no response carries reasoning.
+    reasoning_content: Vec<Option<String>>,
     next_response: usize,
     cancelled: Vec<String>,
+    /// Every request the adapter was handed, in order, so tests can assert on
+    /// what a later round actually replayed back to the provider.
+    pub requests: Vec<ModelRequest>,
 }
 
 impl MockModelAdapter {
@@ -157,8 +190,10 @@ impl MockModelAdapter {
             responses: vec![response.into()],
             tool_calls: vec![Vec::new()],
             truncated: Vec::new(),
+            reasoning_content: Vec::new(),
             next_response: 0,
             cancelled: Vec::new(),
+            requests: Vec::new(),
         }
     }
 
@@ -168,8 +203,10 @@ impl MockModelAdapter {
             responses,
             tool_calls,
             truncated: Vec::new(),
+            reasoning_content: Vec::new(),
             next_response: 0,
             cancelled: Vec::new(),
+            requests: Vec::new(),
         }
     }
 
@@ -184,8 +221,10 @@ impl MockModelAdapter {
             responses,
             tool_calls,
             truncated: Vec::new(),
+            reasoning_content: Vec::new(),
             next_response: 0,
             cancelled: Vec::new(),
+            requests: Vec::new(),
         }
     }
 
@@ -193,6 +232,13 @@ impl MockModelAdapter {
     /// output-token ceiling, for testing truncation handling.
     pub fn with_truncated(mut self, truncated: Vec<bool>) -> Self {
         self.truncated = truncated;
+        self
+    }
+
+    /// Attaches thinking-mode reasoning to responses (by index), for testing
+    /// that it is replayed on the assistant's tool-call message.
+    pub fn with_reasoning_content(mut self, reasoning_content: Vec<Option<String>>) -> Self {
+        self.reasoning_content = reasoning_content;
         self
     }
 }
@@ -205,6 +251,7 @@ impl ModelAdapter for MockModelAdapter {
     ) -> Result<ModelRun> {
         let run_id = create_id("modelrun");
         let started_at_ms = now_millis();
+        self.requests.push(request.clone());
         let mut content = String::new();
         let index = self.next_response;
         let response = self
@@ -241,6 +288,7 @@ impl ModelAdapter for MockModelAdapter {
             retry_count: 0,
             tool_calls,
             truncated: self.truncated.get(index).copied().unwrap_or(false),
+            reasoning_content: self.reasoning_content.get(index).cloned().flatten(),
         })
     }
 
@@ -526,6 +574,7 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
             retry_count,
             tool_calls,
             truncated: response_was_truncated(&raw),
+            reasoning_content: extract_reasoning_content(&raw),
         })
     }
 
@@ -569,6 +618,14 @@ fn message_json(message: &ModelMessage) -> String {
         object.push_str(&format!(
             ",\"tool_call_id\":\"{}\"",
             audit_escape_json(tool_call_id)
+        ));
+    }
+    // Replayed for the provider's benefit, not the user's: DeepSeek's thinking
+    // mode requires the reasoning behind a tool call to come back with it.
+    if let Some(reasoning_content) = &message.reasoning_content {
+        object.push_str(&format!(
+            ",\"reasoning_content\":\"{}\"",
+            audit_escape_json(reasoning_content)
         ));
     }
     object.push('}');
@@ -766,6 +823,55 @@ fn extract_tool_calls(raw: &str) -> Vec<ToolCall> {
 
     calls.retain(|call| !call.name.is_empty());
     calls
+}
+
+/// The thinking-mode reasoning a response carried, or `None` if the model
+/// didn't think. Handles both a non-streaming object (`choices[].message`) and
+/// an SSE stream, where reasoning arrives fragmented across `delta` chunks just
+/// like `content` and has to be reassembled in arrival order.
+///
+/// This exists purely so the reasoning can be handed back on the next request:
+/// DeepSeek rejects a follow-up whose assistant tool-call message is missing
+/// it. It is never shown to the user.
+fn extract_reasoning_content(raw: &str) -> Option<String> {
+    fn chunk_reasoning(value: &serde_json::Value) -> Option<&str> {
+        value
+            .get("choices")?
+            .as_array()?
+            .iter()
+            .find_map(|choice| {
+                // A stream carries `delta`, a whole response `message`.
+                choice
+                    .get("delta")
+                    .or_else(|| choice.get("message"))?
+                    .get("reasoning_content")?
+                    .as_str()
+            })
+    }
+
+    let mut reasoning = String::new();
+    if raw.contains("data:") {
+        for line in raw.lines() {
+            let Some(payload) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            if payload == "[DONE]" {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload)
+                && let Some(fragment) = chunk_reasoning(&value)
+            {
+                reasoning.push_str(fragment);
+            }
+        }
+    } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw)
+        && let Some(fragment) = chunk_reasoning(&value)
+    {
+        reasoning.push_str(fragment);
+    }
+
+    (!reasoning.is_empty()).then_some(reasoning)
 }
 
 /// Whether the provider stopped because it ran out of output budget. Handles
@@ -1024,6 +1130,85 @@ mod tests {
     #[test]
     fn model_request_json_omits_max_tokens_when_absent() {
         assert!(!model_request_json(&test_request()).contains("max_tokens"));
+    }
+
+    /// DeepSeek's thinking mode rejects a follow-up request with
+    /// `The `reasoning_content` in the thinking mode must be passed back to
+    /// the API.` unless the assistant message that made a tool call carries
+    /// the reasoning it was produced with. It must therefore survive
+    /// serialization.
+    #[test]
+    fn model_request_json_replays_reasoning_content_on_tool_call_turns() {
+        let mut request = test_request();
+        request.messages = vec![ModelMessage::assistant_with_tool_calls(
+            String::new(),
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_git_status".to_string(),
+                arguments_json: "{}".to_string(),
+            }],
+            Some("I should check the working tree first.".to_string()),
+        )];
+
+        let body = model_request_json(&request);
+        // Parsed rather than substring-matched: the reasoning has to sit on the
+        // assistant message itself, and a malformed body would be a fresh 400.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("request body must be valid JSON");
+        let message = &parsed["messages"][0];
+        assert_eq!(
+            message["reasoning_content"].as_str(),
+            Some("I should check the working tree first.")
+        );
+        assert_eq!(message["role"].as_str(), Some("assistant"));
+        assert!(message["tool_calls"].is_array());
+        assert!(parsed["reasoning_content"].is_null(), "must not leak to root");
+    }
+
+    #[test]
+    fn model_request_json_omits_reasoning_content_when_absent() {
+        assert!(!model_request_json(&test_request()).contains("reasoning_content"));
+    }
+
+    #[test]
+    fn extracts_reasoning_content_from_streamed_and_whole_responses() {
+        // Streamed thinking arrives fragmented across chunks, exactly like
+        // `content`, and must be concatenated in order.
+        let streamed = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"First \"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"I check git.\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_git_status\",\"arguments\":\"{}\"}}]}}]}\n",
+            "data: [DONE]\n",
+        );
+        assert_eq!(
+            extract_reasoning_content(streamed).as_deref(),
+            Some("First I check git.")
+        );
+        assert_eq!(
+            extract_reasoning_content(
+                r#"{"choices":[{"message":{"reasoning_content":"Thinking.","content":"hi"}}]}"#
+            )
+            .as_deref(),
+            Some("Thinking.")
+        );
+    }
+
+    #[test]
+    fn reasoning_content_is_none_when_the_model_did_not_think() {
+        assert!(
+            extract_reasoning_content(r#"{"choices":[{"message":{"content":"hi"}}]}"#).is_none()
+        );
+    }
+
+    /// Reasoning text must not leak into the visible answer — `extract_model_tokens`
+    /// looks for `"content"`, which must not match `"reasoning_content"`.
+    #[test]
+    fn streamed_reasoning_content_is_not_emitted_as_visible_content() {
+        let streamed = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hidden\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"visible\"}}]}\n",
+        );
+        assert_eq!(extract_model_tokens(streamed), vec!["visible".to_string()]);
     }
 
     #[test]
