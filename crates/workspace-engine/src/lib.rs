@@ -47,11 +47,11 @@ pub use error::{ClientError, Result};
 pub use file_access::{FileAccessController, FileRead};
 pub use git_service::{GitFileStatus, GitService, GitStatus};
 pub use index_cache::IndexCache;
+pub use indexer::{ProjectIndexer, RepositoryIndex, SearchResult};
 pub use mcp::{
     McpClient, McpRuntime, McpServerRuntime, McpTool, McpToolResult, namespaced_tool_name,
     parse_namespaced_tool_name,
 };
-pub use indexer::{ProjectIndexer, RepositoryIndex, SearchResult};
 pub use model::{
     CurlModelTransport, MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage,
     ModelRequest, ModelRun, ModelTransport, OpenAICompatibleAdapter, ToolCall, ToolDefinition,

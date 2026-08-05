@@ -227,10 +227,20 @@ impl ProjectIndexer {
 
         let mut files = Vec::new();
         let mut skipped = Vec::new();
-        self.add_file(repository_id, &absolute_path, relative_path, &mut files, &mut skipped)?;
+        self.add_file(
+            repository_id,
+            &absolute_path,
+            relative_path,
+            &mut files,
+            &mut skipped,
+        )?;
         Ok(files.into_iter().next())
     }
 
+    // Recursive directory walk: carries both the position in the tree
+    // (root/directory/relative_directory), inherited ignore rules, and the two
+    // output accumulators down each level.
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         &self,
         root: &Path,

@@ -59,7 +59,9 @@ impl IndexCache {
             })
             .clone();
 
-        let mut cached = entry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cached = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let stale = cached.index.is_none()
             || now_millis().saturating_sub(cached.last_full_rescan_ms) > FULL_RESCAN_INTERVAL_MS;
         if stale {

@@ -78,10 +78,10 @@ pub fn extract_imports(content: &str, language: &str) -> Vec<String> {
                     if let Some(value) = first_quoted(trimmed) {
                         imports.push(value);
                     }
-                } else if let Some(start) = trimmed.find("require(") {
-                    if let Some(value) = first_quoted(&trimmed[start..]) {
-                        imports.push(value);
-                    }
+                } else if let Some(start) = trimmed.find("require(")
+                    && let Some(value) = first_quoted(&trimmed[start..])
+                {
+                    imports.push(value);
                 }
             }
             "python" => {
@@ -92,10 +92,10 @@ pub fn extract_imports(content: &str, language: &str) -> Vec<String> {
                 }
             }
             "go" => {
-                if trimmed.starts_with('"') {
-                    if let Some(value) = first_quoted(trimmed) {
-                        imports.push(value);
-                    }
+                if trimmed.starts_with('"')
+                    && let Some(value) = first_quoted(trimmed)
+                {
+                    imports.push(value);
                 }
             }
             "rust" => {
@@ -183,7 +183,8 @@ mod tests {
 
     #[test]
     fn extract_imports_reads_single_and_double_quoted_js_imports() {
-        let source = "import a from \"./double\";\nimport b from './single';\nconst c = require('./req');\n";
+        let source =
+            "import a from \"./double\";\nimport b from './single';\nconst c = require('./req');\n";
         assert_eq!(
             extract_imports(source, "javascript"),
             vec![

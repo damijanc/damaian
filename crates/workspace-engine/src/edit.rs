@@ -145,6 +145,9 @@ pub struct EditOrchestrator {
 }
 
 impl EditOrchestrator {
+    // Dependency-injection constructor: every argument is a collaborator the
+    // orchestrator needs.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         scanner: SecretScanner,
@@ -318,9 +321,12 @@ impl EditOrchestrator {
         approved_by: &str,
     ) -> Result<crate::patch_engine::PatchRollbackResult> {
         let patch = self.patch_store.load(patch_id)?;
-        let result =
-            self.patch_engine
-                .rollback_patch(repository_root, &patch, selected_paths, approved_by)?;
+        let result = self.patch_engine.rollback_patch(
+            repository_root,
+            &patch,
+            selected_paths,
+            approved_by,
+        )?;
         self.audit_log.record(
             "stored_patch_rolled_back",
             &[

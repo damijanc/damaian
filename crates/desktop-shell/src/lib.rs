@@ -123,16 +123,16 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
     if request.method == "OPTIONS" && request.path.starts_with("/api/") {
         return write_preflight_response(stream, &request);
     }
-    if api_request_requires_token(&request.path) {
-        if let Err(error) = require_api_token(&request, &options.api_token) {
-            return write_response(
-                stream,
-                &request,
-                401,
-                "application/json",
-                &json_error(&error),
-            );
-        }
+    if api_request_requires_token(&request.path)
+        && let Err(error) = require_api_token(&request, &options.api_token)
+    {
+        return write_response(
+            stream,
+            &request,
+            401,
+            "application/json",
+            &json_error(&error),
+        );
     }
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") => write_response(
@@ -470,9 +470,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             )
         }
         ("POST", "/api/ask-stream") => handle_ask_stream(stream, &request),
-        ("POST", "/api/resume-command-stream") => {
-            handle_resume_command_stream(stream, &request)
-        }
+        ("POST", "/api/resume-command-stream") => handle_resume_command_stream(stream, &request),
         ("POST", "/api/ask") => {
             let form = parse_form(&request.body);
             let mut on_token = |_token: &str| {};
@@ -909,8 +907,7 @@ fn handle_resume_command_stream(stream: &mut TcpStream, request: &Request) -> Re
 /// Encode raw pty bytes for transport across the IPC boundary as UTF-8-safe
 /// text. Shared with the desktop app's terminal commands.
 pub fn base64_encode(input: &[u8]) -> String {
-    const CHARS: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -1094,7 +1091,7 @@ fn resolve_model_api_key(reference: &str) -> Result<String, String> {
 /// directly. Mirrors [`resolve_model_api_key`], but returns `None` instead of
 /// erroring so a missing token just means "no auth header".
 fn mcp_token_resolver() -> McpTokenResolver {
-    McpTokenResolver::new(|reference| resolve_mcp_token(reference))
+    McpTokenResolver::new(resolve_mcp_token)
 }
 
 fn resolve_mcp_token(reference: &str) -> Option<String> {
@@ -1128,10 +1125,9 @@ fn mcp_config_from_form(
         .filter(|value| !value.is_empty())
         .unwrap_or("test");
     let id = normalize_mcp_server_id(raw_id).map_err(|error| error.to_string())?;
-    let transport = parse_mcp_transport(
-        form.get("transport").map(String::as_str).unwrap_or("stdio"),
-    )
-    .map_err(|error| error.to_string())?;
+    let transport =
+        parse_mcp_transport(form.get("transport").map(String::as_str).unwrap_or("stdio"))
+            .map_err(|error| error.to_string())?;
 
     let split = |value: &str| {
         value
@@ -1173,7 +1169,10 @@ fn mcp_config_from_form(
         label: form.get("label").cloned().unwrap_or_else(|| id.clone()),
         transport,
         command: form.get("command").cloned().unwrap_or_default(),
-        args: form.get("args").map(|value| split(value)).unwrap_or_default(),
+        args: form
+            .get("args")
+            .map(|value| split(value))
+            .unwrap_or_default(),
         env,
         url: form
             .get("url")
@@ -1272,7 +1271,10 @@ fn render_markdown_with_optional_file_links(content: &str, repo: Option<&String>
         return workspace_engine::render_markdown_to_html(content);
     };
     let verifier = |candidate: &str| -> Option<String> {
-        let target = engine.path_policy.resolve_existing(repo, candidate, false).ok()?;
+        let target = engine
+            .path_policy
+            .resolve_existing(repo, candidate, false)
+            .ok()?;
         engine
             .path_policy
             .assert_not_restricted(&target.relative_path, false)
@@ -1508,16 +1510,14 @@ fn launch_vscode(path: &Path, line: Option<u32>, col: Option<u32>) -> Result<(),
     // `code` CLI's `--goto` first. If `code` isn't on PATH (the user never
     // installed the shell command) fall back to `open -a`, which still opens
     // the file — just not at the exact line.
-    if let Some(line) = line {
-        if let Ok(status) = Command::new("code")
+    if let Some(line) = line
+        && let Ok(status) = Command::new("code")
             .arg("--goto")
             .arg(goto_target(path, line, col))
             .status()
-        {
-            if status.success() {
-                return Ok(());
-            }
-        }
+        && status.success()
+    {
+        return Ok(());
     }
     let status = Command::new("open")
         .arg("-a")
@@ -1762,9 +1762,9 @@ fn parse_optional_path_list(value: &str) -> Vec<String> {
 fn parse_form(body: &str) -> HashMap<String, String> {
     body.split('&')
         .filter(|part| !part.is_empty())
-        .filter_map(|part| {
+        .map(|part| {
             let (key, value) = part.split_once('=').unwrap_or((part, ""));
-            Some((percent_decode(key), percent_decode(value)))
+            (percent_decode(key), percent_decode(value))
         })
         .collect()
 }
@@ -2090,16 +2090,15 @@ mod tests {
     use super::{
         Request, ShellOptions, allowed_cors_origin, api_request_requires_token,
         cached_model_api_key, desktop_settings_config_path, effective_policy_for_repo,
-        forget_model_api_key, handle_connection, index_html, keychain, parse_form,
-        parse_path_list, percent_decode, remember_model_api_key,
-        render_markdown_with_optional_file_links, require_api_token, run_terminal_command,
-        save_config_file, terminal_cwd_for_repo, validate_context_files, validate_working_folder,
-        validate_workspace_path,
+        forget_model_api_key, handle_connection, index_html, keychain, parse_form, parse_path_list,
+        percent_decode, remember_model_api_key, render_markdown_with_optional_file_links,
+        require_api_token, run_terminal_command, save_config_file, terminal_cwd_for_repo,
+        validate_context_files, validate_working_folder, validate_workspace_path,
     };
     use std::collections::HashMap;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
     use workspace_engine::{Config, WorkspaceEngine};
 
@@ -2193,7 +2192,10 @@ mod tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("read response");
 
-        assert!(response.starts_with("HTTP/1.1 200"), "unexpected response: {response}");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "unexpected response: {response}"
+        );
     }
 
     #[test]
@@ -2220,7 +2222,10 @@ mod tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("read response");
 
-        assert!(response.starts_with("HTTP/1.1 200"), "unexpected response: {response}");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "unexpected response: {response}"
+        );
         assert!(response.contains("<h1>Title</h1>"));
         assert!(response.contains("hl-"));
         assert!(!response.contains("<script>"));
@@ -2632,6 +2637,9 @@ mod tests {
         );
 
         super::terminal::resize(&id, 120, 40).expect("resize pty");
-        assert!(super::terminal::close(&id).is_some(), "close should reap the shell");
+        assert!(
+            super::terminal::close(&id).is_some(),
+            "close should reap the shell"
+        );
     }
 }

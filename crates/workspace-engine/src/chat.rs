@@ -22,12 +22,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+type McpTokenResolverFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 /// Resolves an MCP server's `auth_token_env` reference (`keychain:<account>`
 /// or an environment variable name) to the actual bearer token. The engine
 /// never reads the keychain itself; the desktop shell injects a resolver that
 /// does. Wrapped so [`ChatOrchestrator`] can stay `Debug`/`Clone`.
 #[derive(Clone)]
-pub struct McpTokenResolver(Arc<dyn Fn(&str) -> Option<String> + Send + Sync>);
+pub struct McpTokenResolver(McpTokenResolverFn);
 
 impl McpTokenResolver {
     pub fn new(resolver: impl Fn(&str) -> Option<String> + Send + Sync + 'static) -> Self {
@@ -98,6 +100,10 @@ pub struct ChatOrchestrator {
 }
 
 impl ChatOrchestrator {
+    // Dependency-injection constructor: every argument is a collaborator the
+    // orchestrator needs. Grouping them into a struct would only move the
+    // same list one level out.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         scanner: SecretScanner,
@@ -323,9 +329,9 @@ impl ChatOrchestrator {
                 reason: proposal.reason.clone(),
             };
             let content = if approved {
-                let record = self
-                    .validation_orchestrator
-                    .run_proposal(proposal_id, true, approved_by)?;
+                let record =
+                    self.validation_orchestrator
+                        .run_proposal(proposal_id, true, approved_by)?;
                 sandbox_command_context(&record.execution)
             } else {
                 self.validation_orchestrator
@@ -396,6 +402,9 @@ impl ChatOrchestrator {
     /// model proposes a command that needs human approval, the in-flight
     /// conversation state is persisted so the turn can be resumed later via
     /// [`Self::resume_after_command_decision`].
+    // Threads the full per-turn state (session, task, messages, round) plus the
+    // model adapter and token sink through one recursive-ish loop.
+    #[allow(clippy::too_many_arguments)]
     fn run_agentic_turn(
         &self,
         repository_root: &Path,
@@ -565,9 +574,11 @@ impl ChatOrchestrator {
                         );
                     }
 
-                    let record = self
-                        .validation_orchestrator
-                        .run_proposal(&proposal.id, false, "sandbox")?;
+                    let record = self.validation_orchestrator.run_proposal(
+                        &proposal.id,
+                        false,
+                        "sandbox",
+                    )?;
                     let command_context = sandbox_command_context(&record.execution);
                     (tool_call_summary(&command_request), command_context)
                 }
@@ -591,10 +602,7 @@ impl ChatOrchestrator {
                         // or out-of-repo path) and correct itself within the
                         // remaining rounds instead of the turn just failing.
                         Err(error) => (
-                            format!(
-                                "Attempted to propose a patch: {}",
-                                generated_edit.summary
-                            ),
+                            format!("Attempted to propose a patch: {}", generated_edit.summary),
                             format!("Cannot propose that patch: {error}"),
                         ),
                     }
@@ -620,8 +628,10 @@ impl ChatOrchestrator {
                     semantic,
                     limit,
                 } => {
-                    let index =
-                        crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
+                    let index = crate::index_cache::IndexCache::get_or_build(
+                        &self.indexer,
+                        repository_root,
+                    )?;
                     let results = if semantic {
                         if self.config.enable_semantic_search {
                             VectorIndexCache::semantic_search(
@@ -726,8 +736,12 @@ impl ChatOrchestrator {
                 "assistant",
                 &assistant_summary,
             )?;
-            self.session_store
-                .append_message(&session.id, Some(&task.id), "tool", &tool_result_text)?;
+            self.session_store.append_message(
+                &session.id,
+                Some(&task.id),
+                "tool",
+                &tool_result_text,
+            )?;
 
             if let Some(call) = &matched_tool_call {
                 messages.push(ModelMessage::assistant_with_tool_calls(
@@ -868,9 +882,7 @@ impl PendingCommandStore {
     fn take(&self, proposal_id: &str) -> Result<PendingChatTurn> {
         let path = self.path_for(proposal_id);
         let content = fs::read_to_string(&path).map_err(|_| {
-            ClientError::InvalidInput(format!(
-                "No pending chat turn for proposal: {proposal_id}"
-            ))
+            ClientError::InvalidInput(format!("No pending chat turn for proposal: {proposal_id}"))
         })?;
         let pending: PendingChatTurn = serde_json::from_str(&content).map_err(|error| {
             ClientError::InvalidInput(format!("Failed to parse pending chat turn: {error}"))
@@ -1051,7 +1063,8 @@ fn tool_action_from_call(call: &ToolCall) -> Option<ToolAction> {
             if query.is_empty() {
                 return None;
             }
-            let semantic = arguments.get("mode").and_then(|value| value.as_str()) == Some("semantic");
+            let semantic =
+                arguments.get("mode").and_then(|value| value.as_str()) == Some("semantic");
             let limit = arguments
                 .get("limit")
                 .and_then(|value| value.as_u64())
@@ -1073,13 +1086,13 @@ fn tool_action_from_call(call: &ToolCall) -> Option<ToolAction> {
                 .unwrap_or(false);
             Some(ToolAction::ReadGitDiff { staged })
         }
-        name => parse_namespaced_tool_name(name).map(|(server_id, tool_name)| {
-            ToolAction::McpCall {
+        name => {
+            parse_namespaced_tool_name(name).map(|(server_id, tool_name)| ToolAction::McpCall {
                 server_id,
                 tool_name,
                 arguments_json: call.arguments_json.clone(),
-            }
-        }),
+            })
+        }
     }
 }
 

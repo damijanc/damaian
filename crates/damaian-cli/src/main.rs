@@ -86,9 +86,10 @@ fn run() -> workspace_engine::Result<()> {
             let repo = require_arg(&args, 1, "<repo>")?;
             let engine = engine_for_repo(repo)?;
             let path = require_arg(&args, 2, "<path>")?;
-            let file = engine
-                .file_access
-                .read_file(repo, path, Some("cli"), Some(repo), false, false)?;
+            let file =
+                engine
+                    .file_access
+                    .read_file(repo, path, Some("cli"), Some(repo), false, false)?;
             print!("{}", file.content);
             if !file.content.ends_with('\n') {
                 println!();
@@ -138,9 +139,7 @@ fn run() -> workspace_engine::Result<()> {
                 ));
             }
             let cwd = std::env::current_dir()?;
-            let classification = engine
-                .command_policy
-                .classify(&args[1..].join(" "), &cwd);
+            let classification = engine.command_policy.classify(&args[1..].join(" "), &cwd);
             println!(
                 "{{\"command\":\"{}\",\"risk\":\"{}\",\"blocked\":{},\"requiresApproval\":{},\"mayUseNetwork\":{}}}",
                 escape(&classification.command),

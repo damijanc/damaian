@@ -1,0 +1,90 @@
+name: Quality
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Everything that does not need to compile the Rust workspace. Runs on Linux
+  # so it stays fast and cheap, and fails before the macOS job burns minutes.
+  checks:
+    name: Formatting, lint config, dependencies
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Check desktop JavaScript syntax
+        run: node --check crates/desktop-shell/static/app.js
+
+      - name: Lint web assets
+        run: npm run lint:web
+
+      - name: Check for typos
+        uses: crate-ci/typos@v1.49.0
+
+      - name: Check dependency advisories and licenses
+        uses: EmbarkStudios/cargo-deny-action@v2.1.1
+        with:
+          command: check
+
+  # Needs macOS: the desktop-app crate is a Tauri wrapper that only builds
+  # against the macOS system webview.
+  rust:
+    name: Clippy and tests
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version
+
+      - name: Cache Cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-quality-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-quality-
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --locked

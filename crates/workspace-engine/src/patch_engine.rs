@@ -304,7 +304,12 @@ impl PatchEngine {
                     ));
                 }
             }
-            prepared.push((file, target.absolute_path, current_content, content_to_write));
+            prepared.push((
+                file,
+                target.absolute_path,
+                current_content,
+                content_to_write,
+            ));
         }
 
         let rollback_dir = self.config.data_dir.join("rollback").join(&patch.id);
@@ -329,8 +334,9 @@ impl PatchEngine {
                     sha256(content_to_write.as_bytes())
                 },
             };
-            let serialized = serde_json::to_string(&snapshot)
-                .map_err(|error| ClientError::Io(format!("Failed to write rollback snapshot: {error}")))?;
+            let serialized = serde_json::to_string(&snapshot).map_err(|error| {
+                ClientError::Io(format!("Failed to write rollback snapshot: {error}"))
+            })?;
             fs::write(&rollback_path, serialized)?;
 
             if file.status == "deleted" {
@@ -431,7 +437,10 @@ impl PatchEngine {
                 .iter()
                 .map(|file| file.path.as_str())
                 .collect::<Vec<_>>();
-            if let Some(path) = paths.iter().find(|path| !patch_paths.contains(&path.as_str())) {
+            if let Some(path) = paths
+                .iter()
+                .find(|path| !patch_paths.contains(&path.as_str()))
+            {
                 return Err(ClientError::InvalidInput(format!(
                     "Selected patch file was not found: {path}"
                 )));
@@ -467,12 +476,13 @@ impl PatchEngine {
                 continue;
             }
             let raw_snapshot = fs::read_to_string(&rollback_path)?;
-            let snapshot: RollbackSnapshot = serde_json::from_str(&raw_snapshot).map_err(|error| {
-                ClientError::Io(format!(
-                    "Corrupt rollback snapshot for {}: {error}",
-                    file.path
-                ))
-            })?;
+            let snapshot: RollbackSnapshot =
+                serde_json::from_str(&raw_snapshot).map_err(|error| {
+                    ClientError::Io(format!(
+                        "Corrupt rollback snapshot for {}: {error}",
+                        file.path
+                    ))
+                })?;
 
             let target = self.path_policy.resolve_for_write(&root_path, &file.path)?;
             self.path_policy
@@ -487,7 +497,8 @@ impl PatchEngine {
                 // Compare against what was actually written (`applied_hash`), not
                 // `file.new_hash`, since a partial hunk accept writes content that
                 // differs from the patch's full proposed `new_content`.
-                current_content.as_ref().map(sha256).as_deref() != Some(snapshot.applied_hash.as_str())
+                current_content.as_ref().map(sha256).as_deref()
+                    != Some(snapshot.applied_hash.as_str())
             };
             if conflict {
                 return Err(ClientError::PatchConflict(format!(
@@ -528,7 +539,12 @@ impl PatchEngine {
                     ("resourcePath", file.path.clone()),
                     (
                         "status",
-                        if snapshot.existed { "restored" } else { "deleted" }.to_string(),
+                        if snapshot.existed {
+                            "restored"
+                        } else {
+                            "deleted"
+                        }
+                        .to_string(),
                     ),
                 ],
             )?;

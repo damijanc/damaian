@@ -212,20 +212,20 @@ impl Config {
         repo_path: Option<&Path>,
         admin_path: Option<&Path>,
     ) -> Result<Self> {
-        if let Some(path) = user_path {
-            if path.exists() {
-                config.apply_overlay(ConfigOverlay::load(path)?);
-            }
+        if let Some(path) = user_path
+            && path.exists()
+        {
+            config.apply_overlay(ConfigOverlay::load(path)?);
         }
-        if let Some(path) = repo_path {
-            if path.exists() {
-                config.apply_overlay(ConfigOverlay::load(path)?);
-            }
+        if let Some(path) = repo_path
+            && path.exists()
+        {
+            config.apply_overlay(ConfigOverlay::load(path)?);
         }
-        if let Some(path) = admin_path {
-            if path.exists() {
-                config.apply_overlay(ConfigOverlay::load(path)?);
-            }
+        if let Some(path) = admin_path
+            && path.exists()
+        {
+            config.apply_overlay(ConfigOverlay::load(path)?);
         }
         Ok(config)
     }
@@ -768,9 +768,7 @@ impl ConfigOverlay {
             }
             "audit_enabled" => self.audit_enabled = Some(parse_bool(key, value)?),
             "audit_retention_days" => self.audit_retention_days = Some(parse_u64(key, value)?),
-            "enable_semantic_search" => {
-                self.enable_semantic_search = Some(parse_bool(key, value)?)
-            }
+            "enable_semantic_search" => self.enable_semantic_search = Some(parse_bool(key, value)?),
             "shell" => self.shell = Some(value.to_string()),
             "model_provider" => self.model_provider = Some(normalize_model_provider(value)?),
             "model_name" => self.model_name = Some(value.to_string()),
@@ -851,7 +849,8 @@ impl ConfigOverlay {
             )));
         };
         let id = normalize_mcp_server_id(raw_id)?;
-        let index = if let Some(index) = self.mcp_servers.iter().position(|server| server.id == id) {
+        let index = if let Some(index) = self.mcp_servers.iter().position(|server| server.id == id)
+        {
             index
         } else {
             self.mcp_servers.push(McpServerConfigOverlay {
@@ -868,9 +867,7 @@ impl ConfigOverlay {
             "args" => server.args = Some(split_list(value)),
             "env" => server.env = Some(split_env(value)),
             "url" => server.url = Some(value.trim_end_matches('/').to_string()),
-            "auth_token_env" => {
-                server.auth_token_env = Some(parse_model_api_key_reference(value)?)
-            }
+            "auth_token_env" => server.auth_token_env = Some(parse_model_api_key_reference(value)?),
             "enabled" => server.enabled = Some(parse_bool(field, value)?),
             "require_approval" => server.require_approval = Some(parse_bool(field, value)?),
             _ => {
@@ -1223,7 +1220,11 @@ fn push_mcp_server_overlay(output: &mut String, server: &McpServerConfigOverlay)
         push_line(output, &format!("mcp_server.{id}.label"), value);
     }
     if let Some(value) = server.transport {
-        push_line(output, &format!("mcp_server.{id}.transport"), value.as_str());
+        push_line(
+            output,
+            &format!("mcp_server.{id}.transport"),
+            value.as_str(),
+        );
     }
     if let Some(value) = &server.command {
         push_line(output, &format!("mcp_server.{id}.command"), value);

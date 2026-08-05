@@ -17,8 +17,8 @@ let termInputChain = Promise.resolve();
 let projectPaths = [];
 let projectDisplayNames = new Map();
 let expandedProjectPaths = new Set();
-let projectSessionsByPath = new Map();
-let projectSessionsLoading = new Set();
+const projectSessionsByPath = new Map();
+const projectSessionsLoading = new Set();
 let projectsCollapsed = false;
 let appUpdateInfo = null;
 let appUpdateInstalling = false;
@@ -241,7 +241,9 @@ function startBootstrap() {
 
 function form(data) {
   const params = new URLSearchParams();
-  Object.entries(data).forEach(([key, value]) => params.set(key, value ?? ""));
+  Object.entries(data).forEach(([key, value]) => {
+    params.set(key, value ?? "");
+  });
   return {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -277,9 +279,7 @@ function projectName(projectPath) {
 function loadProjectState() {
   try {
     const stored = JSON.parse(localStorage.getItem(projectsStorageKey) || "[]");
-    projectPaths = Array.isArray(stored)
-      ? stored.map(normalizeProjectPath).filter(Boolean)
-      : [];
+    projectPaths = Array.isArray(stored) ? stored.map(normalizeProjectPath).filter(Boolean) : [];
   } catch {
     projectPaths = [];
   }
@@ -363,7 +363,13 @@ function ensureAppDialog() {
 
 // Resolves to the entered string (or `null` if cancelled) when `inputValue`
 // is given; otherwise behaves like `confirm` and resolves to a boolean.
-function showAppDialog({ title, message = "", inputValue = null, confirmLabel = "OK", danger = false }) {
+function showAppDialog({
+  title,
+  message = "",
+  inputValue = null,
+  confirmLabel = "OK",
+  danger = false,
+}) {
   return new Promise((resolve) => {
     const backdrop = ensureAppDialog();
     const titleEl = backdrop.querySelector(".app-dialog-title");
@@ -528,10 +534,7 @@ function positionProjectMenu(anchorEl) {
   const el = ensureProjectMenu();
   const rect = anchorEl.getBoundingClientRect();
   const width = el.offsetWidth || 200;
-  const left = Math.min(
-    Math.max(8, rect.right - width),
-    window.innerWidth - width - 8,
-  );
+  const left = Math.min(Math.max(8, rect.right - width), window.innerWidth - width - 8);
   const top = Math.min(rect.bottom + 4, window.innerHeight - el.offsetHeight - 8);
   el.style.left = `${left}px`;
   el.style.top = `${top}px`;
@@ -659,7 +662,9 @@ function removePinnedContextFile(path) {
 }
 
 function fileBaseName(path) {
-  const parts = String(path || "").split(/[\\/]/).filter(Boolean);
+  const parts = String(path || "")
+    .split(/[\\/]/)
+    .filter(Boolean);
   return parts[parts.length - 1] || path;
 }
 
@@ -1005,13 +1010,7 @@ function createTerminalInstance() {
     // mode, so handle it ourselves unconditionally — this makes Ctrl+R, Ctrl+C,
     // etc. work even if the webview swallows the shortcut or drops keyCode.
     // Returning false stops xterm from also sending it.
-    if (
-      event.ctrlKey &&
-      !event.metaKey &&
-      !event.altKey &&
-      event.key &&
-      event.key.length === 1
-    ) {
+    if (event.ctrlKey && !event.metaKey && !event.altKey && event.key && event.key.length === 1) {
       const code = event.key.toLowerCase().charCodeAt(0);
       if (code >= 97 && code <= 122) {
         event.preventDefault();
@@ -1099,17 +1098,15 @@ async function ensureTerminal() {
 function focusTerminalSoon() {
   if (!term) return;
   term.focus();
-  requestAnimationFrame(() => term && term.focus());
-  setTimeout(() => term && term.focus(), 60);
+  requestAnimationFrame(() => term?.focus());
+  setTimeout(() => term?.focus(), 60);
 }
 
 async function startTerminalSession() {
   const invoke = tauriInvoke();
   const Channel = window.__TAURI__?.core?.Channel;
   if (!invoke || !Channel) {
-    term.write(
-      "\r\n\x1b[33mThe terminal is only available in the Damaian desktop app.\x1b[0m\r\n",
-    );
+    term.write("\r\n\x1b[33mThe terminal is only available in the Damaian desktop app.\x1b[0m\r\n");
     return;
   }
 
@@ -1243,19 +1240,28 @@ function configEntries(content) {
 }
 
 function normalizeChatProvider(value) {
-  const provider = String(value || "").trim().toLowerCase().replaceAll("_", "-");
+  const provider = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replaceAll("_", "-");
   if (provider === "open-ai" || provider === "openai") return "openai";
   if (provider === "deep-seek" || provider === "deepseek" || provider === "deedseek") {
     return "deepseek";
   }
-  if (provider === "custom" || provider === "open-ai-compatible" || provider === "openai-compatible") {
+  if (
+    provider === "custom" ||
+    provider === "open-ai-compatible" ||
+    provider === "openai-compatible"
+  ) {
     return "openai-compatible";
   }
   return /^[a-z0-9.-]+$/.test(provider) ? provider : "openai-compatible";
 }
 
 function normalizeChatReasoning(value) {
-  const reasoning = String(value || "").trim().toLowerCase();
+  const reasoning = String(value || "")
+    .trim()
+    .toLowerCase();
   return validReasoningLevels.has(reasoning) ? reasoning : "default";
 }
 
@@ -1326,8 +1332,12 @@ function syncConfiguredProvidersFromConfig(content) {
 }
 
 function syncProviderCatalogFromPolicy(policyText) {
-  Object.keys(modelProviderPresets).forEach((key) => delete modelProviderPresets[key]);
-  Object.keys(providerLabels).forEach((key) => delete providerLabels[key]);
+  Object.keys(modelProviderPresets).forEach((key) => {
+    delete modelProviderPresets[key];
+  });
+  Object.keys(providerLabels).forEach((key) => {
+    delete providerLabels[key];
+  });
   Object.entries(builtInModelProviderPresets).forEach(([id, preset]) => {
     modelProviderPresets[id] = { ...preset, models: [...preset.models] };
   });
@@ -1359,8 +1369,7 @@ function syncProviderCatalogFromPolicy(policyText) {
       apiKeyEnv: provider.apiKeyEnv || existing.apiKeyEnv || "",
       defaultModel: models[0] || existing.defaultModel || "",
       models,
-      supportsNativeTools:
-        provider.supportsNativeTools ?? existing.supportsNativeTools ?? false,
+      supportsNativeTools: provider.supportsNativeTools ?? existing.supportsNativeTools ?? false,
       // Blank means "use the built-in per-model default", which only the
       // engine knows, so the UI carries the value through untouched rather
       // than substituting a number of its own.
@@ -1732,7 +1741,12 @@ function providerDescription(provider) {
 }
 
 function providerMark(label) {
-  return String(label || "?").trim().slice(0, 1).toUpperCase() || "?";
+  return (
+    String(label || "?")
+      .trim()
+      .slice(0, 1)
+      .toUpperCase() || "?"
+  );
 }
 
 function renderSettingsProviderLists() {
@@ -1933,7 +1947,9 @@ async function saveProviderConfig() {
 }
 
 async function removeProviderConfigFromSettings() {
-  const id = normalizeChatProvider($("provider-id-input").dataset.originalId || $("provider-id-input").value);
+  const id = normalizeChatProvider(
+    $("provider-id-input").dataset.originalId || $("provider-id-input").value,
+  );
   if (!id || !configuredProviderIds.has(id)) return;
   $("config-editor").value = removeProviderConfig($("config-editor").value, id);
   if (selectedChatModelOptions().provider === id) {
@@ -2027,7 +2043,10 @@ function syncMcpServersFromConfig(content) {
     const match = key.match(mcpServerFieldPattern);
     if (!match) return;
     const id = match[1];
-    const server = servers[id] || (servers[id] = { id, transport: "stdio", requireApproval: true });
+    if (!servers[id]) {
+      servers[id] = { id, transport: "stdio", requireApproval: true };
+    }
+    const server = servers[id];
     const field = match[2];
     if (field === "label") server.label = value;
     else if (field === "transport") server.transport = value === "http" ? "http" : "stdio";
@@ -2065,8 +2084,12 @@ function linesToPipe(value) {
 
 function updateMcpTransportFields() {
   const isHttp = $("mcp-transport-select").value === "http";
-  document.querySelectorAll(".mcp-http-fields").forEach((el) => (el.hidden = !isHttp));
-  document.querySelectorAll(".mcp-stdio-fields").forEach((el) => (el.hidden = isHttp));
+  document.querySelectorAll(".mcp-http-fields").forEach((el) => {
+    el.hidden = !isHttp;
+  });
+  document.querySelectorAll(".mcp-stdio-fields").forEach((el) => {
+    el.hidden = isHttp;
+  });
 }
 
 function mcpServerFromForm() {
@@ -2139,7 +2162,8 @@ function renderMcpConfigForm(serverId = $("mcp-config-select").value) {
   $("mcp-args-input").value = pipeToLines(server.args);
   $("mcp-env-input").value = pipeToLines(server.env);
   $("mcp-url-input").value = server.url || "";
-  $("mcp-token-ref-input").value = server.authTokenEnv || `keychain:mcp-${server.id || "server"}-token`;
+  $("mcp-token-ref-input").value =
+    server.authTokenEnv || `keychain:mcp-${server.id || "server"}-token`;
   $("mcp-token-input").value = "";
   $("mcp-enabled-input").checked = server.enabled === true;
   $("mcp-approval-input").checked = server.requireApproval !== false;
@@ -2463,19 +2487,23 @@ function renderInlineMarkdown(value) {
   // characters inside inline code (e.g. `a**b` should not become a<strong>).
   // PLACEHOLDER is a private-use-area character that cannot occur in
   // escaped HTML text, so it cannot collide with real content.
-  var withoutCode = escaped.replace(/`([^`]+)`/g, function (_match, code) {
+  var withoutCode = escaped.replace(/`([^`]+)`/g, (_match, code) => {
     codeSpans.push(code);
     return PLACEHOLDER + (codeSpans.length - 1) + PLACEHOLDER;
   });
   var withInline = withoutCode
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(
+      /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>',
+    )
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/__([^_]+)__/g, "<strong>$1</strong>")
     .replace(/\*([^*]+)\*/g, "<em>$1</em>");
-  var codePattern = new RegExp(PLACEHOLDER + "(\\d+)" + PLACEHOLDER, "g");
-  return withInline.replace(codePattern, function (_match, index) {
-    return "<code>" + codeSpans[Number(index)] + "</code>";
-  });
+  var codePattern = new RegExp(`${PLACEHOLDER}(\\d+)${PLACEHOLDER}`, "g");
+  return withInline.replace(
+    codePattern,
+    (_match, index) => `<code>${codeSpans[Number(index)]}</code>`,
+  );
 }
 
 function parseTableRow(line) {
@@ -2546,7 +2574,10 @@ function renderMarkdown(markdown) {
         closeParagraph();
         closeList();
         codeOpen = true;
-        codeLanguage = line.slice(3).trim().replace(/[^a-z0-9_-]/gi, "");
+        codeLanguage = line
+          .slice(3)
+          .trim()
+          .replace(/[^a-z0-9_-]/gi, "");
       }
       continue;
     }
@@ -2642,7 +2673,7 @@ async function finalizeChatMessage(target, content) {
   try {
     const payload = await api("/api/render-markdown", form({ content, repo: chatRepo || "" }));
     target.body.innerHTML = payload.html;
-  } catch (error) {
+  } catch (_error) {
     target.body.innerHTML = renderMarkdown(content);
   }
   wireFileReferences(target.body, chatRepo);
@@ -2815,7 +2846,9 @@ function renderProjectList() {
         empty.textContent = "No sessions yet";
         sessionsList.append(empty);
       } else {
-        sessions.forEach((session) => sessionsList.append(renderProjectSession(projectPath, session)));
+        sessions.forEach((session) => {
+          sessionsList.append(renderProjectSession(projectPath, session));
+        });
       }
       group.append(sessionsList);
     }
@@ -2888,7 +2921,7 @@ function renderSessionOptions(sessions = []) {
   });
 }
 
-function renderSessionList() {
+function _renderSessionList() {
   renderProjectList();
 }
 
@@ -2924,7 +2957,7 @@ async function startNewSession(projectPath = repo()) {
 
 async function renameSessionForProject(projectPath, session) {
   const title = await promptDialog("Session name", session.title);
-  if (!title || !title.trim()) return;
+  if (!title?.trim()) return;
   const payload = await api(
     "/api/session-rename",
     form({ session_id: session.id, title: title.trim() }),
@@ -2992,7 +3025,9 @@ function diffLineClass(line) {
 function renderColoredDiff(diff) {
   const view = document.createElement("div");
   view.className = "diff-view";
-  const lines = String(diff || "").replace(/\n$/, "").split(/\r?\n/);
+  const lines = String(diff || "")
+    .replace(/\n$/, "")
+    .split(/\r?\n/);
   if (lines.length === 1 && !lines[0]) {
     const empty = document.createElement("div");
     empty.className = "diff-line context";
@@ -3071,7 +3106,11 @@ function renderGitStatusText(payload) {
 
 async function appendGitStatusAfterChange(repoPath) {
   const payload = await api(`/api/git-status?repo=${encodeURIComponent(repoPath)}`);
-  setRepoState(payload.clean ? projectName(repoPath) : `${projectName(repoPath)} - ${payload.files.length} changed`);
+  setRepoState(
+    payload.clean
+      ? projectName(repoPath)
+      : `${projectName(repoPath)} - ${payload.files.length} changed`,
+  );
   appendChatMessage("system", renderGitStatusText(payload));
 }
 
@@ -3203,7 +3242,9 @@ function createPatchPreview(payload, patchRepo) {
               "/api/rollback-patch",
               form({ repo: patchRepo, patch_id: state.patchId, paths: file.path }),
             );
-            (result.warnings || []).forEach((warning) => toast(warning));
+            (result.warnings || []).forEach((warning) => {
+              toast(warning);
+            });
             if (result.restoredFiles?.includes(file.path)) {
               file.state = "rolled_back";
               toast(`Restored ${file.path}`);
@@ -3244,7 +3285,9 @@ function createPatchPreview(payload, patchRepo) {
       const hunkSelection = {};
       state.files.forEach((file) => {
         if (paths.includes(file.path) && file.hunks.length) {
-          hunkSelection[file.path] = file.hunks.filter((hunk) => hunk.selected).map((hunk) => hunk.id);
+          hunkSelection[file.path] = file.hunks
+            .filter((hunk) => hunk.selected)
+            .map((hunk) => hunk.id);
         }
       });
       const result = await api(
@@ -3362,7 +3405,10 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
             localStorage.setItem(lastSessionStorageKey(), currentSessionId);
           }
           renderContextFiles(payload.contextFiles || []);
-          setChatStatus(payload.incomplete ? "Incomplete" : "Complete", payload.incomplete ? "warn" : "ok");
+          setChatStatus(
+            payload.incomplete ? "Incomplete" : "Complete",
+            payload.incomplete ? "warn" : "ok",
+          );
         },
         error(payload) {
           streamError = new Error(payload.error || "Command resume failed");
@@ -3699,7 +3745,10 @@ async function sendChatPrompt() {
           await finalizeChatMessage(assistantMessage, assistantText);
           appendProposals(assistantMessage, payload, chatRepo);
           renderContextFiles(payload.contextFiles || []);
-          setChatStatus(payload.incomplete ? "Incomplete" : "Complete", payload.incomplete ? "warn" : "ok");
+          setChatStatus(
+            payload.incomplete ? "Incomplete" : "Complete",
+            payload.incomplete ? "warn" : "ok",
+          );
         },
         error(payload) {
           streamError = new Error(payload.error || "Model request failed");
@@ -3776,7 +3825,8 @@ $("provider-new-btn").addEventListener("click", newProviderConfigForm);
 
 $("provider-label-input").addEventListener("input", () => {
   if (!$("provider-id-input").disabled && !$("provider-id-input").value.trim()) {
-    $("provider-key-ref-input").value = `keychain:${providerSlug($("provider-label-input").value)}-api-key`;
+    $("provider-key-ref-input").value =
+      `keychain:${providerSlug($("provider-label-input").value)}-api-key`;
   }
 });
 
@@ -3873,7 +3923,8 @@ $("model-key-save-btn").addEventListener("click", async () => {
 
 $("model-key-delete-btn").addEventListener("click", async () => {
   try {
-    if (!(await confirmDialog("Remove API key?", "Remove this stored API key from Keychain?"))) return;
+    if (!(await confirmDialog("Remove API key?", "Remove this stored API key from Keychain?")))
+      return;
     const payload = await deleteModelApiKey();
     toast(payload.deleted ? "Model API key removed" : "No stored key found");
   } catch (error) {

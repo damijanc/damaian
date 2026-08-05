@@ -1,0 +1,11 @@
+[files]
+extend-exclude = [
+  "Cargo.lock",
+  "package-lock.json",
+  "crates/desktop-shell/static/xterm*",
+  "target/",
+]
+
+[default.extend-identifiers]
+# Upstream `candle` API name; not ours to rename.
+from_mmaped_safetensors = "from_mmaped_safetensors"

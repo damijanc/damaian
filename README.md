@@ -68,6 +68,7 @@ detail.
 - [macOS Installation](docs/MACOS_INSTALLATION.md) — install and first-launch steps
 - [Security Policy](SECURITY.md) — safety model and vulnerability reporting
 - [Development](docs/DEVELOPMENT.md) — building from source, the CLI, and releases
+- [AGENTS.md](AGENTS.md) — conventions and constraints for coding agents
 
 ## License
 

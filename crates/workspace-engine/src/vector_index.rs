@@ -79,7 +79,12 @@ impl VectorIndex {
         changed
     }
 
-    fn search(&self, query_vector: &[f32], index: &RepositoryIndex, limit: usize) -> Vec<SearchResult> {
+    fn search(
+        &self,
+        query_vector: &[f32],
+        index: &RepositoryIndex,
+        limit: usize,
+    ) -> Vec<SearchResult> {
         let mut scored: Vec<(f32, &StoredChunkVector)> = self
             .entries
             .iter()
@@ -97,7 +102,10 @@ impl VectorIndex {
             .take(limit)
             .filter_map(|(score, entry)| {
                 let file = index.files.iter().find(|file| file.path == entry.path)?;
-                let chunk = file.chunks.iter().find(|chunk| chunk.ordinal == entry.ordinal)?;
+                let chunk = file
+                    .chunks
+                    .iter()
+                    .find(|chunk| chunk.ordinal == entry.ordinal)?;
                 Some(SearchResult {
                     path: file.path.clone(),
                     language: file.language.clone(),
@@ -139,7 +147,9 @@ fn registry() -> &'static Registry {
 }
 
 fn vector_index_path(data_dir: &Path, repository_id: &str) -> PathBuf {
-    data_dir.join("vector-index").join(format!("{repository_id}.bin"))
+    data_dir
+        .join("vector-index")
+        .join(format!("{repository_id}.bin"))
 }
 
 /// Real, embedding-based semantic search, backed by a process-wide cache of
@@ -177,7 +187,9 @@ impl VectorIndexCache {
             })
             .clone();
 
-        let mut cached = entry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cached = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if cached.index.sync(index, model) {
             cached.index.save(&cached.path);
         }
