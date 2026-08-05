@@ -2,6 +2,12 @@ use crate::error::{ClientError, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Repository-context budget used when neither the provider config nor the
+/// built-in per-model table specifies one. Matches the value that was
+/// previously hardcoded at the two `build_context` call sites, so a config
+/// that says nothing behaves exactly as before.
+pub const DEFAULT_CONTEXT_TOKEN_BUDGET: u32 = 16_000;
+
 pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
     ".git/",
     ".gitignore",
@@ -84,6 +90,20 @@ pub struct ModelProviderConfig {
     /// to false so existing providers are unaffected until explicitly
     /// enabled.
     pub supports_native_tools: bool,
+    /// Explicit `max_tokens` to send with every request to this provider.
+    /// `None` omits the field and lets the provider apply its own default —
+    /// fine for providers whose default is generous, but dangerous for ones
+    /// that default low (DeepSeek defaults to 4096), because a large
+    /// `propose_patch` call gets truncated mid-arguments and the resulting
+    /// partial JSON is unusable.
+    pub max_output_tokens: Option<u32>,
+    /// How many tokens of repository context to pack into a request. `None`
+    /// falls back to the built-in per-model budget. This is an input-side
+    /// budget and is unrelated to [`Self::max_output_tokens`]: it bounds what
+    /// the model reads, not what it writes. Raising it improves answer quality
+    /// on large repositories but is billed on every turn, so the defaults stay
+    /// well below what a model's context window technically allows.
+    pub context_token_budget: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -94,6 +114,8 @@ pub struct ModelProviderConfigOverlay {
     pub api_key_env: Option<String>,
     pub models: Option<Vec<String>>,
     pub supports_native_tools: Option<bool>,
+    pub max_output_tokens: Option<u32>,
+    pub context_token_budget: Option<u32>,
 }
 
 /// How the client talks to an MCP server. `Stdio` spawns a local subprocess
@@ -319,6 +341,44 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// The explicit `max_tokens` to send for the active provider and model.
+    /// `None` leaves the field off the request entirely.
+    ///
+    /// Resolved most specific first:
+    /// 1. a user-configured `model_provider.<id>.max_output_tokens`,
+    /// 2. the built-in ceiling for this exact model,
+    /// 3. the built-in provider-wide fallback for unrecognized models.
+    ///
+    /// Step 3 matters because an overlay routinely creates a partial entry for
+    /// a built-in provider — setting only `label` and `supports_native_tools`,
+    /// say — and such an entry must not silently drop the ceiling and
+    /// reinstate the 4096-token truncation this field exists to prevent.
+    pub fn max_output_tokens(&self) -> Option<u32> {
+        self.model_provider_config(&self.model_provider)
+            .and_then(|provider| provider.max_output_tokens)
+            .or_else(|| builtin_model_output_tokens(&self.model_provider, &self.model_name))
+            .or_else(|| {
+                builtin_model_provider_config(&self.model_provider)
+                    .and_then(|provider| provider.max_output_tokens)
+            })
+    }
+
+    /// How many tokens of repository context to pack into a request, resolved
+    /// with the same precedence as [`Self::max_output_tokens`] and falling back
+    /// to [`DEFAULT_CONTEXT_TOKEN_BUDGET`]. Always returns a usable number —
+    /// unlike the output ceiling, there is no "omit it" option, since some
+    /// budget has to be chosen before context can be assembled.
+    pub fn context_token_budget(&self) -> usize {
+        self.model_provider_config(&self.model_provider)
+            .and_then(|provider| provider.context_token_budget)
+            .or_else(|| builtin_model_context_budget(&self.model_provider, &self.model_name))
+            .or_else(|| {
+                builtin_model_provider_config(&self.model_provider)
+                    .and_then(|provider| provider.context_token_budget)
+            })
+            .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET) as usize
+    }
+
     pub fn apply_model_provider_defaults(&mut self) {
         if let Some(provider) = self
             .model_provider_config(&self.model_provider)
@@ -365,6 +425,12 @@ impl Config {
             if let Some(value) = overlay.supports_native_tools {
                 provider.supports_native_tools = value;
             }
+            if let Some(value) = overlay.max_output_tokens {
+                provider.max_output_tokens = Some(value);
+            }
+            if let Some(value) = overlay.context_token_budget {
+                provider.context_token_budget = Some(value);
+            }
             return;
         }
 
@@ -375,6 +441,8 @@ impl Config {
             api_key_env: overlay.api_key_env.unwrap_or_default(),
             models: overlay.models.unwrap_or_default(),
             supports_native_tools: overlay.supports_native_tools.unwrap_or(false),
+            max_output_tokens: overlay.max_output_tokens,
+            context_token_budget: overlay.context_token_budget,
             id,
         });
     }
@@ -760,6 +828,13 @@ impl ConfigOverlay {
             "supports_native_tools" => {
                 provider.supports_native_tools = Some(parse_bool(field, value)?)
             }
+            "max_output_tokens" => {
+                provider.max_output_tokens = Some(parse_token_count(provider_key, field, value)?);
+            }
+            "context_token_budget" => {
+                provider.context_token_budget =
+                    Some(parse_token_count(provider_key, field, value)?);
+            }
             _ => {
                 return Err(ClientError::InvalidInput(format!(
                     "Unknown model provider config key: model_provider.{provider_key}"
@@ -917,6 +992,8 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
                 "o4-mini".to_string(),
             ],
             supports_native_tools: false,
+            max_output_tokens: None,
+            context_token_budget: None,
         }),
         "deepseek" => Some(ModelProviderConfig {
             id: "deepseek".to_string(),
@@ -925,10 +1002,16 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
                 .unwrap_or_else(|_| "https://api.deepseek.com".to_string()),
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
             models: vec![
-                std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string()),
-                "deepseek-reasoner".to_string(),
+                std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string()),
+                "deepseek-v4-pro".to_string(),
             ],
             supports_native_tools: false,
+            // Fallback for a DeepSeek model not in `builtin_model_output_tokens`.
+            // Deliberately the conservative legacy ceiling: an unrecognized
+            // model may still be a legacy alias, and a too-small ceiling costs
+            // an extra round trip whereas a too-large one is a hard API error.
+            max_output_tokens: Some(8192),
+            context_token_budget: None,
         }),
         "openai-compatible" => Some(ModelProviderConfig {
             id: "openai-compatible".to_string(),
@@ -937,9 +1020,60 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             api_key_env: "OPENAI_API_KEY".to_string(),
             models: vec!["configured-model".to_string()],
             supports_native_tools: false,
+            max_output_tokens: None,
+            context_token_budget: None,
         }),
         _ => None,
     }
+}
+
+/// Built-in `max_tokens` per model, consulted when the provider config
+/// doesn't pin one. Keyed by model rather than provider because a single
+/// provider serves models with wildly different limits: DeepSeek's retired
+/// `deepseek-chat`/`deepseek-reasoner` aliases cap at 8192, while the V4
+/// models accept up to 384000.
+///
+/// The V4 entries deliberately sit well below that 384000 maximum. `max_tokens`
+/// is only a ceiling — you're billed for what's generated, not what's
+/// reserved — but it's also the sole bound on a runaway generation, and 64k
+/// output already covers any realistic multi-file patch. Raise it per install
+/// with `model_provider.deepseek.max_output_tokens`, which takes precedence
+/// over everything here.
+fn builtin_model_output_tokens(provider: &str, model: &str) -> Option<u32> {
+    match (provider, model) {
+        ("deepseek", "deepseek-v4-flash" | "deepseek-v4-pro") => Some(65_536),
+        // Retired 2026-07-24 and served only as compatibility aliases; kept
+        // here so an un-migrated config still gets a correct ceiling instead
+        // of an over-large one the legacy endpoint would reject.
+        ("deepseek", "deepseek-chat" | "deepseek-reasoner") => Some(8_192),
+        _ => None,
+    }
+}
+
+/// Built-in repository-context budget per model, consulted when the provider
+/// config doesn't pin one.
+///
+/// These sit far below what each model's context window technically allows —
+/// v4-flash accepts 1M tokens, and this grants 64k. Context is re-sent and
+/// re-billed on every single turn, so the budget is tuned to "enough of the
+/// repository to answer well" rather than "everything that fits". Installs
+/// that want more can raise `model_provider.<id>.context_token_budget`.
+fn builtin_model_context_budget(provider: &str, model: &str) -> Option<u32> {
+    match (provider, model) {
+        ("deepseek", "deepseek-v4-flash" | "deepseek-v4-pro") => Some(64_000),
+        _ => None,
+    }
+}
+
+fn parse_token_count(provider_key: &str, field: &str, value: &str) -> Result<u32> {
+    let parsed = parse_u64(field, value)?;
+    if parsed == 0 || parsed > u32::MAX as u64 {
+        return Err(ClientError::InvalidInput(format!(
+            "model_provider.{provider_key} must be between 1 and {}",
+            u32::MAX
+        )));
+    }
+    Ok(parsed as u32)
 }
 
 fn is_builtin_model_provider(id: &str) -> bool {
@@ -972,6 +1106,20 @@ fn push_model_provider_config(output: &mut String, provider: &ModelProviderConfi
         &format!("model_provider.{}.supports_native_tools", provider.id),
         &provider.supports_native_tools.to_string(),
     );
+    if let Some(value) = provider.max_output_tokens {
+        push_line(
+            output,
+            &format!("model_provider.{}.max_output_tokens", provider.id),
+            &value.to_string(),
+        );
+    }
+    if let Some(value) = provider.context_token_budget {
+        push_line(
+            output,
+            &format!("model_provider.{}.context_token_budget", provider.id),
+            &value.to_string(),
+        );
+    }
 }
 
 fn push_model_provider_overlay(output: &mut String, provider: &ModelProviderConfigOverlay) {
@@ -1007,6 +1155,20 @@ fn push_model_provider_overlay(output: &mut String, provider: &ModelProviderConf
         push_line(
             output,
             &format!("model_provider.{}.supports_native_tools", provider.id),
+            &value.to_string(),
+        );
+    }
+    if let Some(value) = provider.max_output_tokens {
+        push_line(
+            output,
+            &format!("model_provider.{}.max_output_tokens", provider.id),
+            &value.to_string(),
+        );
+    }
+    if let Some(value) = provider.context_token_budget {
+        push_line(
+            output,
+            &format!("model_provider.{}.context_token_budget", provider.id),
             &value.to_string(),
         );
     }

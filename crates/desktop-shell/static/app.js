@@ -50,8 +50,8 @@ const builtInModelProviderPresets = {
     label: "DeepSeek",
     baseUrl: "https://api.deepseek.com",
     apiKeyEnv: "DEEPSEEK_API_KEY",
-    defaultModel: "deepseek-chat",
-    models: ["deepseek-chat", "deepseek-reasoner"],
+    defaultModel: "deepseek-v4-flash",
+    models: ["deepseek-v4-flash", "deepseek-v4-pro"],
   },
   "openai-compatible": {
     label: "Custom",
@@ -1319,7 +1319,7 @@ function syncConfiguredProvidersFromConfig(content) {
   configuredProviderIds.clear();
   configEntries(content).forEach(([key]) => {
     const match = key.match(
-      /^model_provider\.([a-zA-Z0-9_.-]+)\.(label|base_url|api_key_env|models|supports_native_tools)$/,
+      /^model_provider\.([a-zA-Z0-9_.-]+)\.(label|base_url|api_key_env|models|supports_native_tools|max_output_tokens|context_token_budget)$/,
     );
     if (match) configuredProviderIds.add(normalizeChatProvider(match[1]));
   });
@@ -1335,7 +1335,7 @@ function syncProviderCatalogFromPolicy(policyText) {
   const providers = {};
   configEntries(policyText).forEach(([key, value]) => {
     const match = key.match(
-      /^model_provider\.([a-zA-Z0-9_.-]+)\.(label|base_url|api_key_env|models|supports_native_tools)$/,
+      /^model_provider\.([a-zA-Z0-9_.-]+)\.(label|base_url|api_key_env|models|supports_native_tools|max_output_tokens|context_token_budget)$/,
     );
     if (!match) return;
     const id = normalizeChatProvider(match[1]);
@@ -1346,6 +1346,8 @@ function syncProviderCatalogFromPolicy(policyText) {
     if (field === "api_key_env") providers[id].apiKeyEnv = value;
     if (field === "models") providers[id].models = splitModelList(value);
     if (field === "supports_native_tools") providers[id].supportsNativeTools = value === "true";
+    if (field === "max_output_tokens") providers[id].maxOutputTokens = value.trim();
+    if (field === "context_token_budget") providers[id].contextTokenBudget = value.trim();
   });
 
   Object.entries(providers).forEach(([id, provider]) => {
@@ -1359,6 +1361,11 @@ function syncProviderCatalogFromPolicy(policyText) {
       models,
       supportsNativeTools:
         provider.supportsNativeTools ?? existing.supportsNativeTools ?? false,
+      // Blank means "use the built-in per-model default", which only the
+      // engine knows, so the UI carries the value through untouched rather
+      // than substituting a number of its own.
+      maxOutputTokens: provider.maxOutputTokens ?? existing.maxOutputTokens ?? "",
+      contextTokenBudget: provider.contextTokenBudget ?? existing.contextTokenBudget ?? "",
     };
   });
 
@@ -1587,6 +1594,26 @@ function providerSlug(value) {
   return slug ? normalizeChatProvider(slug) : "";
 }
 
+// Returns "" for a blank field (meaning "use the built-in default") and
+// rejects anything the engine's own parser would refuse, so a bad value is
+// caught in the form rather than surfacing as a config-save error.
+//
+// Takes the element, not its value, because `<input type="number">` reports
+// `value === ""` for text it cannot parse ("1e", "--") while still showing
+// that text to the user. Reading `.value` alone would save "use the default"
+// under a field that visibly says otherwise; `validity.badInput` is the only
+// way to tell that apart from a genuinely empty field.
+function optionalTokenCount(input, fieldLabel) {
+  if (input.validity?.badInput) throw new Error(`${fieldLabel} must be a whole number`);
+  const value = String(input.value || "").trim();
+  if (!value) return "";
+  if (!/^\d+$/.test(value)) throw new Error(`${fieldLabel} must be a whole number`);
+  const parsed = Number(value);
+  if (parsed < 1) throw new Error(`${fieldLabel} must be at least 1`);
+  if (parsed > 4294967295) throw new Error(`${fieldLabel} is too large`);
+  return String(parsed);
+}
+
 function providerConfigFromForm() {
   const label = $("provider-label-input").value.trim();
   const id = providerSlug($("provider-id-input").value || label);
@@ -1594,13 +1621,30 @@ function providerConfigFromForm() {
   const apiKeyEnv = $("provider-key-ref-input").value.trim();
   const models = splitModelList($("provider-models-input").value);
   const supportsNativeTools = $("provider-native-tools-input").checked;
+  const maxOutputTokens = optionalTokenCount(
+    $("provider-max-output-tokens-input"),
+    "Max output tokens",
+  );
+  const contextTokenBudget = optionalTokenCount(
+    $("provider-context-budget-input"),
+    "Context budget",
+  );
   if (!label) throw new Error("Provider name is required");
   if (!id) throw new Error("Provider ID is required");
   if (!baseUrl) throw new Error("Provider base URL is required");
   if (!apiKeyEnv) throw new Error("Provider API key reference is required");
   if (apiKeyEnv === "keychain:") throw new Error("Keychain account is required");
   if (!models.length) throw new Error("At least one model is required");
-  return { id, label, baseUrl, apiKeyEnv, models, supportsNativeTools };
+  return {
+    id,
+    label,
+    baseUrl,
+    apiKeyEnv,
+    models,
+    supportsNativeTools,
+    maxOutputTokens,
+    contextTokenBudget,
+  };
 }
 
 function renderProviderConfigSelect(selectedId = $("provider-config-select").value) {
@@ -1650,6 +1694,8 @@ function renderProviderConfigForm(providerId = $("provider-config-select").value
   $("provider-api-key-input").value = "";
   $("provider-models-input").value = (provider.models || []).join("\n");
   $("provider-native-tools-input").checked = provider.supportsNativeTools === true;
+  $("provider-max-output-tokens-input").value = provider.maxOutputTokens || "";
+  $("provider-context-budget-input").value = provider.contextTokenBudget || "";
   $("provider-remove-btn").disabled = !configuredProviderIds.has(id);
 }
 
@@ -1664,6 +1710,8 @@ function clearProviderConfigForm() {
   $("provider-api-key-input").value = "";
   $("provider-models-input").value = "";
   $("provider-native-tools-input").checked = false;
+  $("provider-max-output-tokens-input").value = "";
+  $("provider-context-budget-input").value = "";
   $("provider-remove-btn").disabled = true;
 }
 
@@ -1908,6 +1956,22 @@ function upsertProviderConfig(content, provider) {
     `model_provider.${provider.id}.supports_native_tools`,
     provider.supportsNativeTools ? "true" : "false",
   );
+  // Omitted entirely when blank: an absent key is what makes the engine fall
+  // back to its per-model default, so writing an empty value would be wrong.
+  if (provider.maxOutputTokens) {
+    next = upsertConfigValue(
+      next,
+      `model_provider.${provider.id}.max_output_tokens`,
+      provider.maxOutputTokens,
+    );
+  }
+  if (provider.contextTokenBudget) {
+    next = upsertConfigValue(
+      next,
+      `model_provider.${provider.id}.context_token_budget`,
+      provider.contextTokenBudget,
+    );
+  }
   return next;
 }
 

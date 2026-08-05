@@ -2335,6 +2335,50 @@ mod tests {
         );
     }
 
+    // The Providers settings panel writes these two keys, so the save endpoint
+    // must accept them and the engine must read back what the form wrote.
+    // Blank fields are omitted entirely rather than written empty, which is
+    // what makes the engine fall back to its per-model defaults.
+    #[test]
+    fn saves_provider_token_settings_written_by_the_settings_panel() {
+        let path = temp_path("token-settings").join("config").join("user.conf");
+        let content = "model_provider=deepseek\n\
+             model_name=deepseek-v4-flash\n\
+             model_provider.deepseek.max_output_tokens=120000\n\
+             model_provider.deepseek.context_token_budget=90000\n";
+        save_config_file(&path, content).unwrap();
+
+        let overlay =
+            workspace_engine::ConfigOverlay::load(&path).expect("saved config must reload");
+        let mut config = workspace_engine::Config::default();
+        config.apply_overlay(overlay);
+        assert_eq!(config.max_output_tokens(), Some(120_000));
+        assert_eq!(config.context_token_budget(), 90_000);
+
+        // Omitting the keys restores the built-in per-model defaults.
+        let blanked = temp_path("token-settings-blank")
+            .join("config")
+            .join("user.conf");
+        save_config_file(
+            &blanked,
+            "model_provider=deepseek\nmodel_name=deepseek-v4-flash\n",
+        )
+        .unwrap();
+        let mut defaults = workspace_engine::Config::default();
+        defaults.apply_overlay(workspace_engine::ConfigOverlay::load(&blanked).unwrap());
+        assert_eq!(defaults.max_output_tokens(), Some(65_536));
+        assert_eq!(defaults.context_token_budget(), 64_000);
+    }
+
+    #[test]
+    fn rejects_invalid_token_settings_without_writing() {
+        let path = temp_path("token-settings-invalid").join("config.conf");
+        let error = save_config_file(&path, "model_provider.deepseek.context_token_budget=0\n")
+            .unwrap_err();
+        assert!(error.contains("between 1"), "unexpected error: {error}");
+        assert!(!path.exists());
+    }
+
     #[test]
     fn rejects_invalid_config_file_without_writing() {
         let path = temp_path("invalid").join("config.conf");

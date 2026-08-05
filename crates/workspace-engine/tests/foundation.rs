@@ -4,7 +4,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, ClientError, CommandPolicy, CommandRisk, Config, ConfigOverlay, IndexCache, McpClient,
+    AuditLog, ClientError, CommandPolicy, CommandRisk, Config, ConfigOverlay,
+    DEFAULT_CONTEXT_TOKEN_BUDGET, IndexCache, McpClient,
     McpServerConfig, McpTransport, MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage,
     ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter, PatchEngine, PatchStore, PathPolicy,
     ProjectIndexer, ProposedChange, SecretScanner, SessionStore, ToolCall, WorkspaceEngine,
@@ -1132,6 +1133,8 @@ fn chat_dispatches_native_tool_call_when_provider_supports_it() {
         api_key_env: String::new(),
         models: Vec::new(),
         supports_native_tools: true,
+        max_output_tokens: None,
+        context_token_budget: None,
     });
     let engine = WorkspaceEngine::new(config);
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
@@ -1180,6 +1183,8 @@ fn chat_chains_multiple_native_tool_calls_within_one_turn() {
         api_key_env: String::new(),
         models: Vec::new(),
         supports_native_tools: true,
+        max_output_tokens: None,
+        context_token_budget: None,
     });
     let engine = WorkspaceEngine::new(config);
     // The model asks to run `pwd`, then—after seeing that result—asks to
@@ -1251,6 +1256,8 @@ fn native_tool_provider() -> ModelProviderConfig {
         api_key_env: String::new(),
         models: Vec::new(),
         supports_native_tools: true,
+        max_output_tokens: None,
+        context_token_budget: None,
     }
 }
 
@@ -1304,6 +1311,78 @@ fn chat_dispatches_propose_patch_tool_call_and_returns_reviewable_patch() {
     );
     let written = fs::read_to_string(repo.join("src/greeting.rs")).unwrap();
     assert!(written.contains("pub fn greet"));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// When the provider stops at its output-token ceiling (finish_reason
+// "length"), a `propose_patch` call arrives with its `arguments` JSON cut off
+// mid-string and cannot be decoded. That must not end the turn silently — the
+// old behavior marked the task complete with only the model's lead-in prose
+// ("Let me create all the necessary files:") and no patch. The failure is fed
+// back so the model can retry with a smaller call in a later round.
+#[test]
+fn chat_truncated_propose_patch_tool_call_is_fed_back_for_retry() {
+    let repo = temp_dir("chat-propose-patch-truncated");
+    write_fixture(&repo, "README.md", "# Chat propose patch truncated test\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            "Let me create all the necessary files:".to_string(),
+            "I've prepared a smaller patch for review.".to_string(),
+        ],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "propose_patch".to_string(),
+                // Cut off mid-`content`, exactly as a `length` finish produces.
+                arguments_json:
+                    "{\"summary\":\"Scaffold Vite app\",\"files\":[{\"path\":\"package.json\",\"content\":\"{\\n  \\\"name\\\": \\\"snake"
+                        .to_string(),
+            }],
+            vec![ToolCall {
+                id: "call_2".to_string(),
+                name: "propose_patch".to_string(),
+                arguments_json:
+                    "{\"summary\":\"Add package.json\",\"files\":[{\"path\":\"package.json\",\"content\":\"{}\\n\"}]}"
+                        .to_string(),
+            }],
+        ],
+    )
+    .with_truncated(vec![true, false]);
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Scaffold a TypeScript + Vite project",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    // The retry's patch survives instead of the turn dying on the truncation.
+    let proposal = result.patch_proposal.expect("expected a patch proposal");
+    assert_eq!(proposal.summary, "Add package.json");
+    assert_eq!(proposal.files.len(), 1);
+    assert_eq!(proposal.files[0].path, "package.json");
+    assert_eq!(result.task.status.as_str(), "waiting_for_approval");
+
+    // The dropped call is recorded rather than vanishing, and the feedback
+    // names truncation as the cause so the model shrinks the retry.
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    let note = messages
+        .iter()
+        .find(|message| message.role == "tool" && message.content.contains("propose_patch"))
+        .expect("expected the undecodable call to be recorded");
+    assert!(note.content.contains("maximum output length"));
 
     fs::remove_dir_all(repo).unwrap();
 }
@@ -1746,6 +1825,7 @@ fn builds_openai_request_json_and_extracts_stream_tokens() {
         reasoning_level: Some("high".to_string()),
         stream: true,
         tools: None,
+        max_tokens: None,
     };
     let body = model_request_json(&request);
     assert!(body.contains("\"model\":\"test-model\""));
@@ -1766,6 +1846,7 @@ fn reports_openai_compatible_error_payloads() {
         reasoning_level: Some("high".to_string()),
         stream: true,
         tools: None,
+        max_tokens: None,
     };
     let body = model_request_json(&request);
     assert!(!body.contains("reasoning_effort"));
@@ -2083,7 +2164,10 @@ fn config_overlay_applies_provider_defaults_and_reasoning_level() {
     assert_eq!(config.model_provider, "deepseek");
     assert_eq!(config.model_base_url, "https://api.deepseek.com");
     assert_eq!(config.model_api_key_env, "DEEPSEEK_API_KEY");
-    assert_eq!(config.model_name, "deepseek-chat");
+    // The retired `deepseek-chat` alias is no longer the default; selecting
+    // the provider picks a current model, which also carries a real ceiling.
+    assert_eq!(config.model_name, "deepseek-v4-flash");
+    assert_eq!(config.max_output_tokens(), Some(65_536));
     assert_eq!(config.model_reasoning_level, "high");
 }
 
@@ -2135,6 +2219,155 @@ fn config_overlay_supports_custom_model_providers() {
             .to_policy_text()
             .contains("model_provider.acme.base_url=https://api.acme.test")
     );
+}
+
+// DeepSeek's own default is 4096 output tokens, which silently truncates a
+// multi-file `propose_patch` call mid-arguments, so the built-in provider
+// pins the documented 8192 ceiling instead of leaving the field off.
+#[test]
+fn deepseek_output_token_ceiling_follows_the_selected_model() {
+    let ceiling_for = |model: &str| {
+        let mut config = Config::default();
+        config.apply_overlay(
+            ConfigOverlay::parse(&format!("model_provider=deepseek\nmodel_name={model}\n"))
+                .unwrap(),
+        );
+        config.max_output_tokens()
+    };
+
+    // V4 models accept far more than the retired aliases they replaced, so
+    // pinning every DeepSeek request to the legacy 8192 would needlessly
+    // force multi-file patches into extra round trips.
+    assert_eq!(ceiling_for("deepseek-v4-flash"), Some(65_536));
+    assert_eq!(ceiling_for("deepseek-v4-pro"), Some(65_536));
+
+    // The legacy aliases keep their real ceiling: too large is a hard API
+    // error, which is worse than the extra round trip too small costs.
+    assert_eq!(ceiling_for("deepseek-chat"), Some(8_192));
+    assert_eq!(ceiling_for("deepseek-reasoner"), Some(8_192));
+
+    // An unrecognized DeepSeek model falls back to the conservative ceiling
+    // rather than to no ceiling at all.
+    assert_eq!(ceiling_for("deepseek-something-new"), Some(8_192));
+
+    // Providers whose defaults are generous stay unpinned.
+    let mut openai = Config::default();
+    openai.apply_overlay(ConfigOverlay::parse("model_provider=openai\n").unwrap());
+    assert_eq!(openai.max_output_tokens(), None);
+}
+
+// The repository-context budget was a hardcoded 16_000 at both `build_context`
+// call sites. It now resolves per model, with the old literal as the fallback
+// so a config that says nothing behaves exactly as it did before.
+#[test]
+fn context_token_budget_follows_the_selected_model() {
+    let budget_for = |provider: &str, model: &str| {
+        let mut config = Config::default();
+        config.apply_overlay(
+            ConfigOverlay::parse(&format!("model_provider={provider}\nmodel_name={model}\n"))
+                .unwrap(),
+        );
+        config.context_token_budget()
+    };
+
+    // A 1M-token context window earns more than the legacy 16k.
+    assert_eq!(budget_for("deepseek", "deepseek-v4-flash"), 64_000);
+    assert_eq!(budget_for("deepseek", "deepseek-v4-pro"), 64_000);
+
+    // Everything else keeps the previous hardcoded behavior.
+    assert_eq!(budget_for("deepseek", "deepseek-chat"), 16_000);
+    assert_eq!(budget_for("openai", "gpt-4.1"), 16_000);
+    assert_eq!(
+        Config::default().context_token_budget(),
+        DEFAULT_CONTEXT_TOKEN_BUDGET as usize
+    );
+}
+
+#[test]
+fn configured_context_token_budget_overrides_the_model_default() {
+    let mut config = Config::default();
+    config.apply_overlay(
+        ConfigOverlay::parse(
+            "model_provider=deepseek\n\
+             model_name=deepseek-v4-flash\n\
+             model_provider.deepseek.context_token_budget=200000\n",
+        )
+        .unwrap(),
+    );
+    assert_eq!(config.context_token_budget(), 200_000);
+    assert!(
+        config
+            .to_policy_text()
+            .contains("model_provider.deepseek.context_token_budget=200000")
+    );
+
+    // The two budgets are independent: pinning input must not disturb output.
+    assert_eq!(config.max_output_tokens(), Some(65_536));
+
+    assert!(ConfigOverlay::parse("model_provider.deepseek.context_token_budget=0\n").is_err());
+    assert!(ConfigOverlay::parse("model_provider.deepseek.context_token_budget=big\n").is_err());
+}
+
+// An explicit per-install ceiling outranks the built-in model table, so a user
+// on V4 can opt into the full 384000 the model actually allows.
+#[test]
+fn configured_output_token_ceiling_overrides_the_model_default() {
+    let mut config = Config::default();
+    config.apply_overlay(
+        ConfigOverlay::parse(
+            "model_provider=deepseek\n\
+             model_name=deepseek-v4-flash\n\
+             model_provider.deepseek.max_output_tokens=384000\n",
+        )
+        .unwrap(),
+    );
+    assert_eq!(config.max_output_tokens(), Some(384_000));
+}
+
+// A user overlay that customizes a built-in provider without mentioning
+// max_output_tokens (the common shape: label + models + supports_native_tools)
+// must not shadow the built-in ceiling — doing so would silently reinstate
+// DeepSeek's 4096-token default and the truncated-patch failure with it.
+#[test]
+fn partial_provider_overlay_keeps_the_builtin_output_token_ceiling() {
+    let mut config = Config::default();
+    config.apply_overlay(
+        ConfigOverlay::parse(
+            "model_provider=deepseek\n\
+             model_provider.deepseek.label=DeepSeek\n\
+             model_provider.deepseek.models=deepseek-chat|deepseek-reasoner\n\
+             model_provider.deepseek.supports_native_tools=true\n",
+        )
+        .unwrap(),
+    );
+
+    assert!(config.supports_native_tools());
+    assert_eq!(config.max_output_tokens(), Some(8192));
+}
+
+#[test]
+fn model_provider_output_token_ceiling_round_trips_through_overlay() {
+    let mut config = Config::default();
+    config.apply_overlay(
+        ConfigOverlay::parse(
+            "model_provider.deepseek.max_output_tokens=4096\n\
+             model_provider=deepseek\n",
+        )
+        .unwrap(),
+    );
+
+    assert_eq!(config.max_output_tokens(), Some(4096));
+    assert!(
+        config
+            .to_policy_text()
+            .contains("model_provider.deepseek.max_output_tokens=4096")
+    );
+
+    assert!(
+        ConfigOverlay::parse("model_provider.deepseek.max_output_tokens=0\n").is_err(),
+        "zero is not a usable ceiling"
+    );
+    assert!(ConfigOverlay::parse("model_provider.deepseek.max_output_tokens=lots\n").is_err());
 }
 
 #[test]

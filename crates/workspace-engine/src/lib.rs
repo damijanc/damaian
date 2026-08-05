@@ -33,8 +33,8 @@ pub use chat::{
 pub use command_policy::{CommandClassification, CommandPolicy, CommandRisk};
 pub use command_runner::{CommandExecution, CommandRunner};
 pub use config::{
-    Config, ConfigOverlay, McpServerConfig, McpServerConfigOverlay, McpTransport,
-    ModelProviderConfig, ModelProviderConfigOverlay, normalize_mcp_server_id,
+    Config, ConfigOverlay, DEFAULT_CONTEXT_TOKEN_BUDGET, McpServerConfig, McpServerConfigOverlay,
+    McpTransport, ModelProviderConfig, ModelProviderConfigOverlay, normalize_mcp_server_id,
     normalize_model_provider, normalize_model_reasoning_level, parse_mcp_transport,
 };
 pub use context_manager::{ContextItem, ContextManager, ContextPlan};

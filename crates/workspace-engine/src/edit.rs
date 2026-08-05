@@ -197,7 +197,7 @@ impl EditOrchestrator {
             prompt,
             Some(&index),
             explicit_paths,
-            16_000,
+            self.config.context_token_budget(),
         );
         let request = ModelRequest {
             provider: self.config.model_provider.clone(),
@@ -210,6 +210,7 @@ impl EditOrchestrator {
             reasoning_level: Some(self.config.model_reasoning_level.clone()),
             stream: true,
             tools: None,
+            max_tokens: self.config.max_output_tokens(),
         };
 
         self.audit_log.record(
