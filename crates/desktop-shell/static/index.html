@@ -496,6 +496,34 @@
                 <input id="provider-native-tools-input" type="checkbox" />
                 <span>Native tool-calling — required for MCP tools and agentic actions</span>
               </label>
+              <div class="provider-fields">
+                <label class="field">
+                  <span>Max output tokens</span>
+                  <input
+                    id="provider-max-output-tokens-input"
+                    type="number"
+                    min="1"
+                    step="1"
+                    placeholder="Automatic"
+                  />
+                </label>
+                <label class="field">
+                  <span>Context budget</span>
+                  <input
+                    id="provider-context-budget-input"
+                    type="number"
+                    min="1"
+                    step="1"
+                    placeholder="Automatic"
+                  />
+                </label>
+              </div>
+              <small class="field-note"
+                >Leave blank to use the built-in default for the selected model. Max output tokens
+                caps what the model writes in one reply — too low truncates large patches. Context
+                budget caps how much of the repository is sent with each request; raising it can
+                improve answers but is billed on every turn.</small
+              >
               <div class="inline-actions">
                 <button id="provider-save-btn" type="button">Save Provider</button>
                 <button id="provider-remove-btn" type="button">Remove</button>

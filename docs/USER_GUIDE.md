@@ -83,6 +83,9 @@ Common keys:
 - `model_base_url`: OpenAI-compatible API base URL.
 - `model_name`: Model identifier.
 - `model_api_key_env`: API key reference. Use `keychain:model-api-key` for the desktop Keychain flow, or an environment variable name for CLI/dev workflows.
+- `model_provider.<id>.max_output_tokens`: Largest reply the model may generate, in tokens. Omit to use the built-in default for the selected model. See [Output and Context Limits](#output-and-context-limits).
+- `model_provider.<id>.context_token_budget`: How much repository content is sent with each request, in tokens. Omit to use the built-in default for the selected model.
+- `model_provider.<id>.supports_native_tools`: Set to `true` to use the provider's native tool-calling API. Required for MCP tools, patch proposals, and other agentic actions.
 
 Repository-scoped settings are not edited from the UI. Put repository defaults in `.damaian/config.conf` inside the selected repository. Repository settings are included in `Effective Policy` and can override user settings.
 
@@ -143,6 +146,31 @@ DEEPSEEK_API_KEY="your-deepseek-api-key" npm run desktop:dev
 
 The same pattern applies to OpenAI or any OpenAI-compatible provider.
 
+If an older configuration still names `deepseek-chat` or `deepseek-reasoner`, update it. Those were compatibility aliases that DeepSeek retired on 24 July 2026; the current models are `deepseek-v4-flash` and `deepseek-v4-pro`.
+
+## Output and Context Limits
+
+Two settings control how many tokens each request may use. They are independent: one bounds what the model writes, the other bounds what it reads. Both live in `Settings` under `Providers`, in the `Provider details` panel, and both apply per provider.
+
+- `Max output tokens` caps the reply the model generates in a single response. Set too low, a large multi-file patch is cut off mid-way. Damaian detects this, tells the model its call was truncated, and asks it to retry with fewer files per patch, so the request recovers instead of failing silently.
+- `Context budget` caps how much repository content Damaian packs into each request. Raising it lets the assistant see more of a large repository, which can improve answers. This content is re-sent and re-billed on every turn, so a higher budget increases cost and latency on all requests, not just large ones.
+
+Leave a field blank to use the built-in default for the selected model. The defaults are:
+
+- `deepseek-v4-flash` and `deepseek-v4-pro`: 65536 output tokens, 64000 context budget.
+- `deepseek-chat` and `deepseek-reasoner` (retired aliases): 8192 output tokens, 16000 context budget.
+- All other models: no output cap is sent, and the context budget is 16000.
+
+The built-in context budgets are deliberately well below what these models technically accept. DeepSeek's V4 models allow up to 384000 output tokens and a 1M-token context window, but requesting the maximum on every turn is rarely worth the cost. Raise the values if your repository or your patches need more.
+
+A value entered in the panel always wins over the built-in default. To give a V4 model its full output range:
+
+```text
+model_provider.deepseek.max_output_tokens=384000
+```
+
+Setting a value higher than the model actually allows causes the provider to reject the request outright, so prefer the built-in defaults unless you know the model's real limit.
+
 ## Local Data
 
 Damaian stores audit records, sessions, and patch proposals locally. By default, global app data is stored under:
@@ -182,5 +210,9 @@ Damaian keeps the local app in control of important effects:
 If the app shows `Repository is required`, select `+` beside `Projects` and pick a working folder.
 
 If model calls fail, open Settings and confirm the `Model API Key` status is `Saved`, or confirm that `model_api_key_env` names an environment variable and that the variable is set before launching the app.
+
+If the assistant announces a file change, such as `Let me create all the necessary files:`, but no patch appears, its reply was cut off at the model's output limit. Ask it to create fewer files at a time, or raise `Max output tokens` in `Provider details`. See [Output and Context Limits](#output-and-context-limits).
+
+If the assistant answers questions but never proposes file changes or uses MCP tools, enable `Native tool-calling` for the provider in `Provider details`. Patch proposals and MCP tools require it.
 
 If macOS warns that the app is from an unidentified developer, see [macOS Installation](./MACOS_INSTALLATION.md).

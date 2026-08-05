@@ -104,6 +104,9 @@ pub struct ModelRequest {
     /// should leave this `None` and rely on the `DAMAIAN_COMMAND_V1` text
     /// envelope instead.
     pub tools: Option<Vec<ToolDefinition>>,
+    /// Explicit output-token ceiling. `None` omits `max_tokens` and lets the
+    /// provider apply its own default.
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +120,11 @@ pub struct ModelRun {
     pub incomplete: bool,
     pub retry_count: u32,
     pub tool_calls: Vec<ToolCall>,
+    /// The provider stopped because it hit the output-token ceiling
+    /// (`finish_reason: "length"`) rather than finishing its answer. Anything
+    /// structured in this run — most importantly a tool call's `arguments`
+    /// JSON — may be cut off mid-token and fail to parse.
+    pub truncated: bool,
 }
 
 pub trait ModelAdapter {
@@ -136,6 +144,9 @@ pub trait ModelAdapter {
 pub struct MockModelAdapter {
     responses: Vec<String>,
     tool_calls: Vec<Vec<ToolCall>>,
+    /// Per-response `finish_reason: "length"` simulation, matched by index.
+    /// Empty (the default) means no response is truncated.
+    truncated: Vec<bool>,
     next_response: usize,
     cancelled: Vec<String>,
 }
@@ -145,6 +156,7 @@ impl MockModelAdapter {
         Self {
             responses: vec![response.into()],
             tool_calls: vec![Vec::new()],
+            truncated: Vec::new(),
             next_response: 0,
             cancelled: Vec::new(),
         }
@@ -155,6 +167,7 @@ impl MockModelAdapter {
         Self {
             responses,
             tool_calls,
+            truncated: Vec::new(),
             next_response: 0,
             cancelled: Vec::new(),
         }
@@ -170,9 +183,17 @@ impl MockModelAdapter {
         Self {
             responses,
             tool_calls,
+            truncated: Vec::new(),
             next_response: 0,
             cancelled: Vec::new(),
         }
+    }
+
+    /// Marks responses (by index) as having stopped at the provider's
+    /// output-token ceiling, for testing truncation handling.
+    pub fn with_truncated(mut self, truncated: Vec<bool>) -> Self {
+        self.truncated = truncated;
+        self
     }
 }
 
@@ -219,6 +240,7 @@ impl ModelAdapter for MockModelAdapter {
             incomplete: self.cancelled.contains(&run_id),
             retry_count: 0,
             tool_calls,
+            truncated: self.truncated.get(index).copied().unwrap_or(false),
         })
     }
 
@@ -503,6 +525,7 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
             incomplete: self.cancelled.contains(&run_id),
             retry_count,
             tool_calls,
+            truncated: response_was_truncated(&raw),
         })
     }
 
@@ -567,6 +590,9 @@ pub fn model_request_json(request: &ModelRequest) -> String {
     );
     if let Some(temperature) = &request.temperature {
         body.push_str(&format!(",\"temperature\":{}", temperature));
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        body.push_str(&format!(",\"max_tokens\":{max_tokens}"));
     }
     if let Some(reasoning_effort) =
         api_reasoning_effort(&request.provider, &request.reasoning_level)
@@ -742,6 +768,40 @@ fn extract_tool_calls(raw: &str) -> Vec<ToolCall> {
     calls
 }
 
+/// Whether the provider stopped because it ran out of output budget. Handles
+/// both a non-streaming object and an SSE stream, mirroring
+/// `extract_tool_calls`; in a stream only the final chunk carries a non-null
+/// `finish_reason`, so every chunk is checked and any `"length"` counts.
+fn response_was_truncated(raw: &str) -> bool {
+    fn any_length_finish(value: &serde_json::Value) -> bool {
+        value
+            .get("choices")
+            .and_then(|choices| choices.as_array())
+            .is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    choice
+                        .get("finish_reason")
+                        .and_then(|reason| reason.as_str())
+                        == Some("length")
+                })
+            })
+    }
+
+    if raw.contains("data:") {
+        raw.lines().any(|line| {
+            let Some(payload) = line.trim().strip_prefix("data:") else {
+                return false;
+            };
+            let payload = payload.trim();
+            payload != "[DONE]"
+                && serde_json::from_str::<serde_json::Value>(payload)
+                    .is_ok_and(|value| any_length_finish(&value))
+        })
+    } else {
+        serde_json::from_str::<serde_json::Value>(raw).is_ok_and(|value| any_length_finish(&value))
+    }
+}
+
 fn extract_error_message(raw: &str) -> Option<String> {
     if !raw.contains("\"error\"") {
         return None;
@@ -859,6 +919,7 @@ mod tests {
             reasoning_level: None,
             stream: false,
             tools: None,
+            max_tokens: None,
         }
     }
 
@@ -951,6 +1012,45 @@ mod tests {
     fn model_request_json_omits_tools_when_absent() {
         let body = model_request_json(&test_request());
         assert!(!body.contains("\"tools\""));
+    }
+
+    #[test]
+    fn model_request_json_includes_max_tokens_when_configured() {
+        let mut request = test_request();
+        request.max_tokens = Some(8192);
+        assert!(model_request_json(&request).contains("\"max_tokens\":8192"));
+    }
+
+    #[test]
+    fn model_request_json_omits_max_tokens_when_absent() {
+        assert!(!model_request_json(&test_request()).contains("max_tokens"));
+    }
+
+    #[test]
+    fn detects_length_finish_reason_in_streamed_and_whole_responses() {
+        // Only the final SSE chunk carries the finish reason.
+        let streamed = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n",
+            "data: [DONE]\n",
+        );
+        assert!(response_was_truncated(streamed));
+        assert!(response_was_truncated(
+            r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"length"}]}"#
+        ));
+    }
+
+    #[test]
+    fn normal_completion_is_not_reported_as_truncated() {
+        let streamed = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+            "data: [DONE]\n",
+        );
+        assert!(!response_was_truncated(streamed));
+        assert!(!response_was_truncated(
+            r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"tool_calls"}]}"#
+        ));
     }
 
     #[test]

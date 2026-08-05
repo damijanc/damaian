@@ -251,7 +251,7 @@ impl ChatOrchestrator {
             prompt,
             Some(&index),
             explicit_paths,
-            16_000,
+            self.config.context_token_budget(),
         );
         let model_prompt = build_model_prompt(prompt, &context.items, &prior_messages, None);
         let messages = vec![
@@ -439,6 +439,7 @@ impl ChatOrchestrator {
                 reasoning_level: Some(self.config.model_reasoning_level.clone()),
                 stream: true,
                 tools,
+                max_tokens: self.config.max_output_tokens(),
             };
 
             let token_estimate: usize = messages
@@ -487,7 +488,42 @@ impl ChatOrchestrator {
                 .or_else(|| parse_command_request(&redacted).map(ToolAction::Command));
 
             let Some(tool_action) = tool_action else {
-                break (model_run, redacted, None, None);
+                // The model asked for a tool but the request couldn't be
+                // decoded. The usual cause is the provider stopping at its
+                // output-token ceiling and cutting the `arguments` JSON off
+                // mid-string. This used to end the turn silently: the user saw
+                // a lead-in like "Let me create all the necessary files:", no
+                // patch, and a task marked complete. Feed the failure back
+                // instead so the model can retry within the remaining rounds —
+                // the same recovery the restricted-path patch arm uses.
+                let Some(undecodable) = model_run.tool_calls.first().cloned() else {
+                    break (model_run, redacted, None, None);
+                };
+                let note = undecodable_tool_call_note(&undecodable, model_run.truncated);
+                let summary = format!(
+                    "Attempted to call `{}`, but the request could not be decoded.",
+                    undecodable.name
+                );
+                self.session_store.append_message(
+                    &session.id,
+                    Some(&task.id),
+                    "assistant",
+                    &summary,
+                )?;
+                self.session_store
+                    .append_message(&session.id, Some(&task.id), "tool", &note)?;
+                // Deliberately not echoed back as an `assistant` tool_calls /
+                // `tool` pair: the malformed arguments would have to be
+                // replayed verbatim, and providers reject a tool result whose
+                // call didn't parse. Plain text carries the correction safely.
+                messages.push(ModelMessage::assistant(if redacted.trim().is_empty() {
+                    summary
+                } else {
+                    redacted.clone()
+                }));
+                messages.push(ModelMessage::user(note));
+                round += 1;
+                continue;
             };
 
             // Each non-terminal arm below produces the (assistant summary,
@@ -1033,6 +1069,22 @@ fn tool_action_from_call(call: &ToolCall) -> Option<ToolAction> {
                 arguments_json: call.arguments_json.clone(),
             }
         }),
+    }
+}
+
+/// Feedback for a tool call whose arguments couldn't be decoded. When the
+/// provider truncated the response, says so explicitly and asks for a smaller
+/// call — retrying the same oversized patch would just truncate again.
+fn undecodable_tool_call_note(call: &ToolCall, truncated: bool) -> String {
+    let name = &call.name;
+    if truncated {
+        format!(
+            "Your `{name}` call was cut off because the response reached the model's maximum output length, so its arguments were incomplete and could not be used. Nothing was changed. Retry with a smaller call: for a patch, propose fewer files at a time — a single file per call if needed — and send the rest in follow-up calls."
+        )
+    } else {
+        format!(
+            "Your `{name}` call could not be decoded: the arguments were not valid JSON matching the tool's schema. Nothing was changed. Retry with well-formed arguments."
+        )
     }
 }
 
