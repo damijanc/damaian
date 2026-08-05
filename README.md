@@ -66,6 +66,7 @@ detail.
 
 - [User Guide](docs/USER_GUIDE.md) — day-to-day usage, settings, model providers
 - [macOS Installation](docs/MACOS_INSTALLATION.md) — install and first-launch steps
+- [Troubleshooting](docs/TROUBLESHOOTING.md) — config and log locations, diagnosing failures
 - [Security Policy](SECURITY.md) — safety model and vulnerability reporting
 - [Development](docs/DEVELOPMENT.md) — building from source, the CLI, and releases
 - [AGENTS.md](AGENTS.md) — conventions and constraints for coding agents

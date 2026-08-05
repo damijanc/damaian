@@ -216,3 +216,5 @@ If the assistant announces a file change, such as `Let me create all the necessa
 If the assistant answers questions but never proposes file changes or uses MCP tools, enable `Native tool-calling` for the provider in `Provider details`. Patch proposals and MCP tools require it.
 
 If macOS warns that the app is from an unidentified developer, see [macOS Installation](./MACOS_INSTALLATION.md).
+
+For anything not covered here — where configuration and logs are stored, how to read the audit trail, and how to diagnose a failure in detail — see [Troubleshooting](./TROUBLESHOOTING.md).
