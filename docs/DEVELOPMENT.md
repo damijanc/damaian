@@ -1,7 +1,8 @@
 # Development
 
 Technical reference for building, running, and releasing Damaian. For end-user
-instructions see the [Damaian User Guide](USER_GUIDE.md).
+instructions see the [Damaian User Guide](USER_GUIDE.md); for diagnosing a
+misbehaving build see [Troubleshooting](TROUBLESHOOTING.md).
 
 Damaian is a Rust workspace with a native Tauri desktop app. No Node.js runtime
 is required to run the packaged macOS app; Node is only used for the build,

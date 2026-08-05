@@ -100,6 +100,14 @@ make something easier:
 
 See [SECURITY.md](SECURITY.md) for the full model.
 
+## When something is broken
+
+[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) is the diagnostic reference:
+where config, sessions, patches, and the audit log are written, what is and is
+not logged (there is no log file — only stdout/stderr), how to read the audit
+trail, and how to reproduce a failure with the CLI instead of the UI. Read it
+before you start instrumenting code to find out what happened.
+
 ## Traps
 
 Things that have actually cost time here:
