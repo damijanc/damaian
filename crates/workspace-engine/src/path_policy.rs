@@ -141,9 +141,12 @@ impl PathPolicy {
 
     pub fn assert_not_restricted(&self, relative_path: &str, allow_restricted: bool) -> Result<()> {
         if !allow_restricted && self.is_restricted(relative_path, false) {
-            return Err(ClientError::AccessDenied(
-                "Path is restricted by policy".to_string(),
-            ));
+            // Name the path: this message is what the user sees when a patch is
+            // refused, and "restricted by policy" alone leaves them guessing
+            // which of the proposed files (often a `.env`) caused it.
+            return Err(ClientError::AccessDenied(format!(
+                "Path is restricted by policy: {relative_path} (see restricted_patterns in settings)"
+            )));
         }
         Ok(())
     }

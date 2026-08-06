@@ -46,6 +46,9 @@ pub fn is_retryable_message(message: &str) -> bool {
         || lower.contains("429")
         || lower.contains("timeout")
         || lower.contains("timed out")
+        // curl's wording when it aborts a transfer that fell below
+        // `speed-limit` for `speed-time` — a stalled stream, not a dead one.
+        || lower.contains("too slow")
         || lower.contains("connection")
         || lower.contains("could not resolve")
 }

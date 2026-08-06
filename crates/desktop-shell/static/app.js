@@ -2660,6 +2660,36 @@ function appendChatMessage(role, content) {
 
 function updateChatMessage(target, content) {
   target.body.innerHTML = renderMarkdown(content);
+  delete target.body.dataset.placeholder;
+  $("chat-log").scrollTop = $("chat-log").scrollHeight;
+}
+
+// Progress text ("Generating a patch preview...") is a promise the bubble
+// cannot keep on its own: if the turn then fails, the toast carrying the real
+// error auto-dismisses and the bubble is left claiming work is still in
+// flight, forever. `data-placeholder` marks a bubble whose content is such a
+// promise so `renderChatMessageError` knows to replace it outright, rather
+// than annotating it the way it does streamed model output worth keeping.
+function setChatMessagePlaceholder(target, content) {
+  updateChatMessage(target, content);
+  target.body.dataset.placeholder = "true";
+}
+
+// Terminal state for a failed turn. The bubble — not the toast — is the
+// authoritative record once a turn is over, so every failure has to land here.
+function renderChatMessageError(target, error) {
+  if (!target) return;
+  const body = target.body;
+  // Placeholder or nothing streamed yet: neither is worth keeping alongside
+  // the error. Partial model output is, so it stays and the error follows it.
+  if (body.dataset.placeholder === "true" || !body.textContent.trim()) {
+    body.textContent = "";
+    delete body.dataset.placeholder;
+  }
+  const note = document.createElement("p");
+  note.className = "message-error";
+  note.textContent = `Request failed: ${error.message}`;
+  body.append(note);
   $("chat-log").scrollTop = $("chat-log").scrollHeight;
 }
 
@@ -3676,7 +3706,7 @@ function looksLikeEditRequest(prompt) {
 }
 
 async function proposePatchFromChat(prompt, assistantMessage) {
-  updateChatMessage(assistantMessage, "Generating a patch preview...");
+  setChatMessagePlaceholder(assistantMessage, "Generating a patch preview...");
   setChatStatus("Generating patch", "running");
   const patchRepo = requireRepo();
   const payload = await api(
@@ -3700,6 +3730,9 @@ async function proposePatchFromChat(prompt, assistantMessage) {
 async function sendChatPrompt() {
   const button = $("ask-btn");
   let streamError = null;
+  // Hoisted out of the `try` so the `catch` can write the failure into the
+  // bubble this turn already added to the log.
+  let assistantMessage = null;
   if (chatSubmitting) return;
   try {
     const prompt = $("chat-prompt").value.trim();
@@ -3709,7 +3742,7 @@ async function sendChatPrompt() {
     await ensureDesktopApiReady();
     const chatRepo = requireRepo();
     appendChatMessage("user", prompt);
-    const assistantMessage = appendChatMessage("assistant", "");
+    assistantMessage = appendChatMessage("assistant", "");
     if (looksLikeEditRequest(prompt)) {
       await proposePatchFromChat(prompt, assistantMessage);
       $("chat-prompt").value = "";
@@ -3762,6 +3795,7 @@ async function sendChatPrompt() {
   } catch (error) {
     setChatStatus("Failed", "error");
     toast(error.message);
+    renderChatMessageError(assistantMessage, error);
   } finally {
     chatSubmitting = false;
     button.disabled = false;

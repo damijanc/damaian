@@ -246,7 +246,7 @@ Event types grouped by what they tell you:
 | Area | Event types |
 |------|-------------|
 | Model turn | `model_request_prepared`, `model_response_completed`, `edit_model_request_prepared` |
-| Patches | `patch_proposed`, `edit_patch_ready_for_approval`, `patch_applied`, `patch_hunks_rejected`, `patch_rollback_started`, `patch_rolled_back`, `stored_patch_applied`, `stored_patch_files_rejected`, `stored_patch_rejected`, `stored_patch_rolled_back` |
+| Patches | `patch_proposed`, `edit_patch_ready_for_approval`, `edit_failed`, `patch_applied`, `patch_hunks_rejected`, `patch_rollback_started`, `patch_rolled_back`, `stored_patch_applied`, `stored_patch_files_rejected`, `stored_patch_rejected`, `stored_patch_rolled_back` |
 | Commands | `command_proposed`, `command_proposal_stored`, `command_executed`, `stored_command_executed`, `stored_command_rejected` |
 | Files & repo | `file_read`, `file_modified`, `file_restored`, `repository_indexed`, `git_status_read`, `git_diff_read` |
 | MCP | `mcp_tools_listed`, `mcp_tool_called`, `mcp_tool_call_failed`, `mcp_discovery_failed` |
@@ -264,6 +264,13 @@ Useful reads:
   assuming the command policy is wrong.
 - A `patch_proposed` with no following `patch_applied` means the user never
   approved, or apply failed on a hash conflict.
+- An `edit_model_request_prepared` followed by `edit_failed` is a proposal that
+  died after the model answered: `edit_failed.status` and `.error` say why. The
+  common causes are a patch naming a path in `restricted_patterns` (asking for a
+  `.env` does this) and a model that replied in prose instead of the
+  `DAMAIAN_EDIT_V1` envelope. An `edit_model_request_prepared` with *neither*
+  `edit_failed` nor `edit_patch_ready_for_approval` means the process died
+  mid-request.
 
 ### Session logs
 

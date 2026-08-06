@@ -170,6 +170,34 @@ impl EditOrchestrator {
         }
     }
 
+    /// Marks a proposal's task failed and records why, then hands the error
+    /// back so callers can keep using `?`. Both writes are best-effort: losing
+    /// the journal or audit entry must not replace the real error with a
+    /// bookkeeping one.
+    fn record_edit_failure(
+        &self,
+        session_id: &str,
+        task: &Task,
+        error: ClientError,
+    ) -> ClientError {
+        let _ = self.session_store.update_task_status(
+            task,
+            TaskStatus::Failed,
+            Some(&error.to_string()),
+        );
+        let _ = self.audit_log.record(
+            "edit_failed",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session_id.to_string()),
+                ("taskId", task.id.clone()),
+                ("status", error.code().to_string()),
+                ("error", error.to_string()),
+            ],
+        );
+        error
+    }
+
     pub fn propose_edit(
         &self,
         repository_root: impl AsRef<Path>,
@@ -229,26 +257,28 @@ impl EditOrchestrator {
         )?;
 
         let mut sink = |_token: &str| {};
-        let run = match model_adapter.stream_response(&request, &mut sink) {
-            Ok(run) => run,
-            Err(error) => {
-                let _ = self.session_store.update_task_status(
-                    &task,
-                    TaskStatus::Failed,
-                    Some(&error.to_string()),
-                );
-                return Err(error);
-            }
-        };
+        // Every failure from here on is recorded: a proposal can die after the
+        // request goes out because the model answered in the wrong format or
+        // named a file policy refuses, and those used to leave the task stuck at
+        // `running` with nothing in the audit log to explain it.
+        let run = model_adapter
+            .stream_response(&request, &mut sink)
+            .map_err(|error| self.record_edit_failure(&session.id, &task, error))?;
         let raw_output = self.scanner.redact(&run.content).text;
-        let generated = parse_generated_edit(&raw_output)?;
-        let patch = self.patch_engine.create_patch(
-            repository_root,
-            &generated.changes,
-            Some(&task.id),
-            &generated.summary,
-        )?;
-        self.patch_store.save(&patch)?;
+        let generated = parse_generated_edit(&raw_output)
+            .map_err(|error| self.record_edit_failure(&session.id, &task, error))?;
+        let patch = self
+            .patch_engine
+            .create_patch(
+                repository_root,
+                &generated.changes,
+                Some(&task.id),
+                &generated.summary,
+            )
+            .map_err(|error| self.record_edit_failure(&session.id, &task, error))?;
+        self.patch_store
+            .save(&patch)
+            .map_err(|error| self.record_edit_failure(&session.id, &task, error))?;
         self.session_store
             .append_message(&session.id, Some(&task.id), "assistant", &raw_output)?;
         task =

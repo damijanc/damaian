@@ -716,6 +716,20 @@ button:disabled {
   background: #f3f4f4;
 }
 
+/* Failure text for a turn that ended badly. Sits either alone in the bubble or
+   directly under whatever the model managed to stream before it broke. */
+.message-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.message-body > .message-error:not(:first-child) {
+  margin-top: 10px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
 .patch-preview {
   display: grid;
   gap: 12px;
