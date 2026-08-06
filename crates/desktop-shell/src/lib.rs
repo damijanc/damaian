@@ -2048,7 +2048,8 @@ fn friendly_chat_error(error: &str) -> String {
     }
     if lower.contains("rate limit") || lower.contains("429") {
         "Model provider rate limit. Wait for the provider retry window, then try again.".to_string()
-    } else if lower.contains("timeout") || lower.contains("timed out") {
+    } else if lower.contains("timeout") || lower.contains("timed out") || lower.contains("too slow")
+    {
         "Model provider request timed out. Try again, or lower the context size.".to_string()
     } else {
         "Model provider network request failed. Check connectivity and provider URL.".to_string()

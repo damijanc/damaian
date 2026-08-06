@@ -5,6 +5,20 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
+/// How long the transport may spend reaching the provider before giving up.
+const CONNECT_TIMEOUT_SECS: u64 = 30;
+/// How long a connected stream may deliver effectively nothing (see
+/// `speed-limit = 1`, i.e. under one byte per second) before it is treated as
+/// wedged. A completion can legitimately run for minutes, so the guard is on
+/// *progress* rather than total duration: a slow-but-advancing generation
+/// survives, a silent socket does not. Note that
+/// [`OpenAICompatibleAdapter::stream_response`] retries a stall that happens
+/// before the first token, so the worst-case wait is a small multiple of this.
+const STALL_TIMEOUT_SECS: u64 = 90;
+/// Backstop for the pathological case where a provider dribbles bytes forever,
+/// staying just above the stall threshold without ever finishing.
+const MAX_TIME_SECS: u64 = 900;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelMessage {
     pub role: String,
@@ -335,7 +349,7 @@ impl CurlModelTransport {
 
     fn curl_config(&self, request_body: &str) -> String {
         format!(
-            "request = \"POST\"\nurl = \"{}\"\nheader = \"content-type: application/json\"\nheader = \"authorization: Bearer {}\"\ndata-binary = \"{}\"\n",
+            "request = \"POST\"\nurl = \"{}\"\nheader = \"content-type: application/json\"\nheader = \"authorization: Bearer {}\"\ndata-binary = \"{}\"\nconnect-timeout = {CONNECT_TIMEOUT_SECS}\nspeed-limit = 1\nspeed-time = {STALL_TIMEOUT_SECS}\nmax-time = {MAX_TIME_SECS}\n",
             escape_curl_config_value(&self.chat_completions_url()),
             escape_curl_config_value(&self.api_key),
             escape_curl_config_value(request_body)
@@ -1000,6 +1014,22 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A completion with no bound is a hang with no bound: the desktop shell
+    // serves requests on a single thread, so one wedged provider connection
+    // freezes the whole UI until the app is killed.
+    #[test]
+    fn curl_transport_bounds_connect_stall_and_total_time() {
+        let transport = CurlModelTransport::new("https://api.example.test/", "sk_test");
+        let config = transport.curl_config("{\"model\":\"test\",\"messages\":[]}");
+
+        assert!(config.contains(&format!("connect-timeout = {CONNECT_TIMEOUT_SECS}")));
+        // Progress-based, not duration-based: a long generation that keeps
+        // streaming must survive, while a silent stream must not.
+        assert!(config.contains("speed-limit = 1"));
+        assert!(config.contains(&format!("speed-time = {STALL_TIMEOUT_SECS}")));
+        assert!(config.contains(&format!("max-time = {MAX_TIME_SECS}")));
+    }
 
     #[test]
     fn curl_transport_does_not_put_api_key_in_argv() {

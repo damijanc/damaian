@@ -2054,6 +2054,86 @@ fn proposes_edit_stores_patch_and_applies_selected_files() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+// curl reports a `speed-time` abort as "Operation too slow", not as a timeout,
+// so without this the transport's own stall guard would read as a permanent
+// failure and skip the retry that a transient stall deserves.
+#[test]
+fn classifies_a_stalled_transfer_as_retryable() {
+    assert!(workspace_engine::error::is_retryable_message(
+        "Model provider transport failed: curl: (28) Operation too slow. Less than 1 bytes/sec transferred the last 90 seconds"
+    ));
+    assert!(!workspace_engine::error::is_retryable_message(
+        "Path is restricted by policy: .env"
+    ));
+}
+
+/// Concatenated session journals for a test repo, so a test can assert on the
+/// task-status transitions the orchestrator recorded.
+fn read_session_journals(repo: &Path) -> String {
+    let sessions = repo.join(".damaian").join("sessions");
+    let mut combined = String::new();
+    for entry in fs::read_dir(sessions).unwrap() {
+        combined.push_str(&fs::read_to_string(entry.unwrap().path()).unwrap());
+    }
+    combined
+}
+
+// A patch refused by path policy is a dead end the user has to be told about:
+// before this was recorded, the task sat at `running` forever and the audit log
+// held no trace of the refusal, leaving the failure invisible after the fact.
+#[test]
+fn propose_edit_records_failure_when_patch_touches_restricted_path() {
+    let repo = temp_dir("edit-restricted-failure");
+    write_fixture(&repo, "src/a.js", "export const a = 1;\n");
+    let config = test_config(&repo);
+    let engine = WorkspaceEngine::new(config);
+    let response = "DAMAIAN_EDIT_V1\nSUMMARY: Add credentials file\nFILE: .env\nSTATUS: added\nCONTENT:\nTOKEN=abc\nEND_FILE\nEND_PATCH\n";
+    let mut adapter = MockModelAdapter::new(response);
+
+    let error = engine
+        .edit_orchestrator
+        .propose_edit(&repo, "introduce a .env file", &[], &mut adapter)
+        .unwrap_err();
+
+    // The message has to name the offending path, or the user cannot tell which
+    // of the proposed files was refused.
+    assert!(error.to_string().contains(".env"), "error: {error}");
+
+    let audit_log =
+        fs::read_to_string(repo.join(".damaian").join("audit").join("events.jsonl")).unwrap();
+    assert!(audit_log.contains("edit_failed"), "audit: {audit_log}");
+    assert!(!audit_log.contains("patch_proposed"));
+    assert!(read_session_journals(&repo).contains("\"status\":\"failed\""));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn propose_edit_records_failure_when_model_output_is_unparseable() {
+    let repo = temp_dir("edit-unparseable-failure");
+    write_fixture(&repo, "src/a.js", "export const a = 1;\n");
+    let config = test_config(&repo);
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new("Sure! Here is my analysis of the README.\n");
+
+    let error = engine
+        .edit_orchestrator
+        .propose_edit(&repo, "validate the README", &[], &mut adapter)
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("DAMAIAN_EDIT_V1"),
+        "error: {error}"
+    );
+
+    let audit_log =
+        fs::read_to_string(repo.join(".damaian").join("audit").join("events.jsonl")).unwrap();
+    assert!(audit_log.contains("edit_failed"), "audit: {audit_log}");
+    assert!(read_session_journals(&repo).contains("\"status\":\"failed\""));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 #[test]
 fn rejects_selected_patch_files_without_modifying_workspace() {
     let repo = temp_dir("edit-reject-selected");
