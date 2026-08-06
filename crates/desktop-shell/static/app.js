@@ -3199,9 +3199,73 @@ function createPatchPreview(payload, patchRepo) {
   rejectButton.textContent = "Reject Selected";
   actions.append(applyButton, rejectButton);
 
+  // Shown when the secret scanner flags a selected file. The apply is not
+  // refused outright: the user sees what was found and decides.
+  const secretNotice = document.createElement("div");
+  secretNotice.className = "patch-secret-notice";
+  secretNotice.hidden = true;
+
   const list = document.createElement("div");
   list.className = "diff-list";
-  wrapper.append(header, actions, list);
+  wrapper.append(header, actions, secretNotice, list);
+
+  function clearSecretNotice() {
+    secretNotice.hidden = true;
+    secretNotice.innerHTML = "";
+  }
+
+  function showSecretNotice(warnings, paths) {
+    secretNotice.innerHTML = "";
+
+    const title = document.createElement("strong");
+    title.textContent =
+      warnings.length === 1
+        ? "1 file may contain a hardcoded secret"
+        : `${warnings.length} files may contain a hardcoded secret`;
+
+    const explanation = document.createElement("p");
+    explanation.textContent =
+      "Detection is not perfect — setup instructions and placeholder values can look like credentials. Review the diff below, then choose.";
+
+    const findings = document.createElement("ul");
+    warnings.forEach((warning) => {
+      const item = document.createElement("li");
+      const path = document.createElement("code");
+      path.textContent = warning.path;
+      const detail = document.createElement("span");
+      const categories = (warning.categories || []).join(", ");
+      detail.textContent = ` — ${warning.count} match${warning.count === 1 ? "" : "es"}${
+        categories ? ` (${categories})` : ""
+      }`;
+      item.append(path, detail);
+      findings.append(item);
+    });
+
+    const noticeActions = document.createElement("div");
+    noticeActions.className = "inline-actions";
+    const acceptButton = document.createElement("button");
+    acceptButton.type = "button";
+    acceptButton.className = "patch-secret-accept";
+    acceptButton.textContent = "Apply Anyway";
+    const cancelButton = document.createElement("button");
+    cancelButton.type = "button";
+    cancelButton.textContent = "Cancel";
+    noticeActions.append(acceptButton, cancelButton);
+
+    acceptButton.addEventListener("click", () => {
+      clearSecretNotice();
+      // Re-apply exactly the same selection, now carrying the user's explicit
+      // consent. The override is per-apply and is not remembered.
+      runApply(paths, true);
+    });
+    cancelButton.addEventListener("click", () => {
+      clearSecretNotice();
+      render();
+    });
+
+    secretNotice.append(title, explanation, findings, noticeActions);
+    secretNotice.hidden = false;
+  }
 
   function selectedPendingPaths() {
     return state.files
@@ -3307,10 +3371,8 @@ function createPatchPreview(payload, patchRepo) {
     $("chat-log").scrollTop = $("chat-log").scrollHeight;
   }
 
-  applyButton.addEventListener("click", async () => {
+  async function runApply(paths, allowSecrets) {
     try {
-      const paths = selectedPendingPaths();
-      if (!paths.length) throw new Error("No pending patch files selected");
       applyButton.disabled = true;
       const hunkSelection = {};
       state.files.forEach((file) => {
@@ -3320,18 +3382,30 @@ function createPatchPreview(payload, patchRepo) {
             .map((hunk) => hunk.id);
         }
       });
-      const result = await api(
-        "/api/apply-patch",
-        form({
-          repo: patchRepo,
-          patch_id: state.patchId,
-          paths: paths.join("\n"),
-          hunk_selection: JSON.stringify(hunkSelection),
-        }),
-      );
+      const fields = {
+        repo: patchRepo,
+        patch_id: state.patchId,
+        paths: paths.join("\n"),
+        hunk_selection: JSON.stringify(hunkSelection),
+      };
+      if (allowSecrets) fields.allow_secrets = "1";
+      const result = await api("/api/apply-patch", form(fields));
+
+      // Nothing was written; the server is asking whether to go ahead.
+      const blocked = result.blockedBySecrets || [];
+      if (blocked.length) {
+        showSecretNotice(blocked, paths);
+        applyButton.disabled = false;
+        return;
+      }
+
       const applied = result.appliedFiles || [];
       markFiles(applied, "applied");
-      toast(`Applied ${applied.length} file(s)`);
+      toast(
+        allowSecrets
+          ? `Applied ${applied.length} file(s) despite secret warning`
+          : `Applied ${applied.length} file(s)`,
+      );
       if (applied.length) {
         await appendGitStatusAfterChange(patchRepo).catch((error) => {
           toast(`Status unavailable: ${error.message}`);
@@ -3341,6 +3415,16 @@ function createPatchPreview(payload, patchRepo) {
       toast(error.message);
       render();
     }
+  }
+
+  applyButton.addEventListener("click", () => {
+    clearSecretNotice();
+    const paths = selectedPendingPaths();
+    if (!paths.length) {
+      toast("No pending patch files selected");
+      return;
+    }
+    runApply(paths, false);
   });
 
   rejectButton.addEventListener("click", async () => {

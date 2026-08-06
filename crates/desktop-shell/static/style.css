@@ -770,6 +770,51 @@ button:disabled {
   justify-content: flex-start;
 }
 
+/* `display` below is an author declaration, so it beats the UA `[hidden]`
+   rule and the notice would sit there as an empty bordered box. */
+.patch-secret-notice[hidden] {
+  display: none;
+}
+
+.patch-secret-notice {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.patch-secret-notice strong {
+  color: var(--warn);
+  font-size: 13px;
+}
+
+.patch-secret-notice p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.patch-secret-notice ul {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+}
+
+.patch-secret-notice code {
+  font-size: 12px;
+}
+
+.patch-secret-notice span {
+  color: var(--muted);
+}
+
+.patch-secret-notice .patch-secret-accept {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
 .message-body h3,
 .message-body h4,
 .message-body h5,

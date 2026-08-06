@@ -66,6 +66,46 @@ fn redacts_credential_assignments() {
 }
 
 #[test]
+fn ignores_documentation_placeholder_credentials() {
+    let scanner = SecretScanner::default();
+    // Every setup README carries lines like these. They are instructions, not
+    // credentials, and blocking them is what made `apply selected` unusable.
+    for line in [
+        "export DEEPSEEK_API_KEY=\"your-deepseek-api-key\"",
+        "OPENAI_API_KEY=<your-api-key-here>",
+        "password: ${DB_PASSWORD}",
+        "api_key = $OPENAI_API_KEY",
+        "client_secret: changeme-please",
+        "token: xxxxxxxxxxxxxxxx",
+        "password = {{ vault_password }}",
+        "model_api_key_env=keychain:model-api-key",
+        "access_token: REPLACE_WITH_YOUR_TOKEN",
+    ] {
+        assert!(
+            scanner.scan(line).is_empty(),
+            "documentation placeholder should not be flagged: {line}"
+        );
+    }
+}
+
+#[test]
+fn still_detects_real_credential_assignments_next_to_placeholders() {
+    let scanner = SecretScanner::default();
+    let findings = scanner.scan(concat!(
+        "# Set your key:\n",
+        "export API_KEY=\"your-api-key-here\"\n",
+        "password = \"hunter2-correct-horse\"\n",
+    ));
+
+    assert_eq!(
+        findings.len(),
+        1,
+        "only the real credential should be found"
+    );
+    assert_eq!(findings[0].category, "credential_assignment");
+}
+
+#[test]
 fn detects_private_keys() {
     let scanner = SecretScanner::default();
     let secret = "-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----";
@@ -750,6 +790,155 @@ fn blocks_generated_hardcoded_secrets_by_default() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+/// The block is a warning the user can overrule, not a dead end: a patch the
+/// scanner flags must still be appliable once the user has seen what was
+/// found and said yes.
+#[test]
+fn applies_generated_secret_when_user_explicitly_overrides() {
+    let repo = temp_dir("patch-secret-override");
+    write_fixture(&repo, "src/config.js", "export const token = \"\";\n");
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+    let secret_content = "export const api_key = \"sk_test_12345678901234567890\";\n";
+    let patch = engine
+        .create_patch(
+            &repo,
+            &[ProposedChange {
+                path: "src/config.js".to_string(),
+                new_content: secret_content.to_string(),
+                status: None,
+                allow_restricted: false,
+            }],
+            None,
+            "secret",
+        )
+        .unwrap();
+
+    let result = engine
+        .apply_patch(&repo, &patch, None, None, "tester", true)
+        .expect("explicit override should apply the patch");
+
+    assert_eq!(result.applied_files, vec!["src/config.js"]);
+    // The override suppresses the block, never the warning.
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("src/config.js")),
+        "override must still surface the warning: {:?}",
+        result.warnings
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("src/config.js")).unwrap(),
+        secret_content
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// The UI needs to know *what* tripped the check before it asks the user to
+/// accept it, and asking must not write anything to disk.
+#[test]
+fn previews_generated_secret_warnings_without_touching_disk() {
+    let repo = temp_dir("patch-secret-preview");
+    write_fixture(&repo, "src/config.js", "export const token = \"\";\n");
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+    let patch = engine
+        .create_patch(
+            &repo,
+            &[ProposedChange {
+                path: "src/config.js".to_string(),
+                new_content: "export const api_key = \"sk_test_12345678901234567890\";\n"
+                    .to_string(),
+                status: None,
+                allow_restricted: false,
+            }],
+            None,
+            "secret",
+        )
+        .unwrap();
+
+    let warnings = engine
+        .preview_generated_secrets(&repo, &patch, None, None)
+        .unwrap();
+
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].path, "src/config.js");
+    assert_eq!(warnings[0].count, 1);
+    assert_eq!(warnings[0].categories, vec!["credential_assignment"]);
+    // Preview is read-only.
+    assert_eq!(
+        fs::read_to_string(repo.join("src/config.js")).unwrap(),
+        "export const token = \"\";\n"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A generated README full of setup instructions is the case that started
+/// this: it must apply with no warning and no override needed.
+#[test]
+fn applies_generated_setup_readme_without_warning() {
+    let repo = temp_dir("patch-readme");
+    write_fixture(&repo, "src/app.js", "export const a = 1;\n");
+    let scanner = SecretScanner::default();
+    let config = test_config(&repo);
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+    let readme = concat!(
+        "# Setup\n\n",
+        "1. Get an API key from the provider dashboard.\n",
+        "2. Export it before launching:\n\n",
+        "```sh\n",
+        "export DEEPSEEK_API_KEY=\"your-deepseek-api-key\"\n",
+        "export DATABASE_URL=\"postgres://user:${DB_PASSWORD}@localhost:5432/app\"\n",
+        "```\n\n",
+        "Never commit the real key. Use `client_secret: <your-client-secret>` only\n",
+        "as a template in `config.example.yml`.\n",
+    );
+    let patch = engine
+        .create_patch(
+            &repo,
+            &[ProposedChange {
+                path: "README.md".to_string(),
+                new_content: readme.to_string(),
+                status: None,
+                allow_restricted: false,
+            }],
+            None,
+            "add setup readme",
+        )
+        .unwrap();
+
+    let result = engine
+        .apply_patch(&repo, &patch, None, None, "tester", false)
+        .expect("a setup README must not be blocked as a hardcoded secret");
+
+    assert_eq!(result.applied_files, vec!["README.md"]);
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    // The stored diff must keep the instructions readable, not redact them.
+    assert!(patch.files[0].diff.contains("your-deepseek-api-key"));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 #[test]
 fn redacts_secrets_from_patch_diffs_before_storage() {
     let repo = temp_dir("patch-diff-redaction");
@@ -1370,7 +1559,7 @@ fn chat_dispatches_propose_patch_tool_call_and_returns_reviewable_patch() {
     // from the text-envelope `propose_edit` flow.
     let apply_result = engine
         .edit_orchestrator
-        .apply_stored_patch(&repo, &proposal.patch_id, None, None, "test_user")
+        .apply_stored_patch(&repo, &proposal.patch_id, None, None, "test_user", false)
         .unwrap();
     assert_eq!(
         apply_result.applied_files,
@@ -2038,7 +2227,14 @@ fn proposes_edit_stores_patch_and_applies_selected_files() {
     let approved = vec!["src/a.js".to_string()];
     let result = engine
         .edit_orchestrator
-        .apply_stored_patch(&repo, &proposal.patch.id, Some(&approved), None, "tester")
+        .apply_stored_patch(
+            &repo,
+            &proposal.patch.id,
+            Some(&approved),
+            None,
+            "tester",
+            false,
+        )
         .unwrap();
 
     assert_eq!(result.applied_files, vec!["src/a.js"]);
@@ -2168,7 +2364,14 @@ fn rejects_selected_patch_files_without_modifying_workspace() {
     let approved = vec!["src/a.js".to_string()];
     let result = engine
         .edit_orchestrator
-        .apply_stored_patch(&repo, &proposal.patch.id, Some(&approved), None, "tester")
+        .apply_stored_patch(
+            &repo,
+            &proposal.patch.id,
+            Some(&approved),
+            None,
+            "tester",
+            false,
+        )
         .unwrap();
     assert_eq!(result.applied_files, vec!["src/a.js"]);
     assert_eq!(
@@ -2199,7 +2402,14 @@ fn rejects_unknown_selected_patch_file() {
 
     let error = engine
         .edit_orchestrator
-        .apply_stored_patch(&repo, &proposal.patch.id, Some(&approved), None, "tester")
+        .apply_stored_patch(
+            &repo,
+            &proposal.patch.id,
+            Some(&approved),
+            None,
+            "tester",
+            false,
+        )
         .unwrap_err();
     assert!(matches!(error, ClientError::InvalidInput(_)));
 

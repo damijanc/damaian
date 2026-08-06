@@ -30,6 +30,7 @@ fn usage() -> &'static str {
   damaian propose-edit <repo> <prompt>
   damaian show-patch <repo> <patch-id>
   damaian apply-patch <repo> <patch-id> [file...] [--hunk-selection <json>]
+                      [--allow-generated-secrets]
   damaian reject-patch <patch-id>
 "
 }
@@ -47,6 +48,9 @@ fn run() -> workspace_engine::Result<()> {
     // Global so positional parsing below never sees the flag or its value;
     // only `apply-patch` reads it.
     let hunk_selection_arg = take_option(&mut args, "--hunk-selection");
+    // Also global for the same reason: stripped before positional parsing so
+    // it can sit anywhere among `apply-patch`'s optional `[file...]` args.
+    let allow_generated_secrets = take_flag(&mut args, "--allow-generated-secrets");
     let Some(command) = args.first().map(String::as_str) else {
         print!("{}", usage());
         return Ok(());
@@ -338,12 +342,37 @@ fn run() -> workspace_engine::Result<()> {
                 .as_deref()
                 .map(parse_hunk_selection)
                 .transpose()?;
+            // Show what the scanner found before applying, so the operator can
+            // see which file tripped the check and re-run with the override
+            // instead of only being told "blocked".
+            if !allow_generated_secrets {
+                let flagged = engine.edit_orchestrator.preview_stored_patch_secrets(
+                    repo,
+                    patch_id,
+                    approved_paths.as_deref(),
+                    hunk_selection.as_ref(),
+                )?;
+                for warning in &flagged {
+                    eprintln!(
+                        "warning: {} may contain a hardcoded secret ({} finding(s): {})",
+                        warning.path,
+                        warning.count,
+                        warning.categories.join(", ")
+                    );
+                }
+                if !flagged.is_empty() {
+                    eprintln!(
+                        "Re-run with --allow-generated-secrets to apply anyway after reviewing the diff."
+                    );
+                }
+            }
             let result = engine.edit_orchestrator.apply_stored_patch(
                 repo,
                 patch_id,
                 approved_paths.as_deref(),
                 hunk_selection.as_ref(),
                 "local_user",
+                allow_generated_secrets,
             )?;
             println!(
                 "{{\"patchId\":\"{}\",\"appliedFiles\":[{}],\"warningCount\":{}}}",

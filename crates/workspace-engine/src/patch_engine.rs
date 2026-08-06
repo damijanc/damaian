@@ -79,6 +79,32 @@ struct RollbackSnapshot {
     applied_hash: String,
 }
 
+/// One selected file whose generated content the secret scanner flagged.
+///
+/// Carries only the path, the distinct finding categories, and how many were
+/// found — never the matched text, so surfacing this to the UI or the audit
+/// log cannot leak a real credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedSecretWarning {
+    pub path: String,
+    pub categories: Vec<String>,
+    pub count: usize,
+}
+
+/// A selected file resolved against the working tree, with the exact content
+/// it would receive.
+struct PreparedFile<'patch> {
+    file: &'patch ProposedFilePatch,
+    absolute_path: PathBuf,
+    current_content: Option<String>,
+    content_to_write: String,
+}
+
+struct PreparedApply<'patch> {
+    files: Vec<PreparedFile<'patch>>,
+    excluded_hunks: Vec<(String, Vec<String>)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposedChange {
     pub path: String,
@@ -206,15 +232,20 @@ impl PatchEngine {
             .collect()
     }
 
-    pub fn apply_patch(
+    /// Resolves the selected files, verifies they have not drifted since the
+    /// patch was generated, and computes the exact bytes each one would
+    /// receive. Shared by `apply_patch` and `preview_generated_secrets` so the
+    /// content the user is warned about is byte-for-byte the content that
+    /// would be written — including partial-hunk reconstruction.
+    ///
+    /// Does not touch disk beyond reading the current files.
+    fn prepare_files<'patch>(
         &self,
         root_path: impl AsRef<Path>,
-        patch: &ProposedPatch,
+        patch: &'patch ProposedPatch,
         approved_paths: Option<&[String]>,
         hunk_selection: Option<&HashMap<String, Vec<String>>>,
-        approved_by: &str,
-        allow_generated_secrets: bool,
-    ) -> Result<PatchApplyResult> {
+    ) -> Result<PreparedApply<'patch>> {
         let selected_paths = approved_paths
             .map(|paths| paths.to_vec())
             .unwrap_or_else(|| patch.files.iter().map(|file| file.path.clone()).collect());
@@ -247,8 +278,7 @@ impl PatchEngine {
             ));
         }
 
-        let mut prepared = Vec::new();
-        let mut warnings = Vec::new();
+        let mut files = Vec::new();
         // Per file, the hunk ids present in the patch but excluded by the
         // caller's `hunk_selection`. Recorded as an audit event after apply
         // so the trail reflects what was left out, not only what was applied.
@@ -291,32 +321,107 @@ impl PatchEngine {
                 }
             };
 
-            let findings = self.scanner.scan(&content_to_write);
-            if !findings.is_empty() {
-                warnings.push(format!(
-                    "{}: generated_secret:{}",
-                    file.path,
-                    findings.len()
-                ));
-                if self.config.block_generated_secrets && !allow_generated_secrets {
-                    return Err(ClientError::PolicyBlocked(
-                        "Generated content appears to contain a hardcoded secret".to_string(),
-                    ));
-                }
-            }
-            prepared.push((
+            files.push(PreparedFile {
                 file,
-                target.absolute_path,
+                absolute_path: target.absolute_path,
                 current_content,
                 content_to_write,
+            });
+        }
+
+        Ok(PreparedApply {
+            files,
+            excluded_hunks,
+        })
+    }
+
+    /// Reports which selected files the secret scanner flags, without applying
+    /// anything.
+    ///
+    /// This is what lets the UI warn *before* apply and then offer to go ahead
+    /// anyway: `apply_patch` alone can only refuse, and an error string cannot
+    /// tell the user which file tripped the check. Only category names and
+    /// counts are reported — never the matched values.
+    pub fn preview_generated_secrets(
+        &self,
+        root_path: impl AsRef<Path>,
+        patch: &ProposedPatch,
+        approved_paths: Option<&[String]>,
+        hunk_selection: Option<&HashMap<String, Vec<String>>>,
+    ) -> Result<Vec<GeneratedSecretWarning>> {
+        let prepared = self.prepare_files(root_path, patch, approved_paths, hunk_selection)?;
+        Ok(prepared
+            .files
+            .iter()
+            .filter_map(|prepared_file| {
+                let findings = self.scanner.scan(&prepared_file.content_to_write);
+                if findings.is_empty() {
+                    return None;
+                }
+                let mut categories = findings
+                    .iter()
+                    .map(|finding| finding.category.clone())
+                    .collect::<Vec<_>>();
+                categories.sort();
+                categories.dedup();
+                Some(GeneratedSecretWarning {
+                    path: prepared_file.file.path.clone(),
+                    categories,
+                    count: findings.len(),
+                })
+            })
+            .collect())
+    }
+
+    pub fn apply_patch(
+        &self,
+        root_path: impl AsRef<Path>,
+        patch: &ProposedPatch,
+        approved_paths: Option<&[String]>,
+        hunk_selection: Option<&HashMap<String, Vec<String>>>,
+        approved_by: &str,
+        allow_generated_secrets: bool,
+    ) -> Result<PatchApplyResult> {
+        let PreparedApply {
+            files: prepared,
+            excluded_hunks,
+        } = self.prepare_files(&root_path, patch, approved_paths, hunk_selection)?;
+
+        let mut warnings = Vec::new();
+        // Collect every flagged file before deciding, so a block names all of
+        // them at once instead of making the user re-run apply per file.
+        let mut blocked = Vec::new();
+        for prepared_file in &prepared {
+            let findings = self.scanner.scan(&prepared_file.content_to_write);
+            if findings.is_empty() {
+                continue;
+            }
+            warnings.push(format!(
+                "{}: generated_secret:{}",
+                prepared_file.file.path,
+                findings.len()
             ));
+            blocked.push(prepared_file.file.path.clone());
+        }
+        if !blocked.is_empty() && self.config.block_generated_secrets && !allow_generated_secrets {
+            return Err(ClientError::PolicyBlocked(format!(
+                "Generated content appears to contain a hardcoded secret ({}). \
+                 Review the diff and apply again with the override to accept it.",
+                blocked.join(", ")
+            )));
         }
 
         let rollback_dir = self.config.data_dir.join("rollback").join(&patch.id);
         fs::create_dir_all(&rollback_dir)?;
         let mut applied_files = Vec::new();
 
-        for (file, absolute_path, current_content, content_to_write) in prepared {
+        for PreparedFile {
+            file,
+            absolute_path,
+            current_content,
+            content_to_write,
+        } in prepared
+        {
             let rollback_path = rollback_dir.join(file.path.replace('/', "__"));
             let rollback_content = self
                 .scanner

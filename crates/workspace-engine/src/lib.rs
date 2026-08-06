@@ -58,8 +58,8 @@ pub use model::{
     extract_model_tokens, model_request_json,
 };
 pub use patch_engine::{
-    PatchApplyResult, PatchEngine, PatchRollbackResult, ProposedChange, ProposedFilePatch,
-    ProposedPatch, parse_hunk_selection,
+    GeneratedSecretWarning, PatchApplyResult, PatchEngine, PatchRollbackResult, ProposedChange,
+    ProposedFilePatch, ProposedPatch, parse_hunk_selection,
 };
 pub use path_policy::PathPolicy;
 pub use render::{

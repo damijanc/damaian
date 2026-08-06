@@ -27,6 +27,10 @@ Damaian supports macOS Keychain-backed model API key storage from desktop settin
 
 Secret scanning redacts detected credentials from indexed context, command output, patch diffs, Git diff output, audit log fields, and model-visible command results. Generated file content is still checked before apply and is blocked by default when hardcoded secrets are detected.
 
+That block is a warning the user can overrule, not a hard stop. When a selected file is flagged, the apply reports which file tripped the check and which detection categories fired — never the matched value — and applies nothing. The user reviews the diff and may then apply anyway (`Apply Anyway` in the desktop app, `--allow-generated-secrets` in the CLI). The override is per-apply, is never inferred or remembered, and is recorded in the audit log as `generatedSecretOverride=true`.
+
+Assignment-shaped detection (`password=`, `api_key:`, database URL credentials) exempts values that are structurally not credentials: template and variable syntax (`<your-key>`, `${DB_PASSWORD}`, `{{ vault_password }}`, `$OPENAI_KEY`), Keychain references, repeated filler (`xxxxxxxx`), environment variable names, and values naming themselves as examples. Setup documentation is the dominant source of these, and blocking or redacting them protected nothing while making generated READMEs unappliable. Structural detectors — private keys, AWS keys, JWTs, provider token prefixes, Azure keys, custom patterns — are not exempted.
+
 ## Local App Boundary
 
 The desktop shell binds to loopback on the fixed app origin `http://127.0.0.1:4765`. Startup refuses to continue if that port is already occupied, and the Tauri capability is scoped to that exact localhost origin.

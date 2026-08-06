@@ -5,7 +5,9 @@ use crate::error::{ClientError, Result};
 use crate::hash::create_id;
 use crate::indexer::ProjectIndexer;
 use crate::model::{ModelAdapter, ModelMessage, ModelRequest, ModelRun};
-use crate::patch_engine::{PatchApplyResult, PatchEngine, ProposedChange, ProposedPatch};
+use crate::patch_engine::{
+    GeneratedSecretWarning, PatchApplyResult, PatchEngine, ProposedChange, ProposedPatch,
+};
 use crate::secret_scanner::SecretScanner;
 use crate::session::{Session, SessionStore, Task, TaskStatus};
 use std::fs;
@@ -314,6 +316,28 @@ impl EditOrchestrator {
         })
     }
 
+    /// Reports which of the selected files the secret scanner flags, without
+    /// applying anything, so a caller can warn the user and offer the override
+    /// rather than dead-ending on a `PolicyBlocked` error.
+    pub fn preview_stored_patch_secrets(
+        &self,
+        repository_root: impl AsRef<Path>,
+        patch_id: &str,
+        approved_paths: Option<&[String]>,
+        hunk_selection: Option<&std::collections::HashMap<String, Vec<String>>>,
+    ) -> Result<Vec<GeneratedSecretWarning>> {
+        let patch = self.patch_store.load(patch_id)?;
+        self.patch_engine.preview_generated_secrets(
+            repository_root,
+            &patch,
+            approved_paths,
+            hunk_selection,
+        )
+    }
+
+    /// `allow_generated_secrets` records an explicit, per-apply user decision
+    /// to accept content the secret scanner flagged. It is never inferred and
+    /// never persisted — each apply asks again.
     pub fn apply_stored_patch(
         &self,
         repository_root: impl AsRef<Path>,
@@ -321,6 +345,7 @@ impl EditOrchestrator {
         approved_paths: Option<&[String]>,
         hunk_selection: Option<&std::collections::HashMap<String, Vec<String>>>,
         approved_by: &str,
+        allow_generated_secrets: bool,
     ) -> Result<PatchApplyResult> {
         let patch = self.patch_store.load(patch_id)?;
         let result = self.patch_engine.apply_patch(
@@ -329,7 +354,7 @@ impl EditOrchestrator {
             approved_paths,
             hunk_selection,
             approved_by,
-            false,
+            allow_generated_secrets,
         )?;
         self.audit_log.record(
             "stored_patch_applied",
@@ -338,6 +363,12 @@ impl EditOrchestrator {
                 ("patchId", patch_id.to_string()),
                 ("approvedBy", approved_by.to_string()),
                 ("files", result.applied_files.join(",")),
+                // The audit trail must show that a flagged patch was applied
+                // by explicit user override, not silently.
+                (
+                    "generatedSecretOverride",
+                    allow_generated_secrets.to_string(),
+                ),
             ],
         )?;
         Ok(result)
