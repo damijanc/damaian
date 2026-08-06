@@ -6,12 +6,13 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use workspace_engine::{
-    ChatMessage, ChatTurnResult, Config, CurlModelTransport, GeneratedSecretWarning, McpClient,
-    McpServerConfig, McpTokenResolver, McpTransport, OpenAICompatibleAdapter, ProposedFilePatch,
-    Session, WorkspaceEngine, command_approval_prompt, normalize_mcp_server_id,
-    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
-    parse_mcp_transport, patch_diff_text,
+    CancelToken, ChatMessage, ChatTurnResult, Config, CurlModelTransport, GeneratedSecretWarning,
+    McpClient, McpServerConfig, McpTokenResolver, McpTransport, OpenAICompatibleAdapter,
+    ProposedFilePatch, Session, TurnPhase, TurnProgress, TurnSink, WorkspaceEngine,
+    command_approval_prompt, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
 };
 
 mod keychain;
@@ -326,15 +327,22 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .session_store
                 .read_messages(&session_id)
                 .map_err(|error| error.to_string())?;
+            // Message roles alone cannot say whether a turn was stopped, so the
+            // task statuses ride along and the UI joins them by `taskId`.
+            let task_statuses = engine
+                .session_store
+                .read_task_statuses(&session_id)
+                .map_err(|error| error.to_string())?;
             write_response(
                 stream,
                 &request,
                 200,
                 "application/json",
                 &format!(
-                    "{{\"session\":{},\"messages\":[{}]}}",
+                    "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}]}}",
                     session_json(&session),
-                    messages_json(&messages)
+                    messages_json(&messages),
+                    task_statuses_json(&task_statuses)
                 ),
             )
         }
@@ -474,8 +482,10 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/resume-command-stream") => handle_resume_command_stream(stream, &request),
         ("POST", "/api/ask") => {
             let form = parse_form(&request.body);
-            let mut on_token = |_token: &str| {};
-            let result = run_chat_request(&form, &mut on_token)?;
+            // The non-streaming fallback: there is no stream for a client to
+            // abort, so nothing here can be stopped. The events go nowhere.
+            let (events, _discard) = std::sync::mpsc::channel();
+            let result = run_chat_request(&form, &CancelToken::new(), &events)?;
             write_response(
                 stream,
                 &request,
@@ -888,55 +898,17 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
 fn handle_ask_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     write_event_stream_headers(stream, request)?;
-
-    let mut write_error = None;
-    let result = {
-        let mut on_token = |token: &str| {
-            if write_error.is_none() {
-                let data = format!("{{\"token\":\"{}\"}}", escape_json(token));
-                if let Err(error) = write_sse_event(stream, "token", &data) {
-                    write_error = Some(error);
-                }
-            }
-        };
-        run_chat_request(&form, &mut on_token)
-    };
-
-    if let Some(error) = write_error {
-        return Err(error);
-    }
-
-    match result {
-        Ok(result) => write_sse_event(stream, "done", &chat_result_json(&result)),
-        Err(error) => write_sse_event(stream, "error", &json_error(&friendly_chat_error(&error))),
-    }
+    stream_turn(stream, move |cancel, events| {
+        run_chat_request(&form, cancel, events)
+    })
 }
 
 fn handle_resume_command_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     write_event_stream_headers(stream, request)?;
-
-    let mut write_error = None;
-    let result = {
-        let mut on_token = |token: &str| {
-            if write_error.is_none() {
-                let data = format!("{{\"token\":\"{}\"}}", escape_json(token));
-                if let Err(error) = write_sse_event(stream, "token", &data) {
-                    write_error = Some(error);
-                }
-            }
-        };
-        run_resume_command_request(&form, &mut on_token)
-    };
-
-    if let Some(error) = write_error {
-        return Err(error);
-    }
-
-    match result {
-        Ok(result) => write_sse_event(stream, "done", &chat_result_json(&result)),
-        Err(error) => write_sse_event(stream, "error", &json_error(&friendly_chat_error(&error))),
-    }
+    stream_turn(stream, move |cancel, events| {
+        run_resume_command_request(&form, cancel, events)
+    })
 }
 
 /// Encode raw pty bytes for transport across the IPC boundary as UTF-8-safe
@@ -967,7 +939,8 @@ pub fn base64_encode(input: &[u8]) -> String {
 
 fn run_resume_command_request(
     form: &HashMap<String, String>,
-    on_token: &mut dyn FnMut(&str),
+    cancel: &CancelToken,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
 ) -> Result<ChatTurnResult, String> {
     let repo = required_form(form, "repo")?;
     let proposal_id = required_form(form, "proposal_id")?;
@@ -993,6 +966,17 @@ fn run_resume_command_request(
         &engine.config.model_name,
         transport,
     );
+    let mut on_token = |token: &str| {
+        let _ = events.send(TurnEvent::Token(token.to_string()));
+    };
+    let mut on_progress = |progress: TurnProgress| {
+        let _ = events.send(turn_progress_event(progress));
+    };
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel,
+    };
     engine
         .chat_orchestrator
         .resume_after_command_decision(
@@ -1000,14 +984,24 @@ fn run_resume_command_request(
             approved,
             "desktop_user",
             &mut adapter,
-            on_token,
+            &mut sink,
         )
         .map_err(|error| error.to_string())
 }
 
+/// A send failure only means the relay has gone, and the cancel token is what
+/// stops the turn in that case, so the result is deliberately discarded.
+fn turn_progress_event(progress: TurnProgress) -> TurnEvent {
+    match progress {
+        TurnProgress::Session(session_id) => TurnEvent::Session(session_id),
+        TurnProgress::Phase(phase) => TurnEvent::Phase(phase),
+    }
+}
+
 fn run_chat_request(
     form: &HashMap<String, String>,
-    on_token: &mut dyn FnMut(&str),
+    cancel: &CancelToken,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
 ) -> Result<ChatTurnResult, String> {
     let repo = required_form(form, "repo")?;
     let prompt = required_form(form, "prompt")?;
@@ -1032,6 +1026,17 @@ fn run_chat_request(
         &engine.config.model_name,
         transport,
     );
+    let mut on_token = |token: &str| {
+        let _ = events.send(TurnEvent::Token(token.to_string()));
+    };
+    let mut on_progress = |progress: TurnProgress| {
+        let _ = events.send(turn_progress_event(progress));
+    };
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel,
+    };
     engine
         .chat_orchestrator
         .ask_with_session(
@@ -1040,7 +1045,7 @@ fn run_chat_request(
             &context_files,
             session_id,
             &mut adapter,
-            on_token,
+            &mut sink,
         )
         .map_err(|error| error.to_string())
 }
@@ -1062,7 +1067,14 @@ fn resume_chat_command(
         &engine.config.model_name,
         transport,
     );
+    let never_cancelled = CancelToken::new();
     let mut on_token = |_token: &str| {};
+    let mut on_progress = |_progress: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &never_cancelled,
+    };
     engine
         .chat_orchestrator
         .resume_after_command_decision(
@@ -1070,7 +1082,7 @@ fn resume_chat_command(
             approved,
             "desktop_user",
             &mut adapter,
-            &mut on_token,
+            &mut sink,
         )
         .map_err(|error| error.to_string())
 }
@@ -1958,16 +1970,137 @@ fn generate_api_token() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn write_sse_event(stream: &mut TcpStream, event: &str, data: &str) -> Result<(), String> {
-    stream
-        .write_all(format!("event: {event}\ndata: {data}\n\n").as_bytes())
-        .and_then(|_| stream.flush())
+fn write_sse_event<W: Write>(out: &mut W, event: &str, data: &str) -> Result<(), String> {
+    out.write_all(format!("event: {event}\ndata: {data}\n\n").as_bytes())
+        .and_then(|_| out.flush())
         .map_err(|error| error.to_string())
+}
+
+/// How often the handler writes to a silent stream. This is the only thing that
+/// reveals a client that has gone away mid-turn: with no data flowing there is
+/// nothing else to fail on. Note that on macOS the first write after the peer
+/// closes usually succeeds into the kernel buffer, so detection takes one or two
+/// of these rather than being instant.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What the worker running a turn reports back to the handler holding the socket.
+enum TurnEvent {
+    Session(String),
+    Phase(TurnPhase),
+    Token(String),
+    Done(Box<ChatTurnResult>),
+    Failed(String),
+}
+
+fn phase_json(phase: &TurnPhase) -> String {
+    format!(
+        "{{\"phase\":\"{}\",\"label\":\"{}\",\"round\":{},\"maxRounds\":{}}}",
+        phase.kind.as_str(),
+        escape_json(&phase.label),
+        phase.round,
+        phase.max_rounds
+    )
+}
+
+/// Forwards a turn's events to the client as SSE, and stops the turn if the
+/// client goes away.
+///
+/// Runs on the thread that owns the socket while the turn itself runs on a
+/// worker, because the turn spends most of its time blocked on the provider and
+/// could not otherwise notice a disconnect.
+fn relay_turn_events<W: Write>(
+    out: &mut W,
+    cancel: &CancelToken,
+    events: std::sync::mpsc::Receiver<TurnEvent>,
+    keepalive: Duration,
+) -> Result<(), String> {
+    let mut client_gone = false;
+    loop {
+        match events.recv_timeout(keepalive) {
+            Ok(event) => {
+                let finished = matches!(event, TurnEvent::Done(_) | TurnEvent::Failed(_));
+                if !client_gone {
+                    let written = match &event {
+                        TurnEvent::Session(session_id) => write_sse_event(
+                            out,
+                            "session",
+                            &format!("{{\"sessionId\":\"{}\"}}", escape_json(session_id)),
+                        ),
+                        TurnEvent::Phase(phase) => {
+                            write_sse_event(out, "phase", &phase_json(phase))
+                        }
+                        TurnEvent::Token(token) => write_sse_event(
+                            out,
+                            "token",
+                            &format!("{{\"token\":\"{}\"}}", escape_json(token)),
+                        ),
+                        TurnEvent::Done(result) => {
+                            write_sse_event(out, "done", &chat_result_json(result))
+                        }
+                        TurnEvent::Failed(error) => {
+                            write_sse_event(out, "error", &json_error(&friendly_chat_error(error)))
+                        }
+                    };
+                    if written.is_err() {
+                        client_gone = true;
+                        cancel.cancel();
+                    }
+                }
+                if finished {
+                    return Ok(());
+                }
+            }
+            // Nothing to send: poke the socket so a departed client is noticed.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if client_gone {
+                    continue;
+                }
+                // An SSE comment. The client ignores it; the kernel does not.
+                if out
+                    .write_all(b": keepalive\n\n")
+                    .and_then(|_| out.flush())
+                    .is_err()
+                {
+                    client_gone = true;
+                    cancel.cancel();
+                }
+            }
+            // The worker dropped its sender, so the turn is over either way.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    }
+}
+
+/// Runs `turn` on a worker thread and relays its events to `stream`.
+fn stream_turn<F>(stream: &mut TcpStream, turn: F) -> Result<(), String>
+where
+    F: FnOnce(&CancelToken, &std::sync::mpsc::Sender<TurnEvent>) -> Result<ChatTurnResult, String>
+        + Send
+        + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let cancel = CancelToken::new();
+    let worker_cancel = cancel.clone();
+    let worker = std::thread::spawn(move || {
+        let event = match turn(&worker_cancel, &sender) {
+            Ok(result) => TurnEvent::Done(Box::new(result)),
+            Err(error) => TurnEvent::Failed(error),
+        };
+        let _ = sender.send(event);
+        // `sender` drops here, which is what disconnects the channel and lets
+        // the relay finish even if the terminal event could not be delivered.
+    });
+
+    let outcome = relay_turn_events(stream, &cancel, receiver, KEEPALIVE_INTERVAL);
+    // Joined unconditionally: the worker owns the curl child, and leaving it
+    // unreaped is how a stopped turn would keep billing tokens.
+    let _ = worker.join();
+    outcome
 }
 
 fn chat_result_json(result: &ChatTurnResult) -> String {
     format!(
-        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"commandProposal\":{},\"patchProposal\":{}}}",
+        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{}}}",
         escape_json(&result.response),
         json_string_array(&result.context_files),
         escape_json(&result.session.id),
@@ -1975,6 +2108,7 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         result.task.status.as_str(),
         escape_json(&result.model_run.run_id),
         result.model_run.incomplete,
+        result.cancelled,
         command_proposal_json(result),
         patch_proposal_json(result)
     )
@@ -2050,6 +2184,23 @@ fn session_json(session: &Session) -> String {
         session.updated_at_ms,
         escape_json(&session.summary)
     )
+}
+
+fn task_statuses_json(statuses: &HashMap<String, String>) -> String {
+    let mut entries: Vec<&String> = statuses.keys().collect();
+    // Sorted so the payload is stable between requests.
+    entries.sort();
+    entries
+        .iter()
+        .map(|id| {
+            format!(
+                "{{\"id\":\"{}\",\"status\":\"{}\"}}",
+                escape_json(id),
+                escape_json(&statuses[*id])
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn messages_json(messages: &[ChatMessage]) -> String {
@@ -2141,20 +2292,116 @@ fn escape_json(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Request, ShellOptions, allowed_cors_origin, api_request_requires_token,
+        Request, ShellOptions, TurnEvent, allowed_cors_origin, api_request_requires_token,
         cached_model_api_key, desktop_settings_config_path, effective_policy_for_repo,
         engine_for_repo, forget_model_api_key, generated_secret_warnings_json, handle_connection,
-        index_html, keychain, parse_form, parse_path_list, percent_decode, remember_model_api_key,
-        render_markdown_with_optional_file_links, require_api_token, run_terminal_command,
-        save_config_file, terminal_cwd_for_repo, validate_context_files, validate_working_folder,
-        validate_workspace_path,
+        index_html, keychain, parse_form, parse_path_list, percent_decode, relay_turn_events,
+        remember_model_api_key, render_markdown_with_optional_file_links, require_api_token,
+        run_terminal_command, save_config_file, terminal_cwd_for_repo, validate_context_files,
+        validate_working_folder, validate_workspace_path,
     };
     use std::collections::HashMap;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use workspace_engine::{Config, GeneratedSecretWarning, WorkspaceEngine};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use workspace_engine::{CancelToken, Config, GeneratedSecretWarning, WorkspaceEngine};
+
+    /// A sink that starts refusing writes after `writes_before_failure`, the way
+    /// a socket does once the client has gone away.
+    struct FlakyWriter {
+        written: Vec<u8>,
+        writes_before_failure: usize,
+    }
+
+    impl Write for FlakyWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.writes_before_failure == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "client went away",
+                ));
+            }
+            self.writes_before_failure -= 1;
+            self.written.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Without a periodic write there is nothing to fail on, so a client that
+    // disappeared while the provider was still thinking would go unnoticed —
+    // exactly the long-wait case the whole feature exists for.
+    #[test]
+    fn the_relay_writes_a_keepalive_while_the_turn_is_silent() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancel = CancelToken::new();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = sender.send(TurnEvent::Token("hi".to_string()));
+        });
+
+        let mut out = FlakyWriter {
+            written: Vec::new(),
+            writes_before_failure: usize::MAX,
+        };
+        relay_turn_events(&mut out, &cancel, receiver, Duration::from_millis(25)).expect("relay");
+
+        let text = String::from_utf8_lossy(&out.written);
+        assert!(text.contains(": keepalive"), "got {text:?}");
+        assert!(text.contains("\"token\":\"hi\""), "got {text:?}");
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[test]
+    fn the_relay_cancels_the_turn_once_the_client_stops_listening() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancel = CancelToken::new();
+        // Sends for long enough that the write failure happens well before the
+        // channel disconnects, which is what ends the relay here.
+        std::thread::spawn(move || {
+            for _ in 0..20 {
+                if sender.send(TurnEvent::Token("x".to_string())).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let mut out = FlakyWriter {
+            written: Vec::new(),
+            writes_before_failure: 2,
+        };
+        relay_turn_events(&mut out, &cancel, receiver, Duration::from_millis(25)).expect("relay");
+
+        assert!(
+            cancel.is_cancelled(),
+            "a dead client must stop the turn, not just stop the writes"
+        );
+    }
+
+    #[test]
+    fn the_relay_reports_a_failed_turn_as_an_error_event() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancel = CancelToken::new();
+        sender
+            .send(TurnEvent::Failed("provider exploded".to_string()))
+            .unwrap();
+        drop(sender);
+
+        let mut out = FlakyWriter {
+            written: Vec::new(),
+            writes_before_failure: usize::MAX,
+        };
+        relay_turn_events(&mut out, &cancel, receiver, Duration::from_millis(25)).expect("relay");
+
+        let text = String::from_utf8_lossy(&out.written);
+        assert!(text.contains("event: error"), "got {text:?}");
+        assert!(text.contains("provider exploded"), "got {text:?}");
+    }
 
     #[test]
     fn decodes_forms() {

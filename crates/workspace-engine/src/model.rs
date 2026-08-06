@@ -1,9 +1,17 @@
 use crate::audit::escape_json as audit_escape_json;
+use crate::cancel::CancelToken;
 use crate::error::{ClientError, Result};
 use crate::hash::{create_id, now_millis};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// How long the reader may go without data before the cancellation flag is
+/// re-checked. The blocking read itself gives no such opportunity, which is why
+/// it runs on its own thread.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How long the transport may spend reaching the provider before giving up.
 const CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -168,17 +176,39 @@ pub struct ModelRun {
     pub reasoning_content: Option<String>,
 }
 
+impl ModelRun {
+    /// Stands in for the run that never happened when a turn is stopped before
+    /// the provider is called. [`ChatTurnResult`](crate::ChatTurnResult) always
+    /// carries a run, and a cancelled turn still needs an id to audit against.
+    pub fn cancelled_before_start(provider: &str, model: &str) -> Self {
+        let now = now_millis();
+        Self {
+            run_id: create_id("modelrun"),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            started_at_ms: now,
+            completed_at_ms: now,
+            content: String::new(),
+            incomplete: true,
+            retry_count: 0,
+            tool_calls: Vec::new(),
+            truncated: false,
+            reasoning_content: None,
+        }
+    }
+}
+
 pub trait ModelAdapter {
     fn stream_response(
         &mut self,
         request: &ModelRequest,
+        cancel: &CancelToken,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<ModelRun>;
 
     fn estimate_tokens(&self, payload: &str) -> usize {
         payload.len().div_ceil(4)
     }
-    fn cancel(&mut self, run_id: &str);
 }
 
 #[derive(Debug, Clone)]
@@ -192,7 +222,6 @@ pub struct MockModelAdapter {
     /// default) means no response carries reasoning.
     reasoning_content: Vec<Option<String>>,
     next_response: usize,
-    cancelled: Vec<String>,
     /// Every request the adapter was handed, in order, so tests can assert on
     /// what a later round actually replayed back to the provider.
     pub requests: Vec<ModelRequest>,
@@ -206,7 +235,6 @@ impl MockModelAdapter {
             truncated: Vec::new(),
             reasoning_content: Vec::new(),
             next_response: 0,
-            cancelled: Vec::new(),
             requests: Vec::new(),
         }
     }
@@ -219,7 +247,6 @@ impl MockModelAdapter {
             truncated: Vec::new(),
             reasoning_content: Vec::new(),
             next_response: 0,
-            cancelled: Vec::new(),
             requests: Vec::new(),
         }
     }
@@ -237,7 +264,6 @@ impl MockModelAdapter {
             truncated: Vec::new(),
             reasoning_content: Vec::new(),
             next_response: 0,
-            cancelled: Vec::new(),
             requests: Vec::new(),
         }
     }
@@ -261,6 +287,7 @@ impl ModelAdapter for MockModelAdapter {
     fn stream_response(
         &mut self,
         request: &ModelRequest,
+        cancel: &CancelToken,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<ModelRun> {
         let run_id = create_id("modelrun");
@@ -284,7 +311,7 @@ impl ModelAdapter for MockModelAdapter {
             self.next_response += 1;
         }
         for chunk in response.as_bytes().chunks(24) {
-            if self.cancelled.contains(&run_id) {
+            if cancel.is_cancelled() {
                 break;
             }
             let token = String::from_utf8_lossy(chunk);
@@ -298,16 +325,12 @@ impl ModelAdapter for MockModelAdapter {
             started_at_ms,
             completed_at_ms: now_millis(),
             content,
-            incomplete: self.cancelled.contains(&run_id),
+            incomplete: cancel.is_cancelled(),
             retry_count: 0,
             tool_calls,
             truncated: self.truncated.get(index).copied().unwrap_or(false),
             reasoning_content: self.reasoning_content.get(index).cloned().flatten(),
         })
-    }
-
-    fn cancel(&mut self, run_id: &str) {
-        self.cancelled.push(run_id.to_string());
     }
 }
 
@@ -317,8 +340,10 @@ pub trait ModelTransport {
     fn send_stream(
         &mut self,
         request_body: &str,
+        cancel: &CancelToken,
         on_chunk: &mut dyn FnMut(&str),
     ) -> Result<String> {
+        cancel.check()?;
         let raw = self.send(request_body)?;
         on_chunk(&raw);
         Ok(raw)
@@ -359,42 +384,47 @@ impl CurlModelTransport {
 
 impl ModelTransport for CurlModelTransport {
     fn send(&mut self, request_body: &str) -> Result<String> {
-        self.send_stream(request_body, &mut |_chunk| {})
+        self.send_stream(request_body, &CancelToken::new(), &mut |_chunk| {})
     }
 
     fn send_stream(
         &mut self,
         request_body: &str,
+        cancel: &CancelToken,
         on_chunk: &mut dyn FnMut(&str),
     ) -> Result<String> {
-        let mut child = Command::new("curl")
-            .args(Self::curl_args())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        // Before spawning, so a turn stopped while queued never reaches the
+        // provider and never gets billed.
+        cancel.check()?;
 
-        if let Some(mut stdin) = child.stdin.take() {
+        let mut child = KillOnDrop(
+            Command::new("curl")
+                .args(Self::curl_args())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?,
+        );
+
+        if let Some(mut stdin) = child.child().stdin.take() {
             stdin.write_all(self.curl_config(request_body).as_bytes())?;
         }
 
-        let mut raw = String::new();
-        if let Some(mut stdout) = child.stdout.take() {
-            let mut buffer = [0_u8; 8192];
-            loop {
-                let read = stdout.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
-                raw.push_str(&chunk);
-                on_chunk(&chunk);
-            }
-        }
+        // Taken out first so the borrow for the scrutinee ends before the
+        // cancellation closure below borrows the child to kill it.
+        let stdout = child.child().stdout.take();
+        let raw = match stdout {
+            Some(stdout) => pump_stream(stdout, cancel, on_chunk, || {
+                // Closes the pipe, which lets the reader thread finish so
+                // `pump_stream` can join it instead of hanging.
+                let _ = child.child().kill();
+            })?,
+            None => String::new(),
+        };
 
-        let status = child.wait()?;
+        let status = child.child().wait()?;
         let mut stderr = String::new();
-        if let Some(mut stderr_pipe) = child.stderr.take() {
+        if let Some(mut stderr_pipe) = child.child().stderr.take() {
             stderr_pipe.read_to_string(&mut stderr)?;
         }
         if !status.success() {
@@ -404,6 +434,88 @@ impl ModelTransport for CurlModelTransport {
             )));
         }
         Ok(raw)
+    }
+}
+
+/// Reads `reader` to EOF, handing each chunk to `on_chunk`, and gives up as soon
+/// as `cancel` is set.
+///
+/// The read runs on its own thread because a blocking read offers no chance to
+/// notice a cancellation — which is exactly the case that matters, since a
+/// provider that has not started generating yet sends nothing at all. The
+/// calling thread waits on the channel with a timeout instead, so it stays
+/// responsive to the flag.
+///
+/// `on_cancel` runs before the reader is joined. It must make the reader finish
+/// (for a child process, by killing it); otherwise the join would block for as
+/// long as the read would have.
+fn pump_stream<R>(
+    reader: R,
+    cancel: &CancelToken,
+    on_chunk: &mut dyn FnMut(&str),
+    on_cancel: impl FnOnce(),
+) -> Result<String>
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let reader_thread = std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                // Decoded here rather than on the calling thread to keep the
+                // existing per-chunk lossy behaviour unchanged.
+                Ok(read) => {
+                    let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    if sender.send(chunk).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut raw = String::new();
+    let outcome = loop {
+        if cancel.is_cancelled() {
+            break Err(ClientError::Cancelled);
+        }
+        match receiver.recv_timeout(CANCEL_POLL_INTERVAL) {
+            Ok(chunk) => {
+                raw.push_str(&chunk);
+                on_chunk(&chunk);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
+        }
+    };
+
+    if outcome.is_err() {
+        on_cancel();
+    }
+    let _ = reader_thread.join();
+    outcome.map(|()| raw)
+}
+
+/// Kills the child if it is still running when this is dropped, so a panic on
+/// the calling thread cannot leave `curl` streaming a paid-for completion into
+/// nothing for the rest of `max-time`.
+struct KillOnDrop(Child);
+
+impl KillOnDrop {
+    fn child(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        // Already-exited is the normal case and reports an error here; either
+        // way there is nothing to recover from at drop time.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -469,7 +581,6 @@ pub struct OpenAICompatibleAdapter<T: ModelTransport> {
     provider: String,
     model: String,
     transport: T,
-    cancelled: Vec<String>,
 }
 
 impl<T: ModelTransport> OpenAICompatibleAdapter<T> {
@@ -486,7 +597,6 @@ impl<T: ModelTransport> OpenAICompatibleAdapter<T> {
             provider: provider.into(),
             model: model.into(),
             transport,
-            cancelled: Vec::new(),
         }
     }
 }
@@ -495,6 +605,7 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
     fn stream_response(
         &mut self,
         request: &ModelRequest,
+        cancel: &CancelToken,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<ModelRun> {
         const MAX_ATTEMPTS: u32 = 3;
@@ -512,14 +623,14 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
             let mut buffered_stream = String::new();
             let mut saw_sse_stream = false;
             let mut emit_token = |token: String| {
-                if self.cancelled.contains(&run_id) {
+                if cancel.is_cancelled() {
                     return;
                 }
                 emitted_any = true;
                 content.push_str(&token);
                 on_token(&token);
             };
-            let send_result = self.transport.send_stream(&body, &mut |chunk| {
+            let send_result = self.transport.send_stream(&body, cancel, &mut |chunk| {
                 buffered_stream.push_str(chunk);
                 if buffered_stream.contains("data:") || saw_sse_stream {
                     saw_sse_stream = true;
@@ -567,7 +678,7 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
             return Err(ClientError::Io(format!("Model provider error: {message}")));
         }
         let tool_calls = extract_tool_calls(&raw);
-        if content.is_empty() && tool_calls.is_empty() && !self.cancelled.contains(&run_id) {
+        if content.is_empty() && tool_calls.is_empty() && !cancel.is_cancelled() {
             return Err(ClientError::Io(
                 "Model provider returned no assistant content".to_string(),
             ));
@@ -584,16 +695,12 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
             started_at_ms,
             completed_at_ms: now_millis(),
             content,
-            incomplete: self.cancelled.contains(&run_id),
+            incomplete: cancel.is_cancelled(),
             retry_count,
             tool_calls,
             truncated: response_was_truncated(&raw),
             reasoning_content: extract_reasoning_content(&raw),
         })
-    }
-
-    fn cancel(&mut self, run_id: &str) {
-        self.cancelled.push(run_id.to_string());
     }
 }
 
@@ -1015,6 +1122,133 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// Behaves like a provider connection that has accepted the request but
+    /// sent nothing yet: `read` blocks. Returns EOF once `closed` flips, which
+    /// is what happens to `child.stdout` after the child is killed.
+    struct SilentPipe {
+        closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl std::io::Read for SilentPipe {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            while !self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn pump_stream_returns_everything_the_provider_sent() {
+        let cancel = CancelToken::new();
+        let mut chunks = Vec::new();
+
+        let raw = pump_stream(
+            std::io::Cursor::new(b"hello world".to_vec()),
+            &cancel,
+            &mut |chunk| chunks.push(chunk.to_string()),
+            || panic!("must not kill the child on the success path"),
+        )
+        .expect("pump");
+
+        assert_eq!(raw, "hello world");
+        assert_eq!(chunks.concat(), "hello world");
+    }
+
+    // The regression test for the 90-minute unstoppable turn: a stop arriving
+    // while the provider is silent must not wait for the blocking read.
+    #[test]
+    fn pump_stream_stops_promptly_when_cancelled_while_the_provider_is_silent() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let closed = Arc::new(AtomicBool::new(false));
+        let killed = Arc::new(AtomicBool::new(false));
+        let cancel = CancelToken::new();
+
+        let stopper = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            stopper.cancel();
+        });
+
+        let kill_flag = Arc::clone(&killed);
+        let pipe_closed = Arc::clone(&closed);
+        let started = std::time::Instant::now();
+        let result = pump_stream(
+            SilentPipe {
+                closed: Arc::clone(&closed),
+            },
+            &cancel,
+            &mut |_chunk| {},
+            move || {
+                // Stands in for `child.kill()`, which closes the pipe and lets
+                // the reader thread finish.
+                kill_flag.store(true, Ordering::SeqCst);
+                pipe_closed.store(true, Ordering::SeqCst);
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), ClientError::Cancelled);
+        // Without this the process leaks and keeps billing tokens for the rest
+        // of `max-time`.
+        assert!(killed.load(Ordering::SeqCst), "the child must be killed");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}, so it waited on the blocking read instead of the token",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn pump_stream_kills_the_child_when_cancelled_before_it_starts() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let closed = Arc::new(AtomicBool::new(false));
+        let killed = Arc::new(AtomicBool::new(false));
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let kill_flag = Arc::clone(&killed);
+        let pipe_closed = Arc::clone(&closed);
+        let result = pump_stream(
+            SilentPipe {
+                closed: Arc::clone(&closed),
+            },
+            &cancel,
+            &mut |_chunk| panic!("must not emit chunks after cancellation"),
+            move || {
+                kill_flag.store(true, Ordering::SeqCst);
+                pipe_closed.store(true, Ordering::SeqCst);
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), ClientError::Cancelled);
+        assert!(killed.load(Ordering::SeqCst));
+    }
+
+    // Cheap and offline: it must bail out before spawning anything, so no
+    // request reaches the (nonexistent) host.
+    #[test]
+    fn curl_transport_does_not_send_a_request_for_an_already_cancelled_turn() {
+        let mut transport = CurlModelTransport::new("https://api.example.test/", "sk_test");
+        let cancel = CancelToken::new();
+        cancel.cancel();
+
+        let started = std::time::Instant::now();
+        let result = transport.send_stream("{\"model\":\"test\"}", &cancel, &mut |_chunk| {
+            panic!("must not stream anything for a cancelled turn")
+        });
+
+        assert_eq!(result.unwrap_err(), ClientError::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "took {:?}, so it spawned curl before checking the token",
+            started.elapsed()
+        );
+    }
+
     // A completion with no bound is a hang with no bound: the desktop shell
     // serves requests on a single thread, so one wedged provider connection
     // freezes the whole UI until the app is killed.
@@ -1067,7 +1301,9 @@ mod tests {
         let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
         let mut tokens = Vec::new();
         let run = adapter
-            .stream_response(&test_request(), &mut |token| tokens.push(token.to_string()))
+            .stream_response(&test_request(), &CancelToken::new(), &mut |token| {
+                tokens.push(token.to_string())
+            })
             .expect("should succeed after retries");
 
         assert_eq!(run.retry_count, 2);
@@ -1079,7 +1315,8 @@ mod tests {
     fn gives_up_after_max_attempts_on_persistent_transient_failure() {
         let transport = MockModelTransport::failing("unused", 10);
         let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
-        let result = adapter.stream_response(&test_request(), &mut |_token| {});
+        let result =
+            adapter.stream_response(&test_request(), &CancelToken::new(), &mut |_token| {});
 
         assert!(result.is_err());
         let error = result.unwrap_err();
@@ -1091,7 +1328,8 @@ mod tests {
         let mut transport = MockModelTransport::failing("unused", 1);
         transport.failure_message = "invalid api key".to_string();
         let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
-        let result = adapter.stream_response(&test_request(), &mut |_token| {});
+        let result =
+            adapter.stream_response(&test_request(), &CancelToken::new(), &mut |_token| {});
 
         assert!(result.is_err());
         assert!(!result.unwrap_err().is_retryable());
@@ -1111,6 +1349,7 @@ mod tests {
             fn send_stream(
                 &mut self,
                 _request_body: &str,
+                _cancel: &CancelToken,
                 on_chunk: &mut dyn FnMut(&str),
             ) -> Result<String> {
                 self.calls += 1;
@@ -1122,8 +1361,9 @@ mod tests {
         let mut adapter =
             OpenAICompatibleAdapter::new("test-model", FlakyMidStreamTransport { calls: 0 });
         let mut tokens = Vec::new();
-        let result =
-            adapter.stream_response(&test_request(), &mut |token| tokens.push(token.to_string()));
+        let result = adapter.stream_response(&test_request(), &CancelToken::new(), &mut |token| {
+            tokens.push(token.to_string())
+        });
 
         assert!(result.is_err());
         assert_eq!(adapter.transport.calls, 1);
@@ -1308,7 +1548,7 @@ mod tests {
         let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
 
         let run = adapter
-            .stream_response(&test_request(), &mut |_token| {})
+            .stream_response(&test_request(), &CancelToken::new(), &mut |_token| {})
             .expect("tool-call-only response should not be treated as empty");
 
         assert!(run.content.is_empty());

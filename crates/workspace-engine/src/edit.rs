@@ -1,4 +1,5 @@
 use crate::audit::AuditLog;
+use crate::cancel::CancelToken;
 use crate::config::Config;
 use crate::context_manager::{ContextItem, ContextManager};
 use crate::error::{ClientError, Result};
@@ -259,12 +260,16 @@ impl EditOrchestrator {
         )?;
 
         let mut sink = |_token: &str| {};
+        // Patch generation is not stoppable: `/api/propose-edit` is a plain JSON
+        // POST with no stream for the client to abort, so there is nothing to
+        // carry a stop signal. See spec 08 §8 follow-up 2.
+        let never_cancelled = CancelToken::new();
         // Every failure from here on is recorded: a proposal can die after the
         // request goes out because the model answered in the wrong format or
         // named a file policy refuses, and those used to leave the task stuck at
         // `running` with nothing in the audit log to explain it.
         let run = model_adapter
-            .stream_response(&request, &mut sink)
+            .stream_response(&request, &never_cancelled, &mut sink)
             .map_err(|error| self.record_edit_failure(&session.id, &task, error))?;
         let raw_output = self.scanner.redact(&run.content).text;
         let generated = parse_generated_edit(&raw_output)

@@ -2,6 +2,7 @@ use crate::audit::escape_json;
 use crate::error::Result;
 use crate::hash::{create_id, now_millis};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ pub enum TaskStatus {
     WaitingForApproval,
     Failed,
     Complete,
+    Cancelled,
 }
 
 impl TaskStatus {
@@ -33,6 +35,7 @@ impl TaskStatus {
             Self::WaitingForApproval => "waiting_for_approval",
             Self::Failed => "failed",
             Self::Complete => "complete",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -114,7 +117,10 @@ impl SessionStore {
     ) -> Result<Task> {
         let mut updated = task.clone();
         updated.status = status;
-        if matches!(updated.status, TaskStatus::Complete | TaskStatus::Failed) {
+        if matches!(
+            updated.status,
+            TaskStatus::Complete | TaskStatus::Failed | TaskStatus::Cancelled
+        ) {
             updated.completed_at_ms = Some(now_millis());
         }
         let mut payload = task_json(&updated);
@@ -215,6 +221,36 @@ impl SessionStore {
             .filter(|line| line.contains("\"eventType\":\"message_appended\""))
             .filter_map(parse_message_event)
             .collect())
+    }
+
+    /// The latest recorded status of every task in the session, keyed by task id.
+    ///
+    /// Tasks are not stored as records but replayed from `task_created` and
+    /// `task_status_updated` events, so a later event simply overwrites an
+    /// earlier one. Lets a reloaded conversation tell a stopped turn from a
+    /// completed one, which the message log alone cannot express.
+    pub fn read_task_statuses(&self, session_id: &str) -> Result<HashMap<String, String>> {
+        let path = self.session_log_path(session_id);
+        let Ok(content) = fs::read_to_string(path) else {
+            return Ok(HashMap::new());
+        };
+        let mut statuses = HashMap::new();
+        for line in content.lines() {
+            if !line.contains("\"eventType\":\"task_created\"")
+                && !line.contains("\"eventType\":\"task_status_updated\"")
+            {
+                continue;
+            }
+            // `task_status_updated` may wrap the task in `{"task":…,"error":…}`,
+            // so read the fields rather than assuming a shape.
+            if let (Some(id), Some(status)) = (
+                json_string_field(line, "id"),
+                json_string_field(line, "status"),
+            ) {
+                statuses.insert(id, status);
+            }
+        }
+        Ok(statuses)
     }
 
     fn append_session_event(

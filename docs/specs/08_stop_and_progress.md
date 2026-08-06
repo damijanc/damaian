@@ -1,6 +1,6 @@
 # Feature Spec: Stoppable Chat Turns and Live Progress
 
-Status: Not started
+Status: Done
 Order: 8 of 8
 Related spec sections: `ai_coding_assistant_specification.md` §7.1 (Chat Interface — "Distinct UI states for thinking, waiting for approval, running command, applying patch, failed, and complete"), §7.5 (Model Adapter — `cancel(runId): void`, "Timeout and cancellation preserve user work", "Partial streamed output is clearly marked if incomplete"), §11 (Error Handling), §12.1 (Performance — "Chat streaming should begin as soon as provider streaming starts").
 
@@ -65,7 +65,7 @@ and therefore works despite the serial accept loop.
 ## 3. Non-Goals
 
 - **Stopping anything other than a chat turn.** `/api/propose-edit`,
-  approved shell commands, and indexing keep today's behaviour. See §7.
+  approved shell commands, and indexing keep today's behaviour. See §8.
 - **Threading the shell.** The serial accept loop stays. The rest of the UI
   remains blocked for the duration of a turn; that is a real problem and it is
   deliberately out of scope here (§7).
@@ -374,8 +374,8 @@ rather than killing the shell.
   overwrites text typed during the turn.
 - No `TaskStatus::Running` task survives a stopped turn.
 - `ModelAdapter::cancel` no longer exists.
-- `ChatOrchestrator::ask`'s signature is unchanged: `damaian-cli` and the
-  existing `foundation.rs` tests compile without edits.
+- `ChatOrchestrator::ask`'s signature is unchanged, so `damaian-cli` needs no
+  edits and neither does any test that goes through `ask`.
 - The first model round reports `round 1/6`, not `round 0/6`.
 
 ## 6. Testing
@@ -414,7 +414,63 @@ engine-side cases without an API key, a network, or touching real user data.
 **Frontend** has no test harness in this repo, so the UI criteria in §5 are
 verified manually and recorded in §8.
 
-## 7. Follow-ups (explicitly not in this spec)
+## 7. Implementation Notes (as built)
+
+Built as designed apart from the five corrections below. Test count 178 → 200;
+all five quality-gate checks green.
+
+**`ModelAdapter::cancel` was worse than dead — `incomplete` was dead too.**
+Removing the `cancelled: Vec<String>` field that backed it revealed that
+`ModelRun.incomplete` had *only ever* been fed by that never-called method, so
+it was hardcoded `false` in production and the UI's "Incomplete" badge could
+never appear. Rather than freezing it at `false`, it is now `cancel.is_cancelled()`
+— which is what it was always meant to mean, and closes §7.5's "partial streamed
+output is clearly marked if incomplete" properly.
+
+**"Drain, don't abandon" was right for the wrong reason.** §4.2 justified it by
+the worker blocking on a full channel. `mpsc::channel()` is unbounded, so a send
+never blocks — a failed send just means the relay has gone. The relay still keeps
+receiving after a write failure, but the actual reason is to reach the worker's
+terminal event (or its `Disconnected`) so the join is immediate rather than
+waiting out a keepalive.
+
+**The planned desktop-shell tests were not buildable as specified.** §6 assumed
+`DAMAIAN_MOCK_MODEL_RESPONSE` would make `/api/ask-stream` testable, but it is
+honoured only in `damaian-cli` (`main.rs`) — the shell always constructs a real
+`CurlModelTransport` and needs a Keychain key. Rather than shipping a mock path
+in the shell, `relay_turn_events` was extracted as a `Write`-generic function and
+tested directly: keepalives on a silent turn, cancellation when writes start
+failing, and a failed turn surfacing as `event: error`. That covers the genuinely
+new logic with no network and nothing extra shipped. End-to-end stop against a
+live provider remains manual, as §6 already had it.
+
+**`stream_response` gaining a parameter did churn four existing call sites** —
+three `resume_after_command_decision` calls and one direct `stream_response` call
+in `foundation.rs`, plus a test-local `ModelTransport` impl. The original
+acceptance criterion overstated this as "no edits"; it is now scoped to `ask`,
+which genuinely did not change. A `resume_command_decision` test helper absorbed
+the three repeated sites.
+
+**`read_task_statuses` had to be written.** §4.8 assumed task statuses could just
+be added to `/api/session`, but `SessionStore` had no way to read tasks back —
+they exist only as `task_created`/`task_status_updated` events. The new method
+replays those with latest-wins.
+
+Also worth recording for anyone testing UI changes here: `app.js`, `style.css`
+and `index.html` are embedded with `include_str!`, so the shell binary must be
+rebuilt and restarted before a browser reload shows any frontend edit. A stale
+served copy cost time during verification.
+
+Verification beyond the gate: the indicator was driven in a real browser against
+a shell on a spare port with `DAMAIAN_DATA_DIR` pointed at a scratch directory —
+phase transitions, the tool label with its round counter, `aria-hidden` on the
+elapsed clock and `aria-live` on the label, idempotent `finish`, and the composer
+button's swap to an enabled square-icon Stop. That found one real bug the unit
+tests would not have: a tool phase left its label up for the rest of the turn,
+because the streaming guard blocked every later `model` phase instead of only the
+repeat within a round.
+
+## 8. Follow-ups (explicitly not in this spec)
 
 1. **The rest of the UI is frozen during a chat turn.** The serial accept loop
    (§1.1) blocks session switching, file browsing and settings for the whole

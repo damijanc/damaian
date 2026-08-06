@@ -2478,3 +2478,75 @@ button:disabled {
     font-size: 12px;
   }
 }
+
+/* Live progress row inside an assistant bubble while a turn runs, and the
+   marker left behind on a turn the user stopped. */
+.turn-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.turn-indicator[data-state="stopped"] {
+  color: var(--warn);
+}
+
+.turn-indicator-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: turn-indicator-pulse 1.4s ease-in-out infinite;
+}
+
+.turn-indicator-elapsed {
+  font-variant-numeric: tabular-nums;
+}
+
+.turn-indicator-stop {
+  margin-left: auto;
+  min-width: 0;
+  padding: 2px 10px;
+  font-size: 12px;
+}
+
+@keyframes turn-indicator-pulse {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* The dot carries no information the label does not, so removing the motion
+   costs nothing. */
+@media (prefers-reduced-motion: reduce) {
+  .turn-indicator-dot {
+    animation: none;
+    opacity: 0.8;
+  }
+}
+
+/* While a turn is in flight the send button is the Stop control: a square
+   replaces the arrow, and it stays enabled. */
+.send-button.is-stopping {
+  background: var(--warn, #b8791f);
+}
+
+.send-button.is-stopping .send-icon {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
+/* The arrow is drawn from these two, so the square needs them gone. */
+.send-button.is-stopping .send-icon::before,
+.send-button.is-stopping .send-icon::after {
+  display: none;
+}

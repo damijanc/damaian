@@ -4,12 +4,13 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, ClientError, CommandPolicy, CommandRisk, Config, ConfigOverlay,
-    DEFAULT_CONTEXT_TOKEN_BUDGET, IndexCache, McpClient, McpServerConfig, McpTransport,
-    MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage, ModelProviderConfig,
-    ModelRequest, OpenAICompatibleAdapter, PatchEngine, PatchStore, PathPolicy, ProjectIndexer,
-    ProposedChange, SecretScanner, SessionStore, ToolCall, WorkspaceEngine, extract_model_tokens,
-    model_request_json, parse_generated_edit,
+    AuditLog, CancelToken, ChatTurnResult, ClientError, CommandPolicy, CommandRisk, Config,
+    ConfigOverlay, DEFAULT_CONTEXT_TOKEN_BUDGET, IndexCache, McpClient, McpServerConfig,
+    McpTransport, MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage,
+    ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter, PatchEngine, PatchStore,
+    PathPolicy, PhaseKind, ProjectIndexer, ProposedChange, SecretScanner, SessionStore, TaskStatus,
+    ToolCall, TurnProgress, TurnSink, WorkspaceEngine, extract_model_tokens, model_request_json,
+    parse_generated_edit,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1196,6 +1197,380 @@ fn redacts_secrets_from_git_diff_output() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+/// Runs one turn with a caller-owned cancel token, so a test can stop the turn
+/// from inside `on_token` the way a user pressing Stop mid-stream does.
+fn ask_with_cancel(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    prompt: &str,
+    adapter: &mut dyn ModelAdapter,
+    cancel: &CancelToken,
+    on_token: &mut dyn FnMut(&str),
+) -> ChatTurnResult {
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token,
+        on_progress: &mut on_progress,
+        cancel,
+    };
+    engine
+        .chat_orchestrator
+        .ask_with_session(repo, prompt, &[], None, adapter, &mut sink)
+        .unwrap()
+}
+
+#[test]
+fn a_turn_cancelled_before_it_starts_never_calls_the_model() {
+    let repo = temp_dir("chat-cancel-early");
+    write_fixture(&repo, "README.md", "# Cancel test\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new("Should never be sent.");
+    let cancel = CancelToken::new();
+    cancel.cancel();
+
+    let result = ask_with_cancel(
+        &engine,
+        &repo,
+        "Explain this",
+        &mut adapter,
+        &cancel,
+        &mut |_token| panic!("must not stream for a stopped turn"),
+    );
+
+    assert!(result.cancelled);
+    assert_eq!(result.task.status, TaskStatus::Cancelled);
+    assert!(
+        adapter.requests.is_empty(),
+        "a stopped turn must not reach the provider"
+    );
+    // The prompt is persisted before the model call, so it stays; there is no
+    // assistant reply because nothing was ever generated.
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .count(),
+        0
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_turn_stopped_mid_stream_keeps_the_partial_answer() {
+    let repo = temp_dir("chat-cancel-midstream");
+    write_fixture(&repo, "README.md", "# Cancel test\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let full =
+        "The first part of the answer, followed by a great deal more text that must never arrive.";
+    let mut adapter = MockModelAdapter::new(full);
+    let cancel = CancelToken::new();
+
+    let mut streamed = String::new();
+    let result = {
+        let mut on_token = |token: &str| {
+            streamed.push_str(token);
+            cancel.cancel();
+        };
+        ask_with_cancel(
+            &engine,
+            &repo,
+            "Explain this",
+            &mut adapter,
+            &cancel,
+            &mut on_token,
+        )
+    };
+
+    assert!(result.cancelled);
+    assert!(
+        !streamed.is_empty(),
+        "some of the answer should have arrived"
+    );
+    assert!(
+        streamed.len() < full.len(),
+        "the stream should have been cut short, got {streamed:?}"
+    );
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    let assistant: Vec<&str> = messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .map(|message| message.content.as_str())
+        .collect();
+    assert_eq!(assistant, vec![streamed.as_str()]);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// The redaction guarantee is not suspended by stopping: the cancelled path
+// persists through the same scanner as a completed turn.
+#[test]
+fn a_stopped_turn_redacts_secrets_from_the_partial_answer() {
+    let repo = temp_dir("chat-cancel-redaction");
+    write_fixture(&repo, "README.md", "# Cancel test\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new(format!(
+        "The access key is {AWS_ACCESS_KEY} and here is a long tail of further explanation."
+    ));
+    let cancel = CancelToken::new();
+
+    let result = {
+        let mut chunks = 0;
+        // Late enough that the whole key has streamed, early enough that the
+        // answer is still cut off.
+        let mut on_token = |_token: &str| {
+            chunks += 1;
+            if chunks >= 3 {
+                cancel.cancel();
+            }
+        };
+        ask_with_cancel(
+            &engine,
+            &repo,
+            "What is the key?",
+            &mut adapter,
+            &cancel,
+            &mut on_token,
+        )
+    };
+
+    assert!(result.cancelled);
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    let partial = messages
+        .iter()
+        .find(|message| message.role == "assistant")
+        .expect("a partial assistant message");
+    assert!(
+        !partial.content.contains(AWS_ACCESS_KEY),
+        "persisted {:?}",
+        partial.content
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Resumes a paused turn with a sink that discards progress and never cancels,
+/// for tests that only care about the resulting turn.
+fn resume_command_decision(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    approved: bool,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+    };
+    engine
+        .chat_orchestrator
+        .resume_after_command_decision(proposal_id, approved, "tester", adapter, &mut sink)
+        .unwrap()
+}
+
+/// Runs one turn and returns everything the orchestrator reported through the
+/// progress channel, in order.
+fn collect_turn_progress(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    prompt: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> (Vec<TurnProgress>, String) {
+    let cancel = CancelToken::new();
+    let mut progress = Vec::new();
+    let session_id = {
+        let mut on_token = |_token: &str| {};
+        let mut on_progress = |event: TurnProgress| progress.push(event);
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+        };
+        engine
+            .chat_orchestrator
+            .ask_with_session(repo, prompt, &[], None, adapter, &mut sink)
+            .unwrap()
+            .session
+            .id
+    };
+    (progress, session_id)
+}
+
+// A client that is never told the session id cannot name, list, or reload the
+// session — so stopping the first turn of a new one would orphan it.
+#[test]
+fn chat_reports_the_session_id_before_doing_any_work() {
+    let repo = temp_dir("chat-progress-session");
+    write_fixture(&repo, "README.md", "# Progress test\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (progress, session_id) =
+        collect_turn_progress(&engine, &repo, "What is this?", &mut adapter);
+
+    assert_eq!(progress.first(), Some(&TurnProgress::Session(session_id)));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn chat_reports_context_assembly_before_it_calls_the_model() {
+    let repo = temp_dir("chat-progress-phases");
+    write_fixture(&repo, "README.md", "# Progress test\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (progress, _) = collect_turn_progress(&engine, &repo, "What is this?", &mut adapter);
+
+    let kinds: Vec<PhaseKind> = progress
+        .iter()
+        .filter_map(|event| match event {
+            TurnProgress::Phase(phase) => Some(phase.kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds.first(),
+        Some(&PhaseKind::Context),
+        "got {kinds:?}; context assembly runs before the model call"
+    );
+    assert!(kinds.contains(&PhaseKind::Model), "got {kinds:?}");
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// The label comes from the engine so the frontend never has to know tool names,
+// and it names the actual target — "Reading docs/notes.md", not "running a tool".
+#[test]
+fn chat_reports_a_tool_phase_labelled_with_what_it_is_doing() {
+    let repo = temp_dir("chat-progress-tool");
+    write_fixture(&repo, "docs/notes.md", "The answer is 42.\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "The notes say the answer is 42.".to_string()],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments_json: "{\"path\":\"docs/notes.md\"}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+
+    let (progress, _) =
+        collect_turn_progress(&engine, &repo, "What do the notes say?", &mut adapter);
+
+    let tool_phase = progress
+        .iter()
+        .find_map(|event| match event {
+            TurnProgress::Phase(phase) if phase.kind == PhaseKind::Tool => Some(phase),
+            _ => None,
+        })
+        .expect("a tool phase");
+    assert!(
+        tool_phase.label.contains("docs/notes.md"),
+        "label was {:?}",
+        tool_phase.label
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// The loop counts rounds from zero; the indicator says "round 1 of 6". The
+// conversion happens once, here, rather than being re-derived in the frontend.
+#[test]
+fn the_first_model_round_is_reported_as_round_one() {
+    let repo = temp_dir("chat-progress-round");
+    write_fixture(&repo, "README.md", "# Progress test\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (progress, _) = collect_turn_progress(&engine, &repo, "What is this?", &mut adapter);
+
+    let first_model_phase = progress
+        .iter()
+        .find_map(|event| match event {
+            TurnProgress::Phase(phase) if phase.kind == PhaseKind::Model => Some(phase),
+            _ => None,
+        })
+        .expect("a model phase");
+    assert_eq!(first_model_phase.round, 1);
+    assert!(first_model_phase.max_rounds >= 1);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// Reloading a session has to be able to tell a stopped turn from a complete
+// one, or a truncated answer renders as a complete short one.
+#[test]
+fn reads_back_the_latest_status_of_each_task() {
+    let repo = temp_dir("session-task-statuses");
+    let store = SessionStore::new(repo.join(".damaian"));
+    let session = store.create_session("repo_1", "Statuses").unwrap();
+    let first = store.create_task(&session.id, "one", "mock", "m").unwrap();
+    let second = store.create_task(&session.id, "two", "mock", "m").unwrap();
+    store
+        .update_task_status(&first, TaskStatus::Running, None)
+        .unwrap();
+    store
+        .update_task_status(&first, TaskStatus::Cancelled, None)
+        .unwrap();
+    store
+        .update_task_status(&second, TaskStatus::Complete, None)
+        .unwrap();
+
+    let statuses = store.read_task_statuses(&session.id).unwrap();
+
+    assert_eq!(
+        statuses.get(&first.id).map(String::as_str),
+        Some("cancelled")
+    );
+    assert_eq!(
+        statuses.get(&second.id).map(String::as_str),
+        Some("complete")
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn cancelling_a_task_completes_it() {
+    let repo = temp_dir("cancelled-task");
+    let store = SessionStore::new(repo.join(".damaian"));
+    let session = store.create_session("repo_1", "Explain auth flow").unwrap();
+    let task = store
+        .create_task(&session.id, "Explain auth", "mock", "mock-model")
+        .unwrap();
+    assert!(task.completed_at_ms.is_none());
+
+    let cancelled = store
+        .update_task_status(&task, TaskStatus::Cancelled, None)
+        .unwrap();
+
+    // A stopped turn must not leave behind a task that still looks in-flight —
+    // that is the wedged `Running` record spec 08 §1 exists to fix.
+    assert_eq!(cancelled.status, TaskStatus::Cancelled);
+    assert!(cancelled.completed_at_ms.is_some());
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 #[test]
 fn persists_session_tasks_and_messages() {
     let repo = temp_dir("session-store");
@@ -1987,10 +2362,7 @@ fn chat_resume_after_command_approval_surfaces_a_patch_proposal() {
         .command_proposal
         .expect("unclassified command should require approval");
 
-    let resumed = engine
-        .chat_orchestrator
-        .resume_after_command_decision(&proposal.id, true, "tester", &mut adapter, &mut on_token)
-        .unwrap();
+    let resumed = resume_command_decision(&engine, &proposal.id, true, &mut adapter);
 
     let patch = resumed
         .patch_proposal
@@ -2031,10 +2403,7 @@ fn chat_resumes_after_command_approval_and_answers_using_the_result() {
         .expect("unclassified command should require approval");
     assert!(proposal.requires_approval);
 
-    let resumed = engine
-        .chat_orchestrator
-        .resume_after_command_decision(&proposal.id, true, "tester", &mut adapter, &mut on_token)
-        .unwrap();
+    let resumed = resume_command_decision(&engine, &proposal.id, true, &mut adapter);
 
     assert!(resumed.command_proposal.is_none());
     assert!(resumed.response.contains("expected marker"));
@@ -2081,10 +2450,7 @@ fn chat_resumes_after_command_rejection_and_answers_without_it() {
         .command_proposal
         .expect("unclassified command should require approval");
 
-    let resumed = engine
-        .chat_orchestrator
-        .resume_after_command_decision(&proposal.id, false, "tester", &mut adapter, &mut on_token)
-        .unwrap();
+    let resumed = resume_command_decision(&engine, &proposal.id, false, &mut adapter);
 
     assert!(resumed.command_proposal.is_none());
     assert!(resumed.response.contains("answer without running"));
@@ -2178,7 +2544,7 @@ fn reports_openai_compatible_error_payloads() {
     let transport = MockModelTransport::new("{\"error\":{\"message\":\"Rate limit exceeded\"}}\n");
     let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
     let error = adapter
-        .stream_response(&request, &mut |_token| {})
+        .stream_response(&request, &CancelToken::new(), &mut |_token| {})
         .unwrap_err();
     assert!(error.to_string().contains("Rate limit exceeded"));
 }
