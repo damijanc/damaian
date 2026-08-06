@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod cancel;
 pub mod chat;
 pub mod command_policy;
 pub mod command_runner;
@@ -27,8 +28,10 @@ pub mod vector_index;
 pub mod workspace_engine;
 
 pub use audit::AuditLog;
+pub use cancel::CancelToken;
 pub use chat::{
     AgentCommandProposal, AgentPatchProposal, ChatOrchestrator, ChatTurnResult, McpTokenResolver,
+    PhaseKind, TurnPhase, TurnProgress, TurnSink,
 };
 pub use command_policy::{CommandClassification, CommandPolicy, CommandRisk};
 pub use command_runner::{CommandExecution, CommandRunner};

@@ -9,6 +9,9 @@ pub enum ClientError {
     Io(String),
     Git(String),
     InvalidInput(String),
+    /// The user stopped an in-flight turn. An internal control signal, not a
+    /// failure: `run_agentic_turn` catches it and reports a cancelled result.
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, ClientError>;
@@ -23,6 +26,7 @@ impl ClientError {
             Self::Io(_) => "io_error",
             Self::Git(_) => "git_error",
             Self::InvalidInput(_) => "invalid_input",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -63,6 +67,7 @@ impl Display for ClientError {
             | Self::Io(message)
             | Self::Git(message)
             | Self::InvalidInput(message) => formatter.write_str(message),
+            Self::Cancelled => formatter.write_str("Stopped by user"),
         }
     }
 }

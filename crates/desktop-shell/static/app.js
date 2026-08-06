@@ -2658,6 +2658,99 @@ function appendChatMessage(role, content) {
   return { message, body };
 }
 
+// Phase labels the server does not spell out. Tool phases arrive with their own
+// `label` so this map never has to know tool names.
+const TURN_PHASE_LABELS = {
+  context: "Assembling context",
+  model: "Waiting for model",
+  tool: "Working",
+  finalizing: "Finalizing",
+};
+
+// A live "something is happening" row inside an assistant bubble: the phase, an
+// elapsed clock, and a Stop button.
+//
+// Owns its DOM, its interval, and its teardown so nothing outside has to track
+// them. `finish` is idempotent, which lets error paths call it blindly.
+function startTurnIndicator(target, onStop) {
+  const row = document.createElement("p");
+  row.className = "turn-indicator";
+  row.dataset.state = "running";
+
+  const dot = document.createElement("span");
+  dot.className = "turn-indicator-dot";
+  dot.setAttribute("aria-hidden", "true");
+
+  // Announced on change, so a screen reader hears the phase but not the clock.
+  const label = document.createElement("span");
+  label.className = "turn-indicator-label";
+  label.setAttribute("aria-live", "polite");
+  label.textContent = "Starting";
+
+  // Ticks every second. Inside the aria-live #chat-log it would otherwise be
+  // read out once per second, which is unusable.
+  const elapsed = document.createElement("span");
+  elapsed.className = "turn-indicator-elapsed";
+  elapsed.setAttribute("aria-hidden", "true");
+
+  const stop = document.createElement("button");
+  stop.type = "button";
+  stop.className = "turn-indicator-stop";
+  stop.textContent = "Stop";
+  stop.addEventListener("click", () => onStop());
+
+  row.append(dot, label, elapsed, stop);
+  target.body.after(row);
+
+  const startedAt = Date.now();
+  const tick = () => {
+    elapsed.textContent = `${Math.round((Date.now() - startedAt) / 1000)}s`;
+  };
+  tick();
+  const timer = setInterval(tick, 1000);
+
+  let done = false;
+  let streaming = false;
+
+  return {
+    phase(payload) {
+      if (done) return;
+      // Any non-model phase means this round's streaming is over, so the next
+      // model round is free to say "Waiting for model" again instead of leaving
+      // the previous tool's label up for the rest of the turn.
+      if (payload.phase !== "model") streaming = false;
+      // Within a round though, tokens are already flowing by the time the model
+      // phase would repeat, and "Streaming" is the truer description.
+      else if (streaming) return;
+      const text = payload.label || TURN_PHASE_LABELS[payload.phase] || "Working";
+      const rounds =
+        payload.phase !== "context" && payload.maxRounds > 1 && payload.round > 1
+          ? ` · round ${payload.round}/${payload.maxRounds}`
+          : "";
+      label.textContent = `${text}${rounds}`;
+    },
+    streaming() {
+      if (done || streaming) return;
+      streaming = true;
+      label.textContent = "Streaming";
+    },
+    // "stopped" | "complete" | "incomplete" | "failed"
+    finish(state) {
+      if (done) return;
+      done = true;
+      clearInterval(timer);
+      if (state === "stopped") {
+        row.dataset.state = "stopped";
+        label.textContent = "Stopped by you";
+        elapsed.remove();
+        stop.remove();
+        return;
+      }
+      row.remove();
+    },
+  };
+}
+
 function updateChatMessage(target, content) {
   target.body.innerHTML = renderMarkdown(content);
   delete target.body.dataset.placeholder;
@@ -2740,14 +2833,33 @@ function wireFileReferences(container, chatRepo) {
   });
 }
 
-function renderMessages(messages) {
+// `tasks` carries each task's final status so a stopped turn stays marked as
+// one on reload. Without it a truncated answer renders as a complete short one.
+function renderMessages(messages, tasks = []) {
   $("chat-log").innerHTML = "";
+  const cancelledTasks = new Set(
+    tasks.filter((task) => task.status === "cancelled").map((task) => task.id),
+  );
   messages.forEach((message) => {
     const bubble = appendChatMessage(message.role, message.content);
     if (message.role === "assistant") {
       void finalizeChatMessage(bubble, message.content);
+      if (message.taskId && cancelledTasks.has(message.taskId)) {
+        markMessageStopped(bubble);
+      }
     }
   });
+}
+
+function markMessageStopped(target) {
+  const row = document.createElement("p");
+  row.className = "turn-indicator";
+  row.dataset.state = "stopped";
+  const label = document.createElement("span");
+  label.className = "turn-indicator-label";
+  label.textContent = "Stopped by you";
+  row.append(label);
+  target.body.after(row);
 }
 
 function renderContextFiles(files = []) {
@@ -3605,13 +3717,13 @@ async function loadSession(sessionId) {
   $("session-select").value = currentSessionId;
   syncSessionListActive();
   loadPinnedContextFiles(currentSessionId);
-  renderMessages(payload.messages);
+  renderMessages(payload.messages, payload.tasks || []);
   renderContextFiles();
   setChatStatus("Loaded");
 }
 
-async function streamChatRequest(data, handlers) {
-  return streamRequest("/api/ask-stream", "/api/ask", data, handlers);
+async function streamChatRequest(data, handlers, signal) {
+  return streamRequest("/api/ask-stream", "/api/ask", data, handlers, signal);
 }
 
 async function streamResumeCommandRequest(data, handlers) {
@@ -3619,8 +3731,12 @@ async function streamResumeCommandRequest(data, handlers) {
   return streamRequest("/api/resume-command-stream", fallbackPath, data, handlers);
 }
 
-async function streamRequest(streamPath, fallbackPath, data, handlers) {
-  const response = await fetch(apiUrl(streamPath), withApiToken(streamPath, form(data)));
+async function streamRequest(streamPath, fallbackPath, data, handlers, signal) {
+  const options = withApiToken(streamPath, form(data));
+  // Aborting closes the socket, which is what the server notices on its next
+  // keepalive write. No cancel request is sent — and none could be, since the
+  // shell serves one request at a time and this turn is holding it.
+  const response = await fetch(apiUrl(streamPath), { ...options, signal });
   if (!response.ok) {
     throw new Error(await response.text());
   }
@@ -3662,6 +3778,8 @@ function processSseEvent(raw, handlers) {
   });
   const payload = data.length ? JSON.parse(data.join("\n")) : {};
   if (event === "token") handlers.token(payload.token || "");
+  if (event === "session" && handlers.session) handlers.session(payload.sessionId || "");
+  if (event === "phase" && handlers.phase) handlers.phase(payload);
   if (event === "done") handlers.done(payload);
   if (event === "error") handlers.error(payload);
 }
@@ -3811,28 +3929,63 @@ async function proposePatchFromChat(prompt, assistantMessage) {
   setChatStatus("Patch ready", "warn");
 }
 
-async function sendChatPrompt() {
+// The turn currently in flight, so Stop (button or Escape) can reach its
+// AbortController. Null whenever nothing is running, which is what keeps a late
+// Stop from aborting the *next* turn.
+let currentTurn = null;
+
+function stopCurrentTurn() {
+  if (!currentTurn) return;
+  currentTurn.stopped = true;
+  currentTurn.controller.abort();
+}
+
+function setComposerBusy(busy) {
   const button = $("ask-btn");
+  button.classList.toggle("is-stopping", busy);
+  button.setAttribute("aria-label", busy ? "Stop generating" : "Send message");
+  // Deliberately left enabled while busy: it is the Stop control now.
+  button.disabled = false;
+}
+
+// Puts a prompt back after a stop or a failure, unless the user has started
+// typing something new. Either way the original is in the session history.
+function restorePrompt(text) {
+  const field = $("chat-prompt");
+  if (field.value.trim()) return;
+  field.value = text;
+}
+
+async function sendChatPrompt() {
   let streamError = null;
   // Hoisted out of the `try` so the `catch` can write the failure into the
   // bubble this turn already added to the log.
   let assistantMessage = null;
+  let indicator = null;
+  let prompt = "";
   if (chatSubmitting) return;
   try {
-    const prompt = $("chat-prompt").value.trim();
+    prompt = $("chat-prompt").value.trim();
     if (!prompt) throw new Error("Prompt is required");
     chatSubmitting = true;
-    button.disabled = true;
+    setComposerBusy(true);
     await ensureDesktopApiReady();
     const chatRepo = requireRepo();
     appendChatMessage("user", prompt);
     assistantMessage = appendChatMessage("assistant", "");
+    // Cleared here rather than after success: the prompt is already echoed in
+    // the log above, and leaving it in the box makes it look unsent.
+    $("chat-prompt").value = "";
     if (looksLikeEditRequest(prompt)) {
       await proposePatchFromChat(prompt, assistantMessage);
-      $("chat-prompt").value = "";
       dismissContextChips();
       return;
     }
+
+    const controller = new AbortController();
+    currentTurn = { controller, stopped: false };
+    indicator = startTurnIndicator(assistantMessage, stopCurrentTurn);
+
     let assistantText = "";
     setChatStatus("Thinking", "running");
 
@@ -3845,9 +3998,19 @@ async function sendChatPrompt() {
         ...chatModelFormFields(),
       },
       {
+        // Arrives before any work starts, so a stopped turn is still
+        // identifiable — without it, stopping a brand-new session's first turn
+        // would leave a session the UI cannot name.
+        session(sessionId) {
+          if (sessionId) currentSessionId = sessionId;
+        },
+        phase(payload) {
+          if (indicator) indicator.phase(payload);
+        },
         token(token) {
           assistantText += token;
           updateChatMessage(assistantMessage, assistantText);
+          if (indicator) indicator.streaming();
           setChatStatus("Streaming", "running");
         },
         async done(payload) {
@@ -3862,6 +4025,12 @@ async function sendChatPrompt() {
           await finalizeChatMessage(assistantMessage, assistantText);
           appendProposals(assistantMessage, payload, chatRepo);
           renderContextFiles(payload.contextFiles || []);
+          if (payload.cancelled) {
+            if (indicator) indicator.finish("stopped");
+            setChatStatus("Stopped", "warn");
+            return;
+          }
+          if (indicator) indicator.finish(payload.incomplete ? "incomplete" : "complete");
           setChatStatus(
             payload.incomplete ? "Incomplete" : "Complete",
             payload.incomplete ? "warn" : "ok",
@@ -3871,22 +4040,47 @@ async function sendChatPrompt() {
           streamError = new Error(payload.error || "Model request failed");
         },
       },
+      controller.signal,
     );
     if (streamError) throw streamError;
-    $("chat-prompt").value = "";
     dismissContextChips();
     await loadSessions(currentSessionId, false);
   } catch (error) {
-    setChatStatus("Failed", "error");
-    toast(error.message);
-    renderChatMessageError(assistantMessage, error);
+    // A stop is not a failure. Without this every Stop would toast "Failed"
+    // and write an error into the bubble the user just chose to keep.
+    if (currentTurn?.stopped || error.name === "AbortError") {
+      if (indicator) indicator.finish("stopped");
+      setChatStatus("Stopped", "warn");
+      restorePrompt(prompt);
+      await loadSessions(currentSessionId, false);
+    } else {
+      if (indicator) indicator.finish("failed");
+      setChatStatus("Failed", "error");
+      toast(error.message);
+      renderChatMessageError(assistantMessage, error);
+      restorePrompt(prompt);
+    }
   } finally {
     chatSubmitting = false;
-    button.disabled = false;
+    currentTurn = null;
+    setComposerBusy(false);
   }
 }
 
-$("ask-btn").addEventListener("click", sendChatPrompt);
+$("ask-btn").addEventListener("click", () => {
+  if (chatSubmitting) {
+    stopCurrentTurn();
+    return;
+  }
+  void sendChatPrompt();
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !chatSubmitting) return;
+  // Escape already closes dialogs and popovers; those keep priority.
+  if (document.querySelector(".app-dialog-backdrop, .model-popover:not([hidden])")) return;
+  stopCurrentTurn();
+});
 
 $("chat-prompt").addEventListener("keydown", (event) => {
   if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;

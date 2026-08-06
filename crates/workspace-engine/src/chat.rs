@@ -1,4 +1,5 @@
 use crate::audit::AuditLog;
+use crate::cancel::CancelToken;
 use crate::command_runner::CommandExecution;
 use crate::config::{Config, McpTransport};
 use crate::context_manager::ContextManager;
@@ -23,6 +24,81 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 type McpTokenResolverFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// Which stage of a turn is running. Drives the progress indicator, so the user
+/// can tell a slow provider apart from a running tool apart from a hang.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseKind {
+    Context,
+    Model,
+    Tool,
+    Finalizing,
+}
+
+impl PhaseKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Context => "context",
+            Self::Model => "model",
+            Self::Tool => "tool",
+            Self::Finalizing => "finalizing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnPhase {
+    pub kind: PhaseKind,
+    /// Human-readable detail, supplied here rather than in the UI so the
+    /// frontend never needs to know tool names. Empty when the kind says it all.
+    pub label: String,
+    /// **1-based**, unlike the loop counter it comes from.
+    pub round: u32,
+    pub max_rounds: u32,
+}
+
+impl TurnPhase {
+    fn new(kind: PhaseKind, label: impl Into<String>, round: u32) -> Self {
+        Self {
+            kind,
+            label: label.into(),
+            round: round + 1,
+            max_rounds: MAX_TOOL_ROUNDS,
+        }
+    }
+}
+
+/// Out-of-band progress about a turn, distinct from the answer text itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnProgress {
+    /// The turn's session id, reported as soon as it exists so a client that
+    /// stops before the turn finishes can still identify what it stopped.
+    Session(String),
+    Phase(TurnPhase),
+}
+
+/// The per-turn side channel: where answer tokens go, where progress goes, and
+/// whether the user has asked to stop.
+///
+/// Grouped into one value because all three travel together through the whole
+/// turn, and threading them as separate parameters would push
+/// [`ChatOrchestrator::run_agentic_turn`]'s argument list further past the point
+/// where clippy already objects.
+pub struct TurnSink<'a> {
+    pub on_token: &'a mut dyn FnMut(&str),
+    pub on_progress: &'a mut dyn FnMut(TurnProgress),
+    pub cancel: &'a CancelToken,
+}
+
+impl TurnSink<'_> {
+    fn session(&mut self, session_id: &str) {
+        (self.on_progress)(TurnProgress::Session(session_id.to_string()));
+    }
+
+    fn phase(&mut self, kind: PhaseKind, label: impl Into<String>, round: u32) {
+        (self.on_progress)(TurnProgress::Phase(TurnPhase::new(kind, label, round)));
+    }
+}
 
 /// Resolves an MCP server's `auth_token_env` reference (`keychain:<account>`
 /// or an environment variable name) to the actual bearer token. The engine
@@ -79,6 +155,9 @@ pub struct ChatTurnResult {
     pub response: String,
     pub command_proposal: Option<AgentCommandProposal>,
     pub patch_proposal: Option<AgentPatchProposal>,
+    /// The user stopped this turn. Distinct from a failure: `response` holds
+    /// whatever had been generated, and it is persisted.
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +268,10 @@ impl ChatOrchestrator {
         std::env::var(reference).ok()
     }
 
+    /// Signature deliberately unchanged: this is the entry point for
+    /// `damaian-cli` and the engine's own tests, neither of which has anything
+    /// to cancel or anywhere to show progress. Only the desktop shell needs
+    /// [`Self::ask_with_session`]'s full sink.
     pub fn ask(
         &self,
         repository_root: impl AsRef<Path>,
@@ -197,13 +280,20 @@ impl ChatOrchestrator {
         model_adapter: &mut dyn ModelAdapter,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<ChatTurnResult> {
+        let never_cancelled = CancelToken::new();
+        let mut discard_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token,
+            on_progress: &mut discard_progress,
+            cancel: &never_cancelled,
+        };
         self.ask_with_session(
             repository_root,
             prompt,
             explicit_paths,
             None,
             model_adapter,
-            on_token,
+            &mut sink,
         )
     }
 
@@ -214,7 +304,7 @@ impl ChatOrchestrator {
         explicit_paths: &[String],
         session_id: Option<&str>,
         model_adapter: &mut dyn ModelAdapter,
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let repository_root = repository_root.as_ref();
         let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
@@ -250,6 +340,11 @@ impl ChatOrchestrator {
         self.session_store
             .append_message(&session.id, Some(&task.id), "user", prompt)?;
 
+        // Before context assembly, which can take a while on a large repository:
+        // a client that stops during it must still know which session it stopped.
+        sink.session(&session.id);
+        sink.phase(PhaseKind::Context, "", 0);
+
         let context = self.context_manager.build_context(
             repository_root,
             &index.repository_id,
@@ -273,7 +368,7 @@ impl ChatOrchestrator {
             messages,
             0,
             model_adapter,
-            on_token,
+            sink,
         )
     }
 
@@ -288,7 +383,7 @@ impl ChatOrchestrator {
         approved: bool,
         approved_by: &str,
         model_adapter: &mut dyn ModelAdapter,
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(proposal_id)?;
         let repository_root = PathBuf::from(&pending.repository_root);
@@ -383,7 +478,7 @@ impl ChatOrchestrator {
             messages,
             pending.round + 1,
             model_adapter,
-            on_token,
+            sink,
         )
     }
 
@@ -414,7 +509,7 @@ impl ChatOrchestrator {
         mut messages: Vec<ModelMessage>,
         mut round: u32,
         model_adapter: &mut dyn ModelAdapter,
-        on_token: &mut dyn FnMut(&str),
+        sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         // Per-turn MCP runtime: connects lazily, caches tool lists and
         // connections for this turn, and tears everything down on drop.
@@ -434,7 +529,27 @@ impl ChatOrchestrator {
             tools
         });
 
+        // Whatever the model has produced so far, carried across rounds so a
+        // stop between them still has an answer to preserve.
+        let mut partial_response = String::new();
+
         let (final_run, response, command_proposal, patch_proposal) = loop {
+            // Checked before each round rather than only mid-stream: stopping
+            // here is what saves a whole model call, and it is the only point
+            // that catches a stop arriving during context assembly or a tool.
+            if sink.cancel.is_cancelled() {
+                return self.finish_cancelled_turn(
+                    session,
+                    task,
+                    context_files,
+                    &partial_response,
+                    ModelRun::cancelled_before_start(
+                        &self.config.model_provider,
+                        &self.config.model_name,
+                    ),
+                );
+            }
+
             let force_final = round >= MAX_TOOL_ROUNDS;
             let tools = if force_final {
                 None
@@ -470,18 +585,50 @@ impl ChatOrchestrator {
                 ],
             )?;
 
-            let model_run = match model_adapter.stream_response(&request, on_token) {
-                Ok(model_run) => model_run,
-                Err(error) => {
-                    let _ = self.session_store.update_task_status(
-                        &task,
-                        TaskStatus::Failed,
-                        Some(&error.to_string()),
-                    );
-                    return Err(error);
-                }
-            };
+            sink.phase(PhaseKind::Model, "", round);
+            let model_run =
+                match model_adapter.stream_response(&request, sink.cancel, &mut *sink.on_token) {
+                    Ok(model_run) => model_run,
+                    // A stop is not a failure. The transport raises `Cancelled`
+                    // when it killed the request mid-flight, and it must not be
+                    // recorded as a provider error.
+                    Err(ClientError::Cancelled) => {
+                        return self.finish_cancelled_turn(
+                            session,
+                            task,
+                            context_files,
+                            &partial_response,
+                            ModelRun::cancelled_before_start(
+                                &self.config.model_provider,
+                                &self.config.model_name,
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = self.session_store.update_task_status(
+                            &task,
+                            TaskStatus::Failed,
+                            Some(&error.to_string()),
+                        );
+                        return Err(error);
+                    }
+                };
             let redacted = self.scanner.redact(&model_run.content).text;
+
+            // An adapter that streamed part of an answer before noticing the
+            // stop returns `Ok` with partial content, so the flag has to be
+            // re-checked here as well as at the top of the loop.
+            if sink.cancel.is_cancelled() {
+                let partial = model_run.content.clone();
+                return self.finish_cancelled_turn(
+                    session,
+                    task,
+                    context_files,
+                    &partial,
+                    model_run,
+                );
+            }
+            partial_response = redacted.clone();
 
             if force_final {
                 break (model_run, redacted, None, None);
@@ -535,6 +682,8 @@ impl ChatOrchestrator {
                 round += 1;
                 continue;
             };
+
+            sink.phase(PhaseKind::Tool, tool_action_label(&tool_action), round);
 
             // Each non-terminal arm below produces the (assistant summary,
             // tool result) pair to persist and feed back to the model.
@@ -803,6 +952,57 @@ impl ChatOrchestrator {
             response,
             command_proposal,
             patch_proposal,
+            cancelled: false,
+        })
+    }
+
+    /// Closes out a turn the user stopped.
+    ///
+    /// The single place `ClientError::Cancelled` is turned back into a result:
+    /// it persists whatever was generated, marks the task terminal so no
+    /// `Running` record is left wedged, and reports the stop as an outcome
+    /// rather than a failure — a stop and a provider error need to stay
+    /// distinguishable in the badge and in the task history alike.
+    fn finish_cancelled_turn(
+        &self,
+        session: Session,
+        task: Task,
+        context_files: Vec<String>,
+        partial: &str,
+        model_run: ModelRun,
+    ) -> Result<ChatTurnResult> {
+        // Through the same scanner as a completed turn: stopping does not
+        // suspend the redaction guarantee.
+        let response = self.scanner.redact(partial).text;
+        if !response.is_empty() {
+            self.session_store.append_message(
+                &session.id,
+                Some(&task.id),
+                "assistant",
+                &response,
+            )?;
+        }
+        let task = self
+            .session_store
+            .update_task_status(&task, TaskStatus::Cancelled, None)?;
+        self.audit_log.record(
+            "chat_turn_cancelled",
+            &[
+                ("actor", "user".to_string()),
+                ("sessionId", session.id.clone()),
+                ("taskId", task.id.clone()),
+                ("partialLength", response.len().to_string()),
+            ],
+        )?;
+        Ok(ChatTurnResult {
+            session,
+            task,
+            model_run,
+            context_files,
+            response,
+            command_proposal: None,
+            patch_proposal: None,
+            cancelled: true,
         })
     }
 }
@@ -982,6 +1182,30 @@ enum ToolAction {
         tool_name: String,
         arguments_json: String,
     },
+}
+
+/// What to show the user while a tool runs. Lives here rather than in the UI so
+/// the frontend never has to map tool names to prose.
+fn tool_action_label(action: &ToolAction) -> String {
+    match action {
+        ToolAction::Command(request) => format!("Proposing `{}`", request.command),
+        ToolAction::ProposePatch(_) => "Preparing a patch".to_string(),
+        ToolAction::ReadFile(path) => format!("Reading {path}"),
+        ToolAction::SearchCodebase { query, .. } => format!("Searching for \"{query}\""),
+        ToolAction::ReadGitStatus => "Reading git status".to_string(),
+        ToolAction::ReadGitDiff { staged } => {
+            if *staged {
+                "Reading the staged diff".to_string()
+            } else {
+                "Reading the working diff".to_string()
+            }
+        }
+        ToolAction::McpCall {
+            server_id,
+            tool_name,
+            ..
+        } => format!("Calling {tool_name} on {server_id}"),
+    }
 }
 
 /// The tools offered to providers configured with `supports_native_tools`.
