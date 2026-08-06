@@ -4,6 +4,9 @@ extend-exclude = [
   "package-lock.json",
   "crates/desktop-shell/static/xterm*",
   "target/",
+  # Specifies the typo fixes that motivated the release gate, so it has to
+  # quote the misspellings it removes. typos has no inline-ignore directive.
+  "docs/specs/09_release_quality_gate.md",
 ]
 
 [default.extend-identifiers]

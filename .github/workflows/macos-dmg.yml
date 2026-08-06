@@ -16,8 +16,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # No build goes out on a red tree. This calls the same workflow that gates
+  # pull requests, so a tag or a manual build cannot ship past a check that a
+  # pull request would have failed on.
+  quality:
+    name: Quality
+    uses: ./.github/workflows/quality.yml
+
   build:
     name: Build Apple Silicon DMG
+    needs: quality
     runs-on: macos-latest
     permissions:
       contents: read
@@ -102,12 +110,6 @@ jobs:
           if ! command -v cargo-tauri >/dev/null 2>&1; then
             cargo install tauri-cli --version 2.11.4 --locked
           fi
-
-      - name: Check desktop JavaScript
-        run: node --check crates/desktop-shell/static/app.js
-
-      - name: Run Rust tests
-        run: cargo test --locked
 
       - name: Build DMG
         env:

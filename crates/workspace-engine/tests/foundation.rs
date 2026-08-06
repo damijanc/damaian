@@ -792,7 +792,7 @@ fn blocks_generated_hardcoded_secrets_by_default() {
 }
 
 /// The block is a warning the user can overrule, not a dead end: a patch the
-/// scanner flags must still be appliable once the user has seen what was
+/// scanner flags must still be applicable once the user has seen what was
 /// found and said yes.
 #[test]
 fn applies_generated_secret_when_user_explicitly_overrides() {
@@ -2671,8 +2671,8 @@ fn propose_edit_records_failure_when_patch_touches_restricted_path() {
 }
 
 #[test]
-fn propose_edit_records_failure_when_model_output_is_unparseable() {
-    let repo = temp_dir("edit-unparseable-failure");
+fn propose_edit_records_failure_when_model_output_is_unparsable() {
+    let repo = temp_dir("edit-unparsable-failure");
     write_fixture(&repo, "src/a.js", "export const a = 1;\n");
     let config = test_config(&repo);
     let engine = WorkspaceEngine::new(config);
