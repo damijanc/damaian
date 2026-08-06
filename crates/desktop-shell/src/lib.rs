@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use workspace_engine::{
-    ChatMessage, ChatTurnResult, Config, CurlModelTransport, McpClient, McpServerConfig,
-    McpTokenResolver, McpTransport, OpenAICompatibleAdapter, ProposedFilePatch, Session,
-    WorkspaceEngine, command_approval_prompt, normalize_mcp_server_id, normalize_model_provider,
-    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    ChatMessage, ChatTurnResult, Config, CurlModelTransport, GeneratedSecretWarning, McpClient,
+    McpServerConfig, McpTokenResolver, McpTransport, OpenAICompatibleAdapter, ProposedFilePatch,
+    Session, WorkspaceEngine, command_approval_prompt, normalize_mcp_server_id,
+    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
+    parse_mcp_transport, patch_diff_text,
 };
 
 mod keychain;
@@ -531,7 +532,40 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .get("hunk_selection")
                 .map(|value| parse_hunk_selection(value).map_err(|error| error.to_string()))
                 .transpose()?;
+            // Explicit per-apply user decision, sent only after the UI has
+            // shown what the scanner found. Absent on the first attempt.
+            let allow_generated_secrets = form
+                .get("allow_secrets")
+                .is_some_and(|value| value == "1" || value == "true");
             let engine = engine_for_repo(&repo)?;
+            // Without the override, report what would be blocked instead of
+            // failing: the user needs to see which file tripped the check to
+            // decide whether to accept it.
+            if !allow_generated_secrets && engine.config.block_generated_secrets {
+                let flagged = engine
+                    .edit_orchestrator
+                    .preview_stored_patch_secrets(
+                        &repo,
+                        &patch_id,
+                        approved_paths.as_deref(),
+                        hunk_selection.as_ref(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if !flagged.is_empty() {
+                    return write_response(
+                        stream,
+                        &request,
+                        200,
+                        "application/json",
+                        &format!(
+                            "{{\"patchId\":\"{}\",\"appliedFiles\":[],\"warningCount\":{},\"blockedBySecrets\":[{}]}}",
+                            escape_json(&patch_id),
+                            flagged.len(),
+                            generated_secret_warnings_json(&flagged)
+                        ),
+                    );
+                }
+            }
             let result = engine
                 .edit_orchestrator
                 .apply_stored_patch(
@@ -540,6 +574,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                     approved_paths.as_deref(),
                     hunk_selection.as_ref(),
                     "desktop_user",
+                    allow_generated_secrets,
                 )
                 .map_err(|error| error.to_string())?;
             write_response(
@@ -2060,6 +2095,23 @@ fn json_error(message: &str) -> String {
     format!("{{\"error\":\"{}\"}}", escape_json(message))
 }
 
+/// Serialises secret-scan warnings for the patch UI. Categories and counts
+/// only — the matched values never leave the engine.
+fn generated_secret_warnings_json(warnings: &[GeneratedSecretWarning]) -> String {
+    warnings
+        .iter()
+        .map(|warning| {
+            format!(
+                "{{\"path\":\"{}\",\"count\":{},\"categories\":[{}]}}",
+                escape_json(&warning.path),
+                warning.count,
+                json_string_array(&warning.categories)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn json_string_array(values: &[String]) -> String {
     values
         .iter()
@@ -2091,17 +2143,18 @@ mod tests {
     use super::{
         Request, ShellOptions, allowed_cors_origin, api_request_requires_token,
         cached_model_api_key, desktop_settings_config_path, effective_policy_for_repo,
-        forget_model_api_key, handle_connection, index_html, keychain, parse_form, parse_path_list,
-        percent_decode, remember_model_api_key, render_markdown_with_optional_file_links,
-        require_api_token, run_terminal_command, save_config_file, terminal_cwd_for_repo,
-        validate_context_files, validate_working_folder, validate_workspace_path,
+        engine_for_repo, forget_model_api_key, generated_secret_warnings_json, handle_connection,
+        index_html, keychain, parse_form, parse_path_list, percent_decode, remember_model_api_key,
+        render_markdown_with_optional_file_links, require_api_token, run_terminal_command,
+        save_config_file, terminal_cwd_for_repo, validate_context_files, validate_working_folder,
+        validate_workspace_path,
     };
     use std::collections::HashMap;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use workspace_engine::{Config, WorkspaceEngine};
+    use workspace_engine::{Config, GeneratedSecretWarning, WorkspaceEngine};
 
     #[test]
     fn decodes_forms() {
@@ -2117,6 +2170,20 @@ mod tests {
             vec!["src/a.js", "src/b.js", "src/c.js"]
         );
         assert!(parse_path_list(" \n ").is_err());
+    }
+
+    #[test]
+    fn serializes_generated_secret_warnings_for_the_patch_ui() {
+        let json = generated_secret_warnings_json(&[GeneratedSecretWarning {
+            path: "docs/\"README\".md".to_string(),
+            categories: vec!["credential_assignment".to_string()],
+            count: 2,
+        }]);
+
+        assert_eq!(
+            json,
+            "{\"path\":\"docs/\\\"README\\\".md\",\"count\":2,\"categories\":[\"credential_assignment\"]}"
+        );
     }
 
     #[test]
@@ -2197,6 +2264,122 @@ mod tests {
             response.starts_with("HTTP/1.1 200"),
             "unexpected response: {response}"
         );
+    }
+
+    /// The reported bug end to end: `apply selected` on flagged content used
+    /// to fail with a `policy_blocked` error the user could not get past. The
+    /// route must instead report *what* was found without writing anything,
+    /// then apply the same selection once the user consents.
+    #[test]
+    fn apply_patch_endpoint_warns_then_applies_when_the_user_accepts() {
+        let repo = std::env::temp_dir().join(format!(
+            "damaian-apply-secret-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(repo.join(".damaian")).unwrap();
+        let data_dir = repo.join(".damaian").join("data");
+        // Pin data_dir through repo config so the test never touches the
+        // user's real application-support directory or a shared env var.
+        fs::write(
+            repo.join(".damaian").join("config.conf"),
+            format!("data_dir={}\n", data_dir.to_string_lossy()),
+        )
+        .unwrap();
+        fs::write(repo.join("config.js"), "export const token = \"\";\n").unwrap();
+
+        let repo_arg = repo.to_string_lossy().to_string();
+        let engine = engine_for_repo(&repo_arg).expect("engine for test repo");
+        let patch = engine
+            .patch_engine
+            .create_patch(
+                &repo,
+                &[workspace_engine::ProposedChange {
+                    path: "config.js".to_string(),
+                    new_content: "export const api_key = \"sk_live_9f8a7b6c5d4e3f2a1b0c\";\n"
+                        .to_string(),
+                    status: None,
+                    allow_restricted: false,
+                }],
+                None,
+                "add key",
+            )
+            .expect("create patch");
+        engine.patch_store.save(&patch).expect("store patch");
+
+        let options = ShellOptions::new(0, None);
+        let token = options.api_token.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let _ = handle_connection(&mut stream, &options);
+            }
+        });
+
+        let post = |body: String| {
+            let request = format!(
+                "POST /api/apply-patch HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/x-www-form-urlencoded\r\nx-damaian-api-token: {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let mut stream =
+                TcpStream::connect(("127.0.0.1", port)).expect("connect to test server");
+            stream.write_all(request.as_bytes()).expect("write request");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("read response");
+            response
+        };
+
+        let base = format!(
+            "repo={}&patch_id={}",
+            percent_encode_for_test(&repo_arg),
+            patch.id
+        );
+
+        // First attempt: warned, nothing written.
+        let warned = post(base.clone());
+        assert!(warned.starts_with("HTTP/1.1 200"), "{warned}");
+        assert!(warned.contains("\"blockedBySecrets\""), "{warned}");
+        assert!(warned.contains("config.js"), "{warned}");
+        assert!(warned.contains("credential_assignment"), "{warned}");
+        assert!(warned.contains("\"appliedFiles\":[]"), "{warned}");
+        assert_eq!(
+            fs::read_to_string(repo.join("config.js")).unwrap(),
+            "export const token = \"\";\n",
+            "a warned apply must not write anything"
+        );
+        // The response must name the category, never the matched value.
+        assert!(!warned.contains("sk_live_9f8a7b6c5d4e3f2a1b0c"), "{warned}");
+
+        // Second attempt: the user accepted.
+        let accepted = post(format!("{base}&allow_secrets=1"));
+        assert!(accepted.starts_with("HTTP/1.1 200"), "{accepted}");
+        assert!(!accepted.contains("\"blockedBySecrets\""), "{accepted}");
+        assert!(
+            accepted.contains("\"appliedFiles\":[\"config.js\"]"),
+            "{accepted}"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("config.js")).unwrap(),
+            "export const api_key = \"sk_live_9f8a7b6c5d4e3f2a1b0c\";\n"
+        );
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    fn percent_encode_for_test(value: &str) -> String {
+        value
+            .chars()
+            .map(|character| match character {
+                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' | '/' => {
+                    character.to_string()
+                }
+                other => format!("%{:02X}", other as u32),
+            })
+            .collect()
     }
 
     #[test]

@@ -162,7 +162,12 @@ impl SecretScanner {
                     continue;
                 };
                 let password_start = credentials_start + colon_rel + 1;
-                if at_index > password_start {
+                // Same placeholder exemption as credential assignments:
+                // `postgres://user:${DB_PASSWORD}@host` in a setup doc is an
+                // instruction, not a credential.
+                if at_index > password_start
+                    && !is_placeholder_value(&text[password_start..at_index])
+                {
                     Self::add_finding(
                         findings,
                         "database_url",
@@ -214,7 +219,9 @@ impl SecretScanner {
                     let value_end = take_while(line, value_start, |byte| {
                         !byte.is_ascii_whitespace() && byte != b'"' && byte != b'\'' && byte != b';'
                     });
-                    if value_end - value_start >= 8 {
+                    if value_end - value_start >= 8
+                        && !is_placeholder_value(&line[value_start..value_end])
+                    {
                         Self::add_finding(
                             findings,
                             "credential_assignment",
@@ -340,6 +347,66 @@ impl SecretScanner {
             }
         }
     }
+}
+
+/// Words that only ever appear in setup instructions, never in a real
+/// credential. Matched as substrings of the lowercased value, so
+/// `your-deepseek-api-key` and `REPLACE_WITH_YOUR_TOKEN` both qualify.
+const PLACEHOLDER_WORDS: [&str; 12] = [
+    "your",
+    "placeholder",
+    "changeme",
+    "change-me",
+    "change_me",
+    "example",
+    "dummy",
+    "sample",
+    "replace",
+    "insert",
+    "todo",
+    "redacted",
+];
+
+/// True when a detected value reads as a documentation placeholder rather than
+/// a credential.
+///
+/// Assignment-shaped detectors match on the *key* (`password`, `api_key`, …),
+/// so every "set your key like this" line in a README looks exactly like a
+/// hardcoded secret to them. That made generated setup docs unappliable while
+/// protecting nothing: a templated value is not a secret, and redacting it
+/// destroys the instruction it belongs to.
+///
+/// Deliberately narrow — it recognises values that are *structurally* not
+/// credentials (templates, variable references, repeated filler) or that name
+/// themselves as examples. High-entropy values, and every structural detector
+/// (AWS, JWT, private keys, provider token prefixes), are untouched.
+fn is_placeholder_value(value: &str) -> bool {
+    // Template and variable syntax: <your-key>, ${DB_PASSWORD}, $OPENAI_KEY,
+    // {{ vault_password }}, %DEPLOY_TOKEN%.
+    if value.contains(['<', '>', '{', '}', '%']) || value.starts_with('$') {
+        return true;
+    }
+    // Already-redacted text, and Keychain references, which are pointers to a
+    // secret rather than the secret itself.
+    if value.starts_with("[REDACTED_") || value.starts_with("keychain:") {
+        return true;
+    }
+    // Filler runs: xxxxxxxx, ********, ........
+    if value.len() >= 8 && value.bytes().all(|byte| byte == value.as_bytes()[0]) {
+        return true;
+    }
+    // An environment variable name (`DEEPSEEK_API_KEY`) names where the secret
+    // lives; it is not the secret. Underscore required so that all-caps
+    // credentials such as an AWS key id are not swept up here.
+    if value.contains('_')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    PLACEHOLDER_WORDS.iter().any(|word| lower.contains(word))
 }
 
 fn take_while(text: &str, start: usize, predicate: impl Fn(u8) -> bool) -> usize {

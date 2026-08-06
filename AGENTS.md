@@ -69,7 +69,7 @@ Notes:
 
 ## Testing
 
-- 167 tests pass by default: mostly inline `#[test]` modules, plus integration
+- 178 tests pass by default: mostly inline `#[test]` modules, plus integration
   tests in `crates/workspace-engine/tests/`. Add tests next to the code you
   change.
 - Two tests are `#[ignore]`d because they have real side effects (one opens

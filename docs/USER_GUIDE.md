@@ -66,6 +66,14 @@ Use the conversation box to request file changes.
 
 Damaian checks file hashes before applying a stored patch. If a target file changed after preview, that file is blocked instead of overwriting newer local work.
 
+### Hardcoded secret warnings
+
+Damaian scans generated content for credentials before writing it. If a selected file is flagged, nothing is written: the preview shows which file tripped the check and what was detected, and you choose.
+
+Detection is not perfect. Setup instructions and placeholder values can resemble credentials, so review the diff before deciding. Select `Apply Anyway` to accept the change as written, or `Cancel` to leave the workspace untouched. The decision applies to that one apply and is not remembered; each apply asks again, and the override is recorded in the audit log.
+
+From the CLI, `damaian apply-patch` prints the same findings and re-runs with `--allow-generated-secrets` to accept them.
+
 After files are applied, Damaian prints a concise Git status summary in the conversation.
 
 ## Settings
