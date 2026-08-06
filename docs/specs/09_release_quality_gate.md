@@ -1,6 +1,6 @@
 # Feature Spec: Release Quality Gate
 
-Status: Not started
+Status: Done
 Order: 9 of 9
 Related spec sections: none. This is a release-engineering defect, not a product gap.
 
@@ -139,9 +139,16 @@ Both `unparseable` occurrences are inside the same test. The test function has
 no callers, and the string is only a scratch-directory name, so neither rename
 affects anything outside those two lines.
 
+This document is added to `extend-exclude` in `_typos.toml`. It has to quote
+the misspellings in order to specify their removal, and `typos` has no
+inline-ignore directive, so a file-scoped exclusion is the only way to state
+the fix and pass the check that motivated it. The exclusion is deliberately
+narrow: one path, not a word added to a repo-wide allow list.
+
 ## 6. Acceptance criteria
 
-1. `typos` reports no findings on the working tree.
+1. `typos` reports no findings on the working tree, with this document excluded
+   in `_typos.toml`.
 2. `cargo test --workspace --locked` passes, including the renamed test.
 3. `quality.yml` declares `workflow_call` alongside its existing
    `pull_request` and `push` triggers, with its jobs and steps otherwise

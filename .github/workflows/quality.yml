@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - main
+  # Called by the release workflow so a tagged build runs exactly these checks.
+  # Quality is defined here and only here.
+  workflow_call:
 
 concurrency:
   group: quality-${{ github.ref }}
