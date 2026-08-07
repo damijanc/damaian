@@ -33,7 +33,9 @@ pub use chat::{
     AgentCommandProposal, AgentPatchProposal, ChatOrchestrator, ChatTurnResult, McpTokenResolver,
     PhaseKind, TurnPhase, TurnProgress, TurnSink,
 };
-pub use command_policy::{CommandClassification, CommandPolicy, CommandRisk};
+pub use command_policy::{
+    CommandClassification, CommandPolicy, CommandRisk, allow_always_eligible,
+};
 pub use command_runner::{CommandExecution, CommandRunner};
 pub use config::{
     Config, ConfigOverlay, DEFAULT_CONTEXT_TOKEN_BUDGET, McpServerConfig, McpServerConfigOverlay,

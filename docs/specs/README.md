@@ -5,7 +5,7 @@ Source: gap analysis against `ai_coding_assistant_specification.md` and `ai_codi
 
 These specs describe features that close gaps between the product specification and the current state of the codebase. They are meant to be implemented one at a time, in the order listed. Each spec is self-contained: motivation, current state (with file references), requirements, non-goals, design, and acceptance criteria.
 
-Specs 1–6 came from the original gap analysis. Later entries are added as design changes come up; #7 came from a reported bug rather than the analysis, #8 from a usability gap reported in use, and #9 from a release-engineering defect found in CI.
+Specs 1–6 came from the original gap analysis. Later entries are added as design changes come up; #7 came from a reported bug rather than the analysis, #8 from a usability gap reported in use, #9 from a release-engineering defect found in CI, and #10 from approval-prompt fatigue reported in use.
 
 ## Implementation order
 
@@ -20,5 +20,6 @@ Specs 1–6 came from the original gap analysis. Later entries are added as desi
 | 7 | [07_generated_secret_override.md](07_generated_secret_override.md) | **Done.** Bug-driven, not from the original gap analysis: the generated-secret block false-positived on setup documentation and had no user override, so a false positive was an unrecoverable dead end. Closes the §7.10 "Override" requirement. |
 | 8 | [08_stop_and_progress.md](08_stop_and_progress.md) | **Done.** Usability-driven: a chat turn can run ~90 minutes unstoppably and reports only a static `Thinking` badge while it does. Closes §7.5's cancellation requirements (`cancel(runId)` is present in the trait but dead code) and §7.1's "distinct UI states" requirement. Independent of #1–#7. |
 | 9 | [09_release_quality_gate.md](09_release_quality_gate.md) | **Done.** Release-engineering, not a product gap: tagged builds publish even when Quality is red, because the release workflow has no dependency on it and Quality never runs on tags. Makes Quality a reusable workflow the release pipeline must pass. Independent of #1–#8. |
+| 10 | [10_persistent_command_approval.md](10_persistent_command_approval.md) | **Done.** Usability-driven, with a safety edge: command approval was one-shot only, so the same command prompted on every run and users learned to click through without reading. Adds "allow always", writing the existing `command_allowlist` to repository config. Independent of #1–#9. |
 
 Each spec's status is tracked at the top of its file: `Not started`, `In progress`, or `Done`.

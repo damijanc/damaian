@@ -80,6 +80,7 @@ cargo run -p damaian-cli -- config-set admin audit_retention_days 30
 cargo run -p damaian-cli -- propose-command /path/to/repo "npm test"
 cargo run -p damaian-cli -- propose-validations /path/to/repo
 cargo run -p damaian-cli -- run-command command_proposal_id --approve
+cargo run -p damaian-cli -- run-command command_proposal_id --approve --always
 cargo run -p damaian-cli -- reject-command command_proposal_id
 DAMAIAN_MOCK_MODEL_RESPONSE="Mock answer" cargo run -p damaian-cli -- ask /path/to/repo "What does auth do?"
 OPENAI_API_KEY=... cargo run -p damaian-cli -- ask /path/to/repo "Explain the project"

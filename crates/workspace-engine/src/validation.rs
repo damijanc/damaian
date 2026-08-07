@@ -1,6 +1,9 @@
 use crate::audit::AuditLog;
-use crate::command_policy::{CommandClassification, CommandPolicy, CommandRisk};
+use crate::command_policy::{
+    CommandClassification, CommandPolicy, CommandRisk, allow_always_eligible,
+};
 use crate::command_runner::{CommandExecution, CommandRunner};
+use crate::config::{Config, ConfigOverlay};
 use crate::error::{ClientError, Result};
 use crate::hash::{create_id, now_millis};
 use std::fs;
@@ -218,6 +221,76 @@ impl ValidationOrchestrator {
             ],
         )?;
         Ok(record)
+    }
+
+    /// Permanently allows a proposal's command by appending it to the
+    /// repository's `command_allowlist`, so future proposals for the exact
+    /// same command classify as low risk and skip the approval prompt.
+    ///
+    /// Writes to `<repo>/.damaian/config.conf` — the repository the proposal
+    /// was raised against, not the user-wide config — so an allowance granted
+    /// in one project never leaks into another. Returns the path written.
+    ///
+    /// The caller is expected to run the command afterwards: this only records
+    /// the decision.
+    pub fn allow_command_always(&self, proposal_id: &str, approved_by: &str) -> Result<PathBuf> {
+        let proposal = self.command_store.load_proposal(proposal_id)?;
+        let repository_root = PathBuf::from(&proposal.working_directory);
+
+        // Deliberately the config this orchestrator was built with, not a
+        // fresh load from disk: the answer here must match the policy that
+        // classified the proposal in the first place, and it keeps this method
+        // a pure function of its injected dependencies. Callers are
+        // responsible for constructing the orchestrator with the config of the
+        // repository the proposal belongs to.
+        let config = self.command_policy.config();
+        if !allow_always_eligible(config, &proposal.command, proposal.blocked) {
+            return Err(ClientError::PolicyBlocked(format!(
+                "Command cannot be permanently allowed: {}",
+                proposal.command
+            )));
+        }
+
+        let path = Config::repository_config_path(&repository_root);
+        let mut overlay = ConfigOverlay::load_or_default(&path)?;
+        // `Config::apply_overlay` *replaces* `command_allowlist` rather than
+        // merging it, so a repository entry listing only the new command would
+        // silently drop everything the user allowed at user scope. Seed from
+        // the already-merged effective list the first time this repository
+        // takes ownership of the key; afterwards the repository entry is the
+        // authority and is appended to directly.
+        let mut allowlist = overlay
+            .command_allowlist
+            .take()
+            .unwrap_or_else(|| config.command_allowlist.clone());
+
+        let command = proposal.command.trim().to_string();
+        let already_allowed = allowlist.iter().any(|entry| entry.trim() == command);
+        if !already_allowed {
+            allowlist.push(command.clone());
+        }
+        overlay.command_allowlist = Some(allowlist);
+        overlay.save(&path)?;
+
+        self.audit_log.record(
+            "command_allowlisted",
+            &[
+                ("actor", "user".to_string()),
+                ("proposalId", proposal.id.clone()),
+                ("command", command),
+                ("approvedBy", approved_by.to_string()),
+                ("alreadyAllowed", already_allowed.to_string()),
+                ("resourcePath", path.to_string_lossy().to_string()),
+            ],
+        )?;
+        Ok(path)
+    }
+
+    /// Reads back a stored proposal. Callers that need to act on a proposal's
+    /// repository before building a repository-scoped engine (the CLI, which
+    /// is handed only a proposal id) need this to find the working directory.
+    pub fn load_proposal(&self, proposal_id: &str) -> Result<CommandProposal> {
+        self.command_store.load_proposal(proposal_id)
     }
 
     pub fn reject_proposal(&self, proposal_id: &str, rejected_by: &str) -> Result<PathBuf> {

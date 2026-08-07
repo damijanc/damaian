@@ -50,6 +50,13 @@ impl CommandPolicy {
         Self { config }
     }
 
+    /// The policy configuration in effect, so callers that need to reason
+    /// about approval settings can do so without reloading it from disk and
+    /// risking a different answer than the one this policy is enforcing.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     pub fn classify(&self, command: &str, working_directory: &Path) -> CommandClassification {
         let mut classification = self.classify_pattern(command);
         if !classification.blocked
@@ -209,6 +216,24 @@ impl CommandPolicy {
 
         Ok(commands)
     }
+}
+
+/// Whether the user may permanently allowlist `command` straight from an
+/// approval prompt.
+///
+/// Three exclusions, each for a different reason:
+/// - Blocked commands are a policy decision, not an approval decision. There
+///   is no approval that makes `rm -rf /` run.
+/// - Shell-control commands would silently do nothing: `classify_pattern`
+///   consults the allowlist *after* the shell-control gate, so the entry
+///   could never match. `command_allowlist` is also pipe-separated on disk
+///   ([`crate::config::ConfigOverlay`]), so a piped command cannot even
+///   round-trip through the file.
+/// - `require_approval_for_all_commands` means "prompt me for everything",
+///   which an allowlist entry cannot satisfy — offering the option there
+///   would promise something the policy then refuses to honor.
+pub fn allow_always_eligible(config: &Config, command: &str, blocked: bool) -> bool {
+    !blocked && !config.require_approval_for_all_commands && !contains_shell_control(command.trim())
 }
 
 fn configured_prefix_matches(patterns: &[String], command: &str) -> bool {
@@ -375,8 +400,51 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_shell_control, references_path_outside_root};
+    use super::{
+        Config, allow_always_eligible, contains_shell_control, references_path_outside_root,
+    };
     use std::path::Path;
+
+    #[test]
+    fn allows_permanent_approval_for_ordinary_commands() {
+        let config = Config::default();
+        assert!(allow_always_eligible(&config, "npm test", false));
+        // High risk is still eligible: the user is explicitly opting in.
+        assert!(allow_always_eligible(&config, "git push", false));
+        // Leading/trailing whitespace must not change the verdict, since the
+        // stored entry is trimmed too.
+        assert!(allow_always_eligible(&config, "  cargo test  ", false));
+    }
+
+    #[test]
+    fn refuses_permanent_approval_for_blocked_commands() {
+        let config = Config::default();
+        assert!(!allow_always_eligible(&config, "rm -rf /", true));
+    }
+
+    #[test]
+    fn refuses_permanent_approval_for_shell_control_commands() {
+        let config = Config::default();
+        // The allowlist is consulted after the shell-control gate, so an entry
+        // for any of these could never match.
+        assert!(!allow_always_eligible(&config, "cat a.txt | grep b", false));
+        assert!(!allow_always_eligible(
+            &config,
+            "npm test && npm run lint",
+            false
+        ));
+        assert!(!allow_always_eligible(&config, "echo hi > out.txt", false));
+        assert!(!allow_always_eligible(&config, "echo $(whoami)", false));
+    }
+
+    #[test]
+    fn refuses_permanent_approval_when_all_commands_need_approval() {
+        let config = Config {
+            require_approval_for_all_commands: true,
+            ..Config::default()
+        };
+        assert!(!allow_always_eligible(&config, "npm test", false));
+    }
 
     #[test]
     fn detects_line_breaks_as_shell_control() {

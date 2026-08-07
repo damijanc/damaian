@@ -51,6 +51,10 @@ If the assistant needs a local command result to answer a question, it can reque
 
 Commands that cannot run in sandbox mode appear as an approval card in the conversation. Review the command, risk, working directory, and reason, then select `Approve Run` or `Reject`. Destructive commands blocked by policy cannot be approved from the UI.
 
+`Allow Always` runs the command and adds it to `command_allowlist` in `.damaian/config.conf` inside the selected repository, so that command stops asking. The allowance covers the exact command only: allowing `npm run test:unit` does not allow `npm run test:unit --watch`, and allowing `git push` does not allow `git push --force`. It applies to that repository alone. Remove an entry by editing `.damaian/config.conf`.
+
+`Allow Always` is not offered for commands blocked by policy, for commands containing shell control syntax such as `|`, `&&`, or `>`, or when `require_approval_for_all_commands` is set — in each of those cases an allowlist entry would have no effect, so the app does not offer to write one.
+
 Sessions are shown under their project folder in the sidebar. Select an existing session to reload its conversation. Double-click a session to rename it, or use the `-` beside a session to delete it.
 
 Context file buttons open the referenced file in Visual Studio Code.
@@ -95,7 +99,7 @@ Common keys:
 - `model_provider.<id>.context_token_budget`: How much repository content is sent with each request, in tokens. Omit to use the built-in default for the selected model.
 - `model_provider.<id>.supports_native_tools`: Set to `true` to use the provider's native tool-calling API. Required for MCP tools, patch proposals, and other agentic actions.
 
-Repository-scoped settings are not edited from the UI. Put repository defaults in `.damaian/config.conf` inside the selected repository. Repository settings are included in `Effective Policy` and can override user settings.
+Repository-scoped settings are not edited from Settings. Put repository defaults in `.damaian/config.conf` inside the selected repository. Repository settings are included in `Effective Policy` and can override user settings. The one exception is `command_allowlist`, which the `Allow Always` button on a command approval card appends to; see [Chat](#chat).
 
 ## Model Providers and API Keys
 
@@ -209,7 +213,7 @@ Damaian keeps the local app in control of important effects:
 - The model does not write files directly.
 - File edits are previewed before application.
 - Sandbox-safe assistant command requests are limited to read-only local commands.
-- Commands outside the sandbox require user approval before execution.
+- Commands outside the sandbox require user approval before execution, unless the exact command was previously approved with `Allow Always` for that repository.
 - Restricted files and detected secrets are redacted or blocked by policy.
 - Important actions are recorded in a local audit trail.
 

@@ -3587,10 +3587,19 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
   runButton.type = "button";
   runButton.textContent = proposal.blocked ? "Blocked" : "Approve Run";
   runButton.disabled = Boolean(proposal.blocked);
+  // The server decides eligibility (blocked, shell-control syntax, and
+  // `require_approval_for_all_commands` all rule it out) so the button is
+  // never shown for a command the policy would refuse to allowlist.
+  const alwaysButton = document.createElement("button");
+  alwaysButton.type = "button";
+  alwaysButton.textContent = "Allow Always";
+  alwaysButton.title = "Run this command and add it to this project's allowlist so it stops asking";
   const rejectButton = document.createElement("button");
   rejectButton.type = "button";
   rejectButton.textContent = "Reject";
-  actions.append(runButton, rejectButton);
+  actions.append(runButton);
+  if (proposal.allowAlways) actions.append(alwaysButton);
+  actions.append(rejectButton);
 
   const output = document.createElement("pre");
   output.className = "command-approval-output";
@@ -3599,8 +3608,9 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
   // Approving or rejecting resumes the chat turn that raised this proposal:
   // the model sees the command's result (or the rejection) and streams back
   // an actual answer, same as a normal chat reply.
-  async function resolveCommandProposal(approved) {
+  async function resolveCommandProposal(approved, always = false) {
     runButton.disabled = true;
+    alwaysButton.disabled = true;
     rejectButton.disabled = true;
     output.hidden = false;
     output.textContent = approved ? "Running…" : "Rejecting…";
@@ -3613,6 +3623,7 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
         repo: proposalRepo,
         proposal_id: proposal.proposalId,
         approved: approved ? "true" : "false",
+        always: always ? "true" : "false",
       },
       {
         token(token) {
@@ -3642,10 +3653,23 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
       },
     );
     if (streamError) throw streamError;
-    output.textContent = approved
-      ? "Command approved — see the assistant's answer above."
-      : "Command rejected — see the assistant's answer above.";
+    if (!approved) {
+      output.textContent = "Command rejected — see the assistant's answer above.";
+    } else if (always) {
+      output.textContent =
+        "Command approved and added to this project's allowlist — see the assistant's answer above.";
+    } else {
+      output.textContent = "Command approved — see the assistant's answer above.";
+    }
     await loadSessions(currentSessionId, false);
+  }
+
+  // Re-enable after a failure so the user can retry or pick a different
+  // action; a blocked proposal's run button stays disabled regardless.
+  function restoreActions() {
+    runButton.disabled = Boolean(proposal.blocked);
+    alwaysButton.disabled = false;
+    rejectButton.disabled = false;
   }
 
   runButton.addEventListener("click", async () => {
@@ -3653,8 +3677,18 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
       await resolveCommandProposal(true);
       toast("Command completed");
     } catch (error) {
-      runButton.disabled = false;
-      rejectButton.disabled = false;
+      restoreActions();
+      output.textContent = error.message;
+      toast(error.message);
+    }
+  });
+
+  alwaysButton.addEventListener("click", async () => {
+    try {
+      await resolveCommandProposal(true, true);
+      toast("Command allowed for this project");
+    } catch (error) {
+      restoreActions();
       output.textContent = error.message;
       toast(error.message);
     }
@@ -3665,8 +3699,7 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
       await resolveCommandProposal(false);
       toast("Command rejected");
     } catch (error) {
-      runButton.disabled = Boolean(proposal.blocked);
-      rejectButton.disabled = false;
+      restoreActions();
       output.textContent = error.message;
       toast(error.message);
     }
