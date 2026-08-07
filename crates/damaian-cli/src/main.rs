@@ -24,7 +24,7 @@ fn usage() -> &'static str {
   damaian config-set admin <key> <value>
   damaian propose-command <repo> <command>
   damaian propose-validations <repo>
-  damaian run-command <proposal-id> --approve
+  damaian run-command <proposal-id> --approve [--always]
   damaian reject-command <proposal-id>
   damaian ask <repo> <prompt>
   damaian propose-edit <repo> <prompt>
@@ -200,17 +200,47 @@ fn run() -> workspace_engine::Result<()> {
             let engine = default_engine()?;
             let proposal_id = require_arg(&args, 1, "<proposal-id>")?;
             let approved = args.iter().any(|arg| arg == "--approve");
+            let always = args.iter().any(|arg| arg == "--always");
+            if always && !approved {
+                return Err(workspace_engine::ClientError::InvalidInput(
+                    "--always requires --approve".to_string(),
+                ));
+            }
+            // Persisted before the run: if the allowlist write fails, the
+            // command must not run either, so the user isn't left thinking a
+            // permanent allowance was granted when it wasn't.
+            //
+            // `default_engine` has no repository overlay applied, so its
+            // approval settings can differ from the ones that classified this
+            // proposal. Re-scope to the proposal's own repository first, or
+            // the eligibility check would be answered against the wrong
+            // policy.
+            let allowlist_path = if always {
+                let proposal = engine.validation_orchestrator.load_proposal(proposal_id)?;
+                let repo_engine = engine_for_repo(&proposal.working_directory)?;
+                Some(
+                    repo_engine
+                        .validation_orchestrator
+                        .allow_command_always(proposal_id, "local_user")?,
+                )
+            } else {
+                None
+            };
             let record =
                 engine
                     .validation_orchestrator
                     .run_proposal(proposal_id, approved, "local_user")?;
             println!(
-                "{{\"proposalId\":\"{}\",\"commandId\":\"{}\",\"exitCode\":{},\"stdoutRef\":\"{}\",\"stderrRef\":\"{}\"}}",
+                "{{\"proposalId\":\"{}\",\"commandId\":\"{}\",\"exitCode\":{},\"stdoutRef\":\"{}\",\"stderrRef\":\"{}\",\"allowlistPath\":{}}}",
                 escape(&record.proposal_id),
                 escape(&record.execution.id),
                 record.execution.exit_code.unwrap_or(-1),
                 escape(&record.stdout_ref.to_string_lossy()),
-                escape(&record.stderr_ref.to_string_lossy())
+                escape(&record.stderr_ref.to_string_lossy()),
+                match &allowlist_path {
+                    Some(path) => format!("\"{}\"", escape(&path.to_string_lossy())),
+                    None => "null".to_string(),
+                }
             );
         }
         "reject-command" => {

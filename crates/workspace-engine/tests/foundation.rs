@@ -2304,6 +2304,8 @@ fn chat_returns_command_approval_when_command_exits_sandbox() {
         .expect("approval-required command should create proposal metadata");
     assert_eq!(proposal.command, "npm test");
     assert!(proposal.requires_approval);
+    // The UI needs this to decide whether to offer "allow always".
+    assert!(proposal.allow_always);
     assert!(result.response.contains("approval"));
     // The task is paused awaiting a human decision, not finished — a prior
     // bug marked it Complete even though the model never got to answer.
@@ -2878,6 +2880,167 @@ fn proposes_detected_validation_commands() {
             .iter()
             .any(|proposal| proposal.command == "npm run lint")
     );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Rebuilds the effective config the way the app would after a repository
+/// overlay was written, but without touching the developer's real user or
+/// admin config, so these assertions don't depend on machine state.
+fn config_with_repository_overlay(repo: &Path) -> Config {
+    Config::load_with_policy_paths(
+        test_config(repo),
+        None,
+        Some(&Config::repository_config_path(repo)),
+        None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn allowing_command_always_writes_repository_config_and_skips_later_approval() {
+    let repo = temp_dir("command-allow-always");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let proposal = engine
+        .validation_orchestrator
+        .propose_command(&repo, "git push", "Publish the branch")
+        .unwrap();
+    assert!(proposal.requires_approval);
+
+    let path = engine
+        .validation_orchestrator
+        .allow_command_always(&proposal.id, "tester")
+        .unwrap();
+
+    assert_eq!(path, Config::repository_config_path(&repo));
+    assert!(fs::read_to_string(&path).unwrap().contains("git push"));
+
+    // The whole point: the same command no longer stops to ask.
+    let policy = CommandPolicy::new(config_with_repository_overlay(&repo));
+    let classification = policy.classify("git push", &repo);
+    assert_eq!(classification.risk, CommandRisk::Low);
+    assert!(!classification.requires_approval);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn allowing_command_always_preserves_existing_allowlist_entries() {
+    // Regression guard: `Config::apply_overlay` replaces `command_allowlist`
+    // rather than merging it, so a repository entry naming only the new
+    // command would silently revoke everything allowed at user scope.
+    let repo = temp_dir("command-allow-always-merge");
+    let config = Config {
+        command_allowlist: vec!["ls -la".to_string()],
+        ..test_config(&repo)
+    };
+    let engine = WorkspaceEngine::new(config);
+    let proposal = engine
+        .validation_orchestrator
+        .propose_command(&repo, "git push", "Publish the branch")
+        .unwrap();
+
+    engine
+        .validation_orchestrator
+        .allow_command_always(&proposal.id, "tester")
+        .unwrap();
+
+    let merged = config_with_repository_overlay(&repo);
+    assert!(merged.command_allowlist.contains(&"ls -la".to_string()));
+    assert!(merged.command_allowlist.contains(&"git push".to_string()));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn allowing_command_always_is_idempotent() {
+    let repo = temp_dir("command-allow-always-repeat");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let proposal = engine
+        .validation_orchestrator
+        .propose_command(&repo, "git push", "Publish the branch")
+        .unwrap();
+
+    engine
+        .validation_orchestrator
+        .allow_command_always(&proposal.id, "tester")
+        .unwrap();
+    engine
+        .validation_orchestrator
+        .allow_command_always(&proposal.id, "tester")
+        .unwrap();
+
+    let entries = config_with_repository_overlay(&repo).command_allowlist;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.as_str() == "git push")
+            .count(),
+        1
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn refuses_to_permanently_allow_blocked_command() {
+    let repo = temp_dir("command-allow-always-blocked");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let proposal = engine
+        .validation_orchestrator
+        .propose_command(&repo, "git reset --hard", "Discard everything")
+        .unwrap();
+    assert!(proposal.blocked);
+
+    let error = engine
+        .validation_orchestrator
+        .allow_command_always(&proposal.id, "tester")
+        .expect_err("blocked commands cannot be permanently allowed");
+    assert!(matches!(error, ClientError::PolicyBlocked(_)));
+    assert!(!Config::repository_config_path(&repo).exists());
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn refuses_to_permanently_allow_shell_control_command() {
+    // An allowlist entry for these could never match, because the
+    // shell-control gate is checked before the allowlist. Offering it would
+    // promise something the policy then refuses to honor.
+    let repo = temp_dir("command-allow-always-shell");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let proposal = engine
+        .validation_orchestrator
+        .propose_command(&repo, "cat notes.txt | grep todo", "Search notes")
+        .unwrap();
+
+    let error = engine
+        .validation_orchestrator
+        .allow_command_always(&proposal.id, "tester")
+        .expect_err("shell-control commands cannot be permanently allowed");
+    assert!(matches!(error, ClientError::PolicyBlocked(_)));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn refuses_to_permanently_allow_when_all_commands_need_approval() {
+    let repo = temp_dir("command-allow-always-strict");
+    let config = Config {
+        require_approval_for_all_commands: true,
+        ..test_config(&repo)
+    };
+    let engine = WorkspaceEngine::new(config);
+    let proposal = engine
+        .validation_orchestrator
+        .propose_command(&repo, "npm test", "Run tests")
+        .unwrap();
+
+    let error = engine
+        .validation_orchestrator
+        .allow_command_always(&proposal.id, "tester")
+        .expect_err("allowlisting cannot satisfy require_approval_for_all_commands");
+    assert!(matches!(error, ClientError::PolicyBlocked(_)));
 
     fs::remove_dir_all(repo).unwrap();
 }

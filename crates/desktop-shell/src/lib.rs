@@ -11,8 +11,9 @@ use workspace_engine::{
     CancelToken, ChatMessage, ChatTurnResult, Config, CurlModelTransport, GeneratedSecretWarning,
     McpClient, McpServerConfig, McpTokenResolver, McpTransport, OpenAICompatibleAdapter,
     ProposedFilePatch, Session, TurnPhase, TurnProgress, TurnSink, WorkspaceEngine,
-    command_approval_prompt, normalize_mcp_server_id, normalize_model_provider,
-    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    allow_always_eligible, command_approval_prompt, normalize_mcp_server_id,
+    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
+    parse_mcp_transport, patch_diff_text,
 };
 
 mod keychain;
@@ -685,12 +686,13 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 200,
                 "application/json",
                 &format!(
-                    "{{\"proposalId\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{}}}",
+                    "{{\"proposalId\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"allowAlways\":{}}}",
                     escape_json(&proposal.id),
                     escape_json(&command_approval_prompt(&proposal)),
                     proposal.risk.as_str(),
                     proposal.requires_approval,
-                    proposal.blocked
+                    proposal.blocked,
+                    allow_always_eligible(&engine.config, &proposal.command, proposal.blocked)
                 ),
             )
         }
@@ -698,6 +700,21 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             let form = parse_form(&request.body);
             let proposal_id = required_form(&form, "proposal_id")?;
             let engine = engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
+
+            // Persist the permanent allowance *before* running. If the write
+            // fails the command must not run either: silently downgrading
+            // "allow always" to a one-time approval would leave the user
+            // believing they'd never be asked again.
+            let allowlist_path = if form.get("always").map(String::as_str) == Some("true") {
+                Some(
+                    engine
+                        .validation_orchestrator
+                        .allow_command_always(&proposal_id, "desktop_user")
+                        .map_err(|error| error.to_string())?,
+                )
+            } else {
+                None
+            };
 
             if engine
                 .chat_orchestrator
@@ -727,12 +744,13 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                     200,
                     "application/json",
                     &format!(
-                        "{{\"proposalId\":\"{}\",\"commandId\":\"{}\",\"exitCode\":{},\"stdout\":\"{}\",\"stderr\":\"{}\"}}",
+                        "{{\"proposalId\":\"{}\",\"commandId\":\"{}\",\"exitCode\":{},\"stdout\":\"{}\",\"stderr\":\"{}\",\"allowlistPath\":{}}}",
                         escape_json(&record.proposal_id),
                         escape_json(&record.execution.id),
                         record.execution.exit_code.unwrap_or(-1),
                         escape_json(&record.execution.stdout),
-                        escape_json(&record.execution.stderr)
+                        escape_json(&record.execution.stderr),
+                        json_optional_string(allowlist_path.as_deref())
                     ),
                 )
             }
@@ -957,6 +975,16 @@ fn run_resume_command_request(
         return Err(format!(
             "No pending chat command for proposal: {proposal_id}"
         ));
+    }
+
+    // Record the permanent allowance before resuming the turn, and fail the
+    // whole request if it can't be written — see `/api/run-command`. Only
+    // meaningful alongside `approved`, since rejecting can't grant anything.
+    if approved && form.get("always").map(String::as_str) == Some("true") {
+        engine
+            .validation_orchestrator
+            .allow_command_always(&proposal_id, "desktop_user")
+            .map_err(|error| error.to_string())?;
     }
 
     let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
@@ -2119,13 +2147,14 @@ fn command_proposal_json(result: &ChatTurnResult) -> String {
         return "null".to_string();
     };
     format!(
-        "{{\"proposalId\":\"{}\",\"command\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{}}}",
+        "{{\"proposalId\":\"{}\",\"command\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"allowAlways\":{}}}",
         escape_json(&proposal.id),
         escape_json(&proposal.command),
         escape_json(&proposal.prompt),
         escape_json(&proposal.risk),
         proposal.requires_approval,
-        proposal.blocked
+        proposal.blocked,
+        proposal.allow_always
     )
 }
 
@@ -2263,6 +2292,15 @@ fn generated_secret_warnings_json(warnings: &[GeneratedSecretWarning]) -> String
         .join(",")
 }
 
+/// Renders an optional path as a JSON string or `null`, so clients can tell
+/// "no allowlist entry was written" apart from "written to the empty path".
+fn json_optional_string(value: Option<&Path>) -> String {
+    match value {
+        Some(path) => format!("\"{}\"", escape_json(&path.to_string_lossy())),
+        None => "null".to_string(),
+    }
+}
+
 fn json_string_array(values: &[String]) -> String {
     values
         .iter()
@@ -2295,10 +2333,10 @@ mod tests {
         Request, ShellOptions, TurnEvent, allowed_cors_origin, api_request_requires_token,
         cached_model_api_key, desktop_settings_config_path, effective_policy_for_repo,
         engine_for_repo, forget_model_api_key, generated_secret_warnings_json, handle_connection,
-        index_html, keychain, parse_form, parse_path_list, percent_decode, relay_turn_events,
-        remember_model_api_key, render_markdown_with_optional_file_links, require_api_token,
-        run_terminal_command, save_config_file, terminal_cwd_for_repo, validate_context_files,
-        validate_working_folder, validate_workspace_path,
+        index_html, json_optional_string, keychain, parse_form, parse_path_list, percent_decode,
+        relay_turn_events, remember_model_api_key, render_markdown_with_optional_file_links,
+        require_api_token, run_terminal_command, save_config_file, terminal_cwd_for_repo,
+        validate_context_files, validate_working_folder, validate_workspace_path,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -2430,6 +2468,17 @@ mod tests {
         assert_eq!(
             json,
             "{\"path\":\"docs/\\\"README\\\".md\",\"count\":2,\"categories\":[\"credential_assignment\"]}"
+        );
+    }
+
+    #[test]
+    fn renders_absent_allowlist_path_as_json_null() {
+        // `null` rather than `""`, so the UI can tell "no permanent allowance
+        // was granted" apart from "granted, path unknown".
+        assert_eq!(json_optional_string(None), "null");
+        assert_eq!(
+            json_optional_string(Some(std::path::Path::new("/tmp/repo/.damaian/config.conf"))),
+            "\"/tmp/repo/.damaian/config.conf\""
         );
     }
 

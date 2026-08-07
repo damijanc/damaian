@@ -1,5 +1,6 @@
 use crate::audit::AuditLog;
 use crate::cancel::CancelToken;
+use crate::command_policy::allow_always_eligible;
 use crate::command_runner::CommandExecution;
 use crate::config::{Config, McpTransport};
 use crate::context_manager::ContextManager;
@@ -131,6 +132,10 @@ pub struct AgentCommandProposal {
     pub risk: String,
     pub requires_approval: bool,
     pub blocked: bool,
+    /// Whether the approval UI may offer "allow always" for this proposal.
+    /// Always false for MCP tool calls, which aren't shell commands and so
+    /// have no `command_allowlist` entry to write.
+    pub allow_always: bool,
 }
 
 /// A patch the model proposed mid-conversation via the `propose_patch` tool
@@ -718,7 +723,7 @@ impl ChatOrchestrator {
                         break (
                             proposal_run,
                             response,
-                            Some(agent_command_proposal(&proposal)),
+                            Some(agent_command_proposal(&self.config, &proposal)),
                             None,
                         );
                     }
@@ -1441,7 +1446,7 @@ fn command_proposal_response(proposal: &CommandProposal) -> String {
     }
 }
 
-fn agent_command_proposal(proposal: &CommandProposal) -> AgentCommandProposal {
+fn agent_command_proposal(config: &Config, proposal: &CommandProposal) -> AgentCommandProposal {
     AgentCommandProposal {
         id: proposal.id.clone(),
         command: proposal.command.clone(),
@@ -1449,6 +1454,7 @@ fn agent_command_proposal(proposal: &CommandProposal) -> AgentCommandProposal {
         risk: proposal.risk.as_str().to_string(),
         requires_approval: proposal.requires_approval,
         blocked: proposal.blocked,
+        allow_always: allow_always_eligible(config, &proposal.command, proposal.blocked),
     }
 }
 
@@ -1477,6 +1483,10 @@ fn mcp_approval_proposal(
         risk: "mcp".to_string(),
         requires_approval: true,
         blocked: false,
+        // An MCP tool call is not a shell command, so `command_allowlist` has
+        // nothing to say about it. Per-server `require_approval` in the MCP
+        // config is the knob for making these stop prompting.
+        allow_always: false,
     }
 }
 
