@@ -572,7 +572,7 @@ pub fn patch_hunk_summary(patch: &ProposedPatch) -> String {
 
 fn edit_system_prompt() -> String {
     format!(
-        "You are a coding assistant that proposes edits only. Return exactly this format:\n{EDIT_FORMAT_HEADER}\nSUMMARY: short summary\nFILE: relative/path.ext\nSTATUS: modified\nCONTENT:\nfull replacement file content\nEND_FILE\nEND_PATCH\nDo not include Markdown fences. Do not include secrets. Use repository-relative paths only."
+        "You are a coding assistant that proposes edits only. Follow repository context sections named `agent_instruction` when they apply; more specific nested AGENTS.md instructions override broader ones, while the user's request and Damaian's safety policy take precedence. Return exactly this format:\n{EDIT_FORMAT_HEADER}\nSUMMARY: short summary\nFILE: relative/path.ext\nSTATUS: modified\nCONTENT:\nfull replacement file content\nEND_FILE\nEND_PATCH\nDo not include Markdown fences. Do not include secrets. Use repository-relative paths only."
     )
 }
 

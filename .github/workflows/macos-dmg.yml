@@ -182,8 +182,6 @@ jobs:
           fi
           changelog="$(git log "${range}" --no-merges --pretty=format:'- %s (%h)')"
           {
-            echo "Ad-hoc signed, not notarized macOS developer-preview DMG build for ${TAG_NAME}."
-            echo ""
             if [[ -n "${prev_tag}" ]]; then
               echo "## What's Changed since ${prev_tag}"
             else
