@@ -2509,6 +2509,140 @@ fn attaches_unique_file_mentions_to_chat_context() {
 }
 
 #[test]
+fn chat_includes_root_agents_md_as_agent_instructions() {
+    let repo = temp_dir("chat-root-agents");
+    write_fixture(
+        &repo,
+        "AGENTS.md",
+        "# Instructions\n\nUse small focused changes.\n",
+    );
+    write_fixture(&repo, "src/lib.rs", "pub fn answer() -> usize { 42 }\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Explain the library.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert!(result.context_files.contains(&"AGENTS.md".to_string()));
+    let request = adapter.requests.first().expect("model request");
+    assert!(
+        request
+            .messages
+            .first()
+            .expect("system prompt")
+            .content
+            .contains("agent_instruction"),
+        "system prompt should explain AGENTS.md precedence"
+    );
+    let prompt = &request.messages[1].content;
+    assert!(prompt.contains("--- agent_instruction: AGENTS.md ---"));
+    assert!(prompt.contains("Use small focused changes."));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn chat_includes_nested_agents_md_from_broad_to_specific_scope() {
+    let repo = temp_dir("chat-nested-agents");
+    write_fixture(&repo, "AGENTS.md", "Root rule.\n");
+    write_fixture(&repo, "crates/AGENTS.md", "Crates rule.\n");
+    write_fixture(
+        &repo,
+        "crates/workspace-engine/AGENTS.md",
+        "Workspace engine rule.\n",
+    );
+    write_fixture(
+        &repo,
+        "crates/workspace-engine/src/lib.rs",
+        "pub fn engine() {}\n",
+    );
+    write_fixture(&repo, "crates/desktop-shell/AGENTS.md", "Shell rule.\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new("Done.");
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Review crates/workspace-engine/src/lib.rs.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert!(result.context_files.contains(&"AGENTS.md".to_string()));
+    assert!(
+        result
+            .context_files
+            .contains(&"crates/AGENTS.md".to_string())
+    );
+    assert!(
+        result
+            .context_files
+            .contains(&"crates/workspace-engine/AGENTS.md".to_string())
+    );
+    assert!(
+        !result
+            .context_files
+            .contains(&"crates/desktop-shell/AGENTS.md".to_string())
+    );
+
+    let prompt = &adapter.requests.first().expect("model request").messages[1].content;
+    let root = prompt.find("agent_instruction: AGENTS.md").unwrap();
+    let crates = prompt.find("agent_instruction: crates/AGENTS.md").unwrap();
+    let engine_scope = prompt
+        .find("agent_instruction: crates/workspace-engine/AGENTS.md")
+        .unwrap();
+    assert!(root < crates);
+    assert!(crates < engine_scope);
+    assert!(!prompt.contains("Shell rule."));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn propose_edit_includes_agents_md_in_edit_prompt() {
+    let repo = temp_dir("edit-agents");
+    write_fixture(&repo, "AGENTS.md", "Keep Rust examples minimal.\n");
+    write_fixture(&repo, "src/lib.rs", "pub fn old() {}\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let response = "DAMAIAN_EDIT_V1\nSUMMARY: Update lib\nFILE: src/lib.rs\nSTATUS: modified\nCONTENT:\npub fn new() {}\nEND_FILE\nEND_PATCH\n";
+    let mut adapter = MockModelAdapter::new(response);
+
+    let proposal = engine
+        .edit_orchestrator
+        .propose_edit(&repo, "Update src/lib.rs", &[], &mut adapter)
+        .unwrap();
+
+    assert!(proposal.context_files.contains(&"AGENTS.md".to_string()));
+    let request = adapter.requests.first().expect("model request");
+    assert!(
+        request
+            .messages
+            .first()
+            .expect("system prompt")
+            .content
+            .contains("agent_instruction")
+    );
+    let prompt = &request.messages[1].content;
+    assert!(prompt.contains("--- agent_instruction: AGENTS.md ---"));
+    assert!(prompt.contains("Keep Rust examples minimal."));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
 fn builds_openai_request_json_and_extracts_stream_tokens() {
     let request = ModelRequest {
         provider: "openai".to_string(),

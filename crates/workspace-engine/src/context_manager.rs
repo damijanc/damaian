@@ -5,8 +5,8 @@ use crate::vector_index::VectorIndexCache;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+const AGENT_INSTRUCTIONS_FILE: &str = "AGENTS.md";
 const PROJECT_RULES: &[&str] = &[
-    "AGENTS.md",
     "README.md",
     "CONTRIBUTING.md",
     ".editorconfig",
@@ -87,20 +87,52 @@ impl ContextManager {
             prompt,
         );
 
-        let mut requested_paths: Vec<(String, bool)> = explicit_paths
+        let requested_paths: Vec<(String, bool)> = explicit_paths
             .iter()
             .map(|path| (path.clone(), true))
             .collect();
-        for path in prompt_file_mentions(prompt, index) {
-            if !requested_paths
-                .iter()
-                .any(|(existing, _)| existing == &path)
-            {
-                requested_paths.push((path, false));
+        let mentioned_paths = prompt_file_mentions(prompt, index);
+        let mut context_paths = requested_paths
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        for path in &mentioned_paths {
+            if !context_paths.iter().any(|existing| existing == path) {
+                context_paths.push(path.clone());
             }
         }
 
-        for (path, allow_outside_root) in &requested_paths {
+        let search_results = index.map(|index| {
+            let mut results = index.keyword_search(prompt, 8);
+            results.extend(if self.enable_semantic_search {
+                VectorIndexCache::semantic_search(&self.data_dir, index, prompt, 8)
+            } else {
+                index.semantic_search(prompt, 8)
+            });
+            results
+        });
+        if let Some(results) = &search_results {
+            for result in results {
+                if !context_paths
+                    .iter()
+                    .any(|existing| existing == &result.path)
+                {
+                    context_paths.push(result.path.clone());
+                }
+            }
+        }
+
+        for path in context_paths.iter().filter(|path| {
+            requested_paths
+                .iter()
+                .any(|(requested, _)| requested == *path)
+                || mentioned_paths.iter().any(|mentioned| mentioned == *path)
+        }) {
+            let allow_outside_root = requested_paths
+                .iter()
+                .find(|(requested, _)| *requested == *path)
+                .map(|(_, allow)| *allow)
+                .unwrap_or(false);
             self.add_file(
                 repository_root.as_ref(),
                 repository_id,
@@ -111,7 +143,22 @@ impl ContextManager {
                 &mut items,
                 &mut token_estimate,
                 token_budget,
-                *allow_outside_root,
+                allow_outside_root,
+            );
+        }
+
+        for instruction_path in agent_instruction_paths(&context_paths) {
+            self.add_file(
+                repository_root.as_ref(),
+                repository_id,
+                task_id,
+                &instruction_path,
+                "agent_instruction",
+                &mut files,
+                &mut items,
+                &mut token_estimate,
+                token_budget,
+                false,
             );
         }
 
@@ -130,13 +177,7 @@ impl ContextManager {
             );
         }
 
-        if let Some(index) = index {
-            let mut results = index.keyword_search(prompt, 8);
-            results.extend(if self.enable_semantic_search {
-                VectorIndexCache::semantic_search(&self.data_dir, index, prompt, 8)
-            } else {
-                index.semantic_search(prompt, 8)
-            });
+        if let Some(results) = search_results {
             for result in results {
                 self.add_file(
                     repository_root.as_ref(),
@@ -234,6 +275,36 @@ fn add_text(
         },
     });
     true
+}
+
+fn agent_instruction_paths(context_paths: &[String]) -> Vec<String> {
+    let mut paths = vec![AGENT_INSTRUCTIONS_FILE.to_string()];
+    for context_path in context_paths {
+        if context_path.starts_with('/') || context_path.contains("../") || context_path == ".." {
+            continue;
+        }
+        let normalized = context_path.trim_start_matches("./").replace('\\', "/");
+        let mut directories = normalized.split('/').collect::<Vec<_>>();
+        directories.pop();
+
+        let mut current = String::new();
+        for directory in directories {
+            if directory.is_empty() {
+                continue;
+            }
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(directory);
+            paths.push(format!("{current}/{AGENT_INSTRUCTIONS_FILE}"));
+        }
+    }
+
+    let mut seen = HashSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
 }
 
 fn prompt_file_mentions(prompt: &str, index: Option<&RepositoryIndex>) -> Vec<String> {

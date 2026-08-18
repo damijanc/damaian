@@ -47,6 +47,12 @@ Use `+ File` above the prompt to pin specific repository files into the next cha
 
 If you name a file in your prompt, such as `USER_GUIDE.md` or `docs/USER_GUIDE.md`, Damaian attempts to include that file in the model context. A filename without a directory must uniquely match one file in the selected repository.
 
+Damaian also reads `AGENTS.md` instruction files when present. A root `AGENTS.md`
+applies across the selected repository. Nested `AGENTS.md` files apply to files
+under their directory, and more specific nested instructions override broader
+ones. These instructions are sent for chat answers and edit proposals, but they
+do not override your request or Damaian's safety policy.
+
 If the assistant needs a local command result to answer a question, it can request one command from Damaian. Sandbox-safe read-only commands, such as `pwd`, `ls`, `git status`, `git diff`, `git log`, and `git show`, run automatically in the selected working folder. Damaian redacts the output and sends it back to the model so it can finish answering.
 
 Commands that cannot run in sandbox mode appear as an approval card in the conversation. Review the command, risk, working directory, and reason, then select `Approve Run` or `Reject`. Destructive commands blocked by policy cannot be approved from the UI.
