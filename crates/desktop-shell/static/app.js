@@ -3275,6 +3275,7 @@ function appendProposals(message, payload, repo) {
 function createPatchPreview(payload, patchRepo) {
   const state = {
     patchId: payload.patchId,
+    initialFileCount: (payload.files || []).length,
     files: (payload.files || []).map((file) => {
       const stats = diffStats(file.diff);
       return {
@@ -3386,6 +3387,13 @@ function createPatchPreview(payload, patchRepo) {
   }
 
   function markFiles(paths, nextState) {
+    if (nextState === "applied") {
+      const appliedPaths = new Set(paths);
+      state.files = state.files.filter((file) => !appliedPaths.has(file.path));
+      render();
+      return;
+    }
+
     state.files.forEach((file) => {
       if (paths.includes(file.path)) {
         file.state = nextState;
@@ -3400,7 +3408,9 @@ function createPatchPreview(payload, patchRepo) {
     if (!state.files.length) {
       const empty = document.createElement("p");
       empty.className = "empty-state";
-      empty.textContent = "No patch files returned.";
+      empty.textContent = state.initialFileCount
+        ? "No patch files left to review."
+        : "No patch files returned.";
       list.append(empty);
     }
 

@@ -118,7 +118,8 @@ returning on the first, so one block names them all.
   error string: the UI cannot render a useful choice from `error.message`.
 - **UI** renders the findings inline under the patch actions with `Apply
   Anyway` / `Cancel`. Accepting re-sends the identical selection with
-  `allow_secrets=1`.
+  `allow_secrets=1`. Once the server confirms applied files, those files leave
+  the patch preview's review list.
 - **CLI** `apply-patch … [--allow-generated-secrets]`. Without the flag it
   prints each finding to stderr plus how to re-run, then applies (and the
   engine block still stops it).
