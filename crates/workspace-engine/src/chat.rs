@@ -19,7 +19,12 @@ use crate::validation::{
     CommandProposal, CommandStore, ValidationOrchestrator, command_approval_prompt,
 };
 use crate::vector_index::VectorIndexCache;
+use crate::web_diagnostics::{
+    WEB_SCENARIO_ACTIONS, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticReport,
+    WebDiagnosticsRunnerHandle,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,12 +64,12 @@ pub struct TurnPhase {
 }
 
 impl TurnPhase {
-    fn new(kind: PhaseKind, label: impl Into<String>, round: u32) -> Self {
+    fn new(kind: PhaseKind, label: impl Into<String>, round: u32, max_rounds: u32) -> Self {
         Self {
             kind,
             label: label.into(),
             round: round + 1,
-            max_rounds: MAX_TOOL_ROUNDS,
+            max_rounds,
         }
     }
 }
@@ -96,8 +101,10 @@ impl TurnSink<'_> {
         (self.on_progress)(TurnProgress::Session(session_id.to_string()));
     }
 
-    fn phase(&mut self, kind: PhaseKind, label: impl Into<String>, round: u32) {
-        (self.on_progress)(TurnProgress::Phase(TurnPhase::new(kind, label, round)));
+    fn phase(&mut self, kind: PhaseKind, label: impl Into<String>, round: u32, max_rounds: u32) {
+        (self.on_progress)(TurnProgress::Phase(TurnPhase::new(
+            kind, label, round, max_rounds,
+        )));
     }
 }
 
@@ -136,6 +143,10 @@ pub struct AgentCommandProposal {
     /// Always false for MCP tool calls, which aren't shell commands and so
     /// have no `command_allowlist` entry to write.
     pub allow_always: bool,
+    /// Whether the UI may offer a session-scoped browser diagnostic allowance.
+    /// This is intentionally separate from command allowlisting: it writes a
+    /// session event, not repository or user config.
+    pub allow_browser_diagnostics_for_session: bool,
 }
 
 /// A patch the model proposed mid-conversation via the `propose_patch` tool
@@ -165,6 +176,17 @@ pub struct ChatTurnResult {
     pub cancelled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ChatTurnOptions {
+    #[serde(default)]
+    pub continue_debugging: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResumeDecisionOptions {
+    pub allow_browser_diagnostics_for_session: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatOrchestrator {
     config: Config,
@@ -181,6 +203,7 @@ pub struct ChatOrchestrator {
     patch_engine: PatchEngine,
     patch_store: PatchStore,
     mcp_token_resolver: Option<McpTokenResolver>,
+    web_diagnostics_runner: Option<WebDiagnosticsRunnerHandle>,
 }
 
 impl ChatOrchestrator {
@@ -218,6 +241,7 @@ impl ChatOrchestrator {
             patch_engine,
             patch_store,
             mcp_token_resolver: None,
+            web_diagnostics_runner: None,
         }
     }
 
@@ -227,6 +251,32 @@ impl ChatOrchestrator {
     /// leave it unset.
     pub fn set_mcp_token_resolver(&mut self, resolver: McpTokenResolver) {
         self.mcp_token_resolver = Some(resolver);
+    }
+
+    pub fn set_web_diagnostics_runner(&mut self, runner: WebDiagnosticsRunnerHandle) {
+        self.web_diagnostics_runner = Some(runner);
+    }
+
+    fn default_tool_round_limit(&self) -> u32 {
+        self.config
+            .agent_max_tool_rounds
+            .clamp(1, ABSOLUTE_TOOL_ROUND_CAP)
+    }
+
+    fn web_debug_tool_round_limit(&self) -> u32 {
+        self.config
+            .agent_web_debug_max_tool_rounds
+            .clamp(self.default_tool_round_limit(), ABSOLUTE_TOOL_ROUND_CAP)
+    }
+
+    fn tool_round_limit(&self, web_debug_mode: bool, options: ChatTurnOptions) -> u32 {
+        if options.continue_debugging {
+            ABSOLUTE_TOOL_ROUND_CAP
+        } else if web_debug_mode {
+            self.web_debug_tool_round_limit()
+        } else {
+            self.default_tool_round_limit()
+        }
     }
 
     /// Builds the per-turn MCP runtime from the active server config, resolving
@@ -257,6 +307,18 @@ impl ChatOrchestrator {
         }
     }
 
+    fn browser_diagnostic_mcp_server_ids(&self) -> Vec<String> {
+        if self.web_diagnostics_runner.is_none() {
+            return Vec::new();
+        }
+        self.config
+            .active_mcp_servers()
+            .into_iter()
+            .filter(|server| looks_like_browser_diagnostics_mcp_server(server))
+            .map(|server| server.id.clone())
+            .collect()
+    }
+
     fn resolve_mcp_token(&self, reference: &str) -> Option<String> {
         let reference = reference.trim();
         if reference.is_empty() {
@@ -271,6 +333,47 @@ impl ChatOrchestrator {
             return None;
         }
         std::env::var(reference).ok()
+    }
+
+    fn run_web_diagnostic_report(&self, call: &WebDiagnosticCall) -> Result<WebDiagnosticReport> {
+        let Some(runner) = &self.web_diagnostics_runner else {
+            return Err(ClientError::InvalidInput(
+                "Browser diagnostics are not configured for this Damaian session.".to_string(),
+            ));
+        };
+        match call.kind {
+            WebDiagnosticKind::Inspect => runner.inspect(call),
+            WebDiagnosticKind::Scenario => runner.run_scenario(call),
+        }
+    }
+
+    fn run_web_diagnostic_call(&self, call: &WebDiagnosticCall) -> String {
+        self.format_web_diagnostic_result(self.run_web_diagnostic_report(call))
+    }
+
+    fn format_web_diagnostic_result(&self, report: Result<WebDiagnosticReport>) -> String {
+        match report {
+            Ok(report) => {
+                let mut text = self.scanner.redact(&report.text).text;
+                if report.is_error && !text.starts_with("Browser diagnostic failed") {
+                    text = format!("Browser diagnostic failed:\n{text}");
+                }
+                if !report.artifacts.is_empty() {
+                    text.push_str("\n\nArtifacts:");
+                    for artifact in report.artifacts {
+                        text.push_str("\n- ");
+                        text.push_str(&artifact.kind);
+                        text.push_str(": ");
+                        text.push_str(&self.scanner.redact(&artifact.path).text);
+                        if let (Some(width), Some(height)) = (artifact.width, artifact.height) {
+                            text.push_str(&format!(" ({width}x{height})"));
+                        }
+                    }
+                }
+                text
+            }
+            Err(error) => format!("Browser diagnostic failed: {error}"),
+        }
     }
 
     /// Signature deliberately unchanged: this is the entry point for
@@ -311,6 +414,28 @@ impl ChatOrchestrator {
         model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
+        self.ask_with_session_with_options(
+            repository_root,
+            prompt,
+            explicit_paths,
+            session_id,
+            model_adapter,
+            sink,
+            ChatTurnOptions::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ask_with_session_with_options(
+        &self,
+        repository_root: impl AsRef<Path>,
+        prompt: &str,
+        explicit_paths: &[String],
+        session_id: Option<&str>,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+        options: ChatTurnOptions,
+    ) -> Result<ChatTurnResult> {
         let repository_root = repository_root.as_ref();
         let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
         let (session, prior_messages) = if let Some(session_id) = session_id {
@@ -348,7 +473,12 @@ impl ChatOrchestrator {
         // Before context assembly, which can take a while on a large repository:
         // a client that stops during it must still know which session it stopped.
         sink.session(&session.id);
-        sink.phase(PhaseKind::Context, "", 0);
+        sink.phase(
+            PhaseKind::Context,
+            "",
+            0,
+            self.tool_round_limit(prompt_enters_web_debug_mode(prompt), options),
+        );
 
         let context = self.context_manager.build_context(
             repository_root,
@@ -374,6 +504,7 @@ impl ChatOrchestrator {
             0,
             model_adapter,
             sink,
+            options,
         )
     }
 
@@ -390,13 +521,68 @@ impl ChatOrchestrator {
         model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
+        self.resume_after_command_decision_with_options(
+            proposal_id,
+            approved,
+            approved_by,
+            model_adapter,
+            sink,
+            ResumeDecisionOptions::default(),
+        )
+    }
+
+    pub fn resume_after_command_decision_with_options(
+        &self,
+        proposal_id: &str,
+        approved: bool,
+        approved_by: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+        decision_options: ResumeDecisionOptions,
+    ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(proposal_id)?;
         let repository_root = PathBuf::from(&pending.repository_root);
         let mut messages = pending.messages;
 
-        // Two kinds of paused action resume through here: a paused MCP tool
-        // call (identified by `mcp_call`) or the original shell-command path.
-        let (assistant_summary, tool_result_content) = if let Some(mcp_call) = &pending.mcp_call {
+        // Three kinds of paused action resume through here: a browser
+        // diagnostic, an MCP tool call, or the original shell-command path.
+        let (assistant_summary, tool_result_content) = if let Some(web_call) =
+            &pending.web_diagnostic_call
+        {
+            let call = web_call.call.clone();
+            let summary = web_diagnostic_summary(&call);
+            let decision = if approved && decision_options.allow_browser_diagnostics_for_session {
+                self.session_store
+                    .allow_browser_diagnostics_for_session(&pending.session.id, approved_by)?;
+                "approved_for_session"
+            } else if approved {
+                "approved_once"
+            } else {
+                "denied"
+            };
+            self.audit_log.record(
+                "browser_diagnostic_approval_decision",
+                &[
+                    ("actor", approved_by.to_string()),
+                    ("sessionId", pending.session.id.clone()),
+                    ("taskId", pending.task.id.clone()),
+                    ("proposalId", proposal_id.to_string()),
+                    ("decision", decision.to_string()),
+                    ("tool", call.name().to_string()),
+                    ("url", call.url.clone()),
+                ],
+            )?;
+            let content = if approved {
+                self.run_web_diagnostic_call(&call)
+            } else {
+                format!(
+                    "The user declined to run `{}` against `{}`. Do not request the same browser diagnostic again; answer using what you already know, noting the limitation if it matters.",
+                    call.name(),
+                    call.url
+                )
+            };
+            (summary, content)
+        } else if let Some(mcp_call) = &pending.mcp_call {
             let summary = mcp_call_summary(&mcp_call.server_id, &mcp_call.tool_name);
             let content = if approved {
                 let mut mcp = self.build_mcp_runtime();
@@ -484,6 +670,7 @@ impl ChatOrchestrator {
             pending.round + 1,
             model_adapter,
             sink,
+            pending.turn_options,
         )
     }
 
@@ -494,14 +681,13 @@ impl ChatOrchestrator {
         self.pending_commands.has(proposal_id)
     }
 
-    /// Runs the model in a loop, letting it request sandboxed commands
-    /// across multiple rounds (e.g. `git log` followed by `git show <sha>`)
-    /// instead of stopping after one. Bounded by `MAX_TOOL_ROUNDS` so a
-    /// provider that never stops requesting commands can't run forever; the
-    /// final round always drops `tools`, forcing a plain answer. If the
-    /// model proposes a command that needs human approval, the in-flight
-    /// conversation state is persisted so the turn can be resumed later via
-    /// [`Self::resume_after_command_decision`].
+    /// Runs the model in a loop, letting it request tools across multiple
+    /// rounds (e.g. `read_git_status` followed by `read_git_diff`) instead of
+    /// stopping after one. Configured round budgets keep a provider that never
+    /// stops requesting tools from running forever; the final round always
+    /// drops `tools`, forcing a plain answer. If a tool needs human approval,
+    /// the in-flight conversation state is persisted so the turn can be
+    /// resumed later via [`Self::resume_after_command_decision`].
     // Threads the full per-turn state (session, task, messages, round) plus the
     // model adapter and token sink through one recursive-ish loop.
     #[allow(clippy::too_many_arguments)]
@@ -515,10 +701,12 @@ impl ChatOrchestrator {
         mut round: u32,
         model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
+        turn_options: ChatTurnOptions,
     ) -> Result<ChatTurnResult> {
         // Per-turn MCP runtime: connects lazily, caches tool lists and
         // connections for this turn, and tears everything down on drop.
         let mut mcp = self.build_mcp_runtime();
+        let browser_mcp_server_ids = self.browser_diagnostic_mcp_server_ids();
         let native_tools = self.config.supports_native_tools().then(|| {
             let mut tools = vec![
                 run_command_tool_definition(),
@@ -528,17 +716,28 @@ impl ChatOrchestrator {
                 read_git_status_tool_definition(),
                 read_git_diff_tool_definition(),
             ];
+            if self.web_diagnostics_runner.is_some() {
+                tools.push(inspect_web_page_tool_definition());
+                tools.push(run_web_scenario_tool_definition());
+            }
             // Best-effort: discovered MCP tools are namespaced (mcp__<server>__<tool>)
             // and appended; a server that fails to connect is simply skipped.
-            tools.extend(mcp.tool_definitions());
+            tools.extend(mcp.tool_definitions().into_iter().filter(|tool| {
+                parse_namespaced_tool_name(&tool.name)
+                    .map(|(server_id, _)| !browser_mcp_server_ids.contains(&server_id))
+                    .unwrap_or(true)
+            }));
             tools
         });
 
         // Whatever the model has produced so far, carried across rounds so a
         // stop between them still has an answer to preserve.
         let mut partial_response = String::new();
+        let mut web_debug_mode =
+            turn_options.continue_debugging || prompt_enters_web_debug_mode(&task.user_prompt);
+        let mut failed_browser_calls = HashMap::new();
 
-        let (final_run, response, command_proposal, patch_proposal) = loop {
+        let (final_run, response, command_proposal, patch_proposal, tool_budget_exhausted) = loop {
             // Checked before each round rather than only mid-stream: stopping
             // here is what saves a whole model call, and it is the only point
             // that catches a stop arriving during context assembly or a tool.
@@ -555,7 +754,8 @@ impl ChatOrchestrator {
                 );
             }
 
-            let force_final = round >= MAX_TOOL_ROUNDS;
+            let max_rounds = self.tool_round_limit(web_debug_mode, turn_options);
+            let force_final = round >= max_rounds;
             let tools = if force_final {
                 None
             } else {
@@ -587,10 +787,11 @@ impl ChatOrchestrator {
                     ("contextFiles", context_files.join(",")),
                     ("tokenEstimate", token_estimate.to_string()),
                     ("toolRound", round.to_string()),
+                    ("toolRoundLimit", max_rounds.to_string()),
                 ],
             )?;
 
-            sink.phase(PhaseKind::Model, "", round);
+            sink.phase(PhaseKind::Model, "", round, max_rounds);
             let model_run =
                 match model_adapter.stream_response(&request, sink.cancel, &mut *sink.on_token) {
                     Ok(model_run) => model_run,
@@ -636,17 +837,18 @@ impl ChatOrchestrator {
             partial_response = redacted.clone();
 
             if force_final {
-                break (model_run, redacted, None, None);
+                if model_output_requests_tool(&model_run, &redacted) {
+                    let response = tool_budget_exhausted_response(max_rounds);
+                    let mut exhausted_run = model_run;
+                    exhausted_run.content = response.clone();
+                    break (exhausted_run, response, None, None, true);
+                }
+                break (model_run, redacted, None, None, false);
             }
 
-            let matched_tool_call: Option<ToolCall> = model_run
-                .tool_calls
-                .iter()
-                .find(|call| tool_action_from_call(call).is_some())
-                .cloned();
-            let tool_action = matched_tool_call
-                .as_ref()
-                .and_then(tool_action_from_call)
+            let (matched_tool_call, decoded_tool_action, tool_decode_error) =
+                first_decodable_tool_action(&model_run.tool_calls);
+            let tool_action = decoded_tool_action
                 .or_else(|| parse_command_request(&redacted).map(ToolAction::Command));
 
             let Some(tool_action) = tool_action else {
@@ -659,9 +861,11 @@ impl ChatOrchestrator {
                 // instead so the model can retry within the remaining rounds —
                 // the same recovery the restricted-path patch arm uses.
                 let Some(undecodable) = model_run.tool_calls.first().cloned() else {
-                    break (model_run, redacted, None, None);
+                    break (model_run, redacted, None, None, false);
                 };
-                let note = undecodable_tool_call_note(&undecodable, model_run.truncated);
+                let note = tool_decode_error.unwrap_or_else(|| {
+                    undecodable_tool_call_note(&undecodable, model_run.truncated)
+                });
                 let summary = format!(
                     "Attempted to call `{}`, but the request could not be decoded.",
                     undecodable.name
@@ -688,7 +892,16 @@ impl ChatOrchestrator {
                 continue;
             };
 
-            sink.phase(PhaseKind::Tool, tool_action_label(&tool_action), round);
+            if matches!(tool_action, ToolAction::WebDiagnostic(_)) {
+                web_debug_mode = true;
+            }
+            let max_rounds = self.tool_round_limit(web_debug_mode, turn_options);
+            sink.phase(
+                PhaseKind::Tool,
+                tool_action_label(&tool_action),
+                round,
+                max_rounds,
+            );
 
             // Each non-terminal arm below produces the (assistant summary,
             // tool result) pair to persist and feed back to the model.
@@ -715,8 +928,10 @@ impl ChatOrchestrator {
                             messages: messages.clone(),
                             matched_tool_call: matched_tool_call.clone(),
                             last_content: redacted.clone(),
+                            turn_options,
                             reasoning_content: model_run.reasoning_content.clone(),
                             mcp_call: None,
+                            web_diagnostic_call: None,
                         })?;
                         let mut proposal_run = model_run;
                         proposal_run.content = response.clone();
@@ -725,6 +940,7 @@ impl ChatOrchestrator {
                             response,
                             Some(agent_command_proposal(&self.config, &proposal)),
                             None,
+                            false,
                         );
                     }
 
@@ -749,7 +965,7 @@ impl ChatOrchestrator {
                             let proposal = agent_patch_proposal(&patch);
                             let mut proposal_run = model_run;
                             proposal_run.content = response.clone();
-                            break (proposal_run, response, None, Some(proposal));
+                            break (proposal_run, response, None, Some(proposal), false);
                         }
                         // Fed back as a tool result rather than aborting the
                         // turn, so the model can see why (e.g. a restricted
@@ -823,6 +1039,69 @@ impl ChatOrchestrator {
                         content,
                     )
                 }
+                ToolAction::WebDiagnostic(call) => {
+                    let call = call.with_context(&session.id, &task.id);
+                    let session_approved = if call.is_low_risk() {
+                        false
+                    } else {
+                        self.session_store
+                            .browser_diagnostics_allowed_for_session(&session.id)?
+                    };
+                    if !call.is_low_risk() && !session_approved {
+                        let proposal_id = create_id("webdiag");
+                        let proposal = web_diagnostic_approval_proposal(&proposal_id, &call);
+                        let response = proposal.prompt.clone();
+                        self.pending_commands.save(&PendingChatTurn {
+                            proposal_id,
+                            session: session.clone(),
+                            task: task.clone(),
+                            repository_root: repository_root.to_string_lossy().to_string(),
+                            context_files: context_files.clone(),
+                            round,
+                            messages: messages.clone(),
+                            matched_tool_call: matched_tool_call.clone(),
+                            last_content: redacted.clone(),
+                            turn_options,
+                            reasoning_content: model_run.reasoning_content.clone(),
+                            mcp_call: None,
+                            web_diagnostic_call: Some(PendingWebDiagnosticCall { call }),
+                        })?;
+                        let mut proposal_run = model_run;
+                        proposal_run.content = response.clone();
+                        break (proposal_run, response, Some(proposal), None, false);
+                    }
+                    if session_approved {
+                        self.audit_log.record(
+                            "browser_diagnostic_session_approval_used",
+                            &[
+                                ("actor", "system".to_string()),
+                                ("sessionId", session.id.clone()),
+                                ("taskId", task.id.clone()),
+                                ("tool", call.name().to_string()),
+                                ("url", call.url.clone()),
+                            ],
+                        )?;
+                    }
+
+                    let signature = web_diagnostic_signature(&call);
+                    let retry_limit = self.config.agent_tool_retry_limit;
+                    let content = if failed_browser_calls
+                        .get(&signature)
+                        .copied()
+                        .unwrap_or_default()
+                        >= retry_limit
+                    {
+                        browser_retry_limit_note(retry_limit)
+                    } else {
+                        let report = self.run_web_diagnostic_report(&call);
+                        let content = self.format_web_diagnostic_result(report);
+                        if browser_tool_result_failed(&content) {
+                            *failed_browser_calls.entry(signature).or_insert(0) += 1;
+                        }
+                        content
+                    };
+                    (web_diagnostic_summary(&call), content)
+                }
                 ToolAction::McpCall {
                     server_id,
                     tool_name,
@@ -852,16 +1131,18 @@ impl ChatOrchestrator {
                             messages: messages.clone(),
                             matched_tool_call: matched_tool_call.clone(),
                             last_content: redacted.clone(),
+                            turn_options,
                             reasoning_content: model_run.reasoning_content.clone(),
                             mcp_call: Some(PendingMcpCall {
                                 server_id,
                                 tool_name,
                                 arguments_json,
                             }),
+                            web_diagnostic_call: None,
                         })?;
                         let mut proposal_run = model_run;
                         proposal_run.content = response.clone();
-                        break (proposal_run, response, Some(proposal), None);
+                        break (proposal_run, response, Some(proposal), None, false);
                     }
 
                     // No approval required: run it now and feed the result back.
@@ -921,6 +1202,8 @@ impl ChatOrchestrator {
             .append_message(&session.id, Some(&task.id), "assistant", &response)?;
         let final_status = if command_proposal.is_some() || patch_proposal.is_some() {
             TaskStatus::WaitingForApproval
+        } else if tool_budget_exhausted {
+            TaskStatus::ToolBudgetExhausted
         } else {
             TaskStatus::Complete
         };
@@ -941,6 +1224,8 @@ impl ChatOrchestrator {
                         "command_approval_required".to_string()
                     } else if patch_proposal.is_some() {
                         "patch_proposal_ready".to_string()
+                    } else if tool_budget_exhausted {
+                        "tool_budget_exhausted".to_string()
                     } else if round > 0 {
                         "complete_with_sandbox_command".to_string()
                     } else {
@@ -1026,6 +1311,8 @@ struct PendingChatTurn {
     messages: Vec<ModelMessage>,
     matched_tool_call: Option<ToolCall>,
     last_content: String,
+    #[serde(default)]
+    turn_options: ChatTurnOptions,
     /// Thinking-mode reasoning behind `matched_tool_call`, which must be
     /// replayed with it when the turn resumes — a pause for human approval
     /// must not lose it, or the resumed request is rejected outright.
@@ -1038,6 +1325,8 @@ struct PendingChatTurn {
     /// keeps older on-disk pending turns (which predate MCP) loadable.
     #[serde(default)]
     mcp_call: Option<PendingMcpCall>,
+    #[serde(default)]
+    web_diagnostic_call: Option<PendingWebDiagnosticCall>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1045,6 +1334,11 @@ struct PendingMcpCall {
     server_id: String,
     tool_name: String,
     arguments_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingWebDiagnosticCall {
+    call: WebDiagnosticCall,
 }
 
 #[derive(Debug, Clone)]
@@ -1097,9 +1391,10 @@ impl PendingCommandStore {
     }
 }
 
-/// Upper bound on how many sandboxed commands the model can chain within a
-/// single user turn before it's forced to answer with what it has.
-const MAX_TOOL_ROUNDS: u32 = 6;
+/// Absolute upper bound for config-driven tool budgets. Raising past this
+/// requires explicit UI work so an agent cannot silently spend a whole session
+/// on repeated tool calls.
+const ABSOLUTE_TOOL_ROUND_CAP: u32 = 16;
 
 fn system_prompt() -> String {
     "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.\n\nIf the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd. The app will run sandbox-safe commands automatically. Commands outside the sandbox require user approval."
@@ -1182,6 +1477,7 @@ enum ToolAction {
     ReadGitDiff {
         staged: bool,
     },
+    WebDiagnostic(WebDiagnosticCall),
     McpCall {
         server_id: String,
         tool_name: String,
@@ -1205,6 +1501,10 @@ fn tool_action_label(action: &ToolAction) -> String {
                 "Reading the working diff".to_string()
             }
         }
+        ToolAction::WebDiagnostic(call) => match call.kind {
+            WebDiagnosticKind::Inspect => format!("Inspecting {}", call.url),
+            WebDiagnosticKind::Scenario => format!("Running web scenario on {}", call.url),
+        },
         ToolAction::McpCall {
             server_id,
             tool_name,
@@ -1272,25 +1572,69 @@ fn read_git_diff_tool_definition() -> ToolDefinition {
     }
 }
 
+fn inspect_web_page_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "inspect_web_page".to_string(),
+        description: "Inspect a web page in a browser diagnostic runner. Use this for local web-app troubleshooting to capture page errors, console output, failed requests, visible DOM summary, accessibility summary, and screenshot metadata without writing files in the repository.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"The page URL to inspect, usually a localhost URL from the user's dev server\"},\"viewport\":{\"type\":\"object\",\"properties\":{\"width\":{\"type\":\"integer\",\"minimum\":320,\"maximum\":4096},\"height\":{\"type\":\"integer\",\"minimum\":240,\"maximum\":2160}},\"required\":[\"width\",\"height\"]},\"wait_ms\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":10000,\"description\":\"How long to wait after navigation before collecting diagnostics\"},\"capture\":{\"type\":\"object\",\"properties\":{\"screenshot\":{\"type\":\"boolean\"},\"dom\":{\"type\":\"boolean\"},\"accessibility\":{\"type\":\"boolean\"},\"network\":{\"type\":\"boolean\"},\"console\":{\"type\":\"boolean\"}}}},\"required\":[\"url\"]}".to_string(),
+    }
+}
+
+fn run_web_scenario_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "run_web_scenario".to_string(),
+        description: "Run a short browser interaction scenario for web-app troubleshooting, then return page errors, console output, failed requests, visible DOM state, and screenshot metadata. Prefer one diagnostic-rich scenario over many small browser calls.".to_string(),
+        parameters_json: format!(
+            "{{\"type\":\"object\",\"properties\":{{\"url\":{{\"type\":\"string\",\"description\":\"The starting page URL\"}},\"viewport\":{{\"type\":\"object\",\"properties\":{{\"width\":{{\"type\":\"integer\",\"minimum\":320,\"maximum\":4096}},\"height\":{{\"type\":\"integer\",\"minimum\":240,\"maximum\":2160}}}},\"required\":[\"width\",\"height\"]}},\"actions\":{{\"type\":\"array\",\"items\":{{\"type\":\"object\",\"properties\":{{\"action\":{{\"type\":\"string\",\"enum\":[{}]}},\"selector\":{{\"type\":\"string\"}},\"value\":{{\"type\":\"string\"}},\"text\":{{\"type\":\"string\"}},\"key\":{{\"type\":\"string\"}},\"ms\":{{\"type\":\"integer\",\"minimum\":0,\"maximum\":10000}},\"path\":{{\"type\":\"string\"}}}},\"required\":[\"action\"]}}}},\"capture\":{{\"type\":\"object\",\"properties\":{{\"screenshot\":{{\"type\":\"boolean\"}},\"dom\":{{\"type\":\"boolean\"}},\"network\":{{\"type\":\"boolean\"}},\"console\":{{\"type\":\"boolean\"}}}}}}}},\"required\":[\"url\",\"actions\"]}}",
+            WEB_SCENARIO_ACTIONS
+                .iter()
+                .map(|action| format!("\"{action}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
+}
+
 /// Recognizes any of the native tools above by name and extracts a
 /// [`ToolAction`] from its arguments. Returns `None` for an unrecognized
 /// tool name or malformed/empty arguments — the caller treats that the same
 /// as the model not having requested a tool at all, matching the existing
 /// (and equally permissive) behavior of `command_request_from_tool_call`.
-fn tool_action_from_call(call: &ToolCall) -> Option<ToolAction> {
+fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
     match call.name.as_str() {
-        "run_command" => command_request_from_tool_call(call).map(ToolAction::Command),
-        "propose_patch" => generated_edit_from_tool_call(call).map(ToolAction::ProposePatch),
+        "run_command" => Ok(command_request_from_tool_call(call).map(ToolAction::Command)),
+        "propose_patch" => Ok(generated_edit_from_tool_call(call).map(ToolAction::ProposePatch)),
         "read_file" => {
-            let arguments: serde_json::Value = serde_json::from_str(&call.arguments_json).ok()?;
-            let path = arguments.get("path")?.as_str()?.trim().to_string();
-            (!path.is_empty()).then_some(ToolAction::ReadFile(path))
+            let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+            else {
+                return Ok(None);
+            };
+            let Some(path) = arguments
+                .get("path")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return Ok(None);
+            };
+            Ok(Some(ToolAction::ReadFile(path.to_string())))
         }
         "search_codebase" => {
-            let arguments: serde_json::Value = serde_json::from_str(&call.arguments_json).ok()?;
-            let query = arguments.get("query")?.as_str()?.trim().to_string();
+            let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+            else {
+                return Ok(None);
+            };
+            let Some(query) = arguments
+                .get("query")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return Ok(None);
+            };
+            let query = query.to_string();
             if query.is_empty() {
-                return None;
+                return Ok(None);
             }
             let semantic =
                 arguments.get("mode").and_then(|value| value.as_str()) == Some("semantic");
@@ -1301,28 +1645,54 @@ fn tool_action_from_call(call: &ToolCall) -> Option<ToolAction> {
                 .filter(|value| *value > 0)
                 .unwrap_or(8)
                 .min(20);
-            Some(ToolAction::SearchCodebase {
+            Ok(Some(ToolAction::SearchCodebase {
                 query,
                 semantic,
                 limit,
-            })
+            }))
         }
-        "read_git_status" => Some(ToolAction::ReadGitStatus),
+        "read_git_status" => Ok(Some(ToolAction::ReadGitStatus)),
         "read_git_diff" => {
             let staged = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
                 .ok()
                 .and_then(|value| value.get("staged").and_then(|value| value.as_bool()))
                 .unwrap_or(false);
-            Some(ToolAction::ReadGitDiff { staged })
+            Ok(Some(ToolAction::ReadGitDiff { staged }))
         }
-        name => {
+        "inspect_web_page" | "run_web_scenario" => {
+            WebDiagnosticCall::from_tool_call(&call.name, &call.arguments_json)
+                .map(|call| call.map(ToolAction::WebDiagnostic))
+        }
+        name => Ok(
             parse_namespaced_tool_name(name).map(|(server_id, tool_name)| ToolAction::McpCall {
                 server_id,
                 tool_name,
                 arguments_json: call.arguments_json.clone(),
-            })
+            }),
+        ),
+    }
+}
+
+fn first_decodable_tool_action(
+    calls: &[ToolCall],
+) -> (Option<ToolCall>, Option<ToolAction>, Option<String>) {
+    for call in calls {
+        match tool_action_from_call(call) {
+            Ok(Some(action)) => return (Some(call.clone()), Some(action), None),
+            Ok(None) => {}
+            Err(error) => {
+                return (
+                    Some(call.clone()),
+                    None,
+                    Some(format!(
+                        "Your `{}` call was rejected before execution: {error}. Retry with well-formed arguments matching the tool schema.",
+                        call.name
+                    )),
+                );
+            }
         }
     }
+    (None, None, None)
 }
 
 /// Feedback for a tool call whose arguments couldn't be decoded. When the
@@ -1455,11 +1825,91 @@ fn agent_command_proposal(config: &Config, proposal: &CommandProposal) -> AgentC
         requires_approval: proposal.requires_approval,
         blocked: proposal.blocked,
         allow_always: allow_always_eligible(config, &proposal.command, proposal.blocked),
+        allow_browser_diagnostics_for_session: false,
     }
 }
 
 fn mcp_call_summary(server_id: &str, tool_name: &str) -> String {
     format!("Called MCP tool `{tool_name}` on server `{server_id}`")
+}
+
+fn web_diagnostic_summary(call: &WebDiagnosticCall) -> String {
+    match call.kind {
+        WebDiagnosticKind::Inspect => format!("Inspected web page `{}`", call.url),
+        WebDiagnosticKind::Scenario => format!("Ran web scenario against `{}`", call.url),
+    }
+}
+
+fn web_diagnostic_signature(call: &WebDiagnosticCall) -> String {
+    format!(
+        "{}:{}",
+        call.name(),
+        normalize_tool_arguments(&call.arguments_json)
+    )
+}
+
+fn normalize_tool_arguments(arguments_json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments_json)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| arguments_json.trim().to_string())
+}
+
+fn browser_tool_result_failed(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.starts_with("browser diagnostic failed")
+        || lower.contains("mcp tool reported an error")
+        || lower.contains("tool call failed")
+}
+
+fn browser_retry_limit_note(retry_limit: u32) -> String {
+    format!(
+        "This browser diagnostic has already failed {retry_limit} time(s) with substantially similar arguments. Change approach: inspect the relevant source files, simplify the scenario, or ask for a different page state instead of repeating the same call."
+    )
+}
+
+fn prompt_enters_web_debug_mode(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    let has_url = lower.contains("http://localhost")
+        || lower.contains("https://localhost")
+        || lower.contains("http://127.0.0.1")
+        || lower.contains("https://127.0.0.1")
+        || lower.contains("http://[::1]")
+        || lower.contains("https://[::1]");
+    let has_web_symptom = [
+        "web page", "web app", "website", "browser", "frontend", "button",
+    ]
+    .iter()
+    .any(|term| lower.contains(term));
+    has_url && has_web_symptom
+}
+
+fn looks_like_browser_diagnostics_mcp_server(server: &crate::config::McpServerConfig) -> bool {
+    let haystack = format!(
+        "{} {} {} {} {}",
+        server.id,
+        server.label,
+        server.command,
+        server.args.join(" "),
+        server.url
+    )
+    .to_ascii_lowercase();
+    haystack.contains("playwright")
+        || haystack.contains("browser")
+        || haystack.contains("web-diagnostic")
+}
+
+fn model_output_requests_tool(model_run: &ModelRun, content: &str) -> bool {
+    !model_run.tool_calls.is_empty()
+        || parse_command_request(content).is_some()
+        || content.contains("DAMAIAN_COMMAND_V1")
+        || content.contains("tool_calls")
+        || content.contains("DSML")
+}
+
+fn tool_budget_exhausted_response(max_rounds: u32) -> String {
+    format!(
+        "This turn reached the configured tool round limit ({max_rounds}) while the model was still trying to call another tool. I stopped instead of treating the raw tool request as a completed answer. Continue debugging with a narrower next request or approve a larger diagnostic budget if available."
+    )
 }
 
 /// Builds the approval proposal surfaced to the user for a pending MCP tool
@@ -1487,6 +1937,54 @@ fn mcp_approval_proposal(
         // nothing to say about it. Per-server `require_approval` in the MCP
         // config is the knob for making these stop prompting.
         allow_always: false,
+        allow_browser_diagnostics_for_session: false,
+    }
+}
+
+fn web_diagnostic_approval_proposal(
+    proposal_id: &str,
+    call: &WebDiagnosticCall,
+) -> AgentCommandProposal {
+    let arguments = truncate_for_prompt(call.arguments_json.trim(), 500);
+    let risk = if call.is_low_risk() {
+        "browser-low"
+    } else if matches!(call.kind, WebDiagnosticKind::Scenario) {
+        "browser-medium"
+    } else {
+        "browser-high"
+    };
+    let origin = url_origin_for_prompt(&call.url);
+    let prompt = format!(
+        "The assistant wants to run `{}` against `{}`.\nTarget origin: `{origin}`\n\nArguments:\n{arguments}\n\nBrowser diagnostics may navigate pages, use current browser state, or interact with forms. Approve to run it, or decline.",
+        call.name(),
+        call.url,
+    );
+    AgentCommandProposal {
+        id: proposal_id.to_string(),
+        command: format!("{} {}", call.name(), call.url),
+        prompt,
+        risk: risk.to_string(),
+        requires_approval: true,
+        blocked: false,
+        allow_always: false,
+        allow_browser_diagnostics_for_session: !call.is_low_risk(),
+    }
+}
+
+fn url_origin_for_prompt(url: &str) -> String {
+    let trimmed = url.trim();
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return trimmed.to_string();
+    };
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if authority.is_empty() {
+        trimmed.to_string()
+    } else {
+        format!("{scheme}://{authority}")
     }
 }
 

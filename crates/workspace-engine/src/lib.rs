@@ -25,13 +25,14 @@ pub mod secret_scanner;
 pub mod session;
 pub mod validation;
 pub mod vector_index;
+pub mod web_diagnostics;
 pub mod workspace_engine;
 
 pub use audit::AuditLog;
 pub use cancel::CancelToken;
 pub use chat::{
-    AgentCommandProposal, AgentPatchProposal, ChatOrchestrator, ChatTurnResult, McpTokenResolver,
-    PhaseKind, TurnPhase, TurnProgress, TurnSink,
+    AgentCommandProposal, AgentPatchProposal, ChatOrchestrator, ChatTurnOptions, ChatTurnResult,
+    McpTokenResolver, PhaseKind, ResumeDecisionOptions, TurnPhase, TurnProgress, TurnSink,
 };
 pub use command_policy::{
     CommandClassification, CommandPolicy, CommandRisk, allow_always_eligible,
@@ -75,5 +76,9 @@ pub use session::{ChatMessage, Session, SessionStore, Task, TaskStatus};
 pub use validation::{
     CommandProposal, CommandRunRecord, CommandStore, ValidationOrchestrator,
     command_approval_prompt,
+};
+pub use web_diagnostics::{
+    WEB_SCENARIO_ACTIONS, WebDiagnosticArtifact, WebDiagnosticCall, WebDiagnosticKind,
+    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
 };
 pub use workspace_engine::WorkspaceEngine;

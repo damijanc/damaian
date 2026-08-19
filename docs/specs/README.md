@@ -1,6 +1,6 @@
 # Feature Specifications
 
-Status: Draft
+Status: Done
 Source: gap analysis against `ai_coding_assistant_specification.md` and `ai_coding_assistant_must_have.md`, and a review of the current implementation (2026-07-17).
 
 These specs describe features that close gaps between the product specification and the current state of the codebase. They are meant to be implemented one at a time, in the order listed. Each spec is self-contained: motivation, current state (with file references), requirements, non-goals, design, and acceptance criteria.
@@ -8,8 +8,9 @@ These specs describe features that close gaps between the product specification 
 Specs 1–6 came from the original gap analysis. Later entries are added as
 design changes come up; #7 came from a reported bug rather than the analysis,
 #8 from a usability gap reported in use, #9 from a release-engineering defect
-found in CI, #10 from approval-prompt fatigue reported in use, and #11 from
-making repository agent instructions first-class.
+found in CI, #10 from approval-prompt fatigue reported in use, #11 from making
+repository agent instructions first-class, and #12 from a web-app
+troubleshooting session where browser runtime evidence was not first-class.
 
 ## Implementation order
 
@@ -26,5 +27,6 @@ making repository agent instructions first-class.
 | 9 | [09_release_quality_gate.md](09_release_quality_gate.md) | **Done.** Release-engineering, not a product gap: tagged builds publish even when Quality is red, because the release workflow has no dependency on it and Quality never runs on tags. Makes Quality a reusable workflow the release pipeline must pass. Independent of #1–#8. |
 | 10 | [10_persistent_command_approval.md](10_persistent_command_approval.md) | **Done.** Usability-driven, with a safety edge: command approval was one-shot only, so the same command prompted on every run and users learned to click through without reading. Adds "allow always", writing the existing `command_allowlist` to repository config. Independent of #1–#9. |
 | 11 | [11_agents_md_support.md](11_agents_md_support.md) | **Done.** Turns the previous root-only generic project-rule handling for `AGENTS.md` into scoped repository instructions, including nested files and prompt precedence. Independent of #1–#10. |
+| 12 | [12_web_app_troubleshooting.md](12_web_app_troubleshooting.md) | **Done.** Adds first-class browser diagnostics for local web-app debugging: page errors, console/network evidence, interaction scenarios, screenshot artifacts, session-scoped diagnostic approval, and safer tool-round handling. Builds on #6, #8, and #10. |
 
 Each spec's status is tracked at the top of its file: `Not started`, `In progress`, or `Done`.

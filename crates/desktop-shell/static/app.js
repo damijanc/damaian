@@ -2651,6 +2651,7 @@ function appendChatMessage(role, content) {
   const body = document.createElement("div");
   body.className = "message-body";
   body.innerHTML = renderMarkdown(content);
+  appendWebDiagnosticArtifacts(body, content);
 
   message.append(label, body);
   $("chat-log").append(message);
@@ -2753,6 +2754,7 @@ function startTurnIndicator(target, onStop) {
 
 function updateChatMessage(target, content) {
   target.body.innerHTML = renderMarkdown(content);
+  appendWebDiagnosticArtifacts(target.body, content);
   delete target.body.dataset.placeholder;
   $("chat-log").scrollTop = $("chat-log").scrollHeight;
 }
@@ -2799,8 +2801,57 @@ async function finalizeChatMessage(target, content) {
   } catch (_error) {
     target.body.innerHTML = renderMarkdown(content);
   }
+  appendWebDiagnosticArtifacts(target.body, content);
   wireFileReferences(target.body, chatRepo);
   $("chat-log").scrollTop = $("chat-log").scrollHeight;
+}
+
+function appendWebDiagnosticArtifacts(container, content) {
+  const paths = webDiagnosticArtifactPaths(content);
+  if (!paths.length) return;
+
+  const grid = document.createElement("div");
+  grid.className = "web-diagnostic-artifacts";
+  paths.forEach((path) => {
+    const item = document.createElement("figure");
+    item.className = "web-diagnostic-artifact";
+
+    const image = document.createElement("img");
+    image.alt = path.split("/").pop() || "Web diagnostic artifact";
+    image.loading = "lazy";
+
+    const caption = document.createElement("figcaption");
+    caption.textContent = path;
+
+    item.append(image, caption);
+    grid.append(item);
+    void loadWebDiagnosticArtifact(image, path);
+  });
+  container.append(grid);
+}
+
+function webDiagnosticArtifactPaths(content) {
+  const paths = new Set();
+  const pattern = /web-diagnostics\/[^\s)"'<>]+?\.(?:png|jpe?g|webp|gif)/gi;
+  for (const match of String(content || "").matchAll(pattern)) {
+    paths.add(match[0].replace(/[.,;:]+$/, ""));
+  }
+  return [...paths];
+}
+
+async function loadWebDiagnosticArtifact(image, path) {
+  try {
+    const chatRepo = repo();
+    const endpoint = `/api/web-diagnostic-artifact?repo=${encodeURIComponent(
+      chatRepo,
+    )}&path=${encodeURIComponent(path)}`;
+    const response = await fetch(apiUrl(endpoint), withApiToken(endpoint));
+    if (!response.ok) throw new Error(response.statusText);
+    const blob = await response.blob();
+    image.src = URL.createObjectURL(blob);
+  } catch (_error) {
+    image.remove();
+  }
 }
 
 // Wires click/Enter on the `.file-reference` elements the server-side
@@ -2840,12 +2891,17 @@ function renderMessages(messages, tasks = []) {
   const cancelledTasks = new Set(
     tasks.filter((task) => task.status === "cancelled").map((task) => task.id),
   );
+  const toolBudgetExhaustedTasks = new Set(
+    tasks.filter((task) => task.status === "tool_budget_exhausted").map((task) => task.id),
+  );
   messages.forEach((message) => {
     const bubble = appendChatMessage(message.role, message.content);
     if (message.role === "assistant") {
       void finalizeChatMessage(bubble, message.content);
       if (message.taskId && cancelledTasks.has(message.taskId)) {
         markMessageStopped(bubble);
+      } else if (message.taskId && toolBudgetExhaustedTasks.has(message.taskId)) {
+        markMessageToolBudgetExhausted(bubble, message.sessionId);
       }
     }
   });
@@ -2860,6 +2916,41 @@ function markMessageStopped(target) {
   label.textContent = "Stopped by you";
   row.append(label);
   target.body.after(row);
+}
+
+function markMessageToolBudgetExhausted(target, sessionId = currentSessionId) {
+  if (target.body.nextElementSibling?.dataset?.state === "incomplete") return;
+  const row = document.createElement("div");
+  row.className = "turn-indicator";
+  row.dataset.state = "incomplete";
+  const label = document.createElement("span");
+  label.className = "turn-indicator-label";
+  label.textContent = "Tool budget exhausted";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "turn-indicator-action";
+  button.textContent = "Continue debugging";
+  button.addEventListener("click", async () => {
+    try {
+      button.disabled = true;
+      await continueDebuggingFromExhausted(sessionId);
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message);
+    }
+  });
+  row.append(label, button);
+  target.body.after(row);
+}
+
+function chatCompletionStatus(payload) {
+  if (payload.taskStatus === "tool_budget_exhausted") {
+    return { label: "Tool budget exhausted", tone: "warn", indicator: "incomplete" };
+  }
+  if (payload.incomplete) {
+    return { label: "Incomplete", tone: "warn", indicator: "incomplete" };
+  }
+  return { label: "Complete", tone: "ok", indicator: "complete" };
 }
 
 function renderContextFiles(files = []) {
@@ -3572,13 +3663,15 @@ function createPatchPreview(payload, patchRepo) {
 }
 
 function createCommandApprovalPreview(proposal, proposalRepo) {
+  const isBrowserDiagnostic =
+    proposal.allowBrowserDiagnosticsForSession || (proposal.risk || "").startsWith("browser");
   const wrapper = document.createElement("div");
   wrapper.className = "command-approval";
 
   const header = document.createElement("div");
   header.className = "command-approval-header";
   const title = document.createElement("strong");
-  title.textContent = "Command approval";
+  title.textContent = isBrowserDiagnostic ? "Browser diagnostic approval" : "Command approval";
   const meta = document.createElement("span");
   meta.textContent = proposal.blocked ? "blocked" : proposal.risk || "review";
   header.append(title, meta);
@@ -3595,7 +3688,11 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
   actions.className = "inline-actions command-approval-actions";
   const runButton = document.createElement("button");
   runButton.type = "button";
-  runButton.textContent = proposal.blocked ? "Blocked" : "Approve Run";
+  runButton.textContent = proposal.blocked
+    ? "Blocked"
+    : isBrowserDiagnostic
+      ? "Approve Once"
+      : "Approve Run";
   runButton.disabled = Boolean(proposal.blocked);
   // The server decides eligibility (blocked, shell-control syntax, and
   // `require_approval_for_all_commands` all rule it out) so the button is
@@ -3604,11 +3701,17 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
   alwaysButton.type = "button";
   alwaysButton.textContent = "Allow Always";
   alwaysButton.title = "Run this command and add it to this project's allowlist so it stops asking";
+  const browserSessionButton = document.createElement("button");
+  browserSessionButton.type = "button";
+  browserSessionButton.textContent = "Allow browser diagnostics for this session";
+  browserSessionButton.title =
+    "Run this diagnostic and allow browser diagnostics in the current chat session";
   const rejectButton = document.createElement("button");
   rejectButton.type = "button";
   rejectButton.textContent = "Reject";
   actions.append(runButton);
   if (proposal.allowAlways) actions.append(alwaysButton);
+  if (proposal.allowBrowserDiagnosticsForSession) actions.append(browserSessionButton);
   actions.append(rejectButton);
 
   const output = document.createElement("pre");
@@ -3618,12 +3721,19 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
   // Approving or rejecting resumes the chat turn that raised this proposal:
   // the model sees the command's result (or the rejection) and streams back
   // an actual answer, same as a normal chat reply.
-  async function resolveCommandProposal(approved, always = false) {
+  async function resolveCommandProposal(approved, options = {}) {
+    const always = options.always === true;
+    const allowBrowserDiagnosticsForSession = options.allowBrowserDiagnosticsForSession === true;
     runButton.disabled = true;
     alwaysButton.disabled = true;
+    browserSessionButton.disabled = true;
     rejectButton.disabled = true;
     output.hidden = false;
-    output.textContent = approved ? "Running…" : "Rejecting…";
+    output.textContent = approved
+      ? isBrowserDiagnostic
+        ? "Running diagnostic…"
+        : "Running…"
+      : "Rejecting…";
 
     const assistantMessage = appendChatMessage("assistant", "");
     let assistantText = "";
@@ -3634,6 +3744,7 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
         proposal_id: proposal.proposalId,
         approved: approved ? "true" : "false",
         always: always ? "true" : "false",
+        allow_browser_diagnostics_for_session: allowBrowserDiagnosticsForSession ? "true" : "false",
       },
       {
         token(token) {
@@ -3652,10 +3763,8 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
             localStorage.setItem(lastSessionStorageKey(), currentSessionId);
           }
           renderContextFiles(payload.contextFiles || []);
-          setChatStatus(
-            payload.incomplete ? "Incomplete" : "Complete",
-            payload.incomplete ? "warn" : "ok",
-          );
+          const status = chatCompletionStatus(payload);
+          setChatStatus(status.label, status.tone);
         },
         error(payload) {
           streamError = new Error(payload.error || "Command resume failed");
@@ -3664,12 +3773,19 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
     );
     if (streamError) throw streamError;
     if (!approved) {
-      output.textContent = "Command rejected — see the assistant's answer above.";
+      output.textContent = isBrowserDiagnostic
+        ? "Diagnostic rejected — see the assistant's answer above."
+        : "Command rejected — see the assistant's answer above.";
+    } else if (allowBrowserDiagnosticsForSession) {
+      output.textContent =
+        "Browser diagnostics allowed for this session — see the assistant's answer above.";
     } else if (always) {
       output.textContent =
         "Command approved and added to this project's allowlist — see the assistant's answer above.";
     } else {
-      output.textContent = "Command approved — see the assistant's answer above.";
+      output.textContent = isBrowserDiagnostic
+        ? "Diagnostic approved — see the assistant's answer above."
+        : "Command approved — see the assistant's answer above.";
     }
     await loadSessions(currentSessionId, false);
   }
@@ -3679,6 +3795,7 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
   function restoreActions() {
     runButton.disabled = Boolean(proposal.blocked);
     alwaysButton.disabled = false;
+    browserSessionButton.disabled = false;
     rejectButton.disabled = false;
   }
 
@@ -3695,8 +3812,19 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
 
   alwaysButton.addEventListener("click", async () => {
     try {
-      await resolveCommandProposal(true, true);
+      await resolveCommandProposal(true, { always: true });
       toast("Command allowed for this project");
+    } catch (error) {
+      restoreActions();
+      output.textContent = error.message;
+      toast(error.message);
+    }
+  });
+
+  browserSessionButton.addEventListener("click", async () => {
+    try {
+      await resolveCommandProposal(true, { allowBrowserDiagnosticsForSession: true });
+      toast("Browser diagnostics allowed for this session");
     } catch (error) {
       restoreActions();
       output.textContent = error.message;
@@ -3999,16 +4127,18 @@ function restorePrompt(text) {
   field.value = text;
 }
 
-async function sendChatPrompt() {
+async function sendChatPrompt(options = {}) {
   let streamError = null;
   // Hoisted out of the `try` so the `catch` can write the failure into the
   // bubble this turn already added to the log.
   let assistantMessage = null;
   let indicator = null;
   let prompt = "";
+  const promptOverride = (options.prompt || "").trim();
+  const restoreSubmittedPrompt = options.restorePrompt !== false && !promptOverride;
   if (chatSubmitting) return;
   try {
-    prompt = $("chat-prompt").value.trim();
+    prompt = promptOverride || $("chat-prompt").value.trim();
     if (!prompt) throw new Error("Prompt is required");
     chatSubmitting = true;
     setComposerBusy(true);
@@ -4038,6 +4168,7 @@ async function sendChatPrompt() {
         prompt,
         session_id: currentSessionId,
         context_files: pinnedContextFiles.join("\n"),
+        continue_debugging: options.continueDebugging ? "true" : "false",
         ...chatModelFormFields(),
       },
       {
@@ -4073,11 +4204,12 @@ async function sendChatPrompt() {
             setChatStatus("Stopped", "warn");
             return;
           }
-          if (indicator) indicator.finish(payload.incomplete ? "incomplete" : "complete");
-          setChatStatus(
-            payload.incomplete ? "Incomplete" : "Complete",
-            payload.incomplete ? "warn" : "ok",
-          );
+          const status = chatCompletionStatus(payload);
+          if (indicator) indicator.finish(status.indicator);
+          if (payload.taskStatus === "tool_budget_exhausted") {
+            markMessageToolBudgetExhausted(assistantMessage, payload.sessionId);
+          }
+          setChatStatus(status.label, status.tone);
         },
         error(payload) {
           streamError = new Error(payload.error || "Model request failed");
@@ -4094,20 +4226,34 @@ async function sendChatPrompt() {
     if (currentTurn?.stopped || error.name === "AbortError") {
       if (indicator) indicator.finish("stopped");
       setChatStatus("Stopped", "warn");
-      restorePrompt(prompt);
+      if (restoreSubmittedPrompt) restorePrompt(prompt);
       await loadSessions(currentSessionId, false);
     } else {
       if (indicator) indicator.finish("failed");
       setChatStatus("Failed", "error");
       toast(error.message);
       renderChatMessageError(assistantMessage, error);
-      restorePrompt(prompt);
+      if (restoreSubmittedPrompt) restorePrompt(prompt);
     }
   } finally {
     chatSubmitting = false;
     currentTurn = null;
     setComposerBusy(false);
   }
+}
+
+async function continueDebuggingFromExhausted(sessionId) {
+  if (chatSubmitting) throw new Error("A turn is already running");
+  if (!sessionId && !currentSessionId) throw new Error("No session selected");
+  if (sessionId && sessionId !== currentSessionId) {
+    await loadSession(sessionId);
+  }
+  await sendChatPrompt({
+    prompt:
+      "Continue debugging from the last tool-budget exhaustion. Use the prior session evidence and continue from the unresolved diagnostic state.",
+    continueDebugging: true,
+    restorePrompt: false,
+  });
 }
 
 $("ask-btn").addEventListener("click", () => {

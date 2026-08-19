@@ -62,6 +62,15 @@ pub struct Config {
     /// embedding model on first use (a one-time network fetch), which the
     /// user should opt into rather than have happen implicitly.
     pub enable_semantic_search: bool,
+    /// Default number of tool/model rounds an agentic chat turn may spend
+    /// before the model is asked to answer with the evidence it has.
+    pub agent_max_tool_rounds: u32,
+    /// Larger budget for turns that are explicitly debugging a web page or
+    /// that call a first-class browser diagnostic tool.
+    pub agent_web_debug_max_tool_rounds: u32,
+    /// How many substantially identical failed tool calls may be retried before
+    /// the model is told to change approach.
+    pub agent_tool_retry_limit: u32,
     pub shell: String,
     pub model_provider: String,
     pub model_name: String,
@@ -295,6 +304,15 @@ impl Config {
         }
         if let Some(value) = overlay.enable_semantic_search {
             self.enable_semantic_search = value;
+        }
+        if let Some(value) = overlay.agent_max_tool_rounds {
+            self.agent_max_tool_rounds = value;
+        }
+        if let Some(value) = overlay.agent_web_debug_max_tool_rounds {
+            self.agent_web_debug_max_tool_rounds = value;
+        }
+        if let Some(value) = overlay.agent_tool_retry_limit {
+            self.agent_tool_retry_limit = value;
         }
         if let Some(value) = overlay.shell {
             self.shell = value;
@@ -597,6 +615,21 @@ impl Config {
             "enable_semantic_search",
             &self.enable_semantic_search.to_string(),
         );
+        push_line(
+            &mut output,
+            "agent_max_tool_rounds",
+            &self.agent_max_tool_rounds.to_string(),
+        );
+        push_line(
+            &mut output,
+            "agent_web_debug_max_tool_rounds",
+            &self.agent_web_debug_max_tool_rounds.to_string(),
+        );
+        push_line(
+            &mut output,
+            "agent_tool_retry_limit",
+            &self.agent_tool_retry_limit.to_string(),
+        );
         push_line(&mut output, "shell", &self.shell);
         push_line(&mut output, "model_provider", &self.model_provider);
         push_line(&mut output, "model_name", &self.model_name);
@@ -650,6 +683,9 @@ impl Default for Config {
             audit_enabled: true,
             audit_retention_days: 90,
             enable_semantic_search: false,
+            agent_max_tool_rounds: 8,
+            agent_web_debug_max_tool_rounds: 12,
+            agent_tool_retry_limit: 2,
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()),
             model_provider: "openai".to_string(),
             model_name: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1".to_string()),
@@ -683,6 +719,9 @@ pub struct ConfigOverlay {
     pub audit_enabled: Option<bool>,
     pub audit_retention_days: Option<u64>,
     pub enable_semantic_search: Option<bool>,
+    pub agent_max_tool_rounds: Option<u32>,
+    pub agent_web_debug_max_tool_rounds: Option<u32>,
+    pub agent_tool_retry_limit: Option<u32>,
     pub shell: Option<String>,
     pub model_provider: Option<String>,
     pub model_name: Option<String>,
@@ -769,6 +808,15 @@ impl ConfigOverlay {
             "audit_enabled" => self.audit_enabled = Some(parse_bool(key, value)?),
             "audit_retention_days" => self.audit_retention_days = Some(parse_u64(key, value)?),
             "enable_semantic_search" => self.enable_semantic_search = Some(parse_bool(key, value)?),
+            "agent_max_tool_rounds" => {
+                self.agent_max_tool_rounds = Some(parse_round_count(key, value)?)
+            }
+            "agent_web_debug_max_tool_rounds" => {
+                self.agent_web_debug_max_tool_rounds = Some(parse_round_count(key, value)?)
+            }
+            "agent_tool_retry_limit" => {
+                self.agent_tool_retry_limit = Some(parse_retry_limit(key, value)?)
+            }
             "shell" => self.shell = Some(value.to_string()),
             "model_provider" => self.model_provider = Some(normalize_model_provider(value)?),
             "model_name" => self.model_name = Some(value.to_string()),
@@ -940,6 +988,19 @@ impl ConfigOverlay {
         }
         if let Some(value) = self.enable_semantic_search {
             push_line(&mut output, "enable_semantic_search", &value.to_string());
+        }
+        if let Some(value) = self.agent_max_tool_rounds {
+            push_line(&mut output, "agent_max_tool_rounds", &value.to_string());
+        }
+        if let Some(value) = self.agent_web_debug_max_tool_rounds {
+            push_line(
+                &mut output,
+                "agent_web_debug_max_tool_rounds",
+                &value.to_string(),
+            );
+        }
+        if let Some(value) = self.agent_tool_retry_limit {
+            push_line(&mut output, "agent_tool_retry_limit", &value.to_string());
         }
         if let Some(value) = &self.shell {
             push_line(&mut output, "shell", value);
@@ -1391,6 +1452,28 @@ fn parse_u64(key: &str, value: &str) -> Result<u64> {
     value
         .parse()
         .map_err(|_| ClientError::InvalidInput(format!("{key} must be an unsigned integer")))
+}
+
+fn parse_round_count(key: &str, value: &str) -> Result<u32> {
+    let parsed = parse_u64(key, value)?;
+    if (1..=16).contains(&parsed) {
+        Ok(parsed as u32)
+    } else {
+        Err(ClientError::InvalidInput(format!(
+            "{key} must be between 1 and 16"
+        )))
+    }
+}
+
+fn parse_retry_limit(key: &str, value: &str) -> Result<u32> {
+    let parsed = parse_u64(key, value)?;
+    if (1..=8).contains(&parsed) {
+        Ok(parsed as u32)
+    } else {
+        Err(ClientError::InvalidInput(format!(
+            "{key} must be between 1 and 8"
+        )))
+    }
 }
 
 fn parse_model_api_key_reference(value: &str) -> Result<String> {

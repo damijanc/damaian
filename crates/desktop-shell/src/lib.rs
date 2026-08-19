@@ -6,14 +6,15 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    CancelToken, ChatMessage, ChatTurnResult, Config, CurlModelTransport, GeneratedSecretWarning,
-    McpClient, McpServerConfig, McpTokenResolver, McpTransport, OpenAICompatibleAdapter,
-    ProposedFilePatch, Session, TurnPhase, TurnProgress, TurnSink, WorkspaceEngine,
-    allow_always_eligible, command_approval_prompt, normalize_mcp_server_id,
-    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
-    parse_mcp_transport, patch_diff_text,
+    CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult, Config, CurlModelTransport,
+    GeneratedSecretWarning, McpClient, McpServerConfig, McpTokenResolver, McpTransport,
+    OpenAICompatibleAdapter, ProposedFilePatch, ResumeDecisionOptions, Session, TurnPhase,
+    TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticReport,
+    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible,
+    command_approval_prompt, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
 };
 
 mod keychain;
@@ -28,7 +29,7 @@ const XTERM_ADDON_FIT_JS: &str = include_str!("../static/xterm-addon-fit.js");
 // `style-src` allows 'unsafe-inline' because xterm.js's DOM renderer injects a
 // <style> element to colour the cursor and size cells; without it the cursor is
 // invisible. `script-src` stays strict ('self' only).
-const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 static MODEL_API_KEY_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 pub fn run_from_env() -> Result<(), String> {
@@ -181,6 +182,16 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 "application/json",
                 &format!("{{\"defaultRepo\":\"{}\"}}", escape_json(&repo)),
             )
+        }
+        ("GET", "/api/web-diagnostic-artifact") => {
+            let repo = request.param("repo").unwrap_or_default();
+            let relative_path = request
+                .param("path")
+                .ok_or_else(|| "path is required".to_string())?;
+            let engine = engine_for_repo(&repo)?;
+            let path = web_diagnostic_artifact_path(&engine.config, &relative_path)?;
+            let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+            write_binary_response(stream, &request, 200, content_type_for_path(&path), &bytes)
         }
         ("GET", "/api/config") => {
             let repo = request.param("repo");
@@ -686,7 +697,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 200,
                 "application/json",
                 &format!(
-                    "{{\"proposalId\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"allowAlways\":{}}}",
+                    "{{\"proposalId\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"allowAlways\":{},\"allowBrowserDiagnosticsForSession\":false}}",
                     escape_json(&proposal.id),
                     escape_json(&command_approval_prompt(&proposal)),
                     proposal.risk.as_str(),
@@ -699,7 +710,8 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/run-command") => {
             let form = parse_form(&request.body);
             let proposal_id = required_form(&form, "proposal_id")?;
-            let engine = engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
+            let mut engine =
+                engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
 
             // Persist the permanent allowance *before* running. If the write
             // fails the command must not run either: silently downgrading
@@ -725,7 +737,12 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 // can actually answer, instead of just executing it in
                 // isolation and leaving the user without a synthesized
                 // response.
-                let result = resume_chat_command(&engine, &proposal_id, true)?;
+                let result = resume_chat_command(
+                    &mut engine,
+                    &proposal_id,
+                    true,
+                    resume_decision_options(&form),
+                )?;
                 write_response(
                     stream,
                     &request,
@@ -758,13 +775,19 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/reject-command") => {
             let form = parse_form(&request.body);
             let proposal_id = required_form(&form, "proposal_id")?;
-            let engine = engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
+            let mut engine =
+                engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
 
             if engine
                 .chat_orchestrator
                 .has_pending_chat_command(&proposal_id)
             {
-                let result = resume_chat_command(&engine, &proposal_id, false)?;
+                let result = resume_chat_command(
+                    &mut engine,
+                    &proposal_id,
+                    false,
+                    ResumeDecisionOptions::default(),
+                )?;
                 write_response(
                     stream,
                     &request,
@@ -964,9 +987,7 @@ fn run_resume_command_request(
     let proposal_id = required_form(form, "proposal_id")?;
     let approved = form.get("approved").map(String::as_str) == Some("true");
     let mut engine = engine_for_repo(&repo)?;
-    engine
-        .chat_orchestrator
-        .set_mcp_token_resolver(mcp_token_resolver());
+    configure_chat_integrations(&mut engine);
 
     if !engine
         .chat_orchestrator
@@ -1007,12 +1028,13 @@ fn run_resume_command_request(
     };
     engine
         .chat_orchestrator
-        .resume_after_command_decision(
+        .resume_after_command_decision_with_options(
             &proposal_id,
             approved,
             "desktop_user",
             &mut adapter,
             &mut sink,
+            resume_decision_options(form),
         )
         .map_err(|error| error.to_string())
 }
@@ -1038,9 +1060,7 @@ fn run_chat_request(
         .map(String::as_str)
         .filter(|value| !value.is_empty());
     let mut engine = engine_for_repo_with_model_options(&repo, form)?;
-    engine
-        .chat_orchestrator
-        .set_mcp_token_resolver(mcp_token_resolver());
+    configure_chat_integrations(&mut engine);
     let context_files = form
         .get("context_files")
         .map(|value| validate_context_files(&engine, &repo, value))
@@ -1065,15 +1085,19 @@ fn run_chat_request(
         on_progress: &mut on_progress,
         cancel,
     };
+    let turn_options = ChatTurnOptions {
+        continue_debugging: form.get("continue_debugging").map(String::as_str) == Some("true"),
+    };
     engine
         .chat_orchestrator
-        .ask_with_session(
+        .ask_with_session_with_options(
             &repo,
             &prompt,
             &context_files,
             session_id,
             &mut adapter,
             &mut sink,
+            turn_options,
         )
         .map_err(|error| error.to_string())
 }
@@ -1084,10 +1108,12 @@ fn run_chat_request(
 /// not SSE), so they're discarded; the final answer still comes back in the
 /// response body.
 fn resume_chat_command(
-    engine: &WorkspaceEngine,
+    engine: &mut WorkspaceEngine,
     proposal_id: &str,
     approved: bool,
+    decision_options: ResumeDecisionOptions,
 ) -> Result<ChatTurnResult, String> {
+    configure_chat_integrations(engine);
     let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
     let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
     let mut adapter = OpenAICompatibleAdapter::with_provider(
@@ -1105,14 +1131,24 @@ fn resume_chat_command(
     };
     engine
         .chat_orchestrator
-        .resume_after_command_decision(
+        .resume_after_command_decision_with_options(
             proposal_id,
             approved,
             "desktop_user",
             &mut adapter,
             &mut sink,
+            decision_options,
         )
         .map_err(|error| error.to_string())
+}
+
+fn resume_decision_options(form: &HashMap<String, String>) -> ResumeDecisionOptions {
+    ResumeDecisionOptions {
+        allow_browser_diagnostics_for_session: form
+            .get("allow_browser_diagnostics_for_session")
+            .map(String::as_str)
+            == Some("true"),
+    }
 }
 
 fn default_engine() -> Result<WorkspaceEngine, String> {
@@ -1169,6 +1205,15 @@ fn mcp_token_resolver() -> McpTokenResolver {
     McpTokenResolver::new(resolve_mcp_token)
 }
 
+fn configure_chat_integrations(engine: &mut WorkspaceEngine) {
+    engine
+        .chat_orchestrator
+        .set_mcp_token_resolver(mcp_token_resolver());
+    if let Some(runner) = browser_diagnostics_runner_for_config(&engine.config) {
+        engine.chat_orchestrator.set_web_diagnostics_runner(runner);
+    }
+}
+
 fn resolve_mcp_token(reference: &str) -> Option<String> {
     let reference = reference.trim();
     if reference.is_empty() {
@@ -1185,6 +1230,257 @@ fn resolve_mcp_token(reference: &str) -> Option<String> {
         return None;
     }
     env::var(reference).ok()
+}
+
+#[derive(Clone)]
+struct McpBrowserDiagnosticsRunner {
+    servers: Vec<BrowserDiagnosticsMcpServer>,
+    data_dir: PathBuf,
+}
+
+#[derive(Clone)]
+struct BrowserDiagnosticsMcpServer {
+    config: McpServerConfig,
+    auth_token: Option<String>,
+}
+
+impl std::fmt::Debug for McpBrowserDiagnosticsRunner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpBrowserDiagnosticsRunner")
+            .field(
+                "servers",
+                &self
+                    .servers
+                    .iter()
+                    .map(|server| server.config.id.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl WebDiagnosticsRunner for McpBrowserDiagnosticsRunner {
+    fn inspect(&self, call: &WebDiagnosticCall) -> workspace_engine::Result<WebDiagnosticReport> {
+        self.call_compatible_tool(&["inspect_page", "inspect_web_page"], call)
+    }
+
+    fn run_scenario(
+        &self,
+        call: &WebDiagnosticCall,
+    ) -> workspace_engine::Result<WebDiagnosticReport> {
+        self.call_compatible_tool(&["run_web_scenario", "run_scenario"], call)
+    }
+}
+
+impl McpBrowserDiagnosticsRunner {
+    fn call_compatible_tool(
+        &self,
+        preferred_tools: &[&str],
+        call: &WebDiagnosticCall,
+    ) -> workspace_engine::Result<WebDiagnosticReport> {
+        let mut last_error = None;
+        for server in &self.servers {
+            let mut client = match McpClient::connect(&server.config, server.auth_token.clone()) {
+                Ok(client) => client,
+                Err(error) => {
+                    last_error = Some(format!("{}: {error}", server.config.id));
+                    continue;
+                }
+            };
+            let tools = match client.list_tools() {
+                Ok(tools) => tools,
+                Err(error) => {
+                    last_error = Some(format!("{}: {error}", server.config.id));
+                    continue;
+                }
+            };
+            let Some(tool_name) = preferred_tools
+                .iter()
+                .find(|candidate| tools.iter().any(|tool| tool.name == **candidate))
+            else {
+                continue;
+            };
+            let arguments = mcp_browser_arguments(tool_name, call)?;
+            match client.call_tool(tool_name, &arguments) {
+                Ok(result) => {
+                    let mut report = WebDiagnosticReport::from_text(result.text, result.is_error);
+                    materialize_browser_artifacts(&mut report, call, &self.data_dir);
+                    report.text = format!(
+                        "{} via MCP server `{}` tool `{}`:\n{}",
+                        if report.is_error {
+                            "Browser diagnostic failed"
+                        } else {
+                            "Browser diagnostic result"
+                        },
+                        server.config.id,
+                        tool_name,
+                        report.text
+                    );
+                    return Ok(report);
+                }
+                Err(error) => {
+                    last_error = Some(format!("{} {tool_name}: {error}", server.config.id));
+                }
+            }
+        }
+        Err(workspace_engine::ClientError::InvalidInput(format!(
+            "No compatible browser diagnostic MCP tool found. Expected one of: {}.{}",
+            preferred_tools.join(", "),
+            last_error
+                .map(|error| format!(" Last error: {error}"))
+                .unwrap_or_default()
+        )))
+    }
+}
+
+fn browser_diagnostics_runner_for_config(config: &Config) -> Option<WebDiagnosticsRunnerHandle> {
+    let servers = config
+        .active_mcp_servers()
+        .into_iter()
+        .filter(|server| looks_like_browser_diagnostics_server(server))
+        .map(|server| BrowserDiagnosticsMcpServer {
+            config: server.clone(),
+            auth_token: if server.transport == McpTransport::Http {
+                resolve_mcp_token(&server.auth_token_env)
+            } else {
+                None
+            },
+        })
+        .collect::<Vec<_>>();
+    (!servers.is_empty()).then(|| {
+        WebDiagnosticsRunnerHandle::new(McpBrowserDiagnosticsRunner {
+            servers,
+            data_dir: config.data_dir.clone(),
+        })
+    })
+}
+
+fn materialize_browser_artifacts(
+    report: &mut WebDiagnosticReport,
+    call: &WebDiagnosticCall,
+    data_dir: &Path,
+) {
+    if report.artifacts.is_empty() {
+        return;
+    }
+    let session_id = call.session_id.as_deref().unwrap_or("unknown-session");
+    let task_id = call.task_id.as_deref().unwrap_or("unknown-task");
+    let run_id = browser_diagnostic_run_id();
+    let relative_dir = PathBuf::from("web-diagnostics")
+        .join(session_id)
+        .join(task_id)
+        .join(run_id);
+    let target_dir = data_dir.join(&relative_dir);
+
+    for artifact in &mut report.artifacts {
+        let source = PathBuf::from(&artifact.path);
+        if !source.is_absolute() || !source.is_file() {
+            continue;
+        }
+        let Some(file_name) = source.file_name() else {
+            continue;
+        };
+        if fs::create_dir_all(&target_dir).is_err() {
+            continue;
+        }
+        let target = target_dir.join(file_name);
+        if fs::copy(&source, &target).is_ok() {
+            let relative = relative_dir.join(file_name);
+            let source_text = artifact.path.clone();
+            artifact.path = relative.to_string_lossy().to_string();
+            report.text = report.text.replace(&source_text, &artifact.path);
+        }
+    }
+}
+
+fn browser_diagnostic_run_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("run-{millis}")
+}
+
+fn web_diagnostic_artifact_path(config: &Config, relative_path: &str) -> Result<PathBuf, String> {
+    let relative = Path::new(relative_path);
+    if relative.is_absolute()
+        || !relative_path.starts_with("web-diagnostics/")
+        || relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("artifact path must be a Damaian web-diagnostics relative path".to_string());
+    }
+    let candidate = config.data_dir.join(relative);
+    let data_dir = config
+        .data_dir
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if !canonical.starts_with(&data_dir) {
+        return Err("artifact path escapes the Damaian data directory".to_string());
+    }
+    Ok(canonical)
+}
+
+fn content_type_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "json" => "application/json; charset=utf-8",
+        "txt" | "log" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn looks_like_browser_diagnostics_server(server: &McpServerConfig) -> bool {
+    let haystack = format!(
+        "{} {} {} {} {}",
+        server.id,
+        server.label,
+        server.command,
+        server.args.join(" "),
+        server.url
+    )
+    .to_ascii_lowercase();
+    haystack.contains("playwright")
+        || haystack.contains("browser")
+        || haystack.contains("web-diagnostic")
+}
+
+fn mcp_browser_arguments(
+    tool_name: &str,
+    call: &WebDiagnosticCall,
+) -> workspace_engine::Result<String> {
+    if tool_name != "run_scenario" || call.kind != WebDiagnosticKind::Scenario {
+        return Ok(call.arguments_json.clone());
+    }
+    let mut value = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+        .map_err(|error| workspace_engine::ClientError::InvalidInput(error.to_string()))?;
+    let Some(object) = value.as_object_mut() else {
+        return Ok(call.arguments_json.clone());
+    };
+    if object.contains_key("steps") {
+        return Ok(value.to_string());
+    }
+    let mut steps = Vec::new();
+    steps.push(serde_json::json!({"action": "goto", "url": call.url}));
+    if let Some(actions) = object.get("actions").and_then(|actions| actions.as_array()) {
+        steps.extend(actions.iter().cloned());
+    }
+    object.insert("steps".to_string(), serde_json::Value::Array(steps));
+    Ok(value.to_string())
 }
 
 /// Builds a one-off [`McpServerConfig`] (plus resolved token) from the MCP
@@ -1907,6 +2203,25 @@ fn write_basic_response(
         .map_err(|error| error.to_string())
 }
 
+fn write_binary_response(
+    stream: &mut TcpStream,
+    request: &Request,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let cors_headers = cors_headers(request);
+    let header = format!(
+        "HTTP/1.1 {status} {}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\ncache-control: no-store\r\ncontent-security-policy: {CONTENT_SECURITY_POLICY}\r\n{cors_headers}connection: close\r\n\r\n",
+        status_text(status),
+        body.len()
+    );
+    stream
+        .write_all(header.as_bytes())
+        .and_then(|_| stream.write_all(body))
+        .map_err(|error| error.to_string())
+}
+
 fn write_preflight_response(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     if allowed_cors_origin(request).is_none() {
         return write_response(
@@ -2147,14 +2462,15 @@ fn command_proposal_json(result: &ChatTurnResult) -> String {
         return "null".to_string();
     };
     format!(
-        "{{\"proposalId\":\"{}\",\"command\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"allowAlways\":{}}}",
+        "{{\"proposalId\":\"{}\",\"command\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"allowAlways\":{},\"allowBrowserDiagnosticsForSession\":{}}}",
         escape_json(&proposal.id),
         escape_json(&proposal.command),
         escape_json(&proposal.prompt),
         escape_json(&proposal.risk),
         proposal.requires_approval,
         proposal.blocked,
-        proposal.allow_always
+        proposal.allow_always,
+        proposal.allow_browser_diagnostics_for_session
     )
 }
 

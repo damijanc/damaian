@@ -25,6 +25,7 @@ pub enum TaskStatus {
     Failed,
     Complete,
     Cancelled,
+    ToolBudgetExhausted,
 }
 
 impl TaskStatus {
@@ -36,6 +37,7 @@ impl TaskStatus {
             Self::Failed => "failed",
             Self::Complete => "complete",
             Self::Cancelled => "cancelled",
+            Self::ToolBudgetExhausted => "tool_budget_exhausted",
         }
     }
 }
@@ -119,7 +121,10 @@ impl SessionStore {
         updated.status = status;
         if matches!(
             updated.status,
-            TaskStatus::Complete | TaskStatus::Failed | TaskStatus::Cancelled
+            TaskStatus::Complete
+                | TaskStatus::Failed
+                | TaskStatus::Cancelled
+                | TaskStatus::ToolBudgetExhausted
         ) {
             updated.completed_at_ms = Some(now_millis());
         }
@@ -251,6 +256,39 @@ impl SessionStore {
             }
         }
         Ok(statuses)
+    }
+
+    pub fn allow_browser_diagnostics_for_session(
+        &self,
+        session_id: &str,
+        approved_by: &str,
+    ) -> Result<()> {
+        self.append_session_event(
+            session_id,
+            "browser_diagnostics_approval_updated",
+            &format!(
+                "{{\"sessionId\":\"{}\",\"allowed\":true,\"approvedBy\":\"{}\"}}",
+                escape_json(session_id),
+                escape_json(approved_by)
+            ),
+        )
+    }
+
+    pub fn browser_diagnostics_allowed_for_session(&self, session_id: &str) -> Result<bool> {
+        let path = self.session_log_path(session_id);
+        let Ok(content) = fs::read_to_string(path) else {
+            return Ok(false);
+        };
+        let mut allowed = false;
+        for line in content.lines() {
+            if !line.contains("\"eventType\":\"browser_diagnostics_approval_updated\"") {
+                continue;
+            }
+            if let Some(value) = json_bool_field(line, "allowed") {
+                allowed = value;
+            }
+        }
+        Ok(allowed)
     }
 
     fn append_session_event(
@@ -389,6 +427,19 @@ fn json_number_field(raw: &str, field: &str) -> Option<u128> {
         .map(|offset| start + offset)
         .unwrap_or(raw.len());
     raw[start..end].parse().ok()
+}
+
+fn json_bool_field(raw: &str, field: &str) -> Option<bool> {
+    let needle = format!("\"{field}\":");
+    let start = raw.find(&needle)? + needle.len();
+    let value = raw[start..].trim_start();
+    if value.starts_with("true") {
+        Some(true)
+    } else if value.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn parse_json_string_at(raw: &str, start: usize) -> Option<String> {

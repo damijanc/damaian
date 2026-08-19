@@ -716,6 +716,40 @@ button:disabled {
   background: #f3f4f4;
 }
 
+.web-diagnostic-artifacts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.web-diagnostic-artifact {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.web-diagnostic-artifact img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+  background: #fff;
+}
+
+.web-diagnostic-artifact figcaption {
+  overflow: hidden;
+  padding: 7px 8px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Failure text for a turn that ended badly. Sits either alone in the bubble or
    directly under whatever the model managed to stream before it broke. */
 .message-error {
@@ -2093,7 +2127,13 @@ button:disabled {
 }
 
 .command-approval-actions {
+  display: flex;
+  flex-wrap: wrap;
   justify-content: flex-start;
+}
+
+.command-approval-actions button {
+  min-width: 0;
 }
 
 .diff-card-header {
@@ -2494,6 +2534,10 @@ button:disabled {
   color: var(--warn);
 }
 
+.turn-indicator[data-state="incomplete"] {
+  color: var(--warn);
+}
+
 .turn-indicator-dot {
   width: 7px;
   height: 7px;
@@ -2507,6 +2551,13 @@ button:disabled {
 }
 
 .turn-indicator-stop {
+  margin-left: auto;
+  min-width: 0;
+  padding: 2px 10px;
+  font-size: 12px;
+}
+
+.turn-indicator-action {
   margin-left: auto;
   min-width: 0;
   padding: 2px 10px;
