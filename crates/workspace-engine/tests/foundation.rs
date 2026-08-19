@@ -4,13 +4,14 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, CancelToken, ChatTurnResult, ClientError, CommandPolicy, CommandRisk, Config,
-    ConfigOverlay, DEFAULT_CONTEXT_TOKEN_BUDGET, IndexCache, McpClient, McpServerConfig,
-    McpTransport, MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage,
-    ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter, PatchEngine, PatchStore,
-    PathPolicy, PhaseKind, ProjectIndexer, ProposedChange, SecretScanner, SessionStore, TaskStatus,
-    ToolCall, TurnProgress, TurnSink, WorkspaceEngine, extract_model_tokens, model_request_json,
-    parse_generated_edit,
+    AuditLog, CancelToken, ChatTurnOptions, ChatTurnResult, ClientError, CommandPolicy,
+    CommandRisk, Config, ConfigOverlay, DEFAULT_CONTEXT_TOKEN_BUDGET, IndexCache, McpClient,
+    McpServerConfig, McpTransport, MockModelAdapter, MockModelTransport, ModelAdapter,
+    ModelMessage, ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter, PatchEngine,
+    PatchStore, PathPolicy, PhaseKind, ProjectIndexer, ProposedChange, ResumeDecisionOptions,
+    SecretScanner, SessionStore, TaskStatus, ToolCall, TurnProgress, TurnSink, WebDiagnosticCall,
+    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
+    extract_model_tokens, model_request_json, parse_generated_edit,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -90,20 +91,34 @@ fn ignores_documentation_placeholder_credentials() {
 }
 
 #[test]
+fn ignores_runtime_credential_assignments_in_source_code() {
+    let scanner = SecretScanner::default();
+    for line in [
+        "const password = passwordInput.value;",
+        "const token = window.localStorage.token;",
+        "password = getPassword();",
+        "client_secret = config.oauth.clientSecret;",
+    ] {
+        assert!(
+            scanner.scan(line).is_empty(),
+            "runtime expression should not be flagged: {line}"
+        );
+    }
+}
+
+#[test]
 fn still_detects_real_credential_assignments_next_to_placeholders() {
     let scanner = SecretScanner::default();
     let findings = scanner.scan(concat!(
         "# Set your key:\n",
         "export API_KEY=\"your-api-key-here\"\n",
         "password = \"hunter2-correct-horse\"\n",
+        "token = unquoted-real-secret\n",
     ));
 
-    assert_eq!(
-        findings.len(),
-        1,
-        "only the real credential should be found"
-    );
+    assert_eq!(findings.len(), 2, "only real credentials should be found");
     assert_eq!(findings[0].category, "credential_assignment");
+    assert_eq!(findings[1].category, "credential_assignment");
 }
 
 #[test]
@@ -1381,6 +1396,34 @@ fn resume_command_decision(
         .unwrap()
 }
 
+fn resume_command_decision_with_options(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    approved: bool,
+    options: ResumeDecisionOptions,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+    };
+    engine
+        .chat_orchestrator
+        .resume_after_command_decision_with_options(
+            proposal_id,
+            approved,
+            "tester",
+            adapter,
+            &mut sink,
+            options,
+        )
+        .unwrap()
+}
+
 /// Runs one turn and returns everything the orchestrator reported through the
 /// progress channel, in order.
 fn collect_turn_progress(
@@ -1890,6 +1933,474 @@ fn native_tool_provider() -> ModelProviderConfig {
         max_output_tokens: None,
         context_token_budget: None,
     }
+}
+
+#[derive(Debug, Clone)]
+struct StaticWebDiagnosticsRunner {
+    text: String,
+    is_error: bool,
+}
+
+impl StaticWebDiagnosticsRunner {
+    fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            is_error: false,
+        }
+    }
+
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            is_error: true,
+        }
+    }
+}
+
+impl WebDiagnosticsRunner for StaticWebDiagnosticsRunner {
+    fn inspect(&self, _call: &WebDiagnosticCall) -> workspace_engine::Result<WebDiagnosticReport> {
+        Ok(WebDiagnosticReport::from_text(
+            self.text.clone(),
+            self.is_error,
+        ))
+    }
+
+    fn run_scenario(
+        &self,
+        _call: &WebDiagnosticCall,
+    ) -> workspace_engine::Result<WebDiagnosticReport> {
+        Ok(WebDiagnosticReport::from_text(
+            self.text.clone(),
+            self.is_error,
+        ))
+    }
+}
+
+#[test]
+fn chat_dispatches_first_class_web_inspection_tool() {
+    let repo = temp_dir("chat-web-inspection");
+    write_fixture(&repo, "README.md", "# Web app\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let mut engine = WorkspaceEngine::new(config);
+    engine
+        .chat_orchestrator
+        .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(
+            StaticWebDiagnosticsRunner::new(
+                "Browser diagnostic failed: 1 page error.\n- pageerror: Cannot access 'game' before initialization\n- Title: Snake Game",
+            ),
+        ));
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            "The browser error is the root cause: `game` is read before initialization."
+                .to_string(),
+        ],
+        vec![
+            vec![ToolCall {
+                id: "call_web".to_string(),
+                name: "inspect_web_page".to_string(),
+                arguments_json: "{\"url\":\"http://localhost:5001/\",\"wait_ms\":1000}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Why does the Register button on http://localhost:5001/ do nothing?",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert!(result.command_proposal.is_none());
+    assert!(result.response.contains("root cause"));
+    assert!(
+        adapter.requests[0]
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|tool| tool.name == "inspect_web_page")
+    );
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    assert!(messages.iter().any(|message| {
+        message.role == "tool"
+            && message
+                .content
+                .contains("Cannot access 'game' before initialization")
+    }));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn web_scenarios_require_approval_before_interaction() {
+    let repo = temp_dir("chat-web-scenario-approval");
+    write_fixture(&repo, "README.md", "# Web app\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let mut engine = WorkspaceEngine::new(config);
+    engine
+        .chat_orchestrator
+        .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(
+            StaticWebDiagnosticsRunner::new("unused"),
+        ));
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![ToolCall {
+            id: "call_web".to_string(),
+            name: "run_web_scenario".to_string(),
+            arguments_json: "{\"url\":\"http://localhost:5001/\",\"actions\":[{\"action\":\"fill\",\"selector\":\"#username\",\"value\":\"tester\"},{\"action\":\"click\",\"selector\":\"#register-btn\"}]}".to_string(),
+        }]],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Try registering on the local web app.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    let proposal = result.command_proposal.expect("scenario needs approval");
+    assert_eq!(proposal.risk, "browser-medium");
+    assert!(proposal.prompt.contains("run_web_scenario"));
+    assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn browser_diagnostic_session_approval_allows_later_scenarios() {
+    let repo = temp_dir("chat-web-session-approval");
+    write_fixture(&repo, "README.md", "# Web app\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let mut engine = WorkspaceEngine::new(config);
+    engine
+        .chat_orchestrator
+        .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(
+            StaticWebDiagnosticsRunner::new("Scenario diagnostics captured."),
+        ));
+    let scenario_call = ToolCall {
+        id: "call_web".to_string(),
+        name: "run_web_scenario".to_string(),
+        arguments_json: "{\"url\":\"http://localhost:5001/\",\"actions\":[{\"action\":\"click\",\"selector\":\"#register-btn\"}]}".to_string(),
+    };
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![scenario_call.clone()]],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Try registering on the local web app.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    let proposal = result.command_proposal.expect("scenario needs approval");
+    assert!(proposal.allow_browser_diagnostics_for_session);
+    let mut resume_adapter =
+        MockModelAdapter::new("The diagnostic shows the button handler is failing.");
+    let resumed = resume_command_decision_with_options(
+        &engine,
+        &proposal.id,
+        true,
+        ResumeDecisionOptions {
+            allow_browser_diagnostics_for_session: true,
+        },
+        &mut resume_adapter,
+    );
+
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+    assert!(
+        engine
+            .session_store
+            .browser_diagnostics_allowed_for_session(&resumed.session.id)
+            .unwrap()
+    );
+    let audit_log =
+        fs::read_to_string(repo.join(".damaian").join("audit").join("events.jsonl")).unwrap();
+    assert!(audit_log.contains("browser_diagnostic_approval_decision"));
+    assert!(audit_log.contains("approved_for_session"));
+
+    let mut second_adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            "The second scenario ran under the session diagnostic approval.".to_string(),
+        ],
+        vec![vec![scenario_call], Vec::new()],
+    );
+    let cancel = CancelToken::new();
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+    };
+    let second = engine
+        .chat_orchestrator
+        .ask_with_session(
+            &repo,
+            "Try that scenario again.",
+            &[],
+            Some(&resumed.session.id),
+            &mut second_adapter,
+            &mut sink,
+        )
+        .unwrap();
+
+    assert!(second.command_proposal.is_none());
+    assert_eq!(second.task.status, TaskStatus::Complete);
+    assert!(second.response.contains("session diagnostic approval"));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn invalid_web_scenario_actions_are_rejected_before_execution() {
+    let repo = temp_dir("chat-web-invalid-action");
+    write_fixture(&repo, "README.md", "# Web app\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let mut engine = WorkspaceEngine::new(config);
+    engine
+        .chat_orchestrator
+        .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(
+            StaticWebDiagnosticsRunner::new("unused"),
+        ));
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            "I'll use the supported wait action instead.".to_string(),
+        ],
+        vec![
+            vec![ToolCall {
+                id: "call_web".to_string(),
+                name: "run_web_scenario".to_string(),
+                arguments_json:
+                    "{\"url\":\"http://localhost:5001/\",\"actions\":[{\"action\":\"wait_for_timeout\",\"ms\":1000}]}"
+                        .to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Debug the local web app.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert!(result.response.contains("supported wait"));
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    assert!(messages.iter().any(|message| {
+        message.role == "tool"
+            && message
+                .content
+                .contains("Unsupported web scenario action `wait_for_timeout`")
+    }));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn repeated_failed_browser_diagnostics_are_stopped() {
+    let repo = temp_dir("chat-web-retry-limit");
+    write_fixture(&repo, "README.md", "# Web app\n");
+    let mut config = test_config(&repo);
+    config.agent_tool_retry_limit = 2;
+    config.model_providers.push(native_tool_provider());
+    let mut engine = WorkspaceEngine::new(config);
+    engine
+        .chat_orchestrator
+        .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(
+            StaticWebDiagnosticsRunner::error("browser unavailable"),
+        ));
+    let call = ToolCall {
+        id: "call_web".to_string(),
+        name: "inspect_web_page".to_string(),
+        arguments_json: "{\"url\":\"http://localhost:5001/\"}".to_string(),
+    };
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            String::new(),
+            String::new(),
+            "I changed approach after the repeated browser diagnostic failed.".to_string(),
+        ],
+        vec![
+            vec![call.clone()],
+            vec![call.clone()],
+            vec![call],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Inspect http://localhost:5001/ in the browser.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert!(result.response.contains("changed approach"));
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.role == "tool" && message.content.contains("Change approach"))
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn tool_round_exhaustion_is_terminal_when_model_still_requests_tools() {
+    let repo = temp_dir("chat-tool-budget-exhausted");
+    write_fixture(&repo, "README.md", "# Tool budget\n");
+    let mut config = test_config(&repo);
+    config.agent_max_tool_rounds = 1;
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            "DAMAIAN_COMMAND_V1\nCOMMAND: pwd\nREASON: Still need another tool.\nEND_COMMAND\n"
+                .to_string(),
+        ],
+        vec![
+            vec![ToolCall {
+                id: "call_status".to_string(),
+                name: "read_git_status".to_string(),
+                arguments_json: "{}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(&repo, "Check status.", &[], &mut adapter, &mut on_token)
+        .unwrap();
+
+    assert_eq!(result.task.status, TaskStatus::ToolBudgetExhausted);
+    assert!(result.response.contains("tool round limit"));
+    assert!(adapter.requests[1].tools.is_none());
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn web_debug_prompts_use_the_web_round_limit() {
+    let repo = temp_dir("chat-web-debug-limit");
+    write_fixture(&repo, "README.md", "# Web debug\n");
+    let mut config = test_config(&repo);
+    config.agent_max_tool_rounds = 8;
+    config.agent_web_debug_max_tool_rounds = 12;
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let (progress, _) = collect_turn_progress(
+        &engine,
+        &repo,
+        "Why does the button on http://localhost:5001/ do nothing?",
+        &mut adapter,
+    );
+
+    let first_model_phase = progress
+        .iter()
+        .find_map(|event| match event {
+            TurnProgress::Phase(phase) if phase.kind == PhaseKind::Model => Some(phase),
+            _ => None,
+        })
+        .expect("a model phase");
+    assert_eq!(first_model_phase.max_rounds, 12);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn continue_debugging_turns_use_the_absolute_round_cap() {
+    let repo = temp_dir("chat-continue-debugging-limit");
+    write_fixture(&repo, "README.md", "# Continue debug\n");
+    let mut config = test_config(&repo);
+    config.agent_max_tool_rounds = 8;
+    config.agent_web_debug_max_tool_rounds = 12;
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new("Continuing.");
+    let cancel = CancelToken::new();
+    let mut progress = Vec::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |event: TurnProgress| progress.push(event);
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+    };
+
+    engine
+        .chat_orchestrator
+        .ask_with_session_with_options(
+            &repo,
+            "Continue debugging.",
+            &[],
+            None,
+            &mut adapter,
+            &mut sink,
+            ChatTurnOptions {
+                continue_debugging: true,
+            },
+        )
+        .unwrap();
+
+    let first_model_phase = progress
+        .iter()
+        .find_map(|event| match event {
+            TurnProgress::Phase(phase) if phase.kind == PhaseKind::Model => Some(phase),
+            _ => None,
+        })
+        .expect("a model phase");
+    assert_eq!(first_model_phase.max_rounds, 16);
+
+    fs::remove_dir_all(repo).unwrap();
 }
 
 #[test]
@@ -3267,6 +3778,34 @@ fn default_config_has_no_configured_model_providers() {
     assert!(config.model_providers.is_empty());
     assert!(!config.to_policy_text().contains("model_provider.openai."));
     assert!(!config.to_policy_text().contains("model_provider.deepseek."));
+}
+
+#[test]
+fn config_overlay_supports_agent_tool_round_limits() {
+    let overlay = ConfigOverlay::parse(
+        "agent_max_tool_rounds=9\n\
+         agent_web_debug_max_tool_rounds=13\n\
+         agent_tool_retry_limit=3\n",
+    )
+    .unwrap();
+
+    let mut config = Config::default();
+    config.apply_overlay(overlay.clone());
+
+    assert_eq!(config.agent_max_tool_rounds, 9);
+    assert_eq!(config.agent_web_debug_max_tool_rounds, 13);
+    assert_eq!(config.agent_tool_retry_limit, 3);
+    let serialized = overlay.to_policy_text();
+    assert!(serialized.contains("agent_max_tool_rounds=9"));
+    assert!(serialized.contains("agent_web_debug_max_tool_rounds=13"));
+    assert!(serialized.contains("agent_tool_retry_limit=3"));
+}
+
+#[test]
+fn config_rejects_out_of_range_tool_round_limits() {
+    assert!(ConfigOverlay::parse("agent_max_tool_rounds=0\n").is_err());
+    assert!(ConfigOverlay::parse("agent_web_debug_max_tool_rounds=17\n").is_err());
+    assert!(ConfigOverlay::parse("agent_tool_retry_limit=0\n").is_err());
 }
 
 #[test]

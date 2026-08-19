@@ -213,21 +213,24 @@ impl SecretScanner {
                     }
                     value_start = skip_spaces(line, value_start + 1);
                     let quote = line.as_bytes().get(value_start).copied();
-                    if matches!(quote, Some(b'"' | b'\'')) {
+                    let quoted = matches!(quote, Some(b'"' | b'\''));
+                    if quoted {
                         value_start += 1;
                     }
                     let value_end = take_while(line, value_start, |byte| {
                         !byte.is_ascii_whitespace() && byte != b'"' && byte != b'\'' && byte != b';'
                     });
+                    let value = &line[value_start..value_end];
                     if value_end - value_start >= 8
-                        && !is_placeholder_value(&line[value_start..value_end])
+                        && !is_placeholder_value(value)
+                        && (quoted || !is_runtime_expression_value(value))
                     {
                         Self::add_finding(
                             findings,
                             "credential_assignment",
                             offset + value_start,
                             offset + value_end,
-                            &line[value_start..value_end],
+                            value,
                         );
                     }
                     cursor = value_end.max(key_end + 1);
@@ -407,6 +410,17 @@ fn is_placeholder_value(value: &str) -> bool {
     }
     let lower = value.to_ascii_lowercase();
     PLACEHOLDER_WORDS.iter().any(|word| lower.contains(word))
+}
+
+fn is_runtime_expression_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.contains('.')
+        || trimmed.contains('(')
+        || trimmed.contains(')')
+        || trimmed.contains('[')
+        || trimmed.contains(']')
+        || trimmed.contains("::")
+        || trimmed.contains("->")
 }
 
 fn take_while(text: &str, start: usize, predicate: impl Fn(u8) -> bool) -> usize {
