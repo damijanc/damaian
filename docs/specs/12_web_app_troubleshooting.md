@@ -1,6 +1,6 @@
 # Feature Spec: First-Class Web App Troubleshooting
 
-Status: Done
+Status: In progress
 Order: 12 of 12
 Related spec sections: `ai_coding_assistant_specification.md` section 7.5
 (tool/function calling), section 7.6 (tool and action orchestrator), section 11
@@ -399,6 +399,12 @@ Implemented:
   tasks, which starts a new turn in the same session with a one-turn budget up
   to the absolute 16-round cap;
 - target-origin display in browser diagnostic approval prompts.
+
+An interaction compatibility regression was identified in the legacy MCP
+`run_scenario` adapter: it forwarded both the Damaian-owned `actions` field and
+the adapter-generated `steps` field. The adapter now sends only `steps` to that
+legacy tool. Spec completion remains pending a real interaction-scenario check
+against the configured browser MCP server.
 
 The native macOS/WebKit runner remains an optional future phase, not a blocker
 for this spec. Phase 1 is intentionally satisfied by the stable

@@ -1471,13 +1471,10 @@ fn mcp_browser_arguments(
     let Some(object) = value.as_object_mut() else {
         return Ok(call.arguments_json.clone());
     };
-    if object.contains_key("steps") {
-        return Ok(value.to_string());
-    }
     let mut steps = Vec::new();
     steps.push(serde_json::json!({"action": "goto", "url": call.url}));
-    if let Some(actions) = object.get("actions").and_then(|actions| actions.as_array()) {
-        steps.extend(actions.iter().cloned());
+    if let Some(serde_json::Value::Array(actions)) = object.remove("actions") {
+        steps.extend(actions);
     }
     object.insert("steps".to_string(), serde_json::Value::Array(steps));
     Ok(value.to_string())
@@ -2649,10 +2646,11 @@ mod tests {
         Request, ShellOptions, TurnEvent, allowed_cors_origin, api_request_requires_token,
         cached_model_api_key, desktop_settings_config_path, effective_policy_for_repo,
         engine_for_repo, forget_model_api_key, generated_secret_warnings_json, handle_connection,
-        index_html, json_optional_string, keychain, parse_form, parse_path_list, percent_decode,
-        relay_turn_events, remember_model_api_key, render_markdown_with_optional_file_links,
-        require_api_token, run_terminal_command, save_config_file, terminal_cwd_for_repo,
-        validate_context_files, validate_working_folder, validate_workspace_path,
+        index_html, json_optional_string, keychain, mcp_browser_arguments, parse_form,
+        parse_path_list, percent_decode, relay_turn_events, remember_model_api_key,
+        render_markdown_with_optional_file_links, require_api_token, run_terminal_command,
+        save_config_file, terminal_cwd_for_repo, validate_context_files, validate_working_folder,
+        validate_workspace_path,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -2734,6 +2732,54 @@ mod tests {
         assert!(
             cancel.is_cancelled(),
             "a dead client must stop the turn, not just stop the writes"
+        );
+    }
+
+    #[test]
+    fn legacy_run_scenario_receives_steps_without_actions() {
+        let call = workspace_engine::WebDiagnosticCall::from_tool_call(
+            "run_web_scenario",
+            r##"{
+                "url":"http://localhost:5001/",
+                "viewport":{"width":1280,"height":720},
+                "actions":[
+                    {"action":"fill","selector":"#username","value":"tester"},
+                    {"action":"click","selector":"#register"}
+                ],
+                "capture":{"screenshot":true}
+            }"##,
+        )
+        .expect("valid scenario")
+        .expect("web diagnostic call");
+
+        let arguments = mcp_browser_arguments("run_scenario", &call).expect("arguments");
+        let value: serde_json::Value = serde_json::from_str(&arguments).expect("JSON arguments");
+
+        assert!(value.get("actions").is_none(), "got {value}");
+        assert_eq!(
+            value["steps"],
+            serde_json::json!([
+                {"action":"goto","url":"http://localhost:5001/"},
+                {"action":"fill","selector":"#username","value":"tester"},
+                {"action":"click","selector":"#register"}
+            ])
+        );
+        assert_eq!(value["viewport"]["width"], 1280);
+        assert_eq!(value["capture"]["screenshot"], true);
+    }
+
+    #[test]
+    fn native_run_web_scenario_keeps_the_damaian_actions_contract() {
+        let call = workspace_engine::WebDiagnosticCall::from_tool_call(
+            "run_web_scenario",
+            r##"{"url":"http://localhost:5001/","actions":[{"action":"click","selector":"#register"}]}"##,
+        )
+        .expect("valid scenario")
+        .expect("web diagnostic call");
+
+        assert_eq!(
+            mcp_browser_arguments("run_web_scenario", &call).expect("arguments"),
+            call.arguments_json
         );
     }
 
