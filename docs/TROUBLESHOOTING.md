@@ -517,6 +517,24 @@ test button in MCP settings. Then check:
 For stdio servers the `command` must be resolvable in the app's environment,
 which for a GUI launch is not your shell's `PATH` — prefer an absolute path.
 
+### Docker command problems
+
+Docker commands are intentionally approval-gated. Use
+`classify-command "docker ps"` or `propose-command /path/to/repo "docker ps"`
+from the CLI to inspect policy decisions without a model call.
+
+If an approved Docker command fails:
+
+- `docker` may be missing from the GUI app environment. A Finder-launched macOS
+  app does not necessarily inherit your Terminal `PATH`; use an absolute Docker
+  executable path or launch Damaian from a shell in development.
+- Docker Desktop or the Docker daemon may not be running or reachable.
+- `docker compose` requires the Compose plugin. If the machine uses the legacy
+  binary, try `docker-compose`.
+- Check audit events `command_proposed`, `command_executed`, and
+  `stored_command_executed` for the proposed command, risk, exit status, and
+  output references.
+
 ### Semantic search does nothing
 
 `enable_semantic_search` is off by default because enabling it downloads an

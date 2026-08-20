@@ -9,8 +9,10 @@ Specs 1–6 came from the original gap analysis. Later entries are added as
 design changes come up; #7 came from a reported bug rather than the analysis,
 #8 from a usability gap reported in use, #9 from a release-engineering defect
 found in CI, #10 from approval-prompt fatigue reported in use, #11 from making
-repository agent instructions first-class, and #12 from a web-app
-troubleshooting session where browser runtime evidence was not first-class.
+repository agent instructions first-class, #12 from a web-app troubleshooting
+session where browser runtime evidence was not first-class, and #13 from a real
+session where Docker was needed but the assistant asked the user to run the
+command manually.
 
 ## Implementation order
 
@@ -28,5 +30,6 @@ troubleshooting session where browser runtime evidence was not first-class.
 | 10 | [10_persistent_command_approval.md](10_persistent_command_approval.md) | **Done.** Usability-driven, with a safety edge: command approval was one-shot only, so the same command prompted on every run and users learned to click through without reading. Adds "allow always", writing the existing `command_allowlist` to repository config. Independent of #1–#9. |
 | 11 | [11_agents_md_support.md](11_agents_md_support.md) | **Done.** Turns the previous root-only generic project-rule handling for `AGENTS.md` into scoped repository instructions, including nested files and prompt precedence. Independent of #1–#10. |
 | 12 | [12_web_app_troubleshooting.md](12_web_app_troubleshooting.md) | **In progress.** Adds first-class browser diagnostics for local web-app debugging: page errors, console/network evidence, interaction scenarios, screenshot artifacts, session-scoped diagnostic approval, and safer tool-round handling. Builds on #6, #8, and #10. |
+| 13 | [13_docker_command_support.md](13_docker_command_support.md) | **Done.** Makes Docker a first-class approval-gated command family with Docker-specific risk messaging and diagnostics, while keeping automatic execution limited to sandbox-safe read-only commands. Builds on #3 and #10. |
 
 Each spec's status is tracked at the top of its file: `Not started`, `In progress`, or `Done`.

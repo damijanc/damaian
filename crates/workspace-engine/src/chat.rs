@@ -1397,7 +1397,7 @@ impl PendingCommandStore {
 const ABSOLUTE_TOOL_ROUND_CAP: u32 = 16;
 
 fn system_prompt() -> String {
-    "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.\n\nIf the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd. The app will run sandbox-safe commands automatically. Commands outside the sandbox require user approval."
+    "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.\n\nIf the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it."
         .to_string()
 }
 
@@ -1521,7 +1521,7 @@ fn tool_action_label(action: &ToolAction) -> String {
 fn run_command_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "run_command".to_string(),
-        description: "Run a read-only local shell command (e.g. git status, git log, git diff, ls, pwd) in the repository sandbox to help answer the user's question.".to_string(),
+        description: "Request a local shell command in the selected repository. Damaian runs sandbox-safe read-only commands automatically and pauses for user approval before running commands with side effects, network access, Docker access, shell control, or unknown risk.".to_string(),
         parameters_json: "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The shell command to run\"},\"reason\":{\"type\":\"string\",\"description\":\"Why this command is needed\"}},\"required\":[\"command\"]}".to_string(),
     }
 }
