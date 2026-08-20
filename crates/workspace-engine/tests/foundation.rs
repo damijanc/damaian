@@ -432,6 +432,66 @@ fn classifies_command_risk() {
 }
 
 #[test]
+fn classifies_docker_commands_as_approval_gated_high_risk() {
+    let policy = CommandPolicy::new(Config {
+        data_dir: PathBuf::from("/tmp/damaian-test"),
+        require_approval_for_risky_commands: false,
+        ..Config::default()
+    });
+    let root = Path::new("/tmp/damaian-test");
+
+    for command in ["docker ps", "docker compose up -d", "docker-compose ps"] {
+        let classification = policy.classify(command, root);
+        assert_eq!(classification.risk, CommandRisk::High);
+        assert!(classification.requires_approval);
+        assert!(classification.may_use_network);
+        assert!(
+            classification
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("Docker command may start containers"))
+        );
+        assert!(classification.expected_effects.contains("Docker daemon"));
+    }
+}
+
+#[test]
+fn docker_blocklist_takes_precedence() {
+    let policy = CommandPolicy::new(Config {
+        data_dir: PathBuf::from("/tmp/damaian-test"),
+        command_blocklist: vec!["docker".to_string()],
+        ..Config::default()
+    });
+    let root = Path::new("/tmp/damaian-test");
+
+    let classification = policy.classify("docker ps", root);
+
+    assert_eq!(classification.risk, CommandRisk::Blocked);
+    assert!(classification.blocked);
+    assert!(classification.requires_approval);
+}
+
+#[test]
+fn docker_allowlist_is_exact_command_only() {
+    let policy = CommandPolicy::new(Config {
+        data_dir: PathBuf::from("/tmp/damaian-test"),
+        command_allowlist: vec!["docker ps".to_string()],
+        ..Config::default()
+    });
+    let root = Path::new("/tmp/damaian-test");
+
+    let allowed = policy.classify("docker ps", root);
+    assert_eq!(allowed.risk, CommandRisk::Low);
+    assert!(!allowed.requires_approval);
+
+    for command in ["docker ps -a", "docker compose ps"] {
+        let classification = policy.classify(command, root);
+        assert_eq!(classification.risk, CommandRisk::High);
+        assert!(classification.requires_approval);
+    }
+}
+
+#[test]
 fn allowlist_does_not_bypass_shell_control_detection() {
     let policy = CommandPolicy::new(Config {
         data_dir: PathBuf::from("/tmp/damaian-test"),
@@ -1784,6 +1844,51 @@ fn chat_dispatches_native_tool_call_when_provider_supports_it() {
 
     assert!(result.command_proposal.is_none());
     assert!(result.response.contains("native tool call"));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn native_run_command_tool_describes_approval_gated_commands() {
+    let repo = temp_dir("chat-native-command-tool-description");
+    write_fixture(&repo, "README.md", "# Chat native tool description test\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new("No local command is needed.");
+    let mut on_token = |_token: &str| {};
+
+    engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Explain this repository.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    let tools = adapter.requests[0]
+        .tools
+        .as_ref()
+        .expect("native tools should be offered");
+    let command_tool = tools
+        .iter()
+        .find(|tool| tool.name == "run_command")
+        .expect("run_command tool should be present");
+    assert!(command_tool.description.contains("user approval"));
+    assert!(command_tool.description.contains("Docker access"));
+    assert!(
+        !command_tool
+            .description
+            .contains("read-only local shell command")
+    );
+    assert!(
+        adapter.requests[0].messages[0]
+            .content
+            .contains("Docker access")
+    );
 
     fs::remove_dir_all(repo).unwrap();
 }

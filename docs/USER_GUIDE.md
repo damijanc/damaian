@@ -57,6 +57,8 @@ If the assistant needs a local command result to answer a question, it can reque
 
 Commands that cannot run in sandbox mode appear as an approval card in the conversation. Review the command, risk, working directory, and reason, then select `Approve Run` or `Reject`. Destructive commands blocked by policy cannot be approved from the UI.
 
+Docker commands, including `docker ps`, `docker compose ...`, and `docker-compose ...`, are approval-gated by default. They can inspect or change a privileged local daemon, use the network, start background services, mount host paths, expose ports, and mutate images or volumes, so Damaian never treats them as automatically sandbox-safe.
+
 `Allow Always` runs the command and adds it to `command_allowlist` in `.damaian/config.conf` inside the selected repository, so that command stops asking. The allowance covers the exact command only: allowing `npm run test:unit` does not allow `npm run test:unit --watch`, and allowing `git push` does not allow `git push --force`. It applies to that repository alone. Remove an entry by editing `.damaian/config.conf`.
 
 `Allow Always` is not offered for commands blocked by policy, for commands containing shell control syntax such as `|`, `&&`, or `>`, or when `require_approval_for_all_commands` is set — in each of those cases an allowlist entry would have no effect, so the app does not offer to write one.

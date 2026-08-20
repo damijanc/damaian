@@ -144,6 +144,22 @@ impl CommandPolicy {
             };
         }
 
+        if is_docker_command(&normalized) {
+            return CommandClassification {
+                command: normalized,
+                risk: CommandRisk::High,
+                blocked: false,
+                requires_approval: true,
+                reasons: vec![
+                    "Docker command may start containers, mount host paths, mutate images or volumes, expose ports, or use the network".to_string(),
+                ],
+                expected_effects:
+                    "Potential Docker daemon, workspace, network, or background-service effects"
+                        .to_string(),
+                may_use_network: true,
+            };
+        }
+
         if is_high_risk_command(&normalized) {
             return CommandClassification {
                 command: normalized,
@@ -306,6 +322,13 @@ fn is_validation_command(command: &str) -> bool {
         || command.starts_with("cargo test")
 }
 
+fn is_docker_command(command: &str) -> bool {
+    command == "docker"
+        || command.starts_with("docker ")
+        || command == "docker-compose"
+        || command.starts_with("docker-compose ")
+}
+
 fn is_high_risk_command(command: &str) -> bool {
     command.contains("npm install")
         || command.contains("npm i ")
@@ -341,6 +364,8 @@ fn may_use_network(command: &str) -> bool {
         "pnpm",
         "yarn",
         "pip",
+        "docker",
+        "docker-compose",
         "git pull",
         "git push",
         "git fetch",
