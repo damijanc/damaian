@@ -19,3 +19,4 @@ tmp/
 *.app/
 .claude/
 docs/devtalk*
+docs/roadmap*
