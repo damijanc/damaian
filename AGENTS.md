@@ -32,7 +32,7 @@ no framework, no bundler, no build step.
 
 ## Before you change a feature
 
-`docs/specs/` is the source of truth for the six implemented features, and each
+`docs/specs/` is the source of truth for the implemented features, and each
 spec carries a `Status:` line. Read the relevant spec before changing behaviour
 it covers, and update the spec when you change the design — not just the code.
 `docs/specs/README.md` lists them in implementation order.
@@ -69,7 +69,7 @@ Notes:
 
 ## Testing
 
-- 178 tests pass by default: mostly inline `#[test]` modules, plus integration
+- 232 tests pass by default: mostly inline `#[test]` modules, plus integration
   tests in `crates/workspace-engine/tests/`. Add tests next to the code you
   change.
 - Two tests are `#[ignore]`d because they have real side effects (one opens
