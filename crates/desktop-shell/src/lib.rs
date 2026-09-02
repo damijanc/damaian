@@ -813,6 +813,38 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 )
             }
         }
+        ("GET", "/api/repository-config-review") => {
+            let repo = request.param("repo").unwrap_or_default();
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &repository_config_review_json(&repo)?,
+            )
+        }
+        ("POST", "/api/repository-config-allowlist") => {
+            let form = parse_form(&request.body);
+            let repo = required_form(&form, "repo")?;
+            // Pipe-separated, matching how `command_allowlist` is written on
+            // disk — which is also why an entry can never contain a pipe.
+            let keep = form
+                .get("keep")
+                .map(String::as_str)
+                .unwrap_or_default()
+                .split('|')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &resolve_repository_allowlist_migration(&repo, &keep)?,
+            )
+        }
         ("POST", "/api/config-set") => {
             let form = parse_form(&request.body);
             let scope = form.get("scope").map(String::as_str);
@@ -1937,6 +1969,75 @@ fn update_config_overlay(
     Ok(path)
 }
 
+/// What the selected repository's config asked for and did not get, plus any
+/// `command_allowlist` entries still awaiting the user's keep-or-discard.
+/// Called when a repository is selected; both halves are reported once per
+/// repository, so an unremarkable repository answers with empty lists.
+fn repository_config_review_json(repo: &str) -> Result<String, String> {
+    if repo.trim().is_empty() {
+        return Ok("{\"rejectedKeys\":[],\"allowlistEntries\":[]}".to_string());
+    }
+    let (config, report) = Config::load_for_repository_reporting(Some(Path::new(repo)))
+        .map_err(|error| error.to_string())?;
+    let engine = WorkspaceEngine::new(config);
+    let notice = engine
+        .repository_trust
+        .review(&report, &engine.audit_log)
+        .map_err(|error| error.to_string())?;
+    let migration = engine
+        .repository_trust
+        .pending_allowlist_migration(&report)
+        .map_err(|error| error.to_string())?;
+
+    let rejected = notice
+        .as_ref()
+        .map(|notice| {
+            notice
+                .rejected
+                .iter()
+                .map(|rejected| {
+                    format!(
+                        "{{\"key\":\"{}\",\"class\":\"{}\"}}",
+                        escape_json(&rejected.key),
+                        rejected.class.as_str()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let entries = migration
+        .as_ref()
+        .map(|migration| {
+            migration
+                .entries
+                .iter()
+                .map(|entry| format!("\"{}\"", escape_json(entry)))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    Ok(format!(
+        "{{\"repositoryPath\":\"{}\",\"rejectedKeys\":[{rejected}],\"allowlistEntries\":[{entries}]}}",
+        escape_json(repo)
+    ))
+}
+
+fn resolve_repository_allowlist_migration(repo: &str, keep: &[String]) -> Result<String, String> {
+    let (config, report) = Config::load_for_repository_reporting(Some(Path::new(repo)))
+        .map_err(|error| error.to_string())?;
+    let engine = WorkspaceEngine::new(config);
+    let path = engine
+        .repository_trust
+        .resolve_allowlist_migration(&report, keep, &engine.audit_log)
+        .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "{{\"path\":\"{}\",\"keptCount\":{}}}",
+        escape_json(&path.to_string_lossy()),
+        keep.len()
+    ))
+}
+
 fn engine_for_repo(repo: &str) -> Result<WorkspaceEngine, String> {
     let config = config_for_repo(repo)?;
     Ok(WorkspaceEngine::new(config))
@@ -2648,9 +2749,9 @@ mod tests {
         engine_for_repo, forget_model_api_key, generated_secret_warnings_json, handle_connection,
         index_html, json_optional_string, keychain, mcp_browser_arguments, parse_form,
         parse_path_list, percent_decode, relay_turn_events, remember_model_api_key,
-        render_markdown_with_optional_file_links, require_api_token, run_terminal_command,
-        save_config_file, terminal_cwd_for_repo, validate_context_files, validate_working_folder,
-        validate_workspace_path,
+        render_markdown_with_optional_file_links, repository_config_review_json, require_api_token,
+        run_terminal_command, save_config_file, terminal_cwd_for_repo, validate_context_files,
+        validate_working_folder, validate_workspace_path,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -3248,6 +3349,19 @@ mod tests {
 
         assert!(policy.is_empty());
         assert!(error.contains("Unknown config key"));
+    }
+
+    // With no repository selected there is nothing to review, and the answer
+    // must not touch the user's real data directory to say so — every other
+    // path through this endpoint loads and writes user-scope state, which is
+    // why the engine-level behaviour is tested in
+    // `workspace-engine/tests/repository_config_trust.rs` instead.
+    #[test]
+    fn repository_config_review_is_empty_without_a_repository() {
+        assert_eq!(
+            repository_config_review_json("  ").unwrap(),
+            "{\"rejectedKeys\":[],\"allowlistEntries\":[]}"
+        );
     }
 
     #[test]

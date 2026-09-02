@@ -2321,6 +2321,46 @@ button:disabled {
     0 4px 12px rgba(31, 36, 40, 0.1);
 }
 
+/* The allowlist migration lists exact commands, which need more width than a
+   rename prompt. */
+.app-dialog-wide {
+  width: min(520px, calc(100vw - 32px));
+}
+
+.app-dialog-checklist {
+  display: grid;
+  gap: 6px;
+  max-height: 40vh;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.app-dialog-checkitem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* The global `input` rule stretches every input to 100%, which would push the
+   command text off to the right. */
+.app-dialog-checkitem input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  margin: 0;
+  border-radius: 3px;
+}
+
+.app-dialog-checkitem code {
+  flex: 1 1 auto;
+  overflow-wrap: anywhere;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+
 .app-dialog-title {
   margin: 0;
   color: var(--ink);

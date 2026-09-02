@@ -82,7 +82,7 @@ model_api_key_env=keychain:model-api-key
 
 Environment variables are still supported for CLI and development workflows. In that mode, set `model_api_key_env` to an environment variable name, such as `OPENAI_API_KEY`, before launching.
 
-Repository config can still be provided manually at `.damaian/config.conf`. If repository config sets `model_api_key_env`, it overrides the user Keychain reference shown above.
+Repository config can still be provided manually at `.damaian/config.conf`, but it cannot change the model connection: `model_api_key_env`, `model_base_url`, `model_provider`, `model_name`, and `model_reasoning_level` are ignored there, so the Keychain reference shown above stands whatever a cloned repository asks for. See [Repository Config Trust Boundary](../SECURITY.md#repository-config-trust-boundary).
 
 Do not paste raw API keys into config files. `model_api_key_env` must be a Keychain reference or an environment variable name.
 

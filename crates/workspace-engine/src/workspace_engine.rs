@@ -10,6 +10,7 @@ use crate::git_service::GitService;
 use crate::indexer::ProjectIndexer;
 use crate::patch_engine::PatchEngine;
 use crate::path_policy::PathPolicy;
+use crate::repository_trust::RepositoryTrustStore;
 use crate::secret_scanner::SecretScanner;
 use crate::session::SessionStore;
 use crate::validation::{CommandStore, ValidationOrchestrator};
@@ -33,6 +34,7 @@ pub struct WorkspaceEngine {
     pub edit_orchestrator: EditOrchestrator,
     pub command_store: CommandStore,
     pub validation_orchestrator: ValidationOrchestrator,
+    pub repository_trust: RepositoryTrustStore,
 }
 
 impl WorkspaceEngine {
@@ -72,6 +74,7 @@ impl WorkspaceEngine {
             scanner.clone(),
             path_policy.clone(),
         );
+        let repository_trust = RepositoryTrustStore::new(&config.data_dir);
         let session_store = SessionStore::new(&config.data_dir);
         let patch_store = PatchStore::new(&config.data_dir);
         let command_store = CommandStore::new(&config.data_dir);
@@ -123,6 +126,7 @@ impl WorkspaceEngine {
             edit_orchestrator,
             command_store,
             validation_orchestrator,
+            repository_trust,
         }
     }
 }

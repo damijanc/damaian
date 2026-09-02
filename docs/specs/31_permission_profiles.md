@@ -8,8 +8,10 @@ reference is a name rather than a link; this spec is self-contained.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
 and secret policy), section 7.4 (command approval), section 7.8 (risk
 classification and approval). Related implementation specs:
-[`10_persistent_command_approval.md`](10_persistent_command_approval.md) (writes
-`command_allowlist` to repository config — §1 explains why that matters here),
+[`10_persistent_command_approval.md`](10_persistent_command_approval.md) (wrote
+`command_allowlist` to repository config — §1 explains why that mattered here;
+[spec 34](34_repository_config_trust_boundary.md) has since moved it to user
+config, and §1's live defect is closed),
 [`11_agents_md_support.md`](11_agents_md_support.md) (repository content is
 untrusted),
 [`13_docker_command_support.md`](13_docker_command_support.md),
@@ -215,8 +217,9 @@ later scope can remove an earlier scope's restriction except admin.
 
 ### 5.3 The trust boundary comes from spec 34
 
-Superseded. [Spec 34](34_repository_config_trust_boundary.md) owns the repository
-config trust boundary and implements it ahead of this phase: the scope-aware
+Superseded, and **now shipped**. [Spec 34](34_repository_config_trust_boundary.md)
+owns the repository config trust boundary and implemented it ahead of this
+phase: the scope-aware
 overlay (§5.1 there), the forbidden-key list, the restrict-only merges, and the
 move of `command_allowlist` to user config keyed by repository (§5.4 there).
 

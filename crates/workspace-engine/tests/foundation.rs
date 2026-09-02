@@ -3637,100 +3637,12 @@ fn proposes_detected_validation_commands() {
 /// Rebuilds the effective config the way the app would after a repository
 /// overlay was written, but without touching the developer's real user or
 /// admin config, so these assertions don't depend on machine state.
-fn config_with_repository_overlay(repo: &Path) -> Config {
-    Config::load_with_policy_paths(
-        test_config(repo),
-        None,
-        Some(&Config::repository_config_path(repo)),
-        None,
-    )
-    .unwrap()
-}
-
-#[test]
-fn allowing_command_always_writes_repository_config_and_skips_later_approval() {
-    let repo = temp_dir("command-allow-always");
-    let engine = WorkspaceEngine::new(test_config(&repo));
-    let proposal = engine
-        .validation_orchestrator
-        .propose_command(&repo, "git push", "Publish the branch")
-        .unwrap();
-    assert!(proposal.requires_approval);
-
-    let path = engine
-        .validation_orchestrator
-        .allow_command_always(&proposal.id, "tester")
-        .unwrap();
-
-    assert_eq!(path, Config::repository_config_path(&repo));
-    assert!(fs::read_to_string(&path).unwrap().contains("git push"));
-
-    // The whole point: the same command no longer stops to ask.
-    let policy = CommandPolicy::new(config_with_repository_overlay(&repo));
-    let classification = policy.classify("git push", &repo);
-    assert_eq!(classification.risk, CommandRisk::Low);
-    assert!(!classification.requires_approval);
-
-    fs::remove_dir_all(repo).unwrap();
-}
-
-#[test]
-fn allowing_command_always_preserves_existing_allowlist_entries() {
-    // Regression guard: `Config::apply_overlay` replaces `command_allowlist`
-    // rather than merging it, so a repository entry naming only the new
-    // command would silently revoke everything allowed at user scope.
-    let repo = temp_dir("command-allow-always-merge");
-    let config = Config {
-        command_allowlist: vec!["ls -la".to_string()],
-        ..test_config(&repo)
-    };
-    let engine = WorkspaceEngine::new(config);
-    let proposal = engine
-        .validation_orchestrator
-        .propose_command(&repo, "git push", "Publish the branch")
-        .unwrap();
-
-    engine
-        .validation_orchestrator
-        .allow_command_always(&proposal.id, "tester")
-        .unwrap();
-
-    let merged = config_with_repository_overlay(&repo);
-    assert!(merged.command_allowlist.contains(&"ls -la".to_string()));
-    assert!(merged.command_allowlist.contains(&"git push".to_string()));
-
-    fs::remove_dir_all(repo).unwrap();
-}
-
-#[test]
-fn allowing_command_always_is_idempotent() {
-    let repo = temp_dir("command-allow-always-repeat");
-    let engine = WorkspaceEngine::new(test_config(&repo));
-    let proposal = engine
-        .validation_orchestrator
-        .propose_command(&repo, "git push", "Publish the branch")
-        .unwrap();
-
-    engine
-        .validation_orchestrator
-        .allow_command_always(&proposal.id, "tester")
-        .unwrap();
-    engine
-        .validation_orchestrator
-        .allow_command_always(&proposal.id, "tester")
-        .unwrap();
-
-    let entries = config_with_repository_overlay(&repo).command_allowlist;
-    assert_eq!(
-        entries
-            .iter()
-            .filter(|entry| entry.as_str() == "git push")
-            .count(),
-        1
-    );
-
-    fs::remove_dir_all(repo).unwrap();
-}
+/// `Allow Always` now writes `command_allowlist.<repository_id>` to *user*
+/// config, so the grant and its per-repository resolution are covered by
+/// `tests/repository_config_trust.rs` alongside the boundary that made the
+/// move necessary. The three tests that used to live here asserted the
+/// repository file was written, which is exactly the behaviour spec 34
+/// removed.
 
 #[test]
 fn refuses_to_permanently_allow_blocked_command() {
@@ -4254,6 +4166,12 @@ fn config_overlay_rejects_literal_model_api_keys() {
 
 #[test]
 fn config_precedence_is_user_then_repo_then_admin() {
+    // This test used to assert that repository config replaced the user's
+    // `model_name`, `command_allowlist`, and `secret_patterns`. It encoded the
+    // defect spec 34 fixes, so it asserts the boundary now: the repository may
+    // only add a restriction, and admin — a local file, not something a clone
+    // carries — still has the last word. `tests/repository_config_trust.rs`
+    // covers the classification key by key.
     let root = temp_dir("config-precedence");
     let user = root.join("user.conf");
     let repo = root.join("repo.conf");
@@ -4265,7 +4183,7 @@ fn config_precedence_is_user_then_repo_then_admin() {
     .unwrap();
     fs::write(
         &repo,
-        "model_name=repo-model\ncommand_allowlist=cargo test\nsecret_patterns=REPO_SECRET\n",
+        "model_name=repo-model\ncommand_allowlist=cargo test\ncommand_blocklist=curl\n",
     )
     .unwrap();
     fs::write(
@@ -4282,9 +4200,9 @@ fn config_precedence_is_user_then_repo_then_admin() {
         Config::load_with_policy_paths(base, Some(&user), Some(&repo), Some(&admin)).unwrap();
 
     assert_eq!(merged.model_name, "admin-model");
-    assert_eq!(merged.command_allowlist, vec!["cargo test"]);
+    assert_eq!(merged.command_allowlist, vec!["npm test"]);
+    // Admin replaces the blocklist outright, which is its prerogative.
     assert_eq!(merged.command_blocklist, vec!["cargo test"]);
-    assert_eq!(merged.secret_patterns, vec!["REPO_SECRET"]);
     assert_eq!(merged.audit_retention_days, 3);
     assert_eq!(
         CommandPolicy::new(merged)

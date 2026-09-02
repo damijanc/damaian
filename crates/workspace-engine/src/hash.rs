@@ -105,6 +105,18 @@ pub fn sha256(input: impl AsRef<[u8]>) -> String {
     format!("sha256:{}", sha256_hex(input.as_ref()))
 }
 
+/// Stable identity for a repository checkout, derived from its canonical path.
+/// Per checkout by design: an `Allow Always` granted for a repository at one
+/// path must not silently transfer to another checkout the user has not looked
+/// at (spec 34 §5.4). A path that cannot be canonicalized — it may not exist
+/// yet — is hashed as given.
+pub fn repository_id_for_root(root: impl AsRef<Path>) -> String {
+    let root = root.as_ref();
+    let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let digest = sha256(canonical.to_string_lossy().as_bytes());
+    format!("repo_{}", &digest[..16])
+}
+
 pub fn file_hash(path: impl AsRef<Path>) -> Result<String> {
     Ok(sha256(fs::read(path)?))
 }

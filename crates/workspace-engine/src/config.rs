@@ -1,4 +1,6 @@
 use crate::error::{ClientError, Result};
+use crate::hash::repository_id_for_root;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -41,6 +43,85 @@ pub const DEFAULT_RESTRICTED_PATTERNS: &[&str] = &[
     "**/credentials/**",
 ];
 
+/// Where a [`ConfigOverlay`] came from. Only [`ConfigScope::Repository`] is
+/// untrusted: that file arrives with a clone, so it may add restrictions but
+/// never remove one. See `docs/specs/34_repository_config_trust_boundary.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigScope {
+    User,
+    /// Untrusted: arrives with a clone.
+    Repository,
+    Admin,
+}
+
+/// Why a repository-sourced key was not honoured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryKeyClass {
+    /// No legitimate repository use case: redirects execution, model traffic,
+    /// credentials, or data location.
+    Forbidden,
+    /// Honoured only in the more restrictive direction; this value would have
+    /// loosened the user's policy.
+    RestrictOnly,
+    /// The user's own decision about this repository, stored in user config.
+    UserOwned,
+}
+
+impl RepositoryKeyClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RepositoryKeyClass::Forbidden => "forbidden",
+            RepositoryKeyClass::RestrictOnly => "restrict_only",
+            RepositoryKeyClass::UserOwned => "user_owned",
+        }
+    }
+}
+
+/// A repository-sourced key that was ignored. Carries the key name and why —
+/// never the value, which is attacker-controlled text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedConfigKey {
+    pub key: String,
+    pub class: RepositoryKeyClass,
+}
+
+impl RejectedConfigKey {
+    fn new(key: impl Into<String>, class: RepositoryKeyClass) -> Self {
+        Self {
+            key: key.into(),
+            class,
+        }
+    }
+}
+
+/// What repository scope attempted, for the audit trail and the one-time
+/// notice. Produced by [`Config::load_for_repository_reporting`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepositoryConfigReport {
+    /// The repository whose config produced this report, when one was loaded.
+    pub repository_root: Option<PathBuf>,
+    /// Keys the repository config set that were not honoured.
+    pub rejected_keys: Vec<RejectedConfigKey>,
+    /// `command_allowlist` entries found in repository config. Never applied;
+    /// carried so the user can be offered the one-time migration.
+    pub repository_allowlist_entries: Vec<String>,
+}
+
+impl RepositoryConfigReport {
+    pub fn is_empty(&self) -> bool {
+        self.rejected_keys.is_empty() && self.repository_allowlist_entries.is_empty()
+    }
+
+    /// The rejected keys worth telling the user about: everything a repository
+    /// asked for and did not get.
+    pub fn rejected_key_names(&self) -> Vec<&str> {
+        self.rejected_keys
+            .iter()
+            .map(|rejected| rejected.key.as_str())
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub data_dir: PathBuf,
@@ -50,6 +131,12 @@ pub struct Config {
     pub ignore_patterns: Vec<String>,
     pub restricted_patterns: Vec<String>,
     pub command_allowlist: Vec<String>,
+    /// `Allow Always` grants, keyed by repository id. The user's own decision
+    /// about one repository, so it lives in user config rather than in the
+    /// repository — a repository cannot grant itself an allowlist entry. A
+    /// repository-scoped load folds the matching entries into
+    /// [`Self::command_allowlist`].
+    pub command_allowlist_by_repository: BTreeMap<String, Vec<String>>,
     pub command_blocklist: Vec<String>,
     pub secret_patterns: Vec<String>,
     pub require_approval_for_file_edits: bool,
@@ -200,6 +287,15 @@ impl Config {
     }
 
     pub fn load_for_repository(repository_root: Option<&Path>) -> Result<Self> {
+        Self::load_for_repository_reporting(repository_root).map(|(config, _)| config)
+    }
+
+    /// The same load, also reporting what the repository's own config asked
+    /// for and did not get. Callers that can audit or tell the user — the
+    /// desktop shell and the CLI — should use this one.
+    pub fn load_for_repository_reporting(
+        repository_root: Option<&Path>,
+    ) -> Result<(Self, RepositoryConfigReport)> {
         let config = Self::default();
         let default_data_dir = config.data_dir.clone();
         let user_path = default_data_dir.join("config").join("user.conf");
@@ -207,36 +303,79 @@ impl Config {
         let admin_path = std::env::var("DAMAIAN_ADMIN_CONFIG")
             .map(PathBuf::from)
             .unwrap_or_else(|_| default_data_dir.join("config").join("admin.conf"));
-        Self::load_with_policy_paths(
+        Self::load_scoped(
             config,
             Some(user_path.as_path()),
             repo_path.as_deref(),
             Some(admin_path.as_path()),
+            repository_root,
         )
     }
 
     pub fn load_with_policy_paths(
-        mut config: Self,
+        config: Self,
         user_path: Option<&Path>,
         repo_path: Option<&Path>,
         admin_path: Option<&Path>,
     ) -> Result<Self> {
+        Self::load_with_policy_paths_reporting(config, user_path, repo_path, admin_path)
+            .map(|(config, _)| config)
+    }
+
+    pub fn load_with_policy_paths_reporting(
+        config: Self,
+        user_path: Option<&Path>,
+        repo_path: Option<&Path>,
+        admin_path: Option<&Path>,
+    ) -> Result<(Self, RepositoryConfigReport)> {
+        // No repository root was passed, so infer it from the layout
+        // `repository_config_path` writes. A path shaped some other way is
+        // still applied at repository scope — it is still repository config —
+        // but its per-repository `Allow Always` entries cannot be resolved,
+        // because there is no repository identity to resolve them against.
+        let derived = repo_path.and_then(repository_root_from_config_path);
+        Self::load_scoped(config, user_path, repo_path, admin_path, derived)
+    }
+
+    /// Applies the three overlays in order, each at its own scope, and folds in
+    /// the `Allow Always` entries the user granted for this repository.
+    ///
+    /// Admin comes last and stays trusted: `DAMAIAN_ADMIN_CONFIG` or
+    /// `<data_dir>/config/admin.conf` is a local file, not something a clone
+    /// carries.
+    pub fn load_scoped(
+        mut config: Self,
+        user_path: Option<&Path>,
+        repo_path: Option<&Path>,
+        admin_path: Option<&Path>,
+        repository_root: Option<&Path>,
+    ) -> Result<(Self, RepositoryConfigReport)> {
+        let mut report = RepositoryConfigReport {
+            repository_root: repository_root.map(Path::to_path_buf),
+            ..RepositoryConfigReport::default()
+        };
         if let Some(path) = user_path
             && path.exists()
         {
-            config.apply_overlay(ConfigOverlay::load(path)?);
+            config.apply_overlay_scoped(ConfigOverlay::load(path)?, ConfigScope::User);
         }
         if let Some(path) = repo_path
             && path.exists()
         {
-            config.apply_overlay(ConfigOverlay::load(path)?);
+            let overlay = ConfigOverlay::load(path)?;
+            report.repository_allowlist_entries =
+                overlay.command_allowlist.clone().unwrap_or_default();
+            report.rejected_keys = config.apply_overlay_scoped(overlay, ConfigScope::Repository);
         }
         if let Some(path) = admin_path
             && path.exists()
         {
-            config.apply_overlay(ConfigOverlay::load(path)?);
+            config.apply_overlay_scoped(ConfigOverlay::load(path)?, ConfigScope::Admin);
         }
-        Ok(config)
+        if let Some(root) = repository_root {
+            config.apply_repository_allowlist(root);
+        }
+        Ok((config, report))
     }
 
     pub fn user_config_path(&self) -> PathBuf {
@@ -256,95 +395,268 @@ impl Config {
             .join("config.conf")
     }
 
+    /// Applies an overlay at user scope: every value it sets is taken.
     pub fn apply_overlay(&mut self, overlay: ConfigOverlay) {
-        if let Some(value) = overlay.data_dir {
+        self.apply_overlay_scoped(overlay, ConfigScope::User);
+    }
+
+    /// Applies an overlay, honouring what the scope is allowed to change.
+    /// Returns the repository-sourced keys that were refused, which the caller
+    /// is expected to audit and surface — [`RejectedConfigKey`] deliberately
+    /// carries no values, since a refused `shell` or `model_api_key_env` is
+    /// attacker-controlled text.
+    pub fn apply_overlay_scoped(
+        &mut self,
+        overlay: ConfigOverlay,
+        scope: ConfigScope,
+    ) -> Vec<RejectedConfigKey> {
+        // Exhaustive destructuring, deliberately without `..`: a field added to
+        // `ConfigOverlay` and not classified here fails to compile. That is
+        // what keeps this boundary from decaying — the alternative default is
+        // repository-writable, which is the defect this exists to fix.
+        let ConfigOverlay {
+            data_dir,
+            max_file_bytes,
+            max_command_output_bytes,
+            allowed_roots,
+            ignore_patterns,
+            restricted_patterns,
+            command_allowlist,
+            command_allowlist_by_repository,
+            command_blocklist,
+            secret_patterns,
+            require_approval_for_file_edits,
+            require_approval_for_risky_commands,
+            require_approval_for_all_commands,
+            block_generated_secrets,
+            audit_enabled,
+            audit_retention_days,
+            enable_semantic_search,
+            agent_max_tool_rounds,
+            agent_web_debug_max_tool_rounds,
+            agent_tool_retry_limit,
+            shell,
+            model_provider,
+            model_name,
+            model_base_url,
+            model_api_key_env,
+            model_reasoning_level,
+            model_providers,
+            mcp_enabled,
+            mcp_server_allowlist,
+            mcp_servers,
+        } = overlay;
+
+        let mut rejected = Vec::new();
+        let trusted = scope != ConfigScope::Repository;
+        let forbidden = RepositoryKeyClass::Forbidden;
+
+        // Forbidden: redirects execution, model traffic, credentials, or where
+        // data lands.
+        if let Some(value) = scoped(data_dir, "data_dir", trusted, forbidden, &mut rejected) {
             self.data_dir = value;
         }
-        if let Some(value) = overlay.max_file_bytes {
-            self.max_file_bytes = value;
-        }
-        if let Some(value) = overlay.max_command_output_bytes {
-            self.max_command_output_bytes = value;
-        }
-        if let Some(value) = overlay.allowed_roots {
+        if let Some(value) = scoped(
+            allowed_roots,
+            "allowed_roots",
+            trusted,
+            forbidden,
+            &mut rejected,
+        ) {
             self.allowed_roots = value;
         }
-        if let Some(value) = overlay.ignore_patterns {
-            self.ignore_patterns = value;
-        }
-        if let Some(value) = overlay.restricted_patterns {
-            self.restricted_patterns = value;
-        }
-        if let Some(value) = overlay.command_allowlist {
-            self.command_allowlist = value;
-        }
-        if let Some(value) = overlay.command_blocklist {
-            self.command_blocklist = value;
-        }
-        if let Some(value) = overlay.secret_patterns {
+        if let Some(value) = scoped(
+            secret_patterns,
+            "secret_patterns",
+            trusted,
+            forbidden,
+            &mut rejected,
+        ) {
             self.secret_patterns = value;
         }
-        if let Some(value) = overlay.require_approval_for_file_edits {
-            self.require_approval_for_file_edits = value;
-        }
-        if let Some(value) = overlay.require_approval_for_risky_commands {
-            self.require_approval_for_risky_commands = value;
-        }
-        if let Some(value) = overlay.require_approval_for_all_commands {
-            self.require_approval_for_all_commands = value;
-        }
-        if let Some(value) = overlay.block_generated_secrets {
+        if let Some(value) = scoped(
+            block_generated_secrets,
+            "block_generated_secrets",
+            trusted,
+            forbidden,
+            &mut rejected,
+        ) {
             self.block_generated_secrets = value;
         }
-        if let Some(value) = overlay.audit_enabled {
+        if let Some(value) = scoped(
+            audit_enabled,
+            "audit_enabled",
+            trusted,
+            forbidden,
+            &mut rejected,
+        ) {
             self.audit_enabled = value;
         }
-        if let Some(value) = overlay.audit_retention_days {
-            self.audit_retention_days = value;
-        }
-        if let Some(value) = overlay.enable_semantic_search {
-            self.enable_semantic_search = value;
-        }
-        if let Some(value) = overlay.agent_max_tool_rounds {
-            self.agent_max_tool_rounds = value;
-        }
-        if let Some(value) = overlay.agent_web_debug_max_tool_rounds {
-            self.agent_web_debug_max_tool_rounds = value;
-        }
-        if let Some(value) = overlay.agent_tool_retry_limit {
-            self.agent_tool_retry_limit = value;
-        }
-        if let Some(value) = overlay.shell {
+        if let Some(value) = scoped(shell, "shell", trusted, forbidden, &mut rejected) {
             self.shell = value;
         }
-        for provider in overlay.model_providers {
-            self.upsert_model_provider(provider);
+        for provider in model_providers {
+            let key = format!("model_provider.{}", provider.id);
+            if trusted {
+                self.upsert_model_provider(provider);
+            } else {
+                rejected.push(RejectedConfigKey::new(key, forbidden));
+            }
         }
-        if let Some(value) = overlay.model_provider {
+        if let Some(value) = scoped(
+            model_provider,
+            "model_provider",
+            trusted,
+            forbidden,
+            &mut rejected,
+        ) {
             self.model_provider = value;
             self.apply_model_provider_defaults();
         }
-        if let Some(value) = overlay.model_name {
+        if let Some(value) = scoped(model_name, "model_name", trusted, forbidden, &mut rejected) {
             self.model_name = value;
         }
-        if let Some(value) = overlay.model_base_url {
+        if let Some(value) = scoped(
+            model_base_url,
+            "model_base_url",
+            trusted,
+            forbidden,
+            &mut rejected,
+        ) {
             self.model_base_url = value;
         }
-        if let Some(value) = overlay.model_api_key_env {
+        if let Some(value) = scoped(
+            model_api_key_env,
+            "model_api_key_env",
+            trusted,
+            forbidden,
+            &mut rejected,
+        ) {
             self.model_api_key_env = value;
         }
-        if let Some(value) = overlay.model_reasoning_level {
+        if let Some(value) = scoped(
+            model_reasoning_level,
+            "model_reasoning_level",
+            trusted,
+            forbidden,
+            &mut rejected,
+        ) {
             self.model_reasoning_level = value;
         }
-        if let Some(value) = overlay.mcp_enabled {
-            self.mcp_enabled = value;
+
+        // User-owned: an `Allow Always` decision is the user's, and lives in
+        // user config keyed by repository. A repository copy is never honoured.
+        if let Some(value) = scoped(
+            command_allowlist,
+            "command_allowlist",
+            trusted,
+            RepositoryKeyClass::UserOwned,
+            &mut rejected,
+        ) {
+            self.command_allowlist = value;
         }
-        if let Some(value) = overlay.mcp_server_allowlist {
-            self.mcp_server_allowlist = value;
+        for (repository_id, entries) in command_allowlist_by_repository {
+            let key = format!("command_allowlist.{repository_id}");
+            if trusted {
+                self.command_allowlist_by_repository
+                    .insert(repository_id, entries);
+            } else {
+                rejected.push(RejectedConfigKey::new(key, RepositoryKeyClass::UserOwned));
+            }
         }
-        for server in overlay.mcp_servers {
-            self.upsert_mcp_server(server);
+
+        // Restrict-only: either scope may add a restriction; a repository
+        // cannot take one away.
+        if let Some(value) = ignore_patterns {
+            union_patterns(&mut self.ignore_patterns, value, trusted);
         }
+        if let Some(value) = restricted_patterns {
+            union_patterns(&mut self.restricted_patterns, value, trusted);
+        }
+        if let Some(value) = command_blocklist {
+            union_patterns(&mut self.command_blocklist, value, trusted);
+        }
+        if let Some(value) = require_approval_for_file_edits {
+            restrict_only_flag(
+                &mut self.require_approval_for_file_edits,
+                value,
+                true,
+                "require_approval_for_file_edits",
+                trusted,
+                &mut rejected,
+            );
+        }
+        if let Some(value) = require_approval_for_risky_commands {
+            restrict_only_flag(
+                &mut self.require_approval_for_risky_commands,
+                value,
+                true,
+                "require_approval_for_risky_commands",
+                trusted,
+                &mut rejected,
+            );
+        }
+        if let Some(value) = require_approval_for_all_commands {
+            restrict_only_flag(
+                &mut self.require_approval_for_all_commands,
+                value,
+                true,
+                "require_approval_for_all_commands",
+                trusted,
+                &mut rejected,
+            );
+        }
+        if let Some(value) = mcp_enabled {
+            restrict_only_flag(
+                &mut self.mcp_enabled,
+                value,
+                false,
+                "mcp_enabled",
+                trusted,
+                &mut rejected,
+            );
+        }
+        if let Some(value) = mcp_server_allowlist {
+            intersect_allowlist(
+                &mut self.mcp_server_allowlist,
+                value,
+                "mcp_server_allowlist",
+                trusted,
+                &mut rejected,
+            );
+        }
+        for server in mcp_servers {
+            if trusted {
+                self.upsert_mcp_server(server);
+            } else {
+                self.upsert_mcp_server_from_repository(server, &mut rejected);
+            }
+        }
+
+        // Free: preferences and budgets, with no capability behind them.
+        if let Some(value) = max_file_bytes {
+            self.max_file_bytes = value;
+        }
+        if let Some(value) = max_command_output_bytes {
+            self.max_command_output_bytes = value;
+        }
+        if let Some(value) = audit_retention_days {
+            self.audit_retention_days = value;
+        }
+        if let Some(value) = enable_semantic_search {
+            self.enable_semantic_search = value;
+        }
+        if let Some(value) = agent_max_tool_rounds {
+            self.agent_max_tool_rounds = value;
+        }
+        if let Some(value) = agent_web_debug_max_tool_rounds {
+            self.agent_web_debug_max_tool_rounds = value;
+        }
+        if let Some(value) = agent_tool_retry_limit {
+            self.agent_tool_retry_limit = value;
+        }
+
+        rejected
     }
 
     /// Whether the active model provider is configured to use native
@@ -537,6 +849,108 @@ impl Config {
         });
     }
 
+    /// Upserts a repository-supplied MCP server. A repository may *suggest* a
+    /// server — that is legitimate and stays inert, since a new server is
+    /// created disabled and approval-gated whatever the file asked for — but it
+    /// may not enable one, clear its approval gate, or redefine a server the
+    /// user already configured. That last case is not in the spec's
+    /// classification table and is refused anyway: overlaying the `command` of
+    /// a server the user has already enabled would redirect a process they
+    /// trust, which requirement 2 forbids.
+    fn upsert_mcp_server_from_repository(
+        &mut self,
+        overlay: McpServerConfigOverlay,
+        rejected: &mut Vec<RejectedConfigKey>,
+    ) {
+        let McpServerConfigOverlay {
+            id,
+            label,
+            transport,
+            command,
+            args,
+            env,
+            url,
+            auth_token_env,
+            enabled,
+            require_approval,
+        } = overlay;
+        let already_configured = self.mcp_server_config(&id).is_some();
+        let mut narrowed = McpServerConfigOverlay {
+            id: id.clone(),
+            ..McpServerConfigOverlay::default()
+        };
+
+        match enabled {
+            // Logical AND: disabling is a restriction, enabling is not.
+            Some(false) => narrowed.enabled = Some(false),
+            Some(true) => rejected.push(RejectedConfigKey::new(
+                format!("mcp_server.{id}.enabled"),
+                RepositoryKeyClass::RestrictOnly,
+            )),
+            None => {}
+        }
+        match require_approval {
+            Some(true) => narrowed.require_approval = Some(true),
+            Some(false) => rejected.push(RejectedConfigKey::new(
+                format!("mcp_server.{id}.require_approval"),
+                RepositoryKeyClass::RestrictOnly,
+            )),
+            None => {}
+        }
+
+        let definition = [
+            ("label", label.is_some()),
+            ("transport", transport.is_some()),
+            ("command", command.is_some()),
+            ("args", args.is_some()),
+            ("env", env.is_some()),
+            ("url", url.is_some()),
+            ("auth_token_env", auth_token_env.is_some()),
+        ];
+        if already_configured {
+            for (field, present) in definition {
+                if present {
+                    rejected.push(RejectedConfigKey::new(
+                        format!("mcp_server.{id}.{field}"),
+                        RepositoryKeyClass::Forbidden,
+                    ));
+                }
+            }
+        } else {
+            if definition.iter().all(|(_, present)| !present) {
+                // Nothing to define, and nothing a narrowed flag could apply
+                // to: creating an empty server entry would only be clutter.
+                return;
+            }
+            narrowed.label = label;
+            narrowed.transport = transport;
+            narrowed.command = command;
+            narrowed.args = args;
+            narrowed.env = env;
+            narrowed.url = url;
+            narrowed.auth_token_env = auth_token_env;
+            narrowed.enabled = Some(false);
+            narrowed.require_approval = Some(true);
+        }
+        self.upsert_mcp_server(narrowed);
+    }
+
+    /// The `Allow Always` entries the user granted for `repository_root`,
+    /// folded into the effective [`Self::command_allowlist`]. Called during a
+    /// repository-scoped load; the entries live in user config keyed by
+    /// repository id, never in the repository's own file.
+    pub fn apply_repository_allowlist(&mut self, repository_root: &Path) {
+        let repository_id = repository_id_for_root(repository_root);
+        let Some(entries) = self.command_allowlist_by_repository.get(&repository_id) else {
+            return;
+        };
+        for entry in entries.clone() {
+            if !self.command_allowlist.contains(&entry) {
+                self.command_allowlist.push(entry);
+            }
+        }
+    }
+
     pub fn to_policy_text(&self) -> String {
         let mut output = String::new();
         push_line(&mut output, "data_dir", &self.data_dir.to_string_lossy());
@@ -570,6 +984,10 @@ impl Config {
             "command_allowlist",
             &join_list(&self.command_allowlist),
         );
+        // Deliberately not the per-repository map: this text answers "what
+        // applies in this repository", and another checkout's `Allow Always`
+        // grants do not. They are visible in user config, which Settings shows
+        // verbatim.
         push_line(
             &mut output,
             "command_blocklist",
@@ -674,6 +1092,7 @@ impl Default for Config {
                 .map(|pattern| pattern.to_string())
                 .collect(),
             command_allowlist: Vec::new(),
+            command_allowlist_by_repository: BTreeMap::new(),
             command_blocklist: Vec::new(),
             secret_patterns: Vec::new(),
             require_approval_for_file_edits: true,
@@ -710,6 +1129,8 @@ pub struct ConfigOverlay {
     pub ignore_patterns: Option<Vec<String>>,
     pub restricted_patterns: Option<Vec<String>>,
     pub command_allowlist: Option<Vec<String>>,
+    /// `command_allowlist.<repository_id>` entries, from user or admin config.
+    pub command_allowlist_by_repository: BTreeMap<String, Vec<String>>,
     pub command_blocklist: Option<Vec<String>>,
     pub secret_patterns: Option<Vec<String>>,
     pub require_approval_for_file_edits: Option<bool>,
@@ -781,6 +1202,9 @@ impl ConfigOverlay {
         if let Some(server_key) = key.strip_prefix("mcp_server.") {
             return self.set_mcp_server_config(server_key, value);
         }
+        if let Some(repository_id) = key.strip_prefix("command_allowlist.") {
+            return self.set_repository_command_allowlist(repository_id, value);
+        }
         match key {
             "data_dir" => self.data_dir = Some(PathBuf::from(value)),
             "max_file_bytes" => self.max_file_bytes = Some(parse_u64(key, value)?),
@@ -842,6 +1266,21 @@ impl ConfigOverlay {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// `command_allowlist.<repository_id>=cmd|cmd` — the `Allow Always` grants
+    /// for one repository. Valid in user and admin config; refused at
+    /// repository scope when the overlay is applied.
+    fn set_repository_command_allowlist(&mut self, repository_id: &str, value: &str) -> Result<()> {
+        let repository_id = repository_id.trim();
+        if !repository_id.starts_with("repo_") {
+            return Err(ClientError::InvalidInput(format!(
+                "Invalid repository id in config key: command_allowlist.{repository_id}"
+            )));
+        }
+        self.command_allowlist_by_repository
+            .insert(repository_id.to_string(), split_list(value));
         Ok(())
     }
 
@@ -949,6 +1388,13 @@ impl ConfigOverlay {
         }
         if let Some(value) = &self.command_allowlist {
             push_line(&mut output, "command_allowlist", &join_list(value));
+        }
+        for (repository_id, entries) in &self.command_allowlist_by_repository {
+            push_line(
+                &mut output,
+                &format!("command_allowlist.{repository_id}"),
+                &join_list(entries),
+            );
         }
         if let Some(value) = &self.command_blocklist {
             push_line(&mut output, "command_blocklist", &join_list(value));
@@ -1404,6 +1850,121 @@ pub fn normalize_model_reasoning_level(value: &str) -> Result<String> {
             "model_reasoning_level must be default, minimal, low, medium, or high".to_string(),
         )),
     }
+}
+
+/// The repository a repository-config path belongs to: the inverse of
+/// [`Config::repository_config_path`]. `None` for any other layout.
+fn repository_root_from_config_path(path: &Path) -> Option<&Path> {
+    if path.file_name()? != "config.conf" {
+        return None;
+    }
+    let damaian = path.parent()?;
+    if damaian.file_name()? != ".damaian" {
+        return None;
+    }
+    damaian.parent()
+}
+
+/// A key only a trusted scope may set. An untrusted value is dropped and
+/// recorded under `class`.
+fn scoped<T>(
+    value: Option<T>,
+    key: &str,
+    trusted: bool,
+    class: RepositoryKeyClass,
+    rejected: &mut Vec<RejectedConfigKey>,
+) -> Option<T> {
+    match value {
+        Some(value) if trusted => Some(value),
+        Some(_) => {
+            rejected.push(RejectedConfigKey::new(key, class));
+            None
+        }
+        None => None,
+    }
+}
+
+/// A list of restrictions. A trusted scope replaces it; an untrusted one may
+/// only append, so a repository listing fewer patterns than the user removes
+/// none of them. Appending is the documented merge, not a refusal, so nothing
+/// is recorded: a repository config that names only its own additions is the
+/// normal, legitimate case.
+fn union_patterns(current: &mut Vec<String>, incoming: Vec<String>, trusted: bool) {
+    if trusted {
+        *current = incoming;
+        return;
+    }
+    for entry in incoming {
+        if !current.contains(&entry) {
+            current.push(entry);
+        }
+    }
+}
+
+/// A boolean an untrusted scope may only push toward `restrictive`. The other
+/// direction is a weakening attempt: ignored, and recorded when it would
+/// actually have changed something.
+fn restrict_only_flag(
+    current: &mut bool,
+    incoming: bool,
+    restrictive: bool,
+    key: &str,
+    trusted: bool,
+    rejected: &mut Vec<RejectedConfigKey>,
+) {
+    if trusted || incoming == restrictive {
+        *current = incoming;
+        return;
+    }
+    if *current != incoming {
+        rejected.push(RejectedConfigKey::new(
+            key,
+            RepositoryKeyClass::RestrictOnly,
+        ));
+    }
+}
+
+/// An allowlist where empty means "no restriction". An untrusted scope may
+/// narrow it — set one where there was none, or intersect an existing one —
+/// but never add an id or clear it.
+fn intersect_allowlist(
+    current: &mut Vec<String>,
+    incoming: Vec<String>,
+    key: &str,
+    trusted: bool,
+    rejected: &mut Vec<RejectedConfigKey>,
+) {
+    if trusted {
+        *current = incoming;
+        return;
+    }
+    if incoming.is_empty() {
+        if !current.is_empty() {
+            rejected.push(RejectedConfigKey::new(
+                key,
+                RepositoryKeyClass::RestrictOnly,
+            ));
+        }
+        return;
+    }
+    if current.is_empty() {
+        *current = incoming;
+        return;
+    }
+    if incoming.iter().any(|id| !current.contains(id)) {
+        rejected.push(RejectedConfigKey::new(
+            key,
+            RepositoryKeyClass::RestrictOnly,
+        ));
+    }
+    // An empty intersection cannot be stored: empty means "no restriction"
+    // here, so writing it back would widen rather than narrow. A repository
+    // whose list shares nothing with the user's is substituting its own, not
+    // narrowing theirs, so the user's list stands.
+    if !current.iter().any(|id| incoming.contains(id)) {
+        return;
+    }
+    current.retain(|id| incoming.contains(id));
 }
 
 fn push_line(output: &mut String, key: &str, value: &str) {

@@ -1,7 +1,7 @@
 use crate::audit::AuditLog;
 use crate::config::{Config, DEFAULT_IGNORE_PATTERNS};
 use crate::error::Result;
-use crate::hash::{now_millis, sha256};
+use crate::hash::{now_millis, repository_id_for_root, sha256};
 use crate::ignore::{IgnoreRule, is_ignored_by_rules, parse_ignore_patterns};
 use crate::language::{detect_language, extract_imports, extract_symbols};
 use crate::secret_scanner::SecretScanner;
@@ -377,11 +377,6 @@ impl ProjectIndexer {
         });
         Ok(())
     }
-}
-
-fn repository_id_for_root(root: &Path) -> String {
-    let digest = sha256(root.to_string_lossy().as_bytes());
-    format!("repo_{}", &digest[..16])
 }
 
 fn tokenize(text: &str) -> Vec<String> {

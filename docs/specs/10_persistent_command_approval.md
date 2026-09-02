@@ -3,7 +3,10 @@
 Status: Done
 Order: 10 of 10
 Related spec sections: `ai_coding_assistant_specification.md` §7.4 (command
-approval), §7.10 (policy configuration).
+approval), §7.10 (policy configuration). **Superseded in part:**
+[`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)
+§5.4 moved where the grant is stored — see the note in §4.2. The user-visible
+behaviour described here is unchanged.
 
 ## 1. Motivation
 
@@ -84,19 +87,22 @@ often would leave the motivating problem unsolved.
 ### 4.2 Persistence
 
 `ValidationOrchestrator::allow_command_always(proposal_id, approved_by)` loads
-the proposal, checks eligibility, and appends the trimmed command to
-`command_allowlist` in `<repo>/.damaian/config.conf` — resolved from the
-proposal's own `working_directory`, which satisfies requirement 2. The file is
-gitignored, so an allowlist never reaches the shared repository.
+the proposal, checks eligibility, and appends the trimmed command to the
+allowlist for the proposal's own `working_directory`, which satisfies
+requirement 2.
 
-Two details carry the correctness of this step:
-
-**Seeding.** `Config::apply_overlay` *replaces* `command_allowlist` rather than
-merging it. A repository entry naming only the newly allowed command would
-therefore silently revoke every command allowed at user scope. The write seeds
-the repository entry from the already-merged effective list the first time the
-repository takes ownership of the key; afterwards the repository entry is the
-authority and is appended to directly. Requirement 7.
+**Storage, as changed by [spec 34](34_repository_config_trust_boundary.md) §5.4.**
+The grant is written to *user* config as
+`command_allowlist.<repository_id>=<command>`, not to
+`<repo>/.damaian/config.conf` as first built. The reason is that Damaian cannot
+distinguish a repository entry the user created here from one that arrived with
+a clone, so a repository could otherwise allow its own commands to run with no
+approval. The scope is unchanged — one repository, exact command — and the id is
+per checkout, so a grant does not transfer to another clone at a different path.
+The **Seeding** problem this section used to describe no longer exists: the
+per-repository key holds only what was granted for that repository, and the
+user's machine-wide `command_allowlist` is unioned in at load time rather than
+being replaced.
 
 **Config source.** Eligibility is answered against the config the orchestrator
 was constructed with, not a fresh load from disk, so the answer matches the
@@ -127,8 +133,10 @@ is an error, since rejecting cannot grant anything.
 ## 5. Acceptance criteria
 
 1. Approving `chmod 644 README.md` with `Allow Always` writes
-   `command_allowlist=chmod 644 README.md` to `<repo>/.damaian/config.conf` and
-   runs the command.
+   `command_allowlist.<repository_id>=chmod 644 README.md` to user config
+   (`<repo>/.damaian/config.conf` before
+   [spec 34](34_repository_config_trust_boundary.md) §5.4) and runs the
+   command.
 2. A later proposal for `chmod 644 README.md` in that repository classifies as
    `low` with `requiresApproval: false`.
 3. A later proposal for `chmod 777 README.md` still classifies as `high` with
@@ -137,7 +145,7 @@ is an error, since rejecting cannot grant anything.
    `ls -la` leaves `ls -la` allowed.
 5. Granting the same allowance twice produces one entry.
 6. Blocked commands, shell-control commands, and any command under
-   `require_approval_for_all_commands` are refused with `PolicyBlocked`, and the
-   repository config is left untouched.
+   `require_approval_for_all_commands` are refused with `PolicyBlocked`, and no
+   config file is written.
 7. A refused grant does not run the command.
 8. MCP tool approvals never offer the action.

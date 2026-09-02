@@ -3,9 +3,9 @@ use crate::command_policy::{
     CommandClassification, CommandPolicy, CommandRisk, allow_always_eligible,
 };
 use crate::command_runner::{CommandExecution, CommandRunner};
-use crate::config::{Config, ConfigOverlay};
+use crate::config::ConfigOverlay;
 use crate::error::{ClientError, Result};
-use crate::hash::{create_id, now_millis};
+use crate::hash::{create_id, now_millis, repository_id_for_root};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -223,13 +223,17 @@ impl ValidationOrchestrator {
         Ok(record)
     }
 
-    /// Permanently allows a proposal's command by appending it to the
-    /// repository's `command_allowlist`, so future proposals for the exact
-    /// same command classify as low risk and skip the approval prompt.
+    /// Permanently allows a proposal's command, so future proposals for the
+    /// exact same command classify as low risk and skip the approval prompt.
     ///
-    /// Writes to `<repo>/.damaian/config.conf` — the repository the proposal
-    /// was raised against, not the user-wide config — so an allowance granted
-    /// in one project never leaks into another. Returns the path written.
+    /// Writes `command_allowlist.<repository_id>` to the *user's* config, not
+    /// to `<repo>/.damaian/config.conf`: the grant is still scoped to the one
+    /// repository the proposal was raised against, but it is the user's
+    /// decision about that repository, and a repository config entry would be
+    /// indistinguishable from one that arrived with a clone — which is how a
+    /// repository could allow its own commands (spec 34 §5.4). The id is per
+    /// checkout, so a grant does not transfer to another clone of the same
+    /// project. Returns the path written.
     ///
     /// The caller is expected to run the command afterwards: this only records
     /// the decision.
@@ -251,25 +255,26 @@ impl ValidationOrchestrator {
             )));
         }
 
-        let path = Config::repository_config_path(&repository_root);
+        let repository_id = repository_id_for_root(&repository_root);
+        let path = config.user_config_path();
         let mut overlay = ConfigOverlay::load_or_default(&path)?;
-        // `Config::apply_overlay` *replaces* `command_allowlist` rather than
-        // merging it, so a repository entry listing only the new command would
-        // silently drop everything the user allowed at user scope. Seed from
-        // the already-merged effective list the first time this repository
-        // takes ownership of the key; afterwards the repository entry is the
-        // authority and is appended to directly.
+        // The per-repository key holds only what was granted here. The user's
+        // machine-wide `command_allowlist` stays separate and is unioned in at
+        // load time, so seeding from the effective list — which the repository
+        // -scoped variant of this used to need — would only duplicate it.
         let mut allowlist = overlay
-            .command_allowlist
-            .take()
-            .unwrap_or_else(|| config.command_allowlist.clone());
+            .command_allowlist_by_repository
+            .remove(&repository_id)
+            .unwrap_or_default();
 
         let command = proposal.command.trim().to_string();
         let already_allowed = allowlist.iter().any(|entry| entry.trim() == command);
         if !already_allowed {
             allowlist.push(command.clone());
         }
-        overlay.command_allowlist = Some(allowlist);
+        overlay
+            .command_allowlist_by_repository
+            .insert(repository_id.clone(), allowlist);
         overlay.save(&path)?;
 
         self.audit_log.record(
@@ -280,6 +285,7 @@ impl ValidationOrchestrator {
                 ("command", command),
                 ("approvedBy", approved_by.to_string()),
                 ("alreadyAllowed", already_allowed.to_string()),
+                ("repositoryId", repository_id),
                 ("resourcePath", path.to_string_lossy().to_string()),
             ],
         )?;

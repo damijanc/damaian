@@ -82,14 +82,15 @@ restart "fixes" stale-index symptoms.
 
 ### Configuration layers
 
-Three files overlay onto the built-in defaults, applied in this order — **later
-wins** ([config.rs:209](../crates/workspace-engine/src/config.rs:209)):
+Three files overlay onto the built-in defaults, applied in this order. Later
+wins — **except at repository scope**, which is untrusted because that file
+arrives with a clone and can only make the policy stricter:
 
-| Order | Scope | Path | Override |
-|-------|-------|------|----------|
-| 1 | User | `<data-dir>/config/user.conf` | — |
-| 2 | Repository | `<repo>/.damaian/config.conf` | — |
-| 3 | Admin | `<data-dir>/config/admin.conf` | `DAMAIAN_ADMIN_CONFIG` |
+| Order | Scope | Path | Can weaken? | Override |
+|-------|-------|------|-------------|----------|
+| 1 | User | `<data-dir>/config/user.conf` | yes | — |
+| 2 | Repository | `<repo>/.damaian/config.conf` | **no** | — |
+| 3 | Admin | `<data-dir>/config/admin.conf` | yes | `DAMAIAN_ADMIN_CONFIG` |
 
 A missing file is skipped silently, not an error. The format is flat
 `key=value`, one per line; blank lines and `#` comments are ignored
@@ -110,7 +111,60 @@ change one field of a provider defined at user scope without restating the rest.
 
 The desktop Settings UI only ever writes **user** scope
 ([lib.rs:1048](../crates/desktop-shell/src/lib.rs:1048)). If a setting will not
-stick, something at repo or admin scope is overriding it.
+stick, something at admin scope is overriding it, or repository scope is adding
+a restriction on top of it.
+
+#### A repository config key had no effect
+
+That is usually deliberate. Repository config may add restrictions but never
+remove one
+([SECURITY.md](../SECURITY.md#repository-config-trust-boundary), spec
+[34](specs/34_repository_config_trust_boundary.md)):
+
+| Key | In repository config |
+|-----|----------------------|
+| `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, any `model_*` (including `model_provider.<id>.*`) | Ignored, audited, reported to the user once per repository |
+| `command_allowlist` | Never honoured — `Allow Always` writes user scope instead |
+| `restricted_patterns`, `ignore_patterns`, `command_blocklist` | Added to the user's list, never replacing it |
+| `require_approval_for_*` | May be set `true`, never `false` |
+| `mcp_enabled`, `mcp_server.<id>.enabled` | May be turned off, never on |
+| `mcp_server_allowlist` | May be narrowed, never widened |
+| `mcp_server.<id>.*` for a server the user already configured | Ignored: it would redirect a process the user trusts |
+| Everything else (budgets, `enable_semantic_search`, `agent_*`) | Applied as written |
+
+Ask which keys a repository asked for and did not get — this also records them
+in the audit log, so it answers once per repository and then reports nothing
+new:
+
+```bash
+cargo run -p damaian-cli -- config-review /path/to/repo
+```
+
+`config-set repo` prints the same note immediately after writing a key that
+repository scope will ignore.
+
+#### Where `Allow Always` entries live
+
+In **user** config, keyed by repository:
+
+```conf
+command_allowlist.repo_sha256:9f2c1a7b=cargo test|npm ci
+```
+
+The id is derived from the working folder's canonical path, so a grant does not
+carry over to another clone of the same project. The plain `command_allowlist`
+key still works at user and admin scope and applies to every repository.
+
+If a repository already carried a `command_allowlist` when you opened it, the
+app lists those commands once and asks which to keep; nothing from that list
+runs without approval until you answer. The CLI equivalent — no commands means
+discard everything:
+
+```bash
+cargo run -p damaian-cli -- config-allowlist-keep /path/to/repo "cargo test"
+```
+
+Either way the repository's own file is left exactly as it is.
 
 ### Secrets
 
@@ -225,6 +279,15 @@ is never pruned. Do not expect it to self-trim.
 Every line carries `eventId`, `timestampMs`, `userId` (`local_user`), and
 `eventType`.
 
+A repository-sourced config key that was refused appears as
+`repository_config_key_rejected` with `key` and `class`
+(`forbidden`, `restrict_only`, or `user_owned`) — never the refused value,
+which is repository-controlled text:
+
+```bash
+jq -r 'select(.eventType=="repository_config_key_rejected") | "\(.repositoryId) \(.key) \(.class)"' ~/Library/Application\ Support/DamaianClient/audit/events.jsonl
+```
+
 ```bash
 tail -20 ~/Library/Application\ Support/DamaianClient/audit/events.jsonl | jq .
 ```
@@ -336,6 +399,11 @@ cargo run -p damaian-cli -- config-show /path/to/repo
 Omit the repo argument to see user + admin only, without repo scope. In the
 desktop app the same data is the **Effective Policy** view, and
 `GET /api/config` returns it as JSON.
+
+`command_allowlist` in `config-show` output is the effective list for that
+repository: the user and admin machine-wide entries plus the `Allow Always`
+grants for that working folder. Other folders' grants are not shown, because
+they do not apply there — read `user.conf` to see them all.
 
 Write to a specific scope — this reports the exact file it touched, which is
 also a quick way to confirm where a scope resolves:

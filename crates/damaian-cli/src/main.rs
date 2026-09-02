@@ -2,9 +2,10 @@ use std::env;
 use std::io::IsTerminal;
 use std::path::Path;
 use workspace_engine::{
-    CommandProposal, CommandRisk, Config, ConfigOverlay, CurlModelTransport, MockModelAdapter,
-    OpenAICompatibleAdapter, SearchResult, WorkspaceEngine, command_approval_prompt,
-    parse_hunk_selection, patch_diff_text, patch_hunk_summary, render_markdown_to_ansi,
+    CommandProposal, CommandRisk, Config, ConfigOverlay, ConfigScope, CurlModelTransport,
+    MockModelAdapter, OpenAICompatibleAdapter, SearchResult, WorkspaceEngine,
+    command_approval_prompt, parse_hunk_selection, patch_diff_text, patch_hunk_summary,
+    render_markdown_to_ansi,
 };
 
 fn usage() -> &'static str {
@@ -19,6 +20,8 @@ fn usage() -> &'static str {
   damaian detect-commands <repo>
   damaian classify-command <command>
   damaian config-show [repo]
+  damaian config-review <repo>
+  damaian config-allowlist-keep <repo> [command...]
   damaian config-set user <key> <value>
   damaian config-set repo <repo> <key> <value>
   damaian config-set admin <key> <value>
@@ -160,6 +163,14 @@ fn run() -> workspace_engine::Result<()> {
                 Config::load_for_repository(None)?
             };
             print!("{}", config.to_policy_text());
+        }
+        "config-review" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            print!("{}", repository_config_review(repo)?);
+        }
+        "config-allowlist-keep" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            print!("{}", keep_repository_allowlist(repo, &args[2..])?);
         }
         "config-set" => {
             set_config_value(&args)?;
@@ -495,6 +506,76 @@ fn engine_for_repo(repo: &str) -> workspace_engine::Result<WorkspaceEngine> {
     ))?))
 }
 
+/// What this repository's config asked for and did not get, and any
+/// `command_allowlist` entries still awaiting a keep-or-discard decision.
+/// Reading the review is what records the refusals in the audit log, so it
+/// reports each key once per repository — the same behaviour the app has.
+fn repository_config_review(repo: &str) -> workspace_engine::Result<String> {
+    let (config, report) = Config::load_for_repository_reporting(Some(Path::new(repo)))?;
+    let engine = WorkspaceEngine::new(config);
+    let mut output = String::new();
+    match engine.repository_trust.review(&report, &engine.audit_log)? {
+        Some(notice) => {
+            for rejected in &notice.rejected {
+                output.push_str(&format!(
+                    "rejected {} ({})\n",
+                    rejected.key,
+                    rejected.class.as_str()
+                ));
+            }
+        }
+        None => output.push_str("no unreported repository config keys were refused\n"),
+    }
+    match engine
+        .repository_trust
+        .pending_allowlist_migration(&report)?
+    {
+        Some(migration) => {
+            for entry in &migration.entries {
+                output.push_str(&format!("awaiting decision: {entry}\n"));
+            }
+            output.push_str(
+                "run `damaian config-allowlist-keep <repo> [command...]` to keep or discard\n",
+            );
+        }
+        None => output.push_str("no repository allowlist entries are awaiting a decision\n"),
+    }
+    Ok(output)
+}
+
+/// Answers the migration question: the named commands move to user config
+/// under this repository's key, everything else the repository listed is
+/// discarded. No commands means discard all. The repository's own file is
+/// never modified.
+fn keep_repository_allowlist(repo: &str, keep: &[String]) -> workspace_engine::Result<String> {
+    let (config, report) = Config::load_for_repository_reporting(Some(Path::new(repo)))?;
+    let engine = WorkspaceEngine::new(config);
+    let path =
+        engine
+            .repository_trust
+            .resolve_allowlist_migration(&report, keep, &engine.audit_log)?;
+    Ok(format!(
+        "kept {} of {} entries in {}\n",
+        keep.len(),
+        report.repository_allowlist_entries.len(),
+        path.to_string_lossy()
+    ))
+}
+
+/// Applies one key at repository scope over this repository's real effective
+/// policy and reports what the boundary refused. Used to warn immediately
+/// after writing a repository config key that will be ignored.
+fn repository_scope_refusals(
+    repo: &str,
+    key: &str,
+    value: &str,
+) -> workspace_engine::Result<Vec<workspace_engine::RejectedConfigKey>> {
+    let mut probe = Config::load_for_repository(Some(Path::new(repo)))?;
+    let mut single = ConfigOverlay::default();
+    single.set(key, value)?;
+    Ok(probe.apply_overlay_scoped(single, ConfigScope::Repository))
+}
+
 fn set_config_value(args: &[String]) -> workspace_engine::Result<()> {
     let scope = require_arg(args, 1, "<scope>")?;
     match scope {
@@ -517,6 +598,15 @@ fn set_config_value(args: &[String]) -> workspace_engine::Result<()> {
             overlay.set(key, value)?;
             overlay.save(&path)?;
             println!("wrote {}", path.to_string_lossy());
+            // Say now if repository scope will refuse this key, rather than
+            // leaving the user to wonder why the setting had no effect.
+            for rejected in repository_scope_refusals(repo, key, value)? {
+                println!(
+                    "note: {} is {} in repository config and was ignored",
+                    rejected.key,
+                    rejected.class.as_str()
+                );
+            }
         }
         "admin" => {
             let key = require_arg(args, 2, "<key>")?;

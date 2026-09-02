@@ -1,6 +1,6 @@
 # Feature Spec: Repository Config Trust Boundary
 
-Status: Not started
+Status: Done
 Order: 34 of 34
 Priority: **Implement ahead of the roadmap queue.** This is a bug-driven spec,
 not a roadmap graduation — like [`07_generated_secret_override.md`](07_generated_secret_override.md)
@@ -203,6 +203,15 @@ logical AND, and a new server's default is off per `config.rs:168-169`), and
 cannot clear its `require_approval`. So a suggested server is inert until the
 user turns it on.
 
+**Amended during implementation.** "Definitions stay free" holds only for a
+server id the user does not already have. Overlaying `command`, `args`, `env`,
+`url`, `transport`, or `auth_token_env` onto a server the user has already
+configured — and possibly already enabled — redirects a process the user
+trusts, which is `shell` again with a different key name, and requirement 2
+forbids it. So a repository may *create* a definition (created disabled and
+approval-gated whatever the file says, so the reasoning above still holds) but
+its fields are **Forbidden** for an id that already exists.
+
 ### 5.2 Restrict-only merges
 
 The three merge shapes, all resolving toward the more restrictive outcome:
@@ -368,20 +377,79 @@ untrusted input" is a product guarantee an agent must not weaken.
 
 ## 7. Implementation Notes
 
-To be completed during implementation. Record:
+**Shape of the fix.** `ConfigScope` and `Config::apply_overlay_scoped`
+(`config.rs`) replace the scope-blind assignment. The function destructures
+`ConfigOverlay` with no `..`, so the compile-time property requirement 9 asks
+for is a language guarantee rather than a convention: a new overlay field is a
+compile error until it is classified. `apply_overlay` delegates at
+`ConfigScope::User`, so existing callers were untouched.
 
-- How many real repositories carried a `command_allowlist`, and how many entries
-  the user kept at the migration prompt. A high discard rate would suggest
-  entries had accumulated that the user no longer wanted, which is worth knowing
-  independently.
-- Whether any existing test relied on repository config overriding a user value.
-  Such a test encodes the defect and should be changed, not accommodated — say
-  which.
-- Confirmation that `MACOS_INSTALLATION.md`'s `model_api_key_env` override
-  statement was corrected, since leaving it would document a behaviour that no
-  longer exists and read as a bug.
+**Deviations from §5.**
 
-Follow-on, out of scope here: `SECURITY.md` should state the boundary for
-`AGENTS.md`, repository config, and MCP server descriptors together, since all
-three are untrusted repository-supplied input and only the first is currently
-documented as such.
+- `apply_overlay_scoped` returns `Vec<RejectedConfigKey>` rather than `()`.
+  §5.3 needs the refused key names for the audit trail and the notice, and
+  returning them keeps the classification in one place instead of duplicating
+  it in a second "would this be refused?" predicate. The CLI's `config-set repo`
+  reuses that return to warn immediately after writing a key that will be
+  ignored.
+- `mcp_server.<id>.*` for a server the user already configured is Forbidden —
+  see the amendment in §5.1.
+- Restrict-only *weakening attempts* are audited too, with class
+  `restrict_only`, and the notice names them alongside the Forbidden keys. §5.3
+  only asked for Forbidden. A repository trying to switch approval prompts off
+  is the same kind of information about that repository, and the notice reads
+  better as "here is everything it asked for and did not get". Union merges
+  (`restricted_patterns`, `ignore_patterns`, `command_blocklist`) are
+  deliberately *not* recorded: a repository listing only its own additions is
+  the normal case, and recording it would bury the signal.
+- `mcp_server_allowlist` intersection has one case §5.2 does not cover: an
+  empty list means "no restriction", so an intersection that comes out empty
+  cannot be stored without widening. A repository whose list shares nothing
+  with the user's is substituting rather than narrowing, so the user's list
+  stands and the attempt is recorded.
+- Auditing happens when the notice is produced (`RepositoryTrustStore::review`),
+  not on every overlay application. Config is loaded per HTTP request, so
+  auditing at load would write thousands of duplicate events per session; the
+  trail wants one entry per key per repository. A key the repository adds later
+  is new, and is audited and shown then.
+
+**Where the state lives.** `<data_dir>/config/repository-trust/<repository_id>.json`
+holds the reported keys and whether the allowlist question has been answered. A
+corrupt file is treated as absent: the worst case is a notice shown twice, which
+is better than a repository that will not open.
+
+**Tests that encoded the defect.** Four, all in
+`crates/workspace-engine/tests/foundation.rs`:
+
+- `config_precedence_is_user_then_repo_then_admin` asserted that repository
+  config replaced the user's `model_name`, `command_allowlist`, and
+  `secret_patterns`. Rewritten to assert the boundary, keeping the part that was
+  always right — admin has the last word.
+- `allowing_command_always_writes_repository_config_and_skips_later_approval`,
+  `allowing_command_always_preserves_existing_allowlist_entries`, and
+  `allowing_command_always_is_idempotent` asserted the repository file was
+  written, and the second existed only to work around the replace-not-merge
+  behaviour of the repository-scoped key. All three are replaced by tests in
+  `crates/workspace-engine/tests/repository_config_trust.rs` (33 tests,
+  including the §5.6 hostile fixture and its companion).
+
+**Migration data.** Not yet observable: this is a developer preview with no
+telemetry, and the local repositories used during implementation carried no
+`command_allowlist` other than the fixtures created to test the flow. The
+question §7 asks — how often entries are discarded — needs real usage to answer,
+and the audit event `repository_allowlist_migrated` records `offeredCount` and
+`keptCount` so it can be answered from a user's own log without adding
+telemetry.
+
+**Documentation.** `MACOS_INSTALLATION.md`'s `model_api_key_env` override
+statement is corrected: it now says the model connection cannot be changed by
+repository config at all, and names the other four `model_*` keys, since a
+reader who trusted the old sentence would have believed a repository could
+redirect their key. `SECURITY.md` gained a **Repository Config Trust Boundary**
+section that also states the boundary for `AGENTS.md` and MCP server
+descriptors — the follow-on this spec listed as out of scope turned out to be
+two sentences, so it was done here rather than left to rot.
+
+`AGENTS.md`, `docs/USER_GUIDE.md`, and `docs/TROUBLESHOOTING.md` are updated,
+including a per-key table of what repository scope can and cannot do and the new
+`damaian config-review` / `damaian config-allowlist-keep` commands.

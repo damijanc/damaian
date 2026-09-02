@@ -69,7 +69,7 @@ Notes:
 
 ## Testing
 
-- 232 tests pass by default: mostly inline `#[test]` modules, plus integration
+- 265 tests pass by default: mostly inline `#[test]` modules, plus integration
   tests in `crates/workspace-engine/tests/`. Add tests next to the code you
   change.
 - Two tests are `#[ignore]`d because they have real side effects (one opens
@@ -97,6 +97,15 @@ make something easier:
   raw key. Never write a raw key into config, code, tests, or logs.
 - **Patch application** verifies file hashes so it cannot overwrite work the user
   changed after the preview was generated. Keep that check.
+- **Repository config is untrusted input.** `<repo>/.damaian/config.conf` arrives
+  with a clone, so it may add restrictions and never remove one. A repository
+  cannot set `shell`, `data_dir`, `allowed_roots`, `secret_patterns`,
+  `audit_enabled`, `block_generated_secrets`, any `model_*` key, or
+  `command_allowlist`. `Config::apply_overlay_scoped` classifies every overlay
+  field in one exhaustive destructuring, so a field added to `ConfigOverlay`
+  without being classified fails to compile — keep it that way rather than
+  adding a catch-all. The same rule already applies to `AGENTS.md`, which
+  cannot widen a working mode.
 
 See [SECURITY.md](SECURITY.md) for the full model.
 

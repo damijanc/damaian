@@ -369,6 +369,7 @@ function showAppDialog({
   inputValue = null,
   confirmLabel = "OK",
   danger = false,
+  dismissOnly = false,
 }) {
   return new Promise((resolve) => {
     const backdrop = ensureAppDialog();
@@ -386,6 +387,8 @@ function showAppDialog({
     inputEl.value = usesInput ? inputValue : "";
     confirmBtn.textContent = confirmLabel;
     confirmBtn.classList.toggle("app-dialog-btn-danger", danger);
+    // A notice has nothing to decline, so it gets one button.
+    cancelBtn.hidden = dismissOnly;
 
     const cleanup = (result) => {
       backdrop.hidden = true;
@@ -420,6 +423,114 @@ function promptDialog(title, initialValue) {
 
 function confirmDialog(title, message, { danger = false, confirmLabel = "Delete" } = {}) {
   return showAppDialog({ title, message, confirmLabel, danger });
+}
+
+function noticeDialog(title, message) {
+  return showAppDialog({ title, message, confirmLabel: "OK", dismissOnly: true });
+}
+
+// Repository config is untrusted input: it may add restrictions but never
+// remove one. The engine refuses the rest and reports it once per repository;
+// these two dialogs are where the user hears about it.
+const reviewedRepositoryConfigs = new Set();
+
+async function reviewRepositoryConfig(repoPath) {
+  const path = normalizeProjectPath(repoPath);
+  if (!path || reviewedRepositoryConfigs.has(path)) return;
+  reviewedRepositoryConfigs.add(path);
+  let review;
+  try {
+    review = await api(`/api/repository-config-review?repo=${encodeURIComponent(path)}`);
+  } catch {
+    // A review that cannot be read must not stop the project from opening.
+    // The engine has already refused the keys either way.
+    return;
+  }
+  const rejected = Array.isArray(review.rejectedKeys) ? review.rejectedKeys : [];
+  if (rejected.length) {
+    await noticeDialog(
+      "This repository tried to change Damaian's settings",
+      `${projectName(path)} ships a .damaian/config.conf that sets ${rejected
+        .map((item) => item.key)
+        .join(", ")}. Damaian ignored ${
+        rejected.length === 1 ? "that key" : "those keys"
+      }: a repository cannot change where commands run, where model traffic goes, where your ` +
+        "data is written, or which approvals you see. Its other settings were applied.",
+    );
+  }
+  const entries = Array.isArray(review.allowlistEntries) ? review.allowlistEntries : [];
+  if (entries.length) {
+    const kept = await showAllowlistMigrationDialog(path, entries);
+    if (kept === null) {
+      // Dismissed rather than answered — ask again next time.
+      reviewedRepositoryConfigs.delete(path);
+      return;
+    }
+    try {
+      await api("/api/repository-config-allowlist", form({ repo: path, keep: kept.join("|") }));
+      toast(
+        kept.length
+          ? `Kept ${kept.length} allowed command${kept.length === 1 ? "" : "s"}`
+          : "Discarded this repository's allowed commands",
+      );
+    } catch (error) {
+      reviewedRepositoryConfigs.delete(path);
+      toast(error.message);
+    }
+  }
+}
+
+// Resolves to the commands to keep (possibly empty), or `null` if the user
+// dismissed the question without answering it.
+function showAllowlistMigrationDialog(repoPath, entries) {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement("div");
+    backdrop.className = "app-dialog-backdrop";
+    backdrop.innerHTML = `
+      <div class="app-dialog app-dialog-wide" role="dialog" aria-modal="true">
+        <p class="app-dialog-title">Commands this repository lists as always allowed</p>
+        <p class="app-dialog-message"></p>
+        <div class="app-dialog-checklist"></div>
+        <div class="app-dialog-actions">
+          <button type="button" class="app-dialog-btn app-dialog-discard">Discard all</button>
+          <button type="button" class="app-dialog-btn app-dialog-confirm">Keep selected</button>
+        </div>
+      </div>
+    `;
+    backdrop.querySelector(".app-dialog-message").textContent =
+      `${projectName(repoPath)} carries these in .damaian/config.conf. Damaian cannot tell which ` +
+      "you allowed yourself and which arrived with the repository, so none of them run without " +
+      "asking until you choose. Keep only the ones you recognise.";
+    const list = backdrop.querySelector(".app-dialog-checklist");
+    entries.forEach((entry, index) => {
+      const row = document.createElement("label");
+      row.className = "app-dialog-checkitem";
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.value = entry;
+      box.id = `allowlist-migration-${index}`;
+      const text = document.createElement("code");
+      text.textContent = entry;
+      row.append(box, text);
+      list.append(row);
+    });
+    document.body.append(backdrop);
+
+    const cleanup = (result) => {
+      document.removeEventListener("keydown", onKeydown, true);
+      backdrop.remove();
+      resolve(result);
+    };
+    const onKeydown = (event) => {
+      if (event.key === "Escape") cleanup(null);
+    };
+    backdrop.querySelector(".app-dialog-confirm").addEventListener("click", () => {
+      cleanup(Array.from(list.querySelectorAll("input:checked")).map((input) => input.value));
+    });
+    backdrop.querySelector(".app-dialog-discard").addEventListener("click", () => cleanup([]));
+    document.addEventListener("keydown", onKeydown, true);
+    backdrop.querySelector(".app-dialog-confirm").focus();
+  });
 }
 
 // Renames a project within damaian only: it changes `projectName()`'s
@@ -726,6 +837,7 @@ function applyRepositoryState(value, persist = true) {
 function setRepository(value, persist = true) {
   const projectPath = applyRepositoryState(value, persist);
   if (projectPath) {
+    void reviewRepositoryConfig(projectPath);
     void loadSessions("", true).catch((error) => toast(error.message));
   } else {
     clearSessionList();
@@ -741,6 +853,7 @@ async function switchProject(projectPath, options = {}) {
     clearChat();
     return;
   }
+  void reviewRepositoryConfig(normalized);
   await loadSessions(options.preferredSessionId || "", options.reloadSelected !== false);
   void loadConfigFile().catch((error) => setModelKeyStatus(error.message, "error"));
 }

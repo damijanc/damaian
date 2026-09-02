@@ -21,6 +21,7 @@ pub mod model;
 pub mod patch_engine;
 pub mod path_policy;
 pub mod render;
+pub mod repository_trust;
 pub mod secret_scanner;
 pub mod session;
 pub mod validation;
@@ -39,8 +40,9 @@ pub use command_policy::{
 };
 pub use command_runner::{CommandExecution, CommandRunner};
 pub use config::{
-    Config, ConfigOverlay, DEFAULT_CONTEXT_TOKEN_BUDGET, McpServerConfig, McpServerConfigOverlay,
-    McpTransport, ModelProviderConfig, ModelProviderConfigOverlay, normalize_mcp_server_id,
+    Config, ConfigOverlay, ConfigScope, DEFAULT_CONTEXT_TOKEN_BUDGET, McpServerConfig,
+    McpServerConfigOverlay, McpTransport, ModelProviderConfig, ModelProviderConfigOverlay,
+    RejectedConfigKey, RepositoryConfigReport, RepositoryKeyClass, normalize_mcp_server_id,
     normalize_model_provider, normalize_model_reasoning_level, parse_mcp_transport,
 };
 pub use context_manager::{ContextItem, ContextManager, ContextPlan};
@@ -52,6 +54,7 @@ pub use edit::{
 pub use error::{ClientError, Result};
 pub use file_access::{FileAccessController, FileRead};
 pub use git_service::{GitFileStatus, GitService, GitStatus};
+pub use hash::repository_id_for_root;
 pub use index_cache::IndexCache;
 pub use indexer::{ProjectIndexer, RepositoryIndex, SearchResult};
 pub use mcp::{
@@ -70,6 +73,9 @@ pub use patch_engine::{
 pub use path_policy::PathPolicy;
 pub use render::{
     render_markdown_to_ansi, render_markdown_to_html, render_markdown_to_html_with_file_links,
+};
+pub use repository_trust::{
+    RepositoryAllowlistMigration, RepositoryConfigNotice, RepositoryTrustStore,
 };
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{ChatMessage, Session, SessionStore, Task, TaskStatus};

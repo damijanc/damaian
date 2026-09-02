@@ -59,7 +59,9 @@ Commands that cannot run in sandbox mode appear as an approval card in the conve
 
 Docker commands, including `docker ps`, `docker compose ...`, and `docker-compose ...`, are approval-gated by default. They can inspect or change a privileged local daemon, use the network, start background services, mount host paths, expose ports, and mutate images or volumes, so Damaian never treats them as automatically sandbox-safe.
 
-`Allow Always` runs the command and adds it to `command_allowlist` in `.damaian/config.conf` inside the selected repository, so that command stops asking. The allowance covers the exact command only: allowing `npm run test:unit` does not allow `npm run test:unit --watch`, and allowing `git push` does not allow `git push --force`. It applies to that repository alone. Remove an entry by editing `.damaian/config.conf`.
+`Allow Always` runs the command and records it in your own config as `command_allowlist.<repository_id>`, so that command stops asking. The allowance covers the exact command only: allowing `npm run test:unit` does not allow `npm run test:unit --watch`, and allowing `git push` does not allow `git push --force`. It applies to that working folder alone, and not to another clone of the same project at a different path. Remove an entry by editing the `command_allowlist.<repository_id>` line in `~/Library/Application Support/DamaianClient/config/user.conf`.
+
+The decision is stored in your config rather than in the repository because Damaian could not otherwise tell a command you allowed from one that arrived with the clone. A `command_allowlist` in a repository's `.damaian/config.conf` is never honoured; if a repository you open already has one, Damaian shows the exact commands once and asks which to keep.
 
 `Allow Always` is not offered for commands blocked by policy, for commands containing shell control syntax such as `|`, `&&`, or `>`, or when `require_approval_for_all_commands` is set — in each of those cases an allowlist entry would have no effect, so the app does not offer to write one.
 
@@ -107,7 +109,15 @@ Common keys:
 - `model_provider.<id>.context_token_budget`: How much repository content is sent with each request, in tokens. Omit to use the built-in default for the selected model.
 - `model_provider.<id>.supports_native_tools`: Set to `true` to use the provider's native tool-calling API. Required for MCP tools, patch proposals, and other agentic actions.
 
-Repository-scoped settings are not edited from Settings. Put repository defaults in `.damaian/config.conf` inside the selected repository. Repository settings are included in `Effective Policy` and can override user settings. The one exception is `command_allowlist`, which the `Allow Always` button on a command approval card appends to; see [Chat](#chat).
+Repository-scoped settings are not edited from Settings. Put repository defaults in `.damaian/config.conf` inside the selected repository. Repository settings are included in `Effective Policy`.
+
+Because that file arrives with a clone, a repository can only make Damaian *more* careful, never less:
+
+- `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
+- `restricted_patterns`, `ignore_patterns`, and `command_blocklist` are added to yours rather than replacing them.
+- The `require_approval_for_*` flags can be turned on by a repository, not off. MCP and individual MCP servers can be turned off, not on.
+- `command_allowlist` is never taken from repository config; `Allow Always` writes to your own config instead. See [Chat](#chat).
+- Budgets and preferences — `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, and the `agent_*` round limits — apply as written.
 
 ## Model Providers and API Keys
 
