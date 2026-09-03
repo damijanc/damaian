@@ -12,7 +12,9 @@
     "updater:manifest": "node scripts/create-updater-manifest.mjs",
     "version:sync": "node scripts/sync-version.mjs",
     "desktop:dev": "cd crates/desktop-app && cargo tauri dev",
-    "desktop:build": "cd crates/desktop-app && APPLE_SIGNING_IDENTITY=\"${APPLE_SIGNING_IDENTITY:--}\" cargo tauri build"
+    "desktop:build": "cd crates/desktop-app && cargo tauri build",
+    "desktop:build:preview": "cd crates/desktop-app && APPLE_SIGNING_IDENTITY=- cargo tauri build",
+    "updater:verify-signature": "node scripts/verify-updater-signature.mjs"
   },
   "engines": {
     "node": ">=24"

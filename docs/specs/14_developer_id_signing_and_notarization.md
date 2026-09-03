@@ -1,6 +1,6 @@
 # Feature Spec: Developer ID Signing and Notarization
 
-Status: Not started
+Status: Implemented; pending the validation runs in §7.
 Order: 14 of 15
 Roadmap: `docs/ROADMAP/00b_phase_0_distributable_build.md`, Phase 0, Work
 Package 1 (Must). That directory is local-only and not committed, so the
@@ -399,7 +399,60 @@ from a workflow run cannot be mistaken for a release build.
 
 ## 7. Implementation Notes
 
-To be completed during implementation.
+Implemented 2026-09-03. Changes: `.github/workflows/macos-dmg.yml` (channel
+input, preflight gate, API-key handling, split stable/preview build steps, DMG
+notarization and stapling, real verification gate, channel-scoped artifact
+name), `package.json` (`desktop:build` no longer defaults the identity, plus
+`desktop:build:preview` and `updater:verify-signature`),
+`scripts/enable-updater-artifacts.mjs` and `scripts/create-updater-manifest.mjs`
+(channel-scoped manifests), the new `scripts/verify-updater-signature.mjs`,
+`crates/desktop-app/src/main.rs` and `build.rs` (compiled-in channel), and the
+release sections of `docs/DEVELOPMENT.md`.
+
+Three deviations from the design above, each deliberate:
+
+1. **§5.2's table lists `APPLE_API_KEY_PATH` as a required secret.** It is not
+   one, as its own description says: the workflow decodes `APPLE_API_KEY_CONTENT`
+   into `RUNNER_TEMP` and exports the path itself. Seven Apple secrets are
+   required, not eight. The table is left as written; this note is the
+   correction.
+2. **`build.rs` gained `rerun-if-env-changed=DAMAIAN_RELEASE_CHANNEL`.** §5.8 is
+   right that `option_env!` fixes the channel at compile time, but Cargo does
+   not track that variable, and the workflow caches `target/`. Without this, a
+   preview build followed by a stable build at the same version could reuse a
+   binary carrying the wrong channel. The neighbouring
+   `rerun-if-env-changed=TAURI_UPDATER_PUBKEY` set the pattern.
+3. **Requirement 6 conflicted with the existing updater gate.** The
+   `Configure updater release artifacts` step failed hard when
+   `TAURI_UPDATER_PUBKEY` was absent, which would have blocked exactly the
+   credential-less fork build that requirement 6 promises. It now fails closed
+   for `stable` and, for `preview`, skips the updater artifacts and continues.
+   `UPDATER_ARTIFACTS` carries that decision to the manifest and verification
+   steps.
+
+Two implementation details worth keeping:
+
+- The verification gate captures `codesign -dvvv` output into a variable instead
+  of piping it to `grep -q`. `grep -q` exits at the first match and closes the
+  pipe, `codesign` then dies of SIGPIPE, and `set -o pipefail` reports a
+  successful verification as a failure.
+- §5.6's warning about the algorithm tags is correct and was confirmed against
+  real `cargo tauri signer` 2.11.4 output: the public key reads `Ed`
+  (`RWTg…`), the signature reads `ED` (`RUTg…`). One further detail the design
+  does not mention: minisign's global signature covers the trusted comment
+  **without** the separator space after `trusted comment:`. Including it makes
+  every genuine signature fail.
+
+`scripts/verify-updater-signature.mjs` was checked against a throwaway keypair
+generated with the pinned CLI version, covering the happy path plus five
+rejections: a signature from a different key, a bundle modified after signing, a
+tampered trusted comment, a malformed base64 blob, and a manifest URL pointing at
+the wrong tag.
+
+Not done here, deliberately: `docs/MACOS_INSTALLATION.md` still says the build is
+ad-hoc signed and not notarized, because that remains true of every artifact
+published so far. Remove that line when the first stable release ships, per
+§5.10.
 
 Sequencing note: the workflow changes cannot be fully exercised on a pull
 request, because a tag-triggered stable path is what they gate. Validate in this

@@ -17,6 +17,14 @@ const PREFERRED_SHELL_PORT: u16 = 4765;
 const SETTINGS_MENU_ID: &str = "damaian-settings";
 const CHECK_FOR_UPDATES_MENU_ID: &str = "damaian-check-for-updates";
 
+/// Set by the release workflow. A build with no channel is a local developer
+/// build, which is a preview by definition. `option_env!` is evaluated at
+/// compile time, so the launch environment cannot change what a build reports.
+const RELEASE_CHANNEL: &str = match option_env!("DAMAIAN_RELEASE_CHANNEL") {
+    Some(channel) => channel,
+    None => "preview",
+};
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopBootstrap {
@@ -178,6 +186,9 @@ fn build_macos_menu<R: Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<Menu
     let about_metadata = AboutMetadata {
         name: Some(app_name.clone()),
         version: Some(app.package_info().version.to_string()),
+        // macOS renders this as "Version <version> (<short_version>)", which is
+        // where the channel becomes visible to the user.
+        short_version: Some(RELEASE_CHANNEL.to_string()),
         ..Default::default()
     };
 

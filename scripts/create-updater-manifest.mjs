@@ -21,6 +21,15 @@ if (!repo || !/^[^/]+\/[^/]+$/.test(repo)) {
   process.exit(2);
 }
 
+const channel = (process.env.RELEASE_CHANNEL || "preview").trim();
+if (channel !== "stable" && channel !== "preview") {
+  console.error(`RELEASE_CHANNEL must be "stable" or "preview", got "${channel}"`);
+  process.exit(2);
+}
+
+// Only the stable channel may write latest.json, which is the file the shipped
+// updater endpoint points at.
+const manifestName = channel === "stable" ? "latest.json" : "preview.json";
 const bundleName = "Damaian.app.tar.gz";
 const signaturePath = `target/release/bundle/macos/${bundleName}.sig`;
 const signature = (await readFile(signaturePath, "utf8")).trim();
@@ -28,6 +37,7 @@ const releaseBaseUrl = `https://github.com/${repo}/releases/download/${tag}`;
 
 const manifest = {
   version,
+  channel,
   notes: `Damaian ${version}`,
   pub_date: new Date().toISOString(),
   platforms: {
@@ -40,5 +50,5 @@ const manifest = {
 
 const outputDir = "target/release/bundle/updater";
 await mkdir(outputDir, { recursive: true });
-await writeFile(path.join(outputDir, "latest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
-console.log(`Created updater manifest for ${tag}`);
+await writeFile(path.join(outputDir, manifestName), `${JSON.stringify(manifest, null, 2)}\n`);
+console.log(`Created ${channel} updater manifest ${manifestName} for ${tag}`);

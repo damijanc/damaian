@@ -115,7 +115,7 @@ reference (`keychain:model-api-key`) or the name of an environment variable.
 ## Build a macOS DMG
 
 ```sh
-npm run desktop:build
+npm run desktop:build:preview
 ```
 
 Artifacts are written to:
@@ -126,6 +126,12 @@ Artifacts are written to:
 The developer-preview package is ad-hoc signed for bundle integrity but is not
 Developer ID signed or notarized. See [macOS Installation](MACOS_INSTALLATION.md)
 for the first-launch steps macOS requires.
+
+`npm run desktop:build` is the stable path and does **not** default the signing
+identity. With no `APPLE_SIGNING_IDENTITY` in the environment it produces an
+unsigned build rather than quietly falling back to an ad-hoc signature, so a
+release that is missing its credentials fails instead of shipping something that
+looks signed and is not.
 
 ## Automatic updates
 
@@ -142,8 +148,56 @@ this feature must be replaced manually once.
 
 ## GitHub macOS release build
 
-The workflow at `.github/workflows/macos-dmg.yml` builds ad-hoc signed Apple
-Silicon DMGs and signed Tauri updater artifacts.
+The workflow at `.github/workflows/macos-dmg.yml` builds Apple Silicon DMGs and
+signed Tauri updater artifacts.
+
+### Release channels
+
+The channel follows the trigger, not a repository setting:
+
+| Trigger | Channel | Signing | Publishes |
+|---|---|---|---|
+| Tag push `v*` | `stable` | Developer ID, notarized, stapled, verified — or the job fails | DMG, `latest.json`, GitHub Release |
+| `workflow_dispatch`, `channel: stable` | `stable` | Same as above | Workflow artifact only |
+| `workflow_dispatch` (default) | `preview` | Ad-hoc | DMG, `preview.json`; never a Release |
+| Pull request / branch CI | n/a | n/a | Nothing; Quality only |
+
+Only the stable channel writes `latest.json`, which is the file the shipped
+updater endpoint reads. A preview install is therefore never offered a stable
+update it did not opt into, and a stable install is never offered a preview
+build. The channel is compiled in with `DAMAIAN_RELEASE_CHANNEL` and shown next
+to the version in the About panel.
+
+### Apple signing credentials
+
+A stable build needs these repository secrets. The job checks that every one is
+present before it starts building, and names any that are missing. Values are
+passed through `env:` only, so GitHub's log masking applies.
+
+| Secret | Purpose |
+|---|---|
+| `APPLE_CERTIFICATE` | Base64-encoded Developer ID Application `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | Password for that `.p12` |
+| `APPLE_SIGNING_IDENTITY` | Full identity, e.g. `Developer ID Application: Name (TEAMID)` |
+| `APPLE_TEAM_ID` | Apple Developer team identifier |
+| `APPLE_API_ISSUER` | App Store Connect API issuer UUID |
+| `APPLE_API_KEY` | App Store Connect API key ID |
+| `APPLE_API_KEY_CONTENT` | Base64-encoded `.p8` private key |
+
+`APPLE_API_KEY_PATH` is not a secret. The workflow decodes `APPLE_API_KEY_CONTENT`
+into the runner's temp directory, points that variable at it, and deletes the
+file in an `if: always()` step so a cancelled job leaves no key behind.
+
+App Store Connect API-key authentication is used rather than an Apple ID and
+app-specific password because it does not tie releases to one person's Apple ID
+and survives that person changing their two-factor settings.
+
+A stable build fails closed: if signing, notarization, stapling, or verification
+fails, or a credential is missing, the job stops before any artifact is uploaded
+and before any Release is created. Verification is not nominal — it asserts a
+`Developer ID Application` signing authority, the hardened-runtime flag,
+`stapler validate` on both the `.app` and the `.dmg`, and `spctl` acceptance of
+both.
 
 ### Updater signing keys
 
@@ -167,7 +221,11 @@ cannot verify artifacts signed with a replacement key.
 1. Open the repository on GitHub → **Actions**.
 2. Select **Build macOS DMG** → **Run workflow**.
 3. Enter a version such as `0.1.3`. This stamps the About dialog, DMG filename, and updater manifest.
-4. Download the `Damaian-macOS-arm64-DMG` artifact from the completed run.
+4. Choose a channel. `preview` needs no Apple credentials; `stable` exercises the full signing and notarization path without creating a Release.
+5. Download the `Damaian-macOS-arm64-<channel>-DMG` artifact from the completed run.
+
+A preview run with no updater secrets configured still produces a DMG — the
+updater artifacts are dropped rather than the build, so a fork is not blocked.
 
 ### Tag-triggered release
 
