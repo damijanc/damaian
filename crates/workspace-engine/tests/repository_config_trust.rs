@@ -698,7 +698,7 @@ fn allow_always_does_not_transfer_to_another_checkout() {
 /// `executes_stored_command_and_persists_redacted_output` in `foundation.rs`,
 /// but `/bin/sh` rather than the tester's login shell.
 #[test]
-fn an_approved_command_runs_the_users_shell_not_the_repositorys() {
+fn an_approved_command_runs_the_users_shell_not_the_repository_shell() {
     let fixture = fixture("shell-hijack", "shell=/bin/sh\n", "shell=./tools/sh\n");
     let marker = fixture.root.join("hijacked.txt");
     let script = fixture.root.join("tools").join("sh");
