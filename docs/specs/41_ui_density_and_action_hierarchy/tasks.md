@@ -13,8 +13,7 @@ where it stopped without reading the git log.
 |---|---|---|---|
 | 1 · Button scale and pre minimum | Done | `928679b` | Verified in the running app: card 161→155px, buttons 13px/600, bare `pre` minimum gone, `#config-output` keeps 180px |
 | 2 · Specimen page | Done | — | Verified over HTTP: real stylesheet loads (375 rules), token flip to `#b3261e` propagated. Six classes still unstyled — `command-approval-risk`, `command-approval-disclosure`, `disclosure-caret`, `patch-preview-heading`, `approval-menu-popover`, `approval-menu-row` — all created by Tasks 3-5. `file://` open not verified, see below |
-| 3 · Command approval structure | Not started | — | **Does not stand alone** — see Known gaps |
-| 4 · Command approval overflow menu | Not started | — | Must land with Task 3 |
+| 3 + 4 · Command approval structure and overflow menu | Done, one criterion missed | — | Landed as one commit: the plan's split needed two no-op stand-in buttons to keep an intermediate state runnable, which is not worth a deliberately-broken commit on `main`. **Collapsed card is 138px against a ≤120px criterion** — see below |
 | 5 · Patch preview header actions | Not started | — | |
 | 6 · Record outcome in spec | Not started | — | |
 
@@ -22,6 +21,33 @@ where it stopped without reading the git log.
 
 Errors found during execution are recorded in [`context.md`](context.md) §3, so
 they sit with the rest of the background rather than in the task list.
+
+### Acceptance criterion 1 missed — 138px against ≤120px
+
+Measured collapsed, single-line command, rationale collapsed. Baseline was
+161px, so this is a 23px reduction rather than the 41px the criterion assumed.
+Recorded rather than fixed by shaving padding, per the criterion's own
+instruction.
+
+Where the 138px goes: header 17, command block 33 (11px text plus 7px padding
+and border), disclosure row 24, actions row 29, and three 10px grid gaps. The
+120px figure came from a mockup whose internal spacing was tighter than the
+card's existing `gap: 10px`.
+
+Two honest ways to close it, neither yet applied:
+
+1. **Put the disclosure and the actions on one row** — "Why this command" left,
+   `Approve / Reject / ⋯` right. Saves a row and a gap, about 34px, landing
+   near 104px. It is a real design change beyond what `proposal.md` §3.3
+   describes, and it reads as a conventional card footer, so it needs a
+   decision rather than a quiet edit.
+2. **Accept 138px** and amend the criterion to match what the design actually
+   costs.
+
+Note also that the expanded card is now **196px**, larger than the 161px
+baseline, because the disclosure row is added on top of the rationale. The win
+is entirely in the collapsed case — which is the common one, and the point of
+the change — but it is a trade, not a free reduction.
 
 ### Open verification
 

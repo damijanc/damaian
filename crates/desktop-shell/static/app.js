@@ -657,6 +657,77 @@ function closeProjectMenu() {
   projectMenuTargetPath = null;
 }
 
+// The approval overflow menu. Same shape and the same reasoning as the project
+// row menu above: one shared `position: fixed` popover on `document.body`,
+// anchored to the trigger's rect. Approval cards live inside the scrolling
+// `#chat-log` and a turn can leave more than one behind, so a popover anchored
+// by CSS to an ancestor would detach as the log scrolls.
+let approvalMenuEl = null;
+
+function ensureApprovalMenu() {
+  if (approvalMenuEl) return approvalMenuEl;
+  const el = document.createElement("div");
+  el.className = "context-menu-popover approval-menu-popover";
+  el.setAttribute("role", "menu");
+  el.hidden = true;
+  el.addEventListener("click", (event) => event.stopPropagation());
+  document.body.append(el);
+  approvalMenuEl = el;
+  return el;
+}
+
+// `items` is [{ label, hint, onSelect }], rebuilt on every open because the
+// grants a proposal offers differ from one to the next.
+function toggleApprovalMenu(items, anchorEl) {
+  const el = ensureApprovalMenu();
+  if (!el.hidden && el.dataset.anchorId === anchorEl.dataset.menuId) {
+    closeApprovalMenu();
+    return;
+  }
+  el.innerHTML = "";
+  const panel = document.createElement("div");
+  panel.className = "context-menu-panel";
+  items.forEach((item) => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "context-menu-row approval-menu-row";
+    row.setAttribute("role", "menuitem");
+    const label = document.createElement("span");
+    label.textContent = item.label;
+    row.append(label);
+    if (item.hint) {
+      const hint = document.createElement("small");
+      hint.textContent = item.hint;
+      row.append(hint);
+    }
+    row.addEventListener("click", () => {
+      closeApprovalMenu();
+      item.onSelect();
+    });
+    panel.append(row);
+  });
+  el.append(panel);
+  el.dataset.anchorId = anchorEl.dataset.menuId || "";
+  el.hidden = false;
+  positionApprovalMenu(anchorEl);
+}
+
+function positionApprovalMenu(anchorEl) {
+  const el = ensureApprovalMenu();
+  const rect = anchorEl.getBoundingClientRect();
+  const width = el.offsetWidth || 272;
+  const left = Math.min(Math.max(8, rect.left), window.innerWidth - width - 8);
+  const top = Math.min(rect.bottom + 4, window.innerHeight - el.offsetHeight - 8);
+  el.style.left = `${left}px`;
+  el.style.top = `${top}px`;
+}
+
+function closeApprovalMenu() {
+  if (!approvalMenuEl) return;
+  approvalMenuEl.hidden = true;
+  approvalMenuEl.dataset.anchorId = "";
+}
+
 async function handleProjectMenuAction(event) {
   const button = event.target.closest("button[data-action]");
   if (!button) return;
@@ -703,9 +774,15 @@ async function handleProjectMenuAction(event) {
   }
 }
 
-document.addEventListener("click", () => closeProjectMenu());
+document.addEventListener("click", () => {
+  closeProjectMenu();
+  closeApprovalMenu();
+});
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeProjectMenu();
+  if (event.key === "Escape") {
+    closeProjectMenu();
+    closeApprovalMenu();
+  }
 });
 
 function setProjectsCollapsed(collapsed, persist = true) {
@@ -4073,48 +4150,99 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
   const header = document.createElement("div");
   header.className = "command-approval-header";
   const title = document.createElement("strong");
-  title.textContent = isBrowserDiagnostic ? "Browser diagnostic approval" : "Command approval";
+  title.textContent = isBrowserDiagnostic ? "Run browser diagnostic" : "Run command";
   const meta = document.createElement("span");
+  meta.className = "command-approval-risk";
   meta.textContent = proposal.blocked ? "blocked" : proposal.risk || "review";
+  meta.dataset.blocked = proposal.blocked ? "true" : "false";
   header.append(title, meta);
 
   const command = document.createElement("code");
   command.className = "command-approval-command";
   command.textContent = proposal.command || "";
 
+  // The rationale sits behind a disclosure because the common case is a short
+  // command approved without reading it. Rendered collapsed every time — the
+  // state is deliberately not remembered between proposals, since the whole
+  // point is that the common case costs one row.
+  const disclosure = document.createElement("button");
+  disclosure.type = "button";
+  disclosure.className = "command-approval-disclosure";
+  disclosure.setAttribute("aria-expanded", "false");
+  const caret = document.createElement("span");
+  caret.className = "disclosure-caret";
+  caret.setAttribute("aria-hidden", "true");
+  disclosure.append(caret, document.createTextNode("Why this command"));
+
   const details = document.createElement("pre");
   details.className = "command-approval-details";
   details.textContent = proposal.prompt || "";
+  details.hidden = true;
+
+  disclosure.addEventListener("click", () => {
+    const open = disclosure.getAttribute("aria-expanded") === "true";
+    disclosure.setAttribute("aria-expanded", open ? "false" : "true");
+    details.hidden = open;
+  });
 
   const actions = document.createElement("div");
-  actions.className = "inline-actions command-approval-actions";
+  actions.className = "command-approval-actions";
   const runButton = document.createElement("button");
   runButton.type = "button";
-  runButton.textContent = proposal.blocked
-    ? "Blocked"
-    : isBrowserDiagnostic
-      ? "Approve Once"
-      : "Approve Run";
+  runButton.className = "btn-sm btn-primary";
+  runButton.textContent = proposal.blocked ? "Blocked" : "Approve";
   runButton.disabled = Boolean(proposal.blocked);
-  // The server decides eligibility (blocked, shell-control syntax, and
-  // `require_approval_for_all_commands` all rule it out) so the button is
-  // never shown for a command the policy would refuse to allowlist.
-  const alwaysButton = document.createElement("button");
-  alwaysButton.type = "button";
-  alwaysButton.textContent = "Allow Always";
-  alwaysButton.title = "Run this command and add it to this project's allowlist so it stops asking";
-  const browserSessionButton = document.createElement("button");
-  browserSessionButton.type = "button";
-  browserSessionButton.textContent = "Allow browser diagnostics for this session";
-  browserSessionButton.title =
-    "Run this diagnostic and allow browser diagnostics in the current chat session";
   const rejectButton = document.createElement("button");
   rejectButton.type = "button";
+  rejectButton.className = "btn-sm btn-quiet";
   rejectButton.textContent = "Reject";
-  actions.append(runButton);
-  if (proposal.allowAlways) actions.append(alwaysButton);
-  if (proposal.allowBrowserDiagnosticsForSession) actions.append(browserSessionButton);
-  actions.append(rejectButton);
+  actions.append(runButton, rejectButton);
+
+  // Grants that outlive this turn go behind the overflow rather than sitting at
+  // the same weight as Approve: the cost of a mis-click is not symmetric.
+  // `Allow Always` writes the user's allowlist for this repository (spec 10);
+  // the session grant widens browser diagnostics for the whole session
+  // (spec 12). The server decides eligibility — blocked commands, shell-control
+  // syntax and `require_approval_for_all_commands` all rule out the allowlist
+  // path — so an item is offered only when the proposal says it may be.
+  const menuItems = [];
+  if (proposal.allowAlways) {
+    menuItems.push({
+      label: "Always allow in this project",
+      hint: "Adds to the allowlist — persists after this turn",
+      onSelect: () => runWithGrant({ always: true }, "Command allowed for this project"),
+    });
+  }
+  if (proposal.allowBrowserDiagnosticsForSession) {
+    menuItems.push({
+      label: "Allow for this session",
+      hint: "Browser diagnostics only, until this session ends",
+      onSelect: () =>
+        runWithGrant(
+          { allowBrowserDiagnosticsForSession: true },
+          "Browser diagnostics allowed for this session",
+        ),
+    });
+  }
+
+  let overflowButton = null;
+  if (menuItems.length && !proposal.blocked) {
+    overflowButton = document.createElement("button");
+    overflowButton.type = "button";
+    overflowButton.className = "btn-icon";
+    overflowButton.dataset.menuId = `approval-${proposal.proposalId}`;
+    overflowButton.setAttribute("aria-haspopup", "menu");
+    overflowButton.setAttribute("aria-label", "More approval options");
+    overflowButton.title = "More approval options";
+    overflowButton.textContent = "⋯";
+    // Without `stopPropagation` the document click handler that dismisses the
+    // menu fires in the same tick and closes it as it opens.
+    overflowButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleApprovalMenu(menuItems, overflowButton);
+    });
+    actions.append(overflowButton);
+  }
 
   const output = document.createElement("pre");
   output.className = "command-approval-output";
@@ -4127,9 +4255,9 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
     const always = options.always === true;
     const allowBrowserDiagnosticsForSession = options.allowBrowserDiagnosticsForSession === true;
     runButton.disabled = true;
-    alwaysButton.disabled = true;
-    browserSessionButton.disabled = true;
     rejectButton.disabled = true;
+    if (overflowButton) overflowButton.disabled = true;
+    closeApprovalMenu();
     output.hidden = false;
     output.textContent = approved
       ? isBrowserDiagnostic
@@ -4196,37 +4324,27 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
   // action; a blocked proposal's run button stays disabled regardless.
   function restoreActions() {
     runButton.disabled = Boolean(proposal.blocked);
-    alwaysButton.disabled = false;
-    browserSessionButton.disabled = false;
     rejectButton.disabled = false;
+    if (overflowButton) overflowButton.disabled = false;
+  }
+
+  // Shared by both overflow grants. Their handlers were previously identical
+  // apart from the options and the toast.
+  async function runWithGrant(options, successToast) {
+    try {
+      await resolveCommandProposal(true, options);
+      toast(successToast);
+    } catch (error) {
+      restoreActions();
+      output.textContent = error.message;
+      toast(error.message);
+    }
   }
 
   runButton.addEventListener("click", async () => {
     try {
       await resolveCommandProposal(true);
       toast("Command completed");
-    } catch (error) {
-      restoreActions();
-      output.textContent = error.message;
-      toast(error.message);
-    }
-  });
-
-  alwaysButton.addEventListener("click", async () => {
-    try {
-      await resolveCommandProposal(true, { always: true });
-      toast("Command allowed for this project");
-    } catch (error) {
-      restoreActions();
-      output.textContent = error.message;
-      toast(error.message);
-    }
-  });
-
-  browserSessionButton.addEventListener("click", async () => {
-    try {
-      await resolveCommandProposal(true, { allowBrowserDiagnosticsForSession: true });
-      toast("Browser diagnostics allowed for this session");
     } catch (error) {
       restoreActions();
       output.textContent = error.message;
@@ -4245,7 +4363,7 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
     }
   });
 
-  wrapper.append(header, command, details, actions, output);
+  wrapper.append(header, command, disclosure, details, actions, output);
   return wrapper;
 }
 

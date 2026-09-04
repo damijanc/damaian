@@ -1470,6 +1470,24 @@ button:disabled {
   color: var(--danger);
 }
 
+/* Approval overflow rows carry a hint line, since what separates the two
+   grants is how long they last rather than what they do. */
+.approval-menu-popover {
+  width: min(272px, calc(100vw - 32px));
+}
+
+.approval-menu-row {
+  display: grid;
+  gap: 1px;
+  text-align: left;
+}
+
+.approval-menu-row small {
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 400;
+}
+
 .context-menu-caret {
   width: 8px;
   height: 8px;
@@ -2178,22 +2196,84 @@ button:disabled {
   white-space: nowrap;
 }
 
-.command-approval-header span {
-  color: var(--muted);
-  font-size: 11px;
+.command-approval-risk {
+  flex: 0 0 auto;
+  border: 1px solid #e3cba8;
+  border-radius: 999px;
+  background: #fdf3e3;
+  color: var(--warn);
+  font-size: 10px;
   font-weight: 800;
+  letter-spacing: 0.04em;
+  padding: 1px 7px;
   text-transform: uppercase;
 }
 
-.command-approval-command {
+.command-approval-risk[data-blocked="true"] {
+  border-color: #d89999;
+  background: #fbe9e7;
+  color: var(--danger);
+}
+
+/* Wrapped and uncapped, deliberately. This is a consent surface: the user has
+   to be able to read the whole command before approving it, so it is never
+   horizontally scrolled, elided, or capped behind a scroll container. A
+   pathological command grows the card, which is the correct trade here.
+   See docs/UI_STYLE_GUIDE.md §5.
+
+   The `code` element selector is load-bearing. Approval cards are appended
+   into `.message-body`, whose `code` rule above is (0,1,1) and would otherwise
+   beat a bare `.command-approval-command` at (0,1,0), holding the command at
+   12px. Qualifying with the element ties the specificity and this rule wins on
+   source order — so it must stay after `.message-body code`. Without it the
+   specimen page, which renders the card outside `.message-body`, disagrees
+   with the app. */
+code.command-approval-command {
   display: block;
-  overflow-x: auto;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #f6f7f7;
   color: var(--ink);
-  padding: 8px 10px;
-  white-space: pre;
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  padding: 7px 9px;
+  white-space: pre-wrap;
+}
+
+/* `min-height` keeps the row at the 24px hit-target floor; at 12px text with
+   3px padding it computed to 23px. */
+.command-approval-disclosure {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  justify-self: start;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 4px;
+}
+
+.command-approval-disclosure:hover {
+  border: 0;
+  color: var(--ink);
+}
+
+.disclosure-caret {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+}
+
+.command-approval-disclosure[aria-expanded="true"] .disclosure-caret {
+  transform: rotate(45deg);
 }
 
 .command-approval-details,
@@ -2212,12 +2292,10 @@ button:disabled {
 
 .command-approval-actions {
   display: flex;
+  align-items: center;
   flex-wrap: wrap;
+  gap: 6px;
   justify-content: flex-start;
-}
-
-.command-approval-actions button {
-  min-width: 0;
 }
 
 .diff-card-header {
