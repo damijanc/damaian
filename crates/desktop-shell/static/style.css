@@ -24,7 +24,6 @@
    `.message-body pre` overrides below, so the cascade reads top-down. */
 pre {
   margin: 0;
-  min-height: 180px;
   border-radius: 8px;
   background: var(--code);
   color: #e6edf3;
@@ -36,6 +35,14 @@ pre {
     SFMono-Regular,
     Menlo,
     monospace;
+}
+
+/* The Effective policy block is empty until the user loads a config, and a
+   collapsed empty box reads as a rendering fault. This floor used to sit on
+   base `pre`, where it reached every `pre` in the app and had to be undone
+   again by `.message-body pre`. It belongs on the one element that wants it. */
+#config-output {
+  min-height: 180px;
 }
 
 body {
@@ -181,6 +188,8 @@ select:focus {
   outline: 0;
 }
 
+/* The medium step of the button scale. `font: inherit` is a shorthand that
+   resets size and weight, so both longhands must stay after it. */
 button {
   min-width: 0;
   border: 1px solid var(--line-strong);
@@ -188,8 +197,9 @@ button {
   background: var(--surface);
   color: var(--ink);
   font: inherit;
-  font-weight: 650;
-  padding: 9px 11px;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 7px 12px;
   cursor: pointer;
 }
 
@@ -198,9 +208,65 @@ button:hover {
   color: var(--accent);
 }
 
+button:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  outline: 0;
+}
+
 button:disabled {
   cursor: not-allowed;
   opacity: 0.62;
+}
+
+/* Button scale — see docs/UI_STYLE_GUIDE.md §3. The rule above is the medium
+   step; these are the opt-in variants. At most one `.btn-primary` per surface,
+   and radius stays 8px throughout: the scale changes size and weight, not
+   shape. */
+.btn-sm {
+  font-size: 12px;
+  padding: 5px 10px;
+}
+
+.btn-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #ffffff;
+}
+
+/* `button:hover` sets `color: var(--accent)`, which on the accent fill would
+   be invisible. These are (0,2,0) against its (0,1,1), so they win on
+   specificity without `!important`. */
+.btn-primary:hover {
+  border-color: #12564a;
+  background: #12564a;
+  color: #ffffff;
+}
+
+.btn-quiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+}
+
+.btn-quiet:hover {
+  border-color: transparent;
+  background: var(--surface-soft);
+  color: var(--ink);
+}
+
+.btn-icon {
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 5px 8px;
+}
+
+.btn-icon:hover {
+  border-color: transparent;
+  background: var(--surface-soft);
+  color: var(--ink);
 }
 
 .projects-panel {
@@ -919,7 +985,6 @@ button:disabled {
 }
 
 .message-body pre {
-  min-height: 0;
   margin-bottom: 10px;
 }
 
@@ -2133,7 +2198,7 @@ button:disabled {
 
 .command-approval-details,
 .command-approval-output {
-  max-height: 240px;
+  max-height: 190px;
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 8px;
