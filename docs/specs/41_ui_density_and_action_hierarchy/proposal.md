@@ -1,72 +1,32 @@
 # Feature Spec: UI Density and Action Hierarchy
 
-Status: Not started
+Status: In progress. Task 1 of 6 complete — see [`tasks.md`](tasks.md).
 Order: 41 of 41
-Reference: [`../UI_STYLE_GUIDE.md`](../UI_STYLE_GUIDE.md) — this spec introduces
+Also in this spec: [`context.md`](context.md) (motivation, current state, and
+corrections found during implementation), [`tasks.md`](tasks.md) (execution
+order and progress).
+Reference: [`../../UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md) — this spec introduces
 the button scale and action-hierarchy rules recorded there, and is the first
 consumer of them. Later UI specs refer to the guide rather than restating it.
 Related spec sections: `ai_coding_assistant_specification.md` §7.1 (distinct UI
 states), §7.4 (command approval), §7.7 (diff and patch engine).
 Related implementation specs:
-[`10_persistent_command_approval.md`](10_persistent_command_approval.md) (the
+[`../10_persistent_command_approval.md`](../10_persistent_command_approval.md) (the
 `Allow Always` action this spec demotes to an overflow menu),
-[`12_web_app_troubleshooting.md`](12_web_app_troubleshooting.md) (the
+[`../12_web_app_troubleshooting.md`](../12_web_app_troubleshooting.md) (the
 session-scoped browser diagnostic grant, likewise demoted),
-[`13_docker_command_support.md`](13_docker_command_support.md) (Docker approvals
+[`../13_docker_command_support.md`](../13_docker_command_support.md) (Docker approvals
 render through the same card).
 
 **Not a roadmap graduation.** Like #7, #8, #10 and #34, this spec comes from
 usability feedback in real use rather than from a roadmap work package: the
 approval and patch cards were reported as too bulky to work with comfortably.
 
-## 1. Motivation
-
-The desktop shell has exactly one button style. Every `<button>` in the
-application resolves to the same rule at `crates/desktop-shell/static/style.css:184`
-— 14px text, weight 650, `9px 11px` padding. That single rule covers the 39
-buttons in `index.html` and the 42 more that `app.js` builds at runtime. A
-settings `Load`, a patch
-`Reject Selected`, and a command `Allow Always` are visually identical.
-
-Two consequences:
-
-- **Nothing communicates consequence.** `Allow Always` writes a persistent
-  entry to the user's command allowlist for that repository; `Approve Run`
-  executes once. They are the same size, weight, and colour, sitting adjacent.
-  Spec 10 added `Allow Always` specifically to reduce approval fatigue, but a
-  control that reduces fatigue while being indistinguishable from the one-shot
-  control next to it converts fatigue into accidental persistent grants.
-- **Everything is bulky.** With no smaller step available, in-conversation
-  cards use full-size controls for what is contextual, secondary work.
-
-The bulk is not only buttons. Base `pre` carries `min-height: 180px`
-(`style.css:25`). `.message-body pre` overrides it to `0`; the approval panes
-never do, so **every command approval reserves 180px for its rationale even
-when the rationale is one line.** That single declaration is the largest
-contributor to the card's height.
-
-## 2. Current state
-
-| Element | Location | Problem |
-|---|---|---|
-| Global `button` | `style.css:184` | Single style for all 40+ buttons; no scale |
-| Base `pre` | `style.css:25` | `min-height: 180px` inherited by both approval panes |
-| `.command-approval-details` | `style.css:2134` | Sets `max-height: 240px`, never resets the inherited minimum |
-| `.command-approval-command` | `style.css:2123` | `white-space: pre` + `overflow-x: auto` — a long command is one line behind a horizontal scrollbar |
-| `.command-approval-actions` | `style.css:2148` | Four equal-weight buttons in a wrapping flex row |
-| `.inline-actions` | `style.css:479` | `grid-template-columns: 1fr 1fr`; correct in the settings column, but `createPatchPreview` reuses it in the conversation column where each button stretches to half the chat width |
-| `createCommandApprovalPreview` | `app.js:4067` | Builds the four-button row, including both escalating actions |
-| `createPatchPreview` | `app.js:3768` | Builds `Apply Selected` / `Reject Selected` into `.inline-actions` |
-
-The diff cards themselves are already dense — 11px pills, 12px monospace diff
-lines, 1px line padding (`style.css:2197-2299`) — and are not changed here
-beyond the patch-level action row.
-
-## 3. Requirements
+## 1. Requirements
 
 1. A button scale exists in `style.css` with a default step and `.btn-sm`,
    `.btn-primary`, `.btn-quiet`, `.btn-icon` modifiers, matching
-   [`UI_STYLE_GUIDE.md`](../UI_STYLE_GUIDE.md) §3.
+   [`UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md) §3.
 2. The global `button` default becomes the medium step (13px / 600 /
    `7px 12px`).
 3. No element inherits a height minimum it does not use. `min-height: 180px`
@@ -82,9 +42,12 @@ beyond the patch-level action row.
 8. Keyboard focus order remains linear through the card, the focus ring is
    preserved on every control, and focus does not land on the primary action by
    default.
-9. `npm run lint:web` passes clean.
+9. A specimen page at `docs/ui-style-guide.html` renders every token, type
+   step, button step and variant, and both approval-card states, by loading the
+   shipping stylesheet rather than a copy of it.
+10. `npm run lint:web` passes clean.
 
-## 4. Non-goals
+## 2. Non-goals
 
 - **The context-file strip.** `#chat-context` (`index.html:118`) will be folded
   into the assistant turn that used it, as a collapsed "Read N files"
@@ -97,28 +60,35 @@ beyond the patch-level action row.
   allowlisted, and where the grant is stored are settled by specs 10 and 34 and
   are untouched. This spec changes presentation only.
 
-## 5. Design
+## 3. Design
 
-### 5.1 Button scale
+### 3.1 Button scale
 
 Rewrite the global `button` rule to the medium step and add the four modifiers
-from the style guide. Existing call sites are unchanged except where §5.3 and
-§5.4 apply, so the rest of the application simply renders one step lighter.
+from the style guide. Existing call sites are unchanged except where §3.3 and
+§3.4 apply, so the rest of the application simply renders one step lighter.
 
 `.inline-actions` keeps its two-column grid. The fix for the patch preview is
 to stop using it there, not to change it.
 
-### 5.2 Removing the inherited minimum
+### 3.2 Scoping the height minimum to the element that wants it
+
+**This change is visually inert.** It removes a trap, not pixels — see `context.md` §1.
 
 Delete `min-height: 180px` from base `pre` (`style.css:25`) and add it to
-`#config-output`, the Effective policy block, which is the one place that wants
-a tall empty box. `.message-body pre`'s existing `min-height: 0` override
-becomes redundant and is removed.
+`#config-output`, the Effective policy block, which is the one element that
+wants a tall empty box and the only `pre` the base rule currently reaches.
+`.message-body pre`'s `min-height: 0` override then has nothing left to undo
+and is removed.
+
+The three changes must land together. Removing the base minimum without adding
+it to `#config-output` collapses the Effective policy block; removing the
+`.message-body` override first would expose every message `pre` to the trap.
 
 `.command-approval-details` and `.command-approval-output` keep a
 `max-height` (reduced to 190px) with `overflow: auto`, and gain no minimum.
 
-### 5.3 Command approval
+### 3.3 Command approval
 
 `createCommandApprovalPreview` (`app.js:4067`) is restructured to:
 
@@ -136,17 +106,29 @@ becomes redundant and is removed.
 
 The overflow menu holds `Always allow in this project` (present when
 `proposal.allowAlways`) and `Allow for this session` (present when
-`proposal.allowBrowserDiagnosticsForSession`). It reuses the existing
-`.model-popover` markup and dismissal behaviour rather than adding a second
-popover implementation. When neither grant is offered, the trigger is not
-rendered.
+`proposal.allowBrowserDiagnosticsForSession`). When neither grant is offered,
+the trigger is not rendered.
+
+The menu follows the **`.context-menu-popover` pattern**, not `.model-popover`.
+`.model-popover` is `position: absolute` anchored to the composer, which would
+detach from an approval card as the log scrolls. The project row menu
+(`ensureProjectMenu`, `app.js:594-658`) already solves this exact problem: one
+shared `position: fixed` popover appended to `document.body`, anchored to the
+trigger's `getBoundingClientRect()`, re-anchored on each open. Approval cards
+have the same constraint — they live inside the scrolling `#chat-log` and there
+may be more than one — so the approval overflow reuses that pattern and its
+existing `.context-menu-*` styling.
+
+Dismissal is already global: `document` click and `Escape` handlers at
+`app.js:706-708`. The approval menu registers alongside them rather than adding
+new listeners.
 
 `resolveCommandProposal` is unchanged in behaviour: it still disables all
 controls on entry, still restores them through `restoreActions` on failure, and
 still resumes the turn with the same parameters. Only the elements it disables
 change. A blocked proposal keeps its disabled primary action.
 
-### 5.4 Patch preview
+### 3.4 Patch preview
 
 In `createPatchPreview` (`app.js:3768`), the actions move onto the header row:
 `Apply {n}` (`.btn-sm .btn-primary`) and `Reject` (`.btn-sm .btn-quiet`), where
@@ -157,12 +139,50 @@ file and line counts.
 The secret-scanner notice, per-file diff cards, hunk selection, and rollback
 controls are unchanged.
 
-## 6. Acceptance criteria
+### 3.5 Specimen page
+
+`docs/ui-style-guide.html` is a static page committed alongside the written
+guide, giving it a rendered counterpart. It links
+`../crates/desktop-shell/static/style.css` by relative path and is opened
+directly from a checkout — no server, no build step, nothing to install.
+
+Loading the shipping stylesheet rather than a copy is the whole point: the
+page cannot misrepresent what the application looks like, because it *is* what
+the application looks like. It carries only enough page-local CSS to lay itself
+out — a grid, headings, swatch boxes — and none that affects the specimens
+themselves.
+
+It renders:
+
+- every `:root` colour token as a labelled swatch;
+- every step of the type scale, with its intended use;
+- every button step and variant as a **live** control;
+- the action-hierarchy group, the disclosure row, both approval-card states,
+  and the patch header.
+
+**States are live, not simulated.** The page does not reproduce `:hover`,
+`:focus-visible` or `[disabled]` with page-local classes, because doing so
+would reintroduce exactly the drift the page exists to prevent. Each variant is
+a real, interactive control the reader hovers and tabs through, with the
+disabled example carrying a real `disabled` attribute. The trade is that not
+every state is visible at a glance; tabbing the page is also how focus order
+gets verified, so the cost is small.
+
+Coverage is maintained by hand. When a later spec adds a component, adding it
+here is part of that spec's work — the page guarantees the styling is current,
+not that the inventory is complete.
+
+No tooling change is needed: `biome.json` scopes `files.includes` to
+`crates/desktop-shell/static/**/*.{js,css}` and `scripts/**/*.mjs`, so a page
+under `docs/` is outside the lint surface and must not be added to it.
+
+## 4. Acceptance criteria
 
 1. A collapsed command approval card for a single-line command and a one-line
    rationale measures **no more than 120px** tall in the running app, down from
-   the current ~330px. The figure is measured in the running app, not
-   estimated, and recorded in this spec's status line on completion.
+   a measured baseline of **161px**. Both figures come from the same
+   measurement in the running app, and the final one is recorded in this
+   spec's status line on completion.
 2. Expanding "Why this command" reveals the rationale; collapsing restores the
    original height. A second proposal in the same session renders collapsed.
 3. A command long enough to exceed the card width is fully readable without
@@ -177,5 +197,9 @@ controls are unchanged.
    the current selection count.
 7. Every control in both cards is at least 24×24 CSS px, shows a visible focus
    ring, and is reachable by keyboard in visual order.
-8. `npm run lint:web` passes clean and the app has been driven by hand through
+8. `docs/ui-style-guide.html` opens from a checkout with no server and renders
+   correctly. Editing a token in `style.css` changes the page on reload,
+   demonstrating it is not a copy. Its buttons respond to real hover and
+   keyboard focus, and its disabled example is genuinely disabled.
+9. `npm run lint:web` passes clean and the app has been driven by hand through
    approve, reject, both overflow grants, and a blocked proposal.

@@ -1,13 +1,22 @@
 # Damaian Desktop UI Style Guide
 
 Status: Living document. Introduced alongside
-[`specs/41_ui_density_and_action_hierarchy.md`](specs/41_ui_density_and_action_hierarchy.md).
+[`specs/41_ui_density_and_action_hierarchy/`](specs/41_ui_density_and_action_hierarchy/proposal.md).
 
 This is the standing reference for the desktop shell's visual language. Specs
 describe *what changes*; this document describes *what the result must look
 like*, so successive UI specs do not each re-derive the same scale. When a spec
 and this guide disagree, the spec wins for the surface it owns and this guide
 should be updated in the same change.
+
+**See it rendered:** [`ui-style-guide.html`](ui-style-guide.html) — *built by
+spec 41; this link is dead until that ships* — is the visual counterpart to
+this document — open it in a browser from a checkout, no server
+needed. It links the shipping `style.css` by relative path, so it shows the
+real thing rather than a copy that can drift. Its buttons are live controls:
+hover and tab through them to see hover, focus and disabled states. This
+document holds the rules and the reasoning; that page holds the pixels. Change
+one and change the other in the same commit.
 
 Scope is the Tauri desktop shell only:
 `crates/desktop-shell/static/{index.html,style.css,app.js}`. Those assets are
@@ -119,8 +128,18 @@ turn ends — writing an allowlist, granting a session-wide permission, deleting
 a stored item — must not sit at the same visual weight as the one-shot action
 next to it, because the cost of a mis-click is not symmetric.
 
-Overflow menus reuse the existing `.model-popover` pattern in `style.css`.
-Do not introduce a second popover implementation.
+There are two popover implementations and they are not interchangeable:
+
+- **`.model-popover`** — `position: absolute`, anchored by CSS to a fixed
+  ancestor. Correct for controls in the composer, which never scrolls.
+- **`.context-menu-popover`** — a single shared `position: fixed` element on
+  `document.body`, anchored to the trigger's `getBoundingClientRect()` on open.
+  Correct for anything inside a scrolling region, and for repeated rows where
+  per-row popovers could not hold stable state.
+
+Anything in the conversation log or the project list uses the second. Dismissal
+(document click, `Escape`) is already wired globally — register with it rather
+than adding listeners. Do not introduce a third implementation.
 
 `.inline-actions` is a two-column grid intended for the narrow settings
 column. Do not reuse it in the conversation column, where it stretches buttons
@@ -149,9 +168,14 @@ the UI, because the user is granting consent rather than navigating.
 
 ## 6. Density
 
-- **No phantom minimums.** An element must not reserve height it is not using.
-  Base `pre` previously carried `min-height: 180px`, which every inheriting
-  panel silently paid; minimums belong on the one element that wants them.
+- **No phantom minimums.** An element must not reserve height it is not using,
+  and a minimum belongs on the one element that wants it, never on a shared
+  base element. Base `pre` carried `min-height: 180px` for exactly one
+  intended consumer (`#config-output`) and was kept survivable only by a
+  counter-override on `.message-body pre` — two rules cancelling out, with any
+  new `pre` outside `.message-body` silently inheriting the cost. If you find
+  yourself writing an override whose only job is to undo a base rule, move the
+  rule instead.
 - **Cap with scroll, not with a floor.** Long content gets `max-height` plus
   `overflow: auto` — with the exception in §5.
 - Standard spacing steps: 4, 6, 8, 10, 14, 18px. Prefer the smaller step.
@@ -180,7 +204,8 @@ Each of these existed in the shell and was removed. Do not reintroduce them.
 | Anti-pattern | Why |
 |---|---|
 | One button style for everything | A settings "Load" and an approval "Reject" read as equally consequential |
-| `min-height` on a shared base element | Every inheriting panel pays for it invisibly |
+| `min-height` on a shared base element | Needs a counter-override elsewhere to stay survivable, and the next element added inherits the cost silently |
+| Trusting an estimate as a measurement | The card this guide was written for was claimed at ~330px from a mockup; it measured 161px. Measure in the running app, and say which |
 | Reusing `.inline-actions` outside settings | Stretches actions to half the chat column |
 | Per-turn information docked in chrome | Costs space on every turn and shows only the newest turn |
 | Full paths as full-size buttons | Maximum visual weight for reference information |
@@ -194,9 +219,13 @@ Each of these existed in the shell and was removed. Do not reintroduce them.
 There is no JS test suite for the shell. A UI change is verified by:
 
 1. `npm run lint:web` (Biome) — must pass clean.
-2. Rebuild and restart the app; static assets are embedded, so an unrebuilt
+2. Open [`ui-style-guide.html`](ui-style-guide.html) and check the specimens
+   still render correctly. If the change added a component, add it there in the
+   same commit — the page keeps styling current automatically, but its
+   inventory is maintained by hand.
+3. Rebuild and restart the app; static assets are embedded, so an unrebuilt
    binary shows stale UI.
-3. Drive the changed surface by hand, including keyboard focus order and the
+4. Drive the changed surface by hand, including keyboard focus order and the
    disclosure/overflow states.
 
 Measure before/after heights when a change claims a density improvement, and
