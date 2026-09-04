@@ -14,7 +14,10 @@ session where browser runtime evidence was not first-class, and #13 from a real
 session where Docker was needed but the assistant asked the user to run the
 command manually. #34 is the other exception to the roadmap rule below: it was
 written and implemented out of order, ahead of #14, because it is a security
-defect rather than a graduation.
+defect rather than a graduation. #41 is a third exception: it comes from
+usability feedback on the desktop shell rather than a work package, and it
+introduces [`../UI_STYLE_GUIDE.md`](../UI_STYLE_GUIDE.md), the standing visual
+reference that later UI specs cite instead of restating.
 
 From #14 onward, specs graduate from the roadmap in `docs/ROADMAP/`, one spec per
 roadmap work package, per that directory's governance section. Each carries a
@@ -67,6 +70,7 @@ written to stand on its own.
 | 38 | [38_subagent_model.md](38_subagent_model.md) | **Not started.** Roadmap Phase 6 WP1, and gated on that phase's eight readiness gates being measured first. Subagents as in-process tasks whose capability can only be derived by narrowing a parent's, staged read-only-first. Corrects the roadmap's process-based framing and the flat `CancelToken`. |
 | 39 | [39_coordination_and_conflict_handling.md](39_coordination_and_conflict_handling.md) | **Not started.** Roadmap Phase 6 WP2. Exclusive file-ownership claims checked at spawn *and* before every write, serialized patch integration with `base_hash` revalidation between applies, and a combined-check rerun that catches two individually-passing patches failing together. |
 | 40 | [40_autonomy_evaluations.md](40_autonomy_evaluations.md) | **Not started.** Roadmap Phase 6 WP7. The decision instrument: same scenarios run in both execution modes, cost amplification as a ratio, and an experimental label *derived* from the recorded comparison rather than chosen. Makes abandoning Phase 6 a first-class recorded outcome. |
+| 41 | [41_ui_density_and_action_hierarchy.md](41_ui_density_and_action_hierarchy.md) | **Not started.** Usability-driven, not a roadmap graduation: the shell has exactly one button style, so a one-shot `Approve Run` and a persistent `Allow Always` are visually identical, and a stray `min-height: 180px` on base `pre` makes every command approval reserve 180px of empty rationale pane. Introduces the button scale in [`../UI_STYLE_GUIDE.md`](../UI_STYLE_GUIDE.md) and applies it to the approval and patch cards. Presentation only — the approval policy from #10, #12 and #34 is untouched. First of three UI specs; the conversation column and the remaining chrome follow. |
 
 **Ordering exception.** Numbers are assigned in creation order, so #34 is last in
 the table but is the next thing to implement. It is a bug-driven spec covering a
