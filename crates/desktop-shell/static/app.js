@@ -3866,21 +3866,42 @@ function createPatchPreview(payload, patchRepo) {
 
   const header = document.createElement("div");
   header.className = "patch-preview-header";
+
+  const headerText = document.createElement("div");
+  headerText.className = "patch-preview-heading";
   const title = document.createElement("strong");
   title.textContent = payload.summary || "Patch preview";
   const meta = document.createElement("span");
-  meta.textContent = state.patchId;
-  header.append(title, meta);
+  headerText.append(title, meta);
 
   const actions = document.createElement("div");
-  actions.className = "inline-actions patch-actions";
+  actions.className = "patch-actions";
   const applyButton = document.createElement("button");
   applyButton.type = "button";
-  applyButton.textContent = "Apply Selected";
+  applyButton.className = "btn-sm btn-primary";
   const rejectButton = document.createElement("button");
   rejectButton.type = "button";
-  rejectButton.textContent = "Reject Selected";
+  rejectButton.className = "btn-sm btn-quiet";
+  rejectButton.textContent = "Reject";
   actions.append(applyButton, rejectButton);
+  header.append(headerText, actions);
+
+  // Label and metadata both track the current selection, so the header states
+  // what will actually happen rather than the indefinite "Selected". The patch
+  // id it used to show is still on `state.patchId`.
+  function updateHeaderCounts() {
+    const selected = state.files.filter((file) => file.selected);
+    const additions = selected.reduce((sum, file) => sum + file.additions, 0);
+    const deletions = selected.reduce((sum, file) => sum + file.deletions, 0);
+    applyButton.textContent = `Apply ${selected.length}`;
+    applyButton.disabled = selected.length === 0;
+    meta.textContent =
+      selected.length === 1
+        ? `1 file · +${additions} −${deletions}`
+        : `${selected.length} files · +${additions} −${deletions}`;
+  }
+
+  updateHeaderCounts();
 
   // Shown when the secret scanner flags a selected file. The apply is not
   // refused outright: the user sees what was found and decides.
@@ -3890,7 +3911,7 @@ function createPatchPreview(payload, patchRepo) {
 
   const list = document.createElement("div");
   list.className = "diff-list";
-  wrapper.append(header, actions, secretNotice, list);
+  wrapper.append(header, secretNotice, list);
 
   function clearSecretNotice() {
     secretNotice.hidden = true;
@@ -3974,6 +3995,7 @@ function createPatchPreview(payload, patchRepo) {
   }
 
   function render() {
+    updateHeaderCounts();
     list.innerHTML = "";
     if (!state.files.length) {
       const empty = document.createElement("p");
@@ -3999,6 +4021,10 @@ function createPatchPreview(payload, patchRepo) {
       checkbox.disabled = file.state !== "pending";
       checkbox.addEventListener("change", () => {
         file.selected = checkbox.checked;
+        // Not `render()`: this handler deliberately does not rebuild the list,
+        // which would discard focus mid-selection. Only the header counts
+        // depend on which files are ticked.
+        updateHeaderCounts();
       });
       const name = document.createElement("span");
       name.textContent = file.path;

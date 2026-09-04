@@ -852,22 +852,38 @@ button:disabled {
   gap: 12px;
 }
 
-.patch-preview-header strong,
-.patch-preview-header span {
+/* The `min-width: 0` note above now applies to this inner group rather than
+   the header itself: these nowrap children are what would otherwise set the
+   row's automatic minimum and push the conversation column into overflow. The
+   actions beside them are `flex: 0 0 auto`, so a long summary ellipsises and
+   the buttons keep their width — the correct priority. */
+.patch-preview-heading {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.patch-preview-heading strong,
+.patch-preview-heading span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.patch-preview-header span {
+.patch-preview-heading span {
+  flex: 0 0 auto;
   color: var(--muted);
   font-size: 11px;
   font-weight: 700;
 }
 
 .patch-actions {
-  justify-content: flex-start;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 /* `display` below is an author declaration, so it beats the UA `[hidden]`
