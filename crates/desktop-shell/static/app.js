@@ -4211,6 +4211,12 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
     details.hidden = open;
   });
 
+  // Disclosure and actions share one footer row: the disclosure is secondary
+  // chrome, and giving it a row of its own cost 34px on every card for a
+  // control most approvals never use.
+  const footer = document.createElement("div");
+  footer.className = "command-approval-footer";
+
   const actions = document.createElement("div");
   actions.className = "command-approval-actions";
   const runButton = document.createElement("button");
@@ -4389,7 +4395,8 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
     }
   });
 
-  wrapper.append(header, command, disclosure, details, actions, output);
+  footer.append(disclosure, actions);
+  wrapper.append(header, command, details, footer, output);
   return wrapper;
 }
 

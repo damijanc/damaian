@@ -71,4 +71,16 @@ an earlier draft of this spec and acted on.
   draft named it as the base to reuse. It is `position: absolute` anchored to
   the composer, so it would detach from an approval card as the log scrolls.
   The correct base is the `.context-menu-popover` pattern — see
-  [`proposal.md`](proposal.md) §5.3.
+  [`proposal.md`](proposal.md) §3.3.
+- **2026-09-04 — `render()` does not run when a file checkbox changes.** The
+  task list assumed it did, and wired the patch header's live selection count
+  through it. The file checkbox handler only mutates `file.selected`;
+  `render()` is reserved for hunk changes and apply/reject, and calling it from
+  the checkbox would rebuild the list and drop focus mid-selection. The handler
+  calls `updateHeaderCounts()` directly instead.
+- **2026-09-04 — `.message-body code` outranks `.command-approval-command`.**
+  At `(0,1,1)` against `(0,1,0)` it held the command at 12px with `1px 4px`
+  padding, so the first attempt at the 11px wrapped command silently did
+  nothing to either. Fixed by qualifying the selector with the element. The
+  specimen page caught this by disagreeing with the app, since it renders the
+  card outside `.message-body`.

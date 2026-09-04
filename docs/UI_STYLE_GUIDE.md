@@ -190,6 +190,10 @@ Used for rationale, file lists, and any detail that is occasionally wanted.
 
 - Trigger is a quiet inline row: caret glyph plus a short label naming what is
   inside, with a count where one exists ("Read 7 files", not "Details").
+- **Pair the trigger with the card's action row rather than giving it a row of
+  its own** — disclosure left, actions right, as one footer. A dedicated row
+  costs about 34px on every card for a control most readers never open. The
+  expanded content goes above the footer, next to whatever it explains.
 - Collapsed by default. Cost when collapsed is one text row.
 - Expanded content is capped with `max-height` and scrolls, unless §5 applies.
 - The trigger is a real `<button>` with `aria-expanded`, and the panel is

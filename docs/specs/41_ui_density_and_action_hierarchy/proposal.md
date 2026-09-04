@@ -1,6 +1,12 @@
 # Feature Spec: UI Density and Action Hierarchy
 
-Status: In progress. Task 1 of 6 complete — see [`tasks.md`](tasks.md).
+Status: Done. All six tasks complete and verified in the running app.
+Collapsed command approval measures **104px**, down from a measured **161px**
+baseline; expanded is 162px, parity with the old always-expanded card. Patch
+actions measure 67px and 59px instead of roughly half the conversation column
+each. Three defects the implementation surfaced, and the one design change made
+along the way, are recorded in [`context.md`](context.md) §3 and
+[`tasks.md`](tasks.md).
 Order: 41 of 41
 Also in this spec: [`context.md`](context.md) (motivation, current state, and
 corrections found during implementation), [`tasks.md`](tasks.md) (execution
@@ -94,15 +100,26 @@ it to `#config-output` collapses the Effective policy block; removing the
 
 1. **Header** — title plus a risk pill. The pill replaces the current uppercase
    muted span.
-2. **Command** — 11px monospace, `white-space: pre-wrap`, `word-break:
-   break-all`, no `max-height`, no `overflow`. Requirement 4: the user reads
+2. **Command** — 11px monospace, `white-space: pre-wrap`, `overflow-wrap:
+   anywhere`, no `max-height`, no `overflow`. Requirement 4: the user reads
    the whole command without interacting. A pathological command grows the
-   card; that is the correct trade on a consent surface.
-3. **Disclosure** — a quiet `<button>` labelled "Why this command" carrying
-   `aria-expanded`, toggling the details pane's `hidden` property. Rendered
-   collapsed unconditionally.
-4. **Actions** — `Approve` (`.btn-sm .btn-primary`), `Reject`
-   (`.btn-sm .btn-quiet`), and a `.btn-icon` overflow trigger.
+   card; that is the correct trade on a consent surface. The rule is written
+   as `code.command-approval-command`, because `.message-body code` is
+   `(0,1,1)` and outranks a bare class.
+3. **Details** — the rationale pane, `hidden` by default, capped at 190px with
+   scroll. It sits directly under the command it explains, above the footer.
+4. **Footer** — one row: the disclosure on the left, the actions on the right.
+   - **Disclosure** — a quiet `<button>` labelled "Why this command" carrying
+     `aria-expanded`, toggling the details pane's `hidden` property. Rendered
+     collapsed unconditionally, never remembered between proposals.
+   - **Actions** — `Approve` (`.btn-sm .btn-primary`), `Reject`
+     (`.btn-sm .btn-quiet`), and a `.btn-icon` overflow trigger.
+
+   Pairing them on one row rather than stacking them saves 34px on every card.
+   Measured both ways during implementation: stacked was 138px and missed
+   acceptance criterion 1, paired is 104px. The disclosure is secondary chrome
+   most approvals never open, so a dedicated row was poor value, and the
+   result reads as a conventional card footer.
 
 The overflow menu holds `Always allow in this project` (present when
 `proposal.allowAlways`) and `Allow for this session` (present when
@@ -180,9 +197,9 @@ under `docs/` is outside the lint surface and must not be added to it.
 
 1. A collapsed command approval card for a single-line command and a one-line
    rationale measures **no more than 120px** tall in the running app, down from
-   a measured baseline of **161px**. Both figures come from the same
-   measurement in the running app, and the final one is recorded in this
-   spec's status line on completion.
+   a measured baseline of **161px**. **Met at 104px**, and it holds at a 740px
+   conversation column. Reached by pairing the disclosure and actions on one
+   row (§3.3); the stacked layout measured 138px and missed.
 2. Expanding "Why this command" reveals the rationale; collapsing restores the
    original height. A second proposal in the same session renders collapsed.
 3. A command long enough to exceed the card width is fully readable without

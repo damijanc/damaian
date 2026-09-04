@@ -12,42 +12,29 @@ where it stopped without reading the git log.
 | Task | State | Commit | Notes |
 |---|---|---|---|
 | 1 · Button scale and pre minimum | Done | `928679b` | Verified in the running app: card 161→155px, buttons 13px/600, bare `pre` minimum gone, `#config-output` keeps 180px |
-| 2 · Specimen page | Done | — | Verified over HTTP: real stylesheet loads (375 rules), token flip to `#b3261e` propagated. Six classes still unstyled — `command-approval-risk`, `command-approval-disclosure`, `disclosure-caret`, `patch-preview-heading`, `approval-menu-popover`, `approval-menu-row` — all created by Tasks 3-5. `file://` open not verified, see below |
-| 3 + 4 · Command approval structure and overflow menu | Done, one criterion missed | — | Landed as one commit: the plan's split needed two no-op stand-in buttons to keep an intermediate state runnable, which is not worth a deliberately-broken commit on `main`. **Collapsed card is 138px against a ≤120px criterion** — see below |
-| 5 · Patch preview header actions | Done | — | Actions 67px/59px instead of half the column; counts track selection 2→1→0→1; narrow column (740px) ellipsises the summary with actions fully visible and no log overflow |
-| 6 · Record outcome in spec | Blocked | — | Waiting on the 138px vs 120px decision below |
+| 2 · Specimen page | Done | `ff4005a` | Verified over HTTP: real stylesheet loads (375 rules), token flip to `#b3261e` propagated. Six classes still unstyled — `command-approval-risk`, `command-approval-disclosure`, `disclosure-caret`, `patch-preview-heading`, `approval-menu-popover`, `approval-menu-row` — all created by Tasks 3-5. `file://` open not verified, see below |
+| 3 + 4 · Command approval structure and overflow menu | Done | `c544590` | Landed as one commit: the plan's split needed two no-op stand-in buttons to keep an intermediate state runnable, which is not worth a deliberately-broken commit on `main` |
+| 5 · Patch preview header actions | Done | `4fc9f13` | Actions 67px/59px instead of half the column; counts track selection 2→1→0→1; narrow column (740px) ellipsises the summary with actions fully visible and no log overflow |
+| 6 · Record outcome in spec | Done | — | Criterion 1 met at 104px after the footer change |
 
 ### Corrections
 
 Errors found during execution are recorded in [`context.md`](context.md) §3, so
 they sit with the rest of the background rather than in the task list.
 
-### Acceptance criterion 1 missed — 138px against ≤120px
+### Acceptance criterion 1 — met at 104px
 
-Measured collapsed, single-line command, rationale collapsed. Baseline was
-161px, so this is a 23px reduction rather than the 41px the criterion assumed.
-Recorded rather than fixed by shaving padding, per the criterion's own
-instruction.
+Stacking the disclosure on its own row first gave **138px**, missing the ≤120px
+criterion. Rather than shave padding to hide the gap, the two options were put
+to the author, who chose to pair the disclosure and actions on one footer row.
+That saved 34px: **104px collapsed**, holding at a 740px conversation column.
 
-Where the 138px goes: header 17, command block 33 (11px text plus 7px padding
-and border), disclosure row 24, actions row 29, and three 10px grid gaps. The
-120px figure came from a mockup whose internal spacing was tighter than the
-card's existing `gap: 10px`.
+The expanded card is 162px against the 161px baseline — parity — so the card is
+no longer worse in either state. Before the footer change the expanded case had
+been 196px, worse than the baseline, because the disclosure row sat on top of
+the rationale.
 
-Two honest ways to close it, neither yet applied:
-
-1. **Put the disclosure and the actions on one row** — "Why this command" left,
-   `Approve / Reject / ⋯` right. Saves a row and a gap, about 34px, landing
-   near 104px. It is a real design change beyond what `proposal.md` §3.3
-   describes, and it reads as a conventional card footer, so it needs a
-   decision rather than a quiet edit.
-2. **Accept 138px** and amend the criterion to match what the design actually
-   costs.
-
-Note also that the expanded card is now **196px**, larger than the 161px
-baseline, because the disclosure row is added on top of the rationale. The win
-is entirely in the collapsed case — which is the common one, and the point of
-the change — but it is a trade, not a free reduction.
+Final: collapsed 161 → 104 (-35%), expanded 161 → 162.
 
 ### Open verification
 

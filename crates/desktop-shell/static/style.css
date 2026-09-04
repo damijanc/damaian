@@ -2257,6 +2257,17 @@ code.command-approval-command {
   white-space: pre-wrap;
 }
 
+/* Disclosure left, actions right, on one row. The disclosure is secondary
+   chrome and a row of its own cost 34px on every card for something most
+   approvals never open. Wraps to two lines in a very narrow column. */
+.command-approval-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 /* `min-height` keeps the row at the 24px hit-target floor; at 12px text with
    3px padding it computed to 23px. */
 .command-approval-disclosure {
@@ -2264,7 +2275,6 @@ code.command-approval-command {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  justify-self: start;
   border: 0;
   border-radius: 6px;
   background: none;

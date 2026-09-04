@@ -295,13 +295,15 @@
               ><span class="command-approval-risk" data-blocked="false">review</span>
             </div>
             <code class="command-approval-command">cargo test -p damaian-core</code>
-            <button type="button" class="command-approval-disclosure" aria-expanded="false">
-              <span class="disclosure-caret" aria-hidden="true"></span> Why this command
-            </button>
-            <div class="command-approval-actions">
-              <button type="button" class="btn-sm btn-primary">Approve</button>
-              <button type="button" class="btn-sm btn-quiet">Reject</button>
-              <button type="button" class="btn-icon" aria-label="More approval options">⋯</button>
+            <div class="command-approval-footer">
+              <button type="button" class="command-approval-disclosure" aria-expanded="false">
+                <span class="disclosure-caret" aria-hidden="true"></span> Why this command
+              </button>
+              <div class="command-approval-actions">
+                <button type="button" class="btn-sm btn-primary">Approve</button>
+                <button type="button" class="btn-sm btn-quiet">Reject</button>
+                <button type="button" class="btn-icon" aria-label="More approval options">⋯</button>
+              </div>
             </div>
           </div>
           <p class="sg-note">Collapsed — the common case.</p>
@@ -314,14 +316,16 @@
               ><span class="command-approval-risk" data-blocked="false">review</span>
             </div>
             <code class="command-approval-command">docker run --rm -v "$PWD":/w -w /w --network host -e RUST_LOG=debug rust:1.79 cargo build --release --target x86_64-unknown-linux-musl</code>
-            <button type="button" class="command-approval-disclosure" aria-expanded="true">
-              <span class="disclosure-caret" aria-hidden="true"></span> Why this command
-            </button>
             <pre class="command-approval-details">Cross-compiling for musl so the release artifact runs on the CI image.</pre>
-            <div class="command-approval-actions">
-              <button type="button" class="btn-sm btn-primary">Approve</button>
-              <button type="button" class="btn-sm btn-quiet">Reject</button>
-              <button type="button" class="btn-icon" aria-label="More approval options">⋯</button>
+            <div class="command-approval-footer">
+              <button type="button" class="command-approval-disclosure" aria-expanded="true">
+                <span class="disclosure-caret" aria-hidden="true"></span> Why this command
+              </button>
+              <div class="command-approval-actions">
+                <button type="button" class="btn-sm btn-primary">Approve</button>
+                <button type="button" class="btn-sm btn-quiet">Reject</button>
+                <button type="button" class="btn-icon" aria-label="More approval options">⋯</button>
+              </div>
             </div>
           </div>
           <p class="sg-note">Expanded, long command shown in full — never scrolled or clipped.</p>
@@ -341,12 +345,14 @@
           ><span class="command-approval-risk" data-blocked="true">blocked</span>
         </div>
         <code class="command-approval-command">rm -rf / --no-preserve-root</code>
-        <button type="button" class="command-approval-disclosure" aria-expanded="false">
-          <span class="disclosure-caret" aria-hidden="true"></span> Why this command
-        </button>
-        <div class="command-approval-actions">
-          <button type="button" class="btn-sm btn-primary" disabled>Blocked</button>
-          <button type="button" class="btn-sm btn-quiet">Reject</button>
+        <div class="command-approval-footer">
+          <button type="button" class="command-approval-disclosure" aria-expanded="false">
+            <span class="disclosure-caret" aria-hidden="true"></span> Why this command
+          </button>
+          <div class="command-approval-actions">
+            <button type="button" class="btn-sm btn-primary" disabled>Blocked</button>
+            <button type="button" class="btn-sm btn-quiet">Reject</button>
+          </div>
         </div>
       </div>
     </section>
