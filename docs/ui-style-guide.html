@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Damaian UI Style Guide — Specimens</title>
+    <!-- The shipping stylesheet, by relative path. This page renders the real
+         thing rather than a copy, so it cannot drift. Do not inline any of it. -->
+    <link rel="stylesheet" href="../crates/desktop-shell/static/style.css" />
+    <style>
+      /* Page-local layout ONLY. Nothing here may affect a specimen's own
+         appearance — no button, card, or token styling. If you find yourself
+         adding a rule that changes how a specimen looks, the rule belongs in
+         style.css instead, or the specimen is wrong. */
+      body {
+        margin: 0 auto;
+        max-width: 1000px;
+        padding: 32px 28px 80px;
+      }
+
+      .sg-lede {
+        border-left: 3px solid var(--accent);
+        padding: 8px 14px;
+        margin-bottom: 28px;
+      }
+
+      .sg-lede p + p {
+        margin-top: 8px;
+      }
+
+      .sg-section {
+        margin-top: 34px;
+        border-top: 1px solid var(--line);
+        padding-top: 18px;
+      }
+
+      .sg-hint {
+        margin: 4px 0 14px;
+      }
+
+      .sg-swatches {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+
+      .sg-swatch {
+        width: 112px;
+      }
+
+      .sg-chip {
+        display: block;
+        height: 40px;
+        border: 1px solid var(--line-strong);
+        border-radius: 8px;
+      }
+
+      .sg-swatch b {
+        display: block;
+        font-size: 11px;
+        margin-top: 5px;
+      }
+
+      .sg-swatch code {
+        font-size: 10px;
+        color: var(--muted);
+      }
+
+      .sg-type-row {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        border-bottom: 1px solid var(--line);
+        padding: 6px 0;
+      }
+
+      .sg-type-row > code {
+        width: 46px;
+        flex: 0 0 auto;
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .sg-type-row > em {
+        margin-left: auto;
+        flex: 0 0 auto;
+        font-style: normal;
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .sg-grid {
+        display: grid;
+        grid-template-columns: 130px 1fr;
+        gap: 12px 16px;
+        align-items: center;
+      }
+
+      .sg-rowlabel {
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+
+      .sg-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .sg-card {
+        max-width: 520px;
+        border: 1px solid var(--line-strong);
+        border-radius: 10px;
+        background: var(--surface);
+        padding: 13px 15px;
+      }
+
+      .sg-pair {
+        display: flex;
+        gap: 18px;
+        flex-wrap: wrap;
+        align-items: flex-start;
+      }
+
+      .sg-note {
+        margin-top: 7px;
+        font-size: 11px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Damaian UI specimens</h1>
+
+    <div class="sg-lede">
+      <p>
+        Rendered from <code>crates/desktop-shell/static/style.css</code> by relative path — this
+        page shows the shipping stylesheet, not a copy of it. Rules and rationale live in
+        <a href="UI_STYLE_GUIDE.md">UI_STYLE_GUIDE.md</a>; change one and change the other in the
+        same commit.
+      </p>
+      <p>
+        <strong>States are live.</strong> Hover the buttons and press Tab through them to see hover
+        and focus. The disabled examples carry a real <code>disabled</code> attribute. Nothing here
+        is simulated with page-local classes, because that is exactly the drift this page exists to
+        prevent — the cost is that not every state is visible at a glance.
+      </p>
+    </div>
+
+    <section class="sg-section">
+      <h2>Colour tokens</h2>
+      <p class="sg-hint">Edit a token in the stylesheet and reload — these follow it.</p>
+      <div class="sg-swatches">
+        <div class="sg-swatch">
+          <span class="sg-chip" style="background: var(--bg)"></span><b>--bg</b><code>window</code>
+        </div>
+        <div class="sg-swatch">
+          <span class="sg-chip" style="background: var(--surface)"></span><b>--surface</b><code>cards</code>
+        </div>
+        <div class="sg-swatch">
+          <span class="sg-chip" style="background: var(--surface-soft)"></span><b>--surface-soft</b><code>recessed</code>
+        </div>
+        <div class="sg-swatch">
+          <span class="sg-chip" style="background: var(--sidebar)"></span><b>--sidebar</b><code>sidebar</code>
+        </div>
+        <div class="sg-swatch">
+          <span class="sg-chip" style="background: var(--ink)"></span><b>--ink</b><code>text</code>
+        </div>
+        <div class="sg-swatch">
+          <span class="sg-chip" style="background: var(--muted)"></span><b>--muted</b><code>secondary</code>
+        </div>
+        <div class="sg-swatch">
+          <span class="sg-chip" style="background: var(--line)"></span><b>--line</b><code>dividers</code>
+        </div>
+        <div class="sg-swatch">
+          <span class="sg-chip" style="background: var(--line-strong)"></span><b>--line-strong</b><code>borders</code>
+        </div>
+        <div class="sg-swatch">
+          <span class="sg-chip" style="background: var(--accent)"></span><b>--accent</b><code>primary</code>
+        </div>
+        <div class="sg-swatch">
+          <span class="sg-chip" style="background: var(--accent-soft)"></span><b>--accent-soft</b><code>focus ring</code>
+        </div>
+        <div class="sg-swatch">
+          <span class="sg-chip" style="background: var(--ok)"></span><b>--ok</b><code>state</code>
+        </div>
+        <div class="sg-swatch">
+          <span class="sg-chip" style="background: var(--warn)"></span><b>--warn</b><code>state</code>
+        </div>
+        <div class="sg-swatch">
+          <span class="sg-chip" style="background: var(--danger)"></span><b>--danger</b><code>state</code>
+        </div>
+        <div class="sg-swatch">
+          <span class="sg-chip" style="background: var(--code)"></span><b>--code</b><code>code bg</code>
+        </div>
+      </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>Type scale</h2>
+      <div class="sg-type-row">
+        <code>14px</code><span style="font-size: 14px">Body copy and message text</span
+        ><em>message body</em>
+      </div>
+      <div class="sg-type-row">
+        <code>13px</code><span style="font-size: 13px">Default control text and card titles</span
+        ><em>buttons, headers</em>
+      </div>
+      <div class="sg-type-row">
+        <code>12px</code><span style="font-size: 12px">Small controls, chips, secondary copy</span
+        ><em>.btn-sm, chips</em>
+      </div>
+      <div class="sg-type-row">
+        <code>11px</code
+        ><span style="font-size: 11px; font-family: ui-monospace, Menlo, monospace"
+          >Commands under review, pills, metadata</span
+        ><em>approval command</em>
+      </div>
+      <div class="sg-type-row">
+        <code>10px</code
+        ><span
+          style="
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+          "
+          >Eyebrow labels only</span
+        ><em>uppercase only</em>
+      </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>Buttons</h2>
+      <p class="sg-hint">
+        Hover and Tab through each row. Every control here is at least 24×24 CSS px; the small
+        step measures 29px tall.
+      </p>
+      <div class="sg-grid">
+        <span class="sg-rowlabel">base · 13px</span>
+        <span class="sg-row">
+          <button type="button">Save Server</button>
+          <button type="button" disabled>Disabled</button>
+        </span>
+
+        <span class="sg-rowlabel">.btn-sm</span>
+        <span class="sg-row">
+          <button type="button" class="btn-sm">Rollback</button>
+          <button type="button" class="btn-sm" disabled>Disabled</button>
+        </span>
+
+        <span class="sg-rowlabel">.btn-primary</span>
+        <span class="sg-row">
+          <button type="button" class="btn-sm btn-primary">Approve</button>
+          <button type="button" class="btn-sm btn-primary" disabled>Blocked</button>
+        </span>
+
+        <span class="sg-rowlabel">.btn-quiet</span>
+        <span class="sg-row">
+          <button type="button" class="btn-sm btn-quiet">Reject</button>
+          <button type="button" class="btn-sm btn-quiet" disabled>Disabled</button>
+        </span>
+
+        <span class="sg-rowlabel">.btn-icon</span>
+        <span class="sg-row">
+          <button type="button" class="btn-icon" aria-label="More actions">⋯</button>
+          <button type="button" class="btn-icon" aria-label="More actions" disabled>⋯</button>
+        </span>
+      </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>Action hierarchy</h2>
+      <p class="sg-hint">
+        One primary, one quiet, everything that outlives the turn behind the overflow.
+      </p>
+      <div class="sg-row">
+        <button type="button" class="btn-sm btn-primary">Approve</button>
+        <button type="button" class="btn-sm btn-quiet">Reject</button>
+        <button type="button" class="btn-icon" aria-label="More actions">⋯</button>
+      </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>Command approval</h2>
+      <p class="sg-hint">Collapsed left, expanded with a long wrapped command right.</p>
+      <div class="sg-pair">
+        <div>
+          <div class="sg-card">
+            <div class="command-approval-header">
+              <strong>Run command</strong
+              ><span class="command-approval-risk" data-blocked="false">review</span>
+            </div>
+            <code class="command-approval-command">cargo test -p damaian-core</code>
+            <button type="button" class="command-approval-disclosure" aria-expanded="false">
+              <span class="disclosure-caret" aria-hidden="true"></span> Why this command
+            </button>
+            <div class="command-approval-actions">
+              <button type="button" class="btn-sm btn-primary">Approve</button>
+              <button type="button" class="btn-sm btn-quiet">Reject</button>
+              <button type="button" class="btn-icon" aria-label="More approval options">⋯</button>
+            </div>
+          </div>
+          <p class="sg-note">Collapsed — the common case.</p>
+        </div>
+
+        <div>
+          <div class="sg-card">
+            <div class="command-approval-header">
+              <strong>Run command</strong
+              ><span class="command-approval-risk" data-blocked="false">review</span>
+            </div>
+            <code class="command-approval-command">docker run --rm -v "$PWD":/w -w /w --network host -e RUST_LOG=debug rust:1.79 cargo build --release --target x86_64-unknown-linux-musl</code>
+            <button type="button" class="command-approval-disclosure" aria-expanded="true">
+              <span class="disclosure-caret" aria-hidden="true"></span> Why this command
+            </button>
+            <pre class="command-approval-details">Cross-compiling for musl so the release artifact runs on the CI image.</pre>
+            <div class="command-approval-actions">
+              <button type="button" class="btn-sm btn-primary">Approve</button>
+              <button type="button" class="btn-sm btn-quiet">Reject</button>
+              <button type="button" class="btn-icon" aria-label="More approval options">⋯</button>
+            </div>
+          </div>
+          <p class="sg-note">Expanded, long command shown in full — never scrolled or clipped.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>Blocked approval</h2>
+      <p class="sg-hint">
+        Disabled primary, danger-toned risk pill, and no overflow trigger at all — a blocked
+        proposal cannot be approved through a menu that does not exist.
+      </p>
+      <div class="sg-card">
+        <div class="command-approval-header">
+          <strong>Run command</strong
+          ><span class="command-approval-risk" data-blocked="true">blocked</span>
+        </div>
+        <code class="command-approval-command">rm -rf / --no-preserve-root</code>
+        <button type="button" class="command-approval-disclosure" aria-expanded="false">
+          <span class="disclosure-caret" aria-hidden="true"></span> Why this command
+        </button>
+        <div class="command-approval-actions">
+          <button type="button" class="btn-sm btn-primary" disabled>Blocked</button>
+          <button type="button" class="btn-sm btn-quiet">Reject</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>Patch header</h2>
+      <div class="sg-card">
+        <div class="patch-preview-header">
+          <div class="patch-preview-heading">
+            <strong>Add retry on 503</strong>
+            <span>2 files · +34 −6</span>
+          </div>
+          <div class="patch-actions">
+            <button type="button" class="btn-sm btn-primary">Apply 2</button>
+            <button type="button" class="btn-sm btn-quiet">Reject</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>Overflow menu</h2>
+      <p class="sg-hint">
+        Shown inline here for inspection. In the app it is a single shared
+        <code>position: fixed</code> popover on <code>document.body</code>, anchored to the
+        trigger's rect, because approval cards live inside the scrolling log.
+      </p>
+      <div class="context-menu-popover approval-menu-popover" style="position: static">
+        <div class="context-menu-panel">
+          <button type="button" class="context-menu-row approval-menu-row">
+            <span>Always allow in this project</span>
+            <small>Adds to the allowlist — persists after this turn</small>
+          </button>
+          <button type="button" class="context-menu-row approval-menu-row">
+            <span>Allow for this session</span>
+            <small>Browser diagnostics only, until this session ends</small>
+          </button>
+        </div>
+      </div>
+    </section>
+  </body>
+</html>

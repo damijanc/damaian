@@ -11,8 +11,8 @@ where it stopped without reading the git log.
 
 | Task | State | Commit | Notes |
 |---|---|---|---|
-| 1 · Button scale and pre minimum | Complete, uncommitted | — | Verified in the running app: card 161→155px, buttons 13px/600, bare `pre` minimum gone, `#config-output` keeps 180px |
-| 2 · Specimen page | Not started | — | |
+| 1 · Button scale and pre minimum | Done | `928679b` | Verified in the running app: card 161→155px, buttons 13px/600, bare `pre` minimum gone, `#config-output` keeps 180px |
+| 2 · Specimen page | Done | — | Verified over HTTP: real stylesheet loads (375 rules), token flip to `#b3261e` propagated. Six classes still unstyled — `command-approval-risk`, `command-approval-disclosure`, `disclosure-caret`, `patch-preview-heading`, `approval-menu-popover`, `approval-menu-row` — all created by Tasks 3-5. `file://` open not verified, see below |
 | 3 · Command approval structure | Not started | — | **Does not stand alone** — see Known gaps |
 | 4 · Command approval overflow menu | Not started | — | Must land with Task 3 |
 | 5 · Patch preview header actions | Not started | — | |
@@ -22,6 +22,16 @@ where it stopped without reading the git log.
 
 Errors found during execution are recorded in [`context.md`](context.md) §3, so
 they sit with the rest of the background rather than in the task list.
+
+### Open verification
+
+- **`docs/ui-style-guide.html` over `file://` is unverified.** It was checked by
+  serving the repo over HTTP (`python3 -m http.server`), which exercises the
+  same relative path, but the documented usage is `open docs/ui-style-guide.html`
+  straight from a checkout. Loading a relative stylesheet over `file://` is
+  ordinary browser behaviour and should work, but acceptance criterion 8 says
+  "with no server", so someone should open it once in a real browser and
+  confirm the buttons are styled rather than bare.
 
 ## How to verify without a model API key
 
