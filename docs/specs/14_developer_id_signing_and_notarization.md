@@ -1,6 +1,6 @@
 # Feature Spec: Developer ID Signing and Notarization
 
-Status: Implemented; pending the validation runs in §7.
+Status: Done. Shipped in v0.31.0; see §7 for the validation runs.
 Order: 14 of 15
 Roadmap: `docs/ROADMAP/00b_phase_0_distributable_build.md`, Phase 0, Work
 Package 1 (Must). That directory is local-only and not committed, so the
@@ -449,6 +449,31 @@ rejections: a signature from a different key, a bundle modified after signing, a
 tampered trusted comment, a malformed base64 blob, and a manifest URL pointing at
 the wrong tag.
 
+The first stable release, **v0.31.0**, shipped on 2026-09-03 from tag `v0.31.0`
+at commit `1ee5200`. Every new step ran and passed — preflight, signed build,
+notarize and staple, the verification gate, updater manifest and signature
+verification — with `Build preview DMG` correctly skipped, and the release was
+published with the DMG, `Damaian.app.tar.gz`, its `.sig`, and `latest.json`.
+The artifact was then installed and checked on a real machine, not just inside
+the workflow:
+
+```text
+Authority=Developer ID Application: Damijan Cavar (2U557HMVJG)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+flags=0x10000(runtime)
+stapler validate: worked
+spctl --assess --type execute: accepted, source=Notarized Developer ID
+```
+
+It installed with no `xattr` command and no Gatekeeper override. Two open
+questions from the design closed with it: Tauri does staple the `.app` itself,
+so no extra staple step is needed, and the secondary defect in §1 is genuinely
+fixed — with a stable identity, clicking **Always Allow** once on first launch
+makes the Keychain grant persist, and later launches prompt zero times. The
+first launch after any identity change still prompts, which is expected and not
+a regression.
+
 Not done here, deliberately: `docs/MACOS_INSTALLATION.md` still says the build is
 ad-hoc signed and not notarized, because that remains true of every artifact
 published so far. Remove that line when the first stable release ships, per
@@ -458,13 +483,36 @@ Sequencing note: the workflow changes cannot be fully exercised on a pull
 request, because a tag-triggered stable path is what they gate. Validate in this
 order, and record the run URLs here:
 
+In the event the order was not followed: step 4 ran first and step 1 was never
+run. The record below is what actually happened, because a spec that overstates
+its own validation is worse than one that admits the gap.
+
 1. `workflow_dispatch` with `channel: preview` and no Apple secrets — confirms
    the preview path still builds and that the preflight gate does not fire.
+   **Not run.** Run 38
+   (https://github.com/damijanc/damaian/actions/runs/32375161993) was
+   misidentified as this: it is a `push` build of `e3e9aa0` from 2026-08-20
+   that released v0.30.0, predating this work entirely.
 2. `workflow_dispatch` with `channel: stable` — exercises signing, notarization,
    stapling, and the full verification gate without creating a GitHub Release.
+   **Not run as a dispatch.** Its coverage was obtained by step 4 instead, which
+   ran the same path and did create a release.
 3. A deliberately broken run: `channel: stable` with one Apple secret temporarily
    cleared — confirms the preflight gate fails closed and uploads nothing.
-4. A real tag push — the first stable release.
+   **Passed 2026-09-04**, dispatched against `main` with `APPLE_TEAM_ID`
+   deleted: the job failed at `Check release credentials` and uploaded nothing.
+
+   A first attempt was invalid and is worth recording. Run 40
+   (https://github.com/damijanc/damaian/actions/runs/33769905441) deleted
+   `APPLE_TEAM_ID` and *succeeded*, because it dispatched against `main` while
+   `main` was still at `2235b48` — the *old* workflow, with no preflight step
+   and `APPLE_SIGNING_IDENTITY: "-"` hardcoded. A `workflow_dispatch` always
+   uses the workflow file on the selected branch, not the newest commit
+   anywhere, so this test is meaningless until the signing commit is on the
+   branch being dispatched.
+4. A real tag push — the first stable release. **Passed 2026-09-03:**
+   https://github.com/damijanc/damaian/actions/runs/33752928615 (tag `v0.31.0`,
+   commit `1ee5200`, release published).
 
 Step 3 is the one worth not skipping. The defect this spec exists to fix is a
 pipeline that reports success while shipping an unsigned artifact, and the only
