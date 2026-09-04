@@ -1058,9 +1058,14 @@ fn redacts_secrets_from_patch_diffs_before_storage() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+// Rollback capture is faithful, per
+// `docs/specs/16_session_checkpoints_and_rewind.md` §5.2: redaction covers what
+// leaves the user's control, and a rollback snapshot is a local copy made so
+// the file can be put back. Redacting it would not protect the credential — it
+// would destroy the user's file on rollback.
 #[test]
-fn redacts_secrets_from_rollback_snapshots() {
-    let repo = temp_dir("rollback-redaction");
+fn keeps_rollback_snapshots_faithful_to_the_users_file() {
+    let repo = temp_dir("rollback-faithful");
     write_fixture(
         &repo,
         "src/config.js",
@@ -1098,14 +1103,14 @@ fn redacts_secrets_from_rollback_snapshots() {
         .join(&patch.id)
         .join("src__config.js");
     let rollback_snapshot = fs::read_to_string(rollback_path).unwrap();
-    assert!(rollback_snapshot.contains("[REDACTED_AWS_ACCESS_KEY_"));
-    assert!(!rollback_snapshot.contains(AWS_ACCESS_KEY));
+    assert!(rollback_snapshot.contains(AWS_ACCESS_KEY));
+    assert!(!rollback_snapshot.contains("[REDACTED_AWS_ACCESS_KEY_"));
 
     fs::remove_dir_all(repo).unwrap();
 }
 
 #[test]
-fn rollback_restores_modified_file_and_warns_about_lost_secret() {
+fn rollback_restores_a_modified_file_byte_identically() {
     let repo = temp_dir("rollback-restore-modified");
     write_fixture(
         &repo,
@@ -1147,11 +1152,13 @@ fn rollback_restores_modified_file_and_warns_about_lost_secret() {
 
     assert_eq!(result.restored_files, vec!["src/config.js"]);
     assert!(result.deleted_files.is_empty());
-    assert_eq!(result.warnings.len(), 1);
-    assert!(result.warnings[0].contains("src/config.js"));
-    let restored = fs::read_to_string(repo.join("src/config.js")).unwrap();
-    assert!(restored.contains("[REDACTED_AWS_ACCESS_KEY_"));
-    assert!(!restored.contains(AWS_ACCESS_KEY));
+    // Nothing to warn about any more: the file comes back exactly as it was,
+    // credential included.
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(
+        fs::read_to_string(repo.join("src/config.js")).unwrap(),
+        format!("export const awsKey = \"{AWS_ACCESS_KEY}\";\n")
+    );
 
     fs::remove_dir_all(repo).unwrap();
 }

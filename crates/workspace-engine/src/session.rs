@@ -221,8 +221,10 @@ impl SessionStore {
         let Ok(content) = fs::read_to_string(path) else {
             return Ok(Vec::new());
         };
-        Ok(content
-            .lines()
+        // Rewound events stay in the log but leave the conversation, so a
+        // reloaded session shows the position the user rewound to.
+        Ok(active_events(&content)
+            .into_iter()
             .filter(|line| line.contains("\"eventType\":\"message_appended\""))
             .filter_map(parse_message_event)
             .collect())
@@ -240,7 +242,7 @@ impl SessionStore {
             return Ok(HashMap::new());
         };
         let mut statuses = HashMap::new();
-        for line in content.lines() {
+        for line in active_events(&content) {
             if !line.contains("\"eventType\":\"task_created\"")
                 && !line.contains("\"eventType\":\"task_status_updated\"")
             {
@@ -291,6 +293,32 @@ impl SessionStore {
         Ok(allowed)
     }
 
+    /// The sequence number of the newest event in the session, or 0 for a
+    /// session with no log yet. This is the conversation position a checkpoint
+    /// records, and the point a rewind returns to.
+    pub fn latest_event_seq(&self, session_id: &str) -> Result<u64> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(0);
+        };
+        Ok(latest_seq(&content))
+    }
+
+    /// Moves the active conversation back to `through_event_seq` by appending a
+    /// marker, never by rewriting the log: tasks are replayed from these events
+    /// and the log is the audit trail. Events after the marker stay on disk,
+    /// stay readable, and stop counting as part of the conversation.
+    pub fn rewind_conversation(&self, session_id: &str, through_event_seq: u64) -> Result<()> {
+        self.append_session_event(
+            session_id,
+            "conversation_rewound",
+            &format!(
+                "{{\"throughEventSeq\":{},\"restoredAtMs\":{}}}",
+                through_event_seq,
+                now_millis()
+            ),
+        )
+    }
+
     fn append_session_event(
         &self,
         session_id: &str,
@@ -301,11 +329,13 @@ impl SessionStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let seq = self.latest_event_seq(session_id)? + 1;
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         writeln!(
             file,
-            "{{\"eventId\":\"{}\",\"timestampMs\":{},\"eventType\":\"{}\",\"payload\":{}}}",
+            "{{\"eventId\":\"{}\",\"seq\":{},\"timestampMs\":{},\"eventType\":\"{}\",\"payload\":{}}}",
             create_id("evt"),
+            seq,
             now_millis(),
             escape_json(event_type),
             payload
@@ -362,6 +392,43 @@ fn message_json(message: &ChatMessage) -> String {
         escape_json(&message.content),
         message.created_at_ms
     )
+}
+
+/// Every event's sequence number. Events written before the `seq` field are
+/// numbered by line order, which is exactly their append order, so sessions
+/// that predate the field need no rewrite.
+fn numbered_events(content: &str) -> impl Iterator<Item = (u64, &str)> {
+    content
+        .lines()
+        .enumerate()
+        .map(|(index, line)| (event_seq(line).unwrap_or(index as u64 + 1), line))
+}
+
+fn event_seq(line: &str) -> Option<u64> {
+    json_number_field(line, "seq").and_then(|value| u64::try_from(value).ok())
+}
+
+fn latest_seq(content: &str) -> u64 {
+    numbered_events(content)
+        .last()
+        .map(|(seq, _)| seq)
+        .unwrap_or(0)
+}
+
+/// The events that are part of the active conversation: everything up to the
+/// newest `conversation_rewound` marker's `throughEventSeq`. A later rewind to
+/// an earlier point supersedes an earlier one, so the newest marker wins even
+/// when it points further back.
+fn active_events(content: &str) -> Vec<&str> {
+    let limit = numbered_events(content)
+        .filter(|(_, line)| line.contains("\"eventType\":\"conversation_rewound\""))
+        .filter_map(|(_, line)| json_number_field(line, "throughEventSeq"))
+        .last()
+        .and_then(|value| u64::try_from(value).ok());
+    numbered_events(content)
+        .filter(|(seq, _)| limit.is_none_or(|limit| *seq <= limit))
+        .map(|(_, line)| line)
+        .collect()
 }
 
 fn parse_session_log(content: &str) -> Option<Session> {

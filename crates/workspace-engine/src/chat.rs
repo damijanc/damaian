@@ -1,5 +1,8 @@
 use crate::audit::AuditLog;
 use crate::cancel::CancelToken;
+use crate::checkpoint::{
+    CheckpointConversation, CheckpointRequest, CheckpointStore, CommandCensus, PendingApproval,
+};
 use crate::command_policy::allow_always_eligible;
 use crate::command_runner::CommandExecution;
 use crate::config::{Config, McpTransport};
@@ -202,6 +205,7 @@ pub struct ChatOrchestrator {
     git: GitService,
     patch_engine: PatchEngine,
     patch_store: PatchStore,
+    checkpoint_store: CheckpointStore,
     mcp_token_resolver: Option<McpTokenResolver>,
     web_diagnostics_runner: Option<WebDiagnosticsRunnerHandle>,
 }
@@ -224,6 +228,7 @@ impl ChatOrchestrator {
         git: GitService,
         patch_engine: PatchEngine,
         patch_store: PatchStore,
+        checkpoint_store: CheckpointStore,
     ) -> Self {
         let pending_commands = PendingCommandStore::new(&config.data_dir);
         Self {
@@ -240,6 +245,7 @@ impl ChatOrchestrator {
             git,
             patch_engine,
             patch_store,
+            checkpoint_store,
             mcp_token_resolver: None,
             web_diagnostics_runner: None,
         }
@@ -458,6 +464,10 @@ impl ChatOrchestrator {
                 Vec::new(),
             )
         };
+        // Captured before the turn's own events, so rewinding this checkpoint
+        // takes the user's prompt with it rather than leaving a question the
+        // conversation no longer answers.
+        let position = self.session_store.latest_event_seq(&session.id)?;
         let mut task = self.session_store.create_task(
             &session.id,
             prompt,
@@ -467,8 +477,17 @@ impl ChatOrchestrator {
         task = self
             .session_store
             .update_task_status(&task, TaskStatus::Running, None)?;
-        self.session_store
-            .append_message(&session.id, Some(&task.id), "user", prompt)?;
+        let user_message =
+            self.session_store
+                .append_message(&session.id, Some(&task.id), "user", prompt)?;
+        self.take_turn_checkpoint(
+            repository_root,
+            &session,
+            &task,
+            prompt,
+            position,
+            &user_message.id,
+        );
 
         // Before context assembly, which can take a while on a large repository:
         // a client that stops during it must still know which session it stopped.
@@ -615,9 +634,21 @@ impl ChatOrchestrator {
                 reason: proposal.reason.clone(),
             };
             let content = if approved {
+                // The census has to be taken before the command runs: once it
+                // has, the pre-command bytes are gone.
+                let census = self
+                    .checkpoint_store
+                    .begin_command_census(&repository_root)
+                    .unwrap_or_else(|_| CommandCensus::unavailable());
                 let record =
                     self.validation_orchestrator
                         .run_proposal(proposal_id, true, approved_by)?;
+                self.record_command_effects(
+                    &repository_root,
+                    &pending.session,
+                    &pending.task,
+                    &census,
+                );
                 sandbox_command_context(&record.execution)
             } else {
                 self.validation_orchestrator
@@ -657,6 +688,8 @@ impl ChatOrchestrator {
             )));
         }
 
+        // The pause is over either way, so the checkpoint stops claiming one.
+        self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
         let task =
             self.session_store
                 .update_task_status(&pending.task, TaskStatus::Running, None)?;
@@ -672,6 +705,115 @@ impl ChatOrchestrator {
             sink,
             pending.turn_options,
         )
+    }
+
+    /// Takes the checkpoint the turn can be rewound to. Best-effort: a store
+    /// that cannot be written is recorded in the audit log and the turn still
+    /// runs, because refusing to answer at all would be a worse failure than
+    /// losing the ability to rewind one turn.
+    fn take_turn_checkpoint(
+        &self,
+        repository_root: &Path,
+        session: &Session,
+        task: &Task,
+        prompt: &str,
+        position: u64,
+        user_message_id: &str,
+    ) {
+        let summary = checkpoint_summary(prompt);
+        let created = self.checkpoint_store.create_checkpoint(
+            repository_root,
+            CheckpointRequest {
+                session_id: &session.id,
+                task_id: Some(&task.id),
+                user_message_id: Some(user_message_id),
+                summary: &summary,
+                conversation: CheckpointConversation {
+                    last_event_seq: position,
+                    task_status: TaskStatus::Running.as_str().to_string(),
+                },
+                pending_approvals: Vec::new(),
+                // Nothing has happened yet: paths arrive as the turn accepts a
+                // patch or runs an approved command.
+                paths: Vec::new(),
+            },
+        );
+        match created {
+            Ok(_) => {
+                // Retention runs here rather than on a timer: it is cheap
+                // unless something actually expired, and a turn is the moment
+                // a new checkpoint was just added.
+                let _ = self
+                    .checkpoint_store
+                    .cleanup(&session.repository_id, Some(&session.id));
+            }
+            Err(error) => {
+                let _ = self.audit_log.record(
+                    "checkpoint_creation_failed",
+                    &[
+                        ("actor", "system".to_string()),
+                        ("sessionId", session.id.clone()),
+                        ("taskId", task.id.clone()),
+                        ("error", error.to_string()),
+                    ],
+                );
+            }
+        }
+    }
+
+    /// Records on the turn's checkpoint what it is waiting on, or clears it
+    /// once the decision is in. Best-effort, like the rest of the checkpoint
+    /// path: a missing note is worth less than a failed turn.
+    fn note_pending_approvals(
+        &self,
+        session: &Session,
+        task: &Task,
+        pending_approvals: Vec<PendingApproval>,
+    ) {
+        let Ok(Some(manifest)) = self
+            .checkpoint_store
+            .read_checkpoint_for_task(&session.repository_id, &task.id)
+        else {
+            return;
+        };
+        let _ = self
+            .checkpoint_store
+            .set_pending_approvals(&manifest, pending_approvals);
+    }
+
+    /// Adds what an approved command changed to the turn's checkpoint.
+    /// Best-effort, like the rest of the checkpoint path.
+    fn record_command_effects(
+        &self,
+        repository_root: &Path,
+        session: &Session,
+        task: &Task,
+        census: &CommandCensus,
+    ) {
+        let Ok(Some(manifest)) = self
+            .checkpoint_store
+            .read_checkpoint_for_task(&session.repository_id, &task.id)
+        else {
+            return;
+        };
+        let _ = self
+            .checkpoint_store
+            .record_command_effects(repository_root, &manifest, census);
+    }
+
+    /// Records what the turn left on disk, so a later rewind can tell the
+    /// agent's own changes from somebody else's. Best-effort for the same
+    /// reason as [`Self::take_turn_checkpoint`].
+    fn seal_turn_checkpoint(&self, repository_root: &Path, session: &Session, task: &Task) {
+        let Ok(Some(manifest)) = self
+            .checkpoint_store
+            .read_checkpoint_for_task(&session.repository_id, &task.id)
+        else {
+            return;
+        };
+        let _ = self
+            .checkpoint_store
+            .seal_checkpoint(repository_root, &manifest);
     }
 
     /// Whether `proposal_id` was raised by a chat turn (and so should be
@@ -743,6 +885,7 @@ impl ChatOrchestrator {
             // that catches a stop arriving during context assembly or a tool.
             if sink.cancel.is_cancelled() {
                 return self.finish_cancelled_turn(
+                    repository_root,
                     session,
                     task,
                     context_files,
@@ -800,6 +943,7 @@ impl ChatOrchestrator {
                     // recorded as a provider error.
                     Err(ClientError::Cancelled) => {
                         return self.finish_cancelled_turn(
+                            repository_root,
                             session,
                             task,
                             context_files,
@@ -827,6 +971,7 @@ impl ChatOrchestrator {
             if sink.cancel.is_cancelled() {
                 let partial = model_run.content.clone();
                 return self.finish_cancelled_turn(
+                    repository_root,
                     session,
                     task,
                     context_files,
@@ -933,6 +1078,14 @@ impl ChatOrchestrator {
                             mcp_call: None,
                             web_diagnostic_call: None,
                         })?;
+                        self.note_pending_approvals(
+                            &session,
+                            &task,
+                            vec![PendingApproval {
+                                kind: "command".to_string(),
+                                proposal_id: proposal.id.clone(),
+                            }],
+                        );
                         let mut proposal_run = model_run;
                         proposal_run.content = response.clone();
                         break (
@@ -1066,6 +1219,14 @@ impl ChatOrchestrator {
                             mcp_call: None,
                             web_diagnostic_call: Some(PendingWebDiagnosticCall { call }),
                         })?;
+                        self.note_pending_approvals(
+                            &session,
+                            &task,
+                            vec![PendingApproval {
+                                kind: "browser_diagnostic".to_string(),
+                                proposal_id: proposal.id.clone(),
+                            }],
+                        );
                         let mut proposal_run = model_run;
                         proposal_run.content = response.clone();
                         break (proposal_run, response, Some(proposal), None, false);
@@ -1140,6 +1301,14 @@ impl ChatOrchestrator {
                             }),
                             web_diagnostic_call: None,
                         })?;
+                        self.note_pending_approvals(
+                            &session,
+                            &task,
+                            vec![PendingApproval {
+                                kind: "mcp_tool".to_string(),
+                                proposal_id: proposal.id.clone(),
+                            }],
+                        );
                         let mut proposal_run = model_run;
                         proposal_run.content = response.clone();
                         break (proposal_run, response, Some(proposal), None, false);
@@ -1234,6 +1403,12 @@ impl ChatOrchestrator {
                 ),
             ],
         )?;
+        // A turn waiting on a command decision is not over: it resumes through
+        // `resume_after_command_decision` and seals then. Anything else has
+        // left the repository in the state a rewind must compare against.
+        if command_proposal.is_none() {
+            self.seal_turn_checkpoint(repository_root, &session, &task);
+        }
         Ok(ChatTurnResult {
             session,
             task,
@@ -1253,8 +1428,10 @@ impl ChatOrchestrator {
     /// `Running` record is left wedged, and reports the stop as an outcome
     /// rather than a failure — a stop and a provider error need to stay
     /// distinguishable in the badge and in the task history alike.
+    #[allow(clippy::too_many_arguments)]
     fn finish_cancelled_turn(
         &self,
+        repository_root: &Path,
         session: Session,
         task: Task,
         context_files: Vec<String>,
@@ -1284,6 +1461,10 @@ impl ChatOrchestrator {
                 ("partialLength", response.len().to_string()),
             ],
         )?;
+        // A stopped turn may still have applied a patch or run a command
+        // before it stopped, so what it left behind is what a rewind has to
+        // compare against.
+        self.seal_turn_checkpoint(repository_root, &session, &task);
         Ok(ChatTurnResult {
             session,
             task,
@@ -2066,6 +2247,21 @@ fn truncate_for_prompt(value: &str, max_chars: usize) -> String {
         output.push_str("\n[truncated]");
     }
     output
+}
+
+/// What the checkpoint list shows for a turn: the prompt it precedes, short
+/// enough to read in a list and long enough to recognise.
+fn checkpoint_summary(prompt: &str) -> String {
+    let summary = prompt
+        .split_whitespace()
+        .take(12)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if summary.is_empty() {
+        "Before this turn".to_string()
+    } else {
+        format!("Before: {summary}")
+    }
 }
 
 fn session_title(prompt: &str) -> String {

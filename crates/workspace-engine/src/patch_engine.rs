@@ -54,12 +54,17 @@ pub struct PatchRollbackResult {
     pub warnings: Vec<String>,
 }
 
-/// Pre-apply per-file snapshot used to roll back an applied patch. `content`
-/// has already passed through secret redaction at capture time (see
-/// `apply_patch`), so a genuine secret value that existed before the patch
-/// can never be restored from this snapshot alone — rollback is best-effort
-/// and surfaces a warning for any file whose restored content still contains
-/// a redaction placeholder.
+/// Pre-apply per-file snapshot used to roll back an applied patch. `content` is
+/// the user's file exactly as it was, unredacted.
+///
+/// That is deliberate, and the same rule the checkpoint store follows (see
+/// `docs/specs/16_session_checkpoints_and_rewind.md` §5.2): secret redaction
+/// covers what leaves the user's control — model context, command output,
+/// diffs, the audit log — and a rollback snapshot is a local copy made so a
+/// file can be put back. Redacting it protects nothing and destroys the user's
+/// file on rollback, which is the failure this capture exists to prevent. The
+/// snapshot lives under `<data_dir>/rollback/` with the sessions and audit
+/// data, and is not safe to share.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RollbackSnapshot {
@@ -423,10 +428,7 @@ impl PatchEngine {
         } in prepared
         {
             let rollback_path = rollback_dir.join(file.path.replace('/', "__"));
-            let rollback_content = self
-                .scanner
-                .redact(current_content.as_deref().unwrap_or_default())
-                .text;
+            let rollback_content = current_content.clone().unwrap_or_default();
             let snapshot = RollbackSnapshot {
                 path: file.path.clone(),
                 base_hash: file.base_hash.clone().unwrap_or_default(),
@@ -625,13 +627,6 @@ impl PatchEngine {
                 deleted_files.push(file.path.clone());
             } else {
                 deleted_files.push(file.path.clone());
-            }
-
-            if snapshot.content.contains("[REDACTED_") {
-                warnings.push(format!(
-                    "{}: original content contained secrets that were redacted before rollback capture and cannot be restored",
-                    file.path
-                ));
             }
 
             self.audit_log.record(

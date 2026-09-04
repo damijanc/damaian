@@ -254,6 +254,11 @@
               <span class="settings-nav-icon keyboard-icon" aria-hidden="true"></span>
               <span>Shortcuts</span>
             </button>
+            <p class="settings-nav-group">Session</p>
+            <button class="settings-nav-item" type="button" data-settings-page="checkpoints">
+              <span class="settings-nav-icon rewind-icon" aria-hidden="true"></span>
+              <span>Checkpoints</span>
+            </button>
             <p class="settings-nav-group">MCP</p>
             <button class="settings-nav-item" type="button" data-settings-page="mcp">
               <span class="settings-nav-icon server-icon" aria-hidden="true"></span>
@@ -318,6 +323,21 @@
               <kbd>⌘,</kbd>
             </div>
           </div>
+        </section>
+
+        <section
+          id="settings-page-checkpoints"
+          class="settings-page"
+          data-page="checkpoints"
+        >
+          <h2 class="settings-page-title">Checkpoints</h2>
+          <p class="settings-page-hint">
+            One checkpoint per turn for this repository, newest first. Checkpoints cover
+            Damaian's own changes — files from patches you applied and files an approved
+            command changed. They are session recovery, not version control, and no
+            substitute for a commit.
+          </p>
+          <div id="checkpoint-list" class="settings-list-card"></div>
         </section>
 
         <section id="settings-page-mcp" class="settings-page" data-page="mcp">

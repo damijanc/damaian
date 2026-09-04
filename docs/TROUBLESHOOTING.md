@@ -67,7 +67,9 @@ isolated tree — that is the intended way to test without touching real data.
 | `sessions/<session-id>.jsonl` | Per-conversation event log: sessions, tasks, messages | [session.rs:244](../crates/workspace-engine/src/session.rs:244) |
 | `patches/pending/` | Proposed patches awaiting approval | [edit.rs:129](../crates/workspace-engine/src/edit.rs:129) |
 | `patches/rejected/` | Rejected patches, kept for inspection | [edit.rs:104](../crates/workspace-engine/src/edit.rs:104) |
-| `rollback/<patch-id>/` | Pre-edit file copies backing patch rollback | [patch_engine.rs:315](../crates/workspace-engine/src/patch_engine.rs:315) |
+| `rollback/<patch-id>/` | Pre-edit file copies backing patch rollback, **unredacted** | [patch_engine.rs:315](../crates/workspace-engine/src/patch_engine.rs:315) |
+| `checkpoints/<repo-id>/objects/` | Session checkpoint content, a Damaian-owned Git object store, **unredacted** | [checkpoint.rs](../crates/workspace-engine/src/checkpoint.rs) |
+| `checkpoints/<repo-id>/manifests/<checkpoint-id>.json` | What one checkpoint covers: paths, hashes, origins. No file content | [checkpoint.rs](../crates/workspace-engine/src/checkpoint.rs) |
 | `commands/pending/<id>.dcmd` | Command proposals awaiting approval | [validation.rs:108](../crates/workspace-engine/src/validation.rs:108) |
 | `commands/output/<exec-id>/` | `stdout.log`, `stderr.log`, `summary.dcmd` per execution | [validation.rs:67](../crates/workspace-engine/src/validation.rs:67) |
 | `commands/rejected/<id>.dcmd` | Rejected command proposals | [validation.rs:93](../crates/workspace-engine/src/validation.rs:93) |
@@ -182,6 +184,23 @@ That prints the secret, so prefer checking existence only. The UI's
 without revealing the value. If `model_api_key_env` names an environment
 variable instead, the variable must be set **in the environment the app was
 launched from** — a GUI launch from Finder does not inherit your shell profile.
+
+#### What is not safe to share
+
+Two places under the data directory hold your files **exactly as they were**,
+credentials included, because their whole job is to put a file back byte for
+byte (`docs/specs/16_session_checkpoints_and_rewind.md` §5.2):
+
+- `checkpoints/<repo-id>/objects/` — session checkpoint content.
+- `rollback/<patch-id>/` — pre-apply copies backing patch rollback.
+
+Redaction covers what leaves your control — model context, command output,
+diffs, the audit log — and deliberately does not cover these. Do not attach
+either to a bug report. Session logs are not safe to share either: they hold
+prompts, answers, and file content.
+
+Checkpoint *manifests* are safe by design: they carry paths, hashes, and counts,
+never content.
 
 ### Web UI state (localStorage)
 
@@ -341,7 +360,12 @@ One JSONL file per conversation, `sessions/<session-id>.jsonl`, appended as
 events. This is where **message content** lives.
 
 Event types: `session_created`, `session_renamed`, `task_created`,
-`task_status_updated`, `message_appended`.
+`task_status_updated`, `message_appended`, `browser_diagnostics_approval_updated`,
+`conversation_rewound`.
+
+Every event carries a monotonic `seq`. Events written before that field existed
+are numbered by line order on read, which is their append order, so old
+sessions need no rewrite.
 
 Find the most recently touched session:
 
@@ -372,6 +396,43 @@ oddly, validate the file:
 ```bash
 jq -e . "$SESSION_FILE" > /dev/null
 ```
+
+### Checkpoints and rewind
+
+One checkpoint per turn, under `checkpoints/<repo-id>/`. The manifest says what
+the turn covered and what it deliberately did not:
+
+```bash
+jq '{summary, fileCount: (.files|length), excluded, commandEffectsCovered}' \
+  "$DATA_DIR/checkpoints/$REPO_ID/manifests/$CHECKPOINT_ID.json"
+```
+
+Common questions:
+
+- **"Rewind says a file changed since the checkpoint."** That is a conflict, and
+  nothing was written — not part of the tree, not one file out of several. The
+  file no longer holds what the turn left there, so Damaian cannot tell your
+  edit from the agent's. Resolve it by hand, or rewind the conversation only.
+- **"A file was not restored."** Look at `excluded` in the manifest. A path
+  matched `restricted_patterns` (`.env` and friends), resolved outside the
+  repository, or lives inside Damaian's own data directory — the last one
+  matters when `DAMAIAN_DATA_DIR` is inside the repository you are working on.
+- **"Command effects were not covered."** `commandEffectsCovered: false` means
+  the working-tree census exceeded `checkpoint_census_max_paths`, or the
+  repository is not a git checkout. Damaian says so rather than implying
+  coverage it does not have.
+- **"The conversation went back but the files did not."** Those are two
+  independent switches, and the rewind dialog offers them separately.
+- **"A rewound message is still in the session log."** Correct: rewind appends
+  a `conversation_rewound` marker rather than truncating the log, so the history
+  stays auditable. Readers treat events after the marker's `throughEventSeq` as
+  inert.
+
+Retention is `checkpoint_retention_days` (default 90) plus a
+`checkpoint_max_total_bytes` ceiling (default 1 GiB). Cleanup drops expired
+manifests, deletes their refs, and lets `git gc` collect the content, but never
+drops the newest checkpoint of the session you are in. None of the three keys
+can be set by repository config.
 
 ### Command output
 

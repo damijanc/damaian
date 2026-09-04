@@ -8,13 +8,14 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult, Config, CurlModelTransport,
-    GeneratedSecretWarning, McpClient, McpServerConfig, McpTokenResolver, McpTransport,
-    OpenAICompatibleAdapter, ProposedFilePatch, ResumeDecisionOptions, Session, TurnPhase,
-    TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticReport,
-    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible,
-    command_approval_prompt, normalize_mcp_server_id, normalize_model_provider,
-    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult, Config,
+    CurlModelTransport, DataSchemaOutcome, GeneratedSecretWarning, McpClient, McpServerConfig,
+    McpTokenResolver, McpTransport, OpenAICompatibleAdapter, ProposedFilePatch,
+    ResumeDecisionOptions, Session, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall,
+    WebDiagnosticKind, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
+    WorkspaceEngine, allow_always_eligible, command_approval_prompt, ensure_data_dir_schema,
+    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
+    parse_hunk_selection, parse_mcp_transport, patch_diff_text,
 };
 
 mod keychain;
@@ -40,10 +41,35 @@ pub fn run_server(options: ShellOptions) -> Result<(), String> {
     run_server_with_ready(options, |_| {})
 }
 
+/// Resolves the effective data directory and brings its schema marker up to
+/// this build's version, or refuses. Called before the shell serves anything,
+/// so a directory this build cannot read produces a startup error instead of an
+/// empty UI. See `docs/specs/15_install_and_update_verification.md` §5.2.
+pub fn verify_data_dir_schema() -> Result<(), String> {
+    let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
+    verify_data_dir_schema_at(&config.data_dir)
+}
+
+fn verify_data_dir_schema_at(data_dir: &Path) -> Result<(), String> {
+    match ensure_data_dir_schema(data_dir).map_err(|error| error.to_string())? {
+        DataSchemaOutcome::Adopted => println!(
+            "Data directory {} adopted at schema version {CURRENT_DATA_SCHEMA_VERSION}",
+            data_dir.display()
+        ),
+        DataSchemaOutcome::Upgraded { from } => println!(
+            "Data directory {} migrated from schema version {from} to {CURRENT_DATA_SCHEMA_VERSION}",
+            data_dir.display()
+        ),
+        DataSchemaOutcome::Initialized | DataSchemaOutcome::Current => {}
+    }
+    Ok(())
+}
+
 pub fn run_server_with_ready<F>(options: ShellOptions, ready: F) -> Result<(), String>
 where
     F: FnOnce(u16),
 {
+    verify_data_dir_schema()?;
     let bind = format!("127.0.0.1:{}", options.port);
     let listener = TcpListener::bind(&bind).map_err(|error| format!("bind {bind}: {error}"))?;
     let actual_port = listener
@@ -323,6 +349,75 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 200,
                 "application/json",
                 &format!("{{\"sessions\":[{}]}}", sessions_json(&sessions)),
+            )
+        }
+        ("GET", "/api/checkpoints") => {
+            let repo = required_param(&request, "repo")?;
+            let engine = engine_for_repo(&repo)?;
+            let repository_id = engine
+                .indexer
+                .repository_id_for_path(&repo)
+                .map_err(|error| error.to_string())?;
+            let mut checkpoints = engine
+                .checkpoint_store
+                .list_checkpoints(&repository_id)
+                .map_err(|error| error.to_string())?;
+            if let Some(session_id) = request.param("session_id") {
+                checkpoints.retain(|manifest| manifest.session_id == session_id);
+            }
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &checkpoint_list_json(&checkpoints),
+            )
+        }
+        // Rewind. `files` and `conversation` are independent switches, and
+        // `path` narrows the file half to one file, which is the fourth of the
+        // restore operations rather than a fourth code path.
+        ("POST", "/api/rewind") => {
+            let form = parse_form(&request.body);
+            let repo = required_form(&form, "repo")?;
+            let checkpoint_id = required_form(&form, "checkpoint_id")?;
+            let files = form.get("files").map(String::as_str) != Some("false");
+            let conversation = form.get("conversation").map(String::as_str) == Some("true");
+            let only_path = form
+                .get("path")
+                .map(String::as_str)
+                .filter(|path| !path.is_empty());
+            if !files && !conversation {
+                return Err("Choose files, conversation, or both".to_string());
+            }
+            let engine = engine_for_repo(&repo)?;
+            let repository_id = engine
+                .indexer
+                .repository_id_for_path(&repo)
+                .map_err(|error| error.to_string())?;
+            let manifest = engine
+                .checkpoint_store
+                .read_checkpoint(&repository_id, &checkpoint_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("Unknown checkpoint: {checkpoint_id}"))?;
+            let result = engine
+                .checkpoint_store
+                .restore(
+                    &repo,
+                    &manifest,
+                    workspace_engine::CheckpointRestoreOptions {
+                        files,
+                        conversation,
+                        only_path,
+                    },
+                    "desktop_user",
+                )
+                .map_err(|error| error.to_string())?;
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &checkpoint_restore_json(&result),
             )
         }
         ("GET", "/api/session") => {
@@ -2715,6 +2810,89 @@ fn json_optional_string(value: Option<&Path>) -> String {
     }
 }
 
+/// What the checkpoint list view needs: when, what turn, how much it covers,
+/// and whether it has been rewound to. Never file content — the manifest holds
+/// none, and this must not become the place that changes.
+fn checkpoint_list_json(manifests: &[workspace_engine::CheckpointManifest]) -> String {
+    let entries = manifests
+        .iter()
+        .map(|manifest| {
+            format!(
+                "{{\"checkpointId\":\"{}\",\"sessionId\":\"{}\",\"createdAtMs\":{},\"summary\":\"{}\",\"userMessageId\":{},\"fileCount\":{},\"excludedCount\":{},\"commandEffectsCovered\":{},\"restoredAtMs\":{},\"files\":[{}],\"pendingApprovals\":[{}]}}",
+                escape_json(&manifest.checkpoint_id),
+                escape_json(&manifest.session_id),
+                manifest.created_at_ms,
+                escape_json(&manifest.summary),
+                manifest
+                    .user_message_id
+                    .as_ref()
+                    .map(|id| format!("\"{}\"", escape_json(id)))
+                    .unwrap_or_else(|| "null".to_string()),
+                manifest.files.len(),
+                manifest.excluded.len(),
+                manifest.command_effects_covered,
+                manifest
+                    .restored_at_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+                checkpoint_files_json(&manifest.files),
+                checkpoint_pending_approvals_json(&manifest.pending_approvals),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"checkpoints\":[{entries}]}}")
+}
+
+/// The paths one checkpoint covers, so the UI can offer to restore a single
+/// file. Path and origin only — a hash here would be noise, and content would
+/// be a leak.
+fn checkpoint_files_json(files: &[workspace_engine::CheckpointFile]) -> String {
+    files
+        .iter()
+        .map(|file| {
+            format!(
+                "{{\"path\":\"{}\",\"origin\":\"{}\"}}",
+                escape_json(&file.path),
+                match file.origin {
+                    workspace_engine::CheckpointOrigin::Patch => "patch",
+                    workspace_engine::CheckpointOrigin::Command => "command",
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn checkpoint_pending_approvals_json(approvals: &[workspace_engine::PendingApproval]) -> String {
+    approvals
+        .iter()
+        .map(|approval| {
+            format!(
+                "{{\"kind\":\"{}\",\"proposalId\":\"{}\"}}",
+                escape_json(&approval.kind),
+                escape_json(&approval.proposal_id)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Skipped and conflicted stay apart all the way to the UI: "there was nothing
+/// to do" and "the file changed under you" call for different next steps.
+fn checkpoint_restore_json(result: &workspace_engine::CheckpointRestoreResult) -> String {
+    format!(
+        "{{\"checkpointId\":\"{}\",\"restoredFiles\":[{}],\"deletedFiles\":[{}],\"skippedFiles\":[{}],\"conflictedFiles\":[{}],\"conversationRestored\":{},\"warnings\":[{}]}}",
+        escape_json(&result.checkpoint_id),
+        json_string_array(&result.restored_files),
+        json_string_array(&result.deleted_files),
+        json_string_array(&result.skipped_files),
+        json_string_array(&result.conflicted_files),
+        result.conversation_restored,
+        json_string_array(&result.warnings)
+    )
+}
+
 fn json_string_array(values: &[String]) -> String {
     values
         .iter()
@@ -2745,20 +2923,52 @@ fn escape_json(value: &str) -> String {
 mod tests {
     use super::{
         Request, ShellOptions, TurnEvent, allowed_cors_origin, api_request_requires_token,
-        cached_model_api_key, desktop_settings_config_path, effective_policy_for_repo,
-        engine_for_repo, forget_model_api_key, generated_secret_warnings_json, handle_connection,
-        index_html, json_optional_string, keychain, mcp_browser_arguments, parse_form,
-        parse_path_list, percent_decode, relay_turn_events, remember_model_api_key,
+        cached_model_api_key, checkpoint_list_json, checkpoint_restore_json,
+        desktop_settings_config_path, effective_policy_for_repo, engine_for_repo,
+        forget_model_api_key, generated_secret_warnings_json, handle_connection, index_html,
+        json_optional_string, keychain, mcp_browser_arguments, parse_form, parse_path_list,
+        percent_decode, relay_turn_events, remember_model_api_key,
         render_markdown_with_optional_file_links, repository_config_review_json, require_api_token,
-        run_terminal_command, save_config_file, terminal_cwd_for_repo, validate_context_files,
-        validate_working_folder, validate_workspace_path,
+        run_server, run_terminal_command, save_config_file, terminal_cwd_for_repo,
+        validate_context_files, validate_working_folder, validate_workspace_path,
+        verify_data_dir_schema_at,
     };
     use std::collections::HashMap;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use workspace_engine::CheckpointRestoreResult;
     use workspace_engine::{CancelToken, Config, GeneratedSecretWarning, WorkspaceEngine};
+
+    /// Points every engine built in this test binary at a throwaway data
+    /// directory, and returns it.
+    ///
+    /// Repository config cannot set `data_dir` — spec 34 makes it forbidden, so
+    /// a repository that arrives with a clone cannot redirect where data lands.
+    /// That leaves the environment as the only lever a test has, and without it
+    /// these tests write sessions, patches, and checkpoints straight into the
+    /// user's real `~/Library/Application Support/DamaianClient`.
+    fn isolated_data_dir() -> &'static std::path::Path {
+        static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+        DATA_DIR.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "damaian-shell-test-data-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).expect("test data dir");
+            // Set once, inside the initializer, before any engine in this
+            // binary is built: a concurrent test waits here rather than
+            // racing, and a test binary shares its environment with nothing.
+            unsafe { std::env::set_var("DAMAIAN_DATA_DIR", &dir) };
+            dir
+        })
+    }
 
     /// A sink that starts refusing writes after `writes_before_failure`, the way
     /// a socket does once the client has gone away.
@@ -3039,14 +3249,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(repo.join(".damaian")).unwrap();
-        let data_dir = repo.join(".damaian").join("data");
-        // Pin data_dir through repo config so the test never touches the
-        // user's real application-support directory or a shared env var.
-        fs::write(
-            repo.join(".damaian").join("config.conf"),
-            format!("data_dir={}\n", data_dir.to_string_lossy()),
-        )
-        .unwrap();
+        isolated_data_dir();
         fs::write(repo.join("config.js"), "export const token = \"\";\n").unwrap();
 
         let repo_arg = repo.to_string_lossy().to_string();
@@ -3127,6 +3330,249 @@ mod tests {
         );
 
         fs::remove_dir_all(&repo).ok();
+    }
+
+    /// The two rewind routes over real HTTP, because the UI reaches them that
+    /// way and a route that compiles is not a route that answers.
+    #[test]
+    fn checkpoint_routes_list_and_rewind_over_http() {
+        let repo = std::env::temp_dir().join(format!(
+            "damaian-rewind-route-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(repo.join(".damaian")).unwrap();
+        isolated_data_dir();
+        fs::write(repo.join("app.js"), "export const a = 1;\n").unwrap();
+        fs::write(repo.join("other.js"), "export const b = 1;\n").unwrap();
+
+        let repo_arg = repo.to_string_lossy().to_string();
+        let engine = engine_for_repo(&repo_arg).expect("engine for test repo");
+        let manifest = engine
+            .checkpoint_store
+            .create_checkpoint(
+                &repo,
+                workspace_engine::CheckpointRequest {
+                    session_id: "session_route",
+                    task_id: Some("task_route"),
+                    user_message_id: Some("msg_route"),
+                    summary: "Before: bump the constant",
+                    conversation: workspace_engine::CheckpointConversation {
+                        last_event_seq: 1,
+                        task_status: "running".to_string(),
+                    },
+                    pending_approvals: Vec::new(),
+                    paths: vec![
+                        workspace_engine::CheckpointPath {
+                            path: "app.js".to_string(),
+                            origin: workspace_engine::CheckpointOrigin::Patch,
+                        },
+                        workspace_engine::CheckpointPath {
+                            path: "other.js".to_string(),
+                            origin: workspace_engine::CheckpointOrigin::Patch,
+                        },
+                    ],
+                },
+            )
+            .expect("create checkpoint");
+        fs::write(repo.join("app.js"), "export const a = 2;\n").unwrap();
+        fs::write(repo.join("other.js"), "export const b = 2;\n").unwrap();
+        engine
+            .checkpoint_store
+            .seal_checkpoint(&repo, &manifest)
+            .expect("seal checkpoint");
+
+        let options = ShellOptions::new(0, None);
+        let token = options.api_token.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let _ = handle_connection(&mut stream, &options);
+            }
+        });
+
+        let send = |request: String| {
+            let mut stream =
+                TcpStream::connect(("127.0.0.1", port)).expect("connect to test server");
+            stream.write_all(request.as_bytes()).expect("write request");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("read response");
+            response
+        };
+
+        let listed = send(format!(
+            "GET /api/checkpoints?repo={}&session_id=session_route HTTP/1.1\r\nHost: 127.0.0.1\r\nx-damaian-api-token: {token}\r\nconnection: close\r\n\r\n",
+            percent_encode_for_test(&repo_arg)
+        ));
+        assert!(listed.contains(&manifest.checkpoint_id), "{listed}");
+        assert!(listed.contains("\"fileCount\":2"), "{listed}");
+        assert!(listed.contains("Before: bump the constant"), "{listed}");
+        assert!(
+            listed.contains("\"path\":\"app.js\",\"origin\":\"patch\""),
+            "{listed}"
+        );
+
+        let rewind = |extra: &str| {
+            let body = format!(
+                "repo={}&checkpoint_id={}&files=true&conversation=false{extra}",
+                percent_encode_for_test(&repo_arg),
+                manifest.checkpoint_id
+            );
+            send(format!(
+                "POST /api/rewind HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/x-www-form-urlencoded\r\nx-damaian-api-token: {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ))
+        };
+
+        // One file: the fourth restore operation, over the wire.
+        let single = rewind("&path=app.js");
+        assert!(
+            single.contains("\"restoredFiles\":[\"app.js\"]"),
+            "{single}"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("app.js")).unwrap(),
+            "export const a = 1;\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("other.js")).unwrap(),
+            "export const b = 2;\n"
+        );
+
+        let both = rewind("");
+        assert!(both.contains("\"other.js\""), "{both}");
+        assert!(both.contains("\"conversationRestored\":false"), "{both}");
+        assert_eq!(
+            fs::read_to_string(repo.join("other.js")).unwrap(),
+            "export const b = 1;\n"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Serves the real UI with a known API token, seeded with a session whose
+    /// turn can be rewound, so the checkpoint controls can actually be looked
+    /// at. The web UI takes its token from the Tauri bootstrap, so a browser
+    /// cannot otherwise authenticate — and a full Tauri build is minutes.
+    ///
+    /// `#[ignore]`d: it binds a port and serves until it is stopped. Run it by
+    /// hand and open the URL it prints:
+    ///
+    /// ```sh
+    /// cargo test -p desktop-shell --lib -- --ignored --nocapture serves_the_ui
+    /// ```
+    ///
+    /// Then, in the browser console (the token gates every `/api/` route):
+    ///
+    /// ```js
+    /// apiToken = "damaian-ui-inspection-token";
+    /// setRepository("<the repository path it printed>", false);
+    /// ```
+    #[test]
+    #[ignore]
+    fn serves_the_ui_for_manual_inspection() {
+        let data_dir = isolated_data_dir().to_path_buf();
+        let repo = std::env::temp_dir().join(format!(
+            "damaian-ui-inspection-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("upload.rs"), "fn upload() {\n    todo!()\n}\n").unwrap();
+        fs::write(repo.join("retry.rs"), "// no retry yet\n").unwrap();
+
+        let repo_arg = repo.to_string_lossy().to_string();
+        let engine = engine_for_repo(&repo_arg).expect("engine");
+        let repository_id = engine
+            .indexer
+            .repository_id_for_path(&repo_arg)
+            .expect("repository id");
+        let session = engine
+            .session_store
+            .create_session(&repository_id, "Add retry to the upload client")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(
+                &session.id,
+                "add retry to the upload client",
+                "mock",
+                "mock",
+            )
+            .unwrap();
+        let user_message = engine
+            .session_store
+            .append_message(
+                &session.id,
+                Some(&task.id),
+                "user",
+                "add retry to the upload client",
+            )
+            .unwrap();
+        engine
+            .session_store
+            .append_message(
+                &session.id,
+                Some(&task.id),
+                "assistant",
+                "Added a retry helper and wired it into `upload`.",
+            )
+            .unwrap();
+        let manifest = engine
+            .checkpoint_store
+            .create_checkpoint(
+                &repo,
+                workspace_engine::CheckpointRequest {
+                    session_id: &session.id,
+                    task_id: Some(&task.id),
+                    user_message_id: Some(&user_message.id),
+                    summary: "Before: add retry to the upload client",
+                    conversation: workspace_engine::CheckpointConversation {
+                        last_event_seq: 1,
+                        task_status: "complete".to_string(),
+                    },
+                    pending_approvals: Vec::new(),
+                    paths: vec![
+                        workspace_engine::CheckpointPath {
+                            path: "upload.rs".to_string(),
+                            origin: workspace_engine::CheckpointOrigin::Patch,
+                        },
+                        workspace_engine::CheckpointPath {
+                            path: "retry.rs".to_string(),
+                            origin: workspace_engine::CheckpointOrigin::Command,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        fs::write(
+            repo.join("upload.rs"),
+            "fn upload() {\n    with_retry(send)\n}\n",
+        )
+        .unwrap();
+        fs::write(repo.join("retry.rs"), "pub fn with_retry() {}\n").unwrap();
+        engine
+            .checkpoint_store
+            .seal_checkpoint(&repo, &manifest)
+            .unwrap();
+
+        let options = ShellOptions {
+            port: 4899,
+            default_repo: Some(repo_arg.clone()),
+            api_token: "damaian-ui-inspection-token".to_string(),
+        };
+        println!("UI inspection server: http://127.0.0.1:{}/", options.port);
+        println!("  apiToken = \"{}\"", options.api_token);
+        println!("  repository = {repo_arg}");
+        println!("  session = {}", session.id);
+        println!("  data_dir = {}", data_dir.display());
+        run_server(options).expect("serve the UI");
     }
 
     fn percent_encode_for_test(value: &str) -> String {
@@ -3525,6 +3971,119 @@ mod tests {
         assert_eq!(result.exit_code, 0);
         assert!(result.stdout.is_empty());
         assert!(result.stderr.is_empty());
+    }
+
+    // The list view needs the counts and the coverage flag, and must not grow
+    // a content field: the manifest deliberately has none.
+    #[test]
+    fn checkpoint_list_json_reports_what_the_list_view_shows() {
+        let manifest = test_manifest();
+
+        let json = checkpoint_list_json(&[manifest]);
+
+        assert!(json.contains("\"checkpointId\":\"checkpoint_1\""));
+        assert!(json.contains("\"summary\":\"Before: bump the version\""));
+        assert!(json.contains("\"fileCount\":1"));
+        assert!(json.contains("\"excludedCount\":1"));
+        assert!(json.contains("\"commandEffectsCovered\":true"));
+        assert!(json.contains("\"restoredAtMs\":null"));
+        assert!(json.contains("\"userMessageId\":\"msg_1\""));
+        // The per-file list is what lets the UI offer "restore only this file".
+        // Paths and origins only: the manifest has no content and this must not
+        // become the place that acquires it.
+        assert!(json.contains("\"files\":[{\"path\":\"src/a.rs\",\"origin\":\"patch\"}]"));
+        assert!(json.contains("\"pendingApprovals\":[]"));
+        assert!(!json.contains("hash"));
+    }
+
+    // A rewind that skipped a file and one that refused to overwrite it are
+    // different outcomes, and the UI has to be able to say which happened.
+    #[test]
+    fn checkpoint_restore_json_keeps_skipped_and_conflicted_apart() {
+        let result = CheckpointRestoreResult {
+            checkpoint_id: "checkpoint_1".to_string(),
+            restored_files: vec!["src/a.rs".to_string()],
+            deleted_files: Vec::new(),
+            skipped_files: vec!["src/b.rs".to_string()],
+            conflicted_files: vec!["src/c.rs".to_string()],
+            conversation_restored: true,
+            warnings: vec!["src/c.rs: changed since the checkpoint was taken".to_string()],
+        };
+
+        let json = checkpoint_restore_json(&result);
+
+        assert!(json.contains("\"restoredFiles\":[\"src/a.rs\"]"));
+        assert!(json.contains("\"skippedFiles\":[\"src/b.rs\"]"));
+        assert!(json.contains("\"conflictedFiles\":[\"src/c.rs\"]"));
+        assert!(json.contains("\"conversationRestored\":true"));
+    }
+
+    fn test_manifest() -> workspace_engine::CheckpointManifest {
+        workspace_engine::CheckpointManifest {
+            checkpoint_id: "checkpoint_1".to_string(),
+            repository_id: "repo_1".to_string(),
+            session_id: "session_1".to_string(),
+            task_id: Some("task_1".to_string()),
+            created_at_ms: 1_788_000_000_000,
+            user_message_id: Some("msg_1".to_string()),
+            summary: "Before: bump the version".to_string(),
+            conversation: workspace_engine::CheckpointConversation {
+                last_event_seq: 12,
+                task_status: "running".to_string(),
+            },
+            pending_approvals: Vec::new(),
+            tree_oid: "abc".to_string(),
+            files: vec![workspace_engine::CheckpointFile {
+                path: "src/a.rs".to_string(),
+                hash: Some("hash".to_string()),
+                existed: true,
+                oid: Some("oid".to_string()),
+                origin: workspace_engine::CheckpointOrigin::Patch,
+                mode: 0o100644,
+                expected_hash: None,
+                expected_existed: None,
+            }],
+            excluded: vec![workspace_engine::CheckpointExclusion {
+                path: ".env".to_string(),
+                reason: "restricted_pattern".to_string(),
+            }],
+            restored_at_ms: None,
+            command_effects_covered: true,
+        }
+    }
+
+    // Startup must fail loudly on a data directory this build cannot read.
+    // The alternative — carrying on with an empty projects list — reads as data
+    // loss and invites the destructive recovery attempt the refusal exists to
+    // prevent.
+    #[test]
+    fn startup_refuses_a_data_directory_written_by_a_newer_schema() {
+        let data_dir = temp_path("schema-newer");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(data_dir.join("schema.conf"), "schema_version=999\n").unwrap();
+
+        let error = verify_data_dir_schema_at(&data_dir).expect_err("startup should refuse");
+
+        assert!(
+            error.contains(&data_dir.display().to_string()),
+            "refusal should name the data directory: {error}"
+        );
+        assert!(
+            error.contains("999"),
+            "refusal should name the version found: {error}"
+        );
+    }
+
+    #[test]
+    fn startup_marks_a_fresh_data_directory_with_the_current_schema() {
+        let data_dir = temp_path("schema-fresh");
+
+        verify_data_dir_schema_at(&data_dir).expect("a fresh data directory should be accepted");
+
+        assert_eq!(
+            fs::read_to_string(data_dir.join("schema.conf")).expect("marker should be written"),
+            "schema_version=1\n"
+        );
     }
 
     #[test]

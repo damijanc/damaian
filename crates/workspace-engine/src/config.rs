@@ -145,6 +145,24 @@ pub struct Config {
     pub block_generated_secrets: bool,
     pub audit_enabled: bool,
     pub audit_retention_days: u64,
+    /// How long a session checkpoint is kept. Defaults to the same window as
+    /// the audit log, since both are local recovery data with the same
+    /// sensitivity.
+    pub checkpoint_retention_days: u64,
+    /// Ceiling on the checkpoint store for one repository. Cleanup drops the
+    /// oldest checkpoints until the store is back under it, so a long-running
+    /// repository cannot fill the disk.
+    pub checkpoint_max_total_bytes: u64,
+    /// How many changed or untracked paths a working-tree census may cover
+    /// before command effects are reported as uncovered for the turn. A
+    /// checkpoint that claims coverage it does not have is worse than one that
+    /// admits the gap — and a census that takes ten seconds reads as a hang.
+    ///
+    /// The default is set from a measurement, not a guess: ~2.7 ms per changed
+    /// path (hashing the file and writing its blob), and the census runs twice
+    /// per approved command, so 1000 paths caps it at roughly five seconds in
+    /// the worst case. See `docs/specs/16_session_checkpoints_and_rewind.md` §7.
+    pub checkpoint_census_max_paths: u64,
     /// Off by default: enabling local semantic search downloads a small
     /// embedding model on first use (a one-time network fetch), which the
     /// user should opt into rather than have happen implicitly.
@@ -431,6 +449,9 @@ impl Config {
             block_generated_secrets,
             audit_enabled,
             audit_retention_days,
+            checkpoint_retention_days,
+            checkpoint_max_total_bytes,
+            checkpoint_census_max_paths,
             enable_semantic_search,
             agent_max_tool_rounds,
             agent_web_debug_max_tool_rounds,
@@ -631,6 +652,37 @@ impl Config {
             } else {
                 self.upsert_mcp_server_from_repository(server, &mut rejected);
             }
+        }
+
+        // Forbidden: lowering a checkpoint budget destroys the user's own
+        // recovery data for a repository a clone brought with it, so a
+        // repository cannot set these even though they look like budgets.
+        if let Some(value) = scoped(
+            checkpoint_retention_days,
+            "checkpoint_retention_days",
+            trusted,
+            forbidden,
+            &mut rejected,
+        ) {
+            self.checkpoint_retention_days = value;
+        }
+        if let Some(value) = scoped(
+            checkpoint_max_total_bytes,
+            "checkpoint_max_total_bytes",
+            trusted,
+            forbidden,
+            &mut rejected,
+        ) {
+            self.checkpoint_max_total_bytes = value;
+        }
+        if let Some(value) = scoped(
+            checkpoint_census_max_paths,
+            "checkpoint_census_max_paths",
+            trusted,
+            forbidden,
+            &mut rejected,
+        ) {
+            self.checkpoint_census_max_paths = value;
         }
 
         // Free: preferences and budgets, with no capability behind them.
@@ -1030,6 +1082,21 @@ impl Config {
         );
         push_line(
             &mut output,
+            "checkpoint_retention_days",
+            &self.checkpoint_retention_days.to_string(),
+        );
+        push_line(
+            &mut output,
+            "checkpoint_max_total_bytes",
+            &self.checkpoint_max_total_bytes.to_string(),
+        );
+        push_line(
+            &mut output,
+            "checkpoint_census_max_paths",
+            &self.checkpoint_census_max_paths.to_string(),
+        );
+        push_line(
+            &mut output,
             "enable_semantic_search",
             &self.enable_semantic_search.to_string(),
         );
@@ -1101,6 +1168,9 @@ impl Default for Config {
             block_generated_secrets: true,
             audit_enabled: true,
             audit_retention_days: 90,
+            checkpoint_retention_days: 90,
+            checkpoint_max_total_bytes: 1_073_741_824,
+            checkpoint_census_max_paths: 1_000,
             enable_semantic_search: false,
             agent_max_tool_rounds: 8,
             agent_web_debug_max_tool_rounds: 12,
@@ -1139,6 +1209,9 @@ pub struct ConfigOverlay {
     pub block_generated_secrets: Option<bool>,
     pub audit_enabled: Option<bool>,
     pub audit_retention_days: Option<u64>,
+    pub checkpoint_retention_days: Option<u64>,
+    pub checkpoint_max_total_bytes: Option<u64>,
+    pub checkpoint_census_max_paths: Option<u64>,
     pub enable_semantic_search: Option<bool>,
     pub agent_max_tool_rounds: Option<u32>,
     pub agent_web_debug_max_tool_rounds: Option<u32>,
@@ -1231,6 +1304,15 @@ impl ConfigOverlay {
             }
             "audit_enabled" => self.audit_enabled = Some(parse_bool(key, value)?),
             "audit_retention_days" => self.audit_retention_days = Some(parse_u64(key, value)?),
+            "checkpoint_retention_days" => {
+                self.checkpoint_retention_days = Some(parse_u64(key, value)?)
+            }
+            "checkpoint_max_total_bytes" => {
+                self.checkpoint_max_total_bytes = Some(parse_u64(key, value)?)
+            }
+            "checkpoint_census_max_paths" => {
+                self.checkpoint_census_max_paths = Some(parse_u64(key, value)?)
+            }
             "enable_semantic_search" => self.enable_semantic_search = Some(parse_bool(key, value)?),
             "agent_max_tool_rounds" => {
                 self.agent_max_tool_rounds = Some(parse_round_count(key, value)?)
@@ -1431,6 +1513,23 @@ impl ConfigOverlay {
         }
         if let Some(value) = self.audit_retention_days {
             push_line(&mut output, "audit_retention_days", &value.to_string());
+        }
+        if let Some(value) = self.checkpoint_retention_days {
+            push_line(&mut output, "checkpoint_retention_days", &value.to_string());
+        }
+        if let Some(value) = self.checkpoint_max_total_bytes {
+            push_line(
+                &mut output,
+                "checkpoint_max_total_bytes",
+                &value.to_string(),
+            );
+        }
+        if let Some(value) = self.checkpoint_census_max_paths {
+            push_line(
+                &mut output,
+                "checkpoint_census_max_paths",
+                &value.to_string(),
+            );
         }
         if let Some(value) = self.enable_semantic_search {
             push_line(&mut output, "enable_semantic_search", &value.to_string());

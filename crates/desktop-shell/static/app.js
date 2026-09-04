@@ -1033,10 +1033,13 @@ async function installAppUpdate() {
 }
 
 function setSettingsPage(page) {
-  const target = ["general", "shortcuts", "mcp", "providers", "models"].includes(page)
+  const target = ["general", "shortcuts", "checkpoints", "mcp", "providers", "models"].includes(
+    page,
+  )
     ? page
     : "providers";
   if (target === "mcp") renderMcpConfigSelect();
+  if (target === "checkpoints") void renderCheckpointList();
   document.querySelectorAll(".settings-nav-item").forEach((button) => {
     button.classList.toggle("active", button.dataset.settingsPage === target);
   });
@@ -3009,6 +3012,10 @@ function renderMessages(messages, tasks = []) {
   );
   messages.forEach((message) => {
     const bubble = appendChatMessage(message.role, message.content);
+    if (message.role === "user") {
+      const checkpoint = sessionCheckpoints.find((entry) => entry.userMessageId === message.id);
+      if (checkpoint) markMessageRewindable(bubble, checkpoint);
+    }
     if (message.role === "assistant") {
       void finalizeChatMessage(bubble, message.content);
       if (message.taskId && cancelledTasks.has(message.taskId)) {
@@ -3017,6 +3024,288 @@ function renderMessages(messages, tasks = []) {
         markMessageToolBudgetExhausted(bubble, message.sessionId);
       }
     }
+  });
+}
+
+// Checkpoints for the open session, newest first. Loaded with the session so
+// a user turn can offer to rewind to the point just before it.
+let sessionCheckpoints = [];
+
+async function loadSessionCheckpoints(sessionId) {
+  const repoPath = repo();
+  if (!repoPath || !sessionId) {
+    sessionCheckpoints = [];
+    return;
+  }
+  try {
+    const payload = await api(
+      `/api/checkpoints?repo=${encodeURIComponent(repoPath)}&session_id=${encodeURIComponent(sessionId)}`,
+    );
+    sessionCheckpoints = Array.isArray(payload.checkpoints) ? payload.checkpoints : [];
+  } catch {
+    // A session whose checkpoints cannot be listed still has to open; the
+    // turn simply offers no rewind.
+    sessionCheckpoints = [];
+  }
+}
+
+/// Every checkpoint for the open repository, newest first: when it was taken,
+/// the turn it precedes, how much it covers, and whether it has been rewound to
+/// already. The per-turn control in the conversation only reaches the turns
+/// still on screen; this reaches the rest.
+async function renderCheckpointList() {
+  const container = $("checkpoint-list");
+  container.innerHTML = "";
+  const repoPath = repo();
+  if (!repoPath) {
+    container.append(emptyCheckpointNotice("Select a project to see its checkpoints."));
+    return;
+  }
+
+  let checkpoints = [];
+  let sessionTitles = new Map();
+  try {
+    const [payload, sessions] = await Promise.all([
+      api(`/api/checkpoints?repo=${encodeURIComponent(repoPath)}`),
+      api(`/api/sessions?repo=${encodeURIComponent(repoPath)}`).catch(() => ({ sessions: [] })),
+    ]);
+    checkpoints = Array.isArray(payload.checkpoints) ? payload.checkpoints : [];
+    sessionTitles = new Map(
+      (sessions.sessions || []).map((session) => [session.id, session.title]),
+    );
+  } catch (error) {
+    container.append(emptyCheckpointNotice(error.message));
+    return;
+  }
+  if (!checkpoints.length) {
+    container.append(emptyCheckpointNotice("No checkpoints yet. One is taken before every turn."));
+    return;
+  }
+
+  checkpoints.forEach((checkpoint) => {
+    const row = document.createElement("div");
+    row.className = "checkpoint-row";
+
+    const details = document.createElement("div");
+    const summary = document.createElement("p");
+    summary.className = "checkpoint-row-summary";
+    summary.textContent = checkpoint.summary;
+    const meta = document.createElement("p");
+    meta.className = "checkpoint-row-meta";
+    const files = `${checkpoint.fileCount} ${checkpoint.fileCount === 1 ? "file" : "files"}`;
+    const session = sessionTitles.get(checkpoint.sessionId);
+    meta.textContent = [
+      new Date(checkpoint.createdAtMs).toLocaleString(),
+      files,
+      session ? `in ${session}` : null,
+      checkpoint.restoredAtMs ? "rewound to already" : null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    details.append(summary, meta);
+
+    // Coverage the checkpoint does not have is said out loud here too, not
+    // only in the rewind dialog.
+    const gaps = [
+      checkpoint.commandEffectsCovered ? null : "command effects not covered",
+      checkpoint.excludedCount
+        ? `${checkpoint.excludedCount} path${
+            checkpoint.excludedCount === 1 ? "" : "s"
+          } excluded by policy`
+        : null,
+    ].filter(Boolean);
+    if (gaps.length) {
+      const warning = document.createElement("p");
+      warning.className = "checkpoint-row-warning";
+      warning.textContent = gaps.join(" · ");
+      details.append(warning);
+    }
+
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "checkpoint-row-action";
+    action.textContent = "Rewind";
+    action.addEventListener("click", async () => {
+      action.disabled = true;
+      try {
+        await rewindToCheckpoint(checkpoint);
+        await renderCheckpointList();
+      } finally {
+        action.disabled = false;
+      }
+    });
+
+    row.append(details, action);
+    container.append(row);
+  });
+}
+
+function emptyCheckpointNotice(message) {
+  const notice = document.createElement("p");
+  notice.className = "checkpoint-list-empty";
+  notice.textContent = message;
+  return notice;
+}
+
+function markMessageRewindable(target, checkpoint) {
+  const row = document.createElement("div");
+  row.className = "turn-indicator";
+  row.dataset.state = "rewindable";
+  const label = document.createElement("span");
+  label.className = "turn-indicator-label";
+  label.textContent = checkpoint.restoredAtMs
+    ? "Rewound to once already"
+    : `${checkpoint.fileCount} ${checkpoint.fileCount === 1 ? "file" : "files"} covered`;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "turn-indicator-action";
+  button.textContent = "Rewind";
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await rewindToCheckpoint(checkpoint);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  row.append(label, button);
+  target.body.after(row);
+}
+
+async function rewindToCheckpoint(checkpoint) {
+  const choice = await showRewindDialog(checkpoint);
+  if (!choice) return;
+  try {
+    const result = await api(
+      "/api/rewind",
+      form({
+        repo: requireRepo(),
+        checkpoint_id: checkpoint.checkpointId,
+        files: String(choice.files),
+        conversation: String(choice.conversation),
+        // One file is the fourth restore operation, not a fourth code path:
+        // the same request with the file half narrowed to one path.
+        path: choice.path || "",
+      }),
+    );
+    if (result.conflictedFiles.length) {
+      // Nothing was written: a partial restore with a conflict in the middle
+      // would leave a tree that is neither the checkpoint nor what is there now.
+      await noticeDialog(
+        "Rewind stopped: files changed since the checkpoint",
+        `${result.conflictedFiles.join(", ")} ${
+          result.conflictedFiles.length === 1 ? "has" : "have"
+        } changed since this turn ran, so nothing was restored. Resolve ${
+          result.conflictedFiles.length === 1 ? "it" : "them"
+        } by hand, or rewind the conversation only.`,
+      );
+      return;
+    }
+    await loadSession(currentSessionId);
+    const restored = result.restoredFiles.length + result.deletedFiles.length;
+    if (choice.path) {
+      toast(restored ? `Restored ${choice.path}` : `Nothing to restore for ${choice.path}`);
+      return;
+    }
+    toast(
+      choice.files
+        ? `Rewound ${restored} ${restored === 1 ? "file" : "files"}${
+            choice.conversation ? " and the conversation" : ""
+          }`
+        : "Rewound the conversation",
+    );
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+// Files and conversation are independent switches, so the dialog offers all
+// three useful combinations rather than making the user rewind twice.
+function showRewindDialog(checkpoint) {
+  return new Promise((resolve) => {
+    const cleanupRef = { current: () => {} };
+    const backdrop = document.createElement("div");
+    backdrop.className = "app-dialog-backdrop";
+    backdrop.innerHTML = `
+      <div class="app-dialog app-dialog-wide app-dialog-rewind" role="dialog" aria-modal="true">
+        <p class="app-dialog-title">Rewind this turn</p>
+        <p class="app-dialog-message"></p>
+        <div class="rewind-file-list"></div>
+        <p class="app-dialog-footnote"></p>
+        <div class="app-dialog-actions">
+          <button type="button" class="app-dialog-btn app-dialog-cancel">Cancel</button>
+          <button type="button" class="app-dialog-btn app-dialog-conversation">Conversation only</button>
+          <button type="button" class="app-dialog-btn app-dialog-files">Files only</button>
+          <button type="button" class="app-dialog-btn app-dialog-confirm">Files and conversation</button>
+        </div>
+      </div>
+    `;
+    const covered = `${checkpoint.fileCount} ${checkpoint.fileCount === 1 ? "file" : "files"}`;
+    const excluded = checkpoint.excludedCount
+      ? ` ${checkpoint.excludedCount} path${checkpoint.excludedCount === 1 ? " was" : "s were"} ` +
+        "excluded by policy and will not be restored."
+      : "";
+    const uncovered = checkpoint.commandEffectsCovered
+      ? ""
+      : " Files changed by approved commands are not covered for this repository.";
+    backdrop.querySelector(".app-dialog-message").textContent =
+      `${checkpoint.summary}. Rewinding restores ${covered} Damaian changed in this turn, and ` +
+      `moves the conversation back to just before it.${excluded}${uncovered}`;
+    // Each covered file can go back on its own, for the common case of one
+    // wrong file in an otherwise useful turn.
+    const fileList = backdrop.querySelector(".rewind-file-list");
+    const files = Array.isArray(checkpoint.files) ? checkpoint.files : [];
+    files.forEach((file) => {
+      const row = document.createElement("div");
+      row.className = "rewind-file";
+      const path = document.createElement("code");
+      path.className = "rewind-file-path";
+      path.textContent = file.path;
+      const origin = document.createElement("span");
+      origin.className = "rewind-file-origin";
+      origin.textContent =
+        file.origin === "command" ? "changed by a command" : "changed by a patch";
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "rewind-file-action";
+      button.textContent = "Restore this file";
+      button.addEventListener("click", () =>
+        cleanupRef.current({ files: true, conversation: false, path: file.path }),
+      );
+      row.append(path, origin, button);
+      fileList.append(row);
+    });
+    fileList.hidden = files.length === 0;
+
+    // Requirement 11: a user must not read this as a Git-like guarantee.
+    backdrop.querySelector(".app-dialog-footnote").textContent =
+      "Checkpoints cover Damaian's own changes to this repository. They are session recovery, " +
+      "not version control, and are no substitute for a commit.";
+    document.body.append(backdrop);
+
+    const cleanup = (result) => {
+      document.removeEventListener("keydown", onKeydown, true);
+      backdrop.remove();
+      resolve(result);
+    };
+    // The per-file rows are built before `cleanup` exists, so they reach it
+    // through this rather than capturing an undefined binding.
+    cleanupRef.current = cleanup;
+    const onKeydown = (event) => {
+      if (event.key === "Escape") cleanup(null);
+    };
+    backdrop
+      .querySelector(".app-dialog-confirm")
+      .addEventListener("click", () => cleanup({ files: true, conversation: true }));
+    backdrop
+      .querySelector(".app-dialog-files")
+      .addEventListener("click", () => cleanup({ files: true, conversation: false }));
+    backdrop
+      .querySelector(".app-dialog-conversation")
+      .addEventListener("click", () => cleanup({ files: false, conversation: true }));
+    backdrop.querySelector(".app-dialog-cancel").addEventListener("click", () => cleanup(null));
+    document.addEventListener("keydown", onKeydown, true);
+    backdrop.querySelector(".app-dialog-confirm").focus();
   });
 }
 
@@ -3992,6 +4281,7 @@ async function loadSession(sessionId) {
     currentSessionId = "";
     localStorage.removeItem(lastSessionStorageKey());
     loadPinnedContextFiles("");
+    sessionCheckpoints = [];
     clearChat();
     return;
   }
@@ -4001,6 +4291,7 @@ async function loadSession(sessionId) {
   $("session-select").value = currentSessionId;
   syncSessionListActive();
   loadPinnedContextFiles(currentSessionId);
+  await loadSessionCheckpoints(currentSessionId);
   renderMessages(payload.messages, payload.tasks || []);
   renderContextFiles();
   setChatStatus("Loaded");
@@ -4257,7 +4548,7 @@ async function sendChatPrompt(options = {}) {
     setComposerBusy(true);
     await ensureDesktopApiReady();
     const chatRepo = requireRepo();
-    appendChatMessage("user", prompt);
+    const userMessage = appendChatMessage("user", prompt);
     assistantMessage = appendChatMessage("assistant", "");
     // Cleared here rather than after success: the prompt is already echoed in
     // the log above, and leaving it in the box makes it look unsent.
@@ -4332,6 +4623,13 @@ async function sendChatPrompt(options = {}) {
     );
     if (streamError) throw streamError;
     dismissContextChips();
+    // The checkpoint for this turn exists now, so the turn just sent becomes
+    // rewindable without waiting for a session reload.
+    await loadSessionCheckpoints(currentSessionId);
+    const checkpoint = sessionCheckpoints.find(
+      (entry) => entry.sessionId === currentSessionId && !entry.restoredAtMs,
+    );
+    if (checkpoint) markMessageRewindable(userMessage, checkpoint);
     await loadSessions(currentSessionId, false);
   } catch (error) {
     // A stop is not a failure. Without this every Stop would toast "Failed"

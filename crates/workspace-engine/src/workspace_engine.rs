@@ -1,5 +1,6 @@
 use crate::audit::AuditLog;
 use crate::chat::ChatOrchestrator;
+use crate::checkpoint::CheckpointStore;
 use crate::command_policy::CommandPolicy;
 use crate::command_runner::CommandRunner;
 use crate::config::Config;
@@ -28,6 +29,7 @@ pub struct WorkspaceEngine {
     pub command_runner: CommandRunner,
     pub git: GitService,
     pub patch_engine: PatchEngine,
+    pub checkpoint_store: CheckpointStore,
     pub session_store: SessionStore,
     pub chat_orchestrator: ChatOrchestrator,
     pub patch_store: PatchStore,
@@ -74,6 +76,8 @@ impl WorkspaceEngine {
             scanner.clone(),
             path_policy.clone(),
         );
+        let checkpoint_store =
+            CheckpointStore::new(config.clone(), audit_log.clone(), path_policy.clone());
         let repository_trust = RepositoryTrustStore::new(&config.data_dir);
         let session_store = SessionStore::new(&config.data_dir);
         let patch_store = PatchStore::new(&config.data_dir);
@@ -97,6 +101,7 @@ impl WorkspaceEngine {
             git.clone(),
             patch_engine.clone(),
             patch_store.clone(),
+            checkpoint_store.clone(),
         );
         let edit_orchestrator = EditOrchestrator::new(
             config.clone(),
@@ -107,6 +112,7 @@ impl WorkspaceEngine {
             session_store.clone(),
             patch_engine.clone(),
             patch_store.clone(),
+            checkpoint_store.clone(),
         );
         Self {
             config,
@@ -120,6 +126,7 @@ impl WorkspaceEngine {
             command_runner,
             git,
             patch_engine,
+            checkpoint_store,
             session_store,
             chat_orchestrator,
             patch_store,

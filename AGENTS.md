@@ -69,13 +69,17 @@ Notes:
 
 ## Testing
 
-- 265 tests pass by default: mostly inline `#[test]` modules, plus integration
+- 333 tests pass by default: mostly inline `#[test]` modules, plus integration
   tests in `crates/workspace-engine/tests/`. Add tests next to the code you
   change.
-- Two tests are `#[ignore]`d because they have real side effects (one opens
-  Finder, one spawns a real login shell). Keep that convention: anything that
-  touches the user's desktop or spawns a shell should be `#[ignore]`d with a doc
-  comment saying how to run it manually.
+- Four tests are `#[ignore]`d because they have real side effects: one opens
+  Finder, one spawns a real login shell, one reads your own checkout to measure
+  census cost, and `serves_the_ui_for_manual_inspection` serves the real web UI
+  on port 4899 with a known API token so the desktop UI can be looked at
+  without a Tauri build (its doc comment has the two console lines you need).
+  Keep that convention: anything that touches the user's desktop, spawns a
+  shell, binds a port, or reads their repository should be `#[ignore]`d with a
+  doc comment saying how to run it manually.
 - `DAMAIAN_MOCK_MODEL_RESPONSE="..."` makes model-dependent paths testable with
   no API key and no network. Prefer it over mocking HTTP.
 - `DAMAIAN_DATA_DIR=.damaian` keeps app data inside the workspace instead of

@@ -11,6 +11,7 @@ use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{Manager, Runtime, Url};
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 const SHELL_HOST: &str = "127.0.0.1";
 const PREFERRED_SHELL_PORT: u16 = 4765;
@@ -57,6 +58,27 @@ fn main() {
             }
         })
         .setup(move |app| {
+            // A data directory written by a layout this build cannot read is a
+            // startup error the user has to see. Carrying on would serve an
+            // empty projects list, which reads as data loss and invites
+            // deleting the directory — the one recovery that loses the
+            // sessions. `blocking_show` must not run on the main thread, hence
+            // the thread. See docs/specs/15_install_and_update_verification.md.
+            if let Err(error) = desktop_shell::verify_data_dir_schema() {
+                eprintln!("Damaian cannot use its data directory: {error}");
+                let handle = app.handle().clone();
+                thread::spawn(move || {
+                    handle
+                        .dialog()
+                        .message(&error)
+                        .kind(MessageDialogKind::Error)
+                        .title("Damaian cannot use its data directory")
+                        .blocking_show();
+                    handle.exit(1);
+                });
+                return Ok(());
+            }
+
             let options = shell_options.clone();
             let (ready_tx, ready_rx) = mpsc::channel();
             thread::spawn(move || {

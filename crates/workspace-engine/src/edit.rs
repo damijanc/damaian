@@ -1,9 +1,13 @@
 use crate::audit::AuditLog;
 use crate::cancel::CancelToken;
+use crate::checkpoint::{
+    CheckpointConversation, CheckpointManifest, CheckpointOrigin, CheckpointPath,
+    CheckpointRequest, CheckpointStore,
+};
 use crate::config::Config;
 use crate::context_manager::{ContextItem, ContextManager};
 use crate::error::{ClientError, Result};
-use crate::hash::create_id;
+use crate::hash::{create_id, repository_id_for_root};
 use crate::indexer::ProjectIndexer;
 use crate::model::{ModelAdapter, ModelMessage, ModelRequest, ModelRun};
 use crate::patch_engine::{
@@ -145,6 +149,7 @@ pub struct EditOrchestrator {
     session_store: SessionStore,
     patch_engine: PatchEngine,
     patch_store: PatchStore,
+    checkpoint_store: CheckpointStore,
 }
 
 impl EditOrchestrator {
@@ -160,6 +165,7 @@ impl EditOrchestrator {
         session_store: SessionStore,
         patch_engine: PatchEngine,
         patch_store: PatchStore,
+        checkpoint_store: CheckpointStore,
     ) -> Self {
         Self {
             config,
@@ -170,6 +176,7 @@ impl EditOrchestrator {
             session_store,
             patch_engine,
             patch_store,
+            checkpoint_store,
         }
     }
 
@@ -212,6 +219,8 @@ impl EditOrchestrator {
         let session = self
             .session_store
             .create_session(&index.repository_id, &edit_session_title(prompt))?;
+        // Before the turn's own events, so a rewind takes the prompt with it.
+        let position = self.session_store.latest_event_seq(&session.id)?;
         let mut task = self.session_store.create_task(
             &session.id,
             prompt,
@@ -221,8 +230,36 @@ impl EditOrchestrator {
         task = self
             .session_store
             .update_task_status(&task, TaskStatus::Running, None)?;
-        self.session_store
-            .append_message(&session.id, Some(&task.id), "user", prompt)?;
+        let user_message =
+            self.session_store
+                .append_message(&session.id, Some(&task.id), "user", prompt)?;
+        // Best-effort, as in the chat flow: an edit proposal that cannot be
+        // checkpointed is still worth showing the user.
+        if let Err(error) = self.checkpoint_store.create_checkpoint(
+            repository_root.as_ref(),
+            CheckpointRequest {
+                session_id: &session.id,
+                task_id: Some(&task.id),
+                user_message_id: Some(&user_message.id),
+                summary: &format!("Before: {}", edit_session_title(prompt)),
+                conversation: CheckpointConversation {
+                    last_event_seq: position,
+                    task_status: TaskStatus::Running.as_str().to_string(),
+                },
+                pending_approvals: Vec::new(),
+                paths: Vec::new(),
+            },
+        ) {
+            let _ = self.audit_log.record(
+                "checkpoint_creation_failed",
+                &[
+                    ("actor", "system".to_string()),
+                    ("sessionId", session.id.clone()),
+                    ("taskId", task.id.clone()),
+                    ("error", error.to_string()),
+                ],
+            );
+        }
 
         let context = self.context_manager.build_context(
             repository_root.as_ref(),
@@ -353,14 +390,25 @@ impl EditOrchestrator {
         allow_generated_secrets: bool,
     ) -> Result<PatchApplyResult> {
         let patch = self.patch_store.load(patch_id)?;
+        // Snapshot the target files before they are written, not after. This
+        // one is not best-effort: a rewind that silently lost the pre-apply
+        // content would be worse than an apply that says it could not snapshot.
+        let checkpoint = self.checkpoint_for_patch(&repository_root, &patch, approved_paths)?;
         let result = self.patch_engine.apply_patch(
-            repository_root,
+            &repository_root,
             &patch,
             approved_paths,
             hunk_selection,
             approved_by,
             allow_generated_secrets,
         )?;
+        // Sealing records what the apply left on disk, which is what a later
+        // rewind compares against before it overwrites anything.
+        if let Some(manifest) = checkpoint {
+            let _ = self
+                .checkpoint_store
+                .seal_checkpoint(&repository_root, &manifest);
+        }
         self.audit_log.record(
             "stored_patch_applied",
             &[
@@ -377,6 +425,42 @@ impl EditOrchestrator {
             ],
         )?;
         Ok(result)
+    }
+
+    /// Adds the patch's selected files to the checkpoint of the turn that
+    /// proposed it, snapshotting each as it is now. Returns `None` when the
+    /// patch has no turn to attach to — a patch created outside a session, or
+    /// one whose checkpoint could not be found.
+    fn checkpoint_for_patch(
+        &self,
+        repository_root: impl AsRef<Path>,
+        patch: &crate::patch_engine::ProposedPatch,
+        approved_paths: Option<&[String]>,
+    ) -> Result<Option<CheckpointManifest>> {
+        let Some(task_id) = patch.task_id.as_deref() else {
+            return Ok(None);
+        };
+        let repository_id = repository_id_for_root(repository_root.as_ref());
+        let Some(manifest) = self
+            .checkpoint_store
+            .read_checkpoint_for_task(&repository_id, task_id)?
+        else {
+            return Ok(None);
+        };
+        let paths = patch
+            .files
+            .iter()
+            .filter(|file| approved_paths.is_none_or(|paths| paths.contains(&file.path)))
+            .map(|file| CheckpointPath {
+                path: file.path.clone(),
+                origin: CheckpointOrigin::Patch,
+            })
+            .collect::<Vec<_>>();
+        Ok(Some(self.checkpoint_store.add_paths(
+            repository_root,
+            &manifest,
+            paths,
+        )?))
     }
 
     pub fn rollback_stored_patch(

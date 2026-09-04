@@ -1,6 +1,9 @@
 # Feature Spec: Install and Update Verification
 
-Status: Not started
+Status: Partially done, remainder skipped. The data-directory schema version
+(§5.2, §5.3) shipped; the updater fixture tests, the update rehearsal, the
+Keychain measurement, the documentation rewrite, and the second-person install
+were skipped as verified in practice. See §7.
 Order: 15 of 15
 Roadmap: `docs/ROADMAP/00b_phase_0_distributable_build.md`, Phase 0, Work
 Package 2 (Must). That directory is local-only and not committed, so the
@@ -314,18 +317,97 @@ a matching application version rather than to delete the directory).
 
 ## 7. Implementation Notes
 
-To be completed during implementation. This work package is not done until the
-following are filled in with actual results, not intentions:
+Partially implemented 2026-09-04, and the remainder deliberately skipped. What
+follows is the record of what actually ran, not what was intended.
 
-- **Updater rejection**: outcome of each fixture case, and of the `#[ignore]`d
-  end-to-end run.
-- **Update rehearsal**: previous version, new version, what was present in the
-  data directory before, what was present after.
-- **Keychain prompts**: count per launch across three cold launches, and which
-  branch of §5.5 that puts the project on.
-- **Second-person install**: who, what hardware and macOS version, whether they
-  needed any workaround, and where they got stuck if they did.
+### Implemented: the data directory schema version (§5.2, §5.3)
 
-The last one is the exit condition for Phase 0. An install that "worked, but they
-had to right-click Open" is a failure of this work package, not a caveat on a
-success.
+New `crates/workspace-engine/src/data_schema.rs` writes and reads
+`<data_dir>/schema.conf` (`schema_version=1`, the same flat `key=value` format
+as `config/user.conf`) and implements the table in §5.2:
+
+| Marker state | Behaviour |
+|---|---|
+| Missing, directory empty or absent | Created, marker written, `Initialized` |
+| Missing, directory has content | Adopted as version 1, marker written, `Adopted` |
+| Equal to the current version | `Current`, nothing written |
+| Older | `migrate()` (no boundary exists yet) then marker rewritten, `Upgraded` |
+| Newer, `0`, or unparsable | Refused. Nothing created, modified, or deleted |
+
+Two deviations from the design, both deliberate:
+
+1. **`schema_version=0` is refused rather than treated as older.** §5.2 says
+   "older than the current version" migrates, but no build ever wrote `0`, so a
+   `0` marker is a corrupt or hand-edited file, not an old install. Refusing is
+   consistent with the unparsable case.
+2. **The refusal is surfaced as a native error dialog, not a page in the web
+   UI.** The shell is what would serve an error page, and the shell is what
+   refuses to start, so there is nothing to serve it from. `desktop-app`'s
+   `setup` calls `desktop_shell::verify_data_dir_schema()` before it spawns the
+   shell thread and, on refusal, shows a `MessageDialogKind::Error` dialog
+   naming the path and both versions, then exits. The dialog is shown from a
+   spawned thread because `blocking_show` must not run on the main thread.
+
+Wired into all three entry points, so no front end can write over data it does
+not understand: `desktop_shell::run_server_with_ready` (before it binds the
+port), `damaian-cli`'s `main` (before any command runs), and `desktop-app`'s
+`setup` (before the shell starts).
+
+Twelve tests, written before the code:
+
+- `crates/workspace-engine/tests/data_schema.rs` — the four §5.3 cases plus
+  first run. The load-bearing assertion is the before-and-after snapshot of
+  every path, length, and mtime under the directory: a refusal that still
+  writes is not a refusal.
+- `crates/workspace-engine/src/data_schema.rs` inline tests — marker parsing,
+  including a commented-out and an absent version.
+- `crates/desktop-shell/src/lib.rs` — startup refuses a `999` directory naming
+  the path and the version found, and marks a fresh one.
+- `crates/damaian-cli/tests/data_schema_refusal.rs` — the built binary exits
+  non-zero with the refusal on stderr, and marks a fresh directory. This one
+  runs the real binary, so it also proves the wiring, not just the module.
+
+The quality gate passes: `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings`,
+`cargo test --workspace --locked`, `npm run lint:web`, and `cargo deny check`.
+
+Not verified: the desktop-app dialog itself. The refusal it displays is tested,
+the display path is not — it needs a packaged build launched by hand against a
+`schema_version=999` directory.
+
+### Skipped
+
+Skipped on the maintainer's decision, 2026-09-04, on the grounds that install
+and update work as expected in practice. Each is a real gap, listed so a later
+phase can pick it up rather than assume it was covered:
+
+- **Requirements 1, 2 — updater rejection fixtures.** No Node test file, no
+  committed fixtures, and no `#[ignore]`d end-to-end test. The pipeline's
+  `scripts/verify-updater-signature.mjs` was exercised by hand against a
+  throwaway keypair during [spec 14](14_developer_id_signing_and_notarization.md)
+  (its §7 records the happy path plus five rejections, including a wrong key, a
+  bundle modified after signing, and a malformed base64 blob), so the behaviour
+  is evidenced — but nothing runs it in CI, so a pipeline change that ships an
+  unverifiable artifact is still undetected.
+- **Requirement 6 — the update rehearsal.** Not run. No recorded evidence that
+  sessions, config, and the `keychain:` reference survive an in-app update
+  across a version boundary.
+- **Requirement 7 — the Keychain prompt count.** Not measured as three cold
+  launches under this spec. Spec 14 §7 records the outcome from the first stable
+  release: with a stable Developer ID identity, clicking **Always Allow** once
+  makes the grant persist and later launches prompt zero times, and the first
+  launch after any identity change still prompts. That puts the project on the
+  first branch of §5.5 — the ad-hoc explanation held — on spec 14's evidence
+  rather than this spec's.
+- **Requirements 8, 9 — the documentation rewrite.**
+  `docs/MACOS_INSTALLATION.md` still leads with the `Open Anyway` /
+  `xattr -dr com.apple.quarantine` workaround and still lists ad-hoc signing
+  under `Current Limitations`, and `AGENTS.md`'s Gatekeeper trap still says a
+  packaged build refusing to launch is expected. Both were true of every
+  artifact before v0.31.0 and are wrong for a signed stable build. This is the
+  cheapest outstanding item and the one most likely to cause harm, because it
+  trains an agent to dismiss a real Gatekeeper regression.
+- **Requirement 10 — the second-person install.** Not done, so Phase 0's exit
+  condition is not evidenced. v0.31.0 was installed and checked on a real
+  machine with no `xattr` command and no Gatekeeper override (spec 14 §7), but
+  that machine was the author's.

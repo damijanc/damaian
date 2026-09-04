@@ -1,6 +1,9 @@
 # Feature Spec: Session Checkpoints and Rewind
 
-Status: Not started
+Status: Done. Every requirement, acceptance criterion, and design section is
+implemented and tested, the storage bound and census cost are measured, and the
+UI has been driven by hand. See §7 for the deviations from the design above and
+the defects the verification pass found.
 Order: 16 of 19
 Roadmap: `docs/ROADMAP/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 1 (Must). That directory is local-only and not committed, so the
@@ -222,15 +225,22 @@ consistently.
   "conversation": { "lastEventSeq": 412, "taskStatus": "waiting_for_approval" },
   "pendingApprovals": [{ "kind": "command", "proposalId": "cmdprop_..." }],
   "treeOid": "…",
+  "commandEffectsCovered": true,
   "files": [
     { "path": "src/upload.rs", "hash": "…", "existed": true, "oid": "…",
-      "origin": "patch" },
+      "origin": "patch", "mode": 33188,
+      "expectedHash": "…", "expectedExisted": true },
     { "path": "src/generated.rs", "hash": null, "existed": false,
-      "origin": "command" }
+      "origin": "command", "mode": 33188,
+      "expectedHash": "…", "expectedExisted": true }
   ],
   "excluded": [{ "path": ".env", "reason": "restricted_pattern" }]
 }
 ```
+
+`mode` carries the executable bit: a script restored without it no longer runs.
+`expectedHash` and `expectedExisted` are written when the checkpoint is sealed,
+and are what restore compares against — see §5.6.
 
 `existed: false` with a null hash is the create-then-delete case, carried over
 from `RollbackSnapshot.existed` rather than invented. `origin` is what makes
@@ -246,12 +256,26 @@ Requirement 3's command coverage needs information nothing currently collects.
 Take a working-tree census immediately before and after each approved command:
 
 ```sh
-git status --porcelain=v1 --untracked-files=all
+git --no-optional-locks -C <repo> status --porcelain=v1 --untracked-files=all -z
 ```
 
-Run it through the same shadow `GIT_DIR`, hash the paths it reports as modified
-or untracked, and diff the two censuses. Paths that appear, disappear, or change
-hash are the command's file effects, recorded with `origin: "command"`.
+This runs in the user's own repository rather than through the shadow `GIT_DIR`:
+through the shadow store every file reads as untracked, so a census would cover
+the whole tree on every approved command. `--no-optional-locks` is what keeps it
+read-only — without it `git status` may refresh and rewrite the user's index.
+Hash the paths it reports as modified or untracked, and diff the two censuses.
+Paths that appear, disappear, or change hash are the command's file effects,
+recorded with `origin: "command"`.
+
+The census also snapshots the content of the paths it covers *before* the
+command runs, because afterwards the pre-command bytes are gone. For a path that
+was already dirty, that snapshot is the only copy. For a path that was committed
+and clean — a formatter rewriting tracked files, the most common case — the
+pre-command content is read out of the user's own Git objects with
+`git --no-optional-locks -C <repo> cat-file blob HEAD:<path>`. That narrows
+§5.1's boundary from "never read" to **never write, never lock, never change a
+ref or the index**: the alternative was leaving `cargo fmt` uncoverable, which
+would make rewind useless for the case users hit most.
 
 Bounds, because this runs on every approved command:
 
@@ -259,11 +283,13 @@ Bounds, because this runs on every approved command:
   hashed. Everything else is not censused at all.
 - The census records paths and hashes, not content. Content is snapshotted only
   for paths that actually changed.
-- A repository whose census exceeds a configured path ceiling records
-  `origin: "command_uncensused"` for the turn and reports in the UI that command
-  effects are not covered for this repository, rather than silently covering
-  some of them. A checkpoint that claims coverage it does not have is worse than
-  one that admits the gap.
+- A repository whose census exceeds `checkpoint_census_max_paths` records
+  `commandEffectsCovered: false` on the manifest and reports in the UI that
+  command effects are not covered for this repository, rather than silently
+  covering some of them. A checkpoint that claims coverage it does not have is
+  worse than one that admits the gap. This is a per-turn fact, so it lives on
+  the manifest rather than as an `origin` on a path that would have no content
+  behind it.
 
 This is honest about a real limit: a command that changes a file *and* a user
 who edits a file during the same command produce one census diff, and Damaian
@@ -318,15 +344,33 @@ Deliberately shaped like `PatchRollbackResult` (`patch_engine.rs:50`), with
 `warnings`, which makes "the file was changed under you" indistinguishable from
 "there was nothing to do".
 
-Per file, restore compares the file's current hash against the manifest hash:
+Per file, restore compares the file's current state against what Damaian last
+left there, which is not the same as what the checkpoint captured. The
+checkpoint's `hash` is the *pre-turn* content; after the turn the file holds the
+agent's content, so comparing against `hash` would report every agent change as
+a conflict. The checkpoint is therefore **sealed** when its turn finishes,
+recording `expectedHash` and `expectedExisted` per file — exactly why
+`RollbackSnapshot::applied_hash` exists (`patch_engine.rs:71-77`).
 
 | Current state | Action |
 |---|---|
-| Matches manifest hash | Restore, or delete when `existed: false` |
-| File absent, manifest says it existed | Restore |
-| Differs from manifest hash | Conflict. Do not write. Report the path |
-| Absent, manifest says it did not exist | Nothing to do. Skipped |
+| Matches what the turn left (`expectedHash`) | Restore, or delete when `existed: false` |
+| File absent, and the turn left content there | Restore |
+| Differs from what the turn left | Conflict. Do not write. Report the path |
+| Absent, and the turn left nothing | Nothing to do. Skipped |
+| Present, and the turn left nothing there | Conflict: it cannot be attributed, so it is not deleted |
 | Excluded by policy at restore time | Skipped, with the policy reason |
+
+An unsealed checkpoint — its turn never ran, or crashed — expects the captured
+state instead, so it refuses anything that has changed since. That is the
+conservative direction: it declines to delete a file it cannot attribute rather
+than removing one the user wrote.
+
+A restore updates `expectedHash` and `expectedExisted` for the files it put
+back, because what Damaian last left at those paths is now the checkpoint's own
+content. Rewinding one file and then the whole turn is an ordinary thing to do,
+and without this the second rewind would report the first file as a conflict
+with a change Damaian itself made.
 
 Conflicts are reported as a set before anything is written, and restore is
 all-or-nothing per invocation for the non-conflicting files: partial writes with
@@ -343,7 +387,15 @@ the shadow store so orphaned blobs go with them.
 
 Cleanup never deletes the newest checkpoint of a session that is still active,
 regardless of age — the one a user is most likely to want is the one a
-time-based rule would remove during a long session.
+time-based rule would remove during a long session. Which session is active is
+the caller's knowledge, so it is passed in: `cleanup(repository_id,
+active_session_id)`.
+
+All three keys are **forbidden at repository scope**, per
+[spec 34](34_repository_config_trust_boundary.md). They look like budgets, but a
+cloned repository that set `checkpoint_retention_days=0` would destroy the
+user's own recovery data for that repository, which is a capability repository
+config does not get.
 
 ### 5.8 Migration of existing rollbacks
 
@@ -357,7 +409,10 @@ which is cheaper and lower-risk than a migration that must handle the flattened
 ### 5.9 UI
 
 A `Rewind` control on each user turn, offering: files only, conversation only,
-or both. The confirmation names the file count and the turn, lists conflicts if
+or both. The dialog also lists the paths the checkpoint covers, each with its
+origin and a `Restore this file` action — requirement 5's fourth operation is
+the same request with the file half narrowed to one path, not a fourth code
+path. The confirmation names the file count and the turn, lists conflicts if
 any, and carries one line stating that checkpoints cover Damaian's own changes
 to this repository and are not a substitute for Git or for a commit.
 
@@ -405,12 +460,224 @@ is not safe to share.
 
 ## 7. Implementation Notes
 
-To be completed during implementation. Record:
+In progress. Implemented 2026-09-04 in `workspace-engine`, with 42 new tests.
+What follows is the record of what exists, what changed from the design above,
+and what is not done.
 
-- Whether the shadow-Git store was used, or the SHA-256 fallback and why.
-- The measured storage bound for the 100-turn fixture, and the repository size
-  it was measured against.
-- The census path ceiling chosen for §5.4, and the measured cost of a census on
-  a mid-sized repository.
-- Whether patch rollback's capture was switched to faithful content in this
-  change, per §5.2, or deferred with a reason.
+### Implemented
+
+- **Store (§5.1): shadow Git, as designed.** The SHA-256 fallback was not
+  needed. `crates/workspace-engine/src/checkpoint.rs` runs git with
+  `--git-dir` pointed at `<data_dir>/checkpoints/<repository_id>/objects` and
+  writes blobs with `hash-object -w --stdin`, trees through a store-local
+  `GIT_INDEX_FILE`, and one commit plus a `refs/damaian/checkpoints/<id>` ref
+  per checkpoint. The ref is load-bearing: `git gc --prune=now` would otherwise
+  collect every checkpoint's content, since all of it is unreachable by
+  construction. Two tests hold that line —
+  `garbage_collection_keeps_referenced_objects_and_drops_orphans` and
+  `cleanup_collects_dropped_content_and_leaves_live_checkpoints_restorable`.
+- **Faithful capture (§5.2).** Content is stored as-is, asserted with a seeded
+  fake AWS key that the scanner does detect, and the manifest is asserted *not*
+  to contain it. Patch rollback was switched in the same change, as §5.2 asks:
+  `RollbackSnapshot.content` is no longer redacted, and the
+  "contained secrets that were redacted before rollback capture" warning is
+  gone with its cause. Two `foundation.rs` tests that asserted the old
+  behaviour now assert the new one.
+- **Manifest (§5.3), census (§5.4), rewind (§5.5), restore (§5.6), retention
+  (§5.7).** All present, with the deviations below.
+- **`seq` on session events (§5.5).** Every appended event carries a monotonic
+  `seq`; events written before the field are numbered by line order, so no
+  existing session is rewritten. `read_messages` and `read_task_statuses` treat
+  events after the newest `conversation_rewound` marker as inert. Spec 17 gets
+  this for free.
+- **Rollback compatibility (requirement 14).** `<data_dir>/rollback/<patch_id>/`
+  is untouched and `rollback_patch` still works; the existing rollback tests
+  cover it.
+
+### Deviations from the design above
+
+Each is written into §5 as well, so the spec and the code agree.
+
+1. **Checkpoints are sealed after their turn.** §5.6's table compared the file's
+   current hash against the manifest hash, which is the *pre-turn* content — so
+   every agent change would have been reported as a conflict and restore would
+   never have worked. `seal_checkpoint` records `expectedHash` and
+   `expectedExisted` per file when the turn finishes, and restore compares
+   against those. This is the same reason `RollbackSnapshot::applied_hash`
+   exists. An unsealed checkpoint expects the captured state and refuses
+   anything else, which is what makes
+   `a_file_that_appeared_without_a_recorded_agent_action_is_not_deleted` pass.
+2. **The census runs in the user's repository, not through the shadow
+   `GIT_DIR`,** because through the shadow store every file reads as untracked
+   and a census would cover the whole tree on every approved command.
+   `--no-optional-locks` keeps it read-only, asserted by
+   `the_census_does_not_write_to_the_users_git_directory`.
+3. **Pre-command content of a clean file is read from the user's Git objects.**
+   `git --no-optional-locks -C <repo> cat-file blob HEAD:<path>`. Decided with
+   the maintainer: the alternative left a formatter rewriting committed files —
+   the most common command effect there is — uncoverable. §5.1's boundary is now
+   "never write, never lock, never change a ref or the index".
+4. **`commandEffectsCovered` on the manifest replaces
+   `origin: "command_uncensused"`.** Coverage is a per-turn fact, and the
+   `origin` form would have needed a path with no content behind it.
+5. **`mode` per file.** §5.3's JSON has no mode; a script restored without its
+   executable bit no longer runs.
+6. **The three new config keys are forbidden at repository scope** rather than
+   free like `audit_retention_days`, because a cloned repository setting
+   `checkpoint_retention_days=0` would destroy the user's recovery data.
+7. **`cleanup` takes the active session id.** "Still active" is the caller's
+   knowledge, not something the store can infer from a manifest.
+
+### Wiring, UI, and documentation
+
+- **A checkpoint per turn (requirement 1).** `ChatOrchestrator::ask_with_session_with_options`
+  and `EditOrchestrator::propose_edit` take one before the turn's own events, so
+  the conversation position it records is the one *before* the user's prompt: a
+  rewind takes the prompt with it rather than leaving a question the
+  conversation no longer answers.
+- **Patch paths (requirement 3).** `EditOrchestrator::apply_stored_patch` adds
+  the selected files to the turn's checkpoint *before* `apply_patch` writes
+  anything, then seals. Both the desktop route and the CLI go through that one
+  method, so neither can apply a patch without a snapshot.
+- **Command effects (requirement 3).** The approved-command path in
+  `resume_after_command_decision_with_options` takes a census before
+  `run_proposal` and records the diff after. Auto-run sandbox commands are not
+  censused: §5.4 scopes this to approved commands, and censusing every
+  read-only command would cost a `git status` and a hash per command.
+- **Sealing.** At the end of a turn that is not waiting on a command decision,
+  on a cancelled turn, and after a patch apply.
+- **Retention.** Runs at turn start, and only pays for `git gc` when something
+  actually expired.
+- **UI (§5.9).** Each of the user's messages carries a `Rewind` control offering
+  files, conversation, or both. The dialog names the file count, says when paths
+  were excluded by policy or command effects are not covered, and carries
+  requirement 11's line: checkpoints are session recovery, not version control,
+  and no substitute for a commit. A conflict is reported as a dialog saying
+  nothing was restored and why.
+- **Routes.** `GET /api/checkpoints` (optionally filtered by session) and
+  `POST /api/rewind`, both behind the existing API token. `checkpoint_list_json`
+  deliberately has no content field, with a test that pins the shape.
+- **Documentation (§5.10).** `docs/USER_GUIDE.md` gains a `Rewind` section
+  covering what is and is not restored, the conflict rule, and the
+  not-version-control statement. `docs/TROUBLESHOOTING.md` gains the checkpoint
+  paths, a `Checkpoints and rewind` section keyed to the questions a user
+  actually arrives with, and a `What is not safe to share` subsection naming the
+  checkpoint store and `rollback/` as holding unredacted content.
+
+### Measurements
+
+- **Requirement 15's bound: 238 KB** for a 100-turn session over three ~9 KB
+  source files, each turn changing every file
+  (`a_hundred_turn_session_stays_within_its_documented_storage_bound`). The
+  uncompressed content across those turns is ~2.7 MB; zlib on near-identical
+  sources plus shared blobs is the difference. The test asserts under 8 MiB, as
+  a regression guard on the order of magnitude rather than a benchmark.
+- **Census cost: 69 ms for 26 changed paths (~1.5 MB)** on this repository, in a
+  release build (`measures_census_cost_on_this_repository`, `#[ignore]`d because
+  it reads the developer's own checkout). `git status --porcelain -uall` is 17 ms
+  of that; the rest is hashing and blob writing, so the cost tracks bytes rather
+  than path count. A debug build measures 3.7 s for the same census, almost all
+  of it the hand-rolled SHA-256 in `hash.rs` — worth knowing before anyone
+  benchmarks this without `--release`.
+
+  Two things came out of the measurement:
+
+  - **The census now writes its blobs in one `git hash-object -w --no-filters
+    --stdin-paths` call** instead of a process per file, which is what took
+    270 ms down to 69 ms. `--no-filters` is load-bearing: given paths rather
+    than bytes, git would otherwise apply the repository's `.gitattributes`
+    clean filters and store its idea of the file instead of the user's.
+    `a_census_stores_bytes_faithfully_including_crlf_and_binary` guards it.
+  - **`checkpoint_census_max_paths` dropped from 5000 to 1000.** At the measured
+    ~2.7 ms per path, and with the census running twice per approved command,
+    5000 paths would have meant roughly 26 seconds of latency on an approved
+    command — which a user reads as a hang, not as coverage. 1000 caps it near
+    five seconds. A repository with more than 1000 changed paths is told its
+    command effects are not covered, which is the honest trade.
+
+### Further deviations found while wiring
+
+8. **Damaian's own data directory is excluded from checkpoint scope.** Found by
+   a wiring test: with `DAMAIAN_DATA_DIR` inside the repository — the documented
+   development setup — the census covered `.damaian/audit/events.jsonl`, so a
+   rewind would have rolled back Damaian's own audit log, sessions, and
+   checkpoint store. Excluded with reason `damaian_data_directory`.
+9. **Checkpoint creation is best-effort; snapshotting before a patch apply is
+   not.** A store that cannot be written records `checkpoint_creation_failed` in
+   the audit log and the turn still runs, because refusing to answer at all is a
+   worse failure than losing the ability to rewind one turn. `add_paths` before
+   an apply propagates instead: a rewind that silently lost the pre-apply
+   content would be worse than an apply that says it could not snapshot.
+10. **A repository that is not a git checkout leaves command effects
+    uncovered** (`CommandCensus::unavailable`) rather than failing the turn.
+
+### Second pass: symlinks, pending approvals, single-file restore
+
+- **Symlink escape (§6), asserted.** Two tests: a symlink inside the repository
+  pointing out of it is recorded as `outside_repository` and never snapshotted,
+  and a path that has *become* such a link by restore time is skipped rather
+  than written through. Both passed the moment they were written — the boundary
+  was already `resolve_for_write`'s — so this closed a missing assertion, not a
+  defect.
+- **`pendingApprovals` (requirement 2).** Recorded when a turn pauses on a
+  command, an MCP tool call, or a browser diagnostic, and cleared when the turn
+  resumes, so a checkpoint never describes a pause that has already ended.
+- **Single-file restore (requirement 5).** `GET /api/checkpoints` now carries
+  the covered paths and their origins — paths only, no hashes and no content —
+  and the rewind dialog offers `Restore this file` per path. The `POST /api/rewind`
+  `path` parameter is covered end to end by the HTTP test.
+
+Two defects came out of writing those tests, both now fixed and covered:
+
+1. **Rewinding the same checkpoint twice conflicted with itself.** Restoring one
+   file left `expectedHash` describing the pre-rewind state, so the next rewind
+   of the same checkpoint reported that file as changed under it — by Damaian's
+   own hand. Restore now records what it left. See §5.6.
+2. **The desktop-shell HTTP tests were writing into the user's real data
+   directory.** They pinned `data_dir` through repository config, which
+   [spec 34](34_repository_config_trust_boundary.md) made forbidden — so the
+   pin silently did nothing and every run wrote sessions, patches, and
+   checkpoints into `~/Library/Application Support/DamaianClient`. The test
+   module now sets `DAMAIAN_DATA_DIR` once per test binary. This predates this
+   spec and also affected the existing apply-patch endpoint test.
+
+### Visual verification
+
+The UI was driven in a browser, not just compiled. The web UI takes its API
+token from the Tauri bootstrap, so a browser cannot otherwise authenticate and a
+full Tauri build is minutes — so `serves_the_ui_for_manual_inspection`
+(`#[ignore]`d, in `desktop-shell`) serves the real assets on port 4899 with a
+known token, seeded with a session whose turn covers a patch-origin and a
+command-origin file. Its doc comment carries the two console lines that finish
+the setup.
+
+Confirmed by hand against that harness: the `Rewind` control under a user turn;
+the dialog with its file rows, origins, and footnote; `Restore this file` for
+one path (`upload.rs` back to its pre-turn content, `retry.rs` left as the turn
+left it); the conflict notice after hand-editing a covered file, with nothing
+written; and `Files and conversation`, which put both files back, emptied the
+active conversation, and appended `conversation_rewound` at `seq` 5 while every
+earlier event stayed in the log.
+
+Three defects the pass found, all fixed:
+
+1. **The four dialog buttons wrapped onto two lines** at `.app-dialog-wide`'s
+   520px. The rewind dialog gets its own 640px width.
+2. **The rewind row's label stranded itself on the far left** of the column,
+   under a right-aligned user bubble. The row is now right-aligned.
+3. **"Resolve those by hand" for a single conflicted file.** Now `it` or `them`
+   to match the count.
+
+### The checkpoint list view
+
+Added as a `Checkpoints` page in the Settings shell's nav, under a new `Session`
+group — the only tab-like surface in the app, and the maintainer's call. It
+lists the repository's checkpoints newest first with time, summary, file count,
+session title, whether it has been rewound to, and any coverage gap (`command
+effects not covered`, `N paths excluded by policy`), each row carrying the same
+rewind dialog. Session titles come from `/api/sessions`, so a row names the
+conversation rather than a session id.
+
+Driven by hand in the same harness: the page renders, the row's `Rewind` opens
+the dialog, `Files and conversation` restored both files and emptied the
+conversation, and the row came back marked `rewound to already`.

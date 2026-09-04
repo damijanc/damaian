@@ -90,6 +90,28 @@ From the CLI, `damaian apply-patch` prints the same findings and re-runs with `-
 
 After files are applied, Damaian prints a concise Git status summary in the conversation.
 
+## Rewind
+
+Damaian takes a checkpoint before every turn, so a turn that went the wrong way can be undone in one action. Each of your messages in the conversation carries a `Rewind` control, which offers three choices:
+
+- **Files and conversation** — puts back the files Damaian changed in that turn and moves the conversation to just before your message.
+- **Files only** — restores the files and leaves the conversation as it is.
+- **Conversation only** — moves the conversation back and leaves your files alone.
+
+What a checkpoint covers is what Damaian itself changed in that turn: files from patches you applied, and files an approved command created, modified, or deleted. Files you edited yourself are not covered.
+
+Some things are deliberately left out, and the dialog says so before you confirm:
+
+- Paths excluded by policy — `.env` and anything else matching `restricted_patterns` — are never snapshotted and never restored.
+- Files an approved command changed are not covered when the repository is not a Git checkout, or when its working tree is larger than `checkpoint_census_max_paths`.
+- Effects that are not files — a pushed commit, a network call, a database write, container state — cannot be undone by a rewind.
+
+If a file changed after the turn ran, the rewind stops and restores nothing. That is deliberate: Damaian cannot tell your later edit from the agent's change, so it reports the conflict and leaves everything alone rather than overwriting work it does not understand. Resolve the file by hand, or rewind the conversation only.
+
+A rewind never rewrites history you can audit. The conversation moves back by appending a marker, so the full session log — including the messages that left the conversation — is still there.
+
+**Checkpoints are session recovery, not version control.** They cover Damaian's own changes to one repository, they expire (`checkpoint_retention_days`, 90 days by default), and they are no substitute for a commit. Commit anything you would be unhappy to lose.
+
 ## Settings
 
 Use the `Settings` tab to inspect and edit user configuration values, then select `Load`.
@@ -222,6 +244,8 @@ DAMAIAN_DATA_DIR=~/.damaian
 ```
 
 Repository-scoped config remains separate and lives at `.damaian/config.conf` inside the selected repository.
+
+Two parts of that directory hold copies of your files exactly as they were, credentials included, because their job is to put a file back byte for byte: `checkpoints/` (session checkpoints) and `rollback/` (patch rollback). They never leave your machine, and they are not safe to attach to a bug report. Session logs hold your prompts and file content, so the same applies to them.
 
 ## Safety Model
 

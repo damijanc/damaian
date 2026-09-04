@@ -1,10 +1,12 @@
 pub mod audit;
 pub mod cancel;
 pub mod chat;
+pub mod checkpoint;
 pub mod command_policy;
 pub mod command_runner;
 pub mod config;
 pub mod context_manager;
+pub mod data_schema;
 pub mod diff;
 pub mod edit;
 pub mod embeddings;
@@ -35,6 +37,11 @@ pub use chat::{
     AgentCommandProposal, AgentPatchProposal, ChatOrchestrator, ChatTurnOptions, ChatTurnResult,
     McpTokenResolver, PhaseKind, ResumeDecisionOptions, TurnPhase, TurnProgress, TurnSink,
 };
+pub use checkpoint::{
+    CheckpointConversation, CheckpointExclusion, CheckpointFile, CheckpointManifest,
+    CheckpointOrigin, CheckpointPath, CheckpointRequest, CheckpointRestoreOptions,
+    CheckpointRestoreResult, CheckpointStore, CommandCensus, PendingApproval,
+};
 pub use command_policy::{
     CommandClassification, CommandPolicy, CommandRisk, allow_always_eligible,
 };
@@ -46,6 +53,9 @@ pub use config::{
     normalize_model_provider, normalize_model_reasoning_level, parse_mcp_transport,
 };
 pub use context_manager::{ContextItem, ContextManager, ContextPlan};
+pub use data_schema::{
+    CURRENT_DATA_SCHEMA_VERSION, DataSchemaError, DataSchemaOutcome, ensure_data_dir_schema,
+};
 pub use diff::{DiffLine, Hunk, create_unified_diff, diff_file, reconstruct_content};
 pub use edit::{
     EditOrchestrator, EditProposalResult, GeneratedEdit, PatchStore, parse_generated_edit,

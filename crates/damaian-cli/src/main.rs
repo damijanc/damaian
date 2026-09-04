@@ -2,10 +2,10 @@ use std::env;
 use std::io::IsTerminal;
 use std::path::Path;
 use workspace_engine::{
-    CommandProposal, CommandRisk, Config, ConfigOverlay, ConfigScope, CurlModelTransport,
-    MockModelAdapter, OpenAICompatibleAdapter, SearchResult, WorkspaceEngine,
-    command_approval_prompt, parse_hunk_selection, patch_diff_text, patch_hunk_summary,
-    render_markdown_to_ansi,
+    CURRENT_DATA_SCHEMA_VERSION, CommandProposal, CommandRisk, Config, ConfigOverlay, ConfigScope,
+    CurlModelTransport, DataSchemaOutcome, MockModelAdapter, OpenAICompatibleAdapter, SearchResult,
+    WorkspaceEngine, command_approval_prompt, ensure_data_dir_schema, parse_hunk_selection,
+    patch_diff_text, patch_hunk_summary, render_markdown_to_ansi,
 };
 
 fn usage() -> &'static str {
@@ -39,10 +39,32 @@ fn usage() -> &'static str {
 }
 
 fn main() {
+    // Before any command touches the data directory: a directory written by a
+    // layout this build does not understand is refused, not written over.
+    if let Err(error) = verify_data_dir_schema() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
     if let Err(error) = run() {
         eprintln!("{error}");
         std::process::exit(1);
     }
+}
+
+fn verify_data_dir_schema() -> std::result::Result<(), String> {
+    let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
+    match ensure_data_dir_schema(&config.data_dir).map_err(|error| error.to_string())? {
+        DataSchemaOutcome::Adopted => eprintln!(
+            "Data directory {} adopted at schema version {CURRENT_DATA_SCHEMA_VERSION}",
+            config.data_dir.display()
+        ),
+        DataSchemaOutcome::Upgraded { from } => eprintln!(
+            "Data directory {} migrated from schema version {from} to {CURRENT_DATA_SCHEMA_VERSION}",
+            config.data_dir.display()
+        ),
+        DataSchemaOutcome::Initialized | DataSchemaOutcome::Current => {}
+    }
+    Ok(())
 }
 
 fn run() -> workspace_engine::Result<()> {

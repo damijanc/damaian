@@ -1684,6 +1684,25 @@ button:disabled {
   top: 12px;
 }
 
+/* Rewind: a circle with the arrow of a step backwards, drawn in CSS like every
+   other icon in this nav rather than pulling in an icon set. */
+.rewind-icon {
+  border: 2px solid currentColor;
+  border-radius: 50%;
+}
+
+.rewind-icon::before {
+  position: absolute;
+  top: 3px;
+  left: 6px;
+  width: 5px;
+  height: 5px;
+  border-top: 2px solid currentColor;
+  border-left: 2px solid currentColor;
+  transform: rotate(-45deg);
+  content: "";
+}
+
 .keyboard-icon {
   border: 2px solid currentColor;
   border-radius: 3px;
@@ -2327,6 +2346,61 @@ button:disabled {
   width: min(520px, calc(100vw - 32px));
 }
 
+/* One row per checkpoint in the Settings > Checkpoints list. */
+.checkpoint-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.checkpoint-row:last-child {
+  border-bottom: 0;
+}
+
+.checkpoint-row-summary {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.checkpoint-row-meta {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.checkpoint-row-warning {
+  margin: 2px 0 0;
+  color: var(--warn);
+  font-size: 12px;
+}
+
+.checkpoint-row-action {
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 4px 12px;
+  font-size: 12px;
+}
+
+.checkpoint-list-empty {
+  margin: 0;
+  padding: 10px 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* Four choices — cancel, conversation, files, both — need more room than
+   `.app-dialog-wide`: at 520px the two longest labels wrap onto a second line.
+   Declared after it so it wins at equal specificity. */
+.app-dialog-rewind {
+  width: min(640px, calc(100vw - 32px));
+}
+
 .app-dialog-checklist {
   display: grid;
   gap: 6px;
@@ -2372,6 +2446,54 @@ button:disabled {
   margin: 0;
   color: var(--muted);
   font-size: 13px;
+}
+
+/* Files one checkpoint covers, each restorable on its own — the common case is
+   one wrong file in an otherwise useful turn. */
+.rewind-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.rewind-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.rewind-file-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.rewind-file-origin {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.rewind-file-action {
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 2px 10px;
+  font-size: 12px;
+}
+
+/* The line that stops a rewind reading as a Git-like guarantee. Quieter than
+   the message above it, and never hidden behind a disclosure. */
+.app-dialog-footnote {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-style: italic;
 }
 
 .app-dialog-input {
@@ -2578,6 +2700,14 @@ button:disabled {
   color: var(--warn);
 }
 
+/* A user turn that has a checkpoint behind it, so it can be rewound. The row
+   sits under a right-aligned bubble, so it hugs the bubble's edge instead of
+   stranding its label on the far left of the column. */
+.turn-indicator[data-state="rewindable"] {
+  color: var(--muted);
+  justify-content: flex-end;
+}
+
 .turn-indicator-dot {
   width: 7px;
   height: 7px;
@@ -2602,6 +2732,12 @@ button:disabled {
   min-width: 0;
   padding: 2px 10px;
   font-size: 12px;
+}
+
+/* The rewindable row is already right-aligned, so the auto margin would push
+   its label back to the far left. Declared after the rule it overrides. */
+.turn-indicator[data-state="rewindable"] .turn-indicator-action {
+  margin-left: 0;
 }
 
 @keyframes turn-indicator-pulse {
