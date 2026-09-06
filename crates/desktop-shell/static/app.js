@@ -578,7 +578,6 @@ async function forgetProject(projectPath) {
     $("repo").value = "";
     loadPinnedContextFiles("");
     clearChat();
-    renderContextFiles();
   }
   renderProjectList();
 }
@@ -2654,7 +2653,6 @@ function clearSessionList() {
 
 function clearChat() {
   $("chat-log").innerHTML = "";
-  $("chat-context").innerHTML = "";
   setChatStatus("Idle");
 }
 
@@ -3454,16 +3452,25 @@ function chatCompletionStatus(payload) {
   return { label: "Complete", tone: "ok", indicator: "complete" };
 }
 
-function renderContextFiles(files = []) {
-  const container = $("chat-context");
-  container.innerHTML = "";
+// The files a turn read, folded into that turn rather than a strip docked above
+// the composer. Reference information, so the paths are quiet links rather than
+// buttons.
+//
+// Live-turn only: stored messages carry no `contextFiles`, so this does not
+// survive a session reload. See the spec's context.md §3 — making it durable is
+// a server-side change.
+function appendContextDisclosure(body, files) {
+  if (!files.length) return;
+
+  const panel = document.createElement("div");
+  panel.className = "context-file-list";
   files.forEach((path) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "context-file";
-    button.textContent = path;
-    button.title = "Open in Visual Studio Code";
-    button.addEventListener("click", async () => {
+    const link = document.createElement("button");
+    link.type = "button";
+    link.className = "context-file";
+    link.textContent = path;
+    link.title = `${path} — open in Visual Studio Code`;
+    link.addEventListener("click", async () => {
       try {
         const payload = await api("/api/open-vscode-file", form({ repo: requireRepo(), path }));
         toast(`Opened ${payload.path}`);
@@ -3471,8 +3478,11 @@ function renderContextFiles(files = []) {
         toast(error.message);
       }
     });
-    container.append(button);
+    panel.append(link);
   });
+
+  const label = files.length === 1 ? "Read 1 file" : `Read ${files.length} files`;
+  body.append(createDisclosure(label, panel), panel);
 }
 
 function renderProjectList() {
@@ -4330,7 +4340,7 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
             currentSessionId = payload.sessionId;
             localStorage.setItem(lastSessionStorageKey(), currentSessionId);
           }
-          renderContextFiles(payload.contextFiles || []);
+          appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
           const status = chatCompletionStatus(payload);
           setChatStatus(status.label, status.tone);
         },
@@ -4450,7 +4460,6 @@ async function loadSession(sessionId) {
   loadPinnedContextFiles(currentSessionId);
   await loadSessionCheckpoints(currentSessionId);
   renderMessages(payload.messages, payload.tasks || []);
-  renderContextFiles();
   setChatStatus("Loaded");
 }
 
@@ -4657,7 +4666,7 @@ async function proposePatchFromChat(prompt, assistantMessage) {
     `Prepared a patch preview for \`${payload.patchId}\`. Review the diff and apply selected files when ready.`,
   );
   assistantMessage.body.append(createPatchPreview(payload, patchRepo));
-  renderContextFiles(payload.contextFiles || []);
+  appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
   setChatStatus("Patch ready", "warn");
 }
 
@@ -4759,7 +4768,7 @@ async function sendChatPrompt(options = {}) {
           // finalize's innerHTML replacement instead of being wiped by it.
           await finalizeChatMessage(assistantMessage, assistantText);
           appendProposals(assistantMessage, payload, chatRepo);
-          renderContextFiles(payload.contextFiles || []);
+          appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
           if (payload.cancelled) {
             if (indicator) indicator.finish("stopped");
             setChatStatus("Stopped", "warn");

@@ -9,7 +9,7 @@
 | Task | State | Commit | Notes |
 |---|---|---|---|
 | 1 · Shared disclosure and visually-hidden helpers | Done | — | Approval card still 104/162px, so the refactor is behaviour-neutral. `.visually-hidden` hardened with `clip-path` since it is now a general utility |
-| 2 · Context files into the turn | Not started | — | Removes `#chat-context` |
+| 2 · Context files into the turn | Done | — | Chat log 459 → 557px. Strip gone from the DOM, grid down to four rows, zero-file turn appends nothing. File rows needed `min-height: 24px` — they computed to 20px |
 | 3 · Thread header shows repo and session | Not started | — | |
 | 4 · Hide role labels | Not started | — | |
 | 5 · Composer auto-grow | Not started | — | |

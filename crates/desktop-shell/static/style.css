@@ -561,7 +561,7 @@ button:disabled {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto auto auto;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
   background: var(--surface);
 }
 
@@ -2142,28 +2142,40 @@ button:disabled {
   color: var(--danger);
 }
 
-.context-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.chat-context-strip {
-  border-top: 1px solid var(--line);
-  background: #fbfbfa;
-  padding: 10px clamp(18px, 5vw, 72px);
-}
-
-.chat-context-strip:empty {
-  display: none;
+/* The files a turn read, listed inside that turn. Reference information, so
+   these are quiet links rather than buttons — full weight here would compete
+   with the approval and patch actions in the same message. `direction: rtl`
+   truncates from the left, keeping the filename visible, which is the part
+   that identifies the file. */
+.context-file-list {
+  display: grid;
+  gap: 2px;
+  margin-top: 6px;
 }
 
 .context-file {
   max-width: 100%;
+  min-height: 24px;
   overflow: hidden;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--muted);
+  direction: rtl;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 18px;
+  padding: 3px 5px;
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.context-file:hover {
+  border: 0;
+  background: var(--surface-soft);
+  color: var(--ink);
 }
 
 .empty-state {
