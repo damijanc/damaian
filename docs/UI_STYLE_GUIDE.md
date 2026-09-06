@@ -17,6 +17,11 @@ hover and tab through them to see hover, focus and disabled states. This
 document holds the rules and the reasoning; that page holds the pixels. Change
 one and change the other in the same commit.
 
+Because it loads the app's stylesheet, it also inherits app-shell layout rules
+that suit a window and not a document — `body { overflow: hidden }` being the
+one that bites. Its page-local block undoes those. Anything you add there must
+still leave the specimens themselves untouched.
+
 Scope is the Tauri desktop shell only:
 `crates/desktop-shell/static/{index.html,style.css,app.js}`. Those assets are
 `include_str!`-embedded into the binary, so any change requires a rebuild and

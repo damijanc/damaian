@@ -91,3 +91,10 @@ which is a storage change and out of scope here — see
   153px. The 56px bottom padding that clears the attach, model and send
   controls sets the real floor, which is why two rows lands at 111px rather
   than something smaller.
+- **2026-09-04 — the specimen page could not scroll.** Reported by the author
+  after opening it. It loads the shipping stylesheet, which sets
+  `body { overflow: hidden }` so the app window never scrolls; a document page
+  needs the opposite. Its page-local block now overrides `overflow` and
+  `height`. The general lesson is in the style guide: loading the real
+  stylesheet buys accuracy on components and inherits app-shell layout rules
+  that have to be undone.

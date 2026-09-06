@@ -12,7 +12,14 @@
          appearance — no button, card, or token styling. If you find yourself
          adding a rule that changes how a specimen looks, the rule belongs in
          style.css instead, or the specimen is wrong. */
+      /* The shipping stylesheet sets `body { overflow: hidden }` so the app
+         window never scrolls — the app scrolls its own panes instead. This is
+         a document, not an app shell, so it has to undo that or the page is
+         stuck at the first screen. `height: auto` releases the `100vh` floor
+         that comes with it. */
       body {
+        height: auto;
+        overflow: auto;
         margin: 0 auto;
         max-width: 1000px;
         padding: 32px 28px 80px;
