@@ -263,6 +263,21 @@ button:disabled {
   color: var(--ink);
 }
 
+/* Quiet weight carrying the danger colour: a destructive action should be
+   findable, not loud. Signalling only — every caller keeps its confirm dialog.
+   --danger on --surface is 5.9:1. */
+.btn-danger {
+  border-color: transparent;
+  background: transparent;
+  color: var(--danger);
+}
+
+.btn-danger:hover {
+  border-color: transparent;
+  background: #fbe9e7;
+  color: var(--danger);
+}
+
 .btn-icon {
   border-color: transparent;
   background: transparent;
@@ -550,9 +565,13 @@ button:disabled {
   padding-top: 12px;
 }
 
+/* Content-sized, like every other action row. This was a `1fr 1fr` grid on the
+   assumption that the settings column was narrow; it is 760-930px, so the grid
+   produced 456px buttons and wrapped any third one onto its own line. */
 .inline-actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
@@ -2056,10 +2075,6 @@ button:disabled {
 
 .settings-provider-editor {
   max-width: 760px;
-}
-
-.compact-actions {
-  width: min(220px, 100%);
 }
 
 #config-editor {
