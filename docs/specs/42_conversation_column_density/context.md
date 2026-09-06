@@ -73,3 +73,21 @@ per-turn history instead of one global list". That was overstated. Making it
 true requires persisting `context_files` per assistant message server-side,
 which is a storage change and out of scope here — see
 [`proposal.md`](proposal.md) §2.
+
+## 4. Defects found during implementation
+
+- **2026-09-04 — a collapsed panel with its own `display` ignores `hidden`.**
+  `.context-file-list` sets `display: grid`, an author declaration that beats
+  the UA `[hidden] { display: none }` rule, so the file list rendered expanded
+  while every scripted check reported `hidden === true`. Only a screenshot
+  caught it. The codebase already documents the same trap on
+  `.patch-secret-notice`; the guide's disclosure section now names it.
+- **2026-09-04 — context file rows fell under the hit-target floor.** At 11px
+  with 2px padding they computed to 20px against the 24px minimum. Fixed with
+  an explicit `min-height`.
+- **2026-09-04 — `rows="4"` was setting the composer height, not the
+  `min-height`.** The spec assumed the 104px `min-height` was the floor. It is
+  not: four rows at 20.3px plus 70px of padding is 151px, so the field measured
+  153px. The 56px bottom padding that clears the attach, model and send
+  controls sets the real floor, which is why two rows lands at 111px rather
+  than something smaller.

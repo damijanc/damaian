@@ -13,7 +13,7 @@
 | 3 · Thread header shows repo and session | Done | — | Driven off `setRepoState` and `syncSessionListActive`, which already fire on every project/session change. Empty, selected, unknown-session and cleared states all verified; long title ellipsises with actions intact |
 | 4 · Hide role labels | Done | — | Accessibility tree still exposes "You" / "Assistant"; rendered height 1px |
 | 5 · Composer auto-grow | Done | — | 111px at rest → 232 at eight lines → caps at 320 (40vh) with scroll → back to 111 after send. Composer 191 → 149px |
-| 6 · Specimen page and outcome | Not started | — | |
+| 6 · Specimen page and outcome | Done | — | Chat log **606px** vs 589px target. Specimen check caught three stale `command-approval-disclosure` usages left from spec 41 |
 
 ## Baseline
 

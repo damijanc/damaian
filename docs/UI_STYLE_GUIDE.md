@@ -9,9 +9,8 @@ like*, so successive UI specs do not each re-derive the same scale. When a spec
 and this guide disagree, the spec wins for the surface it owns and this guide
 should be updated in the same change.
 
-**See it rendered:** [`ui-style-guide.html`](ui-style-guide.html) — *built by
-spec 41; this link is dead until that ships* — is the visual counterpart to
-this document — open it in a browser from a checkout, no server
+**See it rendered:** [`ui-style-guide.html`](ui-style-guide.html) is the visual
+counterpart to this document — open it in a browser from a checkout, no server
 needed. It links the shipping `style.css` by relative path, so it shows the
 real thing rather than a copy that can drift. Its buttons are live controls:
 hover and tab through them to see hover, focus and disabled states. This
@@ -188,6 +187,9 @@ the UI, because the user is granting consent rather than navigating.
 
 Used for rationale, file lists, and any detail that is occasionally wanted.
 
+- Build it with `createDisclosure(label, panel)` in `app.js`. There is one
+  implementation, styled by `.disclosure` and `.disclosure-caret`; do not write
+  a second.
 - Trigger is a quiet inline row: caret glyph plus a short label naming what is
   inside, with a count where one exists ("Read 7 files", not "Details").
 - **Pair the trigger with the card's action row rather than giving it a row of
@@ -197,7 +199,10 @@ Used for rationale, file lists, and any detail that is occasionally wanted.
 - Collapsed by default. Cost when collapsed is one text row.
 - Expanded content is capped with `max-height` and scrolls, unless §5 applies.
 - The trigger is a real `<button>` with `aria-expanded`, and the panel is
-  toggled with the `hidden` property.
+  toggled with the `hidden` property. **If the panel's own rule sets
+  `display`, add `[hidden] { display: none }` for it** — an author `display`
+  declaration beats the UA `[hidden]` rule, and the panel stays on screen
+  while every scripted check reports it hidden.
 
 ---
 
@@ -211,8 +216,8 @@ Each of these existed in the shell and was removed. Do not reintroduce them.
 | `min-height` on a shared base element | Needs a counter-override elsewhere to stay survivable, and the next element added inherits the cost silently |
 | Trusting an estimate as a measurement | The card this guide was written for was claimed at ~330px from a mockup; it measured 161px. Measure in the running app, and say which |
 | Reusing `.inline-actions` outside settings | Stretches actions to half the chat column |
-| Per-turn information docked in chrome | Costs space on every turn and shows only the newest turn |
-| Full paths as full-size buttons | Maximum visual weight for reference information |
+| Per-turn information docked in chrome | Costs space on every turn and shows only the newest turn. The context strip was 99px of permanent band showing one turn's files; it now sits inside the turn that read them |
+| Full paths as full-size buttons | Maximum visual weight for reference information. Reference lists are quiet links, truncated from the left so the filename survives |
 | Horizontally scrolled command under review | User approves what they cannot see |
 | Escalating and one-shot actions at equal weight | Mis-click cost is not symmetric |
 

@@ -1,6 +1,10 @@
 # Feature Spec: Conversation Column Density
 
-Status: Not started
+Status: Done. All six tasks complete and verified in the running app at
+1280×800. Chat log **459px → 606px** (+147, against a ≥589px criterion); chrome
+falls from **43% to 24%** of the conversation column. Thread header 51→45px,
+composer 191→149px, context strip 99→0px. Defects found during implementation
+are in [`context.md`](context.md) §4.
 Order: 42 of 42
 Also in this spec: [`context.md`](context.md) (motivation, current state, and
 the reload limitation), [`tasks.md`](tasks.md) (execution order and progress).
@@ -133,8 +137,8 @@ field is cleared, since none of those fire `input`.
 ## 4. Acceptance criteria
 
 1. At 1280×800 with a two-message exchange and seven context files, the chat
-   log measures **at least 589px**, up from the measured 459px baseline. The
-   final figure is measured in the running app and recorded in the status line.
+   log measures **at least 589px**, up from the measured 459px baseline.
+   **Met at 606px.**
 2. The context strip is gone from the DOM, and a turn that read files shows a
    collapsed "Read N files" row inside its assistant message. Expanding lists
    the paths; clicking one opens it in Visual Studio Code.

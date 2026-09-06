@@ -296,7 +296,7 @@
             </div>
             <code class="command-approval-command">cargo test -p damaian-core</code>
             <div class="command-approval-footer">
-              <button type="button" class="command-approval-disclosure" aria-expanded="false">
+              <button type="button" class="disclosure" aria-expanded="false">
                 <span class="disclosure-caret" aria-hidden="true"></span> Why this command
               </button>
               <div class="command-approval-actions">
@@ -318,7 +318,7 @@
             <code class="command-approval-command">docker run --rm -v "$PWD":/w -w /w --network host -e RUST_LOG=debug rust:1.79 cargo build --release --target x86_64-unknown-linux-musl</code>
             <pre class="command-approval-details">Cross-compiling for musl so the release artifact runs on the CI image.</pre>
             <div class="command-approval-footer">
-              <button type="button" class="command-approval-disclosure" aria-expanded="true">
+              <button type="button" class="disclosure" aria-expanded="true">
                 <span class="disclosure-caret" aria-hidden="true"></span> Why this command
               </button>
               <div class="command-approval-actions">
@@ -346,7 +346,7 @@
         </div>
         <code class="command-approval-command">rm -rf / --no-preserve-root</code>
         <div class="command-approval-footer">
-          <button type="button" class="command-approval-disclosure" aria-expanded="false">
+          <button type="button" class="disclosure" aria-expanded="false">
             <span class="disclosure-caret" aria-hidden="true"></span> Why this command
           </button>
           <div class="command-approval-actions">
@@ -354,6 +354,29 @@
             <button type="button" class="btn-sm btn-quiet">Reject</button>
           </div>
         </div>
+      </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>Disclosure</h2>
+      <p class="sg-hint">
+        One implementation, two callers. Collapsed by default and never remembered; the label
+        names what is inside, with a count where there is one. Click either trigger.
+      </p>
+      <div class="sg-card">
+        <button type="button" class="disclosure" aria-expanded="false">
+          <span class="disclosure-caret" aria-hidden="true"></span> Read 7 files
+        </button>
+        <div class="context-file-list">
+          <button type="button" class="context-file">crates/net/src/client.rs</button>
+          <button type="button" class="context-file">crates/net/src/retry.rs</button>
+          <button type="button" class="context-file">crates/core/src/upload.rs</button>
+          <button type="button" class="context-file">docs/specs/12_web_app_troubleshooting.md</button>
+        </div>
+        <p class="sg-note">
+          Shown expanded here. In the app this sits inside the assistant turn that read the
+          files; paths truncate from the left so the filename stays visible.
+        </p>
       </div>
     </section>
 
