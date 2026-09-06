@@ -66,7 +66,7 @@ p {
 }
 
 h1 {
-  font-size: 17px;
+  font-size: 15px;
 }
 
 h2 {
@@ -316,8 +316,8 @@ button:disabled {
   border: 0;
   background: transparent;
   color: #8f9295;
-  font-size: 18px;
-  font-weight: 650;
+  font-size: 13px;
+  font-weight: 600;
   padding: 6px 4px;
   text-align: left;
 }
@@ -1195,7 +1195,7 @@ button:disabled {
   min-height: 220px;
   max-height: min(360px, 38vh);
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr);
   border-top: 1px solid var(--line);
   background: #ffffff;
   color: var(--ink);
@@ -1206,39 +1206,47 @@ button:disabled {
   display: none;
 }
 
+/* The two glyph controls default to 30px squares, which alone keep the bar
+   above its 36px budget. 26px still clears the 24px hit-target floor. */
+.terminal-tabbar .icon-button {
+  width: 26px;
+  height: 26px;
+}
+
 .terminal-tabbar {
-  min-height: 44px;
+  min-height: 36px;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   border-bottom: 1px solid var(--line);
   background: #ffffff;
-  padding: 7px 12px;
+  padding: 3px 10px;
 }
 
 .terminal-tab {
   max-width: min(320px, 45vw);
-  min-height: 36px;
+  min-height: 26px;
+  flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 10px;
-  border-radius: 14px;
+  gap: 8px;
+  border-radius: 999px;
   background: #f1f1ef;
   color: var(--ink);
-  padding: 0 16px;
+  padding: 0 10px;
 }
 
 .terminal-tab span:last-child {
   overflow: hidden;
-  font-size: 15px;
-  font-weight: 650;
+  font-size: 12px;
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .terminal-new-btn {
-  width: 30px;
-  height: 30px;
+  width: 26px;
+  height: 26px;
   border: 0;
   border-radius: 50%;
   background: transparent;
@@ -1257,10 +1265,6 @@ button:disabled {
   flex: 1 1 auto;
 }
 
-.terminal-tabbar > button:not(.terminal-new-btn) {
-  padding: 6px 9px;
-}
-
 .terminal-body {
   position: relative;
   min-height: 0;
@@ -1277,12 +1281,17 @@ button:disabled {
   background-color: transparent;
 }
 
+/* Lives in the tab bar rather than a strip of its own: a full-width 27px band
+   with its own border was a lot of chrome for one line of muted text, in a
+   panel whose entire job is showing output. `direction: rtl` truncates from
+   the left so the leaf directory survives. */
 .terminal-cwd {
+  min-width: 0;
   overflow: hidden;
-  border-top: 1px solid var(--line);
   color: var(--muted);
+  direction: rtl;
   font-size: 11px;
-  padding: 5px 12px;
+  text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1536,7 +1545,7 @@ button:disabled {
 
 .approval-menu-row small {
   color: var(--muted);
-  font-size: 10.5px;
+  font-size: 11px;
   font-weight: 400;
 }
 
@@ -1748,7 +1757,7 @@ button:disabled {
 
 .settings-app-title {
   color: #5d6063;
-  font-size: 17px;
+  font-size: 15px;
   font-weight: 650;
   margin-bottom: 14px;
 }
@@ -1775,8 +1784,8 @@ button:disabled {
   border-radius: 6px;
   background: transparent;
   color: #595d60;
-  font-size: 14px;
-  font-weight: 650;
+  font-size: 13px;
+  font-weight: 600;
   padding: 0 10px;
   text-align: left;
 }
@@ -1962,7 +1971,7 @@ button:disabled {
 
 .settings-section h3 {
   color: #181a1c;
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 750;
 }
 
@@ -2883,7 +2892,7 @@ code.command-approval-command {
   }
 
   .settings-page-title {
-    font-size: 17px;
+    font-size: 15px;
   }
 
   .settings-section h3 {
