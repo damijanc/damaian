@@ -1,6 +1,6 @@
 # macOS Installation
 
-This document covers installing the current Damaian developer-preview build on macOS.
+This document covers installing Damaian on macOS.
 
 ## System Requirements
 
@@ -18,11 +18,15 @@ Download the DMG from the GitHub Release page, or use a DMG you built locally.
 3. Eject the mounted disk image.
 4. Open `Damaian` from `Applications`.
 
-## Developer Preview Signing
+## Signing and Gatekeeper
 
-The developer-preview package is ad-hoc signed for bundle integrity, but it is not Developer ID signed or notarized. On first launch, macOS may show a warning that the app cannot be opened because the developer cannot be verified.
+Release DMGs are Developer ID signed, notarized and stapled, and the release
+workflow fails closed if any of that does not verify. A downloaded release
+should open without a Gatekeeper prompt.
 
-For this developer-preview package:
+If macOS does warn that the developer cannot be verified, you are almost
+certainly running a locally built DMG — local builds are ad-hoc signed unless
+you supply signing credentials. To open one:
 
 1. Open `System Settings`.
 2. Go to `Privacy & Security`.
@@ -31,8 +35,10 @@ For this developer-preview package:
 5. Confirm the launch prompt.
 
 Only do this for builds you created yourself or received from a trusted source.
+A *release* build should never need it; if one does, treat that as a signing
+problem worth reporting rather than something to click through.
 
-You can also open a trusted developer-preview build from Finder:
+You can also open a locally built app from Finder:
 
 1. Open `Applications` in Finder.
 2. Control-click `Damaian.app`.
@@ -48,7 +54,7 @@ open /Applications/Damaian.app
 
 Do not remove quarantine from apps downloaded from sources you do not trust.
 
-If macOS says the application is damaged, verify that you are using a release built after the ad-hoc signing fix. Older DMGs had an invalid bundle signature and should be replaced by a new release build.
+If macOS says the application is damaged, the bundle signature did not verify. Replace it with a current release build rather than working around the warning.
 
 ## Updates
 
@@ -102,6 +108,5 @@ The installer contains:
 
 ## Current Limitations
 
-- The package is ad-hoc signed but not Developer ID signed or notarized.
 - Repository selection uses a native folder picker from the Projects sidebar.
 - The app uses a local in-process server on `127.0.0.1:4765` as the temporary bridge between Tauri and the workspace engine.
