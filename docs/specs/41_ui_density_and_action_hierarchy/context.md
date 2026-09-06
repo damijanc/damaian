@@ -84,3 +84,14 @@ an earlier draft of this spec and acted on.
   nothing to either. Fixed by qualifying the selector with the element. The
   specimen page caught this by disagreeing with the app, since it renders the
   card outside `.message-body`.
+
+## 4. Superseded by spec 43
+
+- **2026-09-04 — §3.1's decision to leave `.inline-actions` alone was wrong.**
+  This spec kept its `1fr 1fr` grid, reasoning that it "is correct in the
+  settings column, it was just being borrowed somewhere it didn't fit". The
+  settings column is 760-930px wide, so the grid produced 456px buttons there
+  and wrapped the MCP page's third button onto its own row. The assumption was
+  never measured. [`../43_chrome_density_and_hierarchy/proposal.md`](../43_chrome_density_and_hierarchy/proposal.md)
+  §3.1 replaces the grid with a content-sized flex row. This spec's actual
+  change — stopping the patch preview from using the rule — stands.

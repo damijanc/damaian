@@ -14,8 +14,8 @@ session where browser runtime evidence was not first-class, and #13 from a real
 session where Docker was needed but the assistant asked the user to run the
 command manually. #34 is the other exception to the roadmap rule below: it was
 written and implemented out of order, ahead of #14, because it is a security
-defect rather than a graduation. #41 and #42 are a third exception: they come
-from usability feedback on the desktop shell rather than a work package, and
+defect rather than a graduation. #41, #42 and #43 are a third exception: they
+come from usability feedback on the desktop shell rather than a work package, and
 #41 introduces [`../UI_STYLE_GUIDE.md`](../UI_STYLE_GUIDE.md), the standing
 visual reference that later UI specs cite instead of restating.
 
@@ -72,6 +72,7 @@ written to stand on its own.
 | 40 | [40_autonomy_evaluations.md](40_autonomy_evaluations.md) | **Not started.** Roadmap Phase 6 WP7. The decision instrument: same scenarios run in both execution modes, cost amplification as a ratio, and an experimental label *derived* from the recorded comparison rather than chosen. Makes abandoning Phase 6 a first-class recorded outcome. |
 | 41 | [41_ui_density_and_action_hierarchy/](41_ui_density_and_action_hierarchy/proposal.md) | **Done.** Collapsed command approval 161px → 104px, patch actions from half the conversation column to their natural width. Usability-driven, not a roadmap graduation: the shell has exactly one button style, so a one-shot `Approve Run` and a persistent `Allow Always` are visually identical, and a stray `min-height: 180px` on base `pre` makes every command approval reserve 180px of empty rationale pane. Introduces the button scale in [`../UI_STYLE_GUIDE.md`](../UI_STYLE_GUIDE.md) and applies it to the approval and patch cards. Presentation only — the approval policy from #10, #12 and #34 is untouched. Also builds `docs/ui-style-guide.html`, a specimen page that loads the shipping stylesheet so the guide has a rendered counterpart that cannot drift. First of three UI specs; the conversation column and the remaining chrome follow. |
 | 42 | [42_conversation_column_density/](42_conversation_column_density/proposal.md) | **Done.** Chat log 459 → 606px at 1280×800; chrome down from 43% to 24% of the column. Second of the three UI specs from the same usability review as #41. 43% of the conversation column measured as chrome at 1280×800: the docked context strip folds into the turn that read the files, the thread header trades a hardcoded caption for the active folder and session, role labels move to screen-reader-only, and the composer grows from two rows instead of reserving four. Depends on #41's button scale and disclosure pattern, which it promotes to a shared class. |
+| 43 | [43_chrome_density_and_hierarchy/](43_chrome_density_and_hierarchy/proposal.md) | **Done.** Last of the three UI specs. Applies the scale to the surfaces #41 and #42 did not reach: settings action buttons 456 → 129px with one primary per group and `.btn-danger` on the destructive ones, every font-size brought onto a type scale that now documents its heading steps, and the terminal tab bar slimmed with the working directory folded into it (body 142 → 183px). Supersedes #41 §3.1 on `.inline-actions`. |
 
 **Ordering exception.** Numbers are assigned in creation order, so #34 is last in
 the table but is the next thing to implement. It is a bug-driven spec covering a

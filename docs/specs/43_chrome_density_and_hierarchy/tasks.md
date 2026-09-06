@@ -11,7 +11,7 @@
 | 1 · `.inline-actions` and settings hierarchy | Done | — | Max button 456→129px, all four groups one row with one primary each. Supersedes spec 41 §3.1 |
 | 2 · Type scale | Done | — | Every `font-size` now on scale except four glyph buttons (`+` at 25/24px, `×` at 20px×2), which size an icon character rather than text — recorded as an exception, not forced |
 | 3 · Terminal chrome | Done | — | Tab bar 51→36px, cwd strip gone, body 142→183px (+41). The two glyph controls went 30→26px; they alone held the bar above budget |
-| 4 · Specimen page, guide and outcome | Not started | — | |
+| 4 · Specimen page, guide and outcome | Done | — | Guide gains `.btn-danger`, the two heading steps and the glyph exception; spec 41's `context.md` §4 records the superseded decision |
 
 ## Baseline
 

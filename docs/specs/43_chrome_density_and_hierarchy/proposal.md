@@ -1,6 +1,11 @@
 # Feature Spec: Chrome Density and Hierarchy
 
-Status: Not started
+Status: Done. All four tasks complete and verified in the running app at
+1280×800. Widest settings action button **456px → 129px**, every group on one
+row with one primary and its destructive action in `.btn-danger`. Terminal tab
+bar **51px → 36px** with the working directory folded into it; terminal body
+**142px → 183px**. Every `font-size` in the stylesheet is on the documented
+scale bar four glyph buttons, now an explicit exception.
 Order: 43 of 43
 Also in this spec: [`context.md`](context.md) (motivation, current state, and
 the spec 41 decision this supersedes), [`tasks.md`](tasks.md) (execution order
@@ -146,7 +151,7 @@ Removing the strip's border and padding, and shrinking the bar, returns roughly
 ## 4. Acceptance criteria
 
 1. No settings action button exceeds 200px. Measured at 1280×800 on the
-   Providers and MCP pages.
+   Providers and MCP pages. **Met — widest is 129px.**
 2. The MCP row renders its three buttons on one line at 1280×800.
 3. Each of the four settings action groups shows exactly one `.btn-primary`,
    and every Remove-type action uses `.btn-danger`.
@@ -156,7 +161,7 @@ Removing the strip's border and padding, and shrinking the bar, returns roughly
 6. The terminal tab bar measures at most 36px, `.terminal-cwd` no longer exists
    as a separate strip, and the working directory is visible in the bar.
 7. The terminal body measures at least 177px at the panel's 220px minimum, up
-   from 142px.
+   from 142px. **Met at 183px**, with the tab bar at exactly 36px.
 8. Every control changed is at least 24×24 CSS px, shows a focus ring, and is
    reachable by keyboard in visual order.
 9. `docs/ui-style-guide.html` shows `.btn-danger` and the heading steps, and no

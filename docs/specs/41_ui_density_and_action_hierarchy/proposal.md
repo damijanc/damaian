@@ -77,6 +77,10 @@ from the style guide. Existing call sites are unchanged except where §3.3 and
 `.inline-actions` keeps its two-column grid. The fix for the patch preview is
 to stop using it there, not to change it.
 
+> **Superseded.** That reasoning assumed the settings column was narrow. It is
+> not, and the grid produced 456px buttons there. Spec 43 §3.1 replaces it with
+> a content-sized flex row — see [`context.md`](context.md) §4.
+
 ### 3.2 Scoping the height minimum to the element that wants it
 
 **This change is visually inert.** It removes a trap, not pixels — see `context.md` §1.

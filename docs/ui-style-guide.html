@@ -209,6 +209,16 @@
     <section class="sg-section">
       <h2>Type scale</h2>
       <div class="sg-type-row">
+        <code>18px</code
+        ><span style="font-size: 18px; font-weight: 750">Page title</span
+        ><em>settings pages, one per page</em>
+      </div>
+      <div class="sg-type-row">
+        <code>15px</code
+        ><span style="font-size: 15px; font-weight: 750">Section heading</span
+        ><em>within a page</em>
+      </div>
+      <div class="sg-type-row">
         <code>14px</code><span style="font-size: 14px">Body copy and message text</span
         ><em>message body</em>
       </div>
@@ -271,6 +281,12 @@
           <button type="button" class="btn-sm btn-quiet" disabled>Disabled</button>
         </span>
 
+        <span class="sg-rowlabel">.btn-danger</span>
+        <span class="sg-row">
+          <button type="button" class="btn-sm btn-danger">Remove Key</button>
+          <button type="button" class="btn-sm btn-danger" disabled>Disabled</button>
+        </span>
+
         <span class="sg-rowlabel">.btn-icon</span>
         <span class="sg-row">
           <button type="button" class="btn-icon" aria-label="More actions">⋯</button>
@@ -288,6 +304,15 @@
         <button type="button" class="btn-sm btn-primary">Approve</button>
         <button type="button" class="btn-sm btn-quiet">Reject</button>
         <button type="button" class="btn-icon" aria-label="More actions">⋯</button>
+      </div>
+      <p class="sg-note">
+        A settings group reads the same way — one primary, the rest quiet, and the destructive
+        one in <code>.btn-danger</code>:
+      </p>
+      <div class="inline-actions">
+        <button type="button" class="btn-primary">Save Provider</button>
+        <button type="button" class="btn-quiet">Test Connection</button>
+        <button type="button" class="btn-danger">Remove</button>
       </div>
     </section>
 
