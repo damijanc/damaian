@@ -885,8 +885,8 @@ button:disabled {
 /* The `min-width: 0` note above now applies to this inner group rather than
    the header itself: these nowrap children are what would otherwise set the
    row's automatic minimum and push the conversation column into overflow. The
-   actions beside them are `flex: 0 0 auto`, so a long summary ellipsises and
-   the buttons keep their width — the correct priority. */
+   actions beside them are `flex: 0 0 auto`, so a long summary truncates with
+   an ellipsis and the buttons keep their width — the correct priority. */
 .patch-preview-heading {
   min-width: 0;
   display: flex;

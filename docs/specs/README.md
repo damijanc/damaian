@@ -99,3 +99,7 @@ A spec folder holds up to three documents, and creates only the ones it needs:
 The split exists so the decision stays readable as the background and the task
 list grow. `proposal.md` is the entry point and the file the table above links
 to; read it first.
+
+**Do not cite commit SHAs in a spec.** They go stale the first time history is
+rewritten, and then the document quietly lies. Record what changed and what was
+measured; `git log` and `git blame` are how you find the commit.

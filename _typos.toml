@@ -12,3 +12,10 @@ extend-exclude = [
 [default.extend-identifiers]
 # Upstream `candle` API name; not ours to rename.
 from_mmaped_safetensors = "from_mmaped_safetensors"
+
+[default.extend-words]
+# The hyphenated `mis-` prefix is house style in prose and comments
+# (`mis-click`, `mis-hashing`). typos splits on the hyphen and sees a bare
+# `mis`, reading it as a misspelling of `miss`. Allowed rather than rewritten
+# because one occurrence quotes a commit message verbatim.
+mis = "mis"

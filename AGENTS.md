@@ -45,13 +45,15 @@ actually built.
 ## Quality gate
 
 CI (`.github/workflows/quality.yml`) runs exactly these. Run them before you
-claim work is done — all five must pass:
+claim work is done — all seven must pass:
 
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+node --check crates/desktop-shell/static/app.js
 npm run lint:web
+typos
 cargo deny check
 ```
 
@@ -62,6 +64,11 @@ Notes:
   explaining why is acceptable — see the `too_many_arguments` allowances on the
   dependency-injection constructors.
 - `npm run lint:web:fix` auto-fixes most web-asset findings.
+- `typos` needs `cargo install typos-cli`; CI pins the `crate-ci/typos` action
+  to the same version. Prefer fixing the prose. Where the word is deliberate,
+  add it to `_typos.toml` with a comment saying why — as `mis` is, since the
+  hyphenated `mis-` prefix reads as a bare `mis` once typos splits on the
+  hyphen.
 - `npm ci` first if `node_modules` is missing. Biome is pinned in
   `package-lock.json`; do not bump it as a side effect of another change.
 - `cargo deny` is scoped to `aarch64-apple-darwin` in `deny.toml`. If you add a

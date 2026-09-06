@@ -9,13 +9,13 @@
 Update this table as tasks land, so anyone picking the work up mid-flight knows
 where it stopped without reading the git log.
 
-| Task | State | Commit | Notes |
-|---|---|---|---|
-| 1 · Button scale and pre minimum | Done | `2a733f1` | Verified in the running app: card 161→155px, buttons 13px/600, bare `pre` minimum gone, `#config-output` keeps 180px |
-| 2 · Specimen page | Done | `31f4f29` | Verified over HTTP: real stylesheet loads (375 rules), token flip to `#b3261e` propagated. Six classes still unstyled — `command-approval-risk`, `command-approval-disclosure`, `disclosure-caret`, `patch-preview-heading`, `approval-menu-popover`, `approval-menu-row` — all created by Tasks 3-5. `file://` open not verified, see below |
-| 3 + 4 · Command approval structure and overflow menu | Done | `8e4b8e0` | Landed as one commit: the plan's split needed two no-op stand-in buttons to keep an intermediate state runnable, which is not worth a deliberately-broken commit on `main` |
-| 5 · Patch preview header actions | Done | `cd450c0` | Actions 67px/59px instead of half the column; counts track selection 2→1→0→1; narrow column (740px) ellipsises the summary with actions fully visible and no log overflow |
-| 6 · Record outcome in spec | Done | — | Criterion 1 met at 104px after the footer change |
+| Task | State | Notes |
+|---|---|---|
+| 1 · Button scale and pre minimum | Done | Verified in the running app: card 161→155px, buttons 13px/600, bare `pre` minimum gone, `#config-output` keeps 180px |
+| 2 · Specimen page | Done | Verified over HTTP: real stylesheet loads (375 rules), token flip to `#b3261e` propagated. Six classes still unstyled — `command-approval-risk`, `command-approval-disclosure`, `disclosure-caret`, `patch-preview-heading`, `approval-menu-popover`, `approval-menu-row` — all created by Tasks 3-5. `file://` open not verified, see below |
+| 3 + 4 · Command approval structure and overflow menu | Done | Landed as one commit: the plan's split needed two no-op stand-in buttons to keep an intermediate state runnable, which is not worth a deliberately-broken commit on `main` |
+| 5 · Patch preview header actions | Done | Actions 67px/59px instead of half the column; counts track selection 2→1→0→1; narrow column (740px) truncates the summary with an ellipsis, actions fully visible and no log overflow |
+| 6 · Record outcome in spec | Done | Criterion 1 met at 104px after the footer change |
 
 ### Corrections
 
