@@ -38,13 +38,15 @@ Final: collapsed 161 → 104 (-35%), expanded 161 → 162.
 
 ### Open verification
 
-- **`docs/ui-style-guide.html` over `file://` is unverified.** It was checked by
-  serving the repo over HTTP (`python3 -m http.server`), which exercises the
-  same relative path, but the documented usage is `open docs/ui-style-guide.html`
-  straight from a checkout. Loading a relative stylesheet over `file://` is
-  ordinary browser behaviour and should work, but acceptance criterion 8 says
-  "with no server", so someone should open it once in a real browser and
-  confirm the buttons are styled rather than bare.
+- **`docs/ui-style-guide.html` over `file://`** — confirmed working by the
+  author on 2026-09-04, opened straight from a checkout. Acceptance criterion 8
+  is met. (Automated checking used `python3 -m http.server`, since the agent's
+  browser renders `file://` as a static snapshot.)
+- **Grant round-trips were not exercised end to end.** The overflow menu's
+  structure, both items, dismissal and the blocked branch were verified with
+  synthetic proposals, but actually approving through a live conversation needs
+  a provider key. `resolveCommandProposal` passes the same parameters as
+  before, so the risk is low — but this is untested, not tested.
 
 ## How to verify without a model API key
 
