@@ -773,17 +773,6 @@ button:disabled {
   align-self: flex-start;
 }
 
-.message-role {
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 800;
-  text-transform: uppercase;
-}
-
-.message.user .message-role {
-  text-align: right;
-}
-
 .message-body {
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -1283,11 +1272,17 @@ button:disabled {
   position: relative;
 }
 
+/* Two rows at rest, growing with content. The floor is 2 x 20.3px of text
+   plus the 70px of padding that keeps the text clear of the attach, model and
+   send controls positioned over the bottom of the field. `max-height` is the
+   cap; `autoGrowPrompt` sets the height between the two, and the browser
+   clamps it here, so the cap still holds if that never runs. */
 .prompt-box textarea {
-  min-height: 104px;
-  max-height: 220px;
+  min-height: 111px;
+  max-height: 40vh;
   padding: 14px 58px 56px 14px;
   font-family: inherit;
+  resize: none;
 }
 
 .attach-menu {
@@ -2161,6 +2156,13 @@ button:disabled {
    with the approval and patch actions in the same message. `direction: rtl`
    truncates from the left, keeping the filename visible, which is the part
    that identifies the file. */
+/* `display` below is an author declaration, so it beats the UA `[hidden]` rule
+   and the collapsed list would stay on screen. Same trap as
+   `.patch-secret-notice[hidden]` above. */
+.context-file-list[hidden] {
+  display: none;
+}
+
 .context-file-list {
   display: grid;
   gap: 2px;

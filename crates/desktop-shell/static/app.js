@@ -2892,8 +2892,10 @@ function appendChatMessage(role, content) {
   const message = document.createElement("article");
   message.className = `message ${role}`;
 
+  // Screen-reader only: the bubble's alignment and background already carry
+  // the role visually, and a printed label cost 22px on every message.
   const label = document.createElement("div");
-  label.className = "message-role";
+  label.className = "visually-hidden";
   label.textContent = role === "assistant" ? "Assistant" : role === "user" ? "You" : "System";
 
   const body = document.createElement("div");
@@ -4725,12 +4727,25 @@ function setComposerBusy(busy) {
   button.disabled = false;
 }
 
+// Sizes the composer to its content. The floor and the cap both live in CSS
+// (`.prompt-box textarea`), so the field stays usable and bounded even if this
+// never runs; all this does is pick the height in between.
+//
+// Call it after any programmatic change to `value` — those do not fire `input`.
+function autoGrowPrompt() {
+  const field = $("chat-prompt");
+  field.style.height = "auto";
+  field.style.height = `${field.scrollHeight}px`;
+  field.style.overflowY = field.scrollHeight > field.clientHeight ? "auto" : "hidden";
+}
+
 // Puts a prompt back after a stop or a failure, unless the user has started
 // typing something new. Either way the original is in the session history.
 function restorePrompt(text) {
   const field = $("chat-prompt");
   if (field.value.trim()) return;
   field.value = text;
+  autoGrowPrompt();
 }
 
 async function sendChatPrompt(options = {}) {
@@ -4755,6 +4770,7 @@ async function sendChatPrompt(options = {}) {
     // Cleared here rather than after success: the prompt is already echoed in
     // the log above, and leaving it in the box makes it look unsent.
     $("chat-prompt").value = "";
+    autoGrowPrompt();
     if (looksLikeEditRequest(prompt)) {
       await proposePatchFromChat(prompt, assistantMessage);
       dismissContextChips();
@@ -4883,6 +4899,9 @@ document.addEventListener("keydown", (event) => {
   if (document.querySelector(".app-dialog-backdrop, .model-popover:not([hidden])")) return;
   stopCurrentTurn();
 });
+
+$("chat-prompt").addEventListener("input", autoGrowPrompt);
+autoGrowPrompt();
 
 $("chat-prompt").addEventListener("keydown", (event) => {
   if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
