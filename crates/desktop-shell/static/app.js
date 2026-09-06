@@ -2833,6 +2833,28 @@ function renderMarkdown(markdown) {
   return html;
 }
 
+// One disclosure implementation for every caller: builds the trigger, hides
+// the panel, and wires `aria-expanded` to it. The caller places both. Always
+// starts collapsed and is deliberately never remembered — see
+// docs/UI_STYLE_GUIDE.md §7.
+function createDisclosure(label, panel) {
+  const trigger = document.createElement("button");
+  trigger.type = "button";
+  trigger.className = "disclosure";
+  trigger.setAttribute("aria-expanded", "false");
+  const caret = document.createElement("span");
+  caret.className = "disclosure-caret";
+  caret.setAttribute("aria-hidden", "true");
+  trigger.append(caret, document.createTextNode(label));
+  panel.hidden = true;
+  trigger.addEventListener("click", () => {
+    const open = trigger.getAttribute("aria-expanded") === "true";
+    trigger.setAttribute("aria-expanded", open ? "false" : "true");
+    panel.hidden = open;
+  });
+  return trigger;
+}
+
 function appendChatMessage(role, content) {
   const message = document.createElement("article");
   message.className = `message ${role}`;
@@ -4188,28 +4210,12 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
   command.textContent = proposal.command || "";
 
   // The rationale sits behind a disclosure because the common case is a short
-  // command approved without reading it. Rendered collapsed every time — the
-  // state is deliberately not remembered between proposals, since the whole
-  // point is that the common case costs one row.
-  const disclosure = document.createElement("button");
-  disclosure.type = "button";
-  disclosure.className = "command-approval-disclosure";
-  disclosure.setAttribute("aria-expanded", "false");
-  const caret = document.createElement("span");
-  caret.className = "disclosure-caret";
-  caret.setAttribute("aria-hidden", "true");
-  disclosure.append(caret, document.createTextNode("Why this command"));
-
+  // command approved without reading it.
   const details = document.createElement("pre");
   details.className = "command-approval-details";
   details.textContent = proposal.prompt || "";
-  details.hidden = true;
 
-  disclosure.addEventListener("click", () => {
-    const open = disclosure.getAttribute("aria-expanded") === "true";
-    disclosure.setAttribute("aria-expanded", open ? "false" : "true");
-    details.hidden = open;
-  });
+  const disclosure = createDisclosure("Why this command", details);
 
   // Disclosure and actions share one footer row: the disclosure is secondary
   // chrome, and giving it a row of its own cost 34px on every card for a

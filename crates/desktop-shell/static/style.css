@@ -153,12 +153,20 @@ label span {
   gap: 5px;
 }
 
-.session-select-hidden {
+/* Available to screen readers, absent from the page. `clip-path` is the
+   current mechanism; `clip` is kept for older WebKit. `white-space: nowrap`
+   stops a long string from being clipped mid-announcement. */
+.visually-hidden {
   position: absolute;
   width: 1px;
   height: 1px;
   overflow: hidden;
+  border: 0;
+  margin: -1px;
+  padding: 0;
   clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 input,
@@ -2270,7 +2278,7 @@ code.command-approval-command {
 
 /* `min-height` keeps the row at the 24px hit-target floor; at 12px text with
    3px padding it computed to 23px. */
-.command-approval-disclosure {
+.disclosure {
   min-height: 24px;
   display: inline-flex;
   align-items: center;
@@ -2284,7 +2292,7 @@ code.command-approval-command {
   padding: 3px 4px;
 }
 
-.command-approval-disclosure:hover {
+.disclosure:hover {
   border: 0;
   color: var(--ink);
 }
@@ -2298,7 +2306,7 @@ code.command-approval-command {
   transform: rotate(-45deg);
 }
 
-.command-approval-disclosure[aria-expanded="true"] .disclosure-caret {
+.disclosure[aria-expanded="true"] .disclosure-caret {
   transform: rotate(45deg);
 }
 

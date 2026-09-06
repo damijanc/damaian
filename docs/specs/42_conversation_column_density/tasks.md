@@ -8,7 +8,7 @@
 
 | Task | State | Commit | Notes |
 |---|---|---|---|
-| 1 · Shared disclosure and visually-hidden helpers | Not started | — | |
+| 1 · Shared disclosure and visually-hidden helpers | Done | — | Approval card still 104/162px, so the refactor is behaviour-neutral. `.visually-hidden` hardened with `clip-path` since it is now a general utility |
 | 2 · Context files into the turn | Not started | — | Removes `#chat-context` |
 | 3 · Thread header shows repo and session | Not started | — | |
 | 4 · Hide role labels | Not started | — | |
