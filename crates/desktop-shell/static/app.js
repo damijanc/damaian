@@ -259,6 +259,41 @@ function requireRepo() {
 
 function setRepoState(message) {
   $("repo-state").textContent = message;
+  renderThreadHeader();
+}
+
+// The thread header used to caption the screen you were already looking at
+// ("Workspace Agent / Conversation", both hardcoded). It now carries the two
+// things that actually change and that you would otherwise hunt for in the
+// sidebar: which folder is active and which session is open.
+//
+// Driven off `setRepoState` and `syncSessionListActive`, which between them
+// already fire on every project switch, session switch, load and rename.
+function renderThreadHeader() {
+  const repoPath = repo();
+  const repoLine = $("thread-repo");
+  const sessionLine = $("thread-session");
+
+  if (!repoPath) {
+    repoLine.textContent = "No repository selected";
+    repoLine.removeAttribute("title");
+    sessionLine.textContent = "";
+    sessionLine.removeAttribute("title");
+    return;
+  }
+
+  // Basename only — a deep path would crowd the row and push the actions off.
+  // The full path stays reachable as a tooltip.
+  const name = repoPath.replace(/\/+$/, "").split("/").pop() || repoPath;
+  repoLine.textContent = name;
+  repoLine.title = repoPath;
+
+  const session = (projectSessionsByPath.get(repoPath) || []).find(
+    (entry) => entry.id === currentSessionId,
+  );
+  sessionLine.textContent = session ? session.title : "New session";
+  if (session) sessionLine.title = session.title;
+  else sessionLine.removeAttribute("title");
 }
 
 function normalizeProjectPath(value) {
@@ -3736,6 +3771,7 @@ async function deleteSessionForProject(projectPath, session) {
 }
 
 function syncSessionListActive() {
+  renderThreadHeader();
   document.querySelectorAll(".session-item").forEach((button) => {
     button.classList.toggle(
       "active",

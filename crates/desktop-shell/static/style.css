@@ -602,7 +602,21 @@ button:disabled {
   padding: 7px 14px 7px 22px;
 }
 
+/* `min-width: 0` lets the two lines below actually ellipsise; without it their
+   untruncated width becomes the flex row's minimum and pushes the actions off
+   the right edge. */
+.thread-identity {
+  min-width: 0;
+}
+
+.thread-identity > * {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .thread-actions {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 8px;
