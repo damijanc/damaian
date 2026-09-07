@@ -66,8 +66,8 @@ stopped without reading the git log.
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · Crate skeleton and data-directory guard | Not started | |
-| 2 · Fixture materialization | Not started | |
+| 1 · Crate skeleton and data-directory guard | Done | `eval-harness` crate + `damaian-eval` bin, `guard.rs`, 2 tests. `toml` resolved offline — it was already in `Cargo.lock`, so the lockfile update needed no network. Full gate green at 338 tests |
+| 2 · Fixture materialization | Done | `rust-workspace` fixture (4 files) copied to a temp dir and `git init`ed with a fixed identity; clean working tree and run independence both asserted. 2 tests, gate green at 340. Verified a nested fixture `Cargo.toml` breaks neither `cargo metadata` nor `cargo check`, so no `workspace.exclude` is needed, and `cargo fmt --all` ignores fixture sources since they are unreachable from the crate root |
 | 3 · Scenario definition and loader | Not started | |
 | 4 · Run record and sanitization | Not started | |
 | 5 · Audit trace reader | Not started | |
@@ -82,8 +82,14 @@ stopped without reading the git log.
 | 14 · Reports and CLI | Not started | |
 | 15 · CI wiring, live tier, docs, and reviewed baseline | Not started | |
 
-Expected workspace test count as tasks land, so a missing test is visible: 333 today → 335, 337,
-340, 342, 344, 346, 349, 351, 353, 356, 359, 361, 366, 369, then Task 15's additions.
+Expected workspace test count as tasks land, so a missing test is visible: **336** at the start
+→ 338, 340, 343, 345, 347, 349, 352, 354, 356, 359, 362, 364, 369, 372, then Task 15's
+additions.
+
+The baseline is 336, not the 333 measured while this plan was being written: the
+`reasoning_content` replay commit landed in between and added three tests to
+`crates/workspace-engine/tests/foundation.rs`. Treat these numbers as a tripwire, not a
+target — if a count is off, find out why before continuing rather than adjusting the number.
 
 ## File Structure
 

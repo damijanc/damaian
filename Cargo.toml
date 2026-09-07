@@ -3,7 +3,8 @@ members = [
   "crates/workspace-engine",
   "crates/damaian-cli",
   "crates/desktop-shell",
-  "crates/desktop-app"
+  "crates/desktop-app",
+  "crates/eval-harness"
 ]
 resolver = "3"
 

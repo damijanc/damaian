@@ -1,0 +1,2 @@
+version = "1"
+description = "A two-module Rust crate with an upload client and no retry logic."
