@@ -20,6 +20,7 @@ repository.
 | `crates/damaian-cli` | Command-line front end over the workspace engine. |
 | `crates/desktop-shell` | Local HTTP shell and web UI served on `127.0.0.1:4765`. |
 | `crates/desktop-app` | Native Tauri wrapper (macOS folder picker, Keychain, updater). |
+| `crates/eval-harness` | Evaluation harness and the `damaian-eval` binary. See [Evaluation harness](#evaluation-harness). |
 
 ## Run locally
 
@@ -33,6 +34,75 @@ DAMAIAN_REPO=/path/to/repo npm run desktop:dev
 # Local desktop shell prototype (no Tauri wrapper)
 cargo run -p desktop-shell -- --repo /path/to/repo --port 4765
 ```
+
+## Evaluation harness
+
+The harness answers "is Damaian getting better at its job", which the unit tests
+do not. It drives a real `WorkspaceEngine` against fixture repositories and
+asserts mechanically on the result. See
+[`../docs/specs/18_local_evaluation_harness/`](specs/18_local_evaluation_harness/proposal.md).
+
+### Running it
+
+```sh
+# Deterministic tier: no credentials, no network. ~6s.
+cargo run -p eval-harness -- run --tier deterministic
+```
+
+```sh
+# Machine-readable, for diffing against the baseline.
+cargo run -p eval-harness -- run --tier deterministic --format json
+```
+
+The deterministic tier also runs inside `cargo test --workspace --locked`, so it
+is already covered by the quality gate and adds no command to it. The binary
+exits non-zero when any assertion fails, so it is usable from a script.
+
+The live tier runs the same scenario files against a real provider, ignoring
+their scripted turns and keeping their assertions. It is credential-gated and
+never run by CI:
+
+```sh
+DAMAIAN_EVAL_PROVIDER=deepseek DAMAIAN_EVAL_MODEL=deepseek-v4-flash \
+  cargo test -p eval-harness --locked -- --ignored live_tier
+```
+
+### Adding a scenario
+
+Add a `.toml` file under `crates/eval-harness/scenarios/`. Each declares a
+fixture, a prompt, an optional sequence of `[[turn]]` blocks scripting the
+model's replies, and an `[assert]` block. Unknown keys are rejected rather than
+ignored, so a typo fails loudly. `crates/eval-harness/src/scenario.rs` lists
+every assertion field.
+
+Two rules worth keeping:
+
+- **An assertion that cannot fail is worse than no assertion.** Before trusting
+  a green scenario, check that its assertion discriminates — a ranking assertion
+  whose limit exceeds the number of candidates, or a rate over an empty set,
+  passes while measuring nothing.
+- **Fix the fixture, not the threshold.** If a scenario will not pass, change
+  what it runs against before you loosen what it demands.
+
+### Adding a fixture
+
+Add a directory under `crates/eval-harness/fixtures/` containing a
+`fixture.toml` with a `version`, plus the tree. Fixtures cannot ship a nested
+`.git`; the harness copies the tree to a temporary directory and `git init`s it
+per run. **Bump the fixture's `version` whenever its contents change** — a
+result is only comparable against a baseline produced from the same fixture.
+
+Note that `.gitignore` excludes `.env` and `*.pem`, so a fixture cannot use
+those filenames; and `DEFAULT_RESTRICTED_PATTERNS` blocks reads under
+`secrets/`, so a fixture file that must be *readable* has to live elsewhere.
+
+### The baseline
+
+`evals/baseline.json` holds the first measured value of every metric.
+Regenerate it with `--format json`, then **read every number before committing
+it**. A baseline nobody validated is worse than none, because every later phase
+compares against it. The two human-sourced metrics take a value with a stated
+sample size, or an explicit null with a reason — they are never computed.
 
 ## Quality checks
 

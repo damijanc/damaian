@@ -155,7 +155,14 @@ pub fn evaluate(
             push(
                 "absent_everywhere",
                 hits.is_empty(),
-                format!("`{needle}` appears nowhere"),
+                // The needle is deliberately NOT echoed. This assertion exists
+                // to prove a seeded credential reached no artifact, and the
+                // report is itself an artifact — quoting the value here put it
+                // straight into `evals/baseline.json`, which acceptance
+                // criterion "appears in no run record, report, log, or
+                // baseline" forbids. The scenario file holds the value; the
+                // report only needs to say whether it escaped.
+                "the scenario's seeded value appears nowhere".to_string(),
                 format!("found in: {hits:?}"),
             );
         }

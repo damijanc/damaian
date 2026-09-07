@@ -76,17 +76,29 @@ Notes:
 
 ## Testing
 
-- 333 tests pass by default: mostly inline `#[test]` modules, plus integration
-  tests in `crates/workspace-engine/tests/`. Add tests next to the code you
-  change.
-- Four tests are `#[ignore]`d because they have real side effects: one opens
+- All tests pass by default: mostly inline `#[test]` modules, plus integration
+  tests in `crates/workspace-engine/tests/` and `crates/eval-harness/tests/`.
+  Add tests next to the code you change. (No count here on purpose — a number in
+  this file goes stale on the next commit that adds a test, and a stale one is
+  worse than none: it invites "close enough" when the real total differs.)
+- `cargo run -p eval-harness -- run --tier deterministic` evaluates Damaian end
+  to end against fixture repositories — twelve scenarios covering retrieval,
+  patch proposal, restricted paths, secret redaction, approval denial and the
+  retry bound. Run it after changing prompt, context-assembly, tool-dispatch or
+  path-policy code: a regression there passes the unit tests and fails here. Its
+  deterministic tier is already part of `cargo test --workspace --locked`, so it
+  adds no quality-gate command. See
+  [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md#evaluation-harness).
+- Five tests are `#[ignore]`d because they have real side effects: one opens
   Finder, one spawns a real login shell, one reads your own checkout to measure
   census cost, and `serves_the_ui_for_manual_inspection` serves the real web UI
   on port 4899 with a known API token so the desktop UI can be looked at
-  without a Tauri build (its doc comment has the two console lines you need).
+  without a Tauri build (its doc comment has the two console lines you need),
+  and `live_tier_runs_one_scenario_against_a_real_provider` calls a real
+  provider over the network and needs credentials.
   Keep that convention: anything that touches the user's desktop, spawns a
-  shell, binds a port, or reads their repository should be `#[ignore]`d with a
-  doc comment saying how to run it manually.
+  shell, binds a port, reaches the network, or reads their repository should be
+  `#[ignore]`d with a doc comment saying how to run it manually.
 - `DAMAIAN_MOCK_MODEL_RESPONSE="..."` makes model-dependent paths testable with
   no API key and no network. Prefer it over mocking HTTP.
 - `DAMAIAN_DATA_DIR=.damaian` keeps app data inside the workspace instead of

@@ -43,6 +43,11 @@ pub fn run_tier(tier: Tier) -> Result<report::Report> {
         let mut record = run.record.clone();
         if record.not_applicable.is_none() {
             record.assertions = assertions::evaluate(&run, &scenario.asserts, tier, &patch_paths);
+            // Sanitized again *here*, after the assertions are attached. The
+            // pass inside `runner::drive` runs before this point, so it sees an
+            // empty assertion list — leaving assertion text as the one route by
+            // which a secret could reach the report and the committed baseline.
+            record.sanitize(&workspace_engine::SecretScanner::default());
         }
         records.push(record);
     }

@@ -987,3 +987,93 @@ fn a_rate_with_no_observations_is_not_reported_as_zero() {
         other => panic!("a rate with no checks must not be a number, got {other:?}"),
     }
 }
+
+/// Ignored by default so CI never needs credentials (§6). Run it explicitly:
+///
+/// ```text
+/// DAMAIAN_EVAL_PROVIDER=deepseek DAMAIAN_EVAL_MODEL=deepseek-v4-flash \
+///   cargo test -p eval-harness --locked -- --ignored live_tier
+/// ```
+///
+/// The live tier has not been exercised against a real provider — see the note
+/// on `runner::run_live`. This test is how you do that.
+#[test]
+#[ignore = "needs provider credentials and network"]
+fn live_tier_runs_one_scenario_against_a_real_provider() {
+    let path = scenario::scenarios_dir().join("file_references.toml");
+    let loaded = scenario::load(&path).expect("scenario");
+    let run = eval_harness::runner::run_live(&loaded).expect("live run");
+
+    assert!(!run.record.provider.is_empty());
+    assert_eq!(run.record.tier, "live");
+    assert!(
+        !run.record.tokens.measured,
+        "no token source exists until spec 19"
+    );
+    assert!(
+        run.record.model_calls > 0,
+        "a live run must actually call the provider"
+    );
+}
+
+/// The live tier must refuse to run rather than fall back to something local
+/// when its credentials are absent — a silent fallback would report live-tier
+/// numbers that were never measured against a provider.
+#[test]
+fn the_live_tier_refuses_without_credentials() {
+    if std::env::var("DAMAIAN_EVAL_PROVIDER").is_ok() {
+        return; // a real live run is configured; nothing to assert here
+    }
+    let path = scenario::scenarios_dir().join("file_references.toml");
+    let loaded = scenario::load(&path).expect("scenario");
+
+    let error = eval_harness::runner::run_live(&loaded)
+        .expect_err("the live tier must refuse without DAMAIAN_EVAL_PROVIDER");
+    assert!(
+        format!("{error:?}").contains("DAMAIAN_EVAL_PROVIDER"),
+        "the refusal should name what is missing, got: {error:?}"
+    );
+}
+
+/// The acceptance criterion in full: the seeded value must appear in no run
+/// record, **report**, log, or baseline. Every other secret test checks a single
+/// `RunRecord` straight out of the runner — which is not the same object. The
+/// report is built later, with the evaluated assertions attached, and that is
+/// what gets committed as `evals/baseline.json`.
+///
+/// This is not hypothetical. The first generated baseline contained the seeded
+/// key, because the `absent_everywhere` assertion quoted the needle in its own
+/// `expected` text — the assertion asserting the secret had not escaped was
+/// what let it escape.
+#[test]
+fn the_seeded_secret_reaches_neither_the_report_nor_the_baseline() {
+    let built = eval_harness::run_tier(Tier::Deterministic).expect("tier should run");
+
+    let json = report::to_json(&built).expect("json report");
+    assert!(
+        !json.contains(FAKE_AWS_KEY),
+        "the seeded key reached the JSON report, which is what evals/baseline.json holds"
+    );
+
+    let text = report::to_text(&built);
+    assert!(
+        !text.contains(FAKE_AWS_KEY),
+        "the seeded key reached the text report"
+    );
+
+    // And the scenario that seeds it still genuinely asserted its absence,
+    // so this is not passing because the check quietly stopped running.
+    let seeded = built
+        .records
+        .iter()
+        .find(|record| record.scenario == "seeded_secret")
+        .expect("the seeded_secret scenario should be in the report");
+    assert!(
+        seeded
+            .assertions
+            .iter()
+            .any(|one| one.name == "absent_everywhere" && one.passed && !one.skipped),
+        "seeded_secret must still evaluate absent_everywhere, got {:?}",
+        seeded.assertions
+    );
+}

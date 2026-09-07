@@ -2,15 +2,17 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::{
-    AgentCommandProposal, AgentPatchProposal, CancelToken, ClientError, Config, MockModelAdapter,
-    ModelProviderConfig, Result, SecretScanner, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
+    AgentCommandProposal, AgentPatchProposal, CancelToken, ClientError, Config, CurlModelTransport,
+    MockModelAdapter, ModelAdapter, ModelProviderConfig, OpenAICompatibleAdapter, Result,
+    SecretScanner, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
 };
 
-use crate::fixture;
+use crate::fixture::{self, Materialized};
 use crate::record::{RecordedApproval, RecordedCheck, RecordedToolCall, RunRecord, Tokens};
 use crate::scenario::{Scenario, Tier};
 use crate::trace::Trace;
 
+#[derive(Debug)]
 pub struct Run {
     pub record: RunRecord,
     pub repo_root: PathBuf,
@@ -43,47 +45,23 @@ pub fn mock_provider() -> ModelProviderConfig {
     }
 }
 
+/// The deterministic tier: a scripted `MockModelAdapter`, no credentials and no
+/// network.
 pub fn run(scenario: &Scenario) -> Result<Run> {
     if scenario.tier != Tier::Deterministic {
         return Err(ClientError::InvalidInput(format!(
-            "{}: runner::run drives the deterministic tier; the live tier has its own entry point",
+            "{}: runner::run drives the deterministic tier; use run_live for the live tier",
             scenario.name
         )));
     }
-
-    // A blocked scenario is skipped before anything is materialized: it measures
-    // a capability that does not exist, so running it would either fail for the
-    // wrong reason or pass without measuring anything.
-    if let Some(blocking) = &scenario.blocked_on {
-        let mut skipped = RunRecord::new(
-            &scenario.name,
-            "n/a",
-            scenario.tier.as_str(),
-            "none",
-            "none",
-        );
-        skipped.final_status = "not_applicable".to_string();
-        skipped.not_applicable = Some(blocking.clone());
-        return Ok(Run {
-            record: skipped,
-            repo_root: PathBuf::new(),
-            data_dir: PathBuf::new(),
-            response: String::new(),
-            context_files: Vec::new(),
-            command_proposal: None,
-            patch_proposal: None,
-            apply_error: None,
-            trace: Trace::default(),
-        });
+    if let Some(skipped) = skip_if_blocked(scenario) {
+        return Ok(skipped);
     }
 
     let materialized = fixture::materialize(&scenario.fixture)?;
-    let mut config = Config {
-        data_dir: materialized.data_dir.clone(),
-        model_provider: "mock".to_string(),
-        model_name: "mock".to_string(),
-        ..Config::default()
-    };
+    let mut config = base_config(&materialized);
+    config.model_provider = "mock".to_string();
+    config.model_name = "mock".to_string();
     config.model_providers.push(mock_provider());
     let scanner = SecretScanner::new(config.secret_patterns.clone());
     let engine = WorkspaceEngine::new(config);
@@ -91,16 +69,133 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
     let (responses, tool_calls, truncated) = script(scenario);
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(responses, tool_calls)
         .with_truncated(truncated);
-    let mut on_token = |_token: &str| {};
 
+    drive(
+        scenario,
+        &materialized,
+        &engine,
+        &scanner,
+        &mut adapter,
+        "deterministic",
+        "mock",
+        "mock",
+    )
+}
+
+/// The live tier: the same scenario files against a real provider, **ignoring
+/// the `[[turn]]` scripts** and keeping the `[assert]` block (§5.3).
+/// Credential-gated and never run by CI.
+///
+/// NOT VERIFIED against a real provider. It is built from the CLI's own live
+/// path (`crates/damaian-cli/src/main.rs:313`), which is the shape that ships,
+/// but this session had no credentials and must not make network calls. Run the
+/// `#[ignore]`d `live_tier_runs_one_scenario_against_a_real_provider` test
+/// before trusting it.
+pub fn run_live(scenario: &Scenario) -> Result<Run> {
+    if let Some(skipped) = skip_if_blocked(scenario) {
+        return Ok(skipped);
+    }
+
+    let provider = std::env::var("DAMAIAN_EVAL_PROVIDER").map_err(|_| {
+        ClientError::InvalidInput(
+            "the live tier needs DAMAIAN_EVAL_PROVIDER (and that provider's API-key variable); \
+             it is never run by CI"
+                .to_string(),
+        )
+    })?;
+    let model = std::env::var("DAMAIAN_EVAL_MODEL").map_err(|_| {
+        ClientError::InvalidInput("the live tier needs DAMAIAN_EVAL_MODEL".to_string())
+    })?;
+
+    let materialized = fixture::materialize(&scenario.fixture)?;
+    let mut config = base_config(&materialized);
+    config.model_provider = provider.clone();
+    config.model_name = model.clone();
+    // Fills `model_base_url` and `model_api_key_env` from the provider entry,
+    // which is what the CLI and the desktop shell both rely on before building
+    // a transport.
+    config.apply_model_provider_defaults();
+
+    let api_key = std::env::var(&config.model_api_key_env).map_err(|_| {
+        ClientError::InvalidInput(format!(
+            "{} is required for the live tier",
+            config.model_api_key_env
+        ))
+    })?;
+    let transport = CurlModelTransport::new(&config.model_base_url, api_key);
+    let scanner = SecretScanner::new(config.secret_patterns.clone());
+    let mut adapter = OpenAICompatibleAdapter::with_provider(&provider, &model, transport);
+    let engine = WorkspaceEngine::new(config);
+
+    drive(
+        scenario,
+        &materialized,
+        &engine,
+        &scanner,
+        &mut adapter,
+        "live",
+        &provider,
+        &model,
+    )
+}
+
+/// A blocked scenario is skipped before anything is materialized: it measures a
+/// capability that does not exist, so running it would either fail for the wrong
+/// reason or pass without measuring anything.
+fn skip_if_blocked(scenario: &Scenario) -> Option<Run> {
+    let blocking = scenario.blocked_on.as_ref()?;
+    let mut skipped = RunRecord::new(
+        &scenario.name,
+        "n/a",
+        scenario.tier.as_str(),
+        "none",
+        "none",
+    );
+    skipped.final_status = "not_applicable".to_string();
+    skipped.not_applicable = Some(blocking.clone());
+    Some(Run {
+        record: skipped,
+        repo_root: PathBuf::new(),
+        data_dir: PathBuf::new(),
+        response: String::new(),
+        context_files: Vec::new(),
+        command_proposal: None,
+        patch_proposal: None,
+        apply_error: None,
+        trace: Trace::default(),
+    })
+}
+
+fn base_config(materialized: &Materialized) -> Config {
+    Config {
+        data_dir: materialized.data_dir.clone(),
+        ..Config::default()
+    }
+}
+
+/// Drives one turn and builds its record. Shared by both tiers so there is one
+/// implementation of "what a run record means" rather than two that drift.
+#[allow(clippy::too_many_arguments)]
+fn drive(
+    scenario: &Scenario,
+    materialized: &Materialized,
+    engine: &WorkspaceEngine,
+    scanner: &SecretScanner,
+    adapter: &mut dyn ModelAdapter,
+    tier: &str,
+    provider: &str,
+    model: &str,
+) -> Result<Run> {
+    let mut on_token = |_token: &str| {};
     let started_at_ms = now_millis();
     let outcome = engine.chat_orchestrator.ask(
         &materialized.root,
         &scenario.prompt,
         &[],
-        &mut adapter,
+        adapter,
         &mut on_token,
     );
+
     // Captured before any resume: the resumed turn does not carry the proposal
     // that stopped the original one, and `approval_required` asserts on it.
     let original_command_proposal = outcome
@@ -127,7 +222,7 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
             &proposal.id,
             approved,
             "eval-harness",
-            &mut adapter,
+            adapter,
             &mut sink,
         ));
     }
@@ -169,16 +264,16 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
     }
 
     let trace = Trace::read(&materialized.data_dir)?;
-    let mut run_record = RunRecord::new(
-        &scenario.name,
-        &materialized.version,
-        "deterministic",
-        "mock",
-        "mock",
-    );
+    let mut run_record =
+        RunRecord::new(&scenario.name, &materialized.version, tier, provider, model);
     run_record.started_at_ms = started_at_ms;
     run_record.duration_ms = duration_ms;
-    run_record.model_calls = adapter.requests.len() as u64;
+    // From the trace rather than a `MockModelAdapter`'s recorded requests, so
+    // both tiers count the same way. Verified equal to `adapter.requests.len()`
+    // on the deterministic scenarios (9/9, 2/2, 2/2). Note that
+    // `model_response_completed` is NOT a substitute: it fires once per turn,
+    // not once per call.
+    run_record.model_calls = trace.count("model_request_prepared");
     run_record.tool_rounds = scenario
         .turns
         .iter()
@@ -258,7 +353,7 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
     // Tool-call outcomes: scripted name, outcome from whether the turn survived.
     // A finer-grained per-call outcome would need an engine-side event that does
     // not exist; recording the turn's outcome is honest, and the tool-error
-    // metric in §5.6 reads it.
+    // metric in §5.6 reads it. The live tier has no script, so it records none.
     let turn_ok = outcome.is_ok();
     for turn in &scenario.turns {
         for call in &turn.tool_calls {
@@ -292,7 +387,7 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
             "awaiting_approval".to_string(),
             String::new(),
             Vec::new(),
-            None,
+            original_command_proposal.clone(),
             None,
         ),
         // A refusal is a first-class outcome, not a harness failure: three
@@ -321,12 +416,12 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
         measured: false,
     };
     run_record.cost = None;
-    run_record.sanitize(&scanner);
+    run_record.sanitize(scanner);
 
     Ok(Run {
         record: run_record,
-        repo_root: materialized.root,
-        data_dir: materialized.data_dir,
+        repo_root: materialized.root.clone(),
+        data_dir: materialized.data_dir.clone(),
         response,
         context_files,
         command_proposal,

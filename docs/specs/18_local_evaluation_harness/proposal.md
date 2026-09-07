@@ -1,6 +1,11 @@
 # Feature Spec: Local Evaluation Harness and Metric Baseline
 
-Status: Not started
+Status: Done. Twelve of the thirteen scenarios in §5.4 run and pass; the resume
+scenario is committed as `blocked_on = "spec-17"` and reports
+`notApplicable: "spec-17"` in every run. The deterministic tier takes **2.8s**
+standalone and runs inside `cargo test --workspace --locked`, adding no
+quality-gate command. `evals/baseline.json` is committed after review. The live
+tier is implemented but **not yet verified against a real provider** — see §7.
 Order: 18 of 19
 Roadmap: `docs/ROADMAP/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 4 (Must). That directory is local-only and not committed, so the
@@ -297,11 +302,66 @@ should run it.
 
 ## 7. Implementation Notes
 
-To be completed during implementation. Record:
+**Baseline review.** `evals/baseline.json` was read metric by metric and approved
+by Damijan Cavar on 2026-09-07, then committed on its own. Its first generation
+was rejected — see "What the review gate caught" below.
 
-- The baseline commit, and who reviewed it.
-- Fixture repositories created, their sizes, and their versions.
-- Deterministic-tier runtime, since it now runs inside every `cargo test` and a
-  slow harness will be the first thing someone disables.
-- For the two human-sourced metrics: the sample size behind the first value, or
-  the reason it is `null`.
+**Fixtures.** One: `rust-workspace`, at **version 4**, 15 files, 60K. Built up
+across three tasks — an upload client and a checkout helper, then six distractor
+modules so a retrieval assertion measures ranking rather than presence, then
+scoped `AGENTS.md` files and two credential-bearing files. The two credentials
+are deliberately different: `secrets/api_token.txt` is covered by
+`DEFAULT_RESTRICTED_PATTERNS` so a read is refused, while
+`src/telemetry_config.rs` is readable so the seeded value reaches context and
+must be *redacted*. A single `.env` could serve neither purpose — it is both
+restricted by default and excluded by `.gitignore`.
+
+**Deterministic-tier runtime.** **2.8s** standalone. Inside
+`cargo test --workspace --locked` the harness's own test binary takes ~20s for 43
+tests, most of which materialize a fixture and drive a full turn. Well short of
+the point where someone would disable it, but it is the figure to watch: this
+tier runs on every test invocation.
+
+**The two human-sourced metrics are `null`, with reasons.** No live-tier runs
+have been performed, so there is no sample to draw from. `manual_repair_rate`
+and `patch_acceptance_rate` both require a human judgement as their only input,
+and a computed value for either would be a fiction that later phases compare
+against. They are recorded as `null` with an explicit reason rather than as zero.
+
+**The live tier is unverified.** `runner::run_live` is implemented from the CLI's
+own live path (`crates/damaian-cli/src/main.rs:313`), which is the shape that
+ships, but no session has run it against a real provider — this one had no
+credentials and could not make network calls. Run
+`live_tier_runs_one_scenario_against_a_real_provider` before trusting it. Its
+companion `the_live_tier_refuses_without_credentials` does run in CI, and asserts
+the tier refuses rather than silently falling back to something local, which
+would report live-tier numbers that were never measured.
+
+### What the review gate caught
+
+The first generated baseline **contained the seeded AWS key**, violating §6's
+"appears in no run record, report, log, or baseline". Two stacked causes:
+
+1. The `absent_everywhere` assertion quoted the needle in its own `expected`
+   text. The assertion proving the secret had not escaped was what let it
+   escape.
+2. `RunRecord::sanitize` does redact assertion text, but it ran inside
+   `runner::drive` — *before* `run_tier` attaches the evaluated assertions. That
+   pass had been operating on an empty vector since the record was written.
+
+Both fixed, and mutation-tested: with both removed the new
+`the_seeded_secret_reaches_neither_the_report_nor_the_baseline` fails with the
+right message; with either restored it passes. Every prior secret test checked a
+`RunRecord` straight out of the runner, which is a different object from the one
+that gets committed — that gap is why nothing failed.
+
+This is the strongest argument for §5.7's review gate being a real stop rather
+than a formality: the harness was green, every scenario passed, and the artifact
+it produced was still wrong.
+
+### Defects this harness found in shipped code
+
+- **A top-level `secrets/` or `credentials/` directory was unrestricted.** Found
+  by `restricted_path` on its first run. Fixed in
+  `crates/workspace-engine/src/config.rs`; full detail in
+  [`tasks.md`](tasks.md#defects-this-harness-found-while-being-built).
