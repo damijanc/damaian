@@ -1,6 +1,12 @@
 # Feature Spec: Composer Control Density
 
-Status: Not started.
+Status: Done. Composer at rest **149px → 129px** at 1280×800, and the 58px
+right gutter every line paid is gone — text now reaches within 13px of the box
+edge. Usable text went 39px → 41px, a clean two rows instead of 1.92. Attach
+and send 38px → 26px; the 220px fixed model pill became two content-sized
+triggers, 81px and 66px at the default model. The effort label can no longer be
+truncated away. Four corrections the implementation forced are recorded in
+[`tasks.md`](tasks.md) under Corrections.
 Order: 44 of 44
 Also in this spec: [`context.md`](context.md) (motivation, current state, and
 the two defects this redesign resolves), [`tasks.md`](tasks.md) (execution
@@ -31,9 +37,9 @@ the input field rather than beside it.
 2. Attach, model, effort and send sit in one content-sized row below the prompt
    box, in that visual and DOM order.
 3. Model and effort are separate triggers. Neither can truncate the other.
-4. The model trigger sizes to its content up to `min(340px, 40%)` of the action
-   row's width, truncates from the right beyond that, and carries the full
-   model id in `title`.
+4. The model trigger sizes to its content up to 340px, truncates from the
+   right beyond that, and carries the full model id in `title`. The cap is
+   absolute, not a percentage — see [`tasks.md`](tasks.md) Corrections §1.
 5. Send remains the Stop control while a turn is running, in place, and is the
    only filled control in the row.
 6. Pinned context chips render inside the prompt box, above the textarea, and
@@ -181,8 +187,10 @@ today; #31's mode control is the expected third.
    edge — the 58px gutter is gone.
 3. With `deepseek-v4-flash` selected, the model trigger shows the id in full
    and the effort label is fully legible beside it.
-4. With a 42-character id selected, the trigger ellipsizes, `title` holds the
-   full id, and the popover's Model row shows it in full.
+4. An id too long for the 340px cap ellipsizes, `title` holds the full id, and
+   the popover's Model row shows it in full. (Drafted as "a 42-character id";
+   42 characters measures 312px and renders in full, which is the generous cap
+   working as intended. Verified with a 63-character id.)
 5. Selecting a longer model id does not move the send button.
 6. Tab from the textarea reaches attach, model, effort, send in that order,
    each with a visible focus ring.
@@ -192,7 +200,9 @@ today; #31's mode control is the expected third.
 8. `Escape` and an outside click still dismiss both popovers.
 9. During a turn, send reads as Stop in place and cancels the turn; attach,
    model and effort stay operable.
-10. With no repository selected and an empty prompt, send is disabled.
+10. An empty prompt is refused at submit time with `Prompt is required`.
+    (Drafted as "send is disabled", which was a wrong claim about existing
+    behaviour — see [`tasks.md`](tasks.md) Corrections §3.)
 11. Pinning four files renders chips inside the box; unpinning all of them
     returns the composer to its at-rest height exactly.
 12. `npm run lint:web` passes clean, and the specimen page renders the action

@@ -292,6 +292,89 @@
           <button type="button" class="btn-icon" aria-label="More actions">⋯</button>
           <button type="button" class="btn-icon" aria-label="More actions" disabled>⋯</button>
         </span>
+
+        <span class="sg-rowlabel">.btn-trigger</span>
+        <span class="sg-row">
+          <button type="button" class="btn-trigger">
+            <span class="bolt-icon" aria-hidden="true"></span>
+            <span class="model-menu-summary">gpt-4.1</span>
+            <span class="menu-caret" aria-hidden="true"></span>
+          </button>
+          <button type="button" class="btn-trigger" aria-expanded="true">
+            <span>Extra High</span>
+            <span class="menu-caret" aria-hidden="true"></span>
+          </button>
+          <button type="button" class="btn-trigger model-trigger" title="us.anthropic.claude-sonnet-4-20250514-v1:0-preview-experimental">
+            <span class="bolt-icon" aria-hidden="true"></span>
+            <span class="model-menu-summary"
+              >us.anthropic.claude-sonnet-4-20250514-v1:0-preview-experimental</span
+            >
+            <span class="menu-caret" aria-hidden="true"></span>
+          </button>
+        </span>
+      </div>
+      <p class="sg-note">
+        <code>.btn-trigger</code> labels itself with its current value rather than a verb, and
+        never takes a fill — the second one above is shown open. The third is capped at 340px by
+        <code>.model-trigger</code> and truncates from the right, with the full string on
+        <code>title</code>.
+      </p>
+    </section>
+
+    <section class="sg-section">
+      <h2>Composer action row</h2>
+      <p class="sg-hint">
+        The standard footer control row: quiet triggers and glyphs left, the one filled action
+        right. Nothing is positioned over the field above it.
+      </p>
+      <div class="prompt-box">
+        <textarea rows="2" placeholder="Ask a question or request a file change"></textarea>
+      </div>
+      <div class="composer-actions">
+        <div class="attach-menu">
+          <button type="button" class="attach-menu-button" aria-label="Add to context">
+            <span class="attach-icon" aria-hidden="true"></span>
+          </button>
+        </div>
+        <div class="model-menu">
+          <button type="button" class="btn-trigger model-trigger" title="gpt-4.1">
+            <span class="bolt-icon" aria-hidden="true"></span>
+            <span class="model-menu-summary">gpt-4.1</span>
+            <span class="menu-caret" aria-hidden="true"></span>
+          </button>
+          <button type="button" class="btn-trigger effort-trigger" title="Reasoning effort">
+            <span>Extra High</span>
+            <span class="menu-caret" aria-hidden="true"></span>
+          </button>
+        </div>
+        <button type="button" class="send-button" aria-label="Send message">
+          <span class="send-icon" aria-hidden="true"></span>
+        </button>
+      </div>
+      <p class="sg-note">
+        Mid-turn the same button becomes Stop in place — same size, same position, so the control
+        never moves under the pointer:
+      </p>
+      <div class="composer-actions">
+        <div class="attach-menu">
+          <button type="button" class="attach-menu-button" aria-label="Add to context">
+            <span class="attach-icon" aria-hidden="true"></span>
+          </button>
+        </div>
+        <div class="model-menu">
+          <button type="button" class="btn-trigger model-trigger" title="gpt-4.1">
+            <span class="bolt-icon" aria-hidden="true"></span>
+            <span class="model-menu-summary">gpt-4.1</span>
+            <span class="menu-caret" aria-hidden="true"></span>
+          </button>
+          <button type="button" class="btn-trigger effort-trigger" title="Reasoning effort">
+            <span>Extra High</span>
+            <span class="menu-caret" aria-hidden="true"></span>
+          </button>
+        </div>
+        <button type="button" class="send-button is-stopping" aria-label="Stop generating">
+          <span class="send-icon" aria-hidden="true"></span>
+        </button>
       </div>
     </section>
 

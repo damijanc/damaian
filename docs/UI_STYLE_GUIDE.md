@@ -104,6 +104,7 @@ scale.
 | `.btn-quiet` | Transparent border and background, `--muted` text | Dismiss, cancel, reject |
 | `.btn-danger` | Transparent, `--danger` text | Delete, remove, revoke |
 | `.btn-icon` | Transparent, `5px 8px`, glyph only | Overflow `⋯`, close, small toggles |
+| `.btn-trigger` | 12px / 600 / `5px 6px`, transparent, `--muted` label, caret | Opens a popover from an action row; the label is the current value |
 
 **Rules**
 
@@ -113,8 +114,15 @@ scale.
   the colour makes it findable, the dialog is what actually protects the user.
   Never give it a fill: that would make Remove the loudest control on the page
   and invert the hierarchy.
+- `.btn-trigger` is the one step whose label is a **value, not a verb** — a
+  model id, an effort level, a mode. It never takes a fill in any state; hover
+  and open shade the background only. In an action row the filled control is
+  the action, and a setting must not outweigh it. Its label never wraps, and a
+  trigger whose value can be arbitrarily long caps its width and truncates
+  rather than pushing the row around.
 - Every interactive control is at least 24×24 CSS px. `.btn-sm` at 12px text
   computes to roughly 29px tall — do not shrink its padding further.
+  `.btn-trigger` computes to 27px on the same arithmetic.
 - Border radius stays at the existing 8px across all steps. The scale changes
   size and weight, not shape.
 - Focus is always visible: `box-shadow: 0 0 0 3px var(--accent-soft)` with
@@ -161,6 +169,18 @@ shape as `.command-approval-actions` and `.patch-actions`. Use it anywhere a
 group of buttons sits together. It was a `1fr 1fr` grid until spec 43, which
 produced 456px buttons in settings and wrapped any third button onto its own
 line.
+
+**Footer control rows** — `.composer-actions` is the shape for a row of
+controls that belongs to the surface *above* it rather than to a card. Glyph
+buttons and `.btn-trigger` settings on the left, the single filled action on
+the right, pushed there by `margin-right: auto` on the last item of the left
+group. Two rules matter:
+
+- **The controls sit below the field, never over it.** See the §8
+  anti-pattern.
+- **The action anchors the right edge and does not move.** Settings grow
+  leftward as their values lengthen, so the button the user aims at is always
+  in the same place — including when it changes into Stop mid-turn.
 
 ---
 
@@ -238,6 +258,8 @@ Each of these existed in the shell and was removed. Do not reintroduce them.
 | Full paths as full-size buttons | Maximum visual weight for reference information. Reference lists are quiet links, truncated from the left so the filename survives |
 | Horizontally scrolled command under review | User approves what they cannot see |
 | Escalating and one-shot actions at equal weight | Mis-click cost is not symmetric |
+| Controls positioned over the field they displace | The field then pays for them in padding it cannot use. The composer's textarea reserved 70px of height and 58px of *every line* to keep text clear of three floating controls — 41px of text inside a 111px field, and text stopping 59px short of the edge on every row. The `@media` block holding that layout together at narrow widths was three rules whose only job was to stop it colliding. Controls belong in a row of their own |
+| Two values sharing one truncating label | Whichever is last is the one that disappears. `model + effort` in one 220px pill rendered `claude-3-5-sonnet-202…` — the effort still in force and readable nowhere but the popover. One trigger per value |
 
 ---
 

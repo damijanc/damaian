@@ -1117,12 +1117,19 @@ button:disabled {
   padding: 14px clamp(18px, 5vw, 72px) 18px;
 }
 
+/* Pinned files sit inside the prompt box, above the text, because they
+   describe the message about to be sent rather than the application (§1.1 of
+   the style guide). Capped and scrolled rather than growing without bound. */
 .composer-context {
+  max-height: 92px;
+  overflow-y: auto;
   display: grid;
   gap: 8px;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 
+/* An author `display` beats the UA `[hidden]` rule, so this is required or the
+   strip stays on screen while every scripted check reports it hidden. */
 .composer-context[hidden] {
   display: none;
 }
@@ -1296,33 +1303,68 @@ button:disabled {
   white-space: nowrap;
 }
 
+/* The box owns the frame, not the textarea: pinned files and the text have to
+   sit inside one border together. The textarea goes transparent and
+   borderless, and the focus ring moves to the box so focusing the text lights
+   the whole field. */
 .prompt-box {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 10px 12px;
 }
 
-/* Two rows at rest, growing with content. The floor is 2 x 20.3px of text
-   plus the 70px of padding that keeps the text clear of the attach, model and
-   send controls positioned over the bottom of the field. `max-height` is the
-   cap; `autoGrowPrompt` sets the height between the two, and the browser
-   clamps it here, so the cap still holds if that never runs. */
+.prompt-box:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* Two rows at rest, growing with content. `max-height` is the cap;
+   `autoGrowPrompt` sets the height between the two, and the browser clamps it
+   here, so the cap still holds if that never runs. `box-sizing` is border-box
+   globally, and the box owns the padding, so `min-height` is pure text: two
+   20.3px rows. No control is positioned over the field, so there is no
+   clearance to reserve on any side. */
 .prompt-box textarea {
-  min-height: 111px;
+  min-height: 41px;
   max-height: 40vh;
-  padding: 14px 58px 56px 14px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
   font-family: inherit;
   resize: none;
 }
 
+/* The box draws the focus ring for it. */
+.prompt-box textarea:focus {
+  border-color: transparent;
+  box-shadow: none;
+}
+
+/* Controls sit below the box, not over it. Attach takes `margin-right: auto`
+   directly — there is no wrapper — which is what pushes the model group and
+   send to the right edge. A working-mode control (spec 31) becomes attach's
+   sibling here, and the auto margin moves to whichever is last in the group. */
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+
 .attach-menu {
-  position: absolute;
-  left: 12px;
-  bottom: 12px;
+  position: relative;
+  margin-right: auto;
   z-index: 20;
 }
 
 .attach-menu-button {
-  width: 38px;
-  height: 38px;
+  width: 26px;
+  height: 26px;
   display: grid;
   place-items: center;
   border: 1px solid #d8d8d5;
@@ -1340,8 +1382,8 @@ button:disabled {
 
 .attach-icon {
   position: relative;
-  width: 14px;
-  height: 14px;
+  width: 12px;
+  height: 12px;
   display: block;
 }
 
@@ -1353,17 +1395,17 @@ button:disabled {
 }
 
 .attach-icon::before {
-  left: 6px;
+  left: 5px;
   top: 0;
   width: 2px;
-  height: 14px;
+  height: 12px;
   border-radius: 2px;
 }
 
 .attach-icon::after {
   left: 0;
-  top: 6px;
-  width: 14px;
+  top: 5px;
+  width: 12px;
   height: 2px;
   border-radius: 2px;
 }
@@ -1371,7 +1413,7 @@ button:disabled {
 .attach-popover {
   left: -1px;
   right: auto;
-  bottom: 48px;
+  bottom: calc(100% + 6px);
   width: min(200px, calc(100vw - 32px));
   display: grid;
   gap: 2px;
@@ -1413,39 +1455,64 @@ button:disabled {
   padding: 2px 6px;
 }
 
+/* Holds both triggers and the one shared popover, so the outside-click test in
+   `app.js` (`#chat-model-menu.contains(target)`) covers all of it. */
 .model-menu {
-  position: absolute;
-  right: 60px;
-  bottom: 12px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
   z-index: 20;
 }
 
-.model-menu-button {
-  width: min(220px, 42vw);
-  height: 38px;
+/* A control whose label *is* its current value, sized to that value. Never
+   takes a fill in any state: a fill here would make a setting the loudest
+   thing in the action row instead of send. Hover and open shade the
+   background only. */
+.btn-trigger {
+  min-width: 0;
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  gap: 7px;
-  border-color: #d8d8d5;
-  border-radius: 999px;
-  background: #f4f4f1;
-  color: #1f2428;
-  font-size: 13px;
-  font-weight: 500;
-  padding: 0 12px;
-  box-shadow: 0 1px 2px rgba(31, 36, 40, 0.05);
+  gap: 5px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 6px;
+  box-shadow: none;
+  white-space: nowrap;
 }
 
-.model-menu-button:hover,
-.model-menu-button[aria-expanded="true"] {
-  border-color: #c9c9c5;
-  background: #eeeeea;
+.btn-trigger:hover,
+.btn-trigger[aria-expanded="true"] {
+  background: #f0f0ed;
+  color: var(--ink);
+}
+
+/* Sizes to the model id, up to a cap generous enough that realistic ids render
+   in full; only pathological ones ellipsize, and `title` carries the whole
+   string when they do. The cap is absolute rather than a percentage: the
+   trigger's containing block is content-sized, so a percentage would resolve
+   against its own width and collapse the label. Narrow windows are handled by
+   flex-shrink instead, which is why the label span sets `min-width: 0`. */
+.model-trigger {
+  max-width: 340px;
+  flex: 0 1 auto;
+}
+
+/* Fixed vocabulary, and the one label that must never be cut — losing it is
+   the defect this spec exists to fix. It refuses to shrink, so the model id
+   absorbs all the compression in a narrow row. */
+.effort-trigger {
+  flex: 0 0 auto;
 }
 
 .bolt-icon {
-  width: 12px;
-  height: 14px;
+  width: 10px;
+  height: 12px;
   flex: 0 0 auto;
   display: block;
   background: currentColor;
@@ -1455,17 +1522,17 @@ button:disabled {
 .model-menu-summary {
   min-width: 0;
   overflow: hidden;
-  color: #4d5154;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .menu-caret {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
   flex: 0 0 auto;
-  border-right: 1.5px solid #85898c;
-  border-bottom: 1.5px solid #85898c;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  opacity: 0.7;
   transform: rotate(45deg) translateY(-2px);
 }
 
@@ -1480,10 +1547,13 @@ button:disabled {
     0 2px 7px rgba(31, 36, 40, 0.08);
 }
 
+/* Opens upward from the action row, right-aligned to it. Both triggers share
+   this one element, so it is anchored to their container rather than to
+   either of them — no dynamic positioning needed. */
 .model-popover {
   position: absolute;
-  right: -50px;
-  bottom: 48px;
+  right: 0;
+  bottom: calc(100% + 6px);
   width: min(264px, calc(100vw - 32px));
 }
 
@@ -1674,13 +1744,13 @@ button:disabled {
   padding: 6px 9px;
 }
 
+/* The one filled control in the action row, and the only one whose weight
+   should draw the eye — it is also the Stop control mid-turn. */
 .send-button {
-  position: absolute;
-  right: 12px;
-  bottom: 12px;
-  width: 38px;
-  height: 38px;
+  width: 26px;
+  height: 26px;
   min-width: 0;
+  flex: 0 0 auto;
   display: grid;
   place-items: center;
   border: 0;
@@ -1701,17 +1771,17 @@ button:disabled {
 
 .send-icon {
   position: relative;
-  width: 18px;
-  height: 20px;
+  width: 13px;
+  height: 14px;
   display: block;
 }
 
 .send-icon::before {
   position: absolute;
-  left: 8px;
-  top: 3px;
+  left: 6px;
+  top: 2px;
   width: 2px;
-  height: 15px;
+  height: 11px;
   border-radius: 2px;
   background: currentColor;
   content: "";
@@ -1719,10 +1789,10 @@ button:disabled {
 
 .send-icon::after {
   position: absolute;
-  left: 3px;
-  top: 3px;
-  width: 10px;
-  height: 10px;
+  left: 2px;
+  top: 2px;
+  width: 8px;
+  height: 8px;
   border-top: 2px solid currentColor;
   border-left: 2px solid currentColor;
   content: "";
@@ -2859,18 +2929,6 @@ code.command-approval-command {
     padding-right: 14px;
   }
 
-  .model-menu {
-    right: 58px;
-  }
-
-  .model-menu-button {
-    width: min(196px, calc(100vw - 110px));
-  }
-
-  .model-popover {
-    right: -46px;
-  }
-
   .provider-fields {
     grid-template-columns: 1fr;
   }
@@ -2995,8 +3053,8 @@ code.command-approval-command {
 }
 
 .send-button.is-stopping .send-icon {
-  width: 11px;
-  height: 11px;
+  width: 10px;
+  height: 10px;
   border-radius: 2px;
   background: currentColor;
 }

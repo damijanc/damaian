@@ -9,10 +9,68 @@
 | Task | State | Notes |
 |---|---|---|
 | 0 · Baseline measurement | Done | Composer 980×149 at 1280×800. Two spec corrections: no `High` effort level exists, and the truncation defect is worse than drafted — effort is absent, not clipped |
-| 1 · Prompt box frame and chips | Not started | |
-| 2 · Action row and control sizes | Not started | |
-| 3 · Split triggers | Not started | |
-| 4 · Specimen page, guide and outcome | Not started | |
+| 1+2 · Prompt box frame, chips and action row | Done | **Merged.** Task 1's symmetric padding is only safe once the controls have moved out, so splitting them would have committed a state with text running under the controls. Composer 149→140px after the move, 129px once the triggers landed |
+| 3 · Split triggers | Done | Model 81px, effort 66px at the default model. Two defects found and fixed in the process — see Corrections §1 and §2 |
+| 4 · Specimen page, guide and outcome | Done | Guide gains `.btn-trigger`, the footer-row pattern in §4 and two anti-patterns in §8. Specimen page gains a `.btn-trigger` row and a Composer action row section, at rest and mid-turn |
+
+## Result
+
+Measured 2026-09-07 at 1280×800, same conditions as the baseline:
+
+| | Before | After |
+|---|---|---|
+| Composer at rest | 980×149 | **980×129** |
+| `.prompt-box` | 852×116 | 852×63 |
+| Action row | — (controls overlaid) | 852×27 |
+| Usable text height | 39px (1.92 rows) | **41px (2.02 rows)** |
+| Right gutter per line | 58px | **13px** (12px padding + 1px border) |
+| Attach | 38×38 | 26×26 |
+| Model control | 220×38 fixed | 81×27, content-sized (cap 340px) |
+| Effort control | none — folded into the pill | 66×27 |
+| Send | 38×38 | 26×26 |
+
+Every acceptance criterion verified in the running app. Notes on three:
+
+- **Criterion 2** reads "within 12px"; measured 13px, which is the 12px
+  padding plus the box's 1px border. The 58px gutter is what mattered.
+- **Criterion 5** holds exactly: send stays at x=1190 across model ids from 7
+  to 63 characters.
+- **Criterion 7** verified through the full sequence — open on root, switch to
+  Effort, close, reopen on Effort, switch back to root — with `aria-expanded`
+  tracking on both triggers throughout. Both report `true` while the shared
+  popover is open, which is accurate: both `aria-controls` the same element.
+
+## Corrections
+
+Four things the implementation found that the spec had wrong:
+
+1. **`min(340px, 40%)` collapsed the label to `g…`.** A percentage `max-width`
+   resolves against the containing block, which is the content-sized
+   `.model-menu` — circular, so it computed to almost nothing. The cap is now
+   an absolute 340px, with `flex-shrink` handling narrow rows instead. The
+   requirement and §3.4 are updated.
+2. **The effort label wrapped to two lines under compression**, taking the row
+   from 27px to 45px. Only `.model-menu-summary` had `white-space: nowrap`;
+   `Extra High` is two words. `nowrap` moved onto `.btn-trigger` itself, and
+   `.effort-trigger` now refuses to shrink (`flex: 0 0 auto`) so the model id
+   absorbs all compression — which is what requirement 3 actually asks for.
+3. **Criterion 10 asserted behaviour that never existed.** Send is not
+   disabled on an empty prompt and never was: `#ask-btn` starts disabled and is
+   enabled once bootstrap resolves *or* fails (`app.js:236`), gated on
+   bootstrap readiness rather than prompt content. An empty submit is refused
+   inside `sendChatPrompt` with `Prompt is required`. Criterion rewritten to
+   match; no behaviour changed, per `proposal.md` §2.
+4. **Criterion 4's 42-character id does not ellipsize.** It measures 312px,
+   under the 340px cap, so it renders in full — the generous cap working as
+   designed. The truncation path was verified with a 63-character id: capped at
+   exactly 340px, ellipsized, full string on `title` and in the popover.
+
+One thing checked and found **not** to be ours: at viewports under ~500px the
+page overflows horizontally. The cause is `#chat-status` rendering
+`Desktop API unavailable` at 166px in a browser-only session, which stretches
+`.thread-header`. In the packaged app that badge reads `Idle`. Confirmed by
+neutralising the badge, after which the composer row measures clean at 600px
+and 700px with a 42-character model id.
 
 ## Baseline
 

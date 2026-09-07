@@ -1647,9 +1647,15 @@ function chatModelFormFields() {
   };
 }
 
-function modelSummaryLabel(options = selectedChatModelOptions()) {
-  const model = options.model || "Configured";
-  return `${model} ${reasoningLabels[options.reasoning] || "Default"}`;
+// The two composer triggers label themselves with their own current value.
+// They were one combined string until spec 44, which is why a long model id
+// used to truncate the effort label away.
+function modelTriggerLabel(options = selectedChatModelOptions()) {
+  return options.model || "Configured";
+}
+
+function effortTriggerLabel(options = selectedChatModelOptions()) {
+  return reasoningLabels[options.reasoning] || "Default";
 }
 
 function modelOptionValues(provider) {
@@ -1660,7 +1666,12 @@ function modelOptionValues(provider) {
 
 function renderChatModelMenu() {
   const options = selectedChatModelOptions();
-  $("model-menu-summary").textContent = modelSummaryLabel(options);
+  const modelLabel = modelTriggerLabel(options);
+  $("model-menu-summary").textContent = modelLabel;
+  // The trigger caps its width, so the full id has to stay reachable. The
+  // popover's Model row below shows it in full too.
+  $("chat-model-menu-btn").title = modelLabel;
+  $("effort-menu-summary").textContent = effortTriggerLabel(options);
   $("model-provider-value").textContent = providerLabels[options.provider] || options.provider;
   $("model-name-value").textContent = options.model || "Configured";
   $("model-reasoning-value").textContent = reasoningLabels[options.reasoning] || "Default";
@@ -1752,9 +1763,20 @@ function modelOptionButton(label, selected, onClick) {
   return button;
 }
 
-function toggleModelMenu() {
+// Both composer triggers open this one popover, each on its own entry panel,
+// so `aria-expanded` has to be written to every trigger rather than to one
+// named id.
+function modelMenuTriggers() {
+  return document.querySelectorAll("#chat-model-menu [data-entry-panel]");
+}
+
+// Clicking the trigger whose panel is already showing closes the popover;
+// clicking the other one switches panel instead, so the two do not fight.
+function toggleModelMenu(panel = "root") {
   if ($("chat-model-popover").hidden) {
-    openModelMenu();
+    openModelMenu(panel);
+  } else if ($(`model-menu-${panel}`)?.hidden) {
+    showModelMenuPanel(panel);
   } else {
     closeModelMenu();
   }
@@ -1763,13 +1785,17 @@ function toggleModelMenu() {
 function openModelMenu(panel = "root") {
   renderChatModelMenu();
   $("chat-model-popover").hidden = false;
-  $("chat-model-menu-btn").setAttribute("aria-expanded", "true");
+  for (const trigger of modelMenuTriggers()) {
+    trigger.setAttribute("aria-expanded", "true");
+  }
   showModelMenuPanel(panel);
 }
 
 function closeModelMenu() {
   $("chat-model-popover").hidden = true;
-  $("chat-model-menu-btn").setAttribute("aria-expanded", "false");
+  for (const trigger of modelMenuTriggers()) {
+    trigger.setAttribute("aria-expanded", "false");
+  }
 }
 
 function toggleAttachMenu() {
@@ -4909,10 +4935,12 @@ $("chat-prompt").addEventListener("keydown", (event) => {
   void sendChatPrompt();
 });
 
-$("chat-model-menu-btn").addEventListener("click", (event) => {
-  event.stopPropagation();
-  toggleModelMenu();
-});
+for (const trigger of modelMenuTriggers()) {
+  trigger.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleModelMenu(trigger.dataset.entryPanel);
+  });
+}
 
 $("chat-model-popover").addEventListener("click", (event) => {
   event.stopPropagation();

@@ -117,15 +117,17 @@
         <section id="chat-log" class="chat-log" aria-live="polite"></section>
 
         <footer class="composer">
-          <div id="composer-context" class="composer-context" hidden>
-            <div id="pinned-context-files" class="pinned-context-files"></div>
-          </div>
           <div class="prompt-box">
+            <div id="composer-context" class="composer-context" hidden>
+              <div id="pinned-context-files" class="pinned-context-files"></div>
+            </div>
             <textarea
               id="chat-prompt"
               rows="2"
               placeholder="Ask a question or request a file change"
             ></textarea>
+          </div>
+          <div class="composer-actions">
             <input id="chat-provider" type="hidden" value="openai" />
             <input id="chat-model" type="hidden" />
             <input id="chat-reasoning" type="hidden" value="default" />
@@ -161,15 +163,28 @@
             <div id="chat-model-menu" class="model-menu">
               <button
                 id="chat-model-menu-btn"
-                class="model-menu-button"
+                class="btn-trigger model-trigger"
                 type="button"
                 aria-haspopup="menu"
                 aria-expanded="false"
                 aria-controls="chat-model-popover"
-                title="Model options"
+                data-entry-panel="root"
               >
                 <span class="bolt-icon" aria-hidden="true"></span>
                 <span id="model-menu-summary" class="model-menu-summary"></span>
+                <span class="menu-caret" aria-hidden="true"></span>
+              </button>
+              <button
+                id="chat-effort-menu-btn"
+                class="btn-trigger effort-trigger"
+                type="button"
+                aria-haspopup="menu"
+                aria-expanded="false"
+                aria-controls="chat-model-popover"
+                data-entry-panel="reasoning"
+                title="Reasoning effort"
+              >
+                <span id="effort-menu-summary"></span>
                 <span class="menu-caret" aria-hidden="true"></span>
               </button>
               <div id="chat-model-popover" class="model-popover" role="menu" hidden>
