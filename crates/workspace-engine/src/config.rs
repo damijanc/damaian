@@ -39,6 +39,16 @@ pub const DEFAULT_RESTRICTED_PATTERNS: &[&str] = &[
     "id_dsa",
     "id_ecdsa",
     "id_ed25519",
+    // Both the root-level and the nested form of each directory. `**/` requires
+    // at least one leading path segment, so `**/secrets/**` alone matches
+    // `nested/secrets/token` but *not* a top-level `secrets/token` — which is
+    // the more common layout. The `.env` entries above already pair a bare
+    // pattern with a `**/` one for the same reason; these two were missing their
+    // bare form, leaving a root `secrets/` or `credentials/` directory
+    // unprotected. Found by the spec 18 eval harness's `restricted_path`
+    // scenario, which now guards it.
+    "secrets/**",
+    "credentials/**",
     "**/secrets/**",
     "**/credentials/**",
 ];

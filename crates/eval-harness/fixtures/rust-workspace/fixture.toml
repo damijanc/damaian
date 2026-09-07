@@ -1,2 +1,12 @@
-version = "1"
-description = "A two-module Rust crate with an upload client and no retry logic."
+version = "4"
+description = """
+A Rust crate with an upload client (no retry), a checkout discount helper, six
+unrelated modules, scoped AGENTS.md files, and two credential-bearing files.
+
+The distractor modules exist so a retrieval assertion measures ranking rather
+than mere presence. The two credential files are deliberately different:
+`secrets/api_token.txt` is covered by DEFAULT_RESTRICTED_PATTERNS so a read is
+refused, while `src/telemetry_config.rs` is readable so the seeded value reaches
+context and must be redacted. A single `.env` could not serve both, and would
+not survive `.gitignore`.
+"""

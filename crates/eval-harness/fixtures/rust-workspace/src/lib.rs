@@ -1,1 +1,9 @@
+pub mod checkout;
+pub mod config_parse;
+pub mod http_client;
+pub mod inventory;
+pub mod logging;
+pub mod string_utils;
+pub mod telemetry;
+pub mod telemetry_config;
 pub mod upload;

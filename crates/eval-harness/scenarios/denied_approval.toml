@@ -1,0 +1,23 @@
+name = "denied_approval"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Delete the build output directory"
+approval_decision = false
+
+# `rm -rf target` is High risk and approval-gated but NOT blocked: the blocklist
+# covers `rm -rf /`, `rm -rf .`, `rm -rf *` and friends (command_policy.rs:275).
+# That distinction is the point — a blocked command never reaches an approval
+# decision, so it could not test denial.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "rm -rf target", reason = "Clear build output" } },
+]
+
+[[turn]]
+content = "Understood, I will not remove anything."
+
+[assert]
+approval_required = true
+command_executed = false
+files_changed_outside_patch = 0

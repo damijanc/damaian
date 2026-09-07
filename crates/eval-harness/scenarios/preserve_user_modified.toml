@@ -1,0 +1,31 @@
+name = "preserve_user_modified"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Add a retry to the upload client"
+
+# The user edits the same file between the preview and the apply. The patch must
+# be refused with a base_hash conflict rather than overwriting their work.
+[modify_after_proposal]
+path = "src/upload.rs"
+content = """
+// The user was editing this file while the patch was being prepared.
+pub fn upload(payload: &str) -> Result<(), String> {
+    let _ = payload;
+    Ok(())
+}
+"""
+
+[[turn]]
+content = "I added a retry loop."
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Retry uploads", files = [
+    { path = "src/upload.rs", status = "modified", content = """
+pub fn upload_with_retry(payload: &str) -> Result<(), String> {
+    upload(payload)
+}
+""" } ] } },
+]
+
+[assert]
+patch_applied = false
+approval_required = true

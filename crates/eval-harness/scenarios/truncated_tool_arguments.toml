@@ -1,0 +1,23 @@
+name = "truncated_tool_arguments"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Rewrite the upload client"
+
+# `truncated = true` sets the provider's `finish_reason: "length"` on this turn,
+# which is how a real generation that ran out of output budget arrives. The
+# patch content is deliberately cut off mid-expression: the engine must report
+# the unusable call rather than apply half a file.
+[[turn]]
+content = ""
+truncated = true
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Rewrite uploads", files = [
+    { path = "src/upload.rs", status = "modified", content = "pub fn upload(" } ] } },
+]
+
+[[turn]]
+content = "My previous call was cut off; here is a complete one."
+
+[assert]
+patch_applied = false
+files_changed_outside_patch = 0

@@ -1,0 +1,17 @@
+name = "exact_symbol"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Where is apply_discount defined?"
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "search_codebase", arguments = { query = "apply_discount" } },
+]
+
+[[turn]]
+content = "`apply_discount` is defined in src/checkout.rs."
+
+[assert]
+file_references_resolve = true
+context_contains = ["src/checkout.rs"]

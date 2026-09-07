@@ -1,0 +1,17 @@
+name = "agents_md_scoping"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "What conventions apply when editing src/upload.rs?"
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs" } },
+]
+
+[[turn]]
+content = "Within src/ prefer expect with a message over unwrap."
+
+[assert]
+context_contains = ["src/AGENTS.md"]
+file_references_resolve = true

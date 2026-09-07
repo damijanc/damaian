@@ -1,0 +1,49 @@
+name = "multi_file_patch"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Add a retry to the upload client and cover it with a test"
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs" } },
+]
+
+[[turn]]
+content = "I added a retry helper and a test for it."
+tool_calls = [
+  { name = "propose_patch", arguments = { summary = "Retry uploads and test it", files = [
+    { path = "src/upload.rs", status = "modified", content = """
+pub fn upload(payload: &str) -> Result<(), String> {
+    if payload.is_empty() {
+        return Err("payload was empty".to_string());
+    }
+    Ok(())
+}
+
+pub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {
+    let mut last = Err("no attempt was made".to_string());
+    for _ in 0..attempts.max(1) {
+        last = upload(payload);
+        if last.is_ok() {
+            return last;
+        }
+    }
+    last
+}
+""" },
+    { path = "tests/upload.rs", status = "added", content = """
+use fixture_upload::upload::upload_with_retry;
+
+#[test]
+fn retries_until_it_succeeds() {
+    assert!(upload_with_retry("payload", 3).is_ok());
+}
+""" } ] } },
+]
+
+[assert]
+patch_touches = ["src/upload.rs", "tests/upload.rs"]
+approval_required = true
+patch_applied = false
+files_changed_outside_patch = 0

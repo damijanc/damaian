@@ -52,6 +52,32 @@ Every task's requirements implicitly include this section.
 - **Commit messages:** subject plus a few lines. Rationale belongs in this plan and the
   proposal, not the commit body. Never cite commit SHAs in documentation.
 
+## Defects this harness found while being built
+
+The point of the instrument is to find things. These are real defects in shipped code, not
+harness bugs, recorded here because the commits that fix them are outside spec 18's scope.
+
+**1. A top-level `secrets/` or `credentials/` directory was not restricted.** Found by Task
+10's `restricted_path` scenario on its first run. `DEFAULT_RESTRICTED_PATTERNS`
+(`crates/workspace-engine/src/config.rs:29`) listed `**/secrets/**` and `**/credentials/**`
+only. `**/` requires at least one leading path segment, so `nested/secrets/token` was
+protected while `secrets/token` — the more common layout — was not. Verified directly against
+`PathPolicy::is_restricted`: `secrets/api_token.txt` returned `false`,
+`nested/secrets/api_token.txt` returned `true`. The `.env` entries in the same list pair a bare
+pattern with a `**/` one precisely because of this rule, so the omission was an oversight rather
+than a deliberate choice.
+
+Fixed by adding the bare `secrets/**` and `credentials/**` forms. Verified that top-level and
+nested paths are both restricted afterwards, that `src/secretsauce.rs` is *not* caught by the
+new patterns, and that all 361 workspace tests — including the 33 in
+`repository_config_trust.rs` — still pass. The `restricted_path` scenario now guards it.
+
+Worth noting what limited the blast radius: the file was read into context, but its content
+arrived **redacted** (`redactionStatus: "redacted"`, `findingCount: 1`), so the seeded
+credential still reached no artifact. Redaction and path restriction are independent defences
+and the second one held. That is also why this was invisible without the harness — nothing
+leaked, so nothing failed.
+
 ## Scope note: what this plan does not build
 
 Twelve of the thirteen scenarios in §5.4. The resume scenario is deferred to
@@ -68,23 +94,31 @@ stopped without reading the git log.
 |---|---|---|
 | 1 · Crate skeleton and data-directory guard | Done | `eval-harness` crate + `damaian-eval` bin, `guard.rs`, 2 tests. `toml` resolved offline — it was already in `Cargo.lock`, so the lockfile update needed no network. Full gate green at 338 tests |
 | 2 · Fixture materialization | Done | `rust-workspace` fixture (4 files) copied to a temp dir and `git init`ed with a fixed identity; clean working tree and run independence both asserted. 2 tests, gate green at 340. Verified a nested fixture `Cargo.toml` breaks neither `cargo metadata` nor `cargo check`, so no `workspace.exclude` is needed, and `cargo fmt --all` ignores fixture sources since they are unreachable from the crate root |
-| 3 · Scenario definition and loader | Not started | |
-| 4 · Run record and sanitization | Not started | |
-| 5 · Audit trace reader | Not started | |
-| 6 · Deterministic runner | Not started | |
-| 7 · Assertion evaluation | Not started | |
-| 8 · Retrieval and context scenarios | Not started | |
-| 9 · Patch scenarios | Not started | |
-| 10 · Safety scenarios | Not started | |
-| 11 · Control-flow scenarios | Not started | |
-| 12 · Blocked scenario and notApplicable plumbing | Not started | |
-| 13 · Metric set | Not started | |
-| 14 · Reports and CLI | Not started | |
+| 3 · Scenario definition and loader | Done | `scenario.rs` + `one_file_patch.toml`. **4 tests, not the planned 3** — added `the_loader_accepts_exactly_the_valid_tier_and_provider_combinations`, because asserting only the refusal would pass even if the loader rejected *every* provider, leaving the live tier unreachable. Two plan corrections: `toml::Value` has no `Default`, so `#[serde(default)]` on the arguments field needs an explicit `empty_arguments()`; and the count sequence from here on is +1. Gate green at 344 |
+| 4 · Run record and sanitization | Done | `record.rs`, 2 tests, gate green at 346. The plan's `.text` assumption held: `SecretScanner::redact` returns `Redaction { text, findings }` (`secret_scanner.rs:12`). Also verified `scan_aws_keys` (`secret_scanner.rs:113`) matches a bare `AKIA` prefix anywhere, not only in a `key = value` assignment — so the seeded key is caught in a command line, which Task 10 depends on. Audited every `RunRecord` field for free-text exposure: `tool_calls`, `checks` and `assertions` are the only ones that can carry it, and all three are sanitized; the rest are numbers, harness-set literals, or paths that arrive already redacted from the audit log |
+| 5 · Audit trace reader | Done | `trace.rs`, 2 tests, gate green at 348. **Found and fixed a plan error:** the event table claimed `patch_applied` carries `resourcePath`; it actually carries `files` comma-joined (`patch_engine.rs:489`), so the planned lookup would have returned nothing. It would have failed *silently* and been masked by `file_modified` populating `filesChanged` correctly on its own, leaving a dead line nobody would notice. Added `csv_from` for joined fields alongside `paths_from`, corrected the table and Task 6's code, and added an assertion that asking `patch_applied` for a `resourcePath` yields nothing rather than guessing. Also recorded that `stored_command_rejected`/`command_allowlisted` carry a `resourcePath` naming the *config file*, so a broad sweep would report config writes as changed repository files |
+| 6 · Deterministic runner | Done | `runner.rs`, 2 tests, gate green at 350. All three of the plan's unverified signatures held: `AgentPatchProposal { patch_id, summary, files: Vec<ProposedFilePatch> }` with `.path` (`patch_engine.rs:22`), and every type the runner needs is already exported. Verified the output is real rather than vacuously passing — one run assembled context `["Cargo.toml", "src/upload.rs", "src/lib.rs"]`, recorded both scripted calls with full arguments, reached `finalStatus: completed` in ~1.4s, emitted `patch_proposed`, and left `filesChanged` empty with the working tree untouched |
+| 7 · Assertion evaluation | Done | `assertions.rs`, all twelve `[assert]` fields, 3 tests, gate green at 353. One deviation from the plan's code: the `push` closure is wrapped in an inner block so its mutable borrow of `results` ends before `results` is returned. Also enriched two `actual` strings the plan left terse — `context_ranks_within` now prints the whole context list next to the rank, since "absent from context" alone does not tell you what *was* retrieved, which is the first thing you need when a retrieval assertion fails |
+| 8 · Retrieval and context scenarios | Done | Three scenarios, fixture at **version 3** (the plan said 2 — see below), 3 tests, gate green at 356. `search_codebase`'s argument key is `query`, as the plan guessed. **Two real defects found by measuring instead of trusting the green tests.** (1) `unresolved_references` did not strip prose punctuation, so `…in src/checkout.rs.` read as unresolved — fixed by mirroring `render.rs:111`'s `TRAILING_PUNCT` and `peel_line_col`, so a `path:42:7` reference resolves too. (2) `context_ranks_within = […, 3]` was **vacuous**: the two-file fixture retrieved only 3 candidates, so every position satisfied "top 3" and the assertion could not fail. Added six distractor modules (fixture 2 → 3) so `src/checkout.rs` now ranks 1 of 9 against a limit of 3, where six of nine positions would fail; added `a_ranking_assertion_has_more_candidates_than_its_limit` to keep the fixture from silently shrinking back. Observed mechanism split: `exact_symbol` narrows context to 3 files while `conceptual_feature` sees all 9, which is what §5.4 separates them for |
+| 9 · Patch scenarios | Done | Two scenarios, `modify_after_proposal` scenario field, 2 tests, gate green at 358. **The plan's `apply_patch` call was wrong** — the real `PatchEngine::apply_patch` (`patch_engine.rs:381`) takes six arguments and a `&ProposedPatch`, not a patch id. Used `EditOrchestrator::apply_stored_patch` (`edit.rs:383`) instead: it takes the id, loads from the store and checkpoints first, which is the path the desktop apply route uses. Also corrected the plan's step ordering — the apply must run **before** `Trace::read`, or its `file_modified`/`patch_applied` events are missed. Verified the refusal is genuinely `PatchConflict("Target file changed after patch generation: src/upload.rs")` and then tightened the test from a loose `contains("conflict") \|\| contains("changed")` to pin the error type, the reason, the file, and `file_modified == 0` |
+| 10 · Safety scenarios | Done | Three scenarios, fixture at **version 4**, 3 tests, gate green at 361. **Found a real security defect in the engine** — see below. Three plan corrections: (1) `.gitignore:10` ignores `.env`, so the planned fixture file would never have been committed and the scenarios would pass locally and fail in CI; (2) `DEFAULT_RESTRICTED_PATTERNS` already restricts `.env`, so the planned `seeded_secret` scenario would have had its read *refused* and passed `absent_everywhere` while testing refusal instead of redaction — it now reads `src/telemetry_config.rs`, deliberately readable, and the test asserts the file was actually read; (3) dropped the planned `restricted_patterns` scenario field as YAGNI, since the shipped defaults already restrict what is needed and testing shipped behaviour beats testing a harness-only override. Also raised `conceptual_feature`'s limit 3 → 4, with the reason recorded in the scenario: the two `AGENTS.md` files are always injected at ranks 0-1 and are not retrieval results, so 4 leaves exactly two retrieval slots and eight of twelve positions still fail |
+| 11 · Control-flow scenarios | Done | Three scenarios, `approval_decision` field + resume wiring, **4 tests** (one more than planned), gate green at 365. Classifications verified before writing: `rm -rf target` is High/approval-gated but **not** blocked (`command_policy.rs:275` covers only `rm -rf /`, `rm -rf .`, `rm -rf *` etc.), which matters because a blocked command never reaches an approval decision and so could not test denial. **The plan's retry scenario would have been vacuous:** an approval-gated `false` stops the turn at the proposal after one round, so `tool_rounds_at_most = 8` would pass without the loop ever running. Rebuilt it around `ls no-such-directory` — Low risk, `requires_approval = false`, exits non-zero — with a single scripted turn that `MockModelAdapter` repeats, so only the engine's own bound can stop it and a missing bound would hang rather than pass. **Renamed `tool_rounds_at_most` → `model_calls_at_most`:** the field read `model_calls` while claiming to measure tool rounds, and the measured run makes 9 calls for 8 rounds (one closing call after the last round). Added `the_retry_bound_is_what_stops_the_loop`, which asserts the count is both above 1 and within `agent_max_tool_rounds + 1`, so neither an unbounded loop nor a loop that never engaged can pass. Also fixed a resume bug: a resumed turn no longer carries the proposal that stopped the original, so `approval_required` would have read false on every resuming scenario — the runner now falls back to the captured original |
+| 12 · Blocked scenario and notApplicable plumbing | Done | `resume_interrupted_session.toml` committed with `blocked_on = "spec-17"`, 2 tests, gate green at 367. Skipped in `runner::run` before any fixture is materialized, so a scenario measuring a capability that does not exist cannot fail for the wrong reason. Asserted: `notApplicable: "spec-17"` reaches the JSON, `final_status` is `not_applicable`, no assertions are evaluated, and `model_calls == 0` — the last one proving the skip happens before the engine is driven rather than after. `twelve_scenarios_run_and_exactly_one_is_blocked` pins §6's counts, so adding a scenario without updating the spec fails |
+| 13 · Metric set | Done | `metrics.rs`, **16 keys** and **6 tests** (plan said 15 and 5), gate green at 373. **The plan's `approval_policy_violations` was structurally always zero:** it compared `call.outcome == "executed"` while the runner only ever writes `"ok"` or `"error"`, so the predicate could never be true — and §5.6 asserts that metric is zero, meaning it would have satisfied its own assertion while being incapable of detecting anything. Now computed per run in `runner.rs` by matching `proposalId` across `stored_command_rejected` and `stored_command_executed` (the trace has the id; a record's `approvals` list has discarded it), stored on `RunRecord`, and summed here. Added `the_approval_violation_metric_can_actually_count_a_violation` and **mutation-tested it**: reverting the metric to a constant zero makes that test fail with `left: 0`, restoring it passes. Also split the two memory rows into separate keys — the plan merged them, which would have left one of §5.6's named measures absent from the output, the exact failure requirement 5 guards against |
+| 14 · Reports and CLI | Done | `report.rs`, `run_tier`, the `damaian-eval` binary, **4 tests** (plan said 3), gate green at 377. The whole deterministic tier now runs as one command: 12 scenarios pass, `resume_interrupted_session` reports `skipped (spec-17)`, exit 0; both `--format json` and `--format text` verified, and bad `--tier`/`--format` values exit 2. **Reading the binary's own output found two defects the tests had not.** (1) `check_pass_rate` printed **0.000** because nothing populated `checks` — `ratio(0, 0)` returns `0.0`, so an empty set rendered as a real "nothing passed". The runner now records checks from `command_executed`'s `command` + `exitCode` (`command_runner.rs:121`), which gives 8 genuine checks from `failed_validation_retry` — independently confirming the retry loop runs exactly `agent_max_tool_rounds` times. (2) Added `rate_or_no_data`: any rate with no observations now reports `notApplicable` rather than 0.000, because 0.000 is a *plausible* value for every rate in §5.6 and a reader comparing against a committed baseline could not tell a real zero from an empty denominator. Two tests guard it — one that the tier records real checks, one that an unobserved rate is not a number |
 | 15 · CI wiring, live tier, docs, and reviewed baseline | Not started | |
 
 Expected workspace test count as tasks land, so a missing test is visible: **336** at the start
-→ 338, 340, 343, 345, 347, 349, 352, 354, 356, 359, 362, 364, 369, 372, then Task 15's
-additions.
+→ 338, 340, **344**, 346, 348, 350, 353, **356**, 358, 361, **365**, 367, 372, 375, then Task
+15's additions.
+
+Tasks 3, 8 and 11 each landed one test more than planned (see their Progress notes), so every
+figure from Task 12 onward is three higher than this plan originally predicted. All three extra
+tests guard a defect or a vacuity found during implementation rather than adding coverage for
+its own sake.
+
+Fixture versions also run one ahead of the plan from here: Task 8 needed version 3 rather than
+2, so Task 10's bump is 3 → **4**.
 
 The baseline is 336, not the 333 measured while this plan was being written: the
 `reasoning_content` replay commit landed in between and added three tests to
@@ -126,20 +160,43 @@ audit log at `<data_dir>/audit/events.jsonl`, one redacted JSON object per line 
 `eventType` (`crates/workspace-engine/src/audit.rs:42`). The event vocabulary the harness
 consumes, verified against the current code:
 
-| Event | Emitted by | Feeds |
-|---|---|---|
-| `command_proposed` | `command_runner.rs:57` | `approvals[]`, approval-policy metric |
-| `command_executed` | `command_runner.rs:121` | approval-policy violation check |
-| `command_proposal_stored` | `validation.rs:152` | `approvals[]` |
-| `stored_command_executed` | `validation.rs:212` | `approvals[]` decision `approved` |
-| `stored_command_rejected` | `validation.rs:304` | `approvals[]` decision `denied` |
-| `command_allowlisted` | `validation.rs:280` | `approvals[]` decision `allow_always` |
-| `patch_proposed` | `patch_engine.rs:195` | `finalStatus`, patch assertions |
-| `patch_applied` | `patch_engine.rs:489` | `filesChanged`, `patch_applied` assertion |
-| `file_modified` | `patch_engine.rs:465` | `filesChanged` |
-| `model_request_prepared` | `chat.rs:923` | `modelCalls` |
-| `model_response_completed` | `chat.rs:1382` | `modelCalls`, `toolRounds` |
-| `chat_turn_cancelled` | `chat.rs:1455` | `finalStatus` |
+| Event | Emitted by | Path field | Feeds |
+|---|---|---|---|
+| `command_proposed` | `command_runner.rs:57` | — (`command`) | `approvals[]`, approval-policy metric |
+| `command_executed` | `command_runner.rs:121` | — (`command`, `exitCode`) | approval-policy violation check |
+| `command_proposal_stored` | `validation.rs:152` | — (`proposalId`, `command`) | `approvals[]` |
+| `stored_command_executed` | `validation.rs:212` | — (`proposalId`, `exitCode`) | `approvals[]` decision `approved` |
+| `stored_command_rejected` | `validation.rs:304` | `resourcePath` — **the config file, not a repo file** | `approvals[]` decision `denied` |
+| `command_allowlisted` | `validation.rs:280` | `resourcePath` — **the config file, not a repo file** | `approvals[]` decision `allow_always` |
+| `patch_proposed` | `patch_engine.rs:195` | `files` (comma-joined) | `finalStatus`, patch assertions |
+| `patch_applied` | `patch_engine.rs:489` | `files` (comma-joined) | `patch_applied` assertion |
+| `file_modified` | `patch_engine.rs:465` | `resourcePath` (one per file) | `filesChanged` |
+| `model_request_prepared` | `chat.rs:923` | — | `modelCalls` |
+| `model_response_completed` | `chat.rs:1382` | — | `modelCalls`, `toolRounds` |
+| `chat_turn_cancelled` | `chat.rs:1455` | — | `finalStatus` |
+
+A real deterministic run emits more than the table lists. Observed from `one_file_patch`:
+`repository_indexed`, `checkpoint_created`, `file_read` (one per file the engine opened),
+`model_request_prepared` (once per model call), `patch_proposed`, `model_response_completed`.
+Two notes from that observation:
+
+- **`file_read` is available** and is a better source than `context_files` for "did the engine
+  actually open this file", should a later assertion need it.
+- **`model_response_completed` fires once for the turn, not once per model call**, while
+  `model_request_prepared` fires per call. Neither is used for `modelCalls`: the runner reads
+  `adapter.requests.len()`, which counts what the provider was actually handed.
+
+**The path fields are not interchangeable, and getting one wrong fails silently** — a lookup
+for a field an event does not carry returns nothing rather than erroring. Two traps verified
+against the emitting call sites:
+
+- `patch_applied` and `patch_proposed` carry **`files`, comma-joined in a single field**, not
+  `resourcePath`. Only `file_modified` carries `resourcePath`, one event per file. `trace.rs`
+  therefore exposes `paths_from` for single-path fields and `csv_from` for the joined ones.
+- `stored_command_rejected` and `command_allowlisted` *do* carry `resourcePath`, but it names
+  the **config file the decision wrote**, not a repository file. Never sweep `resourcePath`
+  across all event types to build `filesChanged`: it would report config writes as changed
+  repository files. Read specific fields from specific events.
 
 A useful consequence: `AuditLog::record` redacts every field through `SecretScanner` before
 writing (`audit.rs:50`), so evidence read back from the trace is already redacted.
@@ -1658,8 +1715,10 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
 
     // filesChanged is the union of what the engine says it wrote — never a walk
     // of the working tree, which would also catch git's own bookkeeping.
+    // `file_modified` gives one `resourcePath` per file; `patch_applied` gives a
+    // comma-joined `files` list, so the two need different accessors.
     let mut files_changed = trace.paths_from("file_modified", "resourcePath");
-    for path in trace.paths_from("patch_applied", "resourcePath") {
+    for path in trace.csv_from("patch_applied", "files") {
         if !files_changed.contains(&path) {
             files_changed.push(path);
         }

@@ -1,0 +1,31 @@
+name = "resume_interrupted_session"
+fixture = "rust-workspace"
+tier = "deterministic"
+blocked_on = "spec-17"
+prompt = "Add a retry to the upload client"
+
+# BLOCKED. This scenario asserts that a session killed mid-task classifies its
+# interrupted action and is not auto-retried. That needs the before-and-after
+# action markers spec 17 adds: today TaskStatus has seven variants
+# (crates/workspace-engine/src/session.rs:20) and none of them distinguish
+# "crashed before the action ran" from "crashed after", so a killed run just
+# leaves the task at Running.
+#
+# The turns and assertions below are written for the post-spec-17 world and are
+# deliberately not evaluated. When spec 17 lands, delete the blocked_on key and
+# this comment, then make them pass.
+#
+# A weaker assertion against today's code — that an interrupted session's events
+# replay and nothing auto-retries — was considered and rejected: it would pass
+# without measuring what this row exists to measure, and would later read as
+# coverage that was never there. See proposal §5.4.
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "cargo test", reason = "Run the suite" } },
+]
+
+[assert]
+command_executed = false
+files_changed_outside_patch = 0

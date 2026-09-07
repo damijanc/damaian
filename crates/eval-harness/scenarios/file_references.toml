@@ -1,0 +1,13 @@
+name = "file_references"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Explain how uploading works in this project"
+
+[[turn]]
+content = """
+Uploading lives in src/upload.rs, which exposes a single `upload` function.
+The crate root src/lib.rs re-exports it.
+"""
+
+[assert]
+file_references_resolve = true

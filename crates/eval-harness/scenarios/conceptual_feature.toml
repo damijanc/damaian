@@ -1,0 +1,27 @@
+name = "conceptual_feature"
+fixture = "rust-workspace"
+tier = "deterministic"
+# MECHANISM: with enable_semantic_search off — which the deterministic tier
+# requires, because enabling it downloads a model — this measures the term
+# overlap fallback's ranking, NOT embedding retrieval. The live tier may enable
+# semantic search, and then this same scenario measures embeddings. Do not read
+# a pass here as evidence that embedding retrieval works.
+prompt = "How does this project reduce a basket total when a promotion applies?"
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "search_codebase", arguments = { query = "reduce basket total promotion" } },
+]
+
+[[turn]]
+content = "That is handled in src/checkout.rs."
+
+[assert]
+# 4, not 3, and this is not the assertion being loosened to pass. The two
+# AGENTS.md instruction files are *always* injected and occupy ranks 0 and 1 —
+# they are not retrieval results at all. So a limit of 4 leaves exactly two
+# retrieval slots, and `src/checkout.rs` has to be one of the top two files
+# retrieval actually chose out of the ten it ranked. Eight of twelve positions
+# still fail.
+context_ranks_within = ["src/checkout.rs", 4]

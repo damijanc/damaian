@@ -1,0 +1,40 @@
+name = "failed_validation_retry"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Check whether the no-such-directory folder lists cleanly, and keep trying"
+
+# The bound is the whole point, so this scenario is built to hit it.
+#
+# `ls no-such-directory` is classified Low risk with `requires_approval = false`
+# (command_policy.rs:293), so it executes automatically — no approval stop to
+# end the turn — and it exits non-zero every time. There is exactly ONE scripted
+# turn, and `MockModelAdapter` repeats its last response once the sequence is
+# exhausted, so the model asks for the same failing command forever.
+#
+# Nothing but the engine's own round limit can stop this. If
+# `agent_max_tool_rounds` were not enforced the run would never terminate and
+# this scenario would hang rather than fail — which is the correct way for a
+# missing bound to announce itself.
+#
+# An approval-gated failing command (`false`, say) would NOT test this: the turn
+# would stop at the proposal after one round and the assertion would pass
+# without the loop ever running.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls no-such-directory", reason = "List the folder" } },
+]
+
+[assert]
+# 9, and the extra one is not slack. `agent_max_tool_rounds` is 8
+# (config.rs:1175) and bounds the *tool rounds*; after the last round the engine
+# makes one more model call to produce the closing answer, so a correctly bounded
+# run makes 8 + 1 = 9 calls. Measured, not assumed: the first version of this
+# scenario asserted 8 and observed exactly 9.
+#
+# This still catches the failure it exists for — an unenforced bound produces an
+# unbounded call count, not 10 — and the companion test
+# `the_retry_bound_is_what_stops_the_loop` additionally asserts the count is
+# above 1, so a loop that never engaged cannot pass either.
+model_calls_at_most = 9
+files_changed_outside_patch = 0
