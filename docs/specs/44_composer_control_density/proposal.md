@@ -92,7 +92,7 @@ empty, so this is a placement change, not a density one.
 A new `.composer-actions` flex row follows the prompt box:
 
 ```
-[ + ]                              [ gpt-4.1 ▾ ] [ High ▾ ]  ( ➤ )
+[ + ]                        [ gpt-4.1 ▾ ] [ Extra High ▾ ]  ( ➤ )
 └ left group, margin-right: auto   └────── #chat-model-menu ─────┘
 ```
 

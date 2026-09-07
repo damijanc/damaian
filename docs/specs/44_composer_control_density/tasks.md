@@ -8,7 +8,7 @@
 
 | Task | State | Notes |
 |---|---|---|
-| 0 · Baseline measurement | Not started | |
+| 0 · Baseline measurement | Done | Composer 980×149 at 1280×800. Two spec corrections: no `High` effort level exists, and the truncation defect is worse than drafted — effort is absent, not clipped |
 | 1 · Prompt box frame and chips | Not started | |
 | 2 · Action row and control sizes | Not started | |
 | 3 · Split triggers | Not started | |
@@ -16,21 +16,36 @@
 
 ## Baseline
 
-**Not yet measured.** Task 0 records it before anything changes. The guide's
-§8 anti-pattern table is explicit that an estimate is not a measurement, so the
-figures below are the *declared CSS values* — facts about the stylesheet, not
-about the rendered composer — and Task 0 replaces the rendered column.
+Measured 2026-09-07 in the running app at 1280×800, nothing pinned, empty
+prompt. Conversation column 980px wide.
 
-| | Declared in CSS | Measured at 1280×800 |
+| | Declared in CSS | Measured |
 |---|---|---|
-| `.prompt-box textarea` min-height | 111px | — |
-| ... of which padding | 70px (14 top + 56 bottom) | — |
-| ... of which text | 41px (2 rows @ 20.3px) | — |
-| Right gutter per line | 58px | — |
-| Attach button | 38×38 | — |
-| Model pill | `min(220px, 42vw)` × 38 | — |
-| Send button | 38×38 | — |
-| Composer at rest (14 + field + 18) | — | — |
+| Composer at rest | — | **980×149** |
+| `.prompt-box` | — | 852×116 |
+| Textarea | `min-height: 111px` | 852×111 |
+| ... padding | `14px 58px 56px 14px` | same |
+| ... usable text height | 41px expected | **39px** — under two 20.3px rows |
+| Right gutter per line | 58px | same |
+| Attach button | 38×38 | 38×38 |
+| Model pill | `min(220px, 42vw)` × 38 | **220×38**, label box 160px |
+| Send button | 38×38 | 38×38 |
+
+Two corrections to `proposal.md` / `context.md` came out of this and are
+already applied:
+
+1. **The effort levels are `Default`, `Minimal`, `Low`, `Medium`,
+   `Extra High`.** The spec was drafted using a `High` level that does not
+   exist. `Extra High` is 60px of label on its own.
+2. **The truncation defect is worse than drafted.** `context.md` §1 now carries
+   the measured table. `deepseek-v4-flash` overflows at *every* effort level,
+   and at `claude-3-5-sonnet-20241022` the effort label is absent rather than
+   clipped — the pill renders `claude-3-5-sonnet-202…`.
+
+A third observation, not a defect: the field's usable text height is 39px
+against a 20.3px line height, so at rest it shows slightly **under** two full
+rows. Task 1 recomputes `min-height` for symmetric padding and should land on
+a clean two rows rather than reproducing 39px.
 
 ## How to verify
 
@@ -67,18 +82,20 @@ popover's Model panel — `deepseek-v4-flash`, then
 
 ---
 
-## Task 0 · Baseline measurement
+## Task 0 · Baseline measurement — Done
 
-**Files:** none — `tasks.md` only
+**Files:** none — `tasks.md`, `context.md`, `proposal.md` corrections only
 
-- [ ] Rebuild and restart the shell at 1280×800.
-- [ ] Run the measurement snippet above and fill the Baseline table's measured
+- [x] Rebuild and restart the shell at 1280×800.
+- [x] Run the measurement snippet above and fill the Baseline table's measured
       column, including composer height at rest with nothing pinned.
-- [ ] Record the rendered width of `.model-menu-button` with `gpt-4.1`
+- [x] Record the rendered width of `.model-menu-button` with `gpt-4.1`
       selected and with `claude-3-5-sonnet-20241022` selected, and confirm the
       effort truncation from `context.md` §1 actually reproduces. If it does
       not, correct `context.md` §1 rather than leaving the claim standing.
-- [ ] Commit the baseline.
+      — **It reproduces, and worse than drafted.** Table corrected with
+      measured widths; the `High` level the draft used does not exist.
+- [x] Commit the baseline.
 
 ## Task 1 · Prompt box frame and chips
 

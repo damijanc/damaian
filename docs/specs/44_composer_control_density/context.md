@@ -30,18 +30,30 @@ is `width: min(220px, 42vw)` — a fixed width, not a content size, which guide
 `.model-menu-summary` ellipsizes it.
 
 That combination produces a real defect, not just wasted space. Because effort
-is appended *last*, a long model id truncates the effort label away:
+is appended *last*, a long model id truncates the effort label away. Measured
+2026-09-07 at 1280×800, with the label box a fixed 160px inside the 220px pill:
 
-| Selected model | Label built | Rendered at 220px |
-|---|---|---|
-| `gpt-4.1` | `gpt-4.1 High` | `gpt-4.1 High` |
-| `deepseek-v4-flash` | `deepseek-v4-flash High` | `deepseek-v4-flash Hi…` |
-| `claude-3-5-sonnet-20241022` | `claude-3-5-sonnet-20241022 High` | `claude-3-5-sonnet-2…` |
+| Selected model | Effort | Label built | Label width | Rendered |
+|---|---|---|---|---|
+| `gpt-4.1` | Default | `gpt-4.1 Default` | 93px | in full |
+| `gpt-4.1` | Extra High | `gpt-4.1 Extra High` | 112px | in full |
+| `deepseek-v4-flash` | Default | `deepseek-v4-flash Default` | 165px | **cut** |
+| `deepseek-v4-flash` | Extra High | `deepseek-v4-flash Extra High` | 185px | **cut** |
+| `claude-3-5-sonnet-20241022` | Extra High | `claude-3-5-sonnet-20241022 Extra High` | 255px | **cut** — renders `claude-3-5-sonnet-202…`, effort entirely absent |
+| `us.anthropic.claude-sonnet-4-20250514-v1:0` | Default | (49 chars) | 335px | **cut** at less than half |
 
+Only a short id keeps its effort label. `deepseek-v4-flash` — an unremarkable
+17-character id — already overflows at *every* effort level, and by
+`claude-3-5-sonnet-20241022` the effort is not partially truncated but gone.
 The reasoning level is still in force, still submitted with the request, and no
-longer readable. The user has to open the popover to find out what effort they
-are running at. Splitting the two triggers fixes this structurally rather than
-by widening anything: effort gets its own box and cannot be crowded out.
+longer readable anywhere except inside the popover.
+
+Splitting the two triggers fixes this structurally rather than by widening
+anything: effort gets its own box and cannot be crowded out.
+
+**The effort levels are `Default`, `Minimal`, `Low`, `Medium` and
+`Extra High`** — there is no `High`. `Extra High` is 60px on its own, which is
+why appending it to a model id overflows so readily.
 
 ## 2. Current state
 
