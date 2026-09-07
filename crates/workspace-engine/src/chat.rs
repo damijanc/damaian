@@ -682,7 +682,10 @@ impl ChatOrchestrator {
             ));
             messages.push(ModelMessage::tool(call.id.clone(), tool_result_content));
         } else {
-            messages.push(ModelMessage::assistant(pending.last_content.clone()));
+            messages.push(
+                ModelMessage::assistant(pending.last_content.clone())
+                    .with_reasoning_content(pending.reasoning_content.clone()),
+            );
             messages.push(ModelMessage::user(format!(
                 "Command result:\n{tool_result_content}"
             )));
@@ -1027,11 +1030,14 @@ impl ChatOrchestrator {
                 // `tool` pair: the malformed arguments would have to be
                 // replayed verbatim, and providers reject a tool result whose
                 // call didn't parse. Plain text carries the correction safely.
-                messages.push(ModelMessage::assistant(if redacted.trim().is_empty() {
-                    summary
-                } else {
-                    redacted.clone()
-                }));
+                messages.push(
+                    ModelMessage::assistant(if redacted.trim().is_empty() {
+                        summary
+                    } else {
+                        redacted.clone()
+                    })
+                    .with_reasoning_content(model_run.reasoning_content.clone()),
+                );
                 messages.push(ModelMessage::user(note));
                 round += 1;
                 continue;
@@ -1358,7 +1364,10 @@ impl ChatOrchestrator {
                 // Only reachable for `ToolAction::Command` via the
                 // `DAMAIAN_COMMAND_V1` text-envelope fallback — every other
                 // action only exists as a native tool call.
-                messages.push(ModelMessage::assistant(redacted.clone()));
+                messages.push(
+                    ModelMessage::assistant(redacted.clone())
+                        .with_reasoning_content(model_run.reasoning_content.clone()),
+                );
                 messages.push(ModelMessage::user(format!(
                     "Command result:\n{tool_result_text}"
                 )));

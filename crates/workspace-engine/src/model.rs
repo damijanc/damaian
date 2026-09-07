@@ -112,6 +112,20 @@ impl ModelMessage {
             reasoning_content: None,
         }
     }
+
+    /// Attaches the thinking-mode reasoning behind this turn. Needed on every
+    /// assistant message replayed into a later round — not just the ones
+    /// carrying `tool_calls` — since a turn the model requested through the
+    /// `DAMAIAN_COMMAND_V1` text envelope, or one whose tool call didn't
+    /// decode, goes back as plain assistant text and DeepSeek's thinking mode
+    /// rejects the request over any assistant message that lost its reasoning.
+    /// Pass the originating [`ModelRun::reasoning_content`] straight through;
+    /// `None` leaves the message unchanged.
+    #[must_use]
+    pub fn with_reasoning_content(mut self, reasoning_content: Option<String>) -> Self {
+        self.reasoning_content = reasoning_content;
+        self
+    }
 }
 
 /// An OpenAI-style function tool definition. `parameters_json` is a raw JSON

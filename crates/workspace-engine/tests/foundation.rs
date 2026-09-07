@@ -1957,6 +1957,166 @@ fn chat_replays_reasoning_content_on_native_tool_call_rounds() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+/// The same DeepSeek rule, on the path that actually broke a session: the model
+/// asked for the command through the `DAMAIAN_COMMAND_V1` text envelope rather
+/// than a native tool call, so the assistant turn is replayed as plain text.
+/// It still has to carry its reasoning — thinking mode rejects the follow-up
+/// over *any* assistant message that lost it, tool calls or not.
+#[test]
+fn chat_replays_reasoning_content_on_text_envelope_command_rounds() {
+    let repo = temp_dir("chat-reasoning-replay-envelope");
+    write_fixture(&repo, "README.md", "# Reasoning replay test\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new_sequence(vec![
+        "DAMAIAN_COMMAND_V1\nCOMMAND: pwd\nREASON: Inspect current working directory.\nEND_COMMAND\n"
+            .to_string(),
+        "The working directory is the repository root.".to_string(),
+    ])
+    .with_reasoning_content(vec![
+        Some("I should look at the working directory first.".to_string()),
+        None,
+    ]);
+    let mut on_token = |_token: &str| {};
+
+    engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "What directory is this project using?",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    let follow_up = &adapter.requests[1];
+    let echoed = follow_up
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .expect("the follow-up round must echo the assistant's command request");
+    assert_eq!(
+        echoed.reasoning_content.as_deref(),
+        Some("I should look at the working directory first."),
+        "reasoning_content must be replayed on the text-envelope command turn"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// And across the approval pause, where the assistant turn is rebuilt from the
+/// persisted `PendingChatTurn` rather than from the live `ModelRun`. This is
+/// the exact shape that failed: a command needing approval, requested through
+/// the text envelope, and a resumed round the provider rejected with
+/// `The `reasoning_content` in the thinking mode must be passed back to the
+/// API.`
+#[test]
+fn chat_replays_reasoning_content_after_command_approval() {
+    let repo = temp_dir("chat-reasoning-replay-approval");
+    write_fixture(&repo, "README.md", "# Reasoning replay test\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new_sequence(vec![
+        "DAMAIAN_COMMAND_V1\nCOMMAND: echo checking-repo\nREASON: Inspect before answering.\nEND_COMMAND\n"
+            .to_string(),
+        "The repository looks as expected.".to_string(),
+    ])
+    .with_reasoning_content(vec![
+        Some("I need to see the repository before answering.".to_string()),
+        None,
+    ]);
+    let mut on_token = |_token: &str| {};
+
+    let first = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Check the repository.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+    let proposal = first
+        .command_proposal
+        .expect("unclassified command should require approval");
+
+    resume_command_decision(&engine, &proposal.id, true, &mut adapter);
+
+    let follow_up = &adapter.requests[1];
+    let echoed = follow_up
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .expect("the resumed round must echo the assistant's command request");
+    assert_eq!(
+        echoed.reasoning_content.as_deref(),
+        Some("I need to see the repository before answering."),
+        "reasoning_content must survive the approval pause"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// The undecodable-tool-call recovery also replays the assistant turn as plain
+/// text, deliberately, so it has the same obligation: the correction round must
+/// carry the reasoning or thinking mode rejects it and the retry never happens.
+#[test]
+fn chat_replays_reasoning_content_on_undecodable_tool_call_rounds() {
+    let repo = temp_dir("chat-reasoning-replay-undecodable");
+    write_fixture(&repo, "README.md", "# Reasoning replay test\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            "Let me create the necessary files:".to_string(),
+            "I've answered without the tool.".to_string(),
+        ],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "propose_patch".to_string(),
+                // Cut off mid-string, as a provider does at its output ceiling.
+                arguments_json: "{\"summary\":\"Scaffold entry po".to_string(),
+            }],
+            Vec::new(),
+        ],
+    )
+    .with_reasoning_content(vec![
+        Some("The scaffold needs an entry point.".to_string()),
+        None,
+    ]);
+    let mut on_token = |_token: &str| {};
+
+    engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Scaffold the project.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    let follow_up = &adapter.requests[1];
+    let echoed = follow_up
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .expect("the correction round must echo the assistant's attempt");
+    assert_eq!(
+        echoed.reasoning_content.as_deref(),
+        Some("The scaffold needs an entry point."),
+        "reasoning_content must be replayed on the correction turn"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 #[test]
 fn chat_chains_multiple_native_tool_calls_within_one_turn() {
     let repo = temp_dir("chat-multi-tool-call");
