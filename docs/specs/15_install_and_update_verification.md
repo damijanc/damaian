@@ -312,7 +312,7 @@ a matching application version rather than to delete the directory).
 - A person other than the author installs the stable DMG and reaches a working
   first-run screen without consulting a workaround, and their result is recorded
   in §7.
-- The five quality-gate commands from `AGENTS.md` pass. No new runtime Node.js
+- Every quality-gate command from `AGENTS.md` passes. No new runtime Node.js
   dependency is added; the signature-verification test is build-time only.
 
 ## 7. Implementation Notes

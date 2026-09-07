@@ -11,16 +11,16 @@ Related implementation specs:
 [`08_stop_and_progress.md`](08_stop_and_progress.md) (`CancelToken`),
 [`17_durable_task_state_and_crash_recovery.md`](17_durable_task_state_and_crash_recovery.md)
 (task state, action markers, and the PID registry),
-[`18_local_evaluation_harness.md`](18_local_evaluation_harness.md) (measures the
-readiness gates), [`20_working_modes.md`](20_working_modes.md) and
-[`31_permission_profiles.md`](31_permission_profiles.md) (the boundary a subagent
-inherits and cannot widen),
+[`18_local_evaluation_harness/`](18_local_evaluation_harness/proposal.md)
+(measures the readiness gates), [`20_working_modes.md`](20_working_modes.md) and
+[`31_permission_profiles.md`](31_permission_profiles.md) (the boundary a
+subagent inherits and cannot widen),
 [`21_task_plan_progress_and_budget.md`](21_task_plan_progress_and_budget.md),
 [`22_findings_model_and_panel.md`](22_findings_model_and_panel.md),
 [`26_context_assembly.md`](26_context_assembly.md),
 [`39_coordination_and_conflict_handling.md`](39_coordination_and_conflict_handling.md),
-[`40_autonomy_evaluations.md`](40_autonomy_evaluations.md).
-See also [`SECURITY.md`](../../SECURITY.md), `AGENTS.md`.
+[`40_autonomy_evaluations.md`](40_autonomy_evaluations.md). See also
+[`SECURITY.md`](../../SECURITY.md), `AGENTS.md`.
 
 ## 1. Precondition: the readiness gates
 
@@ -32,7 +32,7 @@ because they affect whether the gates can be evaluated at all:
 - **Six of eight gates are measurable with specified work**: task completion,
   approval-policy violations, restricted-path and secret violations, and
   cost/latency/iteration ceilings come from
-  [spec 18](18_local_evaluation_harness.md) and
+  [spec 18](18_local_evaluation_harness/proposal.md) and
   [spec 21](21_task_plan_progress_and_budget.md); crash-recovery fixtures from
   [spec 17](17_durable_task_state_and_crash_recovery.md); external-write
   handling from [specs 35–37](37_pull_request_creation.md). Trace completeness
@@ -440,9 +440,9 @@ narrowed away, and how budgets divide.
   feature depends on them.
 - The eight readiness gates are recorded as satisfied, with the §1 substitution
   documented if worktrees are absent, before this spec is implemented.
-- The five quality-gate commands from `AGENTS.md` pass, and the
-  [spec 18](18_local_evaluation_harness.md) baseline shows no regression and no
-  increase in approval-policy violations.
+- Every quality-gate command from `AGENTS.md` passes, and the
+  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  regression and no increase in approval-policy violations.
 
 ## 7. Implementation Notes
 

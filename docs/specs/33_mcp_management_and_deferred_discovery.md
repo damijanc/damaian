@@ -374,9 +374,9 @@ authentication failure without exposing the token.
   absorbed.
 - No MCP server process outlives the session that started it, and a recorded PID
   whose start time no longer matches is not killed.
-- The five quality-gate commands from `AGENTS.md` pass, and the
-  [spec 18](18_local_evaluation_harness.md) baseline shows no regression and no
-  increase in approval-policy violations.
+- Every quality-gate command from `AGENTS.md` passes, and the
+  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  regression and no increase in approval-policy violations.
 
 ## 7. Implementation Notes
 

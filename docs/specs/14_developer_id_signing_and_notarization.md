@@ -394,7 +394,7 @@ from a workflow run cannot be mistaken for a release build.
 - The About panel shows the channel next to the version.
 - `npm run desktop:build` with no `APPLE_SIGNING_IDENTITY` set no longer silently
   ad-hoc signs.
-- The five quality-gate commands from `AGENTS.md` pass. Application behaviour is
+- Every quality-gate command from `AGENTS.md` passes. Application behaviour is
   otherwise unchanged.
 
 ## 7. Implementation Notes

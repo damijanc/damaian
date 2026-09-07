@@ -351,7 +351,7 @@ generic-fallback finding from a parsed one, and where full output lives.
 - `details` is bounded, and full output remains reachable through `origin_ref`.
 - Findings survive a restart with their statuses intact.
 - Dismissing a finding does not suppress the same problem found by a later check.
-- The five quality-gate commands from `AGENTS.md` pass.
+- Every quality-gate command from `AGENTS.md` passes.
 
 ## 7. Implementation Notes
 

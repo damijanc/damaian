@@ -456,7 +456,7 @@ is not safe to share.
   of an active session.
 - `path_policy.rs` is applied to every snapshot and restore path, and a symlink
   pointing outside the repository is not followed — asserted by test.
-- The five quality-gate commands from `AGENTS.md` pass.
+- Every quality-gate command from `AGENTS.md` passes.
 
 ## 7. Implementation Notes
 

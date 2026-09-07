@@ -418,8 +418,9 @@ category with its own budget, so symbol results do not crowd out file content.
   file's content hash changes.
 - A corrupt or version-mismatched symbol index rebuilds cleanly and reports it.
 - Symbol accuracy fixtures pass for each supported language.
-- The five quality-gate commands from `AGENTS.md` pass, and the
-  [spec 18](18_local_evaluation_harness.md) baseline shows no regression.
+- Every quality-gate command from `AGENTS.md` passes, and the
+  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  regression.
 
 ## 7. Implementation Notes
 

@@ -351,8 +351,9 @@ crash actually landed, and where the commit appears in the audit log.
 - Repository config cannot enable committing.
 - No amend, reset, or history-rewriting operation is reachable from this work
   package.
-- The five quality-gate commands from `AGENTS.md` pass, and the
-  [spec 18](18_local_evaluation_harness.md) baseline shows no regression.
+- Every quality-gate command from `AGENTS.md` passes, and the
+  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  regression.
 
 ## 7. Implementation Notes
 

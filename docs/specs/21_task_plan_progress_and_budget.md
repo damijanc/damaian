@@ -97,7 +97,8 @@ completion report, and it cannot exist without steps that carry evidence.
 
 - Automatic plan generation quality. This spec defines the plan's structure,
   persistence, evidence rules, and budget behaviour. How good the model's plans
-  are is measured by [spec 18](18_local_evaluation_harness.md), not fixed here.
+  are is measured by [spec 18](18_local_evaluation_harness/proposal.md), not
+  fixed here.
 - Parallel step execution. Requirement 2 leaves room for it; nothing in this spec
   runs steps concurrently. Subagents are Phase 6.
 - A dependency solver. Dependencies are recorded and used to block a step whose
@@ -310,7 +311,7 @@ statuses.
 - An unset ceiling imposes no limit, so existing configurations are unaffected.
 - A plan revised by the user records both the original and the revision.
 - The task phase is derived from step state and cannot contradict it.
-- The five quality-gate commands from `AGENTS.md` pass, and the end-to-end
+- Every quality-gate command from `AGENTS.md` passes, and the end-to-end
   fixture from [spec 23](23_verification_loop.md) exercises a plan through to a
   completion report.
 

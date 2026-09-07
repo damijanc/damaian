@@ -396,9 +396,9 @@ one, and what to do when content is being excluded as
   [spec 19](19_token_and_cost_accounting.md), and the calibration is recorded in
   §7.
 - The manifest is written through `AuditLog::record`.
-- The five quality-gate commands from `AGENTS.md` pass, and the
-  [spec 18](18_local_evaluation_harness.md) baseline shows no regression in task
-  completion rate.
+- Every quality-gate command from `AGENTS.md` passes, and the
+  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  regression in task completion rate.
 
 ## 7. Implementation Notes
 

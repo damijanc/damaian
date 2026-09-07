@@ -371,9 +371,9 @@ command, path, secret, and key boundaries.
   profile denying remote writes; repository config cannot enable either.
 - No token value appears in any audit field, log, or displayed output.
 - No pull request is merged by this work package.
-- The five quality-gate commands from `AGENTS.md` pass, and the
-  [spec 18](18_local_evaluation_harness.md) baseline shows no increase in
-  approval-policy violations.
+- Every quality-gate command from `AGENTS.md` passes, and the
+  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no increase
+  in approval-policy violations.
 - No test contacts a real remote — push and PR operations are exercised against a
   local bare repository and a mock MCP server.
 

@@ -508,7 +508,7 @@ note about session files.
 - There is no way to construct a `MemoryEntry` whose provenance is a
   model inference with no user action — asserted by the absence of such a
   variant.
-- The five quality-gate commands from `AGENTS.md` pass.
+- Every quality-gate command from `AGENTS.md` passes.
 
 ## 7. Implementation Notes
 

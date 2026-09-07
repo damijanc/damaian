@@ -281,7 +281,7 @@ to inspect a past turn's context.
   which is off by default.
 - No content from a restricted or secret-bearing file is shown in the panel —
   the view renders paths, ranges, and counts from the manifest, never content.
-- The five quality-gate commands from `AGENTS.md` pass.
+- Every quality-gate command from `AGENTS.md` passes.
 
 ## 7. Implementation Notes
 

@@ -276,10 +276,10 @@ Construction rules, which are the requirement rather than the formatting:
 
 The roadmap requires the end-to-end fixture to become an eval scenario so later
 phases cannot silently regress it. Added to
-[spec 18](18_local_evaluation_harness.md): request a change, plan, edit, fail a
-test, repair, pass, review, complete — with the deterministic tier scripting the
-model turns via `MockModelAdapter` and asserting the report's passed list contains
-only checks that ran and exited zero.
+[spec 18](18_local_evaluation_harness/proposal.md): request a change, plan,
+edit, fail a test, repair, pass, review, complete — with the deterministic tier
+scripting the model turns via `MockModelAdapter` and asserting the report's
+passed list contains only checks that ran and exited zero.
 
 A second scenario asserts the negative: a task whose repair limit is exhausted
 produces a report that does not claim success. That one matters more, because it
@@ -325,9 +325,10 @@ stops asking.
 - The summary line never says "complete" when a check failed or the repair limit
   was exhausted.
 - Both eval scenarios from §5.8 exist in
-  [spec 18](18_local_evaluation_harness.md) and pass.
-- The five quality-gate commands from `AGENTS.md` pass, and the
-  [spec 18](18_local_evaluation_harness.md) baseline shows no regression.
+  [spec 18](18_local_evaluation_harness/proposal.md) and pass.
+- Every quality-gate command from `AGENTS.md` passes, and the
+  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  regression.
 
 ## 7. Implementation Notes
 

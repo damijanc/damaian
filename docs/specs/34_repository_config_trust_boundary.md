@@ -372,7 +372,7 @@ untrusted input" is a product guarantee an agent must not weaken.
 - Adding a field to `ConfigOverlay` without classifying it fails to compile.
 - The hostile-fixture test in §5.6 passes, and its companion permissive-direction
   test passes.
-- The five quality-gate commands from `AGENTS.md` pass, and no existing test
+- Every quality-gate command from `AGENTS.md` passes, and no existing test
   regresses.
 
 ## 7. Implementation Notes

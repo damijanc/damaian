@@ -362,8 +362,9 @@ unavailable on an older Git, and where branch operations appear in the audit log
   worktree and never the source repository; deleting a dirty worktree requires a
   distinct confirmation naming the dirty paths; an externally deleted worktree is
   reported rather than crashed on.
-- The five quality-gate commands from `AGENTS.md` pass, and the
-  [spec 18](18_local_evaluation_harness.md) baseline shows no regression.
+- Every quality-gate command from `AGENTS.md` passes, and the
+  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  regression.
 
 ## 7. Implementation Notes
 

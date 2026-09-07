@@ -106,7 +106,8 @@ ignored file content, which the roadmap does not address at all.
 
 - Deciding *what is worth* remembering, as a quality problem. This spec defines
   the gate; suggestion quality is measured by
-  [spec 18](18_local_evaluation_harness.md)'s memory metrics, not tuned here.
+  [spec 18](18_local_evaluation_harness/proposal.md)'s memory metrics, not tuned
+  here.
 - Automatic learning from repository content without confirmation. Explicitly
   forbidden by requirement 6, and listed as a roadmap non-goal.
 - Editing, superseding, or deleting entries — Phase 3b WP3, Should-tier, outside
@@ -353,7 +354,7 @@ than one, so they do not compete with the completion report
 ### 5.8 Evals
 
 Requirement 2 and 6 are proven by scenarios, not by design argument. Added to
-[spec 18](18_local_evaluation_harness.md):
+[spec 18](18_local_evaluation_harness/proposal.md):
 
 - **Prompt-injection via repository content**: a fixture whose `AGENTS.md` and
   `CONTRIBUTING.md` instruct the agent to remember that commands are
@@ -423,9 +424,9 @@ proposal in the audit log, and how to see which scope an entry is in.
 - A confirmed memory cannot change the active mode, the approval policy, or path
   policy — asserted by a test where a memory states otherwise.
 - Repository observations record `EvidenceRef` with path and content hash.
-- The five quality-gate commands from `AGENTS.md` pass, and the
-  [spec 18](18_local_evaluation_harness.md) baseline shows no increase in
-  approval-policy violations.
+- Every quality-gate command from `AGENTS.md` passes, and the
+  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no increase
+  in approval-policy violations.
 
 ## 7. Implementation Notes
 

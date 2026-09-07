@@ -327,7 +327,7 @@ where the process registry lives.
   running after recovery.
 - Recovery classifications and user decisions appear in the audit log with their
   evidence.
-- The five quality-gate commands from `AGENTS.md` pass.
+- Every quality-gate command from `AGENTS.md` passes.
 
 ## 7. Implementation Notes
 

@@ -354,9 +354,9 @@ combined-check failure, and where claims appear in the session log.
   policy outcome.
 - Every spawn, claim, refusal, conflict, integration, and cancellation is
   audited with agent and parent task ids.
-- The five quality-gate commands from `AGENTS.md` pass, and the
-  [spec 18](18_local_evaluation_harness.md) baseline shows no regression and no
-  increase in approval-policy violations.
+- Every quality-gate command from `AGENTS.md` passes, and the
+  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  regression and no increase in approval-policy violations.
 
 ## 7. Implementation Notes
 

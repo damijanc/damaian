@@ -7,10 +7,11 @@ Package 7 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Related spec sections: `ai_coding_assistant_specification.md` section 19
 (recommended technology direction). Related implementation specs:
-[`18_local_evaluation_harness.md`](18_local_evaluation_harness.md) (the harness
-this extends — this spec adds scenarios and metrics, it does not build a second
-harness), [`19_token_and_cost_accounting.md`](19_token_and_cost_accounting.md)
-(the usage figures amplification is computed from),
+[`18_local_evaluation_harness/`](18_local_evaluation_harness/proposal.md) (the
+harness this extends — this spec adds scenarios and metrics, it does not build a
+second harness),
+[`19_token_and_cost_accounting.md`](19_token_and_cost_accounting.md) (the usage
+figures amplification is computed from),
 [`21_task_plan_progress_and_budget.md`](21_task_plan_progress_and_budget.md),
 [`38_subagent_model.md`](38_subagent_model.md),
 [`39_coordination_and_conflict_handling.md`](39_coordination_and_conflict_handling.md).
@@ -42,21 +43,21 @@ measures it, and this spec is that something.
 
 Nothing in this phase exists. What it builds on:
 
-- **The harness exists**, from [spec 18](18_local_evaluation_harness.md): a
-  workspace crate with a `damaian-eval` binary (§5.1 there), fixture
-  repositories materialised into temporary directories with `DAMAIAN_DATA_DIR`
-  isolation (§5.2), a deterministic tier driven by `MockModelAdapter` via
-  scenario files (§5.3), thirteen scenarios (§5.4), a per-scenario run record
-  (§5.5), full coverage of the roadmap's metric set (§5.6), and a committed
-  reviewed baseline at `evals/baseline.json` (§5.7).
+- **The harness exists**, from
+  [spec 18](18_local_evaluation_harness/proposal.md): a workspace crate with a
+  `damaian-eval` binary (§5.1 there), fixture repositories materialised into
+  temporary directories with `DAMAIAN_DATA_DIR` isolation (§5.2), a
+  deterministic tier driven by `MockModelAdapter` via scenario files (§5.3),
+  thirteen scenarios (§5.4), a per-scenario run record (§5.5), full coverage of
+  the roadmap's metric set (§5.6), and a committed reviewed baseline at
+  `evals/baseline.json` (§5.7).
 - **The deterministic tier runs inside `cargo test --workspace --locked`**
-  ([spec 18](18_local_evaluation_harness.md) §5.8), adding no new quality-gate
-  command.
+  ([spec 18](18_local_evaluation_harness/proposal.md) §5.8), adding no new
+  quality-gate command.
 - **Two metric rows were deferred and are now filled.**
-  [Spec 18](18_local_evaluation_harness.md) §5.6 marks memory recall usefulness
-  and memory correction rate `notApplicable: "phase-3b"`, and
-  [spec 30](30_memory_retrieval_and_lifecycle.md) §5.8 supplies them. This spec
-  adds rows rather than filling deferred ones.
+  [Spec 18](18_local_evaluation_harness/proposal.md) §5.6 marks memory recall
+  usefulness and memory correction rate `notApplicable: "phase-3b"`, and [spec 30](30_memory_retrieval_and_lifecycle.md) §5.8 supplies them. This spec adds
+  rows rather than filling deferred ones.
 - **Per-task usage aggregates upward.**
   [Spec 19](19_token_and_cost_accounting.md) §5.4 records usage per run and sums
   per task, and [spec 38](38_subagent_model.md) §5.10 makes a parent's total
@@ -70,11 +71,11 @@ Nothing in this phase exists. What it builds on:
 
 ## 3. Requirements
 
-Extend the [spec 18](18_local_evaluation_harness.md) harness to measure:
-delegation correctness; redundant work; conflicting edits; parent integration
-quality; permission propagation; cancellation and timeout behaviour; cost and
-latency amplification; recovery after child failure; and remote/local result
-equivalence where applicable.
+Extend the [spec 18](18_local_evaluation_harness/proposal.md) harness to
+measure: delegation correctness; redundant work; conflicting edits; parent
+integration quality; permission propagation; cancellation and timeout behaviour;
+cost and latency amplification; recovery after child failure; and remote/local
+result equivalence where applicable.
 
 1. Compare advanced execution against the recorded single-agent baseline on the
    same representative tasks.
@@ -87,15 +88,15 @@ equivalence where applicable.
 - A second harness. This adds scenarios, metrics, and a comparison mode to the
   existing one.
 - Model-graded quality scoring. Every assertion stays mechanical, per
-  [spec 18](18_local_evaluation_harness.md) §4 — a model judging whether
-  delegation produced a better answer is not evidence, particularly when it is
-  the same model that did the delegating.
+  [spec 18](18_local_evaluation_harness/proposal.md) §4 — a model judging
+  whether delegation produced a better answer is not evidence, particularly when
+  it is the same model that did the delegating.
 - Tuning delegation. This measures; changing prompts or agent kinds in response
   is separate work informed by the measurement.
 - Remote/local equivalence as implemented behaviour. Phase 6 WP5 (Remote
   Sandbox) is Could-tier and unspecified, so §5.4 defines the metric and marks
   it not-applicable until that ships — the same treatment
-  [spec 18](18_local_evaluation_harness.md) gave the memory rows.
+  [spec 18](18_local_evaluation_harness/proposal.md) gave the memory rows.
 - Benchmarking against other assistants.
 - A dashboard. Machine-readable output plus a concise report, as before.
 
@@ -154,8 +155,8 @@ Three properties this needs to be honest:
   of two estimates is not a measurement.
 - **Deterministic-tier duration measures Damaian's own work only**, since the
   mock returns instantly — recorded as such, per
-  [spec 18](18_local_evaluation_harness.md) §5.6's treatment of latency.
-  Wall-clock amplification is a live-tier figure.
+  [spec 18](18_local_evaluation_harness/proposal.md) §5.6's treatment of
+  latency. Wall-clock amplification is a live-tier figure.
 
 ### 5.3 The new scenarios
 
@@ -249,8 +250,8 @@ phase's abandonment option requires the pre-Phase-6 baseline to remain
 intact and citable.
 
 Both files are human-reviewed before commit, per
-[spec 18](18_local_evaluation_harness.md) §5.7's rule that an unread baseline is
-not a baseline.
+[spec 18](18_local_evaluation_harness/proposal.md) §5.7's rule that an unread
+baseline is not a baseline.
 
 ### 5.7 Abandonment is a recorded outcome
 
@@ -309,7 +310,7 @@ and what it is derived from.
 - The remote/local equivalence row is `notApplicable: "phase-6-wp5"` and does
   not block the metric-coverage assertion.
 - No model-graded scoring is used anywhere.
-- The five quality-gate commands from `AGENTS.md` pass, and the harness adds no
+- Every quality-gate command from `AGENTS.md` passes, and the harness adds no
   new quality-gate command.
 
 ## 7. Implementation Notes

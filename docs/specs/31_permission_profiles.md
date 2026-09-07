@@ -373,9 +373,9 @@ secret, command, path, and key boundaries.
   and an imported profile's widenings require review.
 - `command_allowlist` remains exact-command; no profile introduces pattern
   matching.
-- The five quality-gate commands from `AGENTS.md` pass, and the
-  [spec 18](18_local_evaluation_harness.md) baseline shows no increase in
-  approval-policy violations.
+- Every quality-gate command from `AGENTS.md` passes, and the
+  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no increase
+  in approval-policy violations.
 
 ## 7. Implementation Notes
 

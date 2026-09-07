@@ -310,9 +310,9 @@ refusal, and where the mode event is in the session log.
 - Existing sessions load in Code mode after migration.
 - A mode refusal tells the user which mode blocked the action and which would
   allow it.
-- The five quality-gate commands from `AGENTS.md` pass, and the
-  [spec 18](18_local_evaluation_harness.md) baseline shows no increase in
-  approval-policy violations.
+- Every quality-gate command from `AGENTS.md` passes, and the
+  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no increase
+  in approval-policy violations.
 
 ## 7. Implementation Notes
 

@@ -363,8 +363,9 @@ report means.
 - Every invocation and outcome is audited, with failure kinds distinguished.
 - An extension failure does not corrupt session state — asserted by failing a
   hook at each event.
-- The five quality-gate commands from `AGENTS.md` pass, and the
-  [spec 18](18_local_evaluation_harness.md) baseline shows no regression.
+- Every quality-gate command from `AGENTS.md` passes, and the
+  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  regression.
 
 ## 7. Implementation Notes
 

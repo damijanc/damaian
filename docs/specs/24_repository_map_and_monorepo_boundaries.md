@@ -353,8 +353,9 @@ directory is wrongly detected, and how to read `detected_by`.
 - A corrupt or version-mismatched map file rebuilds cleanly and reports that it
   did.
 - A root cannot widen `path_policy.rs`.
-- The five quality-gate commands from `AGENTS.md` pass, and the
-  [spec 18](18_local_evaluation_harness.md) baseline shows no regression.
+- Every quality-gate command from `AGENTS.md` passes, and the
+  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  regression.
 
 ## 7. Implementation Notes
 

@@ -11,8 +11,8 @@ adapter), section 12.1 (performance). Related implementation specs:
 figures attach to),
 [`17_durable_task_state_and_crash_recovery.md`](17_durable_task_state_and_crash_recovery.md)
 (the session-log append rules and the lost-call case), and
-[`18_local_evaluation_harness.md`](18_local_evaluation_harness.md) (consumes
-these fields).
+[`18_local_evaluation_harness/`](18_local_evaluation_harness/proposal.md)
+(consumes these fields).
 
 ## 1. Motivation
 
@@ -35,8 +35,8 @@ number. The only token figure in the codebase is a `payload.len() / 4` estimate
 This work package only measures. The enforced per-task ceiling lands in Phase 2
 alongside the plan machinery, because stopping a task cleanly needs it — but a
 ceiling cannot be built on numbers that do not exist, and
-[spec 18](18_local_evaluation_harness.md)'s metric set has four rows that stay
-empty until this ships.
+[spec 18](18_local_evaluation_harness/proposal.md)'s metric set has four rows
+that stay empty until this ships.
 
 ## 2. Current State
 
@@ -71,7 +71,7 @@ empty until this ships.
 1. Input tokens, output tokens, and provider-reported cost are recorded per task
    and stored alongside the task in `SessionStore`.
 2. The stored totals are exposed through task state and the completion report.
-3. The same fields feed the [spec 18](18_local_evaluation_harness.md) harness, so
+3. The same fields feed the [spec 18](18_local_evaluation_harness/proposal.md) harness, so
    the metric set is populated by real sessions as well as eval runs.
 4. Where a provider does not report usage, the figure is estimated and labelled
    as an estimate. **An estimate is never presented as measured.**
@@ -248,8 +248,9 @@ than it is.
   and ids only — requirement 7 is satisfied by construction, since no prompt or
   file content enters the record.
 - **Eval harness**: `read_task_usage` is what
-  [spec 18](18_local_evaluation_harness.md)'s `tokens` and `cost` fields read,
-  and `measured: false` there is this spec's `UsageSource::Estimated`.
+  [spec 18](18_local_evaluation_harness/proposal.md)'s `tokens` and `cost`
+  fields read, and `measured: false` there is this spec's
+  `UsageSource::Estimated`.
 
 Optional cost estimation from user-configured rates
 (`price_per_million_input_tokens`, `price_per_million_output_tokens` per
@@ -291,7 +292,7 @@ why a figure may be estimated, and how to set price rates for a cost figure.
 - Cost is `None` and nothing is displayed when no rates are configured; a
   configured-rate figure is labelled estimated and attributed to the user's
   rates.
-- The five quality-gate commands from `AGENTS.md` pass.
+- Every quality-gate command from `AGENTS.md` passes.
 
 ## 7. Implementation Notes
 
