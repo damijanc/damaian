@@ -10,7 +10,7 @@ Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 (secret detection). Related implementation specs:
 [`06_mcp_support.md`](06_mcp_support.md) (the transport this uses instead of a
 bespoke API client),
-[`17_durable_task_state_and_crash_recovery.md`](17_durable_task_state_and_crash_recovery.md)
+[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (`unknown_external_outcome` — the central mechanism here),
 [`23_verification_loop.md`](23_verification_loop.md) (the check evidence the PR
 body quotes), [`31_permission_profiles.md`](31_permission_profiles.md),
@@ -44,7 +44,7 @@ requires two approvals in order, and this spec makes them structurally distinct.
 process dies after the PR request is sent and before the response arrives, the PR
 may exist. Retrying creates a duplicate; assuming failure loses the work;
 assuming success reports a URL that may not exist.
-[Spec 17](17_durable_task_state_and_crash_recovery.md) built
+[Spec 17](17_durable_task_state_and_crash_recovery/proposal.md) built
 `unknown_external_outcome` for exactly this, and a PR creation is its clearest
 case.
 
@@ -74,7 +74,7 @@ bespoke GitHub client would duplicate all of that and add a credential path.
   the same reason as in [spec 35](35_commit_preparation.md) §5.4: what is
   displayed is not what is transmitted.
 - **`unknown_external_outcome` and action markers exist** in
-  [spec 17](17_durable_task_state_and_crash_recovery.md) §5.1 and §5.3, including
+  [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.1 and §5.3, including
   the rule that nothing with an unknown outcome is ever automatically repeated.
 - **Check evidence is structured.**
   [Spec 23](23_verification_loop.md) §5.7 defines a completion report whose
@@ -242,7 +242,7 @@ terminal, where the command says what it is.
 Requirement 3, and the mechanism the whole flow is built around.
 
 Both external writes are bracketed by
-[spec 17](17_durable_task_state_and_crash_recovery.md) §5.3 action markers with
+[spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.3 action markers with
 `sideEffecting: true`, and both have a real window between "request sent" and
 "response received" in which the outcome is genuinely unknown.
 

@@ -317,7 +317,7 @@ mode, where a turn captures its mode at start.
 
 An action already running to completion under the old profile is not aborted:
 interrupting a patch application or a command mid-flight creates exactly the
-unknown-outcome state [spec 17](17_durable_task_state_and_crash_recovery.md)
+unknown-outcome state [spec 17](17_durable_task_state_and_crash_recovery/proposal.md)
 exists to avoid. The next action is evaluated under the new profile.
 
 ### 5.9 Export and import

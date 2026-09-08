@@ -81,7 +81,7 @@ leaked, so nothing failed.
 ## Scope note: what this plan does not build
 
 Twelve of the thirteen scenarios in §5.4. The resume scenario is deferred to
-[spec 17](../17_durable_task_state_and_crash_recovery.md) — see proposal §5.4 for why a weaker
+[spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) — see proposal §5.4 for why a weaker
 assertion was rejected. Task 11 builds the `blocked_on` plumbing that makes the deferral
 machine-readable, and is the only resume-related work here.
 

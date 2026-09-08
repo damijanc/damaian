@@ -14,7 +14,7 @@ Related implementation specs:
 [`04_hunk_level_patch_apply.md`](04_hunk_level_patch_apply.md),
 [`07_generated_secret_override.md`](07_generated_secret_override.md),
 [`08_stop_and_progress.md`](08_stop_and_progress.md),
-[`17_durable_task_state_and_crash_recovery.md`](17_durable_task_state_and_crash_recovery.md)
+[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (shares the session event log and its migration).
 
 ## 1. Motivation
@@ -44,7 +44,7 @@ Two gaps make the existing rollback insufficient as a foundation:
   most about.
 
 Rewind is also the feature that makes the rest of Phase 1 safe to use. Durable
-task state ([spec 17](17_durable_task_state_and_crash_recovery.md)) lets a user
+task state ([spec 17](17_durable_task_state_and_crash_recovery/proposal.md)) lets a user
 resume after a crash; checkpoints are what let them decline to.
 
 ## 2. Current State
@@ -316,7 +316,7 @@ rewind to an earlier point supersedes an earlier one, so the newest marker wins.
 
 This requires the log to have a per-event sequence number, which it does not
 have today. Add a monotonic `seq` to every appended event.
-[Spec 17](17_durable_task_state_and_crash_recovery.md) needs the same field for
+[Spec 17](17_durable_task_state_and_crash_recovery/proposal.md) needs the same field for
 crash classification, so the two specs share one migration: events without
 `seq` are numbered by line order on read, which is exactly their append order,
 so existing sessions need no rewrite.

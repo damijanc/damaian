@@ -10,7 +10,7 @@ interface UI states), section 7.6 (tool and action orchestrator), section 11
 (error handling). Related implementation specs:
 [`08_stop_and_progress.md`](08_stop_and_progress.md) (the per-turn progress and
 cancellation this extends to multi-step tasks),
-[`17_durable_task_state_and_crash_recovery.md`](17_durable_task_state_and_crash_recovery.md)
+[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (the durable task state and append rules this persists through),
 [`19_token_and_cost_accounting.md`](19_token_and_cost_accounting.md) (supplies
 the token figures the ceiling is enforced against),
@@ -51,7 +51,7 @@ completion report, and it cannot exist without steps that carry evidence.
   `TaskStatus`.
 - **`TaskStatus` is per task, not per step.** Seven variants today
   (`crates/workspace-engine/src/session.rs:21-29`), extended to twelve by
-  [spec 17](17_durable_task_state_and_crash_recovery.md).
+  [spec 17](17_durable_task_state_and_crash_recovery/proposal.md).
 - **A budget-stop shape already exists and works.** `agent_max_tool_rounds` is
   enforced in the chat loop, producing `tool_budget_exhausted_response`
   (`crates/workspace-engine/src/chat.rs:841`) and
@@ -62,7 +62,7 @@ completion report, and it cannot exist without steps that carry evidence.
   repository config (`config.rs:308-315`).
 - **Sessions are an append-only event log** with replay-based readers
   (`session.rs:237-260`), gaining a monotonic `seq` in
-  [spec 17](17_durable_task_state_and_crash_recovery.md) §5.2.
+  [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.2.
 - **No token accounting exists yet.** `ModelRun`
   (`crates/workspace-engine/src/model.rs:158-177`) has no usage fields;
   [spec 19](19_token_and_cost_accounting.md) adds them and
@@ -84,7 +84,7 @@ completion report, and it cannot exist without steps that carry evidence.
    reviewing, or complete.
 4. Users can inspect and adjust a plan before implementation begins.
 5. Progress persists and is recovered after restart, through the durable task
-   state from [spec 17](17_durable_task_state_and_crash_recovery.md).
+   state from [spec 17](17_durable_task_state_and_crash_recovery/proposal.md).
 6. **A step is never marked complete only because the model says so.** Observable
    evidence is attached wherever one exists. Where none exists, the step is
    marked completed *unverified* and the completion report says so.
@@ -153,7 +153,7 @@ read, or a one-command turn gets no plan, because a one-step plan is ceremony �
 
 ### 5.2 Persistence: appended, replayed
 
-Following [spec 17](17_durable_task_state_and_crash_recovery.md) §5.2, plan state
+Following [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.2, plan state
 is appended to the session log, never rewritten:
 
 ```json
@@ -174,7 +174,7 @@ This satisfies requirement 5 without a second store, per the roadmap's
 instruction to extend the durable task state rather than add a parallel one. It
 also means a crash mid-step loses nothing already recorded: the step's last
 persisted status is its status, and
-[spec 17](17_durable_task_state_and_crash_recovery.md)'s dangling
+[spec 17](17_durable_task_state_and_crash_recovery/proposal.md)'s dangling
 `action_started` marker says what was in flight inside it.
 
 ### 5.3 Evidence, and what "completed" is allowed to mean

@@ -9,7 +9,7 @@ Related spec sections: `ai_coding_assistant_specification.md` section 7.6 (tool
 and action orchestrator), section 7.8 (risk classification and approval).
 Related implementation specs:
 [`08_stop_and_progress.md`](08_stop_and_progress.md) (`CancelToken`),
-[`17_durable_task_state_and_crash_recovery.md`](17_durable_task_state_and_crash_recovery.md)
+[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (task state, action markers, and the PID registry),
 [`18_local_evaluation_harness/`](18_local_evaluation_harness/proposal.md)
 (measures the readiness gates), [`20_working_modes.md`](20_working_modes.md) and
@@ -34,7 +34,7 @@ because they affect whether the gates can be evaluated at all:
   cost/latency/iteration ceilings come from
   [spec 18](18_local_evaluation_harness/proposal.md) and
   [spec 21](21_task_plan_progress_and_budget.md); crash-recovery fixtures from
-  [spec 17](17_durable_task_state_and_crash_recovery.md); external-write
+  [spec 17](17_durable_task_state_and_crash_recovery/proposal.md); external-write
   handling from [specs 35–37](37_pull_request_creation.md). Trace completeness
   is a manual review.
 - **One gate is not currently measurable.** "Worktree isolation stability —
@@ -88,7 +88,7 @@ Nothing in this phase exists, deliberately. What it builds on:
   provider, model, and timestamps. No parent reference exists, so trace linkage
   is a new field.
 - **Task state is an append-only session event log**, extended to twelve states
-  by [spec 17](17_durable_task_state_and_crash_recovery.md), with `seq`-ordered
+  by [spec 17](17_durable_task_state_and_crash_recovery/proposal.md), with `seq`-ordered
   events and action markers.
 - **The tool list has one construction site**, `chat.rs:711-731`, filtered by
   mode in [spec 20](20_working_modes.md) §5.2 — the same place a subagent's
@@ -98,7 +98,7 @@ Nothing in this phase exists, deliberately. What it builds on:
   the effective capability defined as `profile ∩ mode`
   ([spec 31](31_permission_profiles.md) §5.6).
 - **The PID registry exists** for spawned children —
-  [spec 17](17_durable_task_state_and_crash_recovery.md) §5.7 — covering MCP
+  [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7 — covering MCP
   stdio servers, the `curl` model child, PTY sessions, and (per later specs)
   hooks and language servers.
 - **`AuditLog::record`** (`audit.rs:42`) is the single trail, redacting field
@@ -194,7 +194,7 @@ policy evaluation.
 
 Requirement 8 then applies to what a subagent *spawns* — commands, MCP servers,
 language servers — all of which already go through
-[spec 17](17_durable_task_state_and_crash_recovery.md) §5.7's PID registry. The
+[spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7's PID registry. The
 addition is one field: each registry entry records the **owning agent's task
 id**, so cancelling or reaping one agent kills its children and not its
 siblings'. "No subagent process outlives its parent task" becomes a property of
@@ -363,7 +363,7 @@ Two consequences worth stating:
 Requirement 7. `Task` gains `parent_task_id: Option<String>` — the first
 hierarchy in the model. Spawn, result, and completion are appended to the
 session event log per
-[spec 17](17_durable_task_state_and_crash_recovery.md) §5.2, and audited:
+[spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.2, and audited:
 
 ```json
 {"seq":512,"eventType":"subagent_spawned","taskId":"task_...",

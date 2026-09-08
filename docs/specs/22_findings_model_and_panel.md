@@ -306,7 +306,7 @@ output into every finding.
 ### 5.7 Persistence
 
 Findings are appended to the session log per
-[spec 17](17_durable_task_state_and_crash_recovery.md) §5.2:
+[spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.2:
 
 ```json
 {"seq":260,"eventType":"finding_recorded","taskId":"task_…","finding":{…}}

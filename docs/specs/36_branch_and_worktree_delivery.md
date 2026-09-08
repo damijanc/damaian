@@ -10,7 +10,7 @@ Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 implementation specs:
 [`16_session_checkpoints_and_rewind.md`](16_session_checkpoints_and_rewind.md)
 (checkpoint scoping when a worktree is in play),
-[`17_durable_task_state_and_crash_recovery.md`](17_durable_task_state_and_crash_recovery.md),
+[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md),
 [`20_working_modes.md`](20_working_modes.md),
 [`31_permission_profiles.md`](31_permission_profiles.md) and
 [`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)
@@ -310,7 +310,7 @@ Every mutation here is a Git mutation and therefore a capability:
   ([spec 34](34_repository_config_trust_boundary.md)).
 - No `Allow Always` for any of them.
 - Each mutation is bracketed by
-  [spec 17](17_durable_task_state_and_crash_recovery.md) §5.3 action markers with
+  [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.3 action markers with
   `sideEffecting: true`. Ref updates are individually atomic, so recovery is a
   read: compare the ref against the start marker's expectation. Branch creation
   interrupted mid-flight either created the ref or did not, and the check says

@@ -9,7 +9,7 @@ Related spec sections: `ai_coding_assistant_specification.md` section 7.5 (model
 adapter), section 12.1 (performance). Related implementation specs:
 [`08_stop_and_progress.md`](08_stop_and_progress.md) (the turn lifecycle these
 figures attach to),
-[`17_durable_task_state_and_crash_recovery.md`](17_durable_task_state_and_crash_recovery.md)
+[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (the session-log append rules and the lost-call case), and
 [`18_local_evaluation_harness/`](18_local_evaluation_harness/proposal.md)
 (consumes these fields).
@@ -188,7 +188,7 @@ is only as trustworthy as its weakest term.
 ### 5.4 Per-task aggregation
 
 A task's usage is the sum over its runs. Following
-[spec 17](17_durable_task_state_and_crash_recovery.md)'s rule that the session
+[spec 17](17_durable_task_state_and_crash_recovery/proposal.md)'s rule that the session
 log is append-only, usage is appended, never rewritten:
 
 ```json
@@ -229,7 +229,7 @@ Requirement 5 is where honest accounting differs from convenient accounting.
   call. `ModelRun::cancelled_before_start` (`model.rs:180-183`) is the one case
   with genuinely zero usage, and it is recorded as measured zero.
 - **Crashed turns**: a call in flight when the app died was billed and its
-  response is gone. [Spec 17](17_durable_task_state_and_crash_recovery.md)
+  response is gone. [Spec 17](17_durable_task_state_and_crash_recovery/proposal.md)
   classifies the task; recovery appends a usage event estimated from the request,
   marked `source: "estimated"` with the reason, so a crash does not silently
   reduce the reported spend.

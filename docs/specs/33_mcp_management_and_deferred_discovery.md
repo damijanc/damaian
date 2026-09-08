@@ -10,7 +10,7 @@ adapter, tool calling), section 7.6 (tool and action orchestrator), section 7.8
 (risk classification and approval). Related implementation specs:
 [`06_mcp_support.md`](06_mcp_support.md) (the delivered runtime this manages),
 [`03_structured_tool_calling.md`](03_structured_tool_calling.md),
-[`17_durable_task_state_and_crash_recovery.md`](17_durable_task_state_and_crash_recovery.md)
+[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (the PID registry MCP servers are the primary client of),
 [`20_working_modes.md`](20_working_modes.md) (mode filters MCP tools),
 [`26_context_assembly.md`](26_context_assembly.md) (the context budget this
@@ -68,7 +68,7 @@ itself favourably.
   tools, whether or not a tool is called.
 - **Stdio servers spawn children with no kill-on-drop guard**
   (`mcp.rs:323`), which
-  [spec 17](17_durable_task_state_and_crash_recovery.md) §5.7 identifies as one
+  [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7 identifies as one
   of three orphan sources and assigns to the PID registry.
 - **Tools are namespaced** `mcp__<server>__<tool>`, parsed by
   `parse_namespaced_tool_name` (used at `chat.rs:726`), so per-tool addressing
@@ -230,7 +230,7 @@ Requirement 4, with three separate budgets because they fail differently:
 A call timeout is reported to the model as a tool error rather than failing the
 turn — a remote system being slow is a normal condition the agent can work
 around, and it is also, per
-[spec 17](17_durable_task_state_and_crash_recovery.md), an **unknown outcome**:
+[spec 17](17_durable_task_state_and_crash_recovery/proposal.md), an **unknown outcome**:
 the request may have been received and acted on. A timed-out call that could have
 written something is recorded as such and never automatically retried.
 
@@ -303,7 +303,7 @@ question a user has after enabling something authored by a third party.
 ### 5.8 Process lifetime
 
 Requirement 8. Stdio children (`mcp.rs:323`) register their PID and start time in
-the [spec 17](17_durable_task_state_and_crash_recovery.md) §5.7 registry, are
+the [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7 registry, are
 killed by PID, and are start-time-checked before killing so a recycled PID is
 never someone else's process.
 

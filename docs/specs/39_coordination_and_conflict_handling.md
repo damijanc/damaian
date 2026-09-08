@@ -11,7 +11,7 @@ implementation specs:
 [`04_hunk_level_patch_apply.md`](04_hunk_level_patch_apply.md),
 [`08_stop_and_progress.md`](08_stop_and_progress.md),
 [`16_session_checkpoints_and_rewind.md`](16_session_checkpoints_and_rewind.md),
-[`17_durable_task_state_and_crash_recovery.md`](17_durable_task_state_and_crash_recovery.md),
+[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md),
 [`21_task_plan_progress_and_budget.md`](21_task_plan_progress_and_budget.md),
 [`22_findings_model_and_panel.md`](22_findings_model_and_panel.md),
 [`23_verification_loop.md`](23_verification_loop.md) (the checks §5.5 reruns),
@@ -72,7 +72,7 @@ Nothing in this phase exists. What it builds on:
   ([spec 16](16_session_checkpoints_and_rewind.md) §5.1), keyed on
   `repository_id` = `sha256(canonical path)` (`indexer.rs:382-385`).
 - **The session event log is append-only** with `seq` ordering
-  ([spec 17](17_durable_task_state_and_crash_recovery.md) §5.2).
+  ([spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.2).
 
 ## 3. Requirements
 
@@ -249,7 +249,7 @@ would produce a patch composed in ignorance of the other half.
 ### 5.6 Failure isolation
 
 Requirement 5. Each child's task status is independent
-([spec 17](17_durable_task_state_and_crash_recovery.md)'s twelve states). A child
+([spec 17](17_durable_task_state_and_crash_recovery/proposal.md)'s twelve states). A child
 that fails, is cancelled, or exhausts its budget:
 
 - Releases its ownership claim.
@@ -278,7 +278,7 @@ its siblings running.
 Cancellation stays **cooperative**, as `cancel.rs` documents — checked at points
 where stopping is safe. Cancelling a group therefore does not abort an
 in-flight patch application or command; it stops before the next one, which is
-what keeps [spec 17](17_durable_task_state_and_crash_recovery.md)'s
+what keeps [spec 17](17_durable_task_state_and_crash_recovery/proposal.md)'s
 unknown-outcome surface from growing with concurrency.
 
 Requirement 1's "structured result handoff" is parent-mediated and one-way:

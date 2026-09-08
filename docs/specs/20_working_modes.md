@@ -239,7 +239,7 @@ when it ran. The turn captures its mode at start and uses that captured value fo
 the whole turn, so a mode change cannot take effect halfway through a tool loop.
 
 The replay reads events by parsed `eventType` rather than
-`line.contains(...)`, per [spec 17](17_durable_task_state_and_crash_recovery.md)
+`line.contains(...)`, per [spec 17](17_durable_task_state_and_crash_recovery/proposal.md)
 §5.2 — the existing browser-diagnostics reader uses substring matching, and this
 one should not copy that part.
 

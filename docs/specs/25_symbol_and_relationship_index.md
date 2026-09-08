@@ -77,7 +77,7 @@ existing heuristics are a reasonable floor and a poor ceiling.
 - **The keyword index is in-memory only** and rebuilt per launch; persistence is
   Phase 3 WP1, which is Should-tier and **not in this phase's minimum slice**.
 - **Process tracking for spawned children is specified but not built.**
-  [Spec 17](17_durable_task_state_and_crash_recovery.md) §5.7 defines the
+  [Spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7 defines the
   session-scoped PID registry, driven by MCP stdio servers and the `curl` model
   child. Language servers are a third client of it.
 - **`Finding`** ([spec 22](22_findings_model_and_panel.md)) declares
@@ -326,7 +326,7 @@ satisfied in neither:
 ### 5.8 Process lifetime
 
 Language servers are long-lived children, so requirement 9 uses the registry
-from [spec 17](17_durable_task_state_and_crash_recovery.md) §5.7: PID and start
+from [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7: PID and start
 time recorded at spawn, killed by PID, with the start-time check before killing
 so a recycled PID is never someone else's process.
 

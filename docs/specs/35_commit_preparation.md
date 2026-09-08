@@ -13,7 +13,7 @@ per-hunk acceptance this commits),
 [`07_generated_secret_override.md`](07_generated_secret_override.md) (the
 warn-and-override mechanism §5.4 reuses),
 [`16_session_checkpoints_and_rewind.md`](16_session_checkpoints_and_rewind.md),
-[`17_durable_task_state_and_crash_recovery.md`](17_durable_task_state_and_crash_recovery.md)
+[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (a commit is a side-effecting action with an unknown-outcome window),
 [`23_verification_loop.md`](23_verification_loop.md) (check evidence),
 [`31_permission_profiles.md`](31_permission_profiles.md) and
@@ -242,7 +242,7 @@ repository's own protections. So the flow runs them explicitly:
 Because hooks are arbitrary local programs, they are executed through the
 existing command path with its timeout, output truncation, and `SecretScanner`
 redaction, and their PIDs are registered per
-[spec 17](17_durable_task_state_and_crash_recovery.md) §5.7 — a hanging
+[spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7 — a hanging
 `pre-commit` must not hang the session, and a crash must not leave it running.
 
 ### 5.6 Message suggestion
@@ -275,7 +275,7 @@ Two rules on the drafted message:
 — harmless, collected by `git gc` — or die after `update-ref` with no record.
 
 So a commit is bracketed by
-[spec 17](17_durable_task_state_and_crash_recovery.md) §5.3's action markers with
+[spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.3's action markers with
 `sideEffecting: true`. A crash in between classifies as
 `unknown_external_outcome`, and recovery **does not re-commit**. Resolution is
 cheap and specific: compare `HEAD` against the expected old value recorded in the

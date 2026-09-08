@@ -10,7 +10,7 @@ Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 classification and approval), section 11 (error handling). Related implementation
 specs: [`10_persistent_command_approval.md`](10_persistent_command_approval.md),
 [`13_docker_command_support.md`](13_docker_command_support.md),
-[`17_durable_task_state_and_crash_recovery.md`](17_durable_task_state_and_crash_recovery.md)
+[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (the PID registry hook processes use, and the action markers hooks sit between),
 [`20_working_modes.md`](20_working_modes.md),
 [`21_task_plan_progress_and_budget.md`](21_task_plan_progress_and_budget.md),
@@ -63,7 +63,7 @@ be the phase's required work rather than its risky work.
   there is no timeout mechanism, which §5.4 has to supply.
 - **Child-process spawning has two precedents**: MCP stdio transport
   (`mcp.rs:288-345`) and the `curl` model child wrapped in `KillOnDrop`
-  (`model.rs:400-406`). [Spec 17](17_durable_task_state_and_crash_recovery.md)
+  (`model.rs:400-406`). [Spec 17](17_durable_task_state_and_crash_recovery/proposal.md)
   §5.7 defines the session-scoped PID registry both should use.
 - **`Finding`** ([spec 22](22_findings_model_and_panel.md)) is the structured
   type a hook returns, with `SecretScanner` redaction applied at construction.
@@ -202,7 +202,7 @@ exits with no deadline. A hook that hangs would hang the turn.
 
 So hook invocation spawns with piped stdio and waits with a deadline, killing the
 child by PID on expiry — registered in the
-[spec 17](17_durable_task_state_and_crash_recovery.md) §5.7 PID registry with its
+[spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7 PID registry with its
 start time, so a crash mid-hook does not leave the process behind and a recycled
 PID is never killed by mistake.
 

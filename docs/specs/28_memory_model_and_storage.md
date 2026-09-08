@@ -269,7 +269,7 @@ its session, so a store that outlives the session would be a leak to clean up
 rather than a feature.
 
 Files are append-only JSONL with the same discipline
-[spec 17](17_durable_task_state_and_crash_recovery.md) §5.2 establishes: one
+[spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.2 establishes: one
 complete record per line, terminated with `\n`, replayed newest-state-wins by
 `id`, and a torn final line discarded on read. This gives supersession and
 deletion history for free — requirement 4's audit trail is the file itself —

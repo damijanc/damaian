@@ -199,7 +199,7 @@ Pins and restrictions persist as appended session events, following the
 ```
 
 Replayed newest-wins, read by parsed `eventType` rather than substring matching,
-per [spec 17](17_durable_task_state_and_crash_recovery.md) §5.2. Pins therefore
+per [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.2. Pins therefore
 survive a restart, which matters because a user who pinned three files for a
 long task should not lose that to a crash.
 
