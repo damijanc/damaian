@@ -628,3 +628,117 @@ fn every_recovery_decision_is_audited_with_its_evidence() {
     );
     assert!(log.contains("apply_patch"), "and the evidence it rested on");
 }
+
+/// The legacy fixture, whose shape was verified against 30 real session logs
+/// from the released version before it was written: no `seq` on any line (777
+/// of 828 real events lack it), `task_status_updated` payloads carrying the
+/// flattened task fields, and one event using the `{"task":…,"error":…}` wrapper
+/// that an error path produces.
+fn legacy_session(fixture: &Fixture) -> &'static str {
+    let sessions = fixture.data_dir.join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/legacy_session.jsonl"
+        ),
+        sessions.join("session_legacy_fixture.jsonl"),
+    )
+    .unwrap();
+    "session_legacy_fixture"
+}
+
+/// Requirement 10: a session written by the current released version loads
+/// after the upgrade with no data loss.
+#[test]
+fn a_session_written_before_this_change_loads_with_no_data_loss() {
+    let fixture = fixture("legacy-load");
+    let session_id = legacy_session(&fixture);
+
+    let messages = fixture.store.read_messages(session_id).unwrap();
+    assert_eq!(messages.len(), 2, "both messages must survive");
+    assert_eq!(messages[0].content, "explain the upload client");
+    assert_eq!(messages[1].content, "It lives in src/upload.rs.");
+
+    let statuses = fixture.store.read_task_statuses(session_id).unwrap();
+    assert_eq!(statuses.len(), 4, "all four tasks must replay");
+    assert_eq!(
+        statuses.get("task_legacy_done").map(String::as_str),
+        Some("complete")
+    );
+    assert_eq!(
+        statuses.get("task_legacy_running").map(String::as_str),
+        Some("running")
+    );
+    assert_eq!(
+        statuses.get("task_legacy_waiting").map(String::as_str),
+        Some("waiting_for_approval")
+    );
+    // The wrapped `{"task":…,"error":…}` form must read the same as the flat one.
+    assert_eq!(
+        statuses.get("task_legacy_errored").map(String::as_str),
+        Some("failed")
+    );
+
+    // Events with no `seq` are numbered by line order, so the newest is 11.
+    assert_eq!(fixture.store.latest_event_seq(session_id).unwrap(), 11);
+    assert_eq!(
+        fixture.store.unreadable_event_count(session_id).unwrap(),
+        0,
+        "a legacy log is fully readable, not partially discarded"
+    );
+}
+
+/// §5.6: a legacy `running` task classifies as `interrupted`.
+#[test]
+fn a_legacy_session_classifies_its_running_task_as_interrupted() {
+    let fixture = fixture("legacy-classify");
+    let session_id = legacy_session(&fixture);
+
+    let recovered = classify_session(&fixture.store, &fixture.audit, session_id).unwrap();
+
+    // `complete` and `failed` are terminal; `waiting_for_approval` is rule 3's
+    // job, not a crash. Only the `running` task is recovered.
+    assert_eq!(
+        recovered
+            .iter()
+            .map(|task| task.task_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["task_legacy_running"]
+    );
+    assert_eq!(recovered[0].classification, TaskStatus::Interrupted);
+    assert_eq!(recovered[0].previous_status, "running");
+    assert!(
+        !recovered[0].auto_resume_permitted,
+        "nothing recorded what it was doing"
+    );
+}
+
+/// The upgrade consequence, asserted rather than left to be discovered: a task
+/// left awaiting approval by the previous version has no recorded link, so it
+/// is failed with a reason. The proposal files themselves are untouched.
+#[test]
+fn a_legacy_task_awaiting_approval_is_failed_because_no_link_was_recorded() {
+    let fixture = fixture("legacy-approval");
+    let session_id = legacy_session(&fixture);
+    let commands = workspace_engine::CommandStore::new(&fixture.data_dir);
+    let patches = workspace_engine::PatchStore::new(&fixture.data_dir);
+
+    let reattached = workspace_engine::reattach_pending_approvals(
+        &fixture.store,
+        &fixture.audit,
+        &commands,
+        &patches,
+        session_id,
+    )
+    .unwrap();
+
+    assert_eq!(reattached.len(), 1);
+    match &reattached[0] {
+        workspace_engine::ReattachedApproval::Unavailable { task_id, reason } => {
+            assert_eq!(task_id, "task_legacy_waiting");
+            assert!(reason.contains("no pending proposal"), "got: {reason}");
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+}
