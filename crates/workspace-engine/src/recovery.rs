@@ -13,7 +13,7 @@
 
 use crate::audit::AuditLog;
 use crate::edit::PatchStore;
-use crate::error::Result;
+use crate::error::{ClientError, Result};
 use crate::patch_engine::ProposedPatch;
 use crate::session::{DanglingAction, PendingApprovalRef, SessionStore, TaskStatus};
 use crate::validation::{CommandProposal, CommandStore};
@@ -275,6 +275,135 @@ fn fail_task(
             ("actor", "system".to_string()),
             ("sessionId", session_id.to_string()),
             ("taskId", task_id.to_string()),
+            ("reason", reason.to_string()),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Whether a human may choose to resume this task at all.
+///
+/// **This is a different question from [`RecoveredTask::auto_resume_permitted`]**,
+/// and conflating them would be a mistake in either direction.
+///
+/// - `auto_resume_permitted` asks "may Damaian continue without asking?" It is
+///   deliberately strict: it excludes a legacy `running` task and a
+///   side-effecting status with no marker, because absence of evidence is not
+///   evidence of safety.
+/// - This asks "may the user, having been shown the evidence, choose to
+///   continue?" Requirement 5 forbids repeating an unknown outcome
+///   *automatically*; an informed human decision is not automatic.
+///
+/// So the only classification that can never be resumed is
+/// [`TaskStatus::UnknownExternalOutcome`]: a side-effecting action was in
+/// flight, and §4 rules out probing an external system to discover whether it
+/// landed. Nothing a user is told can make that knowable.
+pub fn resume_allowed(recovered: &RecoveredTask) -> bool {
+    recovered.classification != TaskStatus::UnknownExternalOutcome
+}
+
+/// Authorizes continuing an interrupted task, or refuses.
+///
+/// Refusing here is requirement 5's enforcement point. Spec 45 will present
+/// this decision from a webview, and a guarantee that lives only in a webview
+/// is not a guarantee — so the refusal is in the engine, where a caller cannot
+/// widen it.
+///
+/// This authorizes and records; actually re-running the turn is the
+/// orchestrator's job, which is why nothing here touches a model adapter.
+pub fn resume(store: &SessionStore, audit: &AuditLog, recovered: &RecoveredTask) -> Result<()> {
+    if !resume_allowed(recovered) {
+        let reason = match &recovered.dangling {
+            Some(action) => format!("{} was in flight and its outcome is unknown", action.action),
+            None => "a side-effecting action was in flight and its outcome is unknown".to_string(),
+        };
+        audit_decision(audit, recovered, "resume", "refused", &reason)?;
+        return Err(ClientError::PolicyBlocked(format!(
+            "Cannot resume {}: {reason}. Inspect it and decide, or mark it failed.",
+            recovered.task_id
+        )));
+    }
+    set_status(store, recovered, TaskStatus::PreparingContext, None)?;
+    audit_decision(audit, recovered, "resume", "allowed", "")?;
+    Ok(())
+}
+
+/// Ends the task as `failed`, noting that its outcome was unknown.
+pub fn mark_failed(
+    store: &SessionStore,
+    audit: &AuditLog,
+    recovered: &RecoveredTask,
+) -> Result<()> {
+    let note = match &recovered.dangling {
+        Some(action) => format!(
+            "Marked failed after a crash: {} was in flight and its outcome is unknown",
+            action.action
+        ),
+        None => "Marked failed after a crash: the task was interrupted".to_string(),
+    };
+    set_status(store, recovered, TaskStatus::Failed, Some(&note))?;
+    audit_decision(audit, recovered, "mark_failed", "applied", &note)?;
+    Ok(())
+}
+
+/// Closes the task as `cancelled`. The turn is not retried.
+pub fn abandon(store: &SessionStore, audit: &AuditLog, recovered: &RecoveredTask) -> Result<()> {
+    set_status(store, recovered, TaskStatus::Cancelled, None)?;
+    audit_decision(audit, recovered, "abandon", "applied", "")?;
+    Ok(())
+}
+
+fn set_status(
+    store: &SessionStore,
+    recovered: &RecoveredTask,
+    status: TaskStatus,
+    error: Option<&str>,
+) -> Result<()> {
+    // Tasks are replayed from events rather than stored as records, so only
+    // `id` and `session_id` are load-bearing here.
+    let task = crate::session::Task {
+        id: recovered.task_id.clone(),
+        session_id: recovered.session_id.clone(),
+        status: recovered.classification.clone(),
+        user_prompt: String::new(),
+        model_provider: String::new(),
+        model_name: String::new(),
+        created_at_ms: 0,
+        completed_at_ms: None,
+    };
+    store.update_task_status(&task, status, error)?;
+    Ok(())
+}
+
+/// Requirement 10: every recovery decision and its outcome, with the evidence
+/// it was made on.
+fn audit_decision(
+    audit: &AuditLog,
+    recovered: &RecoveredTask,
+    decision: &str,
+    outcome: &str,
+    reason: &str,
+) -> Result<()> {
+    audit.record(
+        "task_recovery_decision",
+        &[
+            ("actor", "user".to_string()),
+            ("sessionId", recovered.session_id.clone()),
+            ("taskId", recovered.task_id.clone()),
+            ("decision", decision.to_string()),
+            ("outcome", outcome.to_string()),
+            (
+                "classification",
+                recovered.classification.as_str().to_string(),
+            ),
+            (
+                "danglingAction",
+                recovered
+                    .dangling
+                    .as_ref()
+                    .map(|action| action.action.clone())
+                    .unwrap_or_default(),
+            ),
             ("reason", reason.to_string()),
         ],
     )?;

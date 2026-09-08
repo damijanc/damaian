@@ -475,3 +475,156 @@ fn a_task_awaiting_approval_with_no_recorded_link_fails() {
         other => panic!("expected Unavailable, got {other:?}"),
     }
 }
+
+fn classify_one(fixture: &Fixture) -> workspace_engine::RecoveredTask {
+    classify_session(&fixture.store, &fixture.audit, &fixture.session_id)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("one recovered task")
+}
+
+fn status_of(fixture: &Fixture, task_id: &str) -> Option<String> {
+    fixture
+        .store
+        .read_task_statuses(&fixture.session_id)
+        .unwrap()
+        .get(task_id)
+        .cloned()
+}
+
+/// Requirement 5's enforcement point. Spec 45 will present this from a webview,
+/// and a guarantee that lives only in a webview is not a guarantee — so the
+/// refusal is here, where a caller cannot widen it.
+#[test]
+fn resume_is_refused_for_a_task_whose_outcome_is_unknown() {
+    let fixture = fixture("resume-refused");
+    task_left_in(
+        &fixture,
+        TaskStatus::ApplyingPatch,
+        Some(("apply_patch", true)),
+    );
+    let recovered = classify_one(&fixture);
+    assert_eq!(recovered.classification, TaskStatus::UnknownExternalOutcome);
+
+    let error = workspace_engine::resume(&fixture.store, &fixture.audit, &recovered)
+        .expect_err("resuming an unknown-outcome task must be refused");
+
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("apply_patch"),
+        "the refusal must name the action, got: {text}"
+    );
+    assert!(text.contains("unknown"), "and say why, got: {text}");
+    assert!(
+        audit_log_text(&fixture).contains("\"outcome\":\"refused\""),
+        "the refusal itself is auditable"
+    );
+}
+
+#[test]
+fn resume_is_permitted_for_an_interrupted_read_only_task() {
+    let fixture = fixture("resume-ok");
+    let task = task_left_in(
+        &fixture,
+        TaskStatus::PreparingContext,
+        Some(("read_file", false)),
+    );
+    let recovered = classify_one(&fixture);
+
+    workspace_engine::resume(&fixture.store, &fixture.audit, &recovered)
+        .expect("read-only work may resume");
+
+    assert_eq!(
+        status_of(&fixture, &task.id).as_deref(),
+        Some("preparing_context")
+    );
+}
+
+/// `auto_resume_permitted` and "a human may choose Resume" are different
+/// questions, and this is the case that separates them: a legacy `running` task
+/// is never resumed *automatically*, because nothing recorded what it was
+/// doing — but requirement 5 forbids repeating an unknown outcome
+/// automatically, and an informed human decision is not automatic.
+#[test]
+fn a_human_may_resume_a_task_that_auto_resume_declined() {
+    let fixture = fixture("resume-human");
+    task_left_in(&fixture, TaskStatus::RunningTool, None);
+    let recovered = classify_one(&fixture);
+
+    assert!(
+        !recovered.auto_resume_permitted,
+        "no marker means Damaian must not continue on its own"
+    );
+    assert!(
+        workspace_engine::resume_allowed(&recovered),
+        "but the classification is `interrupted`, so a human may still choose it"
+    );
+    workspace_engine::resume(&fixture.store, &fixture.audit, &recovered).expect("allowed");
+}
+
+#[test]
+fn mark_failed_is_terminal_and_notes_the_unknown_outcome() {
+    let fixture = fixture("mark-failed");
+    let task = task_left_in(
+        &fixture,
+        TaskStatus::RunningTool,
+        Some(("run_command", true)),
+    );
+    let recovered = classify_one(&fixture);
+
+    workspace_engine::mark_failed(&fixture.store, &fixture.audit, &recovered).unwrap();
+
+    assert_eq!(status_of(&fixture, &task.id).as_deref(), Some("failed"));
+    assert!(
+        TaskStatus::parse("failed").unwrap().is_terminal(),
+        "and `failed` is terminal, so the classifier will not pick it up again"
+    );
+    let log = audit_log_text(&fixture);
+    assert!(log.contains("mark_failed"));
+    assert!(
+        log.contains("outcome is unknown"),
+        "the note must say the outcome was unknown, got: {log}"
+    );
+}
+
+#[test]
+fn abandon_is_terminal_and_does_not_retry_the_turn() {
+    let fixture = fixture("abandon");
+    let task = task_left_in(
+        &fixture,
+        TaskStatus::ApplyingPatch,
+        Some(("apply_patch", true)),
+    );
+    let recovered = classify_one(&fixture);
+
+    workspace_engine::abandon(&fixture.store, &fixture.audit, &recovered).unwrap();
+
+    assert_eq!(status_of(&fixture, &task.id).as_deref(), Some("cancelled"));
+    // Re-classifying finds nothing: the task is closed, not queued for a retry.
+    let again = classify_session(&fixture.store, &fixture.audit, &fixture.session_id).unwrap();
+    assert!(again.is_empty(), "an abandoned task is not picked up again");
+}
+
+/// Requirement 10.
+#[test]
+fn every_recovery_decision_is_audited_with_its_evidence() {
+    let fixture = fixture("decision-audit");
+    task_left_in(
+        &fixture,
+        TaskStatus::ApplyingPatch,
+        Some(("apply_patch", true)),
+    );
+    let recovered = classify_one(&fixture);
+
+    let _ = workspace_engine::resume(&fixture.store, &fixture.audit, &recovered);
+    workspace_engine::mark_failed(&fixture.store, &fixture.audit, &recovered).unwrap();
+
+    let log = audit_log_text(&fixture);
+    assert!(log.contains("task_recovery_decision"));
+    assert!(
+        log.contains("unknown_external_outcome"),
+        "the classification"
+    );
+    assert!(log.contains("apply_patch"), "and the evidence it rested on");
+}

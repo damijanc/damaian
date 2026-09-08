@@ -83,7 +83,8 @@ pub use patch_engine::{
 };
 pub use path_policy::PathPolicy;
 pub use recovery::{
-    ReattachedApproval, RecoveredTask, classify_all, classify_session, reattach_pending_approvals,
+    ReattachedApproval, RecoveredTask, abandon, classify_all, classify_session, mark_failed,
+    reattach_pending_approvals, resume, resume_allowed,
 };
 pub use render::{
     render_markdown_to_ansi, render_markdown_to_html, render_markdown_to_html_with_file_links,
