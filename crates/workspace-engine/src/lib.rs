@@ -22,7 +22,8 @@ pub mod mcp;
 pub mod model;
 pub mod patch_engine;
 pub mod path_policy;
-pub mod render;
+pub mod recovery;
+mod render;
 pub mod repository_trust;
 pub mod secret_scanner;
 pub mod session;
@@ -81,6 +82,7 @@ pub use patch_engine::{
     ProposedFilePatch, ProposedPatch, parse_hunk_selection,
 };
 pub use path_policy::PathPolicy;
+pub use recovery::{RecoveredTask, classify_all, classify_session};
 pub use render::{
     render_markdown_to_ansi, render_markdown_to_html, render_markdown_to_html_with_file_links,
 };
