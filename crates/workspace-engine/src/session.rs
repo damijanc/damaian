@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
@@ -17,28 +18,109 @@ pub struct Session {
     pub summary: String,
 }
 
+/// What a task is doing, precisely enough that a crash in it is classifiable.
+///
+/// The old `Running` covered context preparation, the model call, tool
+/// execution, patch application and validation indiscriminately, so a crash
+/// while `Running` said nothing about whether anything had happened. See
+/// `docs/specs/17_durable_task_state_and_crash_recovery/proposal.md` §5.1 for
+/// the state table and what a crash in each one means.
+///
+/// `Interrupted` and `UnknownExternalOutcome` are never set during normal
+/// operation — they are the recovery classifier's output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskStatus {
     Created,
-    Running,
+    PreparingContext,
+    WaitingForModel,
+    RunningTool,
     WaitingForApproval,
-    Failed,
+    ApplyingPatch,
+    Validating,
     Complete,
+    Failed,
     Cancelled,
     ToolBudgetExhausted,
+    Interrupted,
+    UnknownExternalOutcome,
 }
 
 impl TaskStatus {
+    /// Every state, so callers can enumerate rather than list. A variant added
+    /// later shows up here automatically, which is what makes the state tests
+    /// fail until it has been given a terminality and a side-effect answer.
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::Created,
+            Self::PreparingContext,
+            Self::WaitingForModel,
+            Self::RunningTool,
+            Self::WaitingForApproval,
+            Self::ApplyingPatch,
+            Self::Validating,
+            Self::Complete,
+            Self::Failed,
+            Self::Cancelled,
+            Self::ToolBudgetExhausted,
+            Self::Interrupted,
+            Self::UnknownExternalOutcome,
+        ]
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Created => "created",
-            Self::Running => "running",
+            Self::PreparingContext => "preparing_context",
+            Self::WaitingForModel => "waiting_for_model",
+            Self::RunningTool => "running_tool",
             Self::WaitingForApproval => "waiting_for_approval",
-            Self::Failed => "failed",
+            Self::ApplyingPatch => "applying_patch",
+            Self::Validating => "validating",
             Self::Complete => "complete",
+            Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::ToolBudgetExhausted => "tool_budget_exhausted",
+            Self::Interrupted => "interrupted",
+            Self::UnknownExternalOutcome => "unknown_external_outcome",
         }
+    }
+
+    /// Reads a stored status back.
+    ///
+    /// `"running"` is accepted and maps to [`Self::Interrupted`]: it is the
+    /// legacy value written before this spec, and a task left in it carries
+    /// exactly the information this work eliminates — something was in flight
+    /// and nothing recorded what (§5.6). Nothing writes it any more.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::all()
+            .into_iter()
+            .find(|status| status.as_str() == value)
+            .or_else(|| (value == "running").then_some(Self::Interrupted))
+    }
+
+    /// Nothing further will happen to a task in this state.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Complete | Self::Failed | Self::Cancelled | Self::ToolBudgetExhausted
+        )
+    }
+
+    /// Whether a crash in this state may have left a side effect part-done, and
+    /// so must never be automatically repeated (requirement 5).
+    ///
+    /// `Validating` is included even though §5.1 says validation "splits on what
+    /// is being validated" — a sandbox-safe read-only command is resumable and
+    /// anything else is not. That split needs the *command*, which the status
+    /// alone does not carry, so the conservative answer lives here and the
+    /// classifier refines it from the dangling marker's `sideEffecting` flag.
+    /// Erring toward "may have a side effect" is the safe direction: the cost is
+    /// a resume that was not offered, not an action silently repeated.
+    pub fn may_have_side_effect_in_flight(&self) -> bool {
+        matches!(
+            self,
+            Self::RunningTool | Self::ApplyingPatch | Self::Validating
+        )
     }
 }
 
@@ -64,15 +146,68 @@ pub struct ChatMessage {
     pub created_at_ms: u128,
 }
 
+/// A started action, returned by [`SessionStore::start_action`] and consumed by
+/// [`SessionStore::finish_action`].
+///
+/// There is deliberately **no `Drop` impl**. A dropped marker is exactly the
+/// crash case this spec exists to detect, so finishing an action automatically
+/// on drop would erase the signal. `finish_action` takes the marker by value, so
+/// a forgotten finish shows up in review as a binding that goes out of scope
+/// unused rather than as silence.
+///
+/// The marker does not carry `sideEffecting`: that is written durably onto the
+/// `action_started` event, which is where the classifier reads it, and a second
+/// in-memory copy would be state that could disagree with the log.
+#[derive(Debug)]
+pub struct ActionMarker {
+    id: String,
+    session_id: String,
+    task_id: String,
+    action: String,
+    reference: String,
+}
+
+/// An action that started and never finished — the signature of a crash while
+/// it was in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DanglingAction {
+    pub task_id: String,
+    pub action: String,
+    pub reference: String,
+    /// Recorded on the *start* event, so the classifier does not have to
+    /// re-derive the action's nature after the code that knew it is gone.
+    pub side_effecting: bool,
+    pub seq: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     data_dir: PathBuf,
+    /// The last `seq` handed out per session, so an append does not have to
+    /// re-read the log to find it.
+    ///
+    /// `Arc`, not a plain field: `SessionStore` derives `Clone` and is cloned
+    /// into both the chat and the edit orchestrator
+    /// (`workspace_engine.rs:97`, `:112`). Per-clone caches would each hand out
+    /// the same next `seq`, and the log would carry duplicates — which rewind
+    /// resolves by sequence number, so it would rewind to the wrong place.
+    ///
+    /// A miss falls back to reading the file, which is what keeps two
+    /// independently constructed stores over one directory in agreement.
+    ///
+    /// Measured before this existed: appending re-read and re-scanned the whole
+    /// log every time, so cost per append grew with the log — 2.3ms at 500
+    /// events, 4.4ms at 1000, 8.7ms at 2000 (17.5s for the batch). Spec 17 adds
+    /// two marker events per action across six action types, which is what made
+    /// this worth fixing before those markers land.
+    last_seq: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl SessionStore {
     pub fn new(data_dir: impl AsRef<Path>) -> Self {
         Self {
             data_dir: data_dir.as_ref().to_path_buf(),
+            last_seq: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -224,8 +359,8 @@ impl SessionStore {
         // Rewound events stay in the log but leave the conversation, so a
         // reloaded session shows the position the user rewound to.
         Ok(active_events(&content)
-            .into_iter()
-            .filter(|line| line.contains("\"eventType\":\"message_appended\""))
+            .iter()
+            .filter(|event| event.event_type == "message_appended")
             .filter_map(parse_message_event)
             .collect())
     }
@@ -242,19 +377,22 @@ impl SessionStore {
             return Ok(HashMap::new());
         };
         let mut statuses = HashMap::new();
-        for line in active_events(&content) {
-            if !line.contains("\"eventType\":\"task_created\"")
-                && !line.contains("\"eventType\":\"task_status_updated\"")
-            {
+        for event in active_events(&content) {
+            if event.event_type != "task_created" && event.event_type != "task_status_updated" {
                 continue;
             }
-            // `task_status_updated` may wrap the task in `{"task":…,"error":…}`,
-            // so read the fields rather than assuming a shape.
+            // `task_status_updated` may wrap the task as `{"task":…,"error":…}`,
+            // so look inside that wrapper when it is there and at the payload
+            // itself when it is not. The old reader found these fields by
+            // substring across the whole line, which reached into the payload
+            // without descending into it — and matched a torn line just as
+            // readily as a complete one.
+            let task = event.payload.get("task").unwrap_or(&event.payload);
             if let (Some(id), Some(status)) = (
-                json_string_field(line, "id"),
-                json_string_field(line, "status"),
+                task.get("id").and_then(|value| value.as_str()),
+                task.get("status").and_then(|value| value.as_str()),
             ) {
-                statuses.insert(id, status);
+                statuses.insert(id.to_string(), status.to_string());
             }
         }
         Ok(statuses)
@@ -282,15 +420,135 @@ impl SessionStore {
             return Ok(false);
         };
         let mut allowed = false;
-        for line in content.lines() {
-            if !line.contains("\"eventType\":\"browser_diagnostics_approval_updated\"") {
+        for event in parsed_events(&content).0 {
+            if event.event_type != "browser_diagnostics_approval_updated" {
                 continue;
             }
-            if let Some(value) = json_bool_field(line, "allowed") {
+            if let Some(value) = event.payload.get("allowed").and_then(|v| v.as_bool()) {
                 allowed = value;
             }
         }
         Ok(allowed)
+    }
+
+    /// Records `action_started` and returns the marker that must be finished.
+    ///
+    /// Requirement 2: a durable marker before a consequential action starts and
+    /// another after it finishes, so a crash between the two is detectable as a
+    /// specific action with an unknown outcome.
+    pub fn start_action(
+        &self,
+        task: &Task,
+        action: &str,
+        reference: &str,
+        side_effecting: bool,
+    ) -> Result<ActionMarker> {
+        let marker = ActionMarker {
+            id: create_id("action"),
+            session_id: task.session_id.clone(),
+            task_id: task.id.clone(),
+            action: action.to_string(),
+            reference: reference.to_string(),
+        };
+        self.append_session_event(
+            &marker.session_id,
+            "action_started",
+            &format!(
+                "{{\"markerId\":\"{}\",\"taskId\":\"{}\",\"action\":\"{}\",\"ref\":\"{}\",\"sideEffecting\":{}}}",
+                escape_json(&marker.id),
+                escape_json(&marker.task_id),
+                escape_json(&marker.action),
+                escape_json(&marker.reference),
+                side_effecting
+            ),
+        )?;
+        Ok(marker)
+    }
+
+    /// Records `action_finished`, consuming the marker.
+    pub fn finish_action(&self, marker: ActionMarker, outcome: &str) -> Result<()> {
+        self.append_session_event(
+            &marker.session_id,
+            "action_finished",
+            &format!(
+                "{{\"markerId\":\"{}\",\"taskId\":\"{}\",\"action\":\"{}\",\"ref\":\"{}\",\"outcome\":\"{}\"}}",
+                escape_json(&marker.id),
+                escape_json(&marker.task_id),
+                escape_json(&marker.action),
+                escape_json(&marker.reference),
+                escape_json(outcome)
+            ),
+        )
+    }
+
+    /// Every action that started and never finished, in log order.
+    ///
+    /// Paired by `markerId` rather than by action name: the same action can run
+    /// twice in one turn, and matching by name would let the second start cancel
+    /// out the first.
+    ///
+    /// Reads **all** events rather than only the active conversation. A rewind
+    /// moves the conversation back; whether an action completed is a fact about
+    /// the world, not about the conversation. Filtering by active events here
+    /// would let a rewind conceal a dangling side-effecting action, which is
+    /// precisely what requirement 5 exists to prevent.
+    pub fn dangling_actions(&self, session_id: &str) -> Result<Vec<DanglingAction>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(Vec::new());
+        };
+        let (events, _) = parsed_events(&content);
+        let mut started: Vec<(String, DanglingAction)> = Vec::new();
+        let mut finished: Vec<String> = Vec::new();
+        for event in &events {
+            let Some(marker_id) = event.text("markerId") else {
+                continue;
+            };
+            match event.event_type.as_str() {
+                "action_started" => {
+                    let Some(task_id) = event.text("taskId") else {
+                        continue;
+                    };
+                    started.push((
+                        marker_id,
+                        DanglingAction {
+                            task_id,
+                            action: event.text("action").unwrap_or_default(),
+                            reference: event.text("ref").unwrap_or_default(),
+                            side_effecting: event
+                                .payload
+                                .get("sideEffecting")
+                                .and_then(|value| value.as_bool())
+                                .unwrap_or(true),
+                            seq: event.seq,
+                        },
+                    ));
+                }
+                "action_finished" => finished.push(marker_id),
+                _ => {}
+            }
+        }
+        Ok(started
+            .into_iter()
+            .filter(|(id, _)| !finished.contains(id))
+            .map(|(_, action)| action)
+            .collect())
+    }
+
+    /// How many lines of the session log did not parse as a complete event.
+    ///
+    /// A non-zero count means a write was interrupted — the tail is torn — and
+    /// is therefore evidence of a crash rather than a mere formatting problem.
+    /// Exposed rather than audited here on purpose: `SessionStore` has no
+    /// `AuditLog`, and threading one through its fifteen construction sites (of
+    /// which thirteen are tests, each of which would then need a
+    /// `SecretScanner`) is a large amount of churn for a diagnostic. The
+    /// recovery classifier is the caller that cares, and audits it —
+    /// spec 17 §5.2.
+    pub fn unreadable_event_count(&self, session_id: &str) -> Result<usize> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(0);
+        };
+        Ok(parsed_events(&content).1)
     }
 
     /// The sequence number of the newest event in the session, or 0 for a
@@ -329,7 +587,7 @@ impl SessionStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let seq = self.latest_event_seq(session_id)? + 1;
+        let seq = self.next_seq(session_id)?;
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         writeln!(
             file,
@@ -341,6 +599,27 @@ impl SessionStore {
             payload
         )?;
         Ok(())
+    }
+
+    /// The `seq` for the next event, taken from the cache when present and read
+    /// back from the log when not.
+    ///
+    /// Holding the lock across the read is deliberate: two appends to one
+    /// session must not both compute the same next value. The lock is per
+    /// store-family rather than per session, which is coarse — but appends are
+    /// short and the alternative is a lock per session id, which buys nothing
+    /// until sessions are appended to concurrently, and nothing does that yet.
+    fn next_seq(&self, session_id: &str) -> Result<u64> {
+        let mut cache = self
+            .last_seq
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let next = match cache.get(session_id) {
+            Some(last) => last + 1,
+            None => self.latest_event_seq(session_id)? + 1,
+        };
+        cache.insert(session_id.to_string(), next);
+        Ok(next)
     }
 
     fn session_log_path(&self, session_id: &str) -> PathBuf {
@@ -394,24 +673,85 @@ fn message_json(message: &ChatMessage) -> String {
     )
 }
 
-/// Every event's sequence number. Events written before the `seq` field are
-/// numbered by line order, which is exactly their append order, so sessions
-/// that predate the field need no rewrite.
-fn numbered_events(content: &str) -> impl Iterator<Item = (u64, &str)> {
-    content
-        .lines()
-        .enumerate()
-        .map(|(index, line)| (event_seq(line).unwrap_or(index as u64 + 1), line))
+/// One parsed log line.
+///
+/// Every read path goes through this rather than matching substrings, so a
+/// partially written line is structurally unreadable rather than a coincidence
+/// of what text happens to be present. Requirement 3 of
+/// `docs/specs/17_durable_task_state_and_crash_recovery/`.
+///
+/// This replaced a substring reader that did not merely mis-handle a torn line
+/// but *fabricated* records from one: with all six message fields present in a
+/// truncated tail, `read_messages` returned a phantom chat message.
+struct SessionEvent {
+    seq: u64,
+    event_type: String,
+    payload: serde_json::Value,
 }
 
-fn event_seq(line: &str) -> Option<u64> {
-    json_number_field(line, "seq").and_then(|value| u64::try_from(value).ok())
+impl SessionEvent {
+    /// A payload string field, or `None` when absent or not a string.
+    fn text(&self, field: &str) -> Option<String> {
+        self.payload
+            .get(field)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    }
+
+    fn number(&self, field: &str) -> Option<u128> {
+        self.payload
+            .get(field)
+            .and_then(|value| value.as_u64())
+            .map(u128::from)
+    }
+}
+
+/// `None` for a line that is not a complete JSON object carrying an
+/// `eventType`. A torn final line is the expected cause; `seq` falls back to
+/// the caller's line ordering for events written before spec 16 added it, which
+/// is their append order.
+fn parse_event(line: &str, fallback_seq: u64) -> Option<SessionEvent> {
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let object = value.as_object()?;
+    let event_type = object.get("eventType")?.as_str()?.to_string();
+    let seq = object
+        .get("seq")
+        .and_then(|seq| seq.as_u64())
+        .unwrap_or(fallback_seq);
+    let payload = object
+        .get("payload")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Some(SessionEvent {
+        seq,
+        event_type,
+        payload,
+    })
+}
+
+/// Every parseable event, in order. Unparsable lines are dropped — see
+/// [`parse_event`] — and the count of them is returned so a caller can audit
+/// the discard rather than swallow it.
+fn parsed_events(content: &str) -> (Vec<SessionEvent>, usize) {
+    let mut events = Vec::new();
+    let mut discarded = 0;
+    for (index, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match parse_event(line, index as u64 + 1) {
+            Some(event) => events.push(event),
+            None => discarded += 1,
+        }
+    }
+    (events, discarded)
 }
 
 fn latest_seq(content: &str) -> u64 {
-    numbered_events(content)
+    parsed_events(content)
+        .0
         .last()
-        .map(|(seq, _)| seq)
+        .map(|event| event.seq)
         .unwrap_or(0)
 }
 
@@ -419,126 +759,49 @@ fn latest_seq(content: &str) -> u64 {
 /// newest `conversation_rewound` marker's `throughEventSeq`. A later rewind to
 /// an earlier point supersedes an earlier one, so the newest marker wins even
 /// when it points further back.
-fn active_events(content: &str) -> Vec<&str> {
-    let limit = numbered_events(content)
-        .filter(|(_, line)| line.contains("\"eventType\":\"conversation_rewound\""))
-        .filter_map(|(_, line)| json_number_field(line, "throughEventSeq"))
-        .last()
+fn active_events(content: &str) -> Vec<SessionEvent> {
+    let (events, _) = parsed_events(content);
+    let limit = events
+        .iter()
+        .filter(|event| event.event_type == "conversation_rewound")
+        .filter_map(|event| event.number("throughEventSeq"))
+        .next_back()
         .and_then(|value| u64::try_from(value).ok());
-    numbered_events(content)
-        .filter(|(seq, _)| limit.is_none_or(|limit| *seq <= limit))
-        .map(|(_, line)| line)
+    events
+        .into_iter()
+        .filter(|event| limit.is_none_or(|limit| event.seq <= limit))
         .collect()
 }
 
 fn parse_session_log(content: &str) -> Option<Session> {
-    let mut session = None;
-    for line in content.lines() {
-        if line.contains("\"eventType\":\"session_created\"")
-            || line.contains("\"eventType\":\"session_renamed\"")
-        {
-            session = parse_session_event(line);
-        }
-    }
-    session
+    let (events, _) = parsed_events(content);
+    events
+        .iter()
+        .filter(|event| {
+            event.event_type == "session_created" || event.event_type == "session_renamed"
+        })
+        .filter_map(parse_session_event)
+        .next_back()
 }
 
-fn parse_session_event(line: &str) -> Option<Session> {
-    let payload_start = line.find("\"payload\":")? + "\"payload\":".len();
-    let payload = &line[payload_start..line.len().checked_sub(1)?];
+fn parse_session_event(event: &SessionEvent) -> Option<Session> {
     Some(Session {
-        id: json_string_field(payload, "id")?,
-        repository_id: json_string_field(payload, "repositoryId")?,
-        title: json_string_field(payload, "title")?,
-        created_at_ms: json_number_field(payload, "createdAtMs")?,
-        updated_at_ms: json_number_field(payload, "updatedAtMs")?,
-        summary: json_string_field(payload, "summary").unwrap_or_default(),
+        id: event.text("id")?,
+        repository_id: event.text("repositoryId")?,
+        title: event.text("title")?,
+        created_at_ms: event.number("createdAtMs")?,
+        updated_at_ms: event.number("updatedAtMs")?,
+        summary: event.text("summary").unwrap_or_default(),
     })
 }
 
-fn parse_message_event(line: &str) -> Option<ChatMessage> {
-    let payload_start = line.find("\"payload\":")? + "\"payload\":".len();
-    let payload = &line[payload_start..line.len().checked_sub(1)?];
+fn parse_message_event(event: &SessionEvent) -> Option<ChatMessage> {
     Some(ChatMessage {
-        id: json_string_field(payload, "id")?,
-        session_id: json_string_field(payload, "sessionId")?,
-        task_id: json_nullable_string_field(payload, "taskId"),
-        role: json_string_field(payload, "role")?,
-        content: json_string_field(payload, "content")?,
-        created_at_ms: json_number_field(payload, "createdAtMs")?,
+        id: event.text("id")?,
+        session_id: event.text("sessionId")?,
+        task_id: event.text("taskId"),
+        role: event.text("role")?,
+        content: event.text("content")?,
+        created_at_ms: event.number("createdAtMs")?,
     })
-}
-
-fn json_string_field(raw: &str, field: &str) -> Option<String> {
-    let needle = format!("\"{field}\":\"");
-    let start = raw.find(&needle)? + needle.len();
-    parse_json_string_at(raw, start)
-}
-
-fn json_nullable_string_field(raw: &str, field: &str) -> Option<String> {
-    let string_needle = format!("\"{field}\":\"");
-    if let Some(start) = raw
-        .find(&string_needle)
-        .map(|index| index + string_needle.len())
-    {
-        return parse_json_string_at(raw, start);
-    }
-    None
-}
-
-fn json_number_field(raw: &str, field: &str) -> Option<u128> {
-    let needle = format!("\"{field}\":");
-    let start = raw.find(&needle)? + needle.len();
-    let end = raw[start..]
-        .find(|character: char| !character.is_ascii_digit())
-        .map(|offset| start + offset)
-        .unwrap_or(raw.len());
-    raw[start..end].parse().ok()
-}
-
-fn json_bool_field(raw: &str, field: &str) -> Option<bool> {
-    let needle = format!("\"{field}\":");
-    let start = raw.find(&needle)? + needle.len();
-    let value = raw[start..].trim_start();
-    if value.starts_with("true") {
-        Some(true)
-    } else if value.starts_with("false") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn parse_json_string_at(raw: &str, start: usize) -> Option<String> {
-    let bytes = raw.as_bytes();
-    let mut output = String::new();
-    let mut index = start;
-    let mut segment_start = index;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'"' => {
-                output.push_str(raw.get(segment_start..index)?);
-                return Some(output);
-            }
-            b'\\' => {
-                output.push_str(raw.get(segment_start..index)?);
-                index += 1;
-                let escaped = *bytes.get(index)?;
-                match escaped {
-                    b'"' => output.push('"'),
-                    b'\\' => output.push('\\'),
-                    b'n' => output.push('\n'),
-                    b'r' => output.push('\r'),
-                    b't' => output.push('\t'),
-                    other => output.push(other as char),
-                }
-                index += 1;
-                segment_start = index;
-                continue;
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    None
 }

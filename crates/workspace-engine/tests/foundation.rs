@@ -1636,7 +1636,7 @@ fn reads_back_the_latest_status_of_each_task() {
     let first = store.create_task(&session.id, "one", "mock", "m").unwrap();
     let second = store.create_task(&session.id, "two", "mock", "m").unwrap();
     store
-        .update_task_status(&first, TaskStatus::Running, None)
+        .update_task_status(&first, TaskStatus::PreparingContext, None)
         .unwrap();
     store
         .update_task_status(&first, TaskStatus::Cancelled, None)

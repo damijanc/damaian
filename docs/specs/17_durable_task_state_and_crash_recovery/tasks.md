@@ -64,11 +64,11 @@ stopped without reading the git log.
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · Parse-first session log reads | Not started | |
-| 2 · Cache the append sequence | Not started | |
-| 3 · Twelve task states | Not started | |
-| 4 · Action markers | Not started | |
-| 5 · Instrument the six action sites | Not started | |
+| 1 · Parse-first session log reads | Done | `SessionEvent` + `parse_event`/`parsed_events` replace `line.contains` and the five substring helpers (now deleted). 3 tests, gate green at **382**; spec 16's 5 rewind tests and spec 18's 12 scenarios both still pass. **§5.6's `seq` migration confirmed already done** (written at `:332`, line-order fallback at `numbered_events`) — not rebuilt. **Found a real defect, not just a spec gap:** the old reader did not merely mishandle a torn line, it *fabricated records from one* — `read_messages` returned a phantom third message (`got ["first", "second", "torn"]`). Note the first version of that test passed against the old code by accident, because the substring reader drops the final character and my torn line happened to end in the `createdAtMs` digit; the tail now ends after a sacrificial field so the test actually distinguishes the two readers. **Audit deferred by design** (plan Step 6 sanctioned this): `SessionStore` has no `AuditLog` and threading one through its 15 construction sites — 13 of them tests, each then needing a `SecretScanner` — is heavy churn for a diagnostic, so `unreadable_event_count` exposes the number and Task 6's classifier audits it |
+| 2 · Cache the append sequence | Done | `last_seq: Arc<Mutex<HashMap<..>>>` + `next_seq`; 2 assertions and 1 `#[ignore]`d timing probe, gate green at **384 passed, 6 ignored**. **Measured, not assumed** — per-append cost before: 2.3ms at 500 events, 4.4ms at 1000, 8.7ms at 2000 (17.5s for that batch); after: 0.067 / 0.063 / 0.065ms (129ms for 2000). **135× at 2000 events, and per-append is now flat rather than doubling** — the change is linear-vs-quadratic, not just faster. **`Arc` turned out to be mandatory, not stylistic:** `SessionStore` derives `Clone` and is cloned into *both* the chat and edit orchestrators (`workspace_engine.rs:97`, `:112`), so per-clone caches would each hand out the same next `seq`. Mutation-tested by giving `Clone` a fresh cache: `got duplicates in [1, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7]` — and rewind resolves by `seq`, so that log would rewind to the wrong place. Note the plan's own test (two independently constructed stores) would **not** have caught this, because a cache miss correctly falls back to the file; the clone test was added after reading how the store is actually cloned |
+| 3 · Twelve task states | Done | 13 variants (12 live + the classifier's two), `all()`/`parse`/`is_terminal`/`may_have_side_effect_in_flight`; 5 tests, gate green at **389**. `Running` removed; `parse("running")` maps to `Interrupted` per §5.6. Call sites were **6, not the plan's 23** — the earlier count included every `TaskStatus::` mention rather than only `::Running`. All six became `PreparingContext`, each **verified rather than defaulted**. **Corrected the plan's own advice:** it said "where unclear, `PreparingContext` is the safe default: it is read-only, so a crash there is resumable" — but *resumable* is the permissive direction, and mislabelling an in-flight command as read-only would let the classifier auto-resume it, violating requirement 5. The safe default is whichever state *blocks* auto-resume. `chat.rs:698` turned out to be genuinely read-only (the approved command has already run — its result is the `tool` message appended just above), established by reading the surrounding code. UI boundary checked: `app.js` branches only on `cancelled` and `tool_budget_exhausted`, both preserved; the `"running"` seen near `setChatStatus` is a CSS class, not a status. The two `"running"` literals in `desktop-shell` tests are a stringly-typed `CheckpointConversation.task_status` and now double as legacy-value coverage. The four finer in-flight states exist but are not yet *reached* — Task 5 wires them at the action sites |
+| 4 · Action markers | Done | `ActionMarker`, `DanglingAction`, `start_action`/`finish_action`/`dangling_actions`; **5 tests** (plan said 3), gate green at **393**. No `Drop` impl, deliberately — an automatic finish-on-drop would erase the crash signal — and `finish_action` consumes the marker so a forgotten finish reads as an unused binding. Paired by `markerId`, not action name, with a test running the same action twice. **One design decision the plan did not settle:** `dangling_actions` reads **all** events, not `active_events`. A rewind moves the *conversation* back, but whether an action completed is a fact about the world — filtering by active events let a rewind conceal a dangling `rm -rf build`, mutation-tested at `left: 0` vs `right: 1`. That is a requirement-5 hole, so the choice has its own test. Also dropped `side_effecting` from `ActionMarker` after clippy flagged it unread: the flag is already durable on the `action_started` event, and a second in-memory copy is state that can disagree with the log |
+| 5 · Instrument the six action sites | Done | All six instrumented; 2 tests added, gate green at **395**. Bracketed at the dispatch layer per the design correction above — `tool_action_marker` derives name/reference/`sideEffecting` in one place, and all three clean-stop `break` exits finish with `awaiting_approval`/`awaiting_review` so stopping for a human is never read as an unknown outcome. Model call is `sideEffecting: false` (§4: a cut stream is a lost call, so a dangling model marker classifying as `interrupted` is correct). **Patch application resolved via option (a)**, chosen after measuring the cost: `ProposedPatch` gained `session_id`, the stored format went `V1` → `V2`, and the reader accepts both — no conversion, no file rewritten, and only 2 patch files existed on disk. `read_field` is name-checked, so a version mismatch fails closed rather than silently reading the next field. `create_patch` was left alone (19 callers, 17 of them tests) because `PatchEngine` has no business knowing about sessions; the two orchestrators that own one set it before saving. **The conflict path finishes its marker** — a conflict is detected in `prepare_files` before any write, so its outcome *is* known, and leaving it dangling would report a false unknown outcome on the most common failure there is; any other apply error is left dangling on purpose, since `apply_patch` writes files one at a time. Verified in real logs: `preserve_user_modified` (a deliberate conflict) shows `apply_patch started=1 finished=1`, and a passing run shows `model_call`/`propose_patch`/`read_file` all balanced. Option (a) also unblocks Task 7 — §5.5's pending-patch reattachment needs the same `session_id`. |
 | 6 · Recovery classifier | Not started | |
 | 7 · Pending approval reattach | Not started | |
 | 8 · Recovery operations | Not started | |
@@ -595,12 +595,33 @@ that goes out of scope unused.
 
 ### Task 5: Instrument the six action sites
 
-**Files:**
-- Modify: `chat.rs` (model call, tool call), `validation.rs` (command execution),
-  `mcp.rs` (MCP call), `edit.rs` (patch application, validation commands)
+**Files — corrected from the plan's original list, see below:**
+- Modify: `chat.rs` (model call, and every `ToolAction` arm: tool, command, MCP, validation)
+- Modify: `edit.rs` (patch application)
+- **Not** `validation.rs` or `mcp.rs`
 
 **Interfaces:**
 - Consumes: Task 4's `start_action` / `finish_action`.
+
+**Design correction, made after reading the call sites.** The plan named
+`validation.rs` and `mcp.rs` as instrumentation points. Neither
+`ValidationOrchestrator` (`validation.rs:118`) nor `McpClient` (`mcp.rs:133`)
+holds a `SessionStore`, and neither receives a `Task` — so instrumenting inside
+them means threading session state through two modules that have nothing to do
+with session state, purely to record a marker.
+
+All of command execution, MCP calls and validation are *dispatched from*
+`chat.rs`'s `ToolAction` match, and `run_agentic_turn` (`chat.rs:850`) takes
+`mut task: Task` — so the task is in scope at every arm. Bracketing there covers
+four of the six action types with no change to those modules.
+
+**The trade-off, stated rather than hidden.** A marker at the dispatch layer
+brackets "the engine asked for this action" rather than "the leaf process
+started", so the window is slightly *wider* — it includes proposal and setup
+work. That is the conservative direction: a crash in the wider window reports an
+unknown outcome for an action that might not have started yet. Erring toward
+"unknown" is correct for requirement 5; erring the other way — a narrow window
+that misses a real side effect — is the bug this spec exists to prevent.
 
 - [ ] **Step 1: Write the failing test**
 

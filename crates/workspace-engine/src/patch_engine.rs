@@ -33,6 +33,15 @@ pub struct ProposedFilePatch {
 pub struct ProposedPatch {
     pub id: String,
     pub task_id: Option<String>,
+    /// The session this patch belongs to, or empty for a patch stored before
+    /// the field existed.
+    ///
+    /// Needed because a patch's action marker and its recovery reattachment
+    /// (spec 17 §5.5) both live in a *per-session* log, and `task_id` alone
+    /// cannot name one. `PatchEngine` does not know about sessions, so
+    /// `create_patch` leaves this empty and the orchestrator that owns the
+    /// session fills it in before saving.
+    pub session_id: String,
     pub summary: String,
     pub status: String,
     pub created_at_ms: u128,
@@ -186,6 +195,9 @@ impl PatchEngine {
         let patch = ProposedPatch {
             id: create_id("patch"),
             task_id: task_id.map(|value| value.to_string()),
+            // Filled in by the caller that owns the session — see the field's
+            // doc comment.
+            session_id: String::new(),
             summary: summary.to_string(),
             status: "pending".to_string(),
             created_at_ms: now_millis(),

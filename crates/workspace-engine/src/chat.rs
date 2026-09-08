@@ -474,9 +474,12 @@ impl ChatOrchestrator {
             &self.config.model_provider,
             &self.config.model_name,
         )?;
+        // Context assembly is the next thing to happen, and it is read-only,
+        // so a crash here is resumable. The finer in-flight states are set at
+        // the action sites when their markers go in.
         task = self
             .session_store
-            .update_task_status(&task, TaskStatus::Running, None)?;
+            .update_task_status(&task, TaskStatus::PreparingContext, None)?;
         let user_message =
             self.session_store
                 .append_message(&session.id, Some(&task.id), "user", prompt)?;
@@ -693,9 +696,17 @@ impl ChatOrchestrator {
 
         // The pause is over either way, so the checkpoint stops claiming one.
         self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
-        let task =
-            self.session_store
-                .update_task_status(&pending.task, TaskStatus::Running, None)?;
+        // The approved command has already run — its result is the `tool`
+        // message appended above — so the side effect is behind us and what
+        // follows is another model round. Verified by reading rather than
+        // assumed: labelling a still-executing command as read-only would let
+        // the classifier auto-resume it, which is exactly what requirement 5
+        // forbids.
+        let task = self.session_store.update_task_status(
+            &pending.task,
+            TaskStatus::PreparingContext,
+            None,
+        )?;
 
         self.run_agentic_turn(
             &repository_root,
@@ -733,7 +744,7 @@ impl ChatOrchestrator {
                 summary: &summary,
                 conversation: CheckpointConversation {
                     last_event_seq: position,
-                    task_status: TaskStatus::Running.as_str().to_string(),
+                    task_status: TaskStatus::PreparingContext.as_str().to_string(),
                 },
                 pending_approvals: Vec::new(),
                 // Nothing has happened yet: paths arrive as the turn accepts a
@@ -938,6 +949,17 @@ impl ChatOrchestrator {
             )?;
 
             sink.phase(PhaseKind::Model, "", round, max_rounds);
+            // `sideEffecting: false` — §4 treats a cut stream as a lost call:
+            // the task resumes by making a new one, and spec 19 reports the cost
+            // of the lost one rather than hiding it. So a marker left dangling
+            // on the cancellation path classifies as `interrupted`, which is the
+            // correct answer per §5.1 ("a call may have been billed").
+            let model_marker = self.session_store.start_action(
+                &task,
+                "model_call",
+                &self.config.model_name,
+                false,
+            )?;
             let model_run =
                 match model_adapter.stream_response(&request, sink.cancel, &mut *sink.on_token) {
                     Ok(model_run) => model_run,
@@ -966,6 +988,7 @@ impl ChatOrchestrator {
                         return Err(error);
                     }
                 };
+            self.session_store.finish_action(model_marker, "ok")?;
             let redacted = self.scanner.redact(&model_run.content).text;
 
             // An adapter that streamed part of an answer before noticing the
@@ -1054,6 +1077,22 @@ impl ChatOrchestrator {
                 max_rounds,
             );
 
+            // Bracket the dispatch, not the leaf call: `ValidationOrchestrator`
+            // and `McpClient` hold no `SessionStore` and receive no `Task`, so
+            // marking inside them would mean threading session state through
+            // two modules that have nothing to do with it. The window is
+            // slightly wider than the leaf action — it includes proposal and
+            // setup — which errs toward reporting an unknown outcome rather
+            // than missing one, the safe direction for requirement 5.
+            let (marker_action, marker_ref, marker_side_effecting) =
+                tool_action_marker(&tool_action);
+            let action_marker = self.session_store.start_action(
+                &task,
+                marker_action,
+                &marker_ref,
+                marker_side_effecting,
+            )?;
+
             // Each non-terminal arm below produces the (assistant summary,
             // tool result) pair to persist and feed back to the model.
             // Terminal outcomes (a command needing approval, or a patch
@@ -1092,6 +1131,11 @@ impl ChatOrchestrator {
                                 proposal_id: proposal.id.clone(),
                             }],
                         );
+                        // A clean stop for a human decision, not a crash: the
+                        // action is finished so the classifier does not read a
+                        // dangling marker as an unknown outcome.
+                        self.session_store
+                            .finish_action(action_marker, "awaiting_approval")?;
                         let mut proposal_run = model_run;
                         proposal_run.content = response.clone();
                         break (
@@ -1119,8 +1163,16 @@ impl ChatOrchestrator {
                         &generated_edit.summary,
                     ) {
                         Ok(patch) => {
+                            // See `ProposedPatch::session_id`: the engine does
+                            // not know the session, this orchestrator does.
+                            let mut patch = patch;
+                            patch.session_id = session.id.clone();
                             self.patch_store.save(&patch)?;
                             let response = patch_proposal_response(&patch);
+                            // A patch waiting for review is a clean stop, not
+                            // a crash — finish the marker before breaking.
+                            self.session_store
+                                .finish_action(action_marker, "awaiting_review")?;
                             let proposal = agent_patch_proposal(&patch);
                             let mut proposal_run = model_run;
                             proposal_run.content = response.clone();
@@ -1233,6 +1285,11 @@ impl ChatOrchestrator {
                                 proposal_id: proposal.id.clone(),
                             }],
                         );
+                        // A clean stop for a human decision, not a crash: the
+                        // action is finished so the classifier does not read a
+                        // dangling marker as an unknown outcome.
+                        self.session_store
+                            .finish_action(action_marker, "awaiting_approval")?;
                         let mut proposal_run = model_run;
                         proposal_run.content = response.clone();
                         break (proposal_run, response, Some(proposal), None, false);
@@ -1336,6 +1393,7 @@ impl ChatOrchestrator {
                     (summary, content)
                 }
             };
+            self.session_store.finish_action(action_marker, "ok")?;
 
             // Persist the tool call and its result so later turns in this
             // session can still see it (previously this context was
@@ -1673,6 +1731,35 @@ enum ToolAction {
         tool_name: String,
         arguments_json: String,
     },
+}
+
+/// The action marker parameters for a dispatched tool: a stable name, a
+/// reference identifying *which* invocation, and whether a crash mid-flight
+/// could have left a side effect.
+///
+/// Derived here rather than at each match arm so the side-effect answer for a
+/// tool exists in exactly one place. `ProposePatch` is **not** side-effecting:
+/// proposing writes nothing to the repository. Applying one is, and is bracketed
+/// separately in `edit.rs`.
+fn tool_action_marker(action: &ToolAction) -> (&'static str, String, bool) {
+    match action {
+        ToolAction::Command(request) => ("run_command", request.command.clone(), true),
+        ToolAction::ProposePatch(edit) => ("propose_patch", edit.summary.clone(), false),
+        ToolAction::ReadFile(path) => ("read_file", path.clone(), false),
+        ToolAction::SearchCodebase { query, .. } => ("search_codebase", query.clone(), false),
+        ToolAction::ReadGitStatus => ("read_git_status", String::new(), false),
+        ToolAction::ReadGitDiff { staged } => ("read_git_diff", staged.to_string(), false),
+        // Drives a real browser and can navigate or click, so its outcome is
+        // not knowable after a crash.
+        ToolAction::WebDiagnostic(call) => ("web_diagnostic", call.url.clone(), true),
+        // An MCP call can mutate a remote system, and §4 rules out probing to
+        // find out whether it did.
+        ToolAction::McpCall {
+            server_id,
+            tool_name,
+            ..
+        } => ("mcp_call", format!("{server_id}/{tool_name}"), true),
+    }
 }
 
 /// What to show the user while a tool runs. Lives here rather than in the UI so

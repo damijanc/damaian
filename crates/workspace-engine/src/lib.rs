@@ -88,7 +88,9 @@ pub use repository_trust::{
     RepositoryAllowlistMigration, RepositoryConfigNotice, RepositoryTrustStore,
 };
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
-pub use session::{ChatMessage, Session, SessionStore, Task, TaskStatus};
+pub use session::{
+    ActionMarker, ChatMessage, DanglingAction, Session, SessionStore, Task, TaskStatus,
+};
 pub use validation::{
     CommandProposal, CommandRunRecord, CommandStore, ValidationOrchestrator,
     command_approval_prompt,

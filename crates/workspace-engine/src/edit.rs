@@ -227,9 +227,10 @@ impl EditOrchestrator {
             &self.config.model_provider,
             &self.config.model_name,
         )?;
+        // As in `chat.rs`: the next work is read-only context assembly.
         task = self
             .session_store
-            .update_task_status(&task, TaskStatus::Running, None)?;
+            .update_task_status(&task, TaskStatus::PreparingContext, None)?;
         let user_message =
             self.session_store
                 .append_message(&session.id, Some(&task.id), "user", prompt)?;
@@ -244,7 +245,7 @@ impl EditOrchestrator {
                 summary: &format!("Before: {}", edit_session_title(prompt)),
                 conversation: CheckpointConversation {
                     last_event_seq: position,
-                    task_status: TaskStatus::Running.as_str().to_string(),
+                    task_status: TaskStatus::PreparingContext.as_str().to_string(),
                 },
                 pending_approvals: Vec::new(),
                 paths: Vec::new(),
@@ -320,6 +321,11 @@ impl EditOrchestrator {
                 &generated.summary,
             )
             .map_err(|error| self.record_edit_failure(&session.id, &task, error))?;
+        // The engine builds the patch without knowing about sessions; the
+        // orchestrator that owns one records it, so the patch can later name
+        // the log its marker and its recovery reattachment belong to.
+        let mut patch = patch;
+        patch.session_id = session.id.clone();
         self.patch_store
             .save(&patch)
             .map_err(|error| self.record_edit_failure(&session.id, &task, error))?;
@@ -390,18 +396,60 @@ impl EditOrchestrator {
         allow_generated_secrets: bool,
     ) -> Result<PatchApplyResult> {
         let patch = self.patch_store.load(patch_id)?;
+        // Writing files is the most side-effecting action in the engine, so its
+        // marker brackets the write itself rather than a caller. A patch stored
+        // before `session_id` existed has no log to name, so it gets no marker —
+        // recorded here rather than silently skipped, because a legacy patch
+        // applied after a crash is exactly the case a reader would wonder about.
+        let apply_marker = if patch.session_id.is_empty() {
+            None
+        } else {
+            let task = Task {
+                id: patch.task_id.clone().unwrap_or_default(),
+                session_id: patch.session_id.clone(),
+                status: TaskStatus::ApplyingPatch,
+                user_prompt: String::new(),
+                model_provider: String::new(),
+                model_name: String::new(),
+                created_at_ms: 0,
+                completed_at_ms: None,
+            };
+            Some(
+                self.session_store
+                    .start_action(&task, "apply_patch", &patch.id, true)?,
+            )
+        };
         // Snapshot the target files before they are written, not after. This
         // one is not best-effort: a rewind that silently lost the pre-apply
         // content would be worse than an apply that says it could not snapshot.
         let checkpoint = self.checkpoint_for_patch(&repository_root, &patch, approved_paths)?;
-        let result = self.patch_engine.apply_patch(
+        let result = match self.patch_engine.apply_patch(
             &repository_root,
             &patch,
             approved_paths,
             hunk_selection,
             approved_by,
             allow_generated_secrets,
-        )?;
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                // A conflict is detected in `prepare_files`, before any file is
+                // written, so this outcome *is* known: nothing changed. Finish
+                // the marker, or the very common stale-patch case would report a
+                // false unknown outcome on every occurrence.
+                //
+                // Any other failure may have happened mid-write, and
+                // `apply_patch` writes files one at a time — so its marker is
+                // left dangling deliberately. That is the honest answer: part of
+                // the patch may be on disk.
+                if let Some(marker) = apply_marker
+                    && matches!(error, ClientError::PatchConflict(_))
+                {
+                    self.session_store.finish_action(marker, "conflict")?;
+                }
+                return Err(error);
+            }
+        };
         // Sealing records what the apply left on disk, which is what a later
         // rewind compares against before it overwrites anything.
         if let Some(manifest) = checkpoint {
@@ -424,6 +472,9 @@ impl EditOrchestrator {
                 ),
             ],
         )?;
+        if let Some(marker) = apply_marker {
+            self.session_store.finish_action(marker, "ok")?;
+        }
         Ok(result)
     }
 
@@ -696,8 +747,9 @@ fn edit_session_title(prompt: &str) -> String {
 
 fn serialize_patch(patch: &ProposedPatch) -> String {
     let mut output = String::new();
-    output.push_str("DAMAIAN_STORED_PATCH_V1\n");
+    output.push_str("DAMAIAN_STORED_PATCH_V2\n");
     write_field(&mut output, "PATCH_ID", &patch.id);
+    write_field(&mut output, "SESSION_ID", &patch.session_id);
     write_field(
         &mut output,
         "TASK_ID",
@@ -736,8 +788,27 @@ fn serialize_patch(patch: &ProposedPatch) -> String {
 
 fn deserialize_patch(raw: &str) -> Result<ProposedPatch> {
     let mut cursor = Cursor::new(raw);
-    cursor.expect_line("DAMAIAN_STORED_PATCH_V1")?;
+    // Both versions are accepted. V1 predates `SESSION_ID`; nothing is
+    // converted and no file is rewritten, so a patch already on disk keeps
+    // working and simply has no session. `read_field` is name-checked, so a
+    // version mismatch fails closed rather than silently reading the next
+    // field's value.
+    let version = cursor.read_line()?;
+    let has_session = match version.as_str() {
+        "DAMAIAN_STORED_PATCH_V2" => true,
+        "DAMAIAN_STORED_PATCH_V1" => false,
+        other => {
+            return Err(ClientError::InvalidInput(format!(
+                "Unknown stored patch format: {other}"
+            )));
+        }
+    };
     let id = cursor.read_field("PATCH_ID")?;
+    let session_id = if has_session {
+        cursor.read_field("SESSION_ID")?
+    } else {
+        String::new()
+    };
     let task_id = empty_to_none(cursor.read_field("TASK_ID")?);
     let summary = cursor.read_field("SUMMARY")?;
     let status = cursor.read_field("STATUS")?;
@@ -772,6 +843,7 @@ fn deserialize_patch(raw: &str) -> Result<ProposedPatch> {
     }
     Ok(ProposedPatch {
         id,
+        session_id,
         task_id,
         summary,
         status,
