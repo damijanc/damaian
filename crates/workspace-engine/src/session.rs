@@ -146,6 +146,18 @@ pub struct ChatMessage {
     pub created_at_ms: u128,
 }
 
+/// Which stored proposal a task is waiting on, recorded alongside the
+/// `waiting_for_approval` status so the link survives a restart.
+///
+/// §5.5: the proposals themselves already persist; what was missing was the
+/// link back to the task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingApprovalRef {
+    /// `"command"` or `"patch"`.
+    pub kind: String,
+    pub proposal_id: String,
+}
+
 /// A started action, returned by [`SessionStore::start_action`] and consumed by
 /// [`SessionStore::finish_action`].
 ///
@@ -429,6 +441,54 @@ impl SessionStore {
             }
         }
         Ok(allowed)
+    }
+
+    /// Sets [`TaskStatus::WaitingForApproval`] and records which stored
+    /// proposal the task is waiting on, so recovery can reattach it (§5.5).
+    pub fn await_approval(&self, task: &Task, pending: &PendingApprovalRef) -> Result<Task> {
+        let mut updated = task.clone();
+        updated.status = TaskStatus::WaitingForApproval;
+        let payload = format!(
+            "{{\"task\":{},\"pendingApproval\":{{\"kind\":\"{}\",\"proposalId\":\"{}\"}}}}",
+            task_json(&updated),
+            escape_json(&pending.kind),
+            escape_json(&pending.proposal_id)
+        );
+        self.append_session_event(&task.session_id, "task_status_updated", &payload)?;
+        Ok(updated)
+    }
+
+    /// The proposal a task is waiting on, from the most recent status event
+    /// that recorded one. `None` when the task is not awaiting approval, or
+    /// when it was set by a version that did not record the link.
+    pub fn pending_approval_for(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<PendingApprovalRef>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(None);
+        };
+        let mut found = None;
+        for event in active_events(&content) {
+            if event.event_type != "task_status_updated" {
+                continue;
+            }
+            let task = event.payload.get("task").unwrap_or(&event.payload);
+            if task.get("id").and_then(|value| value.as_str()) != Some(task_id) {
+                continue;
+            }
+            // A later status event without a pending approval clears an earlier
+            // one: the task has moved on, and a stale link would reattach a
+            // proposal the user already decided about.
+            found = event.payload.get("pendingApproval").and_then(|pending| {
+                Some(PendingApprovalRef {
+                    kind: pending.get("kind")?.as_str()?.to_string(),
+                    proposal_id: pending.get("proposalId")?.as_str()?.to_string(),
+                })
+            });
+        }
+        Ok(found)
     }
 
     /// Records `action_started` and returns the marker that must be finished.

@@ -289,3 +289,189 @@ fn a_torn_log_tail_is_audited_during_classification() {
         "a discarded line must be audited, not swallowed"
     );
 }
+
+/// §5.5: a pending approval survives restart with the proposal it refers to.
+#[test]
+fn a_pending_approval_survives_restart_with_its_proposal() {
+    let fixture = fixture("reattach-ok");
+    let commands = workspace_engine::CommandStore::new(&fixture.data_dir);
+    let patches = workspace_engine::PatchStore::new(&fixture.data_dir);
+
+    let patch = workspace_engine::ProposedPatch {
+        id: "patch_pending".to_string(),
+        session_id: fixture.session_id.clone(),
+        task_id: Some("task_x".to_string()),
+        summary: "waiting".to_string(),
+        status: "pending".to_string(),
+        created_at_ms: 1,
+        files: Vec::new(),
+    };
+    patches.save(&patch).unwrap();
+
+    let task = fixture
+        .store
+        .create_task(&fixture.session_id, "edit", "mock", "m")
+        .unwrap();
+    fixture
+        .store
+        .await_approval(
+            &task,
+            &workspace_engine::PendingApprovalRef {
+                kind: "patch".to_string(),
+                proposal_id: patch.id.clone(),
+            },
+        )
+        .unwrap();
+
+    // A fresh store, as after a restart.
+    let restarted = SessionStore::new(&fixture.data_dir);
+    let reattached = workspace_engine::reattach_pending_approvals(
+        &restarted,
+        &fixture.audit,
+        &commands,
+        &patches,
+        &fixture.session_id,
+    )
+    .unwrap();
+
+    assert_eq!(reattached.len(), 1);
+    match &reattached[0] {
+        workspace_engine::ReattachedApproval::Patch { task_id, patch } => {
+            assert_eq!(task_id, &task.id);
+            assert_eq!(patch.id, "patch_pending");
+        }
+        other => panic!("expected the patch to be reattached, got {other:?}"),
+    }
+}
+
+/// §5.5: never an approval card reconstructed from partial data — the user
+/// would be approving a command Damaian is guessing at. The task fails instead.
+#[test]
+fn a_missing_proposal_file_fails_the_task_with_a_reason() {
+    let fixture = fixture("reattach-missing");
+    let commands = workspace_engine::CommandStore::new(&fixture.data_dir);
+    let patches = workspace_engine::PatchStore::new(&fixture.data_dir);
+
+    let task = fixture
+        .store
+        .create_task(&fixture.session_id, "edit", "mock", "m")
+        .unwrap();
+    fixture
+        .store
+        .await_approval(
+            &task,
+            &workspace_engine::PendingApprovalRef {
+                kind: "patch".to_string(),
+                proposal_id: "patch_vanished".to_string(),
+            },
+        )
+        .unwrap();
+
+    let reattached = workspace_engine::reattach_pending_approvals(
+        &fixture.store,
+        &fixture.audit,
+        &commands,
+        &patches,
+        &fixture.session_id,
+    )
+    .unwrap();
+
+    match &reattached[0] {
+        workspace_engine::ReattachedApproval::Unavailable { task_id, reason } => {
+            assert_eq!(task_id, &task.id);
+            assert!(
+                reason.contains("patch_vanished"),
+                "the reason must name what is missing, got: {reason}"
+            );
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+
+    assert_eq!(
+        fixture
+            .store
+            .read_task_statuses(&fixture.session_id)
+            .unwrap()
+            .get(&task.id)
+            .map(String::as_str),
+        Some("failed"),
+        "the task must be failed, not left waiting on something that is gone"
+    );
+    assert!(audit_log_text(&fixture).contains("pending_approval_unavailable"));
+}
+
+/// A corrupt file must fail the same way as a missing one: the alternative is
+/// presenting a card built from whatever happened to parse.
+#[test]
+fn a_corrupt_proposal_file_fails_the_task_rather_than_reconstructing_a_card() {
+    let fixture = fixture("reattach-corrupt");
+    let commands = workspace_engine::CommandStore::new(&fixture.data_dir);
+    let patches = workspace_engine::PatchStore::new(&fixture.data_dir);
+
+    let pending = fixture.data_dir.join("patches").join("pending");
+    fs::create_dir_all(&pending).unwrap();
+    fs::write(
+        pending.join("patch_corrupt.dpatch"),
+        "DAMAIAN_STORED_PATCH_V2\nPATCH_ID 7\ntrunca",
+    )
+    .unwrap();
+
+    let task = fixture
+        .store
+        .create_task(&fixture.session_id, "edit", "mock", "m")
+        .unwrap();
+    fixture
+        .store
+        .await_approval(
+            &task,
+            &workspace_engine::PendingApprovalRef {
+                kind: "patch".to_string(),
+                proposal_id: "patch_corrupt".to_string(),
+            },
+        )
+        .unwrap();
+
+    let reattached = workspace_engine::reattach_pending_approvals(
+        &fixture.store,
+        &fixture.audit,
+        &commands,
+        &patches,
+        &fixture.session_id,
+    )
+    .unwrap();
+
+    assert!(
+        matches!(
+            reattached[0],
+            workspace_engine::ReattachedApproval::Unavailable { .. }
+        ),
+        "a corrupt proposal must not become a card, got {:?}",
+        reattached[0]
+    );
+}
+
+/// A task whose approval was recorded by a version that did not store the link
+/// has nothing to reattach and nothing to guess from, so it fails too.
+#[test]
+fn a_task_awaiting_approval_with_no_recorded_link_fails() {
+    let fixture = fixture("reattach-nolink");
+    let commands = workspace_engine::CommandStore::new(&fixture.data_dir);
+    let patches = workspace_engine::PatchStore::new(&fixture.data_dir);
+    task_left_in(&fixture, TaskStatus::WaitingForApproval, None);
+
+    let reattached = workspace_engine::reattach_pending_approvals(
+        &fixture.store,
+        &fixture.audit,
+        &commands,
+        &patches,
+        &fixture.session_id,
+    )
+    .unwrap();
+
+    match &reattached[0] {
+        workspace_engine::ReattachedApproval::Unavailable { reason, .. } => {
+            assert!(reason.contains("no pending proposal"), "got: {reason}");
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+}

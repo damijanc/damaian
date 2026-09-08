@@ -82,7 +82,9 @@ pub use patch_engine::{
     ProposedFilePatch, ProposedPatch, parse_hunk_selection,
 };
 pub use path_policy::PathPolicy;
-pub use recovery::{RecoveredTask, classify_all, classify_session};
+pub use recovery::{
+    ReattachedApproval, RecoveredTask, classify_all, classify_session, reattach_pending_approvals,
+};
 pub use render::{
     render_markdown_to_ansi, render_markdown_to_html, render_markdown_to_html_with_file_links,
 };
@@ -91,7 +93,8 @@ pub use repository_trust::{
 };
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{
-    ActionMarker, ChatMessage, DanglingAction, Session, SessionStore, Task, TaskStatus,
+    ActionMarker, ChatMessage, DanglingAction, PendingApprovalRef, Session, SessionStore, Task,
+    TaskStatus,
 };
 pub use validation::{
     CommandProposal, CommandRunRecord, CommandStore, ValidationOrchestrator,

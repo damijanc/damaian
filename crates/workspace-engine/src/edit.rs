@@ -331,9 +331,15 @@ impl EditOrchestrator {
             .map_err(|error| self.record_edit_failure(&session.id, &task, error))?;
         self.session_store
             .append_message(&session.id, Some(&task.id), "assistant", &raw_output)?;
-        task =
-            self.session_store
-                .update_task_status(&task, TaskStatus::WaitingForApproval, None)?;
+        // Records which proposal the task is waiting on, so a restart can
+        // reattach it rather than showing a card rebuilt from guesswork (§5.5).
+        task = self.session_store.await_approval(
+            &task,
+            &crate::session::PendingApprovalRef {
+                kind: "patch".to_string(),
+                proposal_id: patch.id.clone(),
+            },
+        )?;
         self.audit_log.record(
             "edit_patch_ready_for_approval",
             &[

@@ -1436,16 +1436,35 @@ impl ChatOrchestrator {
 
         self.session_store
             .append_message(&session.id, Some(&task.id), "assistant", &response)?;
-        let final_status = if command_proposal.is_some() || patch_proposal.is_some() {
-            TaskStatus::WaitingForApproval
-        } else if tool_budget_exhausted {
-            TaskStatus::ToolBudgetExhausted
-        } else {
-            TaskStatus::Complete
+        // A turn that ends awaiting a decision records *which* proposal, so a
+        // restart reattaches it instead of rebuilding a card from partial data
+        // (§5.5).
+        let pending = command_proposal
+            .as_ref()
+            .map(|proposal| crate::session::PendingApprovalRef {
+                kind: "command".to_string(),
+                proposal_id: proposal.id.clone(),
+            })
+            .or_else(|| {
+                patch_proposal
+                    .as_ref()
+                    .map(|proposal| crate::session::PendingApprovalRef {
+                        kind: "patch".to_string(),
+                        proposal_id: proposal.patch_id.clone(),
+                    })
+            });
+        task = match &pending {
+            Some(pending) => self.session_store.await_approval(&task, pending)?,
+            None => {
+                let final_status = if tool_budget_exhausted {
+                    TaskStatus::ToolBudgetExhausted
+                } else {
+                    TaskStatus::Complete
+                };
+                self.session_store
+                    .update_task_status(&task, final_status, None)?
+            }
         };
-        task = self
-            .session_store
-            .update_task_status(&task, final_status, None)?;
         self.audit_log.record(
             "model_response_completed",
             &[

@@ -12,8 +12,11 @@
 //! a guarantee enforced only in a webview is not enforced.
 
 use crate::audit::AuditLog;
+use crate::edit::PatchStore;
 use crate::error::Result;
-use crate::session::{DanglingAction, SessionStore, TaskStatus};
+use crate::patch_engine::ProposedPatch;
+use crate::session::{DanglingAction, PendingApprovalRef, SessionStore, TaskStatus};
+use crate::validation::{CommandProposal, CommandStore};
 
 /// A task that was in flight when the process stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,4 +170,113 @@ pub fn classify_all(store: &SessionStore, audit: &AuditLog) -> Result<Vec<Recove
         recovered.extend(classify_session(store, audit, &session.id)?);
     }
     Ok(recovered)
+}
+
+/// A task that was awaiting a human decision when the process stopped, with the
+/// proposal it was waiting on — or the reason it could not be produced.
+#[derive(Debug, Clone)]
+pub enum ReattachedApproval {
+    Command {
+        task_id: String,
+        proposal: CommandProposal,
+    },
+    Patch {
+        task_id: String,
+        patch: ProposedPatch,
+    },
+    /// The link or the proposal file is gone, so the task was failed.
+    ///
+    /// §5.5: never an approval card reconstructed from partial data. The user
+    /// would be approving a command Damaian is guessing at, which is worse than
+    /// losing the task.
+    Unavailable { task_id: String, reason: String },
+}
+
+/// Reattaches the stored proposal to every task left awaiting approval (§5.5).
+///
+/// A task whose proposal cannot be loaded is marked [`TaskStatus::Failed`] with
+/// the reason, rather than being left waiting on something that no longer
+/// exists.
+pub fn reattach_pending_approvals(
+    store: &SessionStore,
+    audit: &AuditLog,
+    commands: &CommandStore,
+    patches: &PatchStore,
+    session_id: &str,
+) -> Result<Vec<ReattachedApproval>> {
+    let mut reattached = Vec::new();
+    for (task_id, raw_status) in store.read_task_statuses(session_id)? {
+        if TaskStatus::parse(&raw_status) != Some(TaskStatus::WaitingForApproval) {
+            continue;
+        }
+
+        let pending = store.pending_approval_for(session_id, &task_id)?;
+        let outcome = match &pending {
+            // Written by a version that recorded the status but not the link.
+            // There is nothing to reattach and nothing to guess from.
+            None => Err("the task records no pending proposal".to_string()),
+            Some(PendingApprovalRef { kind, proposal_id }) if kind == "command" => commands
+                .load_proposal(proposal_id)
+                .map(|proposal| ReattachedApproval::Command {
+                    task_id: task_id.clone(),
+                    proposal,
+                })
+                .map_err(|error| {
+                    format!("command proposal {proposal_id} is unreadable: {error:?}")
+                }),
+            Some(PendingApprovalRef { kind, proposal_id }) if kind == "patch" => patches
+                .load(proposal_id)
+                .map(|patch| ReattachedApproval::Patch {
+                    task_id: task_id.clone(),
+                    patch,
+                })
+                .map_err(|error| format!("patch {proposal_id} is unreadable: {error:?}")),
+            Some(PendingApprovalRef { kind, .. }) => {
+                Err(format!("unknown pending approval kind {kind}"))
+            }
+        };
+
+        match outcome {
+            Ok(value) => reattached.push(value),
+            Err(reason) => {
+                fail_task(store, audit, session_id, &task_id, &reason)?;
+                reattached.push(ReattachedApproval::Unavailable { task_id, reason });
+            }
+        }
+    }
+    Ok(reattached)
+}
+
+/// Moves a task to terminal `failed` with a stated reason, and records it.
+fn fail_task(
+    store: &SessionStore,
+    audit: &AuditLog,
+    session_id: &str,
+    task_id: &str,
+    reason: &str,
+) -> Result<()> {
+    // `update_task_status` needs a `Task`, and tasks are replayed from events
+    // rather than stored as records, so the fields that do not affect the
+    // status event are left empty. Only `id` and `session_id` are load-bearing.
+    let task = crate::session::Task {
+        id: task_id.to_string(),
+        session_id: session_id.to_string(),
+        status: TaskStatus::WaitingForApproval,
+        user_prompt: String::new(),
+        model_provider: String::new(),
+        model_name: String::new(),
+        created_at_ms: 0,
+        completed_at_ms: None,
+    };
+    store.update_task_status(&task, TaskStatus::Failed, Some(reason))?;
+    audit.record(
+        "pending_approval_unavailable",
+        &[
+            ("actor", "system".to_string()),
+            ("sessionId", session_id.to_string()),
+            ("taskId", task_id.to_string()),
+            ("reason", reason.to_string()),
+        ],
+    )?;
+    Ok(())
 }
