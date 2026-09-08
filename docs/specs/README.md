@@ -17,7 +17,11 @@ written and implemented out of order, ahead of #14, because it is a security
 defect rather than a graduation. #41 through #44 are a third exception: they
 come from usability feedback on the desktop shell rather than a work package, and
 #41 introduces [`../UI_STYLE_GUIDE.md`](../UI_STYLE_GUIDE.md), the standing
-visual reference that later UI specs cite instead of restating.
+visual reference that later UI specs cite instead of restating. #47 is a fourth
+exception, and the only one that came from measuring Damaian against this
+directory rather than from using the product: a session asked what capabilities
+Damaian needs to implement the remaining specs, and ran out of tool rounds
+before it could answer.
 
 From #14 onward, specs graduate from the roadmap in `docs/ROADMAP/`, one spec per
 roadmap work package, per that directory's governance section. Each carries a
@@ -76,6 +80,7 @@ written to stand on its own.
 | 44 | [44_composer_control_density/](44_composer_control_density/proposal.md) | **Done.** Composer 149 → 129px, and the 58px right gutter every line paid is gone. Fourth UI spec from the same usability review, covering the one surface #41–#43 did not reach: the attach, model and send controls were 38px and positioned *over* the textarea, which reserved 70px of height and 58px of every line as padding to clear them, and the 220px model pill truncated its own effort label away because model and effort shared one string. Controls moved to a content-sized row below the box, model and effort split into separate `.btn-trigger` entry points onto the one existing popover, and pinned chips moved inside the frame. Adds `.btn-trigger`, the footer-row pattern and two anti-patterns to [`../UI_STYLE_GUIDE.md`](../UI_STYLE_GUIDE.md). Presentation only — model persistence, send/stop behaviour and the menu's contents are untouched. Leaves room in the row for #31's working-mode control without building it. |
 | 45 | [45_crash_recovery_prompt.md](45_crash_recovery_prompt.md) | **Not started.** Split out of #17. The user-facing half of crash recovery: a prompt naming the specific in-flight action, the four choices, and the `Inspect` view linking to #16's checkpoint. Renders a decision #17 has already constrained — `Resume` is refused in the engine for an unsafe task, so this surface cannot widen the guarantee. Depends on #17. |
 | 46 | [46_process_registry_and_orphan_sweep.md](46_process_registry_and_orphan_sweep.md) | **Not started.** Split out of #17. A session-scoped registry of PIDs for MCP stdio servers, `curl` model calls and PTY sessions, plus the launch-time sweep that kills them. Turns on one question: a PID is reused, so a recorded PID is killed only when it is still alive *and* its start time matches. Killing a stranger's process is a worse bug than the leak. Independent of #17's state machine. |
+| 47 | [47_agent_working_capability.md](47_agent_working_capability.md) | **Not started.** Evidence-driven, not a roadmap graduation: a session asked what capabilities Damaian needs to implement the remaining specs and ran out of tool rounds before it could answer. Asks whether Damaian can do a spec's worth of work in one sitting — today it cannot, and the reason is the tool surface rather than the model. Ranged reads, listing and content search as first-class tools, region-bounded edits so an edit payload scales with the change rather than the file, cancellable commands with a timeout, and a bounded continuation past the eight-round limit. Adds no autonomy: every capability is read-only or produces the same reviewable patch. The cheap deterministic floor beneath #24, #25 and #26, specified first because those three cannot be built by an agent that lacks it. Defers its budget to #19 and #21 rather than inventing a second one. |
 
 **Ordering exception.** Numbers are assigned in creation order, so #34 is last in
 the table but is the next thing to implement. It is a bug-driven spec covering a
