@@ -1,6 +1,6 @@
 # Feature Spec: Durable Task State and Recovery Classification
 
-Status: Not started
+Status: Done
 Order: 17 of 19
 Roadmap: `docs/ROADMAP/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 2 (Must). That directory is local-only and not committed, so the
@@ -318,11 +318,98 @@ here would document a screen that does not exist yet.
 
 ## 7. Implementation Notes
 
-To be completed during implementation.
+Written after implementation. Per-task detail is in
+[`tasks.md`](tasks.md)'s progress table; this is what the spec asked to have
+recorded.
 
-The twelve-state kill matrix is the load-bearing test and the one most likely to
-be quietly reduced to "a few representative states". Record which states were
-exercised by an automated failure-injection test and which, if any, were only
-checked by hand — per `AGENTS.md`, anything that spawns a real shell or kills a
-real process is `#[ignore]`d with instructions, so some of this matrix will be
-manual by design. Say which.
+### The kill matrix: every state automated, one manual test
+
+**All thirteen states are covered by automated failure injection** — the twelve
+of §5.1 plus `unknown_external_outcome`, which §5.1 lists as a state even
+though it is assigned at recovery time. Each is crossed with the three shapes a
+crash can leave on disk (no marker, a read-only marker, a side-effecting
+marker), giving **39 cells, none of them manual**. Every cell asserts the
+classification, whether auto-resume is permitted, and whether a human may
+resume — the last because §5.4 and requirement 5 answer different questions and
+conflating them would be a mistake in either direction.
+
+Two rows cannot be produced from `TaskStatus::all()` and are covered by their
+own tests rather than dropped:
+
+- The legacy `running` string. Only the no-marker shape is reachable for it,
+  because action markers did not exist in the version that wrote it.
+- A status string from a *later* version. Treated as neither finished nor safe.
+
+**One test is manual by design**, `#[ignore]`d per `AGENTS.md`:
+`a_real_sigkill_mid_action_leaves_a_readable_log_and_an_unknown_outcome` spawns
+a child process, waits until its action marker is genuinely on disk, then kills
+it by PID and asserts the death was `SIGKILL` rather than a clean exit. It
+proves what all 39 constructed cells assume and cannot check: that after a real
+kill the log is *fully parsable* and the dangling marker survives, not just the
+status. The division is deliberate — that test establishes the signature is
+real, and the matrix establishes what is done about it.
+
+The matrix earned its place by finding a hole rather than confirming the code.
+The auto-resume gate had three conditions and none covered a task whose
+*stored* status is already `unknown_external_outcome`. Nothing writes that
+today, but `TaskStatus::parse` accepts it, so the first thing to persist a
+classification — spec 45 keeping a recovery list across a second crash — would
+have made a status that says "the outcome is unknown" re-derive as resumable
+whenever its marker was out of reach. It is now a fourth condition.
+
+### Append cost, measured before and after (§5.2, Task 2)
+
+`append_session_event` computed the next `seq` by rescanning the whole log.
+This spec adds two events per action across six action types, so the cost was
+quadratic in session length. Per-append, before and after the `Arc<Mutex<..>>`
+sequence cache:
+
+| Session length | Before | After |
+|---|---|---|
+| 500 events | 2.3 ms | 0.067 ms |
+| 1000 events | 4.4 ms | 0.063 ms |
+| 2000 events | 8.7 ms | 0.065 ms |
+
+**17.5 s to append 2000 events became 129 ms — 135×.** The shape matters more
+than the factor: per-append cost was *doubling* with length and is now flat, so
+this was linear-versus-quadratic rather than a constant-factor win.
+
+`Arc` turned out to be mandatory, not stylistic. `SessionStore` derives `Clone`
+and is cloned into both the chat and edit orchestrators, so a per-clone cache
+has each clone handing out the same next `seq` — mutation-tested, producing
+`[1, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7]`. Since [spec
+16](../16_session_checkpoints_and_rewind.md) resolves a rewind by `seq`, that
+log would have rewound to the wrong place.
+
+### Task 1's audit ripple: deferred to the classifier, deliberately
+
+`SessionStore` has no `AuditLog`, and threading one through it would touch 15
+construction sites — 13 of them tests, each then also needing a
+`SecretScanner`. That is heavy churn for a diagnostic, and it would put an
+audit dependency inside the storage layer.
+
+So the discarded-line *count* is exposed by
+`SessionStore::unreadable_event_count`, and `recovery::classify_session` records
+it as `session_log_truncated_tail`. The caller that cares does the auditing.
+This is better than the original plan rather than merely cheaper: a torn tail is
+only meaningful as evidence of the crash being classified, and the classifier is
+where that context exists.
+
+### Two things worth knowing about the upgrade
+
+Verified against 30 real session logs, structure only:
+
+- **777 of 828 real events carry no `seq`.** The line-order fallback is the
+  majority path, not an edge case.
+- **`task_status_updated` really does appear in two shapes** — flat, and wrapped
+  as `{"task":…,"error":…}` by `await_approval`. Both are current, and any
+  reader of that event must handle both.
+
+Of 74 real tasks, 25 were non-terminal at their latest status: 24
+`waiting_for_approval` and one `running`. The 24 are marked `failed` with a
+stated reason on first launch, because no earlier version recorded *which*
+proposal a task was waiting on and §5.5 forbids rebuilding an approval card
+from partial data. A `task_id` fallback was considered and rejected:
+`CommandProposal` carries no task id, neither store can enumerate, and
+decisively, failing a stale approval *task* destroys nothing — all 46 stored
+patches remain on disk and stay applicable.

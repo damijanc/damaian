@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md) · background in [`context.md`](context.md)
-**Started:** not yet
+**Status:** Done — all twelve tasks landed. See the progress table.
 
 **Goal:** Make a crash classifiable. After this lands, every task interrupted by a crash is
 recorded as a specific action with a known or unknown outcome, and nothing whose outcome is
@@ -75,11 +75,12 @@ stopped without reading the git log.
 | 9 · Legacy migration | Done | `tests/fixtures/legacy_session.jsonl` + 3 tests, gate green at **418**. The plan said capture a real fixture rather than hand-write one; a real log could not be committed (it would publish the user's own conversations), so instead the **shape was verified against 30 real session logs** and the fixture written to match. That verification corrected assumptions: **777 of 828 real events carry no `seq`**, so Task 1's line-order fallback is the majority path rather than an edge case; `running` is the most common non-terminal status (131 occurrences); and `task_status_updated` really does appear in *both* the flat and the `{"task":…,"error":…}` wrapped form, so Task 1's `payload.get("task").unwrap_or(&payload)` was necessary, not defensive. The fixture covers all four. **Measured upgrade impact on real data:** of 74 tasks, 25 are non-terminal at their latest status — 24 `waiting_for_approval` and 1 `running`. The 24 will be marked `failed` on first launch, because no version before this recorded a `pendingApproval` link. Considered a fallback that finds the proposal by `task_id` and rejected it: `CommandProposal` carries no task id at all, neither store can enumerate, and — decisively — failing a stale approval *task* destroys nothing, since all 46 stored patches remain on disk and stay applicable. A test asserts that outcome rather than leaving it to be discovered |
 | 10 · Twelve-state kill matrix | Done | `every_state_and_crash_shape_recovers_the_way_the_matrix_says` + 2 more, gate green at **420 passed, 8 ignored**. **All thirteen states are automated**, each crossed with three crash shapes (no marker / read-only marker / side-effecting marker) — **39 cells, none manual**, asserting classification, `auto_resume_permitted` *and* `resume_allowed` per cell. Two rows `TaskStatus::all()` cannot produce are covered separately rather than dropped: the legacy `running` string (only the no-marker shape is reachable — action markers did not exist in the version that wrote it) and an unrecognised status from a *later* version, which gets its own test. **Only the real-`SIGKILL` test is manual**, `#[ignore]`d per `AGENTS.md`: it re-executes the test binary into a helper that starts a side-effecting action and waits, polls until the marker reaches disk, then kills the child **by PID through the handle it owns** and asserts `signal() == Some(9)` — so a child that exited on its own cannot be mistaken for a crash. It proves what the constructed logs assume: after a real kill the log is *fully parsable* (`unreadable_event_count == 0`) and the dangling marker survives, not just the status. **The matrix found a requirement-5 hole:** the auto-resume gate had three conditions and none of them covered a task whose *stored status* is already `unknown_external_outcome`. Nothing writes that today — it is the classifier's output — but `parse` accepts it, so the moment anything persists a classification (spec 45 keeping a recovery list across a *second* crash) a status that says the outcome is unknown would re-derive as resumable if its marker were out of reach. Added as a fourth condition. **Mutation-tested, six mutations, all killed:** dropping that new guard, dropping `applying_patch` from `may_have_side_effect_in_flight`, ignoring the marker's `sideEffecting` flag, dropping rule 3's `waiting_for_approval` skip, dropping the terminal skip, and — for the kill test — making the child's action read-only (`left: Interrupted, right: UnknownExternalOutcome`) or removing the poll so the kill lands *before* the marker (`got []`). **The anti-shrink mechanism is itself verified:** `expected()`'s match is exhaustive, so adding a fourteenth variant fails to *compile* — checked by adding one (`error[E0004]: non-exhaustive patterns: &TaskStatus::Hypothetical not covered --> tests/crash_recovery.rs`), which is stronger than the runtime failure the plan asked for. Also corrected `AGENTS.md`, which claimed "Five tests are `#[ignore]`d" — now non-numeric, for the same reason the test count is |
 | 11 · Unblock spec 18's resume scenario | Done, baseline awaiting review | `blocked_on` removed; the scenario now injects a crash and measures recovery. Gate green at **422 passed, 8 ignored**; the deterministic tier runs **thirteen scenarios with zero skipped**, and `recovery_success` is a real **1.0** rather than `notApplicable: "spec-17"`. **The scenario as written would have passed while measuring nothing** — its only assertions were `command_executed = false` and `files_changed_outside_patch = 0`, and `run_command` needs approval, so both read as expected whether or not recovery works at all. That is exactly the weak version the scenario's own original comment rejected, so two assertions that can actually fail were added: `recovered_classification` and `auto_retry_refused`. **`auto_retry_refused` checks both halves** — that Damaian would not continue on its own *and* that the engine refused an outright `resume` — because either alone leaves requirement 5 resting on the other, and the refusal in `recovery::resume` is the single enforcement point. New `crash_mid_action` scenario key, following the `modify_after_proposal` / `approval_decision` precedent; new `RecordedRecovery` on the run record, following `approval_policy_violations`' precedent that a metric needs a per-run field that can express a failure. **What is simulated and what is real, stated in the scenario file itself:** the process is not killed, the runner writes the *signature* a kill leaves (task in `running_tool`, `action_started` with no `action_finished`) and then reopens the store; that the signature is what a real kill leaves is proven by Task 10's `SIGKILL` test, so the two tasks divide the claim rather than both half-proving it. The restart uses a **fresh** `SessionStore`, not the engine's — that one carries Task 2's in-memory seq cache, which a new process would not have. **Mutation-tested, four mutations, all killed:** forcing `resume_allowed` true fails the scenario's own assertion with a legible report line (`auto_retry_refused: expected true, got autoResumePermitted=false, resumeRefused=false`), flipping the injected action to read-only fails the classification, deleting the `[crash_mid_action]` block fails rather than vacuously passing, and the metric test pins that a scenario injecting no crash is not averaged in — otherwise one bad recovery drifts toward 1.0 as the suite grows. The deferral machinery (`skip_if_blocked`, `notApplicable`) kept its coverage via a synthetic blocked scenario, since no committed scenario is blocked any more. Also corrected `AGENTS.md`'s "twelve scenarios". **Baseline regenerated and diffed: the only changes are the resume scenario moving from skipped to run, `recovery_success` becoming 1.0, and latency/model-call figures shifting because the denominator went 12 → 13. Checked for secret leakage (the defect the last review gate caught): none. Awaiting the §5.7 human review.** |
-| 12 · Docs and spec closure | Not started | |
+| 12 · Docs and spec closure | Done | `docs/TROUBLESHOOTING.md`, `proposal.md` §7 + `Status: Done`, `docs/specs/README.md` rows 17/18/45/46, `AGENTS.md`. Gate green. **Corrected two claims the implementation had falsified rather than only adding new text:** the session-log section still said reads "scan and parse lines" so "a truncated or hand-edited line degrades quietly" — Task 1 is precisely what made that false, and an unparsable line is now discarded, counted and audited as `session_log_truncated_tail`; and it told the reader to look for a task left at `running`, a status that no longer exists. **Every documented `jq` command was run against a real session log before being committed, which caught two defects in my own first draft.** (1) `.payload.sideEffecting // "-"` prints the same thing for a read-only action as for a missing field, because `jq`'s `//` treats `false` as absent — on the one field that decides whether an action may be retried. Fixed with `|tostring`, and the reason is written down so it is not "simplified" back. (2) The pairing view left the reader matching marker ids by eye; the real log turned out to contain **two `run_command` markers, one finished and one dangling**, so a name-based match reports the wrong one — replaced with a command that computes the dangling set from `markerId` and verified to isolate exactly the one dangling action out of 3 started / 2 finished. The recovery-decisions command reads the **audit** log, not the session log, which the doc now says explicitly. Also documented the upgrade consequence users will actually see (24 stale approvals failed with a reason, no stored proposal deleted) and why an unknown outcome is refused even to an explicit request. Deliberately **not** `docs/USER_GUIDE.md`: that surface is spec 45's, and documenting a screen that does not exist would be worse than silence |
 
-Record the workspace test count as each task lands. The baseline at the start of this plan is
-**379 passed, 0 failed, 5 ignored**. Treat the count as a tripwire: if it moves by an amount
-you did not intend, find out why before continuing.
+Record the workspace test count as each task lands. The baseline at the start of this plan was
+**379 passed, 0 failed, 5 ignored**; it finished at **422 passed, 0 failed, 8 ignored**. Treat
+the count as a tripwire: if it moves by an amount you did not intend, find out why before
+continuing.
 
 ## File Structure
 
@@ -170,7 +171,7 @@ scenarios are the regression guard.
   `SessionEvent { seq: u64, event_type: String, payload: serde_json::Value }`.
   Every read path goes through it.
 
-- [ ] **Step 1: Verify the `seq` migration is already done, before assuming it**
+- [x] **Step 1: Verify the `seq` migration is already done, before assuming it**
 
 ```bash
 grep -n 'seq' crates/workspace-engine/src/session.rs | head -20
@@ -180,7 +181,7 @@ Expected: `append_session_event` writes `"seq":{}` (`:336`) and `numbered_events
 falls back to line order. If both hold, §5.6's `seq` work is complete and this plan does not
 touch it. Record the finding in the Progress table.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Add to `crates/workspace-engine/tests/session_rewind.rs`:
 
@@ -234,7 +235,7 @@ The helpers `session_with_messages`, `session_log_path` and `extract_seq` do not
 write them at the top of the test file from the existing tests' setup, which already builds a
 `SessionStore` over a temp dir.
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `cargo test -p workspace-engine --locked --test session_rewind`
 Expected: FAIL. The torn-line case is the one that matters — today `line.contains(…)` matches
@@ -243,7 +244,7 @@ the substring inside the torn line and `parse_message_event` returns `None`, so 
 `contains` matches and parsing does not, e.g. cut the line after `"eventType":"message_appended"`,
 so the test genuinely distinguishes the two implementations.
 
-- [ ] **Step 4: Add the parsed event type**
+- [x] **Step 4: Add the parsed event type**
 
 In `session.rs`:
 
@@ -276,7 +277,7 @@ fn parse_event(line: &str, fallback_seq: u64) -> Option<SessionEvent> {
 }
 ```
 
-- [ ] **Step 5: Route every read through it**
+- [x] **Step 5: Route every read through it**
 
 Rewrite `numbered_events`, `active_events`, `read_messages`, `read_task_statuses`,
 `browser_diagnostics_allowed_for_session`, `parse_session_log` and `parse_session_event` to
@@ -304,7 +305,7 @@ Delete `json_string_field`, `json_nullable_string_field`, `json_number_field`,
 `json_bool_field` and `parse_json_string_at` once nothing calls them. If something outside
 `session.rs` calls them, stop and report it rather than making them public.
 
-- [ ] **Step 6: Audit the discard**
+- [x] **Step 6: Audit the discard** — took the sanctioned alternative: 15 construction sites, 13 of them tests, so `unreadable_event_count` exposes the count and Task 6's classifier records `session_log_truncated_tail`. See §7.
 
 When a line fails to parse, record it once per read:
 
@@ -325,12 +326,12 @@ than it looks, stop and report it** — an acceptable alternative is for the cla
 to do the auditing, since it is the caller that cares. Decide with the real call-site count in
 front of you, and record which you chose.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 Run: `cargo test -p workspace-engine --locked --test session_rewind`
 Expected: PASS, including the 5 pre-existing rewind tests.
 
-- [ ] **Step 8: Run the regression guards explicitly**
+- [x] **Step 8: Run the regression guards explicitly**
 
 ```bash
 cargo test --workspace --locked
@@ -344,7 +345,7 @@ Expected: 379 + 2 new tests, 0 failed; and the eval tier still reports 12 passin
 **The eval tier is the guard that matters here** — it reads real session logs end to end, which
 no unit test does.
 
-- [ ] **Step 9: Run the full quality gate**
+- [x] **Step 9: Run the full quality gate**
 
 Every command in `AGENTS.md`'s `## Quality gate`.
 
@@ -361,7 +362,7 @@ Fixes the quadratic append found in the survey, before Task 5 multiplies the num
 - Consumes: Task 1's `parse_event`.
 - Produces: no public API change. `SessionStore` gains an internal per-session seq cache.
 
-- [ ] **Step 1: Measure first, so the fix has a number attached**
+- [x] **Step 1: Measure first, so the fix has a number attached**
 
 Write an `#[ignore]`d benchmark-style test that appends 2,000 events to one session and prints
 the elapsed time. Run it and record the figure. Without a before number, the after number
@@ -371,7 +372,7 @@ means nothing.
 cargo test -p workspace-engine --locked -- --ignored append_cost
 ```
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 ```rust
 /// The next `seq` must not require re-reading the whole log. Asserted through
@@ -395,7 +396,7 @@ fn a_second_store_over_the_same_session_continues_the_sequence() {
 }
 ```
 
-- [ ] **Step 3: Implement the cache**
+- [x] **Step 3: Implement the cache**
 
 A `Mutex<HashMap<String, u64>>` on `SessionStore`, populated lazily from `latest_event_seq` on
 first append for a session and incremented in memory thereafter. **A cache miss must fall back
@@ -405,13 +406,13 @@ to reading the file**, which is what makes the test above pass with two stores.
 shared, so it is an `Arc<Mutex<…>>`, not a plain field. Check how `SessionStore` is cloned in
 `workspace_engine.rs` before choosing.
 
-- [ ] **Step 4: Run the tests, then re-measure**
+- [x] **Step 4: Run the tests, then re-measure**
 
 Run the ignored benchmark again and record the new figure next to the old one in the Progress
 table. If it did not improve materially, the cache is not on the path you thought — investigate
 rather than keeping a change that bought nothing.
 
-- [ ] **Step 5: Full quality gate**
+- [x] **Step 5: Full quality gate**
 
 ---
 
@@ -441,7 +442,7 @@ impl TaskStatus {
 }
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -485,7 +486,7 @@ fn terminal_states_are_exactly_these() {
 `TaskStatus::all()` is a new associated function returning every variant — needed so these
 tests enumerate rather than list, which is what makes a forgotten variant fail.
 
-- [ ] **Step 2: Run to verify failure, then implement**
+- [x] **Step 2: Run to verify failure, then implement**
 
 Extend the enum and `as_str`. String forms are exactly §5.1's: `created`, `preparing_context`,
 `waiting_for_model`, `running_tool`, `waiting_for_approval`, `applying_patch`, `validating`,
@@ -501,19 +502,19 @@ conservative answer is encoded here and the classifier refines it in Task 6 usin
 marker's `sideEffecting` flag. Erring toward "may have a side effect" is the safe direction for
 requirement 5.
 
-- [ ] **Step 3: Update the 23 call sites**
+- [x] **Step 3: Update the 23 call sites**
 
 `chat.rs` 8, `edit.rs` 4, `cancel.rs` 1, `tests/foundation.rs` 10. Most are
 `TaskStatus::Running`, which now needs a more specific state — use the one matching what the
 code is about to do. Where genuinely unclear, `PreparingContext` is the safe default: it is
 read-only, so a crash there is resumable.
 
-- [ ] **Step 4: Run the full suite, then the eval tier**
+- [x] **Step 4: Run the full suite, then the eval tier**
 
 Expected: all pass. The eval tier's `resume_interrupted_session` is still blocked, so it still
 reports skipped.
 
-- [ ] **Step 5: Full quality gate**
+- [x] **Step 5: Full quality gate**
 
 ---
 
@@ -535,7 +536,7 @@ impl SessionStore {
 }
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -579,7 +580,7 @@ fn only_the_unfinished_action_is_dangling() {
 }
 ```
 
-- [ ] **Step 2: Implement, matching each finish to its start**
+- [x] **Step 2: Implement, matching each finish to its start**
 
 Pair them by a marker id written on both events, not by action name — the same action can run
 twice in a turn, and matching by name would let the second start cancel out the first.
@@ -589,7 +590,7 @@ crash case this spec exists to detect, and an automatic "finished" on drop would
 signal. `finish_action` consumes the marker so forgetting it is visible in review as a marker
 that goes out of scope unused.
 
-- [ ] **Step 3: Run, then full quality gate**
+- [x] **Step 3: Run, then full quality gate**
 
 ---
 
@@ -623,7 +624,7 @@ unknown outcome for an action that might not have started yet. Erring toward
 "unknown" is correct for requirement 5; erring the other way — a narrow window
 that misses a real side effect — is the bug this spec exists to prevent.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 One test per action type asserting a completed action leaves no dangling marker, and that the
 `sideEffecting` flag matches §5.3's list: model call `false`, read-only tool `false`, command
@@ -633,7 +634,7 @@ One test per action type asserting a completed action leaves no dangling marker,
 Reuse `CommandPolicy::classify` for the validation case rather than a second list — §5.1: "the
 resume rule and the approval rule cannot drift apart."
 
-- [ ] **Step 2: Instrument each site, then run the eval tier**
+- [x] **Step 2: Instrument each site, then run the eval tier**
 
 ```bash
 cargo run -p eval-harness -- run --tier deterministic --format json
@@ -643,7 +644,7 @@ The twelve scenarios drive all six action types. Check `modelCalls` and the trac
 have not changed shape, and that runtime has not regressed materially from **2.8s** — Task 2's
 cache is what should keep it flat, and this is where you find out whether it did.
 
-- [ ] **Step 3: Full quality gate**
+- [x] **Step 3: Full quality gate**
 
 ---
 
@@ -669,7 +670,7 @@ pub fn classify_session(store: &SessionStore, session_id: &str)
 pub fn classify_all(store: &SessionStore) -> Result<Vec<RecoveredTask>>;
 ```
 
-- [ ] **Step 1: Write the failing tests — §5.4's three rules**
+- [x] **Step 1: Write the failing tests — §5.4's three rules**
 
 ```rust
 #[test]
@@ -699,12 +700,12 @@ fn auto_resume_is_permitted_only_for_read_only_dangling_actions() {
 fn classification_records_the_dangling_action_and_its_seq() { … }
 ```
 
-- [ ] **Step 2: Implement, and append `task_recovered`**
+- [x] **Step 2: Implement, and append `task_recovered`**
 
 The event carries the classification, the dangling action and its `seq`. Recording it makes a
 recovery decision auditable rather than a conclusion something reached once and forgot.
 
-- [ ] **Step 3: Run, then full quality gate**
+- [x] **Step 3: Run, then full quality gate**
 
 ---
 
@@ -713,7 +714,7 @@ recovery decision auditable rather than a conclusion something reached once and 
 **Files:**
 - Modify: `session.rs` (the `pendingApproval` field on the status event), `recovery.rs`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -728,7 +729,7 @@ fn a_missing_proposal_file_fails_the_task_with_a_reason() { … }
 fn a_corrupt_proposal_file_fails_the_task_rather_than_reconstructing_a_card() { … }
 ```
 
-- [ ] **Step 2: Implement, then full quality gate**
+- [x] **Step 2: Implement, then full quality gate**
 
 ---
 
@@ -740,7 +741,7 @@ fn a_corrupt_proposal_file_fails_the_task_rather_than_reconstructing_a_card() { 
 **Interfaces:**
 - Produces: `resume(store, &RecoveredTask)`, `mark_failed(...)`, `abandon(...)`.
 
-- [ ] **Step 1: Write the failing tests — the central guarantee**
+- [x] **Step 1: Write the failing tests — the central guarantee**
 
 ```rust
 /// Requirement 5, enforced where it cannot be widened. Spec 45 will be a
@@ -767,7 +768,7 @@ fn abandon_is_terminal_and_does_not_retry_the_turn() { … }
 fn every_recovery_decision_is_audited_with_its_evidence() { … }
 ```
 
-- [ ] **Step 2: Implement, then full quality gate**
+- [x] **Step 2: Implement, then full quality gate**
 
 ---
 
@@ -777,12 +778,12 @@ fn every_recovery_decision_is_audited_with_its_evidence() { … }
 - Create: `crates/workspace-engine/tests/fixtures/legacy_session.jsonl`
 - Modify: `session.rs` (`TaskStatus::parse` legacy mapping), `recovery.rs`
 
-- [ ] **Step 1: Capture a real fixture, do not hand-write one**
+- [x] **Step 1: Capture a real fixture, do not hand-write one**
 
 Generate a session log with the **current released** code path and commit it verbatim. A
 hand-written fixture tests your idea of the old format; a captured one tests the old format.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 ```rust
 #[test]
@@ -795,7 +796,7 @@ fn a_session_written_before_this_change_loads_with_no_data_loss() { … }
 fn a_legacy_running_task_classifies_as_interrupted() { … }
 ```
 
-- [ ] **Step 3: Implement, then full quality gate**
+- [x] **Step 3: Implement, then full quality gate**
 
 ---
 
@@ -866,21 +867,21 @@ skipped. Per §5.7 of spec 18, that is a **human review gate** — present the d
 - Modify: `docs/TROUBLESHOOTING.md`, `AGENTS.md`, `proposal.md`, `tasks.md`,
   `docs/specs/README.md`
 
-- [ ] **Step 1: `docs/TROUBLESHOOTING.md`**
+- [x] **Step 1: `docs/TROUBLESHOOTING.md`**
 
 How to read recovery events in a session log, how to find a task's dangling action, and what
 `unknown_external_outcome` means. **Not** `docs/USER_GUIDE.md` — that is spec 45's, and writing
 it here would document a screen that does not exist.
 
-- [ ] **Step 2: Close the spec**
+- [x] **Step 2: Close the spec**
 
 `Status: Done` with what was measured. Fill §7: which of the twelve states are covered by
 automated injection and which are manual; the append-cost figures before and after Task 2; and
 whether Task 1's audit ripple was taken in `SessionStore` or deferred to the classifier.
 
-- [ ] **Step 3: Update `docs/specs/README.md`'s row 17, and note that 45 and 46 are now unblocked**
+- [x] **Step 3: Update `docs/specs/README.md`'s row 17, and note that 45 and 46 are now unblocked**
 
-- [ ] **Step 4: Final full quality gate**
+- [x] **Step 4: Final full quality gate**
 
 ---
 

@@ -360,8 +360,8 @@ One JSONL file per conversation, `sessions/<session-id>.jsonl`, appended as
 events. This is where **message content** lives.
 
 Event types: `session_created`, `session_renamed`, `task_created`,
-`task_status_updated`, `message_appended`, `browser_diagnostics_approval_updated`,
-`conversation_rewound`.
+`task_status_updated`, `message_appended`, `action_started`, `action_finished`,
+`browser_diagnostics_approval_updated`, `conversation_rewound`.
 
 Every event carries a monotonic `seq`. Events written before that field existed
 are numbered by line order on read, which is their append order, so old
@@ -380,22 +380,101 @@ jq -r 'select(.eventType=="message_appended") | "[\(.payload.role)] \(.payload.c
 ```
 
 Follow task state, which is how you spot a turn that died mid-flight — a task
-left at `running` or `waiting_for_approval` never reached `complete` or
-`failed`:
+whose last status is not `complete`, `failed`, `cancelled` or
+`tool_budget_exhausted` never finished:
 
 ```bash
-jq -r 'select(.eventType=="task_status_updated") | "\(.payload.status) \(.payload.id)"' "$SESSION_FILE"
+jq -r 'select(.eventType=="task_status_updated") | "\(.payload.task.status // .payload.status) \(.payload.task.id // .payload.id)"' "$SESSION_FILE"
 ```
 
-Session files are read by scanning and parsing lines, and `list_sessions`
-returns an empty list rather than failing when the directory is unreadable
-([session.rs:151](../crates/workspace-engine/src/session.rs:151)). A truncated
-or hand-edited line therefore degrades quietly — if a conversation renders
-oddly, validate the file:
+The `.task //` fallbacks are not defensive padding: `task_status_updated`
+genuinely appears in two shapes. `await_approval` wraps the task alongside the
+proposal it is waiting for, and the plain status write does not. Both are
+current.
+
+Every line is parsed as JSON on read, and a line that does not parse is
+**discarded rather than half-read** — a truncated tail cannot turn into a
+phantom message. The count of discarded lines is available
+(`SessionStore::unreadable_event_count`) and the recovery classifier audits it
+as `session_log_truncated_tail`, so a torn write shows up as evidence of the
+crash rather than as silent corruption. `list_sessions` still returns an empty
+list rather than failing when the directory is unreadable
+([session.rs:151](../crates/workspace-engine/src/session.rs:151)), so an
+unreadable *directory* is the case that stays quiet. To check a file yourself:
 
 ```bash
 jq -e . "$SESSION_FILE" > /dev/null
 ```
+
+### After a crash: what recovery decided
+
+A task that was mid-action when the process died leaves an `action_started`
+with no matching `action_finished`. That pairing is the crash signature, and it
+is what the classifier reads. Find the dangling ones:
+
+```bash
+jq -rs 'map(select(.eventType=="action_finished").payload.markerId) as $finished
+        | map(select(.eventType=="action_started"
+                     and (.payload.markerId | IN($finished[])) == false))
+        | .[] | "seq=\(.seq) \(.payload.action) ref=\(.payload.ref) sideEffecting=\(.payload.sideEffecting) task=\(.payload.taskId)"' "$SESSION_FILE"
+```
+
+Pair by **`markerId`, not by action name.** A session that ran the same tool
+twice has two `run_command` markers, and one can be closed while the other is
+not — matching on the name alone reports the wrong one, or reports a completed
+action as dangling.
+
+To see the raw pairing instead:
+
+```bash
+jq -r 'select(.eventType=="action_started" or .eventType=="action_finished")
+       | "\(.eventType) \(.payload.markerId) \(.payload.action) sideEffecting=\(.payload.sideEffecting|tostring)"' "$SESSION_FILE"
+```
+
+`|tostring` there is not cosmetic. `jq`'s `//` operator treats `false` as
+absent, so the obvious `.payload.sideEffecting // "-"` prints the same thing
+for a read-only action as for a missing field — on the one field that decides
+whether the action can be retried. `action_finished` does not carry the field
+at all and prints `null`.
+
+`sideEffecting` on the `action_started` line is what decides everything. Two
+outcomes, per
+[spec 17](specs/17_durable_task_state_and_crash_recovery/proposal.md) §5.4:
+
+- **`interrupted`** — nothing observable outside the process was in flight, so
+  the task can be picked up again. A cut model call lands here: the call may
+  have been billed, but repeating it costs another call rather than repeating an
+  effect.
+- **`unknown_external_outcome`** — a side-effecting action was in flight and
+  **there is no way to find out whether it landed.** A command may have deleted
+  files, a patch may have written some of them, an MCP call may have posted
+  something. Damaian will not repeat it, and will not repeat it even if you ask:
+  `resume` refuses this classification outright. Inspect what actually happened
+  and then mark the task failed or abandon it.
+
+That refusal is deliberate and lives in the engine rather than the UI. Nothing
+you can be told makes an unknown outcome knowable, so there is no informed
+choice to offer — probing the external system to find out is explicitly out of
+scope, because the probe itself can have effects.
+
+Recovery decisions are in the **audit log**, not the session log:
+
+```bash
+jq -r 'select(.eventType|startswith("task_recover")) | "\(.eventType) \(.taskId) \(.classification // "") \(.decision // "") \(.outcome // "") \(.reason // "")"' ~/Library/Application\ Support/DamaianClient/audit/events.jsonl
+```
+
+`task_recovered` carries the classification and the evidence it was made on
+(`danglingAction`, `danglingRef`, `danglingSeq`, `autoResumePermitted`);
+`task_recovery_decision` carries what was then done about it and whether it was
+allowed or refused.
+
+One upgrade consequence worth knowing, if tasks appear as `failed` with a reason
+after updating: a task left awaiting approval by a version older than spec 17
+recorded its status but not *which* proposal it was waiting on. There is nothing
+to reattach and nothing safe to guess, so it is failed with that stated reason
+rather than shown as an approval card rebuilt from partial data. **No stored
+proposal is deleted** — the patches and commands themselves remain on disk and
+stay usable.
 
 ### Checkpoints and rewind
 
