@@ -89,16 +89,20 @@ Notes:
   deterministic tier is already part of `cargo test --workspace --locked`, so it
   adds no quality-gate command. See
   [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md#evaluation-harness).
-- Five tests are `#[ignore]`d because they have real side effects: one opens
+- Some tests are `#[ignore]`d because they have real side effects: one opens
   Finder, one spawns a real login shell, one reads your own checkout to measure
-  census cost, and `serves_the_ui_for_manual_inspection` serves the real web UI
-  on port 4899 with a known API token so the desktop UI can be looked at
-  without a Tauri build (its doc comment has the two console lines you need),
-  and `live_tier_runs_one_scenario_against_a_real_provider` calls a real
-  provider over the network and needs credentials.
+  census cost, `serves_the_ui_for_manual_inspection` serves the real web UI on
+  port 4899 with a known API token so the desktop UI can be looked at without a
+  Tauri build (its doc comment has the two console lines you need),
+  `live_tier_runs_one_scenario_against_a_real_provider` calls a real provider
+  over the network and needs credentials, and
+  `a_real_sigkill_mid_action_leaves_a_readable_log_and_an_unknown_outcome`
+  spawns a child process and `SIGKILL`s it, together with the helper test it
+  re-executes into. Every one carries its manual command in its doc comment.
   Keep that convention: anything that touches the user's desktop, spawns a
-  shell, binds a port, reaches the network, or reads their repository should be
-  `#[ignore]`d with a doc comment saying how to run it manually.
+  shell or a process, binds a port, reaches the network, or reads their
+  repository should be `#[ignore]`d with a doc comment saying how to run it
+  manually.
 - `DAMAIAN_MOCK_MODEL_RESPONSE="..."` makes model-dependent paths testable with
   no API key and no network. Prefer it over mocking HTTP.
 - `DAMAIAN_DATA_DIR=.damaian` keeps app data inside the workspace instead of

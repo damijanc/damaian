@@ -742,3 +742,348 @@ fn a_legacy_task_awaiting_approval_is_failed_because_no_link_was_recorded() {
         other => panic!("expected Unavailable, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// The kill matrix (§7)
+//
+// §7 calls this the load-bearing test and the one most likely to be quietly
+// reduced to "a few representative states". Every state is crossed with every
+// shape a crash can leave on disk, and every cell has a written-down answer.
+// ---------------------------------------------------------------------------
+
+/// What the crash left behind alongside the status. `NoMarker` is a crash
+/// *between* actions; the other two are a crash *inside* one, told apart by
+/// whether the action could be observed from outside this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrashShape {
+    NoMarker,
+    ReadOnlyAction,
+    SideEffectingAction,
+}
+
+impl CrashShape {
+    fn all() -> [Self; 3] {
+        [
+            Self::NoMarker,
+            Self::ReadOnlyAction,
+            Self::SideEffectingAction,
+        ]
+    }
+
+    fn marker(self) -> Option<(&'static str, bool)> {
+        match self {
+            Self::NoMarker => None,
+            Self::ReadOnlyAction => Some(("read_file", false)),
+            Self::SideEffectingAction => Some(("run_command", true)),
+        }
+    }
+}
+
+/// The recovery outcome for one cell.
+#[derive(Debug, PartialEq, Eq)]
+enum Expected {
+    /// Absent from the recovery list, because there is nothing to recover.
+    NotRecovered,
+    Recovered {
+        classification: TaskStatus,
+        /// May Damaian continue on its own?
+        auto_resume_permitted: bool,
+        /// May the user, shown the evidence, choose to continue?
+        human_resume_allowed: bool,
+    },
+}
+
+fn resumable() -> Expected {
+    Expected::Recovered {
+        classification: TaskStatus::Interrupted,
+        auto_resume_permitted: true,
+        human_resume_allowed: true,
+    }
+}
+
+/// Interrupted, so a human may continue it, but not without being asked.
+fn needs_a_decision() -> Expected {
+    Expected::Recovered {
+        classification: TaskStatus::Interrupted,
+        auto_resume_permitted: false,
+        human_resume_allowed: true,
+    }
+}
+
+/// Requirement 5: nothing may repeat this, not even a human choosing to.
+fn unknown_outcome() -> Expected {
+    Expected::Recovered {
+        classification: TaskStatus::UnknownExternalOutcome,
+        auto_resume_permitted: false,
+        human_resume_allowed: false,
+    }
+}
+
+/// The matrix, as one expectation per cell.
+///
+/// This `match` is deliberately exhaustive rather than a lookup with a default:
+/// a `TaskStatus` variant added later does not compile until someone writes
+/// down what recovery should do with it. That is half of what stops the matrix
+/// shrinking; `TaskStatus::all()` in the driver is the other half.
+fn expected(status: &TaskStatus, shape: CrashShape) -> Expected {
+    let in_a_side_effecting_action = shape == CrashShape::SideEffectingAction;
+    match status {
+        // Nothing further happens to a terminal task, whatever the log holds.
+        // A dangling marker under a terminal status means the crash landed
+        // between the action and the status write, and the status won.
+        TaskStatus::Complete
+        | TaskStatus::Failed
+        | TaskStatus::Cancelled
+        | TaskStatus::ToolBudgetExhausted => Expected::NotRecovered,
+
+        // §5.4 rule 3: a task awaiting a human was not interrupted mid-action.
+        // Its proposal is reattached (§5.5) instead.
+        TaskStatus::WaitingForApproval => Expected::NotRecovered,
+
+        // §5.1: a crash in these states leaves nothing half-done, so read-only
+        // work resumes on its own. A billed-but-unanswered model call counts as
+        // resumable — the cost of a second call, not an unrepeatable effect.
+        TaskStatus::Created
+        | TaskStatus::PreparingContext
+        | TaskStatus::WaitingForModel
+        | TaskStatus::Interrupted => {
+            if in_a_side_effecting_action {
+                unknown_outcome()
+            } else {
+                resumable()
+            }
+        }
+
+        // §5.1's three "never auto-retry" states. With a side-effecting marker
+        // the outcome is unknown. Without one, rule 2 still classifies the task
+        // `interrupted` — but the status alone says a command may have been
+        // running, and a missing marker is absence of evidence, not evidence of
+        // safety, so it is never resumed unasked.
+        TaskStatus::RunningTool | TaskStatus::ApplyingPatch | TaskStatus::Validating => {
+            if in_a_side_effecting_action {
+                unknown_outcome()
+            } else {
+                needs_a_decision()
+            }
+        }
+
+        // Not written during normal operation — the classifier's own output,
+        // which only reaches disk if something persists it. Should that happen,
+        // a status saying the outcome is unknown must not re-derive as
+        // resumable just because its marker is out of reach.
+        TaskStatus::UnknownExternalOutcome => {
+            if in_a_side_effecting_action {
+                unknown_outcome()
+            } else {
+                needs_a_decision()
+            }
+        }
+    }
+}
+
+fn observed(recovered: &[workspace_engine::RecoveredTask], task_id: &str) -> Expected {
+    match recovered.iter().find(|task| task.task_id == task_id) {
+        None => Expected::NotRecovered,
+        Some(task) => Expected::Recovered {
+            classification: task.classification.clone(),
+            auto_resume_permitted: task.auto_resume_permitted,
+            human_resume_allowed: workspace_engine::resume_allowed(task),
+        },
+    }
+}
+
+/// Every state, crossed with every crash shape.
+///
+/// Two rows cannot be produced from `TaskStatus::all()` and are covered
+/// separately rather than dropped: the legacy `running` string, by
+/// `a_legacy_running_task_classifies_as_interrupted_but_is_never_auto_resumed`
+/// (only `NoMarker` is reachable for it — action markers did not exist in the
+/// version that wrote `running`), and an unrecognised status from a future
+/// version, by `a_status_this_version_does_not_understand_is_never_resumed`.
+#[test]
+fn every_state_and_crash_shape_recovers_the_way_the_matrix_says() {
+    let mut cells = 0;
+    for status in TaskStatus::all() {
+        for shape in CrashShape::all() {
+            let fixture = fixture("matrix");
+            let task = task_left_in(&fixture, status.clone(), shape.marker());
+
+            let recovered =
+                classify_session(&fixture.store, &fixture.audit, &fixture.session_id).unwrap();
+
+            assert_eq!(
+                observed(&recovered, &task.id),
+                expected(&status, shape),
+                "state `{}` after a crash with {shape:?}",
+                status.as_str()
+            );
+            cells += 1;
+        }
+    }
+    // Thirteen states by three crash shapes. If this number moves, a state or
+    // a shape was added or removed — check the matrix is still complete before
+    // updating it.
+    assert_eq!(cells, 39, "the matrix must not shrink");
+}
+
+/// The row `TaskStatus::all()` cannot reach: a status written by a *later*
+/// version, read by this one. Guessing is least safe exactly here, so an
+/// unreadable status is treated as non-terminal and never resumed unasked.
+#[test]
+fn a_status_this_version_does_not_understand_is_never_resumed() {
+    let fixture = fixture("future-status");
+    let task = fixture
+        .store
+        .create_task(&fixture.session_id, "from the future", "mock", "m")
+        .unwrap();
+    let log = fixture
+        .data_dir
+        .join("sessions")
+        .join(format!("{}.jsonl", fixture.session_id));
+    let mut content = fs::read_to_string(&log).unwrap();
+    content.push_str(&format!(
+        "{{\"eventId\":\"evt_future\",\"seq\":900,\"timestampMs\":1,\
+          \"eventType\":\"task_status_updated\",\"payload\":{{\"id\":\"{}\",\
+          \"sessionId\":\"{}\",\"status\":\"negotiating_with_the_compiler\"}}}}\n",
+        task.id, fixture.session_id
+    ));
+    fs::write(&log, content).unwrap();
+
+    let recovered = classify_session(&fixture.store, &fixture.audit, &fixture.session_id).unwrap();
+
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        recovered[0].previous_status,
+        "negotiating_with_the_compiler"
+    );
+    assert_eq!(
+        recovered[0].classification,
+        TaskStatus::Interrupted,
+        "not terminal: a status this version cannot read is not assumed finished"
+    );
+    assert!(
+        !recovered[0].auto_resume_permitted,
+        "and not assumed safe either"
+    );
+}
+
+/// The one row of the matrix a constructed log cannot prove: that the session
+/// log on disk is still fully parsable after a **real** `SIGKILL` mid-action.
+/// Every other test in this file assumes that and then reasons about
+/// classification; this one checks the assumption.
+///
+/// `#[ignore]`d per `AGENTS.md` because it spawns and kills a real process. Run
+/// it by hand:
+///
+/// ```sh
+/// cargo test -p workspace-engine --test crash_recovery -- --ignored --exact \
+///   a_real_sigkill_mid_action_leaves_a_readable_log_and_an_unknown_outcome
+/// ```
+#[test]
+#[ignore]
+fn a_real_sigkill_mid_action_leaves_a_readable_log_and_an_unknown_outcome() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    let fixture = fixture("sigkill");
+    // The child is this same test binary, re-executed into the helper below so
+    // it writes through the very `SessionStore` under test.
+    let mut child = Command::new(std::env::current_exe().expect("test binary path"))
+        .args([
+            "--ignored",
+            "--exact",
+            "sigkill_helper_starts_a_side_effecting_action_and_waits_to_be_killed",
+        ])
+        .env("DAMAIAN_SIGKILL_DIR", &fixture.data_dir)
+        .env("DAMAIAN_SIGKILL_SESSION", &fixture.session_id)
+        .spawn()
+        .expect("child should spawn");
+
+    // Wait for the marker to actually reach disk, rather than sleeping a guessed
+    // interval — the point is to kill the child *inside* the action.
+    let log = fixture
+        .data_dir
+        .join("sessions")
+        .join(format!("{}.jsonl", fixture.session_id));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("action_started")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the child never reached the action"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // By PID, through the handle we own. Never by name: the user's real app
+    // shares binary names with test processes on this machine.
+    child.kill().expect("SIGKILL should be delivered");
+    let status = child.wait().expect("child should be reaped");
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "the child must have died by SIGKILL rather than exiting on its own, \
+         or this proves nothing about a crash"
+    );
+
+    assert_eq!(
+        fixture
+            .store
+            .unreadable_event_count(&fixture.session_id)
+            .unwrap(),
+        0,
+        "an append-only log must survive a kill with every line parsable"
+    );
+
+    let recovered = classify_session(&fixture.store, &fixture.audit, &fixture.session_id).unwrap();
+
+    assert_eq!(recovered.len(), 1, "got {recovered:?}");
+    assert_eq!(
+        recovered[0].classification,
+        TaskStatus::UnknownExternalOutcome
+    );
+    assert!(!recovered[0].auto_resume_permitted);
+    assert_eq!(
+        recovered[0].dangling.as_ref().expect("the marker").action,
+        "run_command",
+        "the evidence must survive the kill, not just the status"
+    );
+}
+
+/// Not a test — the child half of the `SIGKILL` test above, which re-executes
+/// this binary into it. It never returns on its own; it waits to be killed.
+///
+/// `#[ignore]`d so the normal suite never runs it, and it returns immediately
+/// unless the parent's environment is present, so a bare `-- --ignored` run
+/// does not hang.
+#[test]
+#[ignore]
+fn sigkill_helper_starts_a_side_effecting_action_and_waits_to_be_killed() {
+    let (Ok(data_dir), Ok(session_id)) = (
+        std::env::var("DAMAIAN_SIGKILL_DIR"),
+        std::env::var("DAMAIAN_SIGKILL_SESSION"),
+    ) else {
+        return;
+    };
+
+    let store = SessionStore::new(&data_dir);
+    let task = store
+        .create_task(&session_id, "get killed", "mock", "m")
+        .unwrap();
+    let task = store
+        .update_task_status(&task, TaskStatus::RunningTool, None)
+        .unwrap();
+    // Never finished. `ActionMarker` has no `Drop` impl by design, so letting
+    // it fall out of scope does not close it either — which is the whole point:
+    // only an explicit `finish_action` closes an action.
+    let _marker = store
+        .start_action(&task, "run_command", "cmd_1", true)
+        .unwrap();
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}

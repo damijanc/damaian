@@ -105,11 +105,22 @@ pub fn classify_session(
         //    exactly the information this work exists to eliminate — something
         //    was in flight and nothing recorded what — so "resumable" cannot be
         //    concluded from it, even though it classifies as `Interrupted`.
+        // 4. A task already *recorded* as `unknown_external_outcome` is never
+        //    auto-resumed. §5.1's table says "never auto-retry" for that state,
+        //    and today that rests entirely on the classification being
+        //    recomputed from a marker which, being append-only, is still
+        //    dangling. That holds only while nothing persists the
+        //    classification — the moment something does (spec 45 keeping a
+        //    recovery list across a second crash), a status that says the
+        //    outcome is unknown would otherwise come back off disk and
+        //    re-derive as resumable if its marker were out of reach.
         let status_allows = status
             .as_ref()
             .is_some_and(|status| !status.may_have_side_effect_in_flight());
-        let auto_resume_permitted =
-            classification == TaskStatus::Interrupted && status_allows && raw_status != "running";
+        let auto_resume_permitted = classification == TaskStatus::Interrupted
+            && status_allows
+            && raw_status != "running"
+            && status != Some(TaskStatus::UnknownExternalOutcome);
 
         let task = RecoveredTask {
             task_id: task_id.clone(),
