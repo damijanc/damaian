@@ -395,6 +395,27 @@ This is better than the original plan rather than merely cheaper: a torn tail is
 only meaningful as evidence of the crash being classified, and the classifier is
 where that context exists.
 
+### What spec 17 deliberately leaves uncalled
+
+Requirement 4 says every incomplete task is detected and classified on launch.
+`recovery::classify_all` **is** that sweep, and it is tested — but nothing on a
+launch path calls it, because per §0 the desktop surface belongs to
+[spec 45](../45_crash_recovery_prompt.md). The engine side is complete and
+exercised end to end by spec 18's `resume_interrupted_session`; what is missing
+is a caller.
+
+Two consequences, stated so they are not discovered as bugs:
+
+- **A crashed task keeps its last-written status until spec 45 lands.** Markers
+  are written from now on, so today's crashes are already classifiable when
+  that surface arrives — nothing has to be back-filled.
+- **The stale-approval migration has not happened yet either.** The 24
+  `waiting_for_approval` tasks described below get failed when
+  `reattach_pending_approvals` is first invoked, not on the next launch.
+
+`docs/TROUBLESHOOTING.md` says this too, in the section on reading recovery
+events, so an operator does not go looking for a sweep that has not run.
+
 ### Two things worth knowing about the upgrade
 
 Verified against 30 real session logs, structure only:

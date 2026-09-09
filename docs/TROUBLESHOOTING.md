@@ -468,13 +468,20 @@ jq -r 'select(.eventType|startswith("task_recover")) | "\(.eventType) \(.taskId)
 `task_recovery_decision` carries what was then done about it and whether it was
 allowed or refused.
 
-One upgrade consequence worth knowing, if tasks appear as `failed` with a reason
-after updating: a task left awaiting approval by a version older than spec 17
-recorded its status but not *which* proposal it was waiting on. There is nothing
-to reattach and nothing safe to guess, so it is failed with that stated reason
-rather than shown as an approval card rebuilt from partial data. **No stored
-proposal is deleted** — the patches and commands themselves remain on disk and
-stay usable.
+**Nothing runs this sweep automatically yet.** Classification, the reattach and
+the three recovery operations are engine APIs with no caller on the launch path
+— [spec 45](specs/45_crash_recovery_prompt.md) is the surface that will invoke
+them and present the choice. Until it lands, a crashed task keeps whatever
+status it was left with, and the `jq` commands above are how you see what
+happened. The markers are being written now, so a crash today is already
+classifiable when that surface arrives.
+
+One consequence to expect when it does: a task left awaiting approval by a
+version older than spec 17 recorded its status but not *which* proposal it was
+waiting on. There is nothing to reattach and nothing safe to guess, so it will
+be failed with that stated reason rather than shown as an approval card rebuilt
+from partial data. **No stored proposal is deleted** — the patches and commands
+themselves remain on disk and stay usable.
 
 ### Checkpoints and rewind
 
