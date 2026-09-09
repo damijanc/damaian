@@ -171,13 +171,35 @@ impl MetricSet {
             MetricValue::Count { value: unrelated },
         );
 
-        // Its only source is the scenario deferred in §5.4.
+        // §5.6: the resume scenario, now that spec 17 has landed. A recovery is
+        // a success only if *both* halves of that row hold — the crash
+        // classified, and the action was not repeated. Counted over the records
+        // that actually injected a crash: a scenario measuring nothing about
+        // recovery must not dilute this toward either 1.0 or 0.0, and with no
+        // such scenario at all the honest answer is no data rather than a rate.
+        let interrupted: Vec<&RunRecord> = runnable
+            .iter()
+            .copied()
+            .filter(|record| record.recovery.is_some())
+            .collect();
+        let recovered_well = interrupted
+            .iter()
+            .filter(|record| {
+                record.recovery.as_ref().is_some_and(|recovery| {
+                    recovery.classification == "unknown_external_outcome"
+                        && !recovery.auto_resume_permitted
+                        && recovery.resume_refused
+                })
+            })
+            .count();
         push(
             "recovery_success",
             "Recovery success",
-            MetricValue::NotApplicable {
-                phase: "spec-17".to_string(),
-            },
+            rate_or_no_data(
+                recovered_well,
+                interrupted.len(),
+                "no-interrupted-scenarios",
+            ),
         );
 
         let all_calls: Vec<&str> = runnable

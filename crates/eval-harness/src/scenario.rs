@@ -56,6 +56,12 @@ pub struct Asserts {
     pub command_executed: Option<bool>,
     pub patch_applied: Option<bool>,
     pub model_calls_at_most: Option<u64>,
+    /// What the classifier must conclude about the task left mid-action by
+    /// `crash_mid_action`, as its `TaskStatus` string.
+    pub recovered_classification: Option<String>,
+    /// That the interrupted action is not repeated: neither automatically, nor
+    /// when a resume is asked for outright.
+    pub auto_retry_refused: Option<bool>,
     /// Assertion names that depend on a scripted tool call and are therefore
     /// skipped in the live tier (proposal §5.3), so a scenario stays one
     /// definition rather than two that drift.
@@ -80,6 +86,10 @@ pub struct Scenario {
     /// it stops on a command proposal, so the approved and denied paths are
     /// exercised end to end rather than stopping at the proposal.
     pub approval_decision: Option<bool>,
+    /// When set, the runner leaves the turn's task mid-action — an
+    /// `action_started` with no `action_finished` — then reopens the store and
+    /// classifies, which is what a restart does. See [`CrashMidAction`].
+    pub crash_mid_action: Option<CrashMidAction>,
     pub turns: Vec<Turn>,
     pub asserts: Asserts,
 }
@@ -100,6 +110,8 @@ struct RawScenario {
     modify_after_proposal: Option<ModifyAfterProposal>,
     #[serde(default)]
     approval_decision: Option<bool>,
+    #[serde(default)]
+    crash_mid_action: Option<CrashMidAction>,
     #[serde(default, rename = "turn")]
     turns: Vec<RawTurn>,
     #[serde(default, rename = "assert")]
@@ -111,6 +123,28 @@ struct RawScenario {
 struct ModifyAfterProposal {
     path: String,
     content: String,
+}
+
+/// The crash to leave behind, for the scenario that measures recovery.
+///
+/// **What is simulated and what is real.** The process is not killed — the
+/// runner writes the *signature* a kill leaves: the task moved to
+/// `running_tool` and an `action_started` with no `action_finished`. That the
+/// signature is genuinely what survives a real `SIGKILL` is proven separately,
+/// by spec 17's `#[ignore]`d
+/// `a_real_sigkill_mid_action_leaves_a_readable_log_and_an_unknown_outcome`.
+/// This scenario's job is the other half: that the engine, restarted, refuses
+/// to repeat the action.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct CrashMidAction {
+    /// The action name, as the dispatch layer records it (`run_command`).
+    pub action: String,
+    /// What the action was operating on, for the evidence the classifier keeps.
+    pub reference: String,
+    /// Whether the interrupted action could be observed outside this process.
+    /// `true` is what makes the outcome unknowable and the retry unsafe.
+    pub side_effecting: bool,
 }
 
 #[derive(Deserialize)]
@@ -196,6 +230,7 @@ pub fn load(path: &Path) -> Result<Scenario> {
             .modify_after_proposal
             .map(|change| (change.path, change.content)),
         approval_decision: raw.approval_decision,
+        crash_mid_action: raw.crash_mid_action,
         turns,
         asserts: raw.asserts,
     })

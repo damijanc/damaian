@@ -6,8 +6,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788793816524,
-      "durationMs": 72,
+      "startedAtMs": 1788945529152,
+      "durationMs": 60,
       "toolCalls": [
         {
           "name": "read_file",
@@ -53,7 +53,7 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788793816672,
+      "startedAtMs": 1788945529287,
       "durationMs": 59,
       "toolCalls": [
         {
@@ -93,8 +93,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788793816802,
-      "durationMs": 57,
+      "startedAtMs": 1788945529424,
+      "durationMs": 63,
       "toolCalls": [
         {
           "name": "run_command",
@@ -157,8 +157,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788793816933,
-      "durationMs": 55,
+      "startedAtMs": 1788945529565,
+      "durationMs": 57,
       "toolCalls": [
         {
           "name": "search_codebase",
@@ -204,8 +204,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788793817063,
-      "durationMs": 132,
+      "startedAtMs": 1788945529699,
+      "durationMs": 151,
       "toolCalls": [
         {
           "name": "run_command",
@@ -350,8 +350,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788793817272,
-      "durationMs": 53,
+      "startedAtMs": 1788945529931,
+      "durationMs": 59,
       "toolCalls": [],
       "approvals": [],
       "filesChanged": [],
@@ -382,8 +382,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788793817396,
-      "durationMs": 57,
+      "startedAtMs": 1788945530070,
+      "durationMs": 63,
       "toolCalls": [
         {
           "name": "read_file",
@@ -462,8 +462,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788793817526,
-      "durationMs": 58,
+      "startedAtMs": 1788945530213,
+      "durationMs": 67,
       "toolCalls": [
         {
           "name": "read_file",
@@ -537,8 +537,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788793817652,
-      "durationMs": 54,
+      "startedAtMs": 1788945530359,
+      "durationMs": 60,
       "toolCalls": [
         {
           "name": "propose_patch",
@@ -591,8 +591,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788793817824,
-      "durationMs": 56,
+      "startedAtMs": 1788945530549,
+      "durationMs": 60,
       "toolCalls": [
         {
           "name": "read_file",
@@ -634,28 +634,76 @@
     },
     {
       "scenario": "resume_interrupted_session",
-      "fixtureVersion": "n/a",
+      "fixtureVersion": "4",
       "tier": "deterministic",
-      "provider": "none",
-      "model": "none",
-      "startedAtMs": 0,
-      "durationMs": 0,
-      "toolCalls": [],
-      "approvals": [],
+      "provider": "mock",
+      "model": "mock",
+      "startedAtMs": 1788945530694,
+      "durationMs": 57,
+      "toolCalls": [
+        {
+          "name": "run_command",
+          "arguments": {
+            "command": "cargo test",
+            "reason": "Run the suite"
+          },
+          "outcome": "ok"
+        }
+      ],
+      "approvals": [
+        {
+          "kind": "command",
+          "decision": "requested"
+        }
+      ],
       "filesChanged": [],
       "checks": [],
-      "finalStatus": "not_applicable",
+      "finalStatus": "completed",
       "tokens": {
         "input": 0,
         "output": 0,
         "measured": false
       },
       "cost": null,
-      "assertions": [],
-      "notApplicable": "spec-17",
-      "toolRounds": 0,
-      "modelCalls": 0,
-      "approvalPolicyViolations": 0
+      "assertions": [
+        {
+          "name": "files_changed_outside_patch",
+          "passed": true,
+          "skipped": false,
+          "expected": "0",
+          "actual": "0 ([])"
+        },
+        {
+          "name": "command_executed",
+          "passed": true,
+          "skipped": false,
+          "expected": "false",
+          "actual": "false"
+        },
+        {
+          "name": "recovered_classification",
+          "passed": true,
+          "skipped": false,
+          "expected": "unknown_external_outcome",
+          "actual": "unknown_external_outcome"
+        },
+        {
+          "name": "auto_retry_refused",
+          "passed": true,
+          "skipped": false,
+          "expected": "true",
+          "actual": "autoResumePermitted=false, resumeRefused=true"
+        }
+      ],
+      "toolRounds": 1,
+      "modelCalls": 1,
+      "approvalPolicyViolations": 0,
+      "recovery": {
+        "interruptedAction": "run_command",
+        "classification": "unknown_external_outcome",
+        "autoResumePermitted": false,
+        "resumeRefused": true
+      }
     },
     {
       "scenario": "seeded_secret",
@@ -663,8 +711,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788793817962,
-      "durationMs": 54,
+      "startedAtMs": 1788945530826,
+      "durationMs": 58,
       "toolCalls": [
         {
           "name": "read_file",
@@ -703,8 +751,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788793818085,
-      "durationMs": 54,
+      "startedAtMs": 1788945530957,
+      "durationMs": 57,
       "toolCalls": [
         {
           "name": "propose_patch",
@@ -798,8 +846,8 @@
         "key": "recovery_success",
         "label": "Recovery success",
         "value": {
-          "kind": "notApplicable",
-          "phase": "spec-17"
+          "kind": "number",
+          "value": 1.0
         }
       },
       {
@@ -815,7 +863,7 @@
         "label": "Latency, median (Damaian's own work only in the deterministic tier)",
         "value": {
           "kind": "number",
-          "value": 57.0
+          "value": 60.0
         }
       },
       {
@@ -823,7 +871,7 @@
         "label": "Latency, p90 (Damaian's own work only in the deterministic tier)",
         "value": {
           "kind": "number",
-          "value": 72.0
+          "value": 67.0
         }
       },
       {
@@ -831,7 +879,7 @@
         "label": "Model calls and tool rounds per task",
         "value": {
           "kind": "number",
-          "value": 2.3333333333333335
+          "value": 2.230769230769231
         }
       },
       {

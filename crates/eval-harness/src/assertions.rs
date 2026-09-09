@@ -178,6 +178,47 @@ pub fn evaluate(
             );
         }
 
+        // §5.4's resume row, in the two halves §5.6 names: it classifies, and
+        // it is not auto-retried.
+        if let Some(expected) = &asserts.recovered_classification {
+            let actual = run
+                .record
+                .recovery
+                .as_ref()
+                .map(|recovery| recovery.classification.clone());
+            push(
+                "recovered_classification",
+                actual.as_deref() == Some(expected.as_str()),
+                expected.clone(),
+                // A scenario asserting this without declaring `crash_mid_action`
+                // must fail rather than quietly compare `None` to `None`.
+                actual.unwrap_or_else(|| "no crash was injected".to_string()),
+            );
+        }
+
+        if let Some(expected) = asserts.auto_retry_refused {
+            let refused = run
+                .record
+                .recovery
+                .as_ref()
+                // Both halves: Damaian would not continue on its own, *and* the
+                // engine refused when asked outright. Either one alone leaves
+                // requirement 5 resting on the other.
+                .map(|recovery| !recovery.auto_resume_permitted && recovery.resume_refused);
+            push(
+                "auto_retry_refused",
+                refused == Some(expected),
+                expected.to_string(),
+                match &run.record.recovery {
+                    Some(recovery) => format!(
+                        "autoResumePermitted={}, resumeRefused={}",
+                        recovery.auto_resume_permitted, recovery.resume_refused
+                    ),
+                    None => "no crash was injected".to_string(),
+                },
+            );
+        }
+
         if let Some(limit) = asserts.model_calls_at_most {
             let rounds = run.record.model_calls;
             push(

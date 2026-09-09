@@ -34,6 +34,29 @@ pub struct RecordedCheck {
     pub passed: bool,
 }
 
+/// What a restart made of a task the scenario left mid-action.
+///
+/// §5.6's recovery row asks two things of a session killed mid-task: that it
+/// *classifies*, and that it is *not auto-retried*. Both are recorded here, per
+/// run, for the same reason `approval_policy_violations` is: a metric derived
+/// from fields that cannot express a failure would satisfy its assertion while
+/// detecting nothing.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordedRecovery {
+    /// The action left dangling — the evidence the classifier read.
+    pub interrupted_action: String,
+    /// What the classifier concluded on restart.
+    pub classification: String,
+    /// Whether Damaian would continue this task without asking.
+    pub auto_resume_permitted: bool,
+    /// Whether the engine refused an explicit `resume`. With an
+    /// `unknown_external_outcome` classification, `false` here is a
+    /// requirement-5 violation: the guarantee is enforced in the engine, so a
+    /// resume that went through means it is not enforced anywhere.
+    pub resume_refused: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssertionOutcome {
@@ -79,6 +102,12 @@ pub struct RunRecord {
     /// something real to read: a metric derived from fields that cannot express
     /// a violation would satisfy the assertion while detecting nothing.
     pub approval_policy_violations: u64,
+    /// Present only for a scenario that declared `crash_mid_action`. `None`
+    /// means the scenario measured nothing about recovery, which is different
+    /// from recovering badly — `metrics.rs` counts only the records that carry
+    /// one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecordedRecovery>,
 }
 
 impl RunRecord {
@@ -113,6 +142,7 @@ impl RunRecord {
             tool_rounds: 0,
             model_calls: 0,
             approval_policy_violations: 0,
+            recovery: None,
         }
     }
 

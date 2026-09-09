@@ -82,10 +82,11 @@ Notes:
   this file goes stale on the next commit that adds a test, and a stale one is
   worse than none: it invites "close enough" when the real total differs.)
 - `cargo run -p eval-harness -- run --tier deterministic` evaluates Damaian end
-  to end against fixture repositories — twelve scenarios covering retrieval,
-  patch proposal, restricted paths, secret redaction, approval denial and the
-  retry bound. Run it after changing prompt, context-assembly, tool-dispatch or
-  path-policy code: a regression there passes the unit tests and fails here. Its
+  to end against fixture repositories — scenarios covering retrieval, patch
+  proposal, restricted paths, secret redaction, approval denial, the retry bound
+  and crash recovery. Run it after changing prompt, context-assembly,
+  tool-dispatch, path-policy or recovery code: a regression there passes the
+  unit tests and fails here. Its
   deterministic tier is already part of `cargo test --workspace --locked`, so it
   adds no quality-gate command. See
   [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md#evaluation-harness).

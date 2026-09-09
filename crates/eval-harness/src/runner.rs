@@ -4,12 +4,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
     AgentCommandProposal, AgentPatchProposal, CancelToken, ClientError, Config, CurlModelTransport,
     MockModelAdapter, ModelAdapter, ModelProviderConfig, OpenAICompatibleAdapter, Result,
-    SecretScanner, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
+    SecretScanner, SessionStore, Task, TaskStatus, ToolCall, TurnProgress, TurnSink,
+    WorkspaceEngine, classify_session, resume,
 };
 
 use crate::fixture::{self, Materialized};
-use crate::record::{RecordedApproval, RecordedCheck, RecordedToolCall, RunRecord, Tokens};
-use crate::scenario::{Scenario, Tier};
+use crate::record::{
+    RecordedApproval, RecordedCheck, RecordedRecovery, RecordedToolCall, RunRecord, Tokens,
+};
+use crate::scenario::{CrashMidAction, Scenario, Tier};
 use crate::trace::Trace;
 
 #[derive(Debug)]
@@ -263,9 +266,20 @@ fn drive(
         }
     }
 
+    // A scenario declaring a crash leaves the turn's task mid-action, then
+    // reopens the store the way a restart does and classifies. Deliberately
+    // before the trace is read: classification and the resume decision are both
+    // audited, and that trail is what the assertions and §5.6's recovery row
+    // read.
+    let recovery = match &scenario.crash_mid_action {
+        Some(crash) => Some(interrupt_and_recover(engine, materialized, crash)?),
+        None => None,
+    };
+
     let trace = Trace::read(&materialized.data_dir)?;
     let mut run_record =
         RunRecord::new(&scenario.name, &materialized.version, tier, provider, model);
+    run_record.recovery = recovery;
     run_record.started_at_ms = started_at_ms;
     run_record.duration_ms = duration_ms;
     // From the trace rather than a `MockModelAdapter`'s recorded requests, so
@@ -428,6 +442,93 @@ fn drive(
         patch_proposal,
         apply_error,
         trace,
+    })
+}
+
+/// Leaves the turn's task mid-action, restarts, and classifies — §5.4's resume
+/// row, and the reason spec 17 was sequenced ahead of specs 45 and 46.
+///
+/// Two properties are measured, matching what §5.6 asks of this row: that a
+/// session killed mid-task **classifies**, and that it is **not auto-retried**.
+/// The second is checked by actually asking the engine to resume and recording
+/// the refusal — requirement 5's enforcement point is `recovery::resume`, so
+/// reading `auto_resume_permitted` alone would test the classifier's opinion
+/// rather than the guarantee.
+fn interrupt_and_recover(
+    engine: &WorkspaceEngine,
+    materialized: &Materialized,
+    crash: &CrashMidAction,
+) -> Result<RecordedRecovery> {
+    let sessions = engine.session_store.list_sessions(None)?;
+    let [session] = sessions.as_slice() else {
+        return Err(ClientError::InvalidInput(format!(
+            "crash_mid_action expects the turn to have created exactly one session, found {}",
+            sessions.len()
+        )));
+    };
+    let statuses = engine.session_store.read_task_statuses(&session.id)?;
+    let task_ids: Vec<&String> = statuses.keys().collect();
+    let [task_id] = task_ids.as_slice() else {
+        return Err(ClientError::InvalidInput(format!(
+            "crash_mid_action expects exactly one task, found {}",
+            statuses.len()
+        )));
+    };
+
+    // The status matters as much as the marker: a crash *after* the approval and
+    // *during* the command leaves `running_tool`, not `waiting_for_approval`,
+    // which §5.4 rule 3 would treat as a task merely awaiting a human.
+    let task = engine.session_store.update_task_status(
+        &Task {
+            id: (*task_id).clone(),
+            session_id: session.id.clone(),
+            status: TaskStatus::PreparingContext,
+            user_prompt: String::new(),
+            model_provider: String::new(),
+            model_name: String::new(),
+            created_at_ms: 0,
+            completed_at_ms: None,
+        },
+        TaskStatus::RunningTool,
+        None,
+    )?;
+    // Started and never finished. `ActionMarker` has no `Drop` impl by design,
+    // so letting it fall out of scope leaves the action open — which is the
+    // signature being injected.
+    let _marker = engine.session_store.start_action(
+        &task,
+        &crash.action,
+        &crash.reference,
+        crash.side_effecting,
+    )?;
+
+    // The restart. A *fresh* `SessionStore` rather than `engine.session_store`,
+    // because that one carries the in-memory sequence cache a new process would
+    // not have — reusing it would let this pass on state a real restart lacks.
+    let restarted = SessionStore::new(&materialized.data_dir);
+    let recovered = classify_session(&restarted, &engine.audit_log, &session.id)?;
+    let [task] = recovered.as_slice() else {
+        return Err(ClientError::InvalidInput(format!(
+            "the interrupted task should be the one recovered, got {recovered:?}"
+        )));
+    };
+
+    // Asked for real, not predicted from `auto_resume_permitted`.
+    let resume_refused = match resume(&restarted, &engine.audit_log, task) {
+        Ok(()) => false,
+        Err(ClientError::PolicyBlocked(_)) => true,
+        Err(error) => return Err(error),
+    };
+
+    Ok(RecordedRecovery {
+        interrupted_action: task
+            .dangling
+            .as_ref()
+            .map(|action| action.action.clone())
+            .unwrap_or_default(),
+        classification: task.classification.as_str().to_string(),
+        auto_resume_permitted: task.auto_resume_permitted,
+        resume_refused,
     })
 }
 

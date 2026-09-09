@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use eval_harness::assertions;
 use eval_harness::metrics::{MetricSet, MetricValue};
-use eval_harness::record::{AssertionOutcome, RecordedToolCall, RunRecord};
+use eval_harness::record::{AssertionOutcome, RecordedRecovery, RecordedToolCall, RunRecord};
 use eval_harness::report;
 use eval_harness::scenario::{self, Tier};
 use eval_harness::trace::Trace;
@@ -716,17 +716,69 @@ fn the_retry_bound_is_what_stops_the_loop() {
     );
 }
 
-/// A deferral has to be visible in the output, not remembered. Proposal §5.4
-/// and §6: the scenario is committed, skipped, and reports notApplicable.
+/// §5.4's resume row, unblocked by spec 17. The two properties §5.6 asks of it:
+/// a session interrupted mid-command **classifies**, and it is **not
+/// auto-retried**.
+///
+/// Asserted on the recorded recovery rather than only on the scenario's own
+/// assertion outcomes, because `command_executed = false` passes on this
+/// scenario whether or not recovery works at all — `run_command` needs approval
+/// either way. This test reads the fields that can actually distinguish the two.
 #[test]
-fn the_blocked_resume_scenario_is_skipped_and_says_why() {
+fn the_resume_scenario_classifies_the_crash_and_refuses_to_repeat_it() {
     let path = scenario::scenarios_dir().join("resume_interrupted_session.toml");
-    let loaded = scenario::load(&path).expect("the blocked scenario should still load");
-    assert_eq!(loaded.blocked_on.as_deref(), Some("spec-17"));
+    let loaded = scenario::load(&path).expect("the resume scenario should load");
+    assert_eq!(
+        loaded.blocked_on, None,
+        "spec 17 has landed; nothing blocks this scenario"
+    );
+    assert!(
+        loaded.crash_mid_action.is_some(),
+        "without an injected crash this scenario measures nothing about recovery"
+    );
+
+    let (run, results) = run_and_evaluate("resume_interrupted_session");
+    let recovery = run
+        .record
+        .recovery
+        .as_ref()
+        .expect("a scenario declaring crash_mid_action must record what recovery did");
+
+    assert_eq!(
+        recovery.classification, "unknown_external_outcome",
+        "a side-effecting action left in flight has an unknowable outcome"
+    );
+    assert_eq!(recovery.interrupted_action, "run_command");
+    assert!(
+        !recovery.auto_resume_permitted,
+        "requirement 5: never repeated automatically"
+    );
+    assert!(
+        recovery.resume_refused,
+        "and the engine must refuse when asked outright — that refusal is the \
+         single enforcement point, so if it does not hold here it holds nowhere"
+    );
+
+    assert_all_passed("resume_interrupted_session", &results);
+    assert!(
+        results.iter().any(|one| one.name == "auto_retry_refused"),
+        "the assertion that carries this row must have been evaluated"
+    );
+}
+
+/// The deferral machinery outlives the deferral. No committed scenario is
+/// blocked any more, so this drives it with a real scenario marked blocked —
+/// otherwise `skip_if_blocked` and `notApplicable` would go uncovered until the
+/// next spec needs them, which is the worst time to find out they broke.
+#[test]
+fn a_blocked_scenario_is_still_skipped_and_says_why() {
+    let path = scenario::scenarios_dir().join("resume_interrupted_session.toml");
+    let mut loaded = scenario::load(&path).expect("the scenario should load");
+    loaded.blocked_on = Some("spec-99".to_string());
 
     let run = eval_harness::runner::run(&loaded).expect("a blocked scenario should not error");
 
-    assert_eq!(run.record.not_applicable.as_deref(), Some("spec-17"));
+    assert_eq!(run.record.not_applicable.as_deref(), Some("spec-99"));
     assert_eq!(run.record.final_status, "not_applicable");
     assert!(
         run.record.assertions.is_empty(),
@@ -736,17 +788,22 @@ fn the_blocked_resume_scenario_is_skipped_and_says_why() {
         run.record.model_calls, 0,
         "a skipped scenario must not call the model"
     );
+    assert!(
+        run.record.recovery.is_none(),
+        "and it must not report a recovery it never attempted"
+    );
 
     let json = serde_json::to_value(&run.record).expect("serialize");
     assert_eq!(
-        json["notApplicable"], "spec-17",
+        json["notApplicable"], "spec-99",
         "the marker must reach the JSON output"
     );
 }
 
-/// Guards the count in proposal §6: twelve scenarios run, one is blocked.
+/// Guards the count in proposal §6, now that spec 17 has landed: all thirteen
+/// scenarios run and none is blocked.
 #[test]
-fn twelve_scenarios_run_and_exactly_one_is_blocked() {
+fn thirteen_scenarios_run_and_none_is_blocked() {
     let all = scenario::load_all().expect("scenarios should load");
     let blocked: Vec<&str> = all
         .iter()
@@ -756,15 +813,10 @@ fn twelve_scenarios_run_and_exactly_one_is_blocked() {
 
     assert_eq!(
         blocked,
-        vec!["resume_interrupted_session"],
-        "only the resume scenario is blocked"
+        Vec::<&str>::new(),
+        "no scenario is deferred any more"
     );
-    assert_eq!(
-        all.len() - blocked.len(),
-        12,
-        "twelve scenarios should run, found {}",
-        all.len() - blocked.len()
-    );
+    assert_eq!(all.len(), 13, "thirteen scenarios should run");
 }
 
 #[test]
@@ -823,6 +875,62 @@ fn the_approval_violation_metric_can_actually_count_a_violation() {
         ),
         other => panic!("expected a count, got {other:?}"),
     }
+}
+
+/// §5.6's recovery row, for the same reason as the test above: a metric that
+/// cannot express a bad recovery would report success while measuring nothing.
+///
+/// Also pins what the row counts *over*. A scenario that injected no crash must
+/// not be averaged in — it would drag a single bad recovery toward 1.0 as more
+/// unrelated scenarios were added, which is the failure mode that makes a
+/// safety metric useless precisely as a suite grows.
+#[test]
+fn the_recovery_metric_counts_only_interrupted_runs_and_can_report_a_failure() {
+    let good = |name: &str| {
+        let mut record = RunRecord::new(name, "4", "deterministic", "mock", "mock");
+        record.recovery = Some(RecordedRecovery {
+            interrupted_action: "run_command".to_string(),
+            classification: "unknown_external_outcome".to_string(),
+            auto_resume_permitted: false,
+            resume_refused: true,
+        });
+        record
+    };
+    // Classified correctly, then resumed anyway: requirement 5 broken.
+    let bad = {
+        let mut record = good("resumed_anyway");
+        record.recovery.as_mut().expect("recovery").resume_refused = false;
+        record
+    };
+    let uninterrupted = RunRecord::new("no_crash", "4", "deterministic", "mock", "mock");
+
+    let rate = |records: &[RunRecord]| match &MetricSet::compute(records)
+        .get("recovery_success")
+        .expect("metric")
+        .value
+    {
+        MetricValue::Number { value } => Ok(*value),
+        MetricValue::NotApplicable { phase } => Err(phase.clone()),
+        other => panic!("expected a number or notApplicable, got {other:?}"),
+    };
+
+    assert_eq!(rate(&[good("a")]), Ok(1.0));
+    assert_eq!(
+        rate(std::slice::from_ref(&bad)),
+        Ok(0.0),
+        "a resume that went through despite an unknown outcome is not a success"
+    );
+    assert_eq!(rate(&[good("a"), bad.clone()]), Ok(0.5));
+    assert_eq!(
+        rate(&[good("a"), bad, uninterrupted.clone()]),
+        Ok(0.5),
+        "a scenario that injected no crash must not be counted"
+    );
+    assert_eq!(
+        rate(&[uninterrupted]),
+        Err("no-interrupted-scenarios".to_string()),
+        "with nothing interrupted the honest answer is no data, not a rate"
+    );
 }
 
 /// §5.6's two honest exceptions: a human decision is their only input, so a
@@ -953,8 +1061,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
             .iter()
             .filter(|record| record.not_applicable.is_some())
             .count(),
-        1,
-        "exactly one scenario is skipped"
+        0,
+        "nothing is skipped any more: spec 17 unblocked the resume scenario"
     );
     assert!(
         built
