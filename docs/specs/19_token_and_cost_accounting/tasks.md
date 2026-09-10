@@ -59,7 +59,7 @@ Every task's requirements implicitly include this section.
 | Task | State | Notes |
 |---|---|---|
 | 1 · `TokenUsage` on `ModelRun`, estimated everywhere | Done | 2 tests, gate green at 440. Used the existing `test_request()` helper rather than the plan's inline literals, which localizes Task 3's new field to one place. **One plan error:** the usage estimate cannot live in the `ModelRun` literal — `content` is moved by an earlier field, so both adapters compute it into a local first. `Eq` dropped from `ModelRun`, `ChatTurnResult` and `EditProposalResult` as planned; nothing used them as a map key |
-| 2 · Read the provider's reported usage | Not started | |
+| 2 · Read the provider's reported usage | Done | `extract_usage` + `usage_payloads`, **6 tests, not the planned 5** — added `a_half_reported_usage_object_is_not_treated_as_measured`, because a usage object carrying only `prompt_tokens` would otherwise have become a measured figure with a fabricated zero in it, which is exactly the fabrication requirement 4 forbids. Gate green at 446. Called `extract_usage` once rather than the plan's twice, since the result is needed for both the usage and the cost field |
 | 3 · Ask for usage, and the capability probe | Not started | |
 | 4 · The usage event and per-task aggregation | Not started | |
 | 5 · Record usage from both model call sites | Not started | |

@@ -1819,6 +1819,7 @@ fn chat_dispatches_native_tool_call_when_provider_supports_it() {
         supports_native_tools: true,
         max_output_tokens: None,
         context_token_budget: None,
+        provider_reports_usage: true,
     });
     let engine = WorkspaceEngine::new(config);
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
@@ -2131,6 +2132,7 @@ fn chat_chains_multiple_native_tool_calls_within_one_turn() {
         supports_native_tools: true,
         max_output_tokens: None,
         context_token_budget: None,
+        provider_reports_usage: true,
     });
     let engine = WorkspaceEngine::new(config);
     // The model asks to run `pwd`, then—after seeing that result—asks to
@@ -2204,6 +2206,7 @@ fn native_tool_provider() -> ModelProviderConfig {
         supports_native_tools: true,
         max_output_tokens: None,
         context_token_budget: None,
+        provider_reports_usage: true,
     }
 }
 
@@ -3436,6 +3439,7 @@ fn builds_openai_request_json_and_extracts_stream_tokens() {
         stream: true,
         tools: None,
         max_tokens: None,
+        request_usage: false,
     };
     let body = model_request_json(&request);
     assert!(body.contains("\"model\":\"test-model\""));
@@ -3457,6 +3461,7 @@ fn reports_openai_compatible_error_payloads() {
         stream: true,
         tools: None,
         max_tokens: None,
+        request_usage: false,
     };
     let body = model_request_json(&request);
     assert!(!body.contains("reasoning_effort"));
@@ -3953,6 +3958,24 @@ fn config_overlay_applies_provider_defaults_and_reasoning_level() {
     assert_eq!(config.model_name, "deepseek-v4-flash");
     assert_eq!(config.max_output_tokens(), Some(65_536));
     assert_eq!(config.model_reasoning_level, "high");
+}
+
+#[test]
+fn provider_usage_reporting_defaults_on_and_can_be_turned_off() {
+    // On by default so a provider that supports the standard field is measured
+    // without the user configuring anything; off is the escape hatch for one
+    // that rejects it, per spec 19 §5.2.
+    let mut config = Config::default();
+    assert!(config.provider_reports_usage());
+
+    config.apply_overlay(
+        ConfigOverlay::parse(
+            "model_provider=deepseek\nmodel_provider.deepseek.provider_reports_usage=false\n",
+        )
+        .unwrap(),
+    );
+
+    assert!(!config.provider_reports_usage());
 }
 
 #[test]

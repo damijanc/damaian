@@ -228,6 +228,11 @@ pub struct ModelProviderConfig {
     /// on large repositories but is billed on every turn, so the defaults stay
     /// well below what a model's context window technically allows.
     pub context_token_budget: Option<u32>,
+    /// Whether to ask this provider to report token usage on a stream.
+    /// Defaults to true: `stream_options` is standard for OpenAI-compatible
+    /// APIs, and the adapter probes once for a provider that rejects it. Set
+    /// false to skip even the probe. Spec 19 §5.2.
+    pub provider_reports_usage: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -240,6 +245,7 @@ pub struct ModelProviderConfigOverlay {
     pub supports_native_tools: Option<bool>,
     pub max_output_tokens: Option<u32>,
     pub context_token_budget: Option<u32>,
+    pub provider_reports_usage: Option<bool>,
 }
 
 /// How the client talks to an MCP server. `Stdio` spawns a local subprocess
@@ -745,6 +751,20 @@ impl Config {
     /// a built-in provider — setting only `label` and `supports_native_tools`,
     /// say — and such an entry must not silently drop the ceiling and
     /// reinstate the 4096-token truncation this field exists to prevent.
+    /// Whether to ask the active provider for token usage. Defaults to true:
+    /// the field is standard for OpenAI-compatible APIs, and the adapter's
+    /// one-shot probe handles a provider that rejects it without the user
+    /// having to know. Spec 19 §5.2.
+    pub fn provider_reports_usage(&self) -> bool {
+        self.model_provider_config(&self.model_provider)
+            .map(|provider| provider.provider_reports_usage)
+            .or_else(|| {
+                builtin_model_provider_config(&self.model_provider)
+                    .map(|provider| provider.provider_reports_usage)
+            })
+            .unwrap_or(true)
+    }
+
     pub fn max_output_tokens(&self) -> Option<u32> {
         self.model_provider_config(&self.model_provider)
             .and_then(|provider| provider.max_output_tokens)
@@ -823,6 +843,9 @@ impl Config {
             if let Some(value) = overlay.context_token_budget {
                 provider.context_token_budget = Some(value);
             }
+            if let Some(value) = overlay.provider_reports_usage {
+                provider.provider_reports_usage = value;
+            }
             return;
         }
 
@@ -835,6 +858,7 @@ impl Config {
             supports_native_tools: overlay.supports_native_tools.unwrap_or(false),
             max_output_tokens: overlay.max_output_tokens,
             context_token_budget: overlay.context_token_budget,
+            provider_reports_usage: overlay.provider_reports_usage.unwrap_or(true),
             id,
         });
     }
@@ -1412,6 +1436,9 @@ impl ConfigOverlay {
                 provider.context_token_budget =
                     Some(parse_token_count(provider_key, field, value)?);
             }
+            "provider_reports_usage" => {
+                provider.provider_reports_usage = Some(parse_bool(field, value)?);
+            }
             _ => {
                 return Err(ClientError::InvalidInput(format!(
                     "Unknown model provider config key: model_provider.{provider_key}"
@@ -1607,6 +1634,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             supports_native_tools: false,
             max_output_tokens: None,
             context_token_budget: None,
+            provider_reports_usage: true,
         }),
         "deepseek" => Some(ModelProviderConfig {
             id: "deepseek".to_string(),
@@ -1625,6 +1653,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             // an extra round trip whereas a too-large one is a hard API error.
             max_output_tokens: Some(8192),
             context_token_budget: None,
+            provider_reports_usage: true,
         }),
         "openai-compatible" => Some(ModelProviderConfig {
             id: "openai-compatible".to_string(),
@@ -1635,6 +1664,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             supports_native_tools: false,
             max_output_tokens: None,
             context_token_budget: None,
+            provider_reports_usage: true,
         }),
         _ => None,
     }

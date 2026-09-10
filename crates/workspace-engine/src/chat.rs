@@ -928,6 +928,7 @@ impl ChatOrchestrator {
                 stream: true,
                 tools,
                 max_tokens: self.config.max_output_tokens(),
+                request_usage: self.config.provider_reports_usage(),
             };
 
             let token_estimate: usize = messages

@@ -181,6 +181,32 @@ fn repository_config_cannot_redirect_model_traffic_or_credentials() {
     fixture.cleanup();
 }
 
+/// Spec 19 adds keys under `model_provider.<id>`. That prefix is rejected from
+/// repository scope wholesale, so they inherit the boundary rather than
+/// widening it — but a new key must not become the exception that proves the
+/// overlay is scope-blind again. Task 8 extends this with the price keys.
+#[test]
+fn repository_config_cannot_change_usage_reporting() {
+    let fixture = fixture(
+        "usage",
+        "model_provider=openai\n",
+        "model_provider.openai.provider_reports_usage=false\n",
+    );
+
+    let config = fixture.load();
+
+    assert!(
+        config.model_provider_config("openai").is_none(),
+        "a repository must not be able to define or amend a provider entry"
+    );
+    assert!(
+        config.provider_reports_usage(),
+        "the user's default must survive a repository trying to turn it off"
+    );
+
+    fixture.cleanup();
+}
+
 #[test]
 fn repository_config_cannot_disable_the_audit_log_or_secret_defences() {
     let fixture = fixture(

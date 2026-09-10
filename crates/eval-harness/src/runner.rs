@@ -45,6 +45,10 @@ pub fn mock_provider() -> ModelProviderConfig {
         supports_native_tools: true,
         max_output_tokens: None,
         context_token_budget: None,
+        // The mock adapter is not a provider and reports no usage, so asking
+        // for it changes nothing here. Left on so the deterministic tier sends
+        // the same request shape the live tier does.
+        provider_reports_usage: true,
     }
 }
 

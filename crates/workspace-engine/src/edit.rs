@@ -284,6 +284,7 @@ impl EditOrchestrator {
             stream: true,
             tools: None,
             max_tokens: self.config.max_output_tokens(),
+            request_usage: self.config.provider_reports_usage(),
         };
 
         self.audit_log.record(

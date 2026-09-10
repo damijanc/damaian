@@ -227,6 +227,12 @@ pub struct ModelRequest {
     /// Explicit output-token ceiling. `None` omits `max_tokens` and lets the
     /// provider apply its own default.
     pub max_tokens: Option<u32>,
+    /// Ask the provider to report token usage on the stream. Only meaningful
+    /// together with [`Self::stream`]: an OpenAI-compatible API omits usage
+    /// from a stream unless `stream_options` asks for it, and the field is
+    /// both pointless and sometimes rejected on a non-streaming call.
+    /// Spec 19 §5.2.
+    pub request_usage: bool,
 }
 
 // No `Eq`: `reported_cost` is an `Option<f64>`. Nothing uses a run as a map key
@@ -258,6 +264,15 @@ pub struct ModelRun {
     /// provider reports cost on a chat completion — and means "this provider
     /// did not tell us", never "free".
     pub reported_cost: Option<f64>,
+    /// This call is the one that discovered the provider rejects a usage
+    /// request, and was retried without it. True exactly once per provider per
+    /// process, so a caller that audits on it audits once.
+    ///
+    /// Reported rather than audited here for the reason `SessionStore` gives
+    /// for not holding an `AuditLog`: threading one through every adapter
+    /// construction site is a large amount of churn for a diagnostic, and the
+    /// orchestrator that owns the turn already has one.
+    pub usage_reporting_unsupported: bool,
 }
 
 impl ModelRun {
@@ -280,6 +295,7 @@ impl ModelRun {
             reasoning_content: None,
             usage: TokenUsage::measured_zero(),
             reported_cost: None,
+            usage_reporting_unsupported: false,
         }
     }
 }
@@ -426,6 +442,7 @@ impl ModelAdapter for MockModelAdapter {
             reasoning_content: self.reasoning_content.get(index).cloned().flatten(),
             usage,
             reported_cost: None,
+            usage_reporting_unsupported: false,
         })
     }
 }
@@ -642,6 +659,15 @@ pub struct MockModelTransport {
     /// transport failures without shelling out to real curl.
     pub fail_before_success: u32,
     pub failure_message: String,
+    /// Responses handed out in order, one per call, the last one repeating.
+    /// Empty means [`Self::response`] answers every call, which is what every
+    /// caller predating this field expects.
+    ///
+    /// Needed because a capability probe is defined by what the *second* call
+    /// returns — a provider rejecting `stream_options` and then accepting the
+    /// same request without it — and one `response` cannot express that.
+    pub responses: Vec<String>,
+    pub next_response: usize,
 }
 
 impl MockModelTransport {
@@ -651,6 +677,8 @@ impl MockModelTransport {
             requests: Vec::new(),
             fail_before_success: 0,
             failure_message: "connection reset by peer".to_string(),
+            responses: Vec::new(),
+            next_response: 0,
         }
     }
 
@@ -658,6 +686,14 @@ impl MockModelTransport {
         Self {
             fail_before_success,
             ..Self::new(response)
+        }
+    }
+
+    /// Answers each call with the next response in order, repeating the last.
+    pub fn sequence(responses: Vec<String>) -> Self {
+        Self {
+            responses,
+            ..Self::new(String::new())
         }
     }
 }
@@ -669,7 +705,12 @@ impl ModelTransport for MockModelTransport {
             self.fail_before_success -= 1;
             return Err(ClientError::Io(self.failure_message.clone()));
         }
-        Ok(self.response.clone())
+        if self.responses.is_empty() {
+            return Ok(self.response.clone());
+        }
+        let index = self.next_response.min(self.responses.len() - 1);
+        self.next_response += 1;
+        Ok(self.responses[index].clone())
     }
 }
 
@@ -677,6 +718,12 @@ pub struct OpenAICompatibleAdapter<T: ModelTransport> {
     provider: String,
     model: String,
     transport: T,
+    /// `None` until this provider has been observed, then the answer for the
+    /// rest of the process, so the probe in [`Self::stream_response`] happens
+    /// once rather than on every turn. Spec 19 §5.2. Phase 1 WP3's capability
+    /// profile is the durable home for this observation; the shape is chosen
+    /// so WP3 can adopt it rather than rediscover it.
+    supports_usage: Option<bool>,
 }
 
 impl<T: ModelTransport> OpenAICompatibleAdapter<T> {
@@ -693,23 +740,32 @@ impl<T: ModelTransport> OpenAICompatibleAdapter<T> {
             provider: provider.into(),
             model: model.into(),
             transport,
+            supports_usage: None,
         }
     }
-}
 
-impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
-    fn stream_response(
+    /// Whether this provider is believed to accept a usage request. `true`
+    /// until observed otherwise: the field is standard, and assuming it is
+    /// absent would mean never measuring anything.
+    pub fn probe_supports_usage(&self) -> bool {
+        self.supports_usage.unwrap_or(true)
+    }
+
+    /// One send, with the existing connection-level retry policy.
+    ///
+    /// Extracted so the usage probe can run the same send twice — once asking
+    /// for usage, once not — without a second definition of how a request is
+    /// sent. Returns the whole body, the streamed content, and how many
+    /// attempts beyond the first it took.
+    fn send_with_retries(
         &mut self,
-        request: &ModelRequest,
+        body: &str,
         cancel: &CancelToken,
         on_token: &mut dyn FnMut(&str),
-    ) -> Result<ModelRun> {
+    ) -> Result<(String, String, u32)> {
         const MAX_ATTEMPTS: u32 = 3;
         const RETRY_BACKOFF_MS: [u64; 2] = [500, 1500];
 
-        let run_id = create_id("modelrun");
-        let started_at_ms = now_millis();
-        let body = model_request_json(request);
         let mut content = String::new();
         let mut emitted_any = false;
         let mut attempt: u32 = 0;
@@ -726,7 +782,7 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
                 content.push_str(&token);
                 on_token(&token);
             };
-            let send_result = self.transport.send_stream(&body, cancel, &mut |chunk| {
+            let send_result = self.transport.send_stream(body, cancel, &mut |chunk| {
                 buffered_stream.push_str(chunk);
                 if buffered_stream.contains("data:") || saw_sse_stream {
                     saw_sse_stream = true;
@@ -768,11 +824,59 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
                 }
             }
         };
-        let retry_count = attempt - 1;
 
-        if let Some(message) = extract_error_message(&raw) {
-            return Err(ClientError::Io(format!("Model provider error: {message}")));
-        }
+        Ok((raw, content, attempt - 1))
+    }
+}
+
+/// The provider is saying it does not understand the usage request, as opposed
+/// to any of the other things a provider says no to.
+fn mentions_unsupported_usage_option(message: &str) -> bool {
+    let lowered = message.to_lowercase();
+    lowered.contains("stream_options") || lowered.contains("include_usage")
+}
+
+impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
+    fn stream_response(
+        &mut self,
+        request: &ModelRequest,
+        cancel: &CancelToken,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<ModelRun> {
+        let run_id = create_id("modelrun");
+        let started_at_ms = now_millis();
+
+        // At most two passes: one asking for usage, and — only if the provider
+        // says it does not know the field — one without it. Spec 19 §5.2.
+        let mut ask_for_usage = request.request_usage && self.probe_supports_usage();
+        let mut usage_reporting_unsupported = false;
+        let (raw, content, retry_count, body) = loop {
+            let body = model_request_json(&ModelRequest {
+                request_usage: ask_for_usage,
+                ..request.clone()
+            });
+            let (raw, content, retry_count) = self.send_with_retries(&body, cancel, on_token)?;
+
+            // A provider that rejects the field says so in the body of an
+            // error response, not through a transport failure: `curl -sS`
+            // exits zero on a 4xx, so the status never reaches us. The retry
+            // is a capability probe rather than a failed call, so it does not
+            // count towards `retry_count`.
+            if let Some(message) = extract_error_message(&raw) {
+                if ask_for_usage && mentions_unsupported_usage_option(&message) {
+                    self.supports_usage = Some(false);
+                    usage_reporting_unsupported = true;
+                    ask_for_usage = false;
+                    continue;
+                }
+                return Err(ClientError::Io(format!("Model provider error: {message}")));
+            }
+            if ask_for_usage && extract_usage(&raw).is_some() {
+                self.supports_usage = Some(true);
+            }
+            break (raw, content, retry_count, body);
+        };
+
         let tool_calls = extract_tool_calls(&raw);
         if content.is_empty() && tool_calls.is_empty() && !cancel.is_cancelled() {
             return Err(ClientError::Io(
@@ -812,6 +916,7 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
             reasoning_content: extract_reasoning_content(&raw),
             usage,
             reported_cost: reported.and_then(|(_, _, cost)| cost),
+            usage_reporting_unsupported,
         })
     }
 }
@@ -883,6 +988,11 @@ pub fn model_request_json(request: &ModelRequest) -> String {
     }
     if let Some(max_tokens) = request.max_tokens {
         body.push_str(&format!(",\"max_tokens\":{max_tokens}"));
+    }
+    // Streaming only: `stream_options` is meaningless on a non-streaming call
+    // and rejected outright by some providers.
+    if request.request_usage && request.stream {
+        body.push_str(",\"stream_options\":{\"include_usage\":true}");
     }
     if let Some(reasoning_effort) =
         api_reasoning_effort(&request.provider, &request.reasoning_level)
@@ -1459,6 +1569,7 @@ mod tests {
             stream: false,
             tools: None,
             max_tokens: None,
+            request_usage: false,
         }
     }
 
@@ -1479,6 +1590,103 @@ mod tests {
         assert_eq!(run.usage.input_tokens, body_estimate);
         assert_eq!(run.usage.output_tokens, "hello".len().div_ceil(4) as u64);
         assert_eq!(run.reported_cost, None);
+    }
+
+    fn usage_request() -> ModelRequest {
+        ModelRequest {
+            stream: true,
+            request_usage: true,
+            ..test_request()
+        }
+    }
+
+    #[test]
+    fn a_streaming_request_asks_for_usage_when_the_provider_supports_it() {
+        let body = model_request_json(&usage_request());
+        assert!(body.contains("\"stream_options\":{\"include_usage\":true}"));
+    }
+
+    #[test]
+    fn a_non_streaming_request_never_asks_for_usage() {
+        // `stream_options` is meaningless without a stream and is rejected
+        // outright by some providers, so the flag alone must not emit it.
+        let request = ModelRequest {
+            stream: false,
+            request_usage: true,
+            ..test_request()
+        };
+        assert!(!model_request_json(&request).contains("stream_options"));
+    }
+
+    #[test]
+    fn a_request_that_does_not_ask_for_usage_omits_the_option() {
+        assert!(!model_request_json(&test_request()).contains("stream_options"));
+    }
+
+    #[test]
+    fn a_provider_that_rejects_stream_options_is_retried_once_without_it() {
+        let transport = MockModelTransport::sequence(vec![
+            "{\"error\":{\"message\":\"Unrecognized request argument supplied: stream_options\"}}"
+                .to_string(),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n"
+                .to_string(),
+        ]);
+        let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
+        let run = adapter
+            .stream_response(&usage_request(), &CancelToken::new(), &mut |_token| {})
+            .expect("the second attempt should succeed");
+
+        assert_eq!(run.content, "hello");
+        // A probe is not a failed call. Counting it would inflate the retry
+        // figure and, once usage is recorded per attempt, bill the user for a
+        // request that never ran.
+        assert_eq!(run.retry_count, 0);
+        assert_eq!(run.usage.source, UsageSource::Estimated);
+        assert!(run.usage_reporting_unsupported);
+        assert!(!adapter.probe_supports_usage());
+    }
+
+    #[test]
+    fn the_probe_happens_once_rather_than_on_every_turn() {
+        let transport = MockModelTransport::sequence(vec![
+            "{\"error\":{\"message\":\"Unrecognized request argument supplied: stream_options\"}}"
+                .to_string(),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: [DONE]\n".to_string(),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\ndata: [DONE]\n".to_string(),
+        ]);
+        let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
+        adapter
+            .stream_response(&usage_request(), &CancelToken::new(), &mut |_token| {})
+            .expect("the first call succeeds after the probe");
+        let second = adapter
+            .stream_response(&usage_request(), &CancelToken::new(), &mut |_token| {})
+            .expect("the second call succeeds directly");
+
+        // A fourth body would mean the second turn probed again.
+        let bodies = &adapter.transport.requests;
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies[0].contains("stream_options"));
+        assert!(!bodies[1].contains("stream_options"));
+        assert!(!bodies[2].contains("stream_options"));
+        // Audited once, on the run that observed it — not on every later call.
+        assert!(!second.usage_reporting_unsupported);
+    }
+
+    #[test]
+    fn a_provider_error_that_is_not_about_usage_is_still_an_error() {
+        // The probe must not swallow real failures by retrying everything.
+        let transport = MockModelTransport::sequence(vec![
+            "{\"error\":{\"message\":\"Insufficient balance\"}}".to_string(),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n"
+                .to_string(),
+        ]);
+        let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
+        let error = adapter
+            .stream_response(&usage_request(), &CancelToken::new(), &mut |_token| {})
+            .expect_err("a balance error must not be retried as a capability probe");
+
+        assert!(format!("{error}").contains("Insufficient balance"));
+        assert_eq!(adapter.transport.requests.len(), 1);
     }
 
     #[test]
