@@ -3918,20 +3918,25 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// Repository config is untrusted input, so a key it cannot parse is
+    /// skipped and reported rather than failing the load (spec 34 §7). This
+    /// panel therefore still shows the effective policy — a repository cannot
+    /// blank it out by shipping one bad line.
     #[test]
-    fn reports_effective_policy_load_errors_without_panicking() {
+    fn effective_policy_survives_an_unparsable_repository_key() {
         let repo = temp_path("invalid-effective-policy");
         fs::create_dir_all(repo.join(".damaian")).unwrap();
         fs::write(
             repo.join(".damaian").join("config.conf"),
-            "unknown_key=value\n",
+            "unknown_key=value\nignore_patterns=vendor/\n",
         )
         .unwrap();
 
         let (policy, error) = effective_policy_for_repo(repo.to_str().unwrap());
 
-        assert!(policy.is_empty());
-        assert!(error.contains("Unknown config key"));
+        assert!(error.is_empty(), "unexpected error: {error}");
+        assert!(policy.contains("vendor/"), "{policy}");
+        assert!(!policy.contains("unknown_key"), "{policy}");
     }
 
     // With no repository selected there is nothing to review, and the answer

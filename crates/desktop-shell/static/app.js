@@ -482,15 +482,32 @@ async function reviewRepositoryConfig(repoPath) {
     return;
   }
   const rejected = Array.isArray(review.rejectedKeys) ? review.rejectedKeys : [];
-  if (rejected.length) {
+  // A key Damaian could not parse is almost always a typo in the repository's
+  // own config, not an attempt on the user's settings. Giving it the sentence
+  // below would be untrue and would train the user to click through the notice
+  // that does matter, so the two get separate dialogs.
+  const refused = rejected.filter((item) => item.class !== "unparsable");
+  const unparsable = rejected.filter((item) => item.class === "unparsable");
+  if (refused.length) {
     await noticeDialog(
       "This repository tried to change Damaian's settings",
-      `${projectName(path)} ships a .damaian/config.conf that sets ${rejected
+      `${projectName(path)} ships a .damaian/config.conf that sets ${refused
         .map((item) => item.key)
         .join(", ")}. Damaian ignored ${
-        rejected.length === 1 ? "that key" : "those keys"
+        refused.length === 1 ? "that key" : "those keys"
       }: a repository cannot change where commands run, where model traffic goes, where your ` +
         "data is written, or which approvals you see. Its other settings were applied.",
+    );
+  }
+  if (unparsable.length) {
+    await noticeDialog(
+      "This repository has a setting Damaian could not read",
+      `${projectName(path)} ships a .damaian/config.conf Damaian could not read in full: ${unparsable
+        .map((item) => item.key)
+        .join(", ")}. Damaian skipped ${
+        unparsable.length === 1 ? "that line" : "those lines"
+      } and applied the rest, so nothing here is broken — it is most likely a typo in the ` +
+        "repository's own config, worth reporting to whoever maintains it.",
     );
   }
   const entries = Array.isArray(review.allowlistEntries) ? review.allowlistEntries : [];

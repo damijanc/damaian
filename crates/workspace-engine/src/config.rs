@@ -76,6 +76,11 @@ pub enum RepositoryKeyClass {
     RestrictOnly,
     /// The user's own decision about this repository, stored in user config.
     UserOwned,
+    /// Damaian could not parse the key or its value, so the line was skipped.
+    /// Only repository scope produces this: user and admin config are the
+    /// user's own files, where a broken key is a mistake to report loudly
+    /// rather than an untrusted input to tolerate.
+    Unparsable,
 }
 
 impl RepositoryKeyClass {
@@ -84,6 +89,7 @@ impl RepositoryKeyClass {
             RepositoryKeyClass::Forbidden => "forbidden",
             RepositoryKeyClass::RestrictOnly => "restrict_only",
             RepositoryKeyClass::UserOwned => "user_owned",
+            RepositoryKeyClass::Unparsable => "unparsable",
         }
     }
 }
@@ -408,10 +414,29 @@ impl Config {
         if let Some(path) = repo_path
             && path.exists()
         {
-            let overlay = ConfigOverlay::load(path)?;
+            // Untrusted, so it is read and parsed tolerantly: a line Damaian
+            // cannot read or parse is reported and skipped, never propagated.
+            // A repository that can fail this load denies Damaian the config
+            // for itself, which is the availability half of "restrict but
+            // never break". The parse failures are reported ahead of the
+            // classification refusals, which is the order they happened in.
+            let (overlay, mut rejected) = match fs::read_to_string(path) {
+                Ok(content) => ConfigOverlay::parse_untrusted(&content),
+                // `exists()` already followed the symlink, so this is a
+                // directory at `config.conf`, a permissions problem, or
+                // non-UTF-8 — the same hole through a different door.
+                Err(_) => (
+                    ConfigOverlay::default(),
+                    vec![RejectedConfigKey::new(
+                        "(unreadable)",
+                        RepositoryKeyClass::Unparsable,
+                    )],
+                ),
+            };
             report.repository_allowlist_entries =
                 overlay.command_allowlist.clone().unwrap_or_default();
-            report.rejected_keys = config.apply_overlay_scoped(overlay, ConfigScope::Repository);
+            rejected.extend(config.apply_overlay_scoped(overlay, ConfigScope::Repository));
+            report.rejected_keys = rejected;
         }
         if let Some(path) = admin_path
             && path.exists()
@@ -1356,6 +1381,54 @@ impl ConfigOverlay {
         Ok(overlay)
     }
 
+    /// Parses config that arrived with a clone, where the content is untrusted
+    /// input: a line that does not parse is collected and skipped instead of
+    /// failing the file.
+    ///
+    /// Spec 34's principle is that a repository may restrict but never break,
+    /// and failing the parse is breaking — the `?` on a whole-file parse lets
+    /// any repository deny Damaian the config for that repository by shipping
+    /// one bad line, and turns a typo in a shared repository config into an
+    /// unexplained hard failure for everyone who clones it. The keys that did
+    /// parse are still subject to the scope filter in
+    /// [`Config::apply_overlay_scoped`]; this only decides which lines reach
+    /// it. User and admin config keep the strict [`Self::parse`], because a
+    /// broken key in the user's own file is a mistake to report, not untrusted
+    /// input to tolerate.
+    pub fn parse_untrusted(content: &str) -> (Self, Vec<RejectedConfigKey>) {
+        let mut overlay = Self::default();
+        let mut rejected = Vec::new();
+        for (line_number, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = trimmed.split_once('=') else {
+                // The line names no key, so it is reported by position. Its
+                // text is repository-controlled and stays out of the report,
+                // exactly as a refused value does.
+                rejected.push(RejectedConfigKey::new(
+                    format!("line {}", line_number + 1),
+                    RepositoryKeyClass::Unparsable,
+                ));
+                continue;
+            };
+            // `set` can mutate before it fails: `model_provider.<id>.<field>`
+            // pushes the provider entry before it matches the field. So a
+            // failed line is rolled back, or the half-built entry survives and
+            // is reported a second time as a phantom rejection of its own.
+            let snapshot = overlay.clone();
+            if overlay.set(key.trim(), value.trim()).is_err() {
+                overlay = snapshot;
+                rejected.push(RejectedConfigKey::new(
+                    bounded_key_name(key.trim()),
+                    RepositoryKeyClass::Unparsable,
+                ));
+            }
+        }
+        (overlay, rejected)
+    }
+
     pub fn load_or_default(path: impl AsRef<Path>) -> Result<Self> {
         if path.as_ref().exists() {
             Self::load(path)
@@ -2267,6 +2340,27 @@ fn join_paths(values: &[PathBuf]) -> String {
         .map(|path| path.to_string_lossy().to_string())
         .collect::<Vec<_>>()
         .join("|")
+}
+
+/// Bounds a rejected key name for the report.
+///
+/// Every other rejected key comes from the known vocabulary in
+/// [`ConfigOverlay::set`], but an *unparsable* one can be any text the
+/// repository put left of the `=` — and it reaches a notice dialog. So it is
+/// trimmed to what a dialog can show: printable, single-line, and short. Long
+/// enough to name the typo the user has to go and fix.
+fn bounded_key_name(key: &str) -> String {
+    const MAX_CHARS: usize = 64;
+    let mut printable = key.chars().filter(|character| !character.is_control());
+    let bounded: String = printable.by_ref().take(MAX_CHARS).collect();
+    if bounded.is_empty() {
+        return "(empty key)".to_string();
+    }
+    if printable.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
 }
 
 fn parse_bool(key: &str, value: &str) -> Result<bool> {

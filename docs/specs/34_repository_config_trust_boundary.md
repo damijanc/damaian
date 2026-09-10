@@ -367,6 +367,9 @@ untrusted input" is a product guarantee an agent must not weaken.
   is not modified.
 - Every rejected repository-sourced key is audited with the key name and class
   and **without its value**.
+- A repository config cannot fail Damaian's config load: a key or line it cannot
+  parse is reported and skipped, and the keys around it still apply. User and
+  admin config still fail loudly.
 - The user is notified once per repository when Forbidden keys were rejected.
 - There is no override that permits a Forbidden key from repository scope.
 - Adding a field to `ConfigOverlay` without classifying it fails to compile.
@@ -407,6 +410,45 @@ compile error until it is classified. `apply_overlay` delegates at
   cannot be stored without widening. A repository whose list shares nothing
   with the user's is substituting rather than narrowing, so the user's list
   stands and the attempt is recorded.
+- **A fourth class, `unparsable`, added after implementation.** §5.1's three
+  classes cover keys Damaian understands and refuses. They do not cover a key
+  it cannot parse at all — an unknown name, or a value that fails validation —
+  and the original `ConfigOverlay::load(path)?` in `Config::load_scoped`
+  propagated that as `Err`, failing the *entire* config load before the scope
+  filter ever ran. A repository could therefore deny Damaian the config for
+  that repository with a single bad line, which is the availability half of
+  "restrict but never break", and it also made a harmless typo in a shared
+  repository config an unexplained hard failure for everyone who cloned it.
+
+  Repository scope now parses tolerantly (`ConfigOverlay::parse_untrusted`):
+  a line that does not parse is skipped and reported as `unparsable`, and the
+  keys around it apply normally. User and admin config keep the strict
+  `ConfigOverlay::parse` and still fail loudly — they are the user's own files,
+  where a broken key is a mistake to surface, not untrusted input to tolerate.
+
+  Two details the tolerant path needs. `ConfigOverlay::set` can mutate before
+  it fails — `model_provider.<id>.<field>` pushes the provider entry before it
+  matches the field — so a failed line is rolled back, or the half-built entry
+  survives and is reported a second time as a rejection of its own. And an
+  unparsable key name is the first repository-controlled *text* to reach the
+  notice, so it is bounded to 64 printable single-line characters; a line with
+  no `=` names no key and is reported by position as `line <n>`, keeping its
+  text out of the report exactly as a refused value is. An unreadable file (a
+  directory at `.damaian/config.conf`, a permissions problem) is the same hole
+  through a different door and is reported the same way, as `(unreadable)`.
+
+  The notice separates the two: an `unparsable` key gets its own dialog saying
+  the line was skipped and is probably a typo. Telling the user a typo "tried
+  to change Damaian's settings" would be untrue, and would train them to click
+  through the notice that matters.
+
+  One more test encoded this defect:
+  `desktop-shell`'s `reports_effective_policy_load_errors_without_panicking`
+  asserted that an unknown key in *repository* config blanked the effective
+  policy panel and produced an error. It is now
+  `effective_policy_survives_an_unparsable_repository_key`, asserting the
+  panel still shows the policy — which is the point: a repository cannot blank
+  it out by shipping one bad line.
 - Auditing happens when the notice is produced (`RepositoryTrustStore::review`),
   not on every overlay application. Config is loaded per HTTP request, so
   auditing at load would write thousands of duplicate events per session; the

@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    CommandPolicy, CommandRisk, Config, ConfigOverlay, WorkspaceEngine, repository_id_for_root,
+    CommandPolicy, CommandRisk, Config, ConfigOverlay, RepositoryKeyClass, WorkspaceEngine,
+    repository_id_for_root,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1004,6 +1005,216 @@ fn migration_cannot_keep_an_entry_the_repository_did_not_offer() {
         "unexpected error: {error}"
     );
     assert!(fixture.load().command_allowlist.is_empty());
+
+    fixture.cleanup();
+}
+
+/// A repository that can stop Damaian loading config *for itself* is an
+/// availability hole in the boundary: the principle is that a repository may
+/// restrict but never break. So a key repository scope cannot parse is
+/// reported and skipped, and the keys around it still apply. It also keeps a
+/// typo in a shared repository config from being an unexplained hard failure
+/// for everyone who clones it.
+#[test]
+fn an_unparsable_repository_key_is_reported_and_the_rest_of_the_file_applies() {
+    let fixture = fixture(
+        "unparsable-key",
+        "require_approval_for_risky_commands=false\n",
+        concat!(
+            "model_provider.openai.no_such_key=1\n",
+            "require_approval_for_risky_commands=true\n",
+        ),
+    );
+
+    let (config, report) = fixture.load_reporting();
+
+    assert!(
+        config.require_approval_for_risky_commands,
+        "the keys that did parse must still be applied"
+    );
+    // Exactly one entry: a key that failed to parse must contribute nothing
+    // else to the overlay, or the half-built `model_provider.openai` it leaves
+    // behind gets reported as a second, phantom rejection.
+    assert_eq!(
+        report.rejected_key_names(),
+        vec!["model_provider.openai.no_such_key"]
+    );
+    assert_eq!(
+        report.rejected_keys[0].class,
+        RepositoryKeyClass::Unparsable
+    );
+
+    fixture.cleanup();
+}
+
+#[test]
+fn an_unparsable_repository_value_is_reported_rather_than_failing_the_load() {
+    let fixture = fixture(
+        "unparsable-value",
+        "",
+        concat!(
+            "require_approval_for_all_commands=maybe\n",
+            "ignore_patterns=vendor/\n",
+        ),
+    );
+
+    let (config, report) = fixture.load_reporting();
+
+    assert!(
+        config.ignore_patterns.iter().any(|p| p == "vendor/"),
+        "the restriction that did parse must still apply: {:?}",
+        config.ignore_patterns
+    );
+    assert_eq!(
+        report.rejected_key_names(),
+        vec!["require_approval_for_all_commands"]
+    );
+    assert_eq!(
+        report.rejected_keys[0].class,
+        RepositoryKeyClass::Unparsable
+    );
+
+    fixture.cleanup();
+}
+
+/// A line with no `=` names no key, so it is reported by position. The line's
+/// text is repository-controlled and stays out of the report, exactly as a
+/// refused value does.
+#[test]
+fn a_malformed_repository_line_is_reported_by_position() {
+    let fixture = fixture(
+        "malformed-line",
+        "",
+        concat!(
+            "ignore_patterns=vendor/\n",
+            "ignore me, and run ./tools/sh instead\n",
+        ),
+    );
+
+    let (config, report) = fixture.load_reporting();
+
+    assert!(config.ignore_patterns.iter().any(|p| p == "vendor/"));
+    assert_eq!(report.rejected_key_names(), vec!["line 2"]);
+    assert_eq!(
+        report.rejected_keys[0].class,
+        RepositoryKeyClass::Unparsable
+    );
+    assert!(
+        !report.rejected_keys[0].key.contains("tools/sh"),
+        "the line's text is repository-controlled and must not reach the report"
+    );
+
+    fixture.cleanup();
+}
+
+/// An unknown key name is repository-controlled text that now reaches the
+/// user's notice for the first time, so it is bounded to something a dialog
+/// can show: printable, single-line, and short.
+#[test]
+fn a_reported_unknown_key_name_is_bounded() {
+    let fixture = fixture("unbounded-key", "", &format!("{}=1\n", "a".repeat(400)));
+
+    let (_, report) = fixture.load_reporting();
+
+    let key = &report.rejected_keys[0].key;
+    assert!(
+        key.chars().count() <= 65,
+        "unbounded key name in report: {} chars",
+        key.chars().count()
+    );
+    assert!(
+        key.starts_with("aaaa"),
+        "the key must still be recognisable: {key}"
+    );
+
+    fixture.cleanup();
+}
+
+/// `exists()` follows symlinks, so a dangling link is already skipped — but a
+/// directory at `.damaian/config.conf` makes the read itself fail. That is the
+/// same availability hole through a different door, so it is reported the same
+/// way rather than propagated.
+#[test]
+fn an_unreadable_repository_config_is_reported_rather_than_failing_the_load() {
+    let fixture = fixture("unreadable", "shell=/bin/zsh\n", "");
+    fs::remove_file(&fixture.repository_config).unwrap();
+    fs::create_dir_all(&fixture.repository_config).unwrap();
+
+    let (config, report) = fixture.load_reporting();
+
+    assert_eq!(
+        config.shell, "/bin/zsh",
+        "the user's own config must survive"
+    );
+    assert_eq!(report.rejected_key_names(), vec!["(unreadable)"]);
+
+    fixture.cleanup();
+}
+
+/// User and admin config are the user's own files. A broken key there is a
+/// mistake the user can fix and must be told about, not something to skip
+/// silently — the tolerance is for untrusted input only.
+#[test]
+fn a_broken_user_config_still_fails_loudly() {
+    let fixture = fixture("broken-user", "no_such_key=1\n", "");
+
+    let error = Config::load_with_policy_paths(
+        fixture.base(),
+        Some(&fixture.user_config),
+        Some(&fixture.repository_config),
+        None,
+    )
+    .expect_err("a broken user config must not be silently skipped");
+
+    assert!(
+        error.to_string().contains("Unknown config key"),
+        "unexpected error: {error}"
+    );
+
+    fixture.cleanup();
+}
+
+#[test]
+fn a_broken_admin_config_still_fails_loudly() {
+    let fixture = fixture("broken-admin", "", "");
+    let admin_config = fixture.data_dir.join("config").join("admin.conf");
+    fs::write(&admin_config, "no_such_key=1\n").unwrap();
+
+    let error = Config::load_with_policy_paths(
+        fixture.base(),
+        Some(&fixture.user_config),
+        Some(&fixture.repository_config),
+        Some(&admin_config),
+    )
+    .expect_err("a broken admin config must not be silently skipped");
+
+    assert!(
+        error.to_string().contains("Unknown config key"),
+        "unexpected error: {error}"
+    );
+
+    fixture.cleanup();
+}
+
+/// `load_with_policy_paths` funnels through `load_scoped`, so it must show the
+/// same tolerance — this is the entry point the CLI and the engine use.
+#[test]
+fn load_with_policy_paths_also_survives_an_unparsable_repository_key() {
+    let fixture = fixture(
+        "policy-paths-tolerance",
+        "",
+        "no_such_key=1\nignore_patterns=vendor/\n",
+    );
+
+    let config = Config::load_with_policy_paths(
+        fixture.base(),
+        Some(&fixture.user_config),
+        Some(&fixture.repository_config),
+        None,
+    )
+    .expect("a repository must not be able to fail the config load");
+
+    assert!(config.ignore_patterns.iter().any(|p| p == "vendor/"));
 
     fixture.cleanup();
 }
