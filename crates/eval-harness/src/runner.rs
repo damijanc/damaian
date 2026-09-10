@@ -97,11 +97,16 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
 /// the `[[turn]]` scripts** and keeping the `[assert]` block (§5.3).
 /// Credential-gated and never run by CI.
 ///
-/// NOT VERIFIED against a real provider. It is built from the CLI's own live
-/// path (`crates/damaian-cli/src/main.rs:313`), which is the shape that ships,
-/// but this session had no credentials and must not make network calls. Run the
-/// `#[ignore]`d `live_tier_runs_one_scenario_against_a_real_provider` test
-/// before trusting it.
+/// NOT YET VERIFIED against a real provider, though the CLI's own live path
+/// (`crates/damaian-cli/src/main.rs:313`) that this is built from now has been:
+/// it reaches DeepSeek, and the provider reports usage.
+///
+/// This function stayed unreachable longer than that note implied. `run_tier`
+/// selected no scenarios for the live tier and called the deterministic runner
+/// for anything it did select, so `--tier live` never arrived here and exited 0
+/// having measured nothing. Both are fixed; the `#[ignore]`d
+/// `live_tier_runs_one_scenario_against_a_real_provider` test is still what
+/// proves this path works.
 pub fn run_live(scenario: &Scenario) -> Result<Run> {
     if let Some(skipped) = skip_if_blocked(scenario) {
         return Ok(skipped);

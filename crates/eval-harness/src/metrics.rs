@@ -102,11 +102,7 @@ impl MetricSet {
         push(
             "task_completion_rate",
             "Task completion rate",
-            rate_or_no_data(
-                completed,
-                completable.len(),
-                "no-completable-scenarios",
-            ),
+            rate_or_no_data(completed, completable.len(), "no-completable-scenarios"),
         );
 
         let checks: Vec<bool> = runnable

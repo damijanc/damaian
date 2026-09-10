@@ -1180,8 +1180,7 @@ fn a_rate_with_no_observations_is_not_reported_as_zero() {
 ///   cargo test -p eval-harness --locked -- --ignored live_tier
 /// ```
 ///
-/// The live tier has not been exercised against a real provider — see the note
-/// on `runner::run_live`. This test is how you do that.
+/// This test is how you exercise the live tier against a real provider.
 #[test]
 #[ignore = "needs provider credentials and network"]
 fn live_tier_runs_one_scenario_against_a_real_provider() {
@@ -1192,12 +1191,17 @@ fn live_tier_runs_one_scenario_against_a_real_provider() {
     assert!(!run.record.provider.is_empty());
     assert_eq!(run.record.tier, "live");
     assert!(
-        !run.record.tokens.measured,
-        "no token source exists until spec 19"
-    );
-    assert!(
         run.record.model_calls > 0,
         "a live run must actually call the provider"
+    );
+    // Spec 19 supplies the figure, and a real call must carry one either way.
+    // Which way is a property of the provider, not of this harness: DeepSeek
+    // reports usage and yields `measured`, and a provider that refuses
+    // `stream_options` yields an honest `len / 4` estimate. Asserting either
+    // one specifically would make this test a claim about the provider.
+    assert!(
+        run.record.tokens.input > 0,
+        "a live run must record a token figure, measured or estimated"
     );
 }
 
@@ -1279,7 +1283,9 @@ fn an_empty_run_reports_no_data_rather_than_zero() {
     let empty = MetricSet::compute(&[]);
 
     for key in MetricSet::KEYS {
-        let metric = empty.get(key).unwrap_or_else(|| panic!("no `{key}` metric"));
+        let metric = empty
+            .get(key)
+            .unwrap_or_else(|| panic!("no `{key}` metric"));
         match &metric.value {
             MetricValue::NotApplicable { .. } | MetricValue::Human { .. } => {}
             other => panic!(
@@ -1289,4 +1295,58 @@ fn an_empty_run_reports_no_data_rather_than_zero() {
             ),
         }
     }
+}
+
+/// §5.3: "The live tier runs the same scenario files against a real provider."
+/// The `tier` field names where a scenario is *defined*, not the only tier
+/// allowed to run it — every committed scenario declares `deterministic`, so
+/// reading the field as an exclusive selector left the live tier with nothing
+/// to run.
+#[test]
+fn the_live_tier_selects_every_committed_scenario() {
+    let scenarios = scenario::load_all().expect("scenarios");
+    assert!(!scenarios.is_empty(), "there should be committed scenarios");
+
+    let selected = eval_harness::selected_for(&scenarios, Tier::Live);
+
+    assert_eq!(
+        selected.len(),
+        scenarios.len(),
+        "the live tier must run the same files as the deterministic tier, not a subset"
+    );
+}
+
+/// The defect this pair exists to prevent: `run_tier(Live)` selected nothing,
+/// called the *deterministic* runner for anything it had selected, and returned
+/// a clean report with zero records and exit code 0. A live tier that cannot
+/// reach the network must say so, not report success.
+#[test]
+fn the_live_tier_drives_the_live_runner_rather_than_the_mock() {
+    if std::env::var("DAMAIAN_EVAL_PROVIDER").is_ok() {
+        return; // a real live run is configured; nothing to assert here
+    }
+
+    let error = eval_harness::run_tier(Tier::Live)
+        .expect_err("run_tier(Live) must reach run_live and refuse without credentials");
+
+    assert!(
+        format!("{error:?}").contains("DAMAIAN_EVAL_PROVIDER"),
+        "the refusal should come from the live runner and name what is missing, got: {error:?}"
+    );
+}
+
+/// A tier that selected nothing must fail, not report a clean run.
+///
+/// With no records there are no failing assertions, so the binary exits 0, and
+/// every metric now correctly reports no data — an output that looks orderly
+/// and says nothing. Silence and success are not the same result.
+#[test]
+fn a_tier_that_selected_no_scenarios_refuses_rather_than_reporting_success() {
+    let error = eval_harness::run_scenarios(&[], Tier::Deterministic)
+        .expect_err("a run over zero scenarios must not succeed");
+
+    assert!(
+        format!("{error:?}").contains("measures nothing"),
+        "the refusal should say the run measured nothing, got: {error:?}"
+    );
 }

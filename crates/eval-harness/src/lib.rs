@@ -23,12 +23,48 @@ use crate::scenario::Tier;
 /// `notApplicable`, and leaving it out would make the gap invisible in exactly
 /// the output that is supposed to carry it.
 pub fn run_tier(tier: Tier) -> Result<report::Report> {
+    run_scenarios(&scenario::load_all()?, tier)
+}
+
+/// The scenarios a tier runs.
+///
+/// §5.3: "The live tier runs the same scenario files against a real provider,
+/// ignoring the `[[turn]]` scripts and keeping the `[assert]` block." So the
+/// `tier` field names where a scenario is *defined* — it is what tells the
+/// deterministic tier to skip a scenario that has no script to replay — and it
+/// is not a filter the live tier applies to itself. Reading it as one left the
+/// live tier selecting nothing, since every committed scenario declares
+/// `deterministic`.
+pub fn selected_for(scenarios: &[scenario::Scenario], tier: Tier) -> Vec<&scenario::Scenario> {
+    scenarios
+        .iter()
+        .filter(|scenario| {
+            tier == Tier::Live || scenario.tier == tier || scenario.blocked_on.is_some()
+        })
+        .collect()
+}
+
+/// [`run_tier`] over a given set of scenarios, so the selection and the
+/// empty-run refusal can be exercised without the committed scenario files.
+pub fn run_scenarios(scenarios: &[scenario::Scenario], tier: Tier) -> Result<report::Report> {
+    let selected = selected_for(scenarios, tier);
+    // A report over zero records is not a passing run: it has no failing
+    // assertions, so the binary exits 0 and every metric reports no data. That
+    // is honest but useless, and it is what the live tier did for its whole
+    // existence. Refuse loudly instead.
+    if selected.is_empty() {
+        return Err(workspace_engine::ClientError::InvalidInput(format!(
+            "the {} tier selected no scenarios; a run that measures nothing must not report success",
+            tier.as_str()
+        )));
+    }
+
     let mut records = Vec::new();
-    for scenario in scenario::load_all()? {
-        if scenario.tier != tier && scenario.blocked_on.is_none() {
-            continue;
-        }
-        let run = runner::run(&scenario)?;
+    for scenario in selected {
+        let run = match tier {
+            Tier::Deterministic => runner::run(scenario)?,
+            Tier::Live => runner::run_live(scenario)?,
+        };
         let patch_paths: Vec<String> = run
             .patch_proposal
             .as_ref()
