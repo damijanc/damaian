@@ -6,9 +6,10 @@ not, and never the one presented as the other. Retries, stopped turns and calls
 lost to a crash all count. The figure shows under each turn and survives a
 reload, and the eval harness reads the same `read_task_usage` rather than
 counting anything itself, so spec 18's token row is a real number instead of
-`notApplicable`. **No provider has been tested for usage reporting, and the
-`len / 4` estimate has never been checked against a measurement** — both need
-credentials; see §7. Requirement 2's completion report waits on spec 23.
+`notApplicable`. **Validated against DeepSeek**, which reports usage on every
+call; the `len / 4` estimate measured 2.5–6.3% high, always in the safe
+direction. OpenAI remains untested. See §7. Requirement 2's completion report
+waits on spec 23.
 Order: 19 of 19
 Roadmap: `docs/ROADMAP/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 6 (Must). That directory is local-only and not committed, so the
@@ -260,25 +261,45 @@ why a figure may be estimated, and how to set price rates for a cost figure.
 
 ## 7. Implementation Notes
 
-**No provider has been tested for usage reporting, and the `len / 4` estimate
-has never been compared against a real measurement.** Both of this section's
-questions need credentials and a network call, and the implementing session had
-neither. Everything below the measured tier is therefore built and tested but
-unvalidated against a provider:
+**Validated against DeepSeek on 2026-09-10.** Both of this section's open
+questions are answered. Measured on `deepseek-v4-flash` over two CLI turns
+against a real repository, and then over a full thirteen-scenario live-tier run.
 
-- The `stream_options` request and its rejection probe are exercised only by
-  `MockModelTransport::sequence`, against a synthetic error body. No real
-  provider has accepted or rejected the field.
-- Every figure the deterministic tier produces is an estimate, so
-  `UsageSource::Measured` has never been produced by anything but a test.
+**DeepSeek reports usage.** It accepts `stream_options: {"include_usage": true}`
+and returns `prompt_tokens`/`completion_tokens`, so `UsageSource::Measured` is
+now produced by something other than a test — on every call of every scenario.
+The probe never fired: no `model_usage_reporting_unsupported` was audited, and
+two prompts produced exactly two model calls, confirming the probe rides on the
+first request rather than costing one of its own. **No other provider has been
+tested**; OpenAI in particular remains unmeasured.
 
-This is the same open item as
-[spec 18](../18_local_evaluation_harness/proposal.md) §7's unverified live
-tier, and the two should be closed in one session with credentials. What to
-record here when that happens: which providers accepted `stream_options`, and
-the measured-versus-estimated counts for the same request as a percentage
-error. **If the estimate is badly wrong, say so here** — a later work package
-can improve it, but nobody should discover it by accident.
+**The `len / 4` estimate runs high by 2.5% to 6.3%.**
+
+| context | marker estimate | measured | error |
+|---|---|---|---|
+| 8 files | 5,566 | 5,236 | +6.3% |
+| 6 files | 2,178 | 2,124 | +2.5% |
+
+Both samples over-estimate, which is the safe direction for a figure a reader
+may treat as a cost. §5.5's "rough scale, not a bill" language is justified
+rather than over-cautious, and no work package is needed to improve it.
+
+**A second, more accurate estimator already exists.** The audit log's
+`model_request_prepared` carries its own `tokenEstimate` — 5,300 and 2,056 for
+those same two requests, so +1.2% and −3.2%. It is closer on both, but it
+under-shoots, which `len / 4` never did. Worth knowing before anyone assumes
+the marker's estimate is the best the tree can do; the two have never been
+reconciled and probably should be.
+
+**DeepSeek reports no cost.** `reportedCost` was `null` on every call, so
+`ModelRun::reported_cost` still has no live producer and a cost figure comes
+only from user-configured rates. The field is not dead — it is unexercised.
+
+**Output tokens can exceed the visible reply.** A turn answering "Reply with the
+single word OK" billed 94 completion tokens, almost certainly reasoning tokens
+counted in `completion_tokens`. Accounting reports what the provider bills,
+which is correct, but a user comparing the token line against the text on screen
+will find it larger. Not a defect; worth stating before it is filed as one.
 
 ### What implementing this found
 

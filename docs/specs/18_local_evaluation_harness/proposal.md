@@ -6,7 +6,9 @@ every run; spec 17 landed and unblocked it, so `recovery_success` is now a
 measured value rather than a deferral marker. The deterministic tier takes **2.8s**
 standalone and runs inside `cargo test --workspace --locked`, adding no
 quality-gate command. `evals/baseline.json` is committed after review. The live
-tier is implemented but **not yet verified against a real provider** — see §7.
+tier **ran against a real provider for the first time on 2026-09-10**, which
+found and fixed five defects in it; one remains, and it means a live run's
+recorded tool calls come from the scenario script rather than the run — see §7.
 Order: 18 of 19
 Roadmap: `docs/ROADMAP/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 4 (Must). That directory is local-only and not committed, so the
@@ -340,20 +342,81 @@ it was a marker, so changing it broke no test — a gap now closed by
 deterministic tier's figure is an *estimate*, carried in the row's label rather
 than left for a reader to infer.
 
-**The two human-sourced metrics are `null`, with reasons.** No live-tier runs
-have been performed, so there is no sample to draw from. `manual_repair_rate`
-and `patch_acceptance_rate` both require a human judgement as their only input,
-and a computed value for either would be a fiction that later phases compare
-against. They are recorded as `null` with an explicit reason rather than as zero.
+**The two human-sourced metrics are `null`, with reasons.**
+`manual_repair_rate` and `patch_acceptance_rate` both require a human judgement
+as their only input, and a computed value for either would be a fiction that
+later phases compare against. They are recorded as `null` with an explicit
+reason rather than as zero. Live runs now exist to draw a sample from, but
+nobody has yet judged their output — the runs happened, the reading did not.
 
-**The live tier is unverified.** `runner::run_live` is implemented from the CLI's
-own live path (`crates/damaian-cli/src/main.rs:313`), which is the shape that
-ships, but no session has run it against a real provider — this one had no
-credentials and could not make network calls. Run
-`live_tier_runs_one_scenario_against_a_real_provider` before trusting it. Its
-companion `the_live_tier_refuses_without_credentials` does run in CI, and asserts
-the tier refuses rather than silently falling back to something local, which
-would report live-tier numbers that were never measured.
+### The live tier, first run 2026-09-10
+
+It had never worked. "Implemented but unverified" was too kind: as invoked from
+the documented command the live tier could not run at all, and said so in the
+one way nobody checks — quietly, with exit code 0.
+
+**Three defects, all in `run_tier`.** `if scenario.tier != tier` skipped every
+scenario, because all thirteen declare `deterministic` and §5.3 means the field
+to say where a scenario is *defined*, not which tier may run it. The loop then
+called `runner::run` unconditionally, so `run_live` was unreachable from the
+binary whatever the filter did. And an empty run reported
+`task_completion_rate: 0.0` alongside `approval_policy_violations: 0` and
+`restricted_or_secret_violations: 0` — a clean bill of health on the safety
+metrics from a run that made no model call. That last one is the worst of the
+three: for an asserted-zero metric the fabricated value and the expected value
+are the same number, so nothing looks wrong. Requirement 5 is now read
+strictly, every measure carrying `notApplicable` rather than a computed value
+when it has no observations, and a tier that selects nothing is an error rather
+than a report.
+
+**What the first real run measured.** Thirteen scenarios against
+`deepseek-v4-flash`, all completed, every one reporting `measured` tokens.
+
+| metric | live | deterministic |
+|---|---|---|
+| task completion rate | 1.0 | 1.0 |
+| tokens | 31,904 measured | 52,271 estimated |
+| latency median / p90 | 5,397 / 8,131 ms | 57 / 68 ms |
+| model calls per task | 1.23 | scripted |
+| recovery success | 1.0 | 1.0 |
+| approval-policy violations | 0 | 0 |
+| restricted-path and secret violations | 0 | 0 |
+
+Those two zeros are the first ones this project has earned rather than assumed.
+Neither the seeded key nor the provider credential appears in the report.
+
+**Two more defects the run itself exposed**, both the deterministic tier's
+assumptions leaking into the live one. `file_references_resolve` split on
+whitespace, so an ordinary markdown link peeled down to the nonsense path
+``src/AGENTS.md`](src/AGENTS.md`` and failed a correct answer — the assertion's
+own doc comment warns that "a false 'unresolved' would fail a good run", which
+is then what it did. The engine was never wrong here: `render.rs` parses
+markdown structurally and renders the same link correctly. And the two tiers
+offered the model *different tools* — `mock_provider()` sets
+`supports_native_tools: true` while the live tier inherited DeepSeek's built-in
+`false`, and `propose_patch` is only offered when that flag is on, so three
+scenarios failed `patch_touches` with `actual = []` against a model that had no
+way to propose anything. Both fixed; `RunRecord::native_tools` now carries the
+capability set into every record so the two tiers cannot silently diverge again.
+Failures fell from six to two.
+
+**Still broken: a live run's `tool_calls` are fiction.** `runner::drive` builds
+that list from `scenario.turns` — the *script* — and marks each entry `ok` or
+`error` by whether the whole turn succeeded. The live tier ignores those scripts,
+so a live record lists tool calls that never happened, complete with the
+scripted patch content the model never sent. This misled the session that found
+it into reading `propose_patch -> ok` as evidence the model had proposed a patch.
+Requirement 4 ("each run records ... tool calls with sanitized arguments") is
+therefore **not met by the live tier**, and `tool_and_model_error_rate` is
+computed from the script whenever that tier runs. The trace exists for exactly
+this reason — its own doc comment says records are "read rather than inferred
+from the scenario script" — so the fix is to build the list from audit events.
+Not yet done.
+
+`the_live_tier_refuses_without_credentials` still runs in CI and asserts the tier
+refuses rather than falling back to something local, joined now by
+`the_live_tier_drives_the_live_runner_rather_than_the_mock`, which is the
+regression test for the selection and dispatch defects above.
 
 ### What the review gate caught
 
