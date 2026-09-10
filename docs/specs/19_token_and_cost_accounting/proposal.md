@@ -301,6 +301,55 @@ counted in `completion_tokens`. Accounting reports what the provider bills,
 which is correct, but a user comparing the token line against the text on screen
 will find it larger. Not a defect; worth stating before it is filed as one.
 
+**The cost path is verified end to end.** With DeepSeek's published rates
+(cache-miss off-peak, $0.15 and $0.60 per million) a measured turn of
+6,079 input and 46 output tokens produced `Some(0.00093945)`, matching hand
+arithmetic and rendering as `$0.0009`.
+
+**But a single rate per direction cannot express real provider pricing.**
+DeepSeek charges four different input prices: cache hit or miss, peak or
+off-peak. Miss is **fifty times** hit ($0.15 against $0.003), and peak is
+double off-peak, with peak defined as 01:00–04:00 and 06:00–10:00 UTC on
+weekdays. §5.7 says Damaian ships no price list because prices change; the
+deeper problem is that a price is not a scalar. A user entering the miss rate
+over-reports a cache-heavy session by up to fifty-fold, and one entering the
+hit rate under-reports. The figure is honest about being *derived from your
+rates* and says nothing about how well those rates fit — that gap should be
+either closed or documented before anyone treats the number as a bill. Neither
+this spec nor `USER_GUIDE.md` currently says it.
+
+### Two config defects this measurement exposed
+
+Both were found trying to enter those rates, and neither is specific to prices.
+
+**`config-set` reported success and discarded the value.** Spec 19 added
+`provider_reports_usage` and the two price keys to `ModelProviderConfigOverlay`
+and to `ConfigOverlay::set`, but not to `push_model_provider_overlay`. Since
+`config-set` is a load-set-save cycle, the loss was not confined to the key
+being set: writing *any* key silently stripped rates a user had hand-edited
+into the file. The serializer now destructures the overlay exhaustively and
+uses every binding, the same guard `apply_overlay_scoped` carries, so the next
+field added fails the build instead.
+
+**Setting one field on a built-in provider erased the rest of it.** Built-in
+providers are produced on demand by `builtin_model_provider_config` rather than
+listed in `model_providers`, so an overlay naming one took the insert path and
+filled every unset field with a default. The blank entry then shadowed the
+built-in: base URL and key variable emptied, model list emptied so `model_name`
+fell back to `gpt-4.1` while `model_provider` still read `deepseek`, and native
+tools forced off. The CLI's report was that an empty-named variable "is
+required for live model calls".
+
+This one predates spec 19 and is reachable from documented advice —
+`USER_GUIDE.md` lists `model_provider.<id>.max_output_tokens` and
+`context_token_budget` as ordinary user settings, and either would have done
+the same damage. `upsert_model_provider` now seeds from the built-in first,
+deliberately omitting the two token budgets: both resolve through three levels
+and the built-in's values are the last-resort fallback, so copying them into a
+listed entry would outrank the per-model table and quietly drop a V4 install
+from a 65,536 output ceiling to the 8,192 legacy one. An existing test caught
+that on the first attempt at this fix.
+
 ### What implementing this found
 
 **A provider 4xx is not a transport error.** `curl -sS` exits zero on a 400, so

@@ -308,6 +308,15 @@ spend. The result is labelled `at your rates`, because it is your arithmetic
 rather than the provider's invoice. Anything under a hundredth of a cent shows
 as `<$0.0001` rather than rounding to zero.
 
+**One rate per direction may not fit your provider's pricing.** Several charge
+more than one input price — a cached prompt costs a fraction of an uncached
+one, and some vary by time of day. DeepSeek, for instance, bills a cache miss
+around fifty times a cache hit, and doubles both during weekday peak hours.
+Damaian multiplies tokens by the single rate you give it and cannot tell which
+price actually applied, so pick the rate matching how you mostly work, and read
+the result as an order of magnitude rather than an amount owed. The token
+counts themselves are exact wherever they are not marked estimated.
+
 Where a provider does report a cost of its own, that figure is shown instead
 and carries no such label.
 
