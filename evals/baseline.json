@@ -6,8 +6,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788945529152,
-      "durationMs": 60,
+      "startedAtMs": 1789040928890,
+      "durationMs": 68,
       "toolCalls": [
         {
           "name": "read_file",
@@ -22,8 +22,8 @@
       "checks": [],
       "finalStatus": "completed",
       "tokens": {
-        "input": 0,
-        "output": 0,
+        "input": 2671,
+        "output": 14,
         "measured": false
       },
       "cost": null,
@@ -53,8 +53,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788945529287,
-      "durationMs": 59,
+      "startedAtMs": 1789040929042,
+      "durationMs": 60,
       "toolCalls": [
         {
           "name": "search_codebase",
@@ -69,8 +69,8 @@
       "checks": [],
       "finalStatus": "completed",
       "tokens": {
-        "input": 0,
-        "output": 0,
+        "input": 3766,
+        "output": 9,
         "measured": false
       },
       "cost": null,
@@ -93,8 +93,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788945529424,
-      "durationMs": 63,
+      "startedAtMs": 1789040929172,
+      "durationMs": 61,
       "toolCalls": [
         {
           "name": "run_command",
@@ -119,8 +119,8 @@
       "checks": [],
       "finalStatus": "completed",
       "tokens": {
-        "input": 0,
-        "output": 0,
+        "input": 3296,
+        "output": 10,
         "measured": false
       },
       "cost": null,
@@ -157,7 +157,7 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788945529565,
+      "startedAtMs": 1789040929305,
       "durationMs": 57,
       "toolCalls": [
         {
@@ -173,8 +173,8 @@
       "checks": [],
       "finalStatus": "completed",
       "tokens": {
-        "input": 0,
-        "output": 0,
+        "input": 3014,
+        "output": 12,
         "measured": false
       },
       "cost": null,
@@ -204,8 +204,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788945529699,
-      "durationMs": 151,
+      "startedAtMs": 1789040929431,
+      "durationMs": 144,
       "toolCalls": [
         {
           "name": "run_command",
@@ -319,7 +319,7 @@
       ],
       "finalStatus": "completed",
       "tokens": {
-        "input": 0,
+        "input": 18349,
         "output": 0,
         "measured": false
       },
@@ -350,16 +350,16 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788945529931,
-      "durationMs": 59,
+      "startedAtMs": 1789040929644,
+      "durationMs": 55,
       "toolCalls": [],
       "approvals": [],
       "filesChanged": [],
       "checks": [],
       "finalStatus": "completed",
       "tokens": {
-        "input": 0,
-        "output": 0,
+        "input": 1662,
+        "output": 30,
         "measured": false
       },
       "cost": null,
@@ -382,8 +382,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788945530070,
-      "durationMs": 63,
+      "startedAtMs": 1789040929768,
+      "durationMs": 57,
       "toolCalls": [
         {
           "name": "read_file",
@@ -417,8 +417,8 @@
       "checks": [],
       "finalStatus": "completed",
       "tokens": {
-        "input": 0,
-        "output": 0,
+        "input": 3623,
+        "output": 11,
         "measured": false
       },
       "cost": null,
@@ -462,8 +462,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788945530213,
-      "durationMs": 67,
+      "startedAtMs": 1789040929894,
+      "durationMs": 57,
       "toolCalls": [
         {
           "name": "read_file",
@@ -492,8 +492,8 @@
       "checks": [],
       "finalStatus": "completed",
       "tokens": {
-        "input": 0,
-        "output": 0,
+        "input": 3599,
+        "output": 6,
         "measured": false
       },
       "cost": null,
@@ -537,8 +537,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788945530359,
-      "durationMs": 60,
+      "startedAtMs": 1789040930020,
+      "durationMs": 55,
       "toolCalls": [
         {
           "name": "propose_patch",
@@ -560,8 +560,8 @@
       "checks": [],
       "finalStatus": "completed",
       "tokens": {
-        "input": 0,
-        "output": 0,
+        "input": 1739,
+        "output": 6,
         "measured": false
       },
       "cost": null,
@@ -591,8 +591,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788945530549,
-      "durationMs": 60,
+      "startedAtMs": 1789040930187,
+      "durationMs": 56,
       "toolCalls": [
         {
           "name": "read_file",
@@ -607,8 +607,8 @@
       "checks": [],
       "finalStatus": "completed",
       "tokens": {
-        "input": 0,
-        "output": 0,
+        "input": 3397,
+        "output": 11,
         "measured": false
       },
       "cost": null,
@@ -638,8 +638,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788945530694,
-      "durationMs": 57,
+      "startedAtMs": 1789040930312,
+      "durationMs": 59,
       "toolCalls": [
         {
           "name": "run_command",
@@ -660,7 +660,7 @@
       "checks": [],
       "finalStatus": "completed",
       "tokens": {
-        "input": 0,
+        "input": 1739,
         "output": 0,
         "measured": false
       },
@@ -711,8 +711,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788945530826,
-      "durationMs": 58,
+      "startedAtMs": 1789040930445,
+      "durationMs": 62,
       "toolCalls": [
         {
           "name": "read_file",
@@ -727,8 +727,8 @@
       "checks": [],
       "finalStatus": "completed",
       "tokens": {
-        "input": 0,
-        "output": 0,
+        "input": 3639,
+        "output": 17,
         "measured": false
       },
       "cost": null,
@@ -751,7 +751,7 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1788945530957,
+      "startedAtMs": 1789040930579,
       "durationMs": 57,
       "toolCalls": [
         {
@@ -774,7 +774,7 @@
       "checks": [],
       "finalStatus": "completed",
       "tokens": {
-        "input": 0,
+        "input": 1651,
         "output": 0,
         "measured": false
       },
@@ -863,7 +863,7 @@
         "label": "Latency, median (Damaian's own work only in the deterministic tier)",
         "value": {
           "kind": "number",
-          "value": 60.0
+          "value": 57.0
         }
       },
       {
@@ -871,7 +871,7 @@
         "label": "Latency, p90 (Damaian's own work only in the deterministic tier)",
         "value": {
           "kind": "number",
-          "value": 67.0
+          "value": 68.0
         }
       },
       {
@@ -884,10 +884,10 @@
       },
       {
         "key": "tokens",
-        "label": "Input and output tokens",
+        "label": "Input and output tokens (estimated; no provider reported usage)",
         "value": {
-          "kind": "notApplicable",
-          "phase": "spec-19"
+          "kind": "count",
+          "value": 52271
         }
       },
       {
