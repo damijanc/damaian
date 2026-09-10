@@ -135,6 +135,14 @@ If a turn was waiting for your approval when Damaian stopped, that approval come
 
 Use the `Settings` tab to inspect and edit user configuration values, then select `Load`.
 
+These are your user-scope settings, and they are kept in one file:
+
+```text
+~/Library/Application Support/DamaianClient/config/user.conf
+```
+
+Editing that file by hand does the same thing as editing it in `Settings`, which is how you configure Damaian for the CLI, where there is no `Settings` tab. Note the `config/` directory in the middle of that path, and the `.conf` name: a file dropped next to it as `config.conf` is not user config and is read by nothing.
+
 Configuration uses one `key=value` entry per line. Edit values directly and select `Save`. Delete a line and save to remove that user-level override.
 
 `model_api_key_env` is a reference field. The app rejects raw API keys in this field; use the `Model API Key` controls to store the secret in Keychain.
@@ -184,6 +192,14 @@ If `Effective Policy` still shows a different `model_api_key_env` after saving t
 
 Environment variables remain supported for CLI and development workflows. In that mode, `model_api_key_env` is the name of an environment variable that contains the key. It is not the key itself.
 
+Every example below is user-scope configuration: enter it in `Settings`, or write it to [`config/user.conf`](#settings) directly. From a shell, the CLI writes that file for you and prints the path it used:
+
+```sh
+cargo run -p damaian-cli -- config-set user model_provider deepseek
+```
+
+Naming a built-in provider is usually the only line you need. `model_provider=deepseek` or `model_provider=openai` fills in the base URL, the default model, and the key variable for that provider; set the other keys only to override one of those.
+
 Example DeepSeek configuration:
 
 ```text
@@ -216,6 +232,14 @@ DEEPSEEK_API_KEY="your-deepseek-api-key" npm run desktop:dev
 ```
 
 The same pattern applies to OpenAI or any OpenAI-compatible provider.
+
+To check that the settings were picked up before spending anything, print the merged configuration. This makes no model call:
+
+```sh
+cargo run -p damaian-cli -- config-show | grep '^model'
+```
+
+If `model_api_key_env` names a variable you did not choose, the configuration was not read at all and the built-in default is standing. That is a wrong path or a wrong filename, not a wrong key.
 
 If an older configuration still names `deepseek-chat` or `deepseek-reasoner`, update it. Those were compatibility aliases that DeepSeek retired on 24 July 2026; the current models are `deepseek-v4-flash` and `deepseek-v4-pro`.
 
@@ -306,6 +330,8 @@ This keeps Damaian data inside the current working directory. If you prefer a ho
 ```sh
 DAMAIAN_DATA_DIR=~/.damaian
 ```
+
+Your own settings live inside that directory too, at `config/user.conf`, so `DAMAIAN_DATA_DIR` moves them along with everything else. A run with the variable set reads the `user.conf` under *that* directory and not your usual one — which is what makes it a clean way to try a different provider without touching your real configuration.
 
 Repository-scoped config remains separate and lives at `.damaian/config.conf` inside the selected repository.
 
