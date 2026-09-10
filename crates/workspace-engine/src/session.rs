@@ -180,6 +180,16 @@ pub struct ActionMarker {
     reference: String,
 }
 
+impl ActionMarker {
+    /// The marker's id, so a caller can tie other events to this action —
+    /// spec 19 records a call's usage against the marker it started under, and
+    /// recovery pairs the two to tell an accounted call from an unaccounted
+    /// one. Read-only: only [`SessionStore`] may mint one.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 /// An action that started and never finished — the signature of a crash while
 /// it was in flight.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -9,7 +9,7 @@ use crate::context_manager::{ContextItem, ContextManager};
 use crate::error::{ClientError, Result};
 use crate::hash::{create_id, repository_id_for_root};
 use crate::indexer::ProjectIndexer;
-use crate::model::{ModelAdapter, ModelMessage, ModelRequest, ModelRun};
+use crate::model::{ModelAdapter, ModelMessage, ModelRequest, ModelRun, TokenUsage};
 use crate::patch_engine::{
     GeneratedSecretWarning, PatchApplyResult, PatchEngine, ProposedChange, ProposedPatch,
 };
@@ -311,6 +311,28 @@ impl EditOrchestrator {
         let run = model_adapter
             .stream_response(&request, &never_cancelled, &mut sink)
             .map_err(|error| self.record_edit_failure(&session.id, &task, error))?;
+        // The other place a model is called, and just as billed as the chat
+        // loop's. No marker id: this call site has no action marker, because
+        // patch generation is not stoppable and so cannot be interrupted
+        // mid-action. Spec 19 §5.4.
+        self.session_store.record_task_usage(
+            &task,
+            &run.run_id,
+            None,
+            run.usage,
+            run.reported_cost,
+            None,
+        )?;
+        for attempt in 0..run.retry_count {
+            self.session_store.record_task_usage(
+                &task,
+                &format!("{}_retry{}", run.run_id, attempt + 1),
+                None,
+                TokenUsage::estimated(run.usage.input_tokens, 0),
+                None,
+                Some("retried_attempt"),
+            )?;
+        }
         let raw_output = self.scanner.redact(&run.content).text;
         let generated = parse_generated_edit(&raw_output)
             .map_err(|error| self.record_edit_failure(&session.id, &task, error))?;

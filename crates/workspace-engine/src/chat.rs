@@ -14,7 +14,10 @@ use crate::git_service::{GitService, GitStatus};
 use crate::hash::create_id;
 use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
-use crate::model::{ModelAdapter, ModelMessage, ModelRequest, ModelRun, ToolCall, ToolDefinition};
+use crate::model::{
+    ModelAdapter, ModelMessage, ModelRequest, ModelRun, TokenUsage, ToolCall, ToolDefinition,
+    model_request_json,
+};
 use crate::patch_engine::{PatchEngine, ProposedChange, ProposedFilePatch, ProposedPatch};
 use crate::secret_scanner::SecretScanner;
 use crate::session::{ChatMessage, Session, SessionStore, Task, TaskStatus};
@@ -890,6 +893,9 @@ impl ChatOrchestrator {
         // Whatever the model has produced so far, carried across rounds so a
         // stop between them still has an answer to preserve.
         let mut partial_response = String::new();
+        // Whether any model call in this turn has been accounted for, so a
+        // stop between rounds does not record a zero on top of real spending.
+        let mut recorded_any_usage = false;
         let mut web_debug_mode =
             turn_options.continue_debugging || prompt_enters_web_debug_mode(&task.user_prompt);
         let mut failed_browser_calls = HashMap::new();
@@ -899,16 +905,30 @@ impl ChatOrchestrator {
             // here is what saves a whole model call, and it is the only point
             // that catches a stop arriving during context assembly or a tool.
             if sink.cancel.is_cancelled() {
+                let cancelled_run = ModelRun::cancelled_before_start(
+                    &self.config.model_provider,
+                    &self.config.model_name,
+                );
+                // Only when nothing was called: a stop between rounds already
+                // has its earlier rounds accounted, and adding a zero on top
+                // would claim a model call that never happened.
+                if !recorded_any_usage {
+                    self.session_store.record_task_usage(
+                        &task,
+                        &cancelled_run.run_id,
+                        None,
+                        TokenUsage::measured_zero(),
+                        None,
+                        None,
+                    )?;
+                }
                 return self.finish_cancelled_turn(
                     repository_root,
                     session,
                     task,
                     context_files,
                     &partial_response,
-                    ModelRun::cancelled_before_start(
-                        &self.config.model_provider,
-                        &self.config.model_name,
-                    ),
+                    cancelled_run,
                 );
             }
 
@@ -962,35 +982,107 @@ impl ChatOrchestrator {
                 &self.config.model_name,
                 false,
             )?;
-            let model_run =
-                match model_adapter.stream_response(&request, sink.cancel, &mut *sink.on_token) {
-                    Ok(model_run) => model_run,
-                    // A stop is not a failure. The transport raises `Cancelled`
-                    // when it killed the request mid-flight, and it must not be
-                    // recorded as a provider error.
-                    Err(ClientError::Cancelled) => {
-                        return self.finish_cancelled_turn(
-                            repository_root,
-                            session,
-                            task,
-                            context_files,
-                            &partial_response,
-                            ModelRun::cancelled_before_start(
-                                &self.config.model_provider,
-                                &self.config.model_name,
-                            ),
-                        );
-                    }
-                    Err(error) => {
-                        let _ = self.session_store.update_task_status(
-                            &task,
-                            TaskStatus::Failed,
-                            Some(&error.to_string()),
-                        );
-                        return Err(error);
-                    }
+            let model_marker_id = model_marker.id().to_string();
+
+            // This round's output, kept here as well as streamed. A stop
+            // mid-stream returns `Err(Cancelled)` and no run at all, and these
+            // tokens are then the only record that the provider generated —
+            // and billed — anything. Spec 19 §5.5.
+            let mut round_output = String::new();
+            let stream_result = {
+                let on_token = &mut *sink.on_token;
+                let mut accumulate = |token: &str| {
+                    round_output.push_str(token);
+                    on_token(token);
                 };
+                model_adapter.stream_response(&request, sink.cancel, &mut accumulate)
+            };
+            let model_run = match stream_result {
+                Ok(model_run) => model_run,
+                // A stop is not a failure. The transport raises `Cancelled`
+                // when it killed the request mid-flight, and it must not be
+                // recorded as a provider error.
+                Err(ClientError::Cancelled) => {
+                    let cancelled_run = ModelRun::cancelled_before_start(
+                        &self.config.model_provider,
+                        &self.config.model_name,
+                    );
+                    // The request was sent and the answer was cut short, so
+                    // this is not the free case: estimate from what went out
+                    // and what came back before the stop.
+                    self.session_store.record_task_usage(
+                        &task,
+                        &cancelled_run.run_id,
+                        Some(&model_marker_id),
+                        TokenUsage::estimated(
+                            model_request_json(&request).len().div_ceil(4) as u64,
+                            round_output.len().div_ceil(4) as u64,
+                        ),
+                        None,
+                        Some("stopped_mid_stream"),
+                    )?;
+                    return self.finish_cancelled_turn(
+                        repository_root,
+                        session,
+                        task,
+                        context_files,
+                        &partial_response,
+                        cancelled_run,
+                    );
+                }
+                Err(error) => {
+                    let _ = self.session_store.update_task_status(
+                        &task,
+                        TaskStatus::Failed,
+                        Some(&error.to_string()),
+                    );
+                    return Err(error);
+                }
+            };
             self.session_store.finish_action(model_marker, "ok")?;
+
+            self.session_store.record_task_usage(
+                &task,
+                &model_run.run_id,
+                Some(&model_marker_id),
+                model_run.usage,
+                model_run.reported_cost,
+                None,
+            )?;
+            // Requirement 5: an attempt that reached the provider was billed
+            // for its input even though its answer never arrived. Same input,
+            // no output. Over-counting a connection that failed before the
+            // body went out is the deliberate direction of error —
+            // under-reporting makes Damaian look cheaper than it is.
+            for attempt in 0..model_run.retry_count {
+                self.session_store.record_task_usage(
+                    &task,
+                    &format!("{}_retry{}", model_run.run_id, attempt + 1),
+                    Some(&model_marker_id),
+                    TokenUsage::estimated(model_run.usage.input_tokens, 0),
+                    None,
+                    Some("retried_attempt"),
+                )?;
+            }
+            recorded_any_usage = true;
+
+            // The adapter observes this once per provider per process, and
+            // has no `AuditLog` of its own — see `ModelRun`. Recording it here
+            // is what lets a user set `provider_reports_usage=false` and stop
+            // paying for a probe on every process start.
+            if model_run.usage_reporting_unsupported {
+                self.audit_log.record(
+                    "model_usage_reporting_unsupported",
+                    &[
+                        ("actor", "system".to_string()),
+                        ("sessionId", session.id.clone()),
+                        ("taskId", task.id.clone()),
+                        ("provider", self.config.model_provider.clone()),
+                        ("model", self.config.model_name.clone()),
+                    ],
+                )?;
+            }
+
             let redacted = self.scanner.redact(&model_run.content).text;
 
             // An adapter that streamed part of an answer before noticing the

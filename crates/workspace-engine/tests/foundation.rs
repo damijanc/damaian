@@ -7,11 +7,12 @@ use workspace_engine::{
     AuditLog, CancelToken, ChatTurnOptions, ChatTurnResult, ClientError, CommandPolicy,
     CommandRisk, Config, ConfigOverlay, DEFAULT_CONTEXT_TOKEN_BUDGET, IndexCache, McpClient,
     McpServerConfig, McpTransport, MockModelAdapter, MockModelTransport, ModelAdapter,
-    ModelMessage, ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter, PatchEngine,
-    PatchStore, PathPolicy, PhaseKind, ProjectIndexer, ProposedChange, ResumeDecisionOptions,
-    SecretScanner, SessionStore, TaskStatus, ToolCall, TurnProgress, TurnSink, WebDiagnosticCall,
-    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
-    extract_model_tokens, model_request_json, parse_generated_edit,
+    ModelMessage, ModelProviderConfig, ModelRequest, ModelTransport, OpenAICompatibleAdapter,
+    PatchEngine, PatchStore, PathPolicy, PhaseKind, ProjectIndexer, ProposedChange, Result,
+    ResumeDecisionOptions, SecretScanner, SessionStore, TaskStatus, ToolCall, TurnProgress,
+    TurnSink, UsageSource, WebDiagnosticCall, WebDiagnosticReport, WebDiagnosticsRunner,
+    WebDiagnosticsRunnerHandle, WorkspaceEngine, extract_model_tokens, model_request_json,
+    parse_generated_edit,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1299,6 +1300,177 @@ fn ask_with_cancel(
         .chat_orchestrator
         .ask_with_session(repo, prompt, &[], None, adapter, &mut sink)
         .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Token accounting through a real turn, per
+// `docs/specs/19_token_and_cost_accounting/`. These live here rather than in
+// `token_accounting.rs` because driving a turn needs this file's engine
+// fixture, and a second copy of it would be the thing that drifts.
+// ---------------------------------------------------------------------------
+
+/// Streams a little and then reports a stop the way the real transport does:
+/// `pump_stream` discards its buffer on cancellation and raises `Cancelled`,
+/// so the adapter returns no run at all and the tokens already streamed to the
+/// UI are the only evidence the call happened.
+struct StopsMidStream;
+
+impl ModelTransport for StopsMidStream {
+    fn send(&mut self, _request_body: &str) -> Result<String> {
+        Err(ClientError::Cancelled)
+    }
+
+    fn send_stream(
+        &mut self,
+        _request_body: &str,
+        cancel: &CancelToken,
+        on_chunk: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        on_chunk("data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n");
+        cancel.cancel();
+        Err(ClientError::Cancelled)
+    }
+}
+
+#[test]
+fn a_completed_turn_records_one_usage_event_per_model_call() {
+    let repo = temp_dir("usage-per-round");
+    write_fixture(&repo, "README.md", "# Usage\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new("A complete answer.");
+
+    let result = ask_with_cancel(
+        &engine,
+        &repo,
+        "Explain this",
+        &mut adapter,
+        &CancelToken::new(),
+        &mut |_token| {},
+    );
+
+    let usage = engine
+        .session_store
+        .read_task_usage(&result.session.id)
+        .unwrap();
+    let total = usage
+        .get(&result.task.id)
+        .expect("a completed turn must account for its model call");
+
+    assert_eq!(total.run_count, 1);
+    assert!(total.input_tokens > 0, "the request was sent and billed");
+    assert!(total.output_tokens > 0);
+    // The mock is not a provider and reports nothing, so this is an estimate.
+    assert_eq!(total.source, UsageSource::Estimated);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn every_attempt_that_reached_the_provider_is_counted() {
+    // `retry_count` means the provider was called more than once and the input
+    // was transmitted each time. Counting only the successful attempt would
+    // make Damaian look cheaper than it is (spec 19 §5.5).
+    let repo = temp_dir("usage-retries");
+    write_fixture(&repo, "README.md", "# Usage\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let transport =
+        MockModelTransport::failing("{\"choices\":[{\"delta\":{\"content\":\"done\"}}]}", 2);
+    let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
+
+    let result = ask_with_cancel(
+        &engine,
+        &repo,
+        "Explain this",
+        &mut adapter,
+        &CancelToken::new(),
+        &mut |_token| {},
+    );
+
+    let usage = engine
+        .session_store
+        .read_task_usage(&result.session.id)
+        .unwrap();
+    let total = &usage[&result.task.id];
+
+    assert_eq!(
+        total.run_count, 3,
+        "one successful attempt plus the two that reached the provider first"
+    );
+    assert_eq!(total.source, UsageSource::Estimated);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_turn_stopped_mid_stream_records_what_it_streamed() {
+    let repo = temp_dir("usage-stopped-mid");
+    write_fixture(&repo, "README.md", "# Usage\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = OpenAICompatibleAdapter::new("test-model", StopsMidStream);
+
+    let result = ask_with_cancel(
+        &engine,
+        &repo,
+        "Explain this",
+        &mut adapter,
+        &CancelToken::new(),
+        &mut |_token| {},
+    );
+
+    assert!(result.cancelled);
+    let usage = engine
+        .session_store
+        .read_task_usage(&result.session.id)
+        .unwrap();
+    let total = usage
+        .get(&result.task.id)
+        .expect("a stopped call still sent its request and was billed");
+
+    assert_eq!(total.source, UsageSource::Estimated);
+    assert!(
+        total.input_tokens > 0,
+        "the request reached the provider and was billed"
+    );
+    assert!(
+        total.output_tokens > 0,
+        "the tokens streamed before the stop were generated and billed"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_turn_stopped_before_the_call_records_a_measured_zero() {
+    let repo = temp_dir("usage-stopped-before");
+    write_fixture(&repo, "README.md", "# Usage\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut adapter = MockModelAdapter::new("Should never be sent.");
+    let cancel = CancelToken::new();
+    cancel.cancel();
+
+    let result = ask_with_cancel(
+        &engine,
+        &repo,
+        "Explain this",
+        &mut adapter,
+        &cancel,
+        &mut |_token| panic!("must not stream for a stopped turn"),
+    );
+
+    let usage = engine
+        .session_store
+        .read_task_usage(&result.session.id)
+        .unwrap();
+    let total = usage
+        .get(&result.task.id)
+        .expect("a turn that spent nothing still says so");
+
+    // The one genuinely free case, and the only measured zero in the system.
+    assert_eq!(total.source, UsageSource::Measured);
+    assert_eq!(total.input_tokens, 0);
+    assert_eq!(total.output_tokens, 0);
+
+    fs::remove_dir_all(repo).unwrap();
 }
 
 #[test]
