@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use crate::record::AssertionOutcome;
 use crate::runner::Run;
 use crate::scenario::{Asserts, Tier};
@@ -243,13 +245,17 @@ const TRAILING_PUNCT: &[char] = &[
 ];
 const LEADING_PUNCT: &[char] = &['(', '[', '{', '"', '\'', '`', '<'];
 
-/// Path-shaped tokens in the response that do not exist in the fixture. Kept
-/// deliberately conservative: a false "unresolved" would fail a good run, so
-/// prose punctuation and a `:line[:col]` suffix are both peeled off before the
-/// existence check.
 fn unresolved_references(run: &Run) -> Vec<String> {
+    unresolved_paths(&run.response, &run.repo_root)
+}
+
+/// Path-shaped tokens in a response that do not exist in the repository. Kept
+/// deliberately conservative: a false "unresolved" would fail a good run, so
+/// markdown link syntax, prose punctuation and a `:line[:col]` suffix are all
+/// peeled off before the existence check.
+pub fn unresolved_paths(response: &str, repo_root: &Path) -> Vec<String> {
     let mut unresolved = Vec::new();
-    for token in run.response.split(char::is_whitespace) {
+    for token in flatten_markdown_links(response).split(char::is_whitespace) {
         let token = token
             .trim_start_matches(LEADING_PUNCT)
             .trim_end_matches(TRAILING_PUNCT);
@@ -260,11 +266,52 @@ fn unresolved_references(run: &Run) -> Vec<String> {
                 .rsplit('/')
                 .next()
                 .is_some_and(|last| last.contains('.'));
-        if looks_like_path && !run.repo_root.join(candidate).exists() {
+        if looks_like_path
+            && !repo_root.join(candidate).exists()
+            && !unresolved.iter().any(|seen| seen == candidate)
+        {
             unresolved.push(candidate.to_string());
         }
     }
     unresolved
+}
+
+/// Rewrites `[text](target)` as `text target`, so the whitespace tokenizer
+/// below sees a link's two halves as two tokens rather than one.
+///
+/// The engine does not need this — `render.rs` parses markdown structurally
+/// before it looks for file references, and renders the same link correctly.
+/// This is the cost of the simplified copy that
+/// [`unresolved_paths`] keeps deliberately: it has to be told about the syntax
+/// a real model actually writes.
+fn flatten_markdown_links(response: &str) -> String {
+    let mut flattened = String::with_capacity(response.len());
+    let mut rest = response;
+    while let Some(open) = rest.find('[') {
+        let after_open = &rest[open + 1..];
+        // `[text](target)` only — a bare `[` in prose is left exactly as it is.
+        let Some(close) = after_open.find(']') else {
+            break;
+        };
+        if !after_open[close + 1..].starts_with('(') {
+            flattened.push_str(&rest[..open + 1 + close + 1]);
+            rest = &after_open[close + 1..];
+            continue;
+        }
+        let target_start = close + 2;
+        let Some(target_end) = after_open[target_start..].find(')') else {
+            break;
+        };
+        flattened.push_str(&rest[..open]);
+        flattened.push(' ');
+        flattened.push_str(&after_open[..close]);
+        flattened.push(' ');
+        flattened.push_str(&after_open[target_start..target_start + target_end]);
+        flattened.push(' ');
+        rest = &after_open[target_start + target_end + 1..];
+    }
+    flattened.push_str(rest);
+    flattened
 }
 
 /// Peels up to two trailing `:<digits>` groups off a path token, so

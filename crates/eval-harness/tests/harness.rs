@@ -1350,3 +1350,63 @@ fn a_tier_that_selected_no_scenarios_refuses_rather_than_reporting_success() {
         "the refusal should say the run measured nothing, got: {error:?}"
     );
 }
+
+/// A markdown link is not an unresolved path.
+///
+/// `unresolved_references` splits on whitespace, so `[`src/AGENTS.md`](src/AGENTS.md)`
+/// arrived as a single token and peeled down to the nonsense path
+/// "src/AGENTS.md`](src/AGENTS.md". The first live-tier run failed
+/// `agents_md_scoping` on exactly that, against a response that was correct —
+/// the assertion's own doc comment warns that "a false 'unresolved' would fail
+/// a good run", which is what it then did.
+///
+/// The deterministic tier cannot catch this: scripted responses are plain text,
+/// and real models write markdown.
+#[test]
+fn a_markdown_link_resolves_but_a_broken_one_is_still_caught() {
+    let dir = eval_harness::guard::eval_data_dir().expect("temp dir");
+    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+    std::fs::write(dir.join("src/AGENTS.md"), "rules").expect("write");
+
+    assert!(
+        assertions::unresolved_paths("See [`src/AGENTS.md`](src/AGENTS.md) for rules.", &dir)
+            .is_empty(),
+        "a markdown link to a file that exists must resolve"
+    );
+
+    // The same shape, pointing at nothing. Without this the fix could simply be
+    // "ignore anything that looks like a link", which would blind the check.
+    assert_eq!(
+        assertions::unresolved_paths("See [`src/NOPE.md`](src/NOPE.md) for rules.", &dir),
+        vec!["src/NOPE.md".to_string()],
+        "a markdown link to a missing file must still be reported, once"
+    );
+}
+
+/// §5.3 keeps one scenario definition so the tiers cannot drift. That holds
+/// only if both tiers offer the model the same tools.
+///
+/// They did not. `mock_provider()` sets `supports_native_tools: true`, while
+/// the live tier inherited DeepSeek's built-in `false`, and the patch tool is
+/// only offered when that flag is on. The first live run failed
+/// `patch_touches` on three scenarios with `actual=[]` — the model was never
+/// able to propose a patch, which measured the configuration rather than the
+/// assistant.
+#[test]
+fn both_tiers_offer_the_model_the_same_tools() {
+    let dir = eval_harness::guard::eval_data_dir().expect("temp dir");
+
+    let live = eval_harness::runner::live_config(&dir, "deepseek", "deepseek-v4-flash");
+    assert!(
+        live.supports_native_tools(),
+        "the live tier must offer native tools; without them no patch can be proposed"
+    );
+
+    let path = scenario::scenarios_dir().join("one_file_patch.toml");
+    let loaded = scenario::load(&path).expect("scenario");
+    let run = eval_harness::runner::run(&loaded).expect("deterministic run");
+    assert!(
+        run.record.native_tools,
+        "the deterministic tier's capability set must be recorded, and it offers native tools"
+    );
+}
