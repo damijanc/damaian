@@ -242,6 +242,51 @@ model_provider.deepseek.max_output_tokens=384000
 
 Setting a value higher than the model actually allows causes the provider to reject the request outright, so prefer the built-in defaults unless you know the model's real limit.
 
+## What a Turn Cost
+
+Every assistant reply carries a line underneath it saying what the turn used:
+
+```text
+~12,714 tokens (estimated) · 3 model calls
+```
+
+The count covers the whole turn, not the last request. A turn that used tools
+makes several model calls, and each one re-sends the assembled context, so
+three calls cost roughly three times what one does. The line survives a reload,
+so you can look back at what an old conversation spent.
+
+**"Estimated" means Damaian counted the tokens itself** rather than being told.
+Most providers report exact usage and the figure is then shown without the `~`
+or the marker. It falls back to an estimate when:
+
+- the provider does not report usage, or rejects the request for it;
+- you stopped the turn mid-answer, so no final report arrived;
+- the app crashed while a call was in flight, and the call is counted from what
+  was sent rather than lost.
+
+A turn mixing both is marked estimated overall — a total is only as reliable as
+its least reliable part. The estimate is a size-based approximation and is not
+exact; treat it as a rough scale, not a bill.
+
+### Showing a cost
+
+Damaian ships no price list. Prices change, and a stale table would report
+confident wrong numbers. If you want a cost figure, give it your own rates —
+per million tokens, in whatever currency you are billed in:
+
+```text
+model_provider.deepseek.price_per_million_input_tokens=0.27
+model_provider.deepseek.price_per_million_output_tokens=1.10
+```
+
+Both are required; one alone would produce a number that quietly omits half the
+spend. The result is labelled `at your rates`, because it is your arithmetic
+rather than the provider's invoice. Anything under a hundredth of a cent shows
+as `<$0.0001` rather than rounding to zero.
+
+Where a provider does report a cost of its own, that figure is shown instead
+and carries no such label.
+
 ## Local Data
 
 Damaian stores audit records, sessions, and patch proposals locally. By default, global app data is stored under:

@@ -1,6 +1,14 @@
 # Feature Spec: Token and Cost Accounting
 
-Status: Not started
+Status: Done, with one measurement outstanding. Every model call is accounted
+per task — measured where the provider reports usage, estimated where it does
+not, and never the one presented as the other. Retries, stopped turns and calls
+lost to a crash all count. The figure shows under each turn and survives a
+reload, and the eval harness reads the same `read_task_usage` rather than
+counting anything itself, so spec 18's token row is a real number instead of
+`notApplicable`. **No provider has been tested for usage reporting, and the
+`len / 4` estimate has never been checked against a measurement** — both need
+credentials; see §7. Requirement 2's completion report waits on spec 23.
 Order: 19 of 19
 Roadmap: `docs/ROADMAP/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 6 (Must). That directory is local-only and not committed, so the
@@ -252,11 +260,57 @@ why a figure may be estimated, and how to set price rates for a cost figure.
 
 ## 7. Implementation Notes
 
-To be completed during implementation. Record:
+**No provider has been tested for usage reporting, and the `len / 4` estimate
+has never been compared against a real measurement.** Both of this section's
+questions need credentials and a network call, and the implementing session had
+neither. Everything below the measured tier is therefore built and tested but
+unvalidated against a provider:
 
-- Which providers were tested for usage reporting, and whether
-  `stream_options: {"include_usage": true}` was accepted.
-- Measured versus estimated token counts for the same request against a provider
-  that reports usage, so the accuracy of the `len / 4` estimate is known rather
-  than assumed. If it is badly wrong, say so here — a later work package can
-  improve it, but nobody should discover it by accident.
+- The `stream_options` request and its rejection probe are exercised only by
+  `MockModelTransport::sequence`, against a synthetic error body. No real
+  provider has accepted or rejected the field.
+- Every figure the deterministic tier produces is an estimate, so
+  `UsageSource::Measured` has never been produced by anything but a test.
+
+This is the same open item as
+[spec 18](../18_local_evaluation_harness/proposal.md) §7's unverified live
+tier, and the two should be closed in one session with credentials. What to
+record here when that happens: which providers accepted `stream_options`, and
+the measured-versus-estimated counts for the same request as a percentage
+error. **If the estimate is badly wrong, say so here** — a later work package
+can improve it, but nobody should discover it by accident.
+
+### What implementing this found
+
+**A provider 4xx is not a transport error.** `curl -sS` exits zero on a 400, so
+a rejection arrives as a successful read whose body carries an `error` object.
+The §5.2 probe therefore branches on the parsed body, not on a failed send, and
+§6's reference to `MockModelTransport::failing` is wrong for the same reason —
+that helper raises `ClientError::Io`. A sequenced transport was added instead.
+
+**A cancelled mid-stream turn kept nothing.** `pump_stream` discards its
+accumulated body on cancellation and the chat loop substituted a synthetic zero
+run, so the two cases §6 asks to distinguish were the same object. The loop now
+keeps its own copy of what it streamed, which is the only surviving evidence
+that the provider generated — and billed — anything.
+
+**Recovery cannot estimate a lost call from a request that no longer exists.**
+The estimate is written onto the `action_started` marker *before* the call, and
+recovery reads it back. Without that, §6's lost-call criterion could only have
+been met with a zero, which is precisely the under-reporting §5.5 forbids. The
+append is guarded by marker id, because the sweep runs at every launch and an
+unguarded one would grow the reported spend each time the app opened.
+
+**Requirement 2's completion report does not exist yet.** It is
+[spec 23](../23_verification_loop.md) §5.7, not started. The task-state surface
+is built; the report reads `read_task_usage` when spec 23 builds it, rather
+than growing a second accounting path.
+
+**Reading the rendered output found what the tests did not.** `toFixed(4)`
+printed any cost below $0.0001 as `$0.0000`, which reads as free — the same
+failure the token side is careful to avoid. That band now renders `<$0.0001`.
+
+**Spec 18's token metric was pinned by nothing.** It reported
+`notApplicable: "spec-19"`, and changing it to a real figure broke no test. A
+test now pins both the sum and the fact that an estimated total says so in its
+label.

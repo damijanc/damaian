@@ -779,6 +779,50 @@ as `failed to start shell: <error>`. Sessions are held in a process-global map,
 so they do not survive a restart. `crates/desktop-shell/static/xterm*` is
 vendored and minified — never edit or reformat it.
 
+### Token figures are always "estimated"
+
+The per-turn line reads `~12,714 tokens (estimated)` and never drops the
+marker. That means no provider-reported usage reached the run.
+
+An OpenAI-compatible streaming API omits usage unless asked, so Damaian sends
+`stream_options: {"include_usage": true}` on every streaming request. Three
+things stop a measured figure coming back:
+
+1. **The provider rejects the field.** It answers with an error body naming
+   `stream_options` or `include_usage`. Damaian retries the request **once**
+   without the field and remembers the answer for the rest of the process, so
+   the probe costs one extra call per launch, not one per turn. That retry is
+   deliberately *not* counted as a retry attempt — it is a capability probe.
+   The observation is audited as `model_usage_reporting_unsupported`; grep the
+   audit log for it.
+2. **The provider accepts the field and reports nothing anyway.** No audit
+   event, because nothing failed. The figure is simply an estimate.
+3. **`provider_reports_usage` is off.** Then not even the probe runs.
+
+To stop probing a provider you know does not support it:
+
+```text
+model_provider.<id>.provider_reports_usage=false
+```
+
+Repository config cannot set this, or any other `model_provider.*` key — see
+[the trust boundary spec](specs/34_repository_config_trust_boundary.md).
+
+An estimate is `payload length / 4`, the same approximation the context budget
+uses. It is deliberately the same one: a second, better estimate would give
+two different token counts for the same turn.
+
+### A turn shows no token line at all
+
+Sessions written before token accounting shipped carry no usage events, and
+those turns render nothing rather than a zero — a zero would read as "this
+turn was free". Only new turns have figures. Check the session log for
+`task_usage_recorded`:
+
+```bash
+grep -c task_usage_recorded ~/Library/Application\ Support/DamaianClient/sessions/<session>.jsonl
+```
+
 ### The packaged app will not launch
 
 Expected, not a bug. The developer preview is ad-hoc signed, not Developer ID
