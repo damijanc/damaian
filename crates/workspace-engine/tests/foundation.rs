@@ -4681,3 +4681,97 @@ fn audit_can_be_disabled_by_policy() {
 
     fs::remove_dir_all(repo).unwrap();
 }
+
+/// Every provider field `set` accepts must survive `save`.
+///
+/// Spec 19 added `provider_reports_usage` and the two price keys to the overlay
+/// and to `set`, but not to `push_model_provider_overlay`. `config-set` then
+/// printed "wrote <path>" and dropped the value — and because `config-set` is a
+/// load-set-save cycle, setting any unrelated key silently stripped rates a
+/// user had hand-edited into the file. Found while configuring real DeepSeek
+/// prices to check a live cost figure.
+#[test]
+fn saving_a_provider_overlay_keeps_every_field_it_accepted() {
+    let root = temp_dir("provider-overlay-round-trip");
+    let path = root.join("user.conf");
+    let mut overlay = ConfigOverlay::default();
+    for (key, value) in [
+        (
+            "model_provider.deepseek.base_url",
+            "https://example.invalid",
+        ),
+        ("model_provider.deepseek.supports_native_tools", "true"),
+        ("model_provider.deepseek.max_output_tokens", "4096"),
+        ("model_provider.deepseek.context_token_budget", "8192"),
+        ("model_provider.deepseek.provider_reports_usage", "false"),
+        (
+            "model_provider.deepseek.price_per_million_input_tokens",
+            "0.15",
+        ),
+        (
+            "model_provider.deepseek.price_per_million_output_tokens",
+            "0.6",
+        ),
+    ] {
+        overlay.set(key, value).unwrap();
+    }
+    overlay.save(&path).unwrap();
+
+    let loaded = ConfigOverlay::load(&path).unwrap();
+    let provider = loaded
+        .model_providers
+        .iter()
+        .find(|provider| provider.id == "deepseek")
+        .expect("the provider entry should survive a save");
+
+    assert_eq!(
+        provider.base_url.as_deref(),
+        Some("https://example.invalid")
+    );
+    assert_eq!(provider.supports_native_tools, Some(true));
+    assert_eq!(provider.max_output_tokens, Some(4096));
+    assert_eq!(provider.context_token_budget, Some(8192));
+    assert_eq!(provider.provider_reports_usage, Some(false));
+    assert_eq!(provider.price_per_million_input_tokens, Some(0.15));
+    assert_eq!(provider.price_per_million_output_tokens, Some(0.6));
+}
+
+/// Setting one field on a built-in provider must not erase the rest of it.
+///
+/// Built-in providers live in `builtin_model_provider_config`, not in
+/// `model_providers`, so an overlay for one took the "insert" path and filled
+/// every unset field with a default. The blank entry then shadowed the
+/// built-in completely: base URL and key variable emptied, model list emptied
+/// so `model_name` fell back to another provider's default while
+/// `model_provider` still said `deepseek`, and native tools forced off.
+///
+/// This is reachable from documented advice — `USER_GUIDE.md` lists
+/// `model_provider.<id>.max_output_tokens` and `context_token_budget` as
+/// ordinary user settings. Found by setting real prices to check a live cost
+/// figure, which left the CLI reporting that an empty-named variable "is
+/// required for live model calls".
+#[test]
+fn setting_one_field_on_a_builtin_provider_keeps_the_rest_of_it() {
+    let mut config = Config::default();
+    config.apply_overlay(
+        ConfigOverlay::parse(
+            "model_provider=deepseek\n\
+             model_provider.deepseek.price_per_million_input_tokens=0.15\n",
+        )
+        .unwrap(),
+    );
+
+    assert_eq!(config.model_base_url, "https://api.deepseek.com");
+    assert_eq!(config.model_api_key_env, "DEEPSEEK_API_KEY");
+    assert_eq!(config.model_name, "deepseek-v4-flash");
+    assert!(
+        config
+            .estimated_cost(&TokenUsage::estimated(1_000_000, 0))
+            .is_none(),
+        "one rate alone must not produce a cost"
+    );
+    // Seeding must not promote the built-in's last-resort token budgets to the
+    // first level of resolution, which would outrank the per-model table and
+    // drop a V4 install to the 8192 legacy ceiling.
+    assert_eq!(config.max_output_tokens(), Some(65_536));
+}

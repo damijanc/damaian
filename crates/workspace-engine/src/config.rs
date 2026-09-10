@@ -850,6 +850,34 @@ impl Config {
     }
 
     fn upsert_model_provider(&mut self, overlay: ModelProviderConfigOverlay) {
+        // A built-in provider is not in `model_providers` — it is produced on
+        // demand by `builtin_model_provider_config` — so an overlay naming one
+        // used to fall through to the insert path below and fill every unset
+        // field with a default. The resulting blank entry then shadowed the
+        // built-in completely, emptying its base URL, key variable and model
+        // list. Seeding from the built-in first keeps a partial override
+        // partial, which is what setting one key is asking for.
+        if !self
+            .model_providers
+            .iter()
+            .any(|provider| provider.id == overlay.id)
+            && let Some(builtin) = builtin_model_provider_config(&overlay.id)
+        {
+            // The two token budgets are deliberately left unset. Both resolve
+            // through three levels — a listed entry, then the per-model table,
+            // then the built-in provider's fallback — and the built-in's own
+            // values are that last-resort fallback. Copying them into a listed
+            // entry would promote them to the first level and outrank the
+            // per-model table, so a DeepSeek V4 install asking only for a
+            // price would silently drop from a 65536 output ceiling to the
+            // 8192 legacy fallback. Level three still consults the built-in.
+            self.model_providers.push(ModelProviderConfig {
+                max_output_tokens: None,
+                context_token_budget: None,
+                ..builtin
+            });
+        }
+
         if let Some(provider) = self
             .model_providers
             .iter_mut()
@@ -1839,52 +1867,82 @@ fn push_model_provider_config(output: &mut String, provider: &ModelProviderConfi
 }
 
 fn push_model_provider_overlay(output: &mut String, provider: &ModelProviderConfigOverlay) {
-    if let Some(value) = &provider.label {
-        push_line(
-            output,
-            &format!("model_provider.{}.label", provider.id),
-            value,
-        );
+    // Exhaustive destructuring, deliberately without `..`, and every binding is
+    // used below — the same guard `apply_overlay_scoped` uses, for the same
+    // reason. A field added to the overlay and not written here compiles
+    // cleanly and silently loses the user's setting on the next save. That is
+    // exactly what happened to `provider_reports_usage` and the two price
+    // keys: `set` accepted them, `save` dropped them, and `config-set`
+    // reported success either way. Adding a field now fails the build instead.
+    let ModelProviderConfigOverlay {
+        id,
+        label,
+        base_url,
+        api_key_env,
+        models,
+        supports_native_tools,
+        max_output_tokens,
+        context_token_budget,
+        provider_reports_usage,
+        price_per_million_input_tokens,
+        price_per_million_output_tokens,
+    } = provider;
+
+    if let Some(value) = label {
+        push_line(output, &format!("model_provider.{id}.label"), value);
     }
-    if let Some(value) = &provider.base_url {
-        push_line(
-            output,
-            &format!("model_provider.{}.base_url", provider.id),
-            value,
-        );
+    if let Some(value) = base_url {
+        push_line(output, &format!("model_provider.{id}.base_url"), value);
     }
-    if let Some(value) = &provider.api_key_env {
-        push_line(
-            output,
-            &format!("model_provider.{}.api_key_env", provider.id),
-            value,
-        );
+    if let Some(value) = api_key_env {
+        push_line(output, &format!("model_provider.{id}.api_key_env"), value);
     }
-    if let Some(value) = &provider.models {
+    if let Some(value) = models {
         push_line(
             output,
-            &format!("model_provider.{}.models", provider.id),
+            &format!("model_provider.{id}.models"),
             &join_list(value),
         );
     }
-    if let Some(value) = provider.supports_native_tools {
+    if let Some(value) = supports_native_tools {
         push_line(
             output,
-            &format!("model_provider.{}.supports_native_tools", provider.id),
+            &format!("model_provider.{id}.supports_native_tools"),
             &value.to_string(),
         );
     }
-    if let Some(value) = provider.max_output_tokens {
+    if let Some(value) = max_output_tokens {
         push_line(
             output,
-            &format!("model_provider.{}.max_output_tokens", provider.id),
+            &format!("model_provider.{id}.max_output_tokens"),
             &value.to_string(),
         );
     }
-    if let Some(value) = provider.context_token_budget {
+    if let Some(value) = context_token_budget {
         push_line(
             output,
-            &format!("model_provider.{}.context_token_budget", provider.id),
+            &format!("model_provider.{id}.context_token_budget"),
+            &value.to_string(),
+        );
+    }
+    if let Some(value) = provider_reports_usage {
+        push_line(
+            output,
+            &format!("model_provider.{id}.provider_reports_usage"),
+            &value.to_string(),
+        );
+    }
+    if let Some(value) = price_per_million_input_tokens {
+        push_line(
+            output,
+            &format!("model_provider.{id}.price_per_million_input_tokens"),
+            &value.to_string(),
+        );
+    }
+    if let Some(value) = price_per_million_output_tokens {
+        push_line(
+            output,
+            &format!("model_provider.{id}.price_per_million_output_tokens"),
             &value.to_string(),
         );
     }
