@@ -1047,6 +1047,42 @@ fn an_unparsable_repository_key_is_reported_and_the_rest_of_the_file_applies() {
     fixture.cleanup();
 }
 
+/// The rollback above matters most for a *known* provider field with a bad
+/// value: it fails inside the field's own parser, after
+/// `set_model_provider_config` has already pushed the provider entry. Spec 19's
+/// price keys are the newest such field and the likeliest to be mistyped, so
+/// they pin the rollback rather than relying on the unknown-key path alone.
+#[test]
+fn a_mistyped_repository_price_does_not_leave_a_phantom_provider_rejection() {
+    let fixture = fixture(
+        "unparsable-price",
+        "model_provider=openai\n",
+        concat!(
+            "model_provider.openai.price_per_million_input_tokens=free\n",
+            "ignore_patterns=vendor/\n",
+        ),
+    );
+
+    let (config, report) = fixture.load_reporting();
+
+    assert!(config.ignore_patterns.iter().any(|p| p == "vendor/"));
+    assert_eq!(
+        report.rejected_key_names(),
+        vec!["model_provider.openai.price_per_million_input_tokens"],
+        "the half-built provider entry must not be reported as a second rejection"
+    );
+    assert_eq!(
+        report.rejected_keys[0].class,
+        RepositoryKeyClass::Unparsable
+    );
+    assert!(
+        config.model_provider_config("openai").is_none(),
+        "a rolled-back line must not leave a provider entry behind either"
+    );
+
+    fixture.cleanup();
+}
+
 #[test]
 fn an_unparsable_repository_value_is_reported_rather_than_failing_the_load() {
     let fixture = fixture(
