@@ -10,7 +10,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use workspace_engine::{SessionStore, Task, TokenUsage, UsageSource};
+use workspace_engine::{
+    AuditLog, SecretScanner, SessionStore, Task, TaskStatus, TokenUsage, UsageSource,
+    classify_session,
+};
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -228,6 +231,159 @@ fn a_session_written_before_this_change_reports_no_runs_rather_than_a_zero() {
         !usage.contains_key(&fixture.task.id),
         "a task with no usage events must be absent, not zero"
     );
+
+    fixture.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// A call lost to a crash. Spec 19 §5.5: the request went out and was billed,
+// and its answer is gone. Under-reporting here would make a crash look free.
+// ---------------------------------------------------------------------------
+
+struct CrashFixture {
+    data_dir: PathBuf,
+    store: SessionStore,
+    audit: AuditLog,
+    session_id: String,
+}
+
+fn crash_fixture(name: &str) -> CrashFixture {
+    let data_dir = temp_data_dir(name);
+    let store = SessionStore::new(&data_dir);
+    let audit = AuditLog::new(&data_dir, true, SecretScanner::default());
+    let session = store.create_session("repo_1", "Crash").unwrap();
+    CrashFixture {
+        data_dir,
+        store,
+        audit,
+        session_id: session.id,
+    }
+}
+
+impl CrashFixture {
+    /// The signature a kill leaves mid-call: the task in a non-terminal state
+    /// with a `model_call` marker that started and never finished, carrying
+    /// the estimate written before the request went out.
+    fn task_with_model_call_in_flight(&self, estimate: u64) -> Task {
+        let task = self
+            .store
+            .create_task(&self.session_id, "do the thing", "mock", "m")
+            .unwrap();
+        let task = self
+            .store
+            .update_task_status(&task, TaskStatus::RunningTool, None)
+            .unwrap();
+        // Never finished: stands in for the process dying here.
+        let _marker = self
+            .store
+            .start_action_with_estimate(&task, "model_call", "m", false, Some(estimate))
+            .unwrap();
+        task
+    }
+
+    fn classify(&self) {
+        classify_session(&self.store, &self.audit, &self.session_id).unwrap();
+    }
+
+    fn cleanup(self) {
+        let _ = fs::remove_dir_all(self.data_dir);
+    }
+}
+
+#[test]
+fn a_call_lost_to_a_crash_is_counted_at_recovery() {
+    let fixture = crash_fixture("lost-call");
+    let task = fixture.task_with_model_call_in_flight(4200);
+
+    fixture.classify();
+
+    let usage = fixture.store.read_task_usage(&fixture.session_id).unwrap();
+    let total = usage
+        .get(&task.id)
+        .expect("a call that was billed and lost is still counted");
+
+    assert_eq!(total.run_count, 1);
+    assert_eq!(total.input_tokens, 4200);
+    assert_eq!(total.output_tokens, 0, "no answer ever came back");
+    assert_eq!(total.source, UsageSource::Estimated);
+
+    fixture.cleanup();
+}
+
+#[test]
+fn classifying_twice_does_not_bill_the_lost_call_twice() {
+    // The launch sweep runs at every start. Without a guard, one crash would
+    // grow the reported spend every time the app is opened.
+    let fixture = crash_fixture("idempotent");
+    let task = fixture.task_with_model_call_in_flight(4200);
+
+    fixture.classify();
+    fixture.classify();
+
+    let usage = fixture.store.read_task_usage(&fixture.session_id).unwrap();
+    assert_eq!(usage[&task.id].run_count, 1);
+    assert_eq!(usage[&task.id].input_tokens, 4200);
+
+    fixture.cleanup();
+}
+
+#[test]
+fn a_call_that_was_already_accounted_is_not_billed_again_at_recovery() {
+    // A crash *after* the usage event was appended but before the task
+    // reached a terminal state. The marker is still dangling, but the call is
+    // already paid for.
+    let fixture = crash_fixture("already-accounted");
+    let task = fixture.task_with_model_call_in_flight(4200);
+    let marker_id = fixture
+        .store
+        .dangling_actions(&fixture.session_id)
+        .unwrap()
+        .first()
+        .expect("the fixture leaves one dangling action")
+        .marker_id
+        .clone();
+    fixture
+        .store
+        .record_task_usage(
+            &task,
+            "modelrun_1",
+            Some(&marker_id),
+            measured(4200, 130),
+            None,
+            None,
+        )
+        .unwrap();
+
+    fixture.classify();
+
+    let usage = fixture.store.read_task_usage(&fixture.session_id).unwrap();
+    assert_eq!(usage[&task.id].run_count, 1, "the call was already counted");
+    assert_eq!(usage[&task.id].output_tokens, 130);
+
+    fixture.cleanup();
+}
+
+#[test]
+fn a_dangling_action_that_is_not_a_model_call_bills_nothing() {
+    // A patch application or a command left in flight cost no tokens.
+    let fixture = crash_fixture("not-a-model-call");
+    let task = fixture
+        .store
+        .create_task(&fixture.session_id, "do the thing", "mock", "m")
+        .unwrap();
+    let task = fixture
+        .store
+        .update_task_status(&task, TaskStatus::ApplyingPatch, None)
+        .unwrap();
+    let _marker = fixture
+        .store
+        .start_action(&task, "apply_patch", "patch_1", true)
+        .unwrap();
+
+    fixture.classify();
+
+    let usage = fixture.store.read_task_usage(&fixture.session_id).unwrap();
+    assert!(!usage.contains_key(&task.id));
 
     fixture.cleanup();
 }

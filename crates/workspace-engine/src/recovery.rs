@@ -6,6 +6,11 @@
 //! `sideEffecting: true` means the outcome is unknown, and anything else means
 //! the task was merely interrupted.
 //!
+//! The classifier makes one write, and only one: spec 19 §5.5 requires a model
+//! call lost to the crash to be accounted for, and the sweep is the only place
+//! that knows one was lost. It is an append, it is idempotent across launches,
+//! and it changes no classification — see `account_for_lost_model_calls`.
+//!
 //! The module's reason for existing is requirement 5 — no action whose outcome
 //! is unknown is ever automatically repeated. That decision is made *here*
 //! rather than by a caller, because spec 45 will present it from a webview and
@@ -14,6 +19,7 @@
 use crate::audit::AuditLog;
 use crate::edit::PatchStore;
 use crate::error::{ClientError, Result};
+use crate::model::TokenUsage;
 use crate::patch_engine::ProposedPatch;
 use crate::session::{DanglingAction, PendingApprovalRef, SessionStore, TaskStatus};
 use crate::validation::{CommandProposal, CommandStore};
@@ -62,6 +68,9 @@ pub fn classify_session(
 
     let statuses = store.read_task_statuses(session_id)?;
     let dangling = store.dangling_actions(session_id)?;
+
+    account_for_lost_model_calls(store, audit, session_id, &dangling)?;
+
     let mut recovered = Vec::new();
 
     for (task_id, raw_status) in statuses {
@@ -171,6 +180,59 @@ pub fn classify_session(
 
     recovered.sort_by(|left, right| left.task_id.cmp(&right.task_id));
     Ok(recovered)
+}
+
+/// Appends an estimated usage event for every model call that started and
+/// never finished, per spec 19 §5.5.
+///
+/// A call in flight when the process died was billed and its answer is gone.
+/// Leaving it out would make a crash look free, which is the under-reporting
+/// that spec's §5.5 exists to prevent. The figure comes from the estimate
+/// written onto the marker *before* the request went out, because the request
+/// itself no longer exists.
+///
+/// Guarded by marker id rather than by a flag: this runs on every launch, and
+/// an unguarded append would grow the reported spend each time the app starts.
+fn account_for_lost_model_calls(
+    store: &SessionStore,
+    audit: &AuditLog,
+    session_id: &str,
+    dangling: &[DanglingAction],
+) -> Result<()> {
+    let already_accounted = store.usage_marker_ids(session_id)?;
+    for action in dangling
+        .iter()
+        .filter(|action| action.action == "model_call")
+    {
+        if already_accounted.contains(&action.marker_id) {
+            continue;
+        }
+        // A marker written before spec 19 carries no estimate. Nothing
+        // truthful can be said about it, and inventing a number would be
+        // worse than the gap.
+        let Some(estimate) = action.estimated_input_tokens else {
+            continue;
+        };
+        store.record_task_usage_for_task_id(
+            session_id,
+            &action.task_id,
+            &format!("lost_{}", action.marker_id),
+            Some(&action.marker_id),
+            TokenUsage::estimated(estimate, 0),
+            None,
+            Some("lost_to_crash"),
+        )?;
+        audit.record(
+            "task_usage_recorded_for_lost_call",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session_id.to_string()),
+                ("taskId", action.task_id.clone()),
+                ("estimatedInputTokens", estimate.to_string()),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// Classifies every non-terminal task across every session in the data

@@ -3,7 +3,7 @@ use crate::error::Result;
 use crate::hash::{create_id, now_millis};
 use crate::model::{TokenUsage, UsageSource};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -194,12 +194,20 @@ impl ActionMarker {
 /// it was in flight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DanglingAction {
+    /// The `markerId` this action started under. Load-bearing for pairing:
+    /// spec 19 records a call's usage against it, so recovery can tell an
+    /// accounted call from an unaccounted one.
+    pub marker_id: String,
     pub task_id: String,
     pub action: String,
     pub reference: String,
     /// Recorded on the *start* event, so the classifier does not have to
     /// re-derive the action's nature after the code that knew it is gone.
     pub side_effecting: bool,
+    /// The input-token estimate written before a model call went out, so a
+    /// call lost to a crash can still be accounted. `None` for every action
+    /// that is not a model call, and for markers written before spec 19.
+    pub estimated_input_tokens: Option<u64>,
     pub seq: u64,
 }
 
@@ -743,6 +751,24 @@ impl SessionStore {
         reference: &str,
         side_effecting: bool,
     ) -> Result<ActionMarker> {
+        self.start_action_with_estimate(task, action, reference, side_effecting, None)
+    }
+
+    /// [`Self::start_action`], additionally recording the input-token estimate
+    /// for a model call.
+    ///
+    /// The estimate has to be durable *before* the call, because after a crash
+    /// the request object is gone: recovery has the marker and nothing else,
+    /// and would otherwise have only a zero to account a billed call with.
+    /// `None` for every action that is not a model call. Spec 19 §5.5.
+    pub fn start_action_with_estimate(
+        &self,
+        task: &Task,
+        action: &str,
+        reference: &str,
+        side_effecting: bool,
+        estimated_input_tokens: Option<u64>,
+    ) -> Result<ActionMarker> {
         let marker = ActionMarker {
             id: create_id("action"),
             session_id: task.session_id.clone(),
@@ -750,19 +776,42 @@ impl SessionStore {
             action: action.to_string(),
             reference: reference.to_string(),
         };
+        let estimate = match estimated_input_tokens {
+            Some(tokens) => format!(",\"estimatedInputTokens\":{tokens}"),
+            None => String::new(),
+        };
         self.append_session_event(
             &marker.session_id,
             "action_started",
             &format!(
-                "{{\"markerId\":\"{}\",\"taskId\":\"{}\",\"action\":\"{}\",\"ref\":\"{}\",\"sideEffecting\":{}}}",
+                "{{\"markerId\":\"{}\",\"taskId\":\"{}\",\"action\":\"{}\",\"ref\":\"{}\",\"sideEffecting\":{}{}}}",
                 escape_json(&marker.id),
                 escape_json(&marker.task_id),
                 escape_json(&marker.action),
                 escape_json(&marker.reference),
-                side_effecting
+                side_effecting,
+                estimate
             ),
         )?;
         Ok(marker)
+    }
+
+    /// The `markerId` of every action that already has a usage event.
+    ///
+    /// Recovery runs at every launch, so "has this call been accounted for"
+    /// has to be answerable from the log rather than from a flag held in
+    /// memory. Without it, one crash would inflate the reported spend on
+    /// every subsequent start.
+    pub fn usage_marker_ids(&self, session_id: &str) -> Result<HashSet<String>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(HashSet::new());
+        };
+        Ok(parsed_events(&content)
+            .0
+            .into_iter()
+            .filter(|event| event.event_type == "task_usage_recorded")
+            .filter_map(|event| event.text("markerId"))
+            .collect())
     }
 
     /// Records `action_finished`, consuming the marker.
@@ -809,8 +858,9 @@ impl SessionStore {
                         continue;
                     };
                     started.push((
-                        marker_id,
+                        marker_id.clone(),
                         DanglingAction {
+                            marker_id,
                             task_id,
                             action: event.text("action").unwrap_or_default(),
                             reference: event.text("ref").unwrap_or_default(),
@@ -819,6 +869,10 @@ impl SessionStore {
                                 .get("sideEffecting")
                                 .and_then(|value| value.as_bool())
                                 .unwrap_or(true),
+                            estimated_input_tokens: event
+                                .payload
+                                .get("estimatedInputTokens")
+                                .and_then(|value| value.as_u64()),
                             seq: event.seq,
                         },
                     ));

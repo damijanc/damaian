@@ -976,11 +976,16 @@ impl ChatOrchestrator {
             // of the lost one rather than hiding it. So a marker left dangling
             // on the cancellation path classifies as `interrupted`, which is the
             // correct answer per §5.1 ("a call may have been billed").
-            let model_marker = self.session_store.start_action(
+            // The estimate rides on the marker because it must outlive the
+            // request: after a crash the request is gone, and recovery would
+            // otherwise have only a zero to account a billed call with.
+            // Spec 19 §5.5.
+            let model_marker = self.session_store.start_action_with_estimate(
                 &task,
                 "model_call",
                 &self.config.model_name,
                 false,
+                Some(model_request_json(&request).len().div_ceil(4) as u64),
             )?;
             let model_marker_id = model_marker.id().to_string();
 
