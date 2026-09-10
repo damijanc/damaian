@@ -151,6 +151,14 @@ turn ends — writing an allowlist, granting a session-wide permission, deleting
 a stored item — must not sit at the same visual weight as the one-shot action
 next to it, because the cost of a mis-click is not symmetric.
 
+**A surface with no safe action has no primary.** §1's "one primary action per
+surface" is a ceiling, not a quota. The crash recovery card
+([spec 45](specs/45_crash_recovery_prompt.md)) drops its fill entirely when
+`Resume` is not on offer, leaving `Mark failed` quiet and `Abandon` in the
+overflow: filling the only remaining control would make a terminal choice the
+loudest thing on a surface that exists because Damaian could not tell what
+happened.
+
 There are two popover implementations and they are not interchangeable:
 
 - **`.model-popover`** — `position: absolute`, anchored by CSS to a fixed

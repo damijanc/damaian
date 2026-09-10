@@ -112,6 +112,25 @@ A rewind never rewrites history you can audit. The conversation moves back by ap
 
 **Checkpoints are session recovery, not version control.** They cover Damaian's own changes to one repository, they expire (`checkpoint_retention_days`, 90 days by default), and they are no substitute for a commit. Commit anything you would be unhappy to lose.
 
+## After a Crash
+
+If Damaian stops while a turn is in flight — a crash, a force quit, a machine that lost power — the turn is not lost silently. When you reopen the session, a card at the top of the conversation says what was actually happening: "A patch application was in progress and its outcome is unknown", "Reading a file was interrupted before it finished". It never just says the session was interrupted, because what was in flight is what decides what can safely be done about it.
+
+Each card offers up to four choices:
+
+- **Resume** or **Continue** — sends your original request again as a new turn. Offered only when Damaian can account for everything that was in flight.
+- **Inspect** — expands to show your request, the action that never finished, the files it may have touched, and the checkpoint taken before the turn, so you can rewind if you want to.
+- **Mark failed** — closes the turn out and records that its outcome was unknown.
+- **Abandon** — closes the turn without retrying it.
+
+Neither `Mark failed` nor `Abandon` changes or undoes anything on disk. They settle what the *turn* is, not what happened to your files. Putting files back is `Rewind`, which is what the checkpoint link in `Inspect` opens.
+
+**Damaian will not retry an action on its own.** Where a turn was reading files or waiting on the model, there is nothing outside Damaian that could have half-happened, so the turn is marked ready to pick up again and the card tells you it was — but it still waits for you to press `Continue`, because resuming means paying for another model call and you should be the one to decide that.
+
+Where something was running that could have changed the world — a command, a patch being written to disk, a call out to an MCP server — `Resume` is not offered at all, and the card says why. There is no way to find out whether a command finished, whether the patch wrote three files or ten, or whether the remote call went through. Damaian will not run it again and hope, and it will not do so even if you ask: the refusal is in the engine, not in a button that could be worked around. Look at what actually happened with `Inspect`, put files back with `Rewind` if you need to, and then mark the turn failed or abandon it.
+
+If a turn was waiting for your approval when Damaian stopped, that approval comes back: the command or the patch is re-presented exactly as it was, and nothing runs until you approve it. A command approved this way runs on its own — the conversation that proposed it ended with the crash, so its output is not fed back to the model. Occasionally an approval cannot be restored, because an older version of Damaian recorded that a turn was waiting without recording what it was waiting for. That turn is closed with the reason stated rather than shown as a rebuilt approval card: approving a command Damaian is guessing at would be worse than losing the turn. Your stored patches and commands are untouched either way.
+
 ## Settings
 
 Use the `Settings` tab to inspect and edit user configuration values, then select `Load`.

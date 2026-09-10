@@ -19,6 +19,7 @@ use workspace_engine::{
 };
 
 mod keychain;
+mod recovery;
 pub mod terminal;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
@@ -350,6 +351,27 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 "application/json",
                 &format!("{{\"sessions\":[{}]}}", sessions_json(&sessions)),
             )
+        }
+        // The launch sweep behind `docs/specs/45_crash_recovery_prompt.md`. It
+        // runs once per process; every call after the first serves the same
+        // snapshot, minus tasks the user has since dealt with.
+        ("GET", "/api/recovery") => {
+            let payload = recovery::sweep_json()?;
+            write_response(stream, &request, 200, "application/json", &payload)
+        }
+        // Resume, mark failed, or abandon one recovered task. The decision is
+        // re-classified server-side: see `recovery::decide`.
+        ("POST", "/api/recovery-decision") => {
+            let form = parse_form(&request.body);
+            let payload = recovery::decide(&form)?;
+            write_response(stream, &request, 200, "application/json", &payload)
+        }
+        // Closes out a task whose reattached approval has been answered, so the
+        // next launch does not offer to run the same command again.
+        ("POST", "/api/recovery-approval-resolved") => {
+            let form = parse_form(&request.body);
+            let payload = recovery::resolve_reattached_approval(&form)?;
+            write_response(stream, &request, 200, "application/json", &payload)
         }
         ("GET", "/api/checkpoints") => {
             let repo = required_param(&request, "repo")?;
@@ -3455,9 +3477,11 @@ mod tests {
     }
 
     /// Serves the real UI with a known API token, seeded with a session whose
-    /// turn can be rewound, so the checkpoint controls can actually be looked
-    /// at. The web UI takes its token from the Tauri bootstrap, so a browser
-    /// cannot otherwise authenticate — and a full Tauri build is minutes.
+    /// turn can be rewound and with three tasks left mid-flight, so the
+    /// checkpoint controls and both shapes of the crash recovery card can
+    /// actually be looked at. The web UI takes its token from the Tauri
+    /// bootstrap, so a browser cannot otherwise authenticate — and a full Tauri
+    /// build is minutes.
     ///
     /// `#[ignore]`d: it binds a port and serves until it is stopped. Run it by
     /// hand and open the URL it prints:
@@ -3560,6 +3584,58 @@ mod tests {
         engine
             .checkpoint_store
             .seal_checkpoint(&repo, &manifest)
+            .unwrap();
+
+        // Both shapes of the crash recovery card
+        // (`docs/specs/45_crash_recovery_prompt.md` §5.6) plus a reattached
+        // approval, so the surface can be driven without staging a real crash.
+        // The turn above stays non-terminal on purpose: its card is the one
+        // with a checkpoint for `Inspect` to link to.
+        let unknown = engine
+            .session_store
+            .create_task(&session.id, "run the database migration", "mock", "mock")
+            .unwrap();
+        let unknown = engine
+            .session_store
+            .update_task_status(&unknown, workspace_engine::TaskStatus::RunningTool, None)
+            .unwrap();
+        let _unknown_marker = engine
+            .session_store
+            .start_action(&unknown, "run_command", "psql -f migrate.sql", true)
+            .unwrap();
+        let interrupted = engine
+            .session_store
+            .create_task(&session.id, "explain the retry helper", "mock", "mock")
+            .unwrap();
+        let interrupted = engine
+            .session_store
+            .update_task_status(
+                &interrupted,
+                workspace_engine::TaskStatus::PreparingContext,
+                None,
+            )
+            .unwrap();
+        let _interrupted_marker = engine
+            .session_store
+            .start_action(&interrupted, "read_file", "retry.rs", false)
+            .unwrap();
+        let awaiting = engine
+            .session_store
+            .create_task(&session.id, "list the crate", "mock", "mock")
+            .unwrap();
+        let proposal = engine
+            .validation_orchestrator
+            .propose_command(&repo, "ls -la", "Desktop command proposal")
+            .unwrap();
+        engine
+            .session_store
+            .await_approval(
+                &awaiting,
+                &workspace_engine::PendingApprovalRef {
+                    kind: "command".to_string(),
+                    proposal_id: proposal.id.clone(),
+                },
+            )
             .unwrap();
 
         let options = ShellOptions {

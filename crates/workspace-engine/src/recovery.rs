@@ -292,6 +292,101 @@ fn fail_task(
     Ok(())
 }
 
+/// The sentence naming what was in flight, for
+/// `docs/specs/45_crash_recovery_prompt.md` §5.2.
+///
+/// It lives here rather than in the desktop shell for two reasons. The
+/// frontend should never map action names to prose — the same reason
+/// `chat::tool_action_label` is not in the UI — and the shell has no JS test
+/// suite, so a sentence assembled in a webview could not be asserted against a
+/// session log at all.
+///
+/// Requirement 1 forbids a generic "session interrupted", so every branch names
+/// something specific: the action when a marker survived, the state the task
+/// was left in when none did, and the raw action name when this version does
+/// not recognise it.
+pub fn headline(recovered: &RecoveredTask) -> String {
+    let unknown = recovered.classification == TaskStatus::UnknownExternalOutcome;
+    match &recovered.dangling {
+        Some(action) => {
+            let subject = action_subject(&action.action);
+            if unknown {
+                format!("{subject} was in progress and its outcome is unknown")
+            } else {
+                format!("{subject} was interrupted before it finished")
+            }
+        }
+        // No marker reached the log. The action is unknowable, but the state is
+        // not, so the sentence says what is actually known.
+        None => format!(
+            "This turn stopped while {}",
+            state_phrase(&recovered.previous_status)
+        ),
+    }
+}
+
+/// The grammatical subject for an action marker: capitalised, because it opens
+/// the sentence. An unrecognised name is returned verbatim rather than
+/// generalised — a later version can add an action without silently turning its
+/// recovery prompt vague.
+fn action_subject(action: &str) -> &str {
+    match action {
+        "apply_patch" => "A patch application",
+        "propose_patch" => "Preparing a patch",
+        "run_command" => "A command",
+        "model_call" => "A model request",
+        "mcp_call" => "An MCP tool call",
+        "web_diagnostic" => "A browser diagnostic",
+        "read_file" => "Reading a file",
+        "search_codebase" => "A codebase search",
+        "read_git_status" => "Reading git status",
+        "read_git_diff" => "Reading the git diff",
+        other => other,
+    }
+}
+
+/// What the task was doing, from the status it was left in. The legacy
+/// `running` string gets its own arm: it means only that something was in
+/// flight, which is exactly what spec 17 §5.6 says cannot be narrowed further.
+fn state_phrase(previous_status: &str) -> &str {
+    match TaskStatus::parse(previous_status) {
+        Some(TaskStatus::Created) => "starting up",
+        Some(TaskStatus::PreparingContext) => "gathering context from your repository",
+        Some(TaskStatus::WaitingForModel) => "waiting for the model",
+        Some(TaskStatus::RunningTool) => "running a tool",
+        Some(TaskStatus::ApplyingPatch) => "applying a patch",
+        Some(TaskStatus::Validating) => "running validation",
+        Some(TaskStatus::WaitingForApproval) => "waiting for your approval",
+        Some(TaskStatus::UnknownExternalOutcome) => "in a state whose outcome was already unknown",
+        // Terminal states are never classified, and `Interrupted` is the
+        // classifier's own output rather than a state anything writes.
+        Some(_) | None => "working, and nothing recorded on what",
+    }
+}
+
+/// Why `Resume` is not offered, or `None` when it is.
+///
+/// Requirement 2 asks for the absence to be explained rather than silent, and
+/// the explanation belongs with the decision: an explanation composed in a
+/// webview is the webview's guess at what the engine concluded.
+pub fn resume_blocked_reason(recovered: &RecoveredTask) -> Option<String> {
+    if resume_allowed(recovered) {
+        return None;
+    }
+    let what = match &recovered.dangling {
+        Some(action) => action_subject(&action.action).to_string(),
+        // `UnknownExternalOutcome` without a marker cannot arise from the
+        // classifier, which needs a side-effecting marker to reach it. It can
+        // arise from a *stored* status of that name, so the sentence still has
+        // to work.
+        None => "A side-effecting action".to_string(),
+    };
+    Some(format!(
+        "{what} was running when Damaian stopped, and there is no way to tell \
+         whether it finished. Damaian will not run it again on its own."
+    ))
+}
+
 /// Whether a human may choose to resume this task at all.
 ///
 /// **This is a different question from [`RecoveredTask::auto_resume_permitted`]**,

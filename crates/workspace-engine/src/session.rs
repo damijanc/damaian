@@ -410,6 +410,72 @@ impl SessionStore {
         Ok(statuses)
     }
 
+    /// Every task in the session as a full record: the latest status, with the
+    /// metadata from whichever event recorded it.
+    ///
+    /// [`Self::read_task_statuses`] stays the cheap path for the conversation
+    /// view, which wants nothing but the status. This exists because resuming a
+    /// recovered task means re-sending the prompt the user typed
+    /// (`docs/specs/45_crash_recovery_prompt.md` §5.4), and that is in the log
+    /// but not in a status map.
+    ///
+    /// **A status event is not required to carry full metadata**, which is why
+    /// a later event is merged rather than substituted. Tasks are replayed from
+    /// events rather than stored as records, so a writer that only wants to
+    /// move the status legitimately fills the rest with blanks —
+    /// `recovery::set_status` and `recovery::fail_task` both do, with only `id`
+    /// and `session_id` load-bearing. Substituting wholesale would let a
+    /// resumed task lose the prompt that a resume exists to re-send.
+    pub fn read_tasks(&self, session_id: &str) -> Result<Vec<Task>> {
+        let path = self.session_log_path(session_id);
+        let Ok(content) = fs::read_to_string(path) else {
+            return Ok(Vec::new());
+        };
+        // Insertion-ordered by first appearance, so the caller sees tasks in
+        // the order the session created them.
+        let mut order: Vec<String> = Vec::new();
+        let mut tasks: HashMap<String, Task> = HashMap::new();
+        for event in active_events(&content) {
+            if event.event_type != "task_created" && event.event_type != "task_status_updated" {
+                continue;
+            }
+            // Both shapes of `task_status_updated` — flat, and wrapped as
+            // `{"task":…,"error":…}` by `await_approval`.
+            let payload = event.payload.get("task").unwrap_or(&event.payload);
+            let Some(task) = parse_task_payload(payload) else {
+                continue;
+            };
+            match tasks.get_mut(&task.id) {
+                Some(known) => {
+                    known.status = task.status;
+                    known.completed_at_ms = task.completed_at_ms.or(known.completed_at_ms);
+                    // Nothing ever *changes* these, so a blank means "not
+                    // recorded on this event" rather than "cleared".
+                    if !task.user_prompt.is_empty() {
+                        known.user_prompt = task.user_prompt;
+                    }
+                    if !task.model_provider.is_empty() {
+                        known.model_provider = task.model_provider;
+                    }
+                    if !task.model_name.is_empty() {
+                        known.model_name = task.model_name;
+                    }
+                    if task.created_at_ms > 0 {
+                        known.created_at_ms = task.created_at_ms;
+                    }
+                }
+                None => {
+                    order.push(task.id.clone());
+                    tasks.insert(task.id.clone(), task);
+                }
+            }
+        }
+        Ok(order
+            .into_iter()
+            .filter_map(|id| tasks.remove(&id))
+            .collect())
+    }
+
     pub fn allow_browser_diagnostics_for_session(
         &self,
         session_id: &str,
@@ -852,6 +918,40 @@ fn parse_session_event(event: &SessionEvent) -> Option<Session> {
         created_at_ms: event.number("createdAtMs")?,
         updated_at_ms: event.number("updatedAtMs")?,
         summary: event.text("summary").unwrap_or_default(),
+    })
+}
+
+/// A `Task` from a `task_created` or `task_status_updated` payload.
+///
+/// `None` for a status string this version does not recognise — from a later
+/// version, say. The event is then skipped and the task keeps its last
+/// known-good record, which loses a status change but never invents one.
+/// Recovery classification does not depend on this: `read_task_statuses` keeps
+/// raw status strings, and `recovery::classify_session` treats an unrecognised
+/// one as neither terminal nor safe.
+fn parse_task_payload(payload: &serde_json::Value) -> Option<Task> {
+    let text = |field: &str| {
+        payload
+            .get(field)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    };
+    Some(Task {
+        id: text("id")?,
+        session_id: text("sessionId")?,
+        status: TaskStatus::parse(&text("status")?)?,
+        user_prompt: text("userPrompt").unwrap_or_default(),
+        model_provider: text("modelProvider").unwrap_or_default(),
+        model_name: text("modelName").unwrap_or_default(),
+        created_at_ms: payload
+            .get("createdAtMs")
+            .and_then(|value| value.as_u64())
+            .map(u128::from)
+            .unwrap_or_default(),
+        completed_at_ms: payload
+            .get("completedAtMs")
+            .and_then(|value| value.as_u64())
+            .map(u128::from),
     })
 }
 

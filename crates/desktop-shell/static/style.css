@@ -2454,6 +2454,90 @@ code.command-approval-command {
   justify-content: flex-start;
 }
 
+/* The crash recovery prompt (docs/specs/45_crash_recovery_prompt.md). It sits
+   at the top of the conversation of the session it belongs to, so it is a card
+   in the log rather than docked chrome. */
+.recovery-card {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 12px 14px;
+}
+
+.recovery-card-eyebrow {
+  margin: 0;
+  color: var(--warn);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.recovery-card-headline {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.recovery-card-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Same footer shape as an approval card: disclosure left, actions right. */
+.recovery-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.recovery-card-detail {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 10px;
+  max-height: 220px;
+  overflow: auto;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 9px 10px;
+  font-size: 12px;
+}
+
+/* The panel sets `display`, which beats the UA `[hidden]` rule, so the
+   disclosure would toggle `hidden` while the panel stayed on screen.
+   See docs/UI_STYLE_GUIDE.md §7. */
+.recovery-card-detail[hidden] {
+  display: none;
+}
+
+.recovery-card-detail dt {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.recovery-card-detail dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.recovery-card-files {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding-left: 16px;
+}
+
 .diff-card-header {
   display: flex;
   align-items: center;

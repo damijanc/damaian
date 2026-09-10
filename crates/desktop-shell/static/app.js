@@ -3209,6 +3209,346 @@ async function loadSessionCheckpoints(sessionId) {
   }
 }
 
+// Crash recovery, per docs/specs/45_crash_recovery_prompt.md.
+//
+// The sweep itself runs once per process on the server; this fetches its result
+// once and keeps it, because the cards are rendered per session as sessions are
+// opened. Nothing here decides what may be resumed: the card offers what the
+// engine's classification said it may, and every decision is re-classified
+// server-side before it is applied.
+let recoveredTasks = [];
+let reattachedApprovals = [];
+let recoverySweepRequest = null;
+
+function loadRecoverySweep() {
+  if (!recoverySweepRequest) {
+    // Every `/api/` route is token-gated and the token arrives with the Tauri
+    // bootstrap, so a sweep fired at load time would otherwise race it and be
+    // rejected — once, permanently, since the result is memoized.
+    recoverySweepRequest = ensureDesktopApiReady()
+      .then(() => api("/api/recovery"))
+      .then((payload) => {
+        recoveredTasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+        reattachedApprovals = Array.isArray(payload.approvals) ? payload.approvals : [];
+      })
+      .catch(() => {
+        // A sweep that cannot be read must not stop a session from opening.
+        // The engine has already classified and audited either way. Cleared
+        // rather than kept so opening the next session tries again: the
+        // alternative is one bad moment at startup hiding every recovered task
+        // for the rest of the run.
+        recoveredTasks = [];
+        reattachedApprovals = [];
+        recoverySweepRequest = null;
+      });
+  }
+  return recoverySweepRequest;
+}
+
+async function renderRecoveryPrompts(sessionId) {
+  if (!sessionId) return;
+  await loadRecoverySweep();
+  if (sessionId !== currentSessionId) return;
+  const cards = [
+    ...recoveredTasks.filter((task) => task.sessionId === sessionId).map(createRecoveryCard),
+    ...reattachedApprovals
+      .filter((approval) => approval.sessionId === sessionId)
+      .map(createReattachedApprovalCard),
+  ];
+  // Prepended in reverse so the cards end up above the conversation in the
+  // order they were built.
+  cards.reverse().forEach((card) => {
+    $("chat-log").prepend(card);
+  });
+}
+
+// The prompt for one recovered task. Two shapes, per §5.6: with `Resume` there
+// is one filled action; without it there is none at all, because the surface is
+// asking the user to decide something Damaian could not.
+function createRecoveryCard(task) {
+  const wrapper = document.createElement("section");
+  wrapper.className = "recovery-card";
+  wrapper.dataset.taskId = task.taskId;
+
+  const eyebrow = document.createElement("p");
+  eyebrow.className = "recovery-card-eyebrow";
+  eyebrow.textContent = task.autoResumed ? "Picked up after a crash" : "After a crash";
+
+  const headline = document.createElement("p");
+  headline.className = "recovery-card-headline";
+  headline.textContent = task.headline;
+
+  const note = document.createElement("p");
+  note.className = "recovery-card-note";
+  if (!task.resumeAllowed) {
+    note.textContent = task.resumeBlockedReason || "";
+  } else if (task.autoResumed) {
+    note.textContent =
+      "Nothing that could have changed anything outside Damaian was in flight, so this turn " +
+      "was marked safe to pick up again. It has not run yet — continuing sends the same " +
+      "request to the model again.";
+  } else {
+    note.textContent = "Continuing sends the same request to the model again.";
+  }
+
+  const footer = document.createElement("div");
+  footer.className = "recovery-card-footer";
+  const detail = createRecoveryDetail(task);
+  const actions = document.createElement("div");
+  actions.className = "inline-actions";
+
+  const close = async (decision, label) => {
+    try {
+      await decideRecovery(task, decision);
+      wrapper.remove();
+      toast(label);
+    } catch (error) {
+      toast(error.message);
+    }
+  };
+
+  const markFailed = async () => {
+    const confirmed = await confirmDialog(
+      "Mark this turn failed?",
+      `${task.headline}. Marking it failed closes it out and records that its outcome was ` +
+        "unknown. Nothing on disk is changed or undone.",
+      { danger: true, confirmLabel: "Mark failed" },
+    );
+    if (confirmed) await close("mark_failed", "Turn marked failed");
+  };
+
+  const abandon = async () => {
+    const confirmed = await confirmDialog(
+      "Abandon this turn?",
+      `${task.headline}. Abandoning closes the turn without retrying it. Nothing on disk is ` +
+        "changed or undone.",
+      { danger: true, confirmLabel: "Abandon" },
+    );
+    if (confirmed) await close("abandon", "Turn abandoned");
+  };
+
+  if (task.resumeAllowed) {
+    const resume = document.createElement("button");
+    resume.type = "button";
+    resume.className = "btn-sm btn-primary";
+    resume.textContent = task.autoResumed ? "Continue" : "Resume";
+    resume.addEventListener("click", async () => {
+      resume.disabled = true;
+      try {
+        const payload = await decideRecovery(task, "resume");
+        wrapper.remove();
+        // The prompt comes back from the server rather than from this card, so
+        // what is re-sent is what the session log recorded.
+        await sendChatPrompt({ prompt: payload.prompt, restorePrompt: false });
+      } catch (error) {
+        resume.disabled = false;
+        toast(error.message);
+      }
+    });
+    actions.append(resume);
+  } else {
+    // The only remaining answer stays quiet: filling it would make the loudest
+    // control on the surface a terminal one.
+    const failed = document.createElement("button");
+    failed.type = "button";
+    failed.className = "btn-sm btn-quiet";
+    failed.textContent = "Mark failed";
+    failed.addEventListener("click", () => void markFailed());
+    actions.append(failed);
+  }
+
+  // Terminal choices live in the overflow: they outlive this interaction, and
+  // the cost of a mis-click is not symmetric with resuming.
+  const menuItems = [];
+  if (task.resumeAllowed) {
+    menuItems.push({
+      label: "Mark failed",
+      hint: "Closes the turn, recording that its outcome was unknown",
+      onSelect: () => void markFailed(),
+    });
+  }
+  menuItems.push({
+    label: "Abandon",
+    hint: "Closes the turn without retrying it",
+    onSelect: () => void abandon(),
+  });
+  const overflow = document.createElement("button");
+  overflow.type = "button";
+  overflow.className = "btn-icon";
+  overflow.dataset.menuId = `recovery-${task.taskId}`;
+  overflow.setAttribute("aria-haspopup", "menu");
+  overflow.setAttribute("aria-label", "More recovery options");
+  overflow.title = "More recovery options";
+  overflow.textContent = "⋯";
+  overflow.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleApprovalMenu(menuItems, overflow);
+  });
+  actions.append(overflow);
+
+  footer.append(createDisclosure("Inspect", detail), actions);
+  wrapper.append(eyebrow, headline);
+  if (note.textContent) wrapper.append(note);
+  wrapper.append(detail, footer);
+  return wrapper;
+}
+
+// What `Inspect` shows: the turn, the action that never finished, the files it
+// may have touched, and its checkpoint. Restoring is spec 16's surface, so the
+// checkpoint row opens the existing rewind dialog rather than restoring here.
+function createRecoveryDetail(task) {
+  const panel = document.createElement("dl");
+  panel.className = "recovery-card-detail";
+
+  const row = (label, value) => {
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const description = document.createElement("dd");
+    if (typeof value === "string") {
+      description.textContent = value;
+    } else {
+      description.append(value);
+    }
+    panel.append(term, description);
+  };
+
+  row("Your request", task.prompt || "Not recorded for this turn");
+  row(
+    "Action in flight",
+    task.danglingAction
+      ? `${task.danglingAction}${task.danglingRef ? ` — ${task.danglingRef}` : ""} (event ${task.danglingSeq})`
+      : `None recorded. The turn's last recorded state was "${task.previousStatus}".`,
+  );
+
+  const files = Array.isArray(task.files) ? task.files : [];
+  if (files.length) {
+    const list = document.createElement("ul");
+    list.className = "recovery-card-files";
+    files.forEach((path) => {
+      const item = document.createElement("li");
+      const code = document.createElement("code");
+      code.textContent = path;
+      item.append(code);
+      list.append(item);
+    });
+    row("Files it may have touched", list);
+  } else {
+    row(
+      "Files it may have touched",
+      task.danglingAction === "run_command" || task.danglingAction === "mcp_call"
+        ? "Not knowable — Damaian does not track what a command or a remote tool changed."
+        : "None recorded.",
+    );
+  }
+
+  const checkpoint = sessionCheckpoints.find((entry) => entry.checkpointId === task.checkpointId);
+  if (checkpoint) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn-sm btn-quiet";
+    button.textContent = `Rewind to before this turn (${checkpoint.fileCount} ${
+      checkpoint.fileCount === 1 ? "file" : "files"
+    })`;
+    button.addEventListener("click", () => void rewindToCheckpoint(checkpoint));
+    row("Checkpoint", button);
+  } else {
+    row("Checkpoint", "No checkpoint was taken for this turn.");
+  }
+
+  return panel;
+}
+
+// An approval that survived the crash with its proposal (spec 17 §5.5). The
+// card is the same component the live turn uses, so re-presenting it runs
+// nothing: the user still has to approve.
+function createReattachedApprovalCard(approval) {
+  const wrapper = document.createElement("section");
+  wrapper.className = "recovery-card";
+  wrapper.dataset.taskId = approval.taskId;
+
+  const eyebrow = document.createElement("p");
+  eyebrow.className = "recovery-card-eyebrow";
+  eyebrow.textContent = "Still waiting for you";
+
+  const headline = document.createElement("p");
+  headline.className = "recovery-card-headline";
+  const note = document.createElement("p");
+  note.className = "recovery-card-note";
+
+  if (approval.kind === "unavailable") {
+    headline.textContent = "An approval from before the crash could not be restored";
+    note.textContent =
+      `${approval.unavailableReason || "The proposal is no longer readable."} The turn was ` +
+      "closed rather than rebuilt from partial data — approving a command Damaian is " +
+      "guessing at would be worse than losing the turn.";
+    wrapper.append(eyebrow, headline, note);
+    return wrapper;
+  }
+
+  headline.textContent =
+    approval.kind === "command"
+      ? "A command was waiting for your approval when Damaian stopped"
+      : "A patch was waiting for your review when Damaian stopped";
+  note.textContent =
+    approval.kind === "command"
+      ? "Approving runs the command on its own: the conversation that proposed it ended with " +
+        "the crash, so nothing is fed back to the model."
+      : "The patch is still on disk and still applies. Reviewing it here changes nothing else.";
+
+  wrapper.append(eyebrow, headline, note);
+  wrapper.append(
+    approval.kind === "command"
+      ? createCommandApprovalPreview(approval.payload, repo(), {
+          detached: true,
+          // A command is one decision, so its outcome is the decision.
+          onResolved: (approved) =>
+            resolveReattachedApproval(approval, approved ? "approved" : "rejected"),
+        })
+      : createPatchPreview(approval.payload, repo(), {
+          // A patch is answered per file and can end up part applied and part
+          // rejected, so "resolved" is the only honest single word for it.
+          onResolved: () => resolveReattachedApproval(approval, "resolved"),
+        }),
+  );
+  return wrapper;
+}
+
+// Closes out the task the approval belonged to. Without it the task stays
+// `waiting_for_approval` in the log, and the next launch reattaches the same
+// proposal and offers to run a command that has already run — the one way this
+// surface could cause a side effect twice.
+async function resolveReattachedApproval(approval, outcome) {
+  reattachedApprovals = reattachedApprovals.filter(
+    (entry) => entry.sessionId !== approval.sessionId || entry.taskId !== approval.taskId,
+  );
+  try {
+    await api(
+      "/api/recovery-approval-resolved",
+      form({
+        session_id: approval.sessionId,
+        task_id: approval.taskId,
+        outcome,
+      }),
+    );
+  } catch (error) {
+    // Surfaced rather than swallowed: the decision has already been carried
+    // out, so a failure here means this approval can come back on the next
+    // launch, and the user should know that before they act on it twice.
+    toast(`Could not close out the recovered turn: ${error.message}`);
+  }
+}
+
+async function decideRecovery(task, decision) {
+  const payload = await api(
+    "/api/recovery-decision",
+    form({ session_id: task.sessionId, task_id: task.taskId, decision }),
+  );
+  recoveredTasks = recoveredTasks.filter(
+    (entry) => entry.sessionId !== task.sessionId || entry.taskId !== task.taskId,
+  );
+  return payload;
+}
+
 /// Every checkpoint for the open repository, newest first: when it was taken,
 /// the turn it precedes, how much it covers, and whether it has been rewound to
 /// already. The per-turn control in the conversation only reaches the turns
@@ -3938,7 +4278,11 @@ function appendProposals(message, payload, repo) {
   }
 }
 
-function createPatchPreview(payload, patchRepo) {
+// `onResolved` is called once no file is left pending, for a patch reattached
+// after a crash: the task it belonged to has to be closed out, or the next
+// launch offers the same patch again. See
+// docs/specs/45_crash_recovery_prompt.md §5.7.
+function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
   const state = {
     patchId: payload.patchId,
     initialFileCount: (payload.files || []).length,
@@ -4071,6 +4415,13 @@ function createPatchPreview(payload, patchRepo) {
     return state.files
       .filter((file) => file.state === "pending" && file.selected)
       .map((file) => file.path);
+  }
+
+  // Every file answered, one way or the other.
+  async function reportResolvedIfSettled() {
+    if (!onResolved) return;
+    if (state.files.some((file) => file.state === "pending")) return;
+    await onResolved();
   }
 
   function markFiles(paths, nextState) {
@@ -4215,6 +4566,7 @@ function createPatchPreview(payload, patchRepo) {
 
       const applied = result.appliedFiles || [];
       markFiles(applied, "applied");
+      await reportResolvedIfSettled();
       toast(
         allowSecrets
           ? `Applied ${applied.length} file(s) despite secret warning`
@@ -4253,6 +4605,7 @@ function createPatchPreview(payload, patchRepo) {
       const rejected = result.rejectedFiles || [];
       markFiles(rejected, "rejected");
       toast(`Rejected ${rejected.length} file(s)`);
+      await reportResolvedIfSettled();
     } catch (error) {
       toast(error.message);
       render();
@@ -4263,7 +4616,14 @@ function createPatchPreview(payload, patchRepo) {
   return wrapper;
 }
 
-function createCommandApprovalPreview(proposal, proposalRepo) {
+// `detached` is for a proposal reattached after a crash: the same card, but
+// the turn that raised it is gone, so approving runs the stored proposal on its
+// own rather than resuming a chat turn. See docs/specs/45_crash_recovery_prompt.md §5.7.
+function createCommandApprovalPreview(
+  proposal,
+  proposalRepo,
+  { detached = false, onResolved = null } = {},
+) {
   const isBrowserDiagnostic =
     proposal.allowBrowserDiagnosticsForSession || (proposal.risk || "").startsWith("browser");
   const wrapper = document.createElement("div");
@@ -4376,6 +4736,29 @@ function createCommandApprovalPreview(proposal, proposalRepo) {
         ? "Running diagnostic…"
         : "Running…"
       : "Rejecting…";
+
+    // A proposal reattached after a crash has no chat turn left to resume —
+    // the turn died with the process, and `/api/resume-command-stream`
+    // rightly refuses a proposal it holds no pending state for. The stored
+    // proposal still runs, so the decision goes to the non-streaming
+    // endpoints and its output lands in this card instead of in an answer
+    // from a model that was never asked anything.
+    if (detached) {
+      const payload = await api(
+        approved ? "/api/run-command" : "/api/reject-command",
+        form({
+          repo: proposalRepo,
+          proposal_id: proposal.proposalId,
+          always: always ? "true" : "false",
+        }),
+      );
+      output.textContent = approved
+        ? `exit ${payload.exitCode}\n${payload.stdout || ""}${payload.stderr || ""}`.trimEnd()
+        : "Command rejected. The turn that proposed it ended with the crash, so nothing continues.";
+      if (onResolved) await onResolved(approved);
+      await loadSessions(currentSessionId, false);
+      return;
+    }
 
     const assistantMessage = appendChatMessage("assistant", "");
     let assistantText = "";
@@ -4524,6 +4907,9 @@ async function loadSession(sessionId) {
   loadPinnedContextFiles(currentSessionId);
   await loadSessionCheckpoints(currentSessionId);
   renderMessages(payload.messages, payload.tasks || []);
+  // After the conversation, because `renderMessages` clears the log and the
+  // cards sit above what it renders.
+  await renderRecoveryPrompts(currentSessionId);
   setChatStatus("Loaded");
 }
 
@@ -5106,4 +5492,8 @@ renderProviderConfigSelect();
 renderPinnedContextFiles();
 
 bootstrapPromise = startBootstrap();
+// Classify what the last run left behind now rather than when a session
+// happens to be opened: spec 17 requirement 4 is a launch-time sweep, and it
+// is what authorizes the tasks that were safe to pick up again.
+void loadRecoverySweep();
 void setupContextFileDragDrop();

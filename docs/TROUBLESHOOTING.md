@@ -468,20 +468,31 @@ jq -r 'select(.eventType|startswith("task_recover")) | "\(.eventType) \(.taskId)
 `task_recovery_decision` carries what was then done about it and whether it was
 allowed or refused.
 
-**Nothing runs this sweep automatically yet.** Classification, the reattach and
-the three recovery operations are engine APIs with no caller on the launch path
-— [spec 45](specs/45_crash_recovery_prompt.md) is the surface that will invoke
-them and present the choice. Until it lands, a crashed task keeps whatever
-status it was left with, and the `jq` commands above are how you see what
-happened. The markers are being written now, so a crash today is already
-classifiable when that surface arrives.
+**The sweep runs once per app start**, on the first `GET /api/recovery` from
+the web UI ([spec 45](specs/45_crash_recovery_prompt.md) §5.3). Once, because
+each pass appends a `task_recovered` event per non-terminal task, and a crash
+ends the process anyway. It classifies every session, reattaches pending
+approvals, and authorizes — but does not run — the tasks the classification
+marked safe. Every card the UI then shows is `GET /api/recovery` output;
+`POST /api/recovery-decision` applies one choice, re-classifying first, so a
+decision cannot be made on a claim the webview supplied.
 
-One consequence to expect when it does: a task left awaiting approval by a
-version older than spec 17 recorded its status but not *which* proposal it was
-waiting on. There is nothing to reattach and nothing safe to guess, so it will
-be failed with that stated reason rather than shown as an approval card rebuilt
-from partial data. **No stored proposal is deleted** — the patches and commands
-themselves remain on disk and stay usable.
+To see what the sweep concluded without the UI:
+
+```bash
+curl -s -H "x-damaian-api-token: $TOKEN" http://127.0.0.1:4765/api/recovery | jq
+```
+
+A task that was resumed shows as `preparing_context` afterwards. That is
+authorization, not execution: the turn re-runs only when the user presses
+`Continue`, which re-sends the recorded prompt as an ordinary turn.
+
+One consequence of the first launch after upgrading: a task left awaiting
+approval by a version older than spec 17 recorded its status but not *which*
+proposal it was waiting on. There is nothing to reattach and nothing safe to
+guess, so it is failed with that stated reason rather than shown as an approval
+card rebuilt from partial data. **No stored proposal is deleted** — the patches
+and commands themselves remain on disk and stay usable.
 
 ### Checkpoints and rewind
 

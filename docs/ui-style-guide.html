@@ -473,6 +473,68 @@
     </section>
 
     <section class="sg-section">
+      <h2>Crash recovery prompt</h2>
+      <p class="sg-hint">
+        Two shapes of the same card. With a resume there is one filled action and the terminal
+        choices are behind the overflow. Without one there is no filled action at all: the only
+        remaining answers close the turn out, and the card states why resuming is not on offer.
+      </p>
+      <div class="sg-card">
+        <section class="recovery-card">
+          <p class="recovery-card-eyebrow">Picked up after a crash</p>
+          <p class="recovery-card-headline">Reading a file was interrupted before it finished</p>
+          <p class="recovery-card-note">
+            Nothing that could have changed anything outside Damaian was in flight, so this turn
+            was marked safe to pick up again. It has not run yet — continuing sends the same
+            request to the model again.
+          </p>
+          <div class="recovery-card-footer">
+            <button type="button" class="disclosure" aria-expanded="false">
+              <span class="disclosure-caret" aria-hidden="true"></span> Inspect
+            </button>
+            <div class="inline-actions">
+              <button type="button" class="btn-sm btn-primary">Continue</button>
+              <button type="button" class="btn-icon" aria-label="More recovery options">⋯</button>
+            </div>
+          </div>
+        </section>
+      </div>
+      <div class="sg-card">
+        <section class="recovery-card">
+          <p class="recovery-card-eyebrow">After a crash</p>
+          <p class="recovery-card-headline">
+            A command was in progress and its outcome is unknown
+          </p>
+          <p class="recovery-card-note">
+            A command was running when Damaian stopped, and there is no way to tell whether it
+            finished. Damaian will not run it again on its own.
+          </p>
+          <dl class="recovery-card-detail">
+            <dt>Your request</dt>
+            <dd>run the migration</dd>
+            <dt>Action in flight</dt>
+            <dd>run_command — psql -f migrate.sql (event 412)</dd>
+            <dt>Files it may have touched</dt>
+            <dd>Not knowable — Damaian does not track what a command or a remote tool changed.</dd>
+          </dl>
+          <div class="recovery-card-footer">
+            <button type="button" class="disclosure" aria-expanded="true">
+              <span class="disclosure-caret" aria-hidden="true"></span> Inspect
+            </button>
+            <div class="inline-actions">
+              <button type="button" class="btn-sm btn-quiet">Mark failed</button>
+              <button type="button" class="btn-icon" aria-label="More recovery options">⋯</button>
+            </div>
+          </div>
+        </section>
+        <p class="sg-note">
+          Shown with <code>Inspect</code> expanded. In the app it renders collapsed, above the
+          footer rather than below it.
+        </p>
+      </div>
+    </section>
+
+    <section class="sg-section">
       <h2>Disclosure</h2>
       <p class="sg-hint">
         One implementation, two callers. Collapsed by default and never remembered; the label

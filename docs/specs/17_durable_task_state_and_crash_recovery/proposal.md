@@ -395,26 +395,30 @@ This is better than the original plan rather than merely cheaper: a torn tail is
 only meaningful as evidence of the crash being classified, and the classifier is
 where that context exists.
 
-### What spec 17 deliberately leaves uncalled
+### What spec 17 left uncalled, and what spec 45 did with it
 
 Requirement 4 says every incomplete task is detected and classified on launch.
-`recovery::classify_all` **is** that sweep, and it is tested — but nothing on a
-launch path calls it, because per §0 the desktop surface belongs to
-[spec 45](../45_crash_recovery_prompt.md). The engine side is complete and
-exercised end to end by spec 18's `resume_interrupted_session`; what is missing
-is a caller.
+`recovery::classify_all` **is** that sweep, and it shipped tested but uncalled,
+because per §0 the desktop surface belongs to
+[spec 45](../45_crash_recovery_prompt.md).
 
-Two consequences, stated so they are not discovered as bugs:
+[Spec 45](../45_crash_recovery_prompt.md) is now that caller: the desktop shell
+runs `classify_all` and `reattach_pending_approvals` once per process on the
+first `GET /api/recovery`, and authorizes — without running — every task the
+classification marked `auto_resume_permitted`. Requirement 4 is therefore
+satisfied on a real launch path, and the 24 stale `waiting_for_approval` tasks
+described below are failed with their stated reason on the first launch after
+that change.
 
-- **A crashed task keeps its last-written status until spec 45 lands.** Markers
-  are written from now on, so today's crashes are already classifiable when
-  that surface arrives — nothing has to be back-filled.
-- **The stale-approval migration has not happened yet either.** The 24
-  `waiting_for_approval` tasks described below get failed when
-  `reattach_pending_approvals` is first invoked, not on the next launch.
-
-`docs/TROUBLESHOOTING.md` says this too, in the section on reading recovery
-events, so an operator does not go looking for a sweep that has not run.
+One finding from that work belongs here, because it was a latent bug in this
+spec's code rather than a limitation of it. `set_status` and `fail_task` write a
+`Task` whose fields other than `id` and `session_id` are blank, since tasks are
+replayed from events rather than stored as records. Nothing noticed while
+`read_task_statuses` was the only reader, because it reads statuses. The first
+reader to want the whole record — `SessionStore::read_tasks`, added by spec 45
+to re-send a resumed task's prompt — found the prompt erased by the very
+`resume` meant to bring the task back. `read_tasks` merges a later event into
+the known record rather than substituting it, and documents why.
 
 ### Two things worth knowing about the upgrade
 
