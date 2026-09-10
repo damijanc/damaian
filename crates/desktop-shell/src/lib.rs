@@ -11,7 +11,7 @@ use workspace_engine::{
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult, Config,
     CurlModelTransport, DataSchemaOutcome, GeneratedSecretWarning, McpClient, McpServerConfig,
     McpTokenResolver, McpTransport, OpenAICompatibleAdapter, ProposedFilePatch,
-    ResumeDecisionOptions, Session, TaskUsage, TurnPhase, TurnProgress, TurnSink,
+    ResumeDecisionOptions, Session, TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink,
     WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticReport, WebDiagnosticsRunner,
     WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible, command_approval_prompt,
     ensure_data_dir_schema, normalize_mcp_server_id, normalize_model_provider,
@@ -476,7 +476,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                     "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}]}}",
                     session_json(&session),
                     messages_json(&messages),
-                    task_states_json(&task_statuses, &task_usage)
+                    task_states_json(&task_statuses, &task_usage, &engine.config)
                 ),
             )
         }
@@ -2674,25 +2674,32 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         result.cancelled,
         command_proposal_json(result),
         patch_proposal_json(result),
-        task_usage_json(result.usage.as_ref())
+        task_usage_json(result.usage.as_ref(), result.estimated_cost)
     )
 }
 
 /// One task's usage, or `null` when nothing was recorded. Shaped like the
 /// per-task fields on `/api/session` so the frontend renders both with the
 /// same code.
-fn task_usage_json(usage: Option<&TaskUsage>) -> String {
+/// `estimated_cost` is the user's own rates applied to these tokens, and is a
+/// separate field from `reportedCost` on purpose: one is what the provider
+/// charged, the other is arithmetic the user configured.
+fn task_usage_json(usage: Option<&TaskUsage>, estimated_cost: Option<f64>) -> String {
     let Some(usage) = usage else {
         return "null".to_string();
     };
     format!(
-        "{{\"inputTokens\":{},\"outputTokens\":{},\"usageSource\":\"{}\",\"runCount\":{}{}}}",
+        "{{\"inputTokens\":{},\"outputTokens\":{},\"usageSource\":\"{}\",\"runCount\":{}{}{}}}",
         usage.input_tokens,
         usage.output_tokens,
         usage.source.as_str(),
         usage.run_count,
         match usage.reported_cost {
             Some(cost) => format!(",\"reportedCost\":{cost}"),
+            None => String::new(),
+        },
+        match estimated_cost {
+            Some(cost) => format!(",\"estimatedCost\":{cost}"),
             None => String::new(),
         }
     )
@@ -2781,6 +2788,7 @@ fn session_json(session: &Session) -> String {
 fn task_states_json(
     statuses: &HashMap<String, String>,
     usage: &HashMap<String, TaskUsage>,
+    config: &Config,
 ) -> String {
     let mut entries: Vec<&String> = statuses.keys().collect();
     // Sorted so the payload is stable between requests.
@@ -2789,17 +2797,18 @@ fn task_states_json(
         .iter()
         .map(|id| {
             let usage_json = match usage.get(*id) {
-                Some(total) => format!(
-                    ",\"inputTokens\":{},\"outputTokens\":{},\"usageSource\":\"{}\",\"runCount\":{}{}",
-                    total.input_tokens,
-                    total.output_tokens,
-                    total.source.as_str(),
-                    total.run_count,
-                    match total.reported_cost {
-                        Some(cost) => format!(",\"reportedCost\":{cost}"),
-                        None => String::new(),
-                    }
-                ),
+                Some(total) => {
+                    let estimated_cost = config.estimated_cost(&TokenUsage {
+                        input_tokens: total.input_tokens,
+                        output_tokens: total.output_tokens,
+                        source: total.source,
+                    });
+                    let body = task_usage_json(Some(total), estimated_cost);
+                    // Spliced into this entry rather than nested, so the shape
+                    // matches what the turn response sends and the frontend
+                    // reads both with the same code.
+                    format!(",{}", body.trim_start_matches('{').trim_end_matches('}'))
+                }
                 None => String::new(),
             };
             format!(
@@ -4117,7 +4126,7 @@ mod tests {
             },
         )]);
 
-        let json = task_states_json(&statuses, &usage);
+        let json = task_states_json(&statuses, &usage, &Config::default());
 
         assert!(json.contains("\"inputTokens\":1200"), "{json}");
         assert!(json.contains("\"outputTokens\":340"), "{json}");
@@ -4136,7 +4145,7 @@ mod tests {
         // indistinguishable from a real measurement of nothing.
         let statuses = HashMap::from([("task_1".to_string(), "complete".to_string())]);
 
-        let json = task_states_json(&statuses, &HashMap::new());
+        let json = task_states_json(&statuses, &HashMap::new(), &Config::default());
 
         assert!(json.contains("\"id\":\"task_1\""), "{json}");
         assert!(!json.contains("inputTokens"), "{json}");

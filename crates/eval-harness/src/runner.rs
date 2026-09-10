@@ -49,6 +49,10 @@ pub fn mock_provider() -> ModelProviderConfig {
         // for it changes nothing here. Left on so the deterministic tier sends
         // the same request shape the live tier does.
         provider_reports_usage: true,
+        // No rates: an eval run reports tokens, and a priced figure would be
+        // a number the baseline could not reproduce on another machine.
+        price_per_million_input_tokens: None,
+        price_per_million_output_tokens: None,
     }
 }
 

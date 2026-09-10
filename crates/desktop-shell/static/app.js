@@ -3846,8 +3846,13 @@ function markMessageUsage(target, usage) {
     `${estimated ? "~" : ""}${total.toLocaleString()} tokens${estimated ? " (estimated)" : ""}`,
     calls,
   ];
+  // What the provider charged wins over what the user's own rates compute:
+  // one is a fact about the bill, the other is arithmetic, and the label says
+  // which is which rather than letting them look alike.
   if (typeof usage.reportedCost === "number") {
     parts.push(formatCost(usage.reportedCost));
+  } else if (typeof usage.estimatedCost === "number") {
+    parts.push(`${formatCost(usage.estimatedCost)} at your rates`);
   }
   label.textContent = parts.join(" · ");
   row.append(label);

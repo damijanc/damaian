@@ -1,5 +1,6 @@
 use crate::error::{ClientError, Result};
 use crate::hash::repository_id_for_root;
+use crate::model::TokenUsage;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -202,7 +203,8 @@ pub struct Config {
     pub mcp_servers: Vec<McpServerConfig>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: the price rates are `Option<f64>`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelProviderConfig {
     pub id: String,
     pub label: String,
@@ -233,9 +235,17 @@ pub struct ModelProviderConfig {
     /// APIs, and the adapter probes once for a provider that rejects it. Set
     /// false to skip even the probe. Spec 19 §5.2.
     pub provider_reports_usage: bool,
+    /// The user's own price per million input tokens. **Not a built-in price
+    /// table** — spec 19 §4 rules one out, because prices change and a stale
+    /// table reports confident wrong numbers. `None` means no cost is shown.
+    pub price_per_million_input_tokens: Option<f64>,
+    /// The user's own price per million output tokens. Both rates must be set
+    /// for a cost to be computed; one alone would silently omit half the bill.
+    pub price_per_million_output_tokens: Option<f64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+// No `Eq`: the price rates are `Option<f64>`.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModelProviderConfigOverlay {
     pub id: String,
     pub label: Option<String>,
@@ -246,6 +256,8 @@ pub struct ModelProviderConfigOverlay {
     pub max_output_tokens: Option<u32>,
     pub context_token_budget: Option<u32>,
     pub provider_reports_usage: Option<bool>,
+    pub price_per_million_input_tokens: Option<f64>,
+    pub price_per_million_output_tokens: Option<f64>,
 }
 
 /// How the client talks to an MCP server. `Stdio` spawns a local subprocess
@@ -765,6 +777,27 @@ impl Config {
             .unwrap_or(true)
     }
 
+    /// Cost from the user's own configured rates, or `None` when they have set
+    /// none.
+    ///
+    /// Deliberately not a built-in price table (spec 19 §4): prices change,
+    /// and nothing in this repository can keep one current, so a stale table
+    /// would report confident wrong numbers. A figure from here is labelled
+    /// estimated and attributed to the user's rates — never to the provider,
+    /// whose own figure lives in `reported_cost`.
+    ///
+    /// Both rates must be set. One alone would produce a number that silently
+    /// omits half the bill, which is worse than showing nothing.
+    pub fn estimated_cost(&self, usage: &TokenUsage) -> Option<f64> {
+        let provider = self.model_provider_config(&self.model_provider)?;
+        let input_rate = provider.price_per_million_input_tokens?;
+        let output_rate = provider.price_per_million_output_tokens?;
+        Some(
+            (usage.input_tokens as f64 / 1_000_000.0) * input_rate
+                + (usage.output_tokens as f64 / 1_000_000.0) * output_rate,
+        )
+    }
+
     pub fn max_output_tokens(&self) -> Option<u32> {
         self.model_provider_config(&self.model_provider)
             .and_then(|provider| provider.max_output_tokens)
@@ -846,6 +879,12 @@ impl Config {
             if let Some(value) = overlay.provider_reports_usage {
                 provider.provider_reports_usage = value;
             }
+            if let Some(value) = overlay.price_per_million_input_tokens {
+                provider.price_per_million_input_tokens = Some(value);
+            }
+            if let Some(value) = overlay.price_per_million_output_tokens {
+                provider.price_per_million_output_tokens = Some(value);
+            }
             return;
         }
 
@@ -859,6 +898,8 @@ impl Config {
             max_output_tokens: overlay.max_output_tokens,
             context_token_budget: overlay.context_token_budget,
             provider_reports_usage: overlay.provider_reports_usage.unwrap_or(true),
+            price_per_million_input_tokens: overlay.price_per_million_input_tokens,
+            price_per_million_output_tokens: overlay.price_per_million_output_tokens,
             id,
         });
     }
@@ -1224,7 +1265,8 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+// No `Eq`: it carries provider overlays, whose price rates are `Option<f64>`.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConfigOverlay {
     pub data_dir: Option<PathBuf>,
     pub max_file_bytes: Option<u64>,
@@ -1439,6 +1481,12 @@ impl ConfigOverlay {
             "provider_reports_usage" => {
                 provider.provider_reports_usage = Some(parse_bool(field, value)?);
             }
+            "price_per_million_input_tokens" => {
+                provider.price_per_million_input_tokens = Some(parse_price(provider_key, value)?);
+            }
+            "price_per_million_output_tokens" => {
+                provider.price_per_million_output_tokens = Some(parse_price(provider_key, value)?);
+            }
             _ => {
                 return Err(ClientError::InvalidInput(format!(
                     "Unknown model provider config key: model_provider.{provider_key}"
@@ -1635,6 +1683,8 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             max_output_tokens: None,
             context_token_budget: None,
             provider_reports_usage: true,
+            price_per_million_input_tokens: None,
+            price_per_million_output_tokens: None,
         }),
         "deepseek" => Some(ModelProviderConfig {
             id: "deepseek".to_string(),
@@ -1654,6 +1704,8 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             max_output_tokens: Some(8192),
             context_token_budget: None,
             provider_reports_usage: true,
+            price_per_million_input_tokens: None,
+            price_per_million_output_tokens: None,
         }),
         "openai-compatible" => Some(ModelProviderConfig {
             id: "openai-compatible".to_string(),
@@ -1665,6 +1717,8 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             max_output_tokens: None,
             context_token_budget: None,
             provider_reports_usage: true,
+            price_per_million_input_tokens: None,
+            price_per_million_output_tokens: None,
         }),
         _ => None,
     }
@@ -1717,6 +1771,25 @@ fn parse_token_count(provider_key: &str, field: &str, value: &str) -> Result<u32
         )));
     }
     Ok(parsed as u32)
+}
+
+/// A price per million tokens, in the user's own currency.
+///
+/// Rejects a negative or non-numeric value rather than clamping: a price the
+/// user mistyped should be a loud error, not a quietly wrong bill. Zero is
+/// allowed — a locally hosted model genuinely costs nothing per token.
+fn parse_price(provider_key: &str, value: &str) -> Result<f64> {
+    let parsed: f64 = value.trim().parse().map_err(|_| {
+        ClientError::InvalidInput(format!(
+            "model_provider.{provider_key} must be a number, got: {value}"
+        ))
+    })?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(ClientError::InvalidInput(format!(
+            "model_provider.{provider_key} must be zero or more"
+        )));
+    }
+    Ok(parsed)
 }
 
 fn is_builtin_model_provider(id: &str) -> bool {

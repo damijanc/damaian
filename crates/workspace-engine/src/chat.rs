@@ -188,6 +188,11 @@ pub struct ChatTurnResult {
     /// figure a client sees when the turn ends is the same one it sees after
     /// a reload. `None` only if the log could not be read.
     pub usage: Option<TaskUsage>,
+    /// Cost computed from the user's own configured rates, when they have set
+    /// any. Kept separate from [`TaskUsage::reported_cost`] on purpose: one is
+    /// what the provider charged, the other is the user's own arithmetic, and
+    /// presenting the second as the first would launder a guess into a fact.
+    pub estimated_cost: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1608,6 +1613,13 @@ impl ChatOrchestrator {
             .read_task_usage(&session.id)
             .ok()
             .and_then(|usage| usage.get(&task.id).copied());
+        let estimated_cost = usage.as_ref().and_then(|usage| {
+            self.config.estimated_cost(&TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                source: usage.source,
+            })
+        });
         Ok(ChatTurnResult {
             session,
             task,
@@ -1618,6 +1630,7 @@ impl ChatOrchestrator {
             patch_proposal,
             cancelled: false,
             usage,
+            estimated_cost,
         })
     }
 
@@ -1670,6 +1683,13 @@ impl ChatOrchestrator {
             .read_task_usage(&session.id)
             .ok()
             .and_then(|usage| usage.get(&task.id).copied());
+        let estimated_cost = usage.as_ref().and_then(|usage| {
+            self.config.estimated_cost(&TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                source: usage.source,
+            })
+        });
         Ok(ChatTurnResult {
             session,
             task,
@@ -1680,6 +1700,7 @@ impl ChatOrchestrator {
             patch_proposal: None,
             cancelled: true,
             usage,
+            estimated_cost,
         })
     }
 }

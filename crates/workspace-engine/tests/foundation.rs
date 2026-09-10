@@ -9,10 +9,10 @@ use workspace_engine::{
     McpServerConfig, McpTransport, MockModelAdapter, MockModelTransport, ModelAdapter,
     ModelMessage, ModelProviderConfig, ModelRequest, ModelTransport, OpenAICompatibleAdapter,
     PatchEngine, PatchStore, PathPolicy, PhaseKind, ProjectIndexer, ProposedChange, Result,
-    ResumeDecisionOptions, SecretScanner, SessionStore, TaskStatus, ToolCall, TurnProgress,
-    TurnSink, UsageSource, WebDiagnosticCall, WebDiagnosticReport, WebDiagnosticsRunner,
-    WebDiagnosticsRunnerHandle, WorkspaceEngine, extract_model_tokens, model_request_json,
-    parse_generated_edit,
+    ResumeDecisionOptions, SecretScanner, SessionStore, TaskStatus, TokenUsage, ToolCall,
+    TurnProgress, TurnSink, UsageSource, WebDiagnosticCall, WebDiagnosticReport,
+    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, extract_model_tokens,
+    model_request_json, parse_generated_edit,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1992,6 +1992,8 @@ fn chat_dispatches_native_tool_call_when_provider_supports_it() {
         max_output_tokens: None,
         context_token_budget: None,
         provider_reports_usage: true,
+        price_per_million_input_tokens: None,
+        price_per_million_output_tokens: None,
     });
     let engine = WorkspaceEngine::new(config);
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
@@ -2305,6 +2307,8 @@ fn chat_chains_multiple_native_tool_calls_within_one_turn() {
         max_output_tokens: None,
         context_token_budget: None,
         provider_reports_usage: true,
+        price_per_million_input_tokens: None,
+        price_per_million_output_tokens: None,
     });
     let engine = WorkspaceEngine::new(config);
     // The model asks to run `pwd`, then—after seeing that result—asks to
@@ -2379,6 +2383,8 @@ fn native_tool_provider() -> ModelProviderConfig {
         max_output_tokens: None,
         context_token_budget: None,
         provider_reports_usage: true,
+        price_per_million_input_tokens: None,
+        price_per_million_output_tokens: None,
     }
 }
 
@@ -4148,6 +4154,68 @@ fn provider_usage_reporting_defaults_on_and_can_be_turned_off() {
     );
 
     assert!(!config.provider_reports_usage());
+}
+
+#[test]
+fn no_configured_rates_means_no_cost_figure() {
+    // §4 rules out a built-in price table, so silence is the correct answer
+    // until the user supplies their own numbers.
+    let config = Config::default();
+
+    assert_eq!(
+        config.estimated_cost(&TokenUsage::estimated(1_000_000, 1_000_000)),
+        None
+    );
+}
+
+#[test]
+fn one_rate_alone_produces_no_cost_figure() {
+    // Half the rates would produce a number that silently omits half the
+    // bill, which is worse than showing nothing.
+    let mut config = Config::default();
+    config.apply_overlay(
+        ConfigOverlay::parse(concat!(
+            "model_provider=deepseek\n",
+            "model_provider.deepseek.price_per_million_input_tokens=0.27\n",
+        ))
+        .unwrap(),
+    );
+
+    assert_eq!(
+        config.estimated_cost(&TokenUsage::estimated(1_000_000, 1_000_000)),
+        None
+    );
+}
+
+#[test]
+fn configured_rates_produce_a_cost_from_the_users_own_numbers() {
+    let mut config = Config::default();
+    config.apply_overlay(
+        ConfigOverlay::parse(concat!(
+            "model_provider=deepseek\n",
+            "model_provider.deepseek.price_per_million_input_tokens=0.27\n",
+            "model_provider.deepseek.price_per_million_output_tokens=1.10\n",
+        ))
+        .unwrap(),
+    );
+
+    let cost = config
+        .estimated_cost(&TokenUsage::estimated(2_000_000, 1_000_000))
+        .expect("configured rates should produce a figure");
+
+    assert!((cost - (0.27 * 2.0 + 1.10)).abs() < 1e-9, "cost was {cost}");
+}
+
+#[test]
+fn a_mistyped_price_is_refused_rather_than_quietly_wrong() {
+    assert!(
+        ConfigOverlay::parse("model_provider.deepseek.price_per_million_input_tokens=free\n")
+            .is_err()
+    );
+    assert!(
+        ConfigOverlay::parse("model_provider.deepseek.price_per_million_input_tokens=-1\n")
+            .is_err()
+    );
 }
 
 #[test]

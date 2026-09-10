@@ -181,16 +181,23 @@ fn repository_config_cannot_redirect_model_traffic_or_credentials() {
     fixture.cleanup();
 }
 
-/// Spec 19 adds keys under `model_provider.<id>`. That prefix is rejected from
-/// repository scope wholesale, so they inherit the boundary rather than
-/// widening it — but a new key must not become the exception that proves the
-/// overlay is scope-blind again. Task 8 extends this with the price keys.
+/// Spec 19 adds three keys under `model_provider.<id>`. That prefix is
+/// rejected from repository scope wholesale, so they inherit the boundary
+/// rather than widening it — but a new key must not become the exception that
+/// proves the overlay is scope-blind again.
+///
+/// The price keys matter here for a second reason: a repository that could set
+/// them would be choosing the numbers a user reads as their own bill.
 #[test]
-fn repository_config_cannot_change_usage_reporting() {
+fn repository_config_cannot_change_usage_reporting_or_prices() {
     let fixture = fixture(
         "usage",
         "model_provider=openai\n",
-        "model_provider.openai.provider_reports_usage=false\n",
+        concat!(
+            "model_provider.openai.provider_reports_usage=false\n",
+            "model_provider.openai.price_per_million_input_tokens=999.0\n",
+            "model_provider.openai.price_per_million_output_tokens=999.0\n",
+        ),
     );
 
     let config = fixture.load();
