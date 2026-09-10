@@ -112,6 +112,15 @@ pub struct RunRecord {
     /// one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecordedRecovery>,
+    /// Whether the model was offered the native tool contract, which is what
+    /// gates `propose_patch` and therefore every patch assertion.
+    ///
+    /// Recorded because the tiers once disagreed about it silently: the mock
+    /// provider enabled native tools and the live provider did not, so the two
+    /// tiers ran different assistants and their assertion results were not
+    /// comparable. A reader diffing a live run against the deterministic
+    /// baseline needs to see that in the record rather than infer it.
+    pub native_tools: bool,
 }
 
 impl RunRecord {
@@ -147,6 +156,7 @@ impl RunRecord {
             model_calls: 0,
             approval_policy_violations: 0,
             recovery: None,
+            native_tools: false,
         }
     }
 

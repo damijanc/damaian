@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::{
@@ -124,13 +124,7 @@ pub fn run_live(scenario: &Scenario) -> Result<Run> {
     })?;
 
     let materialized = fixture::materialize(&scenario.fixture)?;
-    let mut config = base_config(&materialized);
-    config.model_provider = provider.clone();
-    config.model_name = model.clone();
-    // Fills `model_base_url` and `model_api_key_env` from the provider entry,
-    // which is what the CLI and the desktop shell both rely on before building
-    // a transport.
-    config.apply_model_provider_defaults();
+    let config = live_config(&materialized.data_dir, &provider, &model);
 
     let api_key = std::env::var(&config.model_api_key_env).map_err(|_| {
         ClientError::InvalidInput(format!(
@@ -153,6 +147,52 @@ pub fn run_live(scenario: &Scenario) -> Result<Run> {
         &provider,
         &model,
     )
+}
+
+/// The live tier's configuration for a provider and model.
+///
+/// Separate from [`run_live`] so the capability set it produces can be asserted
+/// without credentials — the tiers disagreeing about that set is a defect that
+/// no credential-free test could otherwise reach.
+pub fn live_config(data_dir: &Path, provider: &str, model: &str) -> Config {
+    let mut config = Config {
+        data_dir: data_dir.to_path_buf(),
+        ..Config::default()
+    };
+    config.model_provider = provider.to_string();
+    config.model_name = model.to_string();
+    // Fills `model_base_url` and `model_api_key_env` from the provider entry,
+    // which is what the CLI and the desktop shell both rely on before building
+    // a transport.
+    config.apply_model_provider_defaults();
+
+    // Both tiers must offer the model the same tools, or their assertions
+    // measure different assistants and §5.3's single scenario definition buys
+    // nothing. The deterministic tier's mock provider enables the native tool
+    // contract, so the live tier does too — overriding the built-in provider
+    // entry, whose `false` is a conservative default for people's own configs
+    // rather than a statement that the provider cannot do it.
+    //
+    // This is a deliberate property of the eval configuration and not of the
+    // shipped default. `RunRecord::native_tools` carries it into every record
+    // so a reader can see which capability set produced a result.
+    config.model_providers.push(ModelProviderConfig {
+        id: provider.to_string(),
+        label: provider.to_string(),
+        base_url: config.model_base_url.clone(),
+        api_key_env: config.model_api_key_env.clone(),
+        models: vec![model.to_string()],
+        supports_native_tools: true,
+        // Left unset so the built-in per-model ceiling still applies.
+        max_output_tokens: None,
+        context_token_budget: None,
+        provider_reports_usage: true,
+        // No rates, for the same reason `mock_provider` carries none: a priced
+        // figure could not be reproduced on another machine.
+        price_per_million_input_tokens: None,
+        price_per_million_output_tokens: None,
+    });
+    config
 }
 
 /// A blocked scenario is skipped before anything is materialized: it measures a
@@ -306,6 +346,9 @@ fn drive(
     run_record.recovery = recovery;
     run_record.started_at_ms = started_at_ms;
     run_record.duration_ms = duration_ms;
+    // Read from the engine both tiers actually ran with, so the record cannot
+    // claim a capability set the run did not have.
+    run_record.native_tools = engine.config.supports_native_tools();
     // From the trace rather than a `MockModelAdapter`'s recorded requests, so
     // both tiers count the same way. Verified equal to `adapter.requests.len()`
     // on the deterministic scenarios (9/9, 2/2, 2/2). Note that
