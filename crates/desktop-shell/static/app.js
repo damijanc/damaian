@@ -3170,6 +3170,12 @@ function renderMessages(messages, tasks = []) {
   const toolBudgetExhaustedTasks = new Set(
     tasks.filter((task) => task.status === "tool_budget_exhausted").map((task) => task.id),
   );
+  // A task with no usage events carries no token fields at all, which is how
+  // a session written before token accounting stays silent instead of
+  // claiming a free turn.
+  const usageByTask = new Map(
+    tasks.filter((task) => typeof task.inputTokens === "number").map((task) => [task.id, task]),
+  );
   messages.forEach((message) => {
     const bubble = appendChatMessage(message.role, message.content);
     if (message.role === "user") {
@@ -3183,6 +3189,7 @@ function renderMessages(messages, tasks = []) {
       } else if (message.taskId && toolBudgetExhaustedTasks.has(message.taskId)) {
         markMessageToolBudgetExhausted(bubble, message.sessionId);
       }
+      if (message.taskId) markMessageUsage(bubble, usageByTask.get(message.taskId));
     }
   });
 }
@@ -3807,6 +3814,44 @@ function showRewindDialog(checkpoint) {
     document.addEventListener("keydown", onKeydown, true);
     backdrop.querySelector(".app-dialog-confirm").focus();
   });
+}
+
+// A cost that rounds to zero is shown as a bound, never as `$0.0000`: a real
+// charge displayed as zero reads as "this turn was free", which is the one
+// thing token accounting exists to stop saying. An actual zero is still zero.
+function formatCost(cost) {
+  if (cost > 0 && cost < 0.0001) return "<$0.0001";
+  return `$${cost.toFixed(4)}`;
+}
+
+// Per docs/specs/19_token_and_cost_accounting/. An estimated figure is always
+// marked as one: a total is only as trustworthy as its weakest term, so a
+// single estimated call makes the whole turn's number an approximation.
+//
+// `reportedCost` is what the provider charged. It is absent for almost every
+// provider, and absent is rendered as nothing rather than as a zero, which
+// would read as "this turn was free".
+function markMessageUsage(target, usage) {
+  if (!usage || typeof usage.inputTokens !== "number") return;
+  if (target.body.nextElementSibling?.dataset?.state === "usage") return;
+  const row = document.createElement("p");
+  row.className = "turn-indicator";
+  row.dataset.state = "usage";
+  const label = document.createElement("span");
+  label.className = "turn-indicator-label";
+  const estimated = usage.usageSource === "estimated";
+  const total = usage.inputTokens + usage.outputTokens;
+  const calls = usage.runCount === 1 ? "1 model call" : `${usage.runCount} model calls`;
+  const parts = [
+    `${estimated ? "~" : ""}${total.toLocaleString()} tokens${estimated ? " (estimated)" : ""}`,
+    calls,
+  ];
+  if (typeof usage.reportedCost === "number") {
+    parts.push(formatCost(usage.reportedCost));
+  }
+  label.textContent = parts.join(" · ");
+  row.append(label);
+  target.body.after(row);
 }
 
 function markMessageStopped(target) {
@@ -4788,6 +4833,7 @@ function createCommandApprovalPreview(
             localStorage.setItem(lastSessionStorageKey(), currentSessionId);
           }
           appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+          markMessageUsage(assistantMessage, payload.usage);
           const status = chatCompletionStatus(payload);
           setChatStatus(status.label, status.tone);
         },
@@ -5117,6 +5163,7 @@ async function proposePatchFromChat(prompt, assistantMessage) {
   );
   assistantMessage.body.append(createPatchPreview(payload, patchRepo));
   appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+  markMessageUsage(assistantMessage, payload.usage);
   setChatStatus("Patch ready", "warn");
 }
 
@@ -5233,6 +5280,7 @@ async function sendChatPrompt(options = {}) {
           await finalizeChatMessage(assistantMessage, assistantText);
           appendProposals(assistantMessage, payload, chatRepo);
           appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+          markMessageUsage(assistantMessage, payload.usage);
           if (payload.cancelled) {
             if (indicator) indicator.finish("stopped");
             setChatStatus("Stopped", "warn");

@@ -20,7 +20,7 @@ use crate::model::{
 };
 use crate::patch_engine::{PatchEngine, ProposedChange, ProposedFilePatch, ProposedPatch};
 use crate::secret_scanner::SecretScanner;
-use crate::session::{ChatMessage, Session, SessionStore, Task, TaskStatus};
+use crate::session::{ChatMessage, Session, SessionStore, Task, TaskStatus, TaskUsage};
 use crate::validation::{
     CommandProposal, CommandStore, ValidationOrchestrator, command_approval_prompt,
 };
@@ -181,6 +181,13 @@ pub struct ChatTurnResult {
     /// The user stopped this turn. Distinct from a failure: `response` holds
     /// whatever had been generated, and it is persisted.
     pub cancelled: bool,
+    /// What this task has spent, summed over every model call it made — not
+    /// just [`Self::model_run`], which is only the last one.
+    ///
+    /// Read back from the log rather than accumulated in memory, so the
+    /// figure a client sees when the turn ends is the same one it sees after
+    /// a reload. `None` only if the log could not be read.
+    pub usage: Option<TaskUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1594,6 +1601,13 @@ impl ChatOrchestrator {
         if command_proposal.is_none() {
             self.seal_turn_checkpoint(repository_root, &session, &task);
         }
+        // From the log, not from a running total: the number the client shows
+        // now must be the number it shows after a reload.
+        let usage = self
+            .session_store
+            .read_task_usage(&session.id)
+            .ok()
+            .and_then(|usage| usage.get(&task.id).copied());
         Ok(ChatTurnResult {
             session,
             task,
@@ -1603,6 +1617,7 @@ impl ChatOrchestrator {
             command_proposal,
             patch_proposal,
             cancelled: false,
+            usage,
         })
     }
 
@@ -1650,6 +1665,11 @@ impl ChatOrchestrator {
         // before it stopped, so what it left behind is what a rewind has to
         // compare against.
         self.seal_turn_checkpoint(repository_root, &session, &task);
+        let usage = self
+            .session_store
+            .read_task_usage(&session.id)
+            .ok()
+            .and_then(|usage| usage.get(&task.id).copied());
         Ok(ChatTurnResult {
             session,
             task,
@@ -1659,6 +1679,7 @@ impl ChatOrchestrator {
             command_proposal: None,
             patch_proposal: None,
             cancelled: true,
+            usage,
         })
     }
 }

@@ -11,11 +11,11 @@ use workspace_engine::{
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult, Config,
     CurlModelTransport, DataSchemaOutcome, GeneratedSecretWarning, McpClient, McpServerConfig,
     McpTokenResolver, McpTransport, OpenAICompatibleAdapter, ProposedFilePatch,
-    ResumeDecisionOptions, Session, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall,
-    WebDiagnosticKind, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
-    WorkspaceEngine, allow_always_eligible, command_approval_prompt, ensure_data_dir_schema,
-    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
-    parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    ResumeDecisionOptions, Session, TaskUsage, TurnPhase, TurnProgress, TurnSink,
+    WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticReport, WebDiagnosticsRunner,
+    WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible, command_approval_prompt,
+    ensure_data_dir_schema, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
 };
 
 mod keychain;
@@ -462,6 +462,11 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .session_store
                 .read_task_statuses(&session_id)
                 .map_err(|error| error.to_string())?;
+            // What each turn spent, joined by the same `taskId` (spec 19 §5.6).
+            let task_usage = engine
+                .session_store
+                .read_task_usage(&session_id)
+                .map_err(|error| error.to_string())?;
             write_response(
                 stream,
                 &request,
@@ -471,7 +476,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                     "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}]}}",
                     session_json(&session),
                     messages_json(&messages),
-                    task_statuses_json(&task_statuses)
+                    task_states_json(&task_statuses, &task_usage)
                 ),
             )
         }
@@ -2658,7 +2663,7 @@ where
 
 fn chat_result_json(result: &ChatTurnResult) -> String {
     format!(
-        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{}}}",
+        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"usage\":{}}}",
         escape_json(&result.response),
         json_string_array(&result.context_files),
         escape_json(&result.session.id),
@@ -2668,7 +2673,28 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         result.model_run.incomplete,
         result.cancelled,
         command_proposal_json(result),
-        patch_proposal_json(result)
+        patch_proposal_json(result),
+        task_usage_json(result.usage.as_ref())
+    )
+}
+
+/// One task's usage, or `null` when nothing was recorded. Shaped like the
+/// per-task fields on `/api/session` so the frontend renders both with the
+/// same code.
+fn task_usage_json(usage: Option<&TaskUsage>) -> String {
+    let Some(usage) = usage else {
+        return "null".to_string();
+    };
+    format!(
+        "{{\"inputTokens\":{},\"outputTokens\":{},\"usageSource\":\"{}\",\"runCount\":{}{}}}",
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.source.as_str(),
+        usage.run_count,
+        match usage.reported_cost {
+            Some(cost) => format!(",\"reportedCost\":{cost}"),
+            None => String::new(),
+        }
     )
 }
 
@@ -2746,17 +2772,41 @@ fn session_json(session: &Session) -> String {
     )
 }
 
-fn task_statuses_json(statuses: &HashMap<String, String>) -> String {
+/// Each task's status and, when it has any, what it spent.
+///
+/// Usage fields are **omitted** for a task with no usage events rather than
+/// sent as zero: a session written before spec 19 has no figures, and a zero
+/// would render as a turn that cost nothing. Same for `reportedCost`, which is
+/// absent unless the provider actually reported one.
+fn task_states_json(
+    statuses: &HashMap<String, String>,
+    usage: &HashMap<String, TaskUsage>,
+) -> String {
     let mut entries: Vec<&String> = statuses.keys().collect();
     // Sorted so the payload is stable between requests.
     entries.sort();
     entries
         .iter()
         .map(|id| {
+            let usage_json = match usage.get(*id) {
+                Some(total) => format!(
+                    ",\"inputTokens\":{},\"outputTokens\":{},\"usageSource\":\"{}\",\"runCount\":{}{}",
+                    total.input_tokens,
+                    total.output_tokens,
+                    total.source.as_str(),
+                    total.run_count,
+                    match total.reported_cost {
+                        Some(cost) => format!(",\"reportedCost\":{cost}"),
+                        None => String::new(),
+                    }
+                ),
+                None => String::new(),
+            };
             format!(
-                "{{\"id\":\"{}\",\"status\":\"{}\"}}",
+                "{{\"id\":\"{}\",\"status\":\"{}\"{}}}",
                 escape_json(id),
-                escape_json(&statuses[*id])
+                escape_json(&statuses[*id]),
+                usage_json
             )
         })
         .collect::<Vec<_>>()
@@ -2951,9 +3001,9 @@ mod tests {
         json_optional_string, keychain, mcp_browser_arguments, parse_form, parse_path_list,
         percent_decode, relay_turn_events, remember_model_api_key,
         render_markdown_with_optional_file_links, repository_config_review_json, require_api_token,
-        run_server, run_terminal_command, save_config_file, terminal_cwd_for_repo,
-        validate_context_files, validate_working_folder, validate_workspace_path,
-        verify_data_dir_schema_at,
+        run_server, run_terminal_command, save_config_file, task_states_json,
+        terminal_cwd_for_repo, validate_context_files, validate_working_folder,
+        validate_workspace_path, verify_data_dir_schema_at,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -2963,7 +3013,9 @@ mod tests {
     use std::sync::OnceLock;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use workspace_engine::CheckpointRestoreResult;
-    use workspace_engine::{CancelToken, Config, GeneratedSecretWarning, WorkspaceEngine};
+    use workspace_engine::{
+        CancelToken, Config, GeneratedSecretWarning, TaskUsage, UsageSource, WorkspaceEngine,
+    };
 
     /// Points every engine built in this test binary at a throwaway data
     /// directory, and returns it.
@@ -4047,6 +4099,47 @@ mod tests {
         assert_eq!(result.exit_code, 0);
         assert!(result.stdout.is_empty());
         assert!(result.stderr.is_empty());
+    }
+
+    // Spec 19: a reloaded conversation shows what each past turn spent, and
+    // says when the figure is an approximation.
+    #[test]
+    fn the_session_payload_carries_each_tasks_usage() {
+        let statuses = HashMap::from([("task_1".to_string(), "complete".to_string())]);
+        let usage = HashMap::from([(
+            "task_1".to_string(),
+            TaskUsage {
+                input_tokens: 1200,
+                output_tokens: 340,
+                source: UsageSource::Estimated,
+                reported_cost: None,
+                run_count: 1,
+            },
+        )]);
+
+        let json = task_states_json(&statuses, &usage);
+
+        assert!(json.contains("\"inputTokens\":1200"), "{json}");
+        assert!(json.contains("\"outputTokens\":340"), "{json}");
+        // The marker requirement 4 turns on: the shell has to be able to tell
+        // the user this is an approximation rather than a measurement.
+        assert!(json.contains("\"usageSource\":\"estimated\""), "{json}");
+        assert!(json.contains("\"runCount\":1"), "{json}");
+        // Nothing reported a cost, so no cost field at all — a zero would read
+        // as "this turn was free".
+        assert!(!json.contains("reportedCost"), "{json}");
+    }
+
+    #[test]
+    fn a_task_with_no_usage_reports_none_rather_than_zero() {
+        // A session written before usage existed. Absent, not zero: a zero is
+        // indistinguishable from a real measurement of nothing.
+        let statuses = HashMap::from([("task_1".to_string(), "complete".to_string())]);
+
+        let json = task_states_json(&statuses, &HashMap::new());
+
+        assert!(json.contains("\"id\":\"task_1\""), "{json}");
+        assert!(!json.contains("inputTokens"), "{json}");
     }
 
     // The list view needs the counts and the coverage flag, and must not grow
