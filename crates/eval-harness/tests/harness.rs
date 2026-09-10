@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use eval_harness::assertions;
 use eval_harness::metrics::{MetricSet, MetricValue};
-use eval_harness::record::{AssertionOutcome, RecordedRecovery, RecordedToolCall, RunRecord};
+use eval_harness::record::{
+    AssertionOutcome, RecordedRecovery, RecordedToolCall, RunRecord, Tokens,
+};
 use eval_harness::report;
 use eval_harness::scenario::{self, Tier};
 use eval_harness::trace::Trace;
@@ -296,6 +298,30 @@ fn a_missing_audit_log_is_an_empty_trace_not_an_error() {
     let data_dir = eval_harness::guard::eval_data_dir().expect("temp dir");
     let trace = Trace::read(&data_dir).expect("a missing log should not be an error");
     assert!(trace.events.is_empty());
+}
+
+/// Spec 18 §5.6's token row reported `notApplicable: "spec-19"` until spec 19
+/// landed. It is now a real figure — and an honest one: the mock provider
+/// reports no usage, so every number here is an estimate and must say so.
+#[test]
+fn a_deterministic_run_reports_the_token_figures_the_session_recorded() {
+    let path = scenario::scenarios_dir().join("one_file_patch.toml");
+    let loaded = scenario::load(&path).expect("scenario should load");
+
+    let run = eval_harness::runner::run(&loaded).expect("the scenario should run");
+
+    assert!(
+        run.record.tokens.input > 0,
+        "a run that made model calls spent input tokens"
+    );
+    assert!(run.record.tokens.output > 0);
+    assert!(
+        !run.record.tokens.measured,
+        "the mock adapter reports no usage, so every figure here is an estimate"
+    );
+    // No configured rates in the harness, so no cost — a number here would be
+    // one the baseline could not reproduce on another machine.
+    assert_eq!(run.record.cost, None);
 }
 
 #[test]
@@ -834,6 +860,57 @@ fn every_metric_in_the_spec_appears_in_the_output() {
         set.metrics.len(),
         MetricSet::KEYS.len(),
         "no metric may be emitted twice or without a KEYS entry"
+    );
+}
+
+/// The token row was `notApplicable: "spec-19"` until that spec landed, and
+/// nothing pinned it — so it could have changed silently. It now reports a
+/// real sum, and says in its label when that sum is an estimate, because a
+/// reader comparing an estimated total against a measured one has to be able
+/// to tell them apart.
+#[test]
+fn the_token_metric_reports_a_sum_and_admits_when_it_is_an_estimate() {
+    let mut estimated = RunRecord::new("a", "4", "deterministic", "mock", "mock");
+    estimated.tokens = Tokens {
+        input: 100,
+        output: 10,
+        measured: false,
+    };
+    let mut also_estimated = RunRecord::new("b", "4", "deterministic", "mock", "mock");
+    also_estimated.tokens = Tokens {
+        input: 50,
+        output: 5,
+        measured: false,
+    };
+
+    let set = MetricSet::compute(&[estimated.clone(), also_estimated]);
+    let row = set.get("tokens").expect("tokens");
+
+    match &row.value {
+        MetricValue::Count { value } => assert_eq!(*value, 165),
+        other => panic!("expected a count, got {other:?}"),
+    }
+    assert!(
+        row.label.contains("estimated"),
+        "an estimated total must say so: {}",
+        row.label
+    );
+
+    // A run whose provider reported usage drops the caveat.
+    let mut measured = RunRecord::new("c", "4", "live", "openai", "gpt-4.1");
+    measured.tokens = Tokens {
+        input: 7,
+        output: 3,
+        measured: true,
+    };
+    let live = MetricSet::compute(&[measured]);
+    assert!(
+        !live
+            .get("tokens")
+            .expect("tokens")
+            .label
+            .contains("estimated"),
+        "a measured total must not be labelled an estimate"
     );
 }
 

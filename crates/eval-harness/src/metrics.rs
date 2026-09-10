@@ -242,22 +242,32 @@ impl MetricSet {
             },
         );
 
-        // Zero and unmeasured until spec 19 adds usage fields to ModelRun. Not
-        // reported as a measured zero, which would be a lie.
+        // Spec 19 records usage per task, so this is a real figure rather than
+        // the `notApplicable: "spec-19"` it reported before that landed. It is
+        // only ever *measured* against a provider that reports usage; the
+        // deterministic tier's mock reports none, so its figure is spec 19's
+        // `len / 4` estimate and the label says so. Carrying the caveat in the
+        // label follows the latency rows above, and keeps a reader from
+        // comparing an estimate against a measurement without noticing.
         let measured = runnable.iter().any(|record| record.tokens.measured);
+        let total_tokens: u64 = runnable
+            .iter()
+            .map(|record| record.tokens.input + record.tokens.output)
+            .sum();
         push(
             "tokens",
-            "Input and output tokens",
             if measured {
-                MetricValue::Count {
-                    value: runnable
-                        .iter()
-                        .map(|record| record.tokens.input + record.tokens.output)
-                        .sum(),
+                "Input and output tokens"
+            } else {
+                "Input and output tokens (estimated; no provider reported usage)"
+            },
+            if runnable.is_empty() {
+                MetricValue::NotApplicable {
+                    phase: "no-runs".to_string(),
                 }
             } else {
-                MetricValue::NotApplicable {
-                    phase: "spec-19".to_string(),
+                MetricValue::Count {
+                    value: total_tokens,
                 }
             },
         );

@@ -7,8 +7,12 @@ pub struct Tokens {
     pub input: u64,
     pub output: u64,
     /// Whether these came from the provider or from an estimate. The harness
-    /// never presents an estimate as measured (proposal §5.5). `ModelRun`
-    /// carries no usage fields until spec 19, so this is false everywhere today.
+    /// never presents an estimate as measured (proposal §5.5).
+    ///
+    /// False throughout the deterministic tier: the mock adapter is not a
+    /// provider and reports nothing, so every figure there is spec 19's
+    /// `len / 4` estimate. Only a live-tier run against a provider that
+    /// reports usage sets this true.
     pub measured: bool,
 }
 

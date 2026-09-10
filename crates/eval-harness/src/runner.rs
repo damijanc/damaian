@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
     AgentCommandProposal, AgentPatchProposal, CancelToken, ClientError, Config, CurlModelTransport,
     MockModelAdapter, ModelAdapter, ModelProviderConfig, OpenAICompatibleAdapter, Result,
-    SecretScanner, SessionStore, Task, TaskStatus, ToolCall, TurnProgress, TurnSink,
+    SecretScanner, SessionStore, Task, TaskStatus, ToolCall, TurnProgress, TurnSink, UsageSource,
     WorkspaceEngine, classify_session, resume,
 };
 
@@ -214,6 +214,12 @@ fn drive(
         .ok()
         .and_then(|result| result.command_proposal.clone());
 
+    // Captured here for the same reason the proposal is: both are consumed by
+    // the status match below. A resumed turn re-reads the same task, so its
+    // total already covers the rounds before the approval and wins when there
+    // is one.
+    let mut recorded_usage = outcome.as_ref().ok().and_then(|result| result.usage);
+
     // A scenario that scripts an approval decision resumes the turn with it, so
     // the denied path is exercised end to end rather than stopping at the
     // proposal. `resume_after_command_decision` takes a `TurnSink`, unlike `ask`.
@@ -240,6 +246,11 @@ fn drive(
 
     // The resumed turn is the one that finished, so it supersedes the original.
     let outcome = resumed.unwrap_or(outcome);
+    if let Ok(result) = &outcome
+        && let Some(usage) = result.usage
+    {
+        recorded_usage = Some(usage);
+    }
     let duration_ms = now_millis().saturating_sub(started_at_ms);
 
     // The conflict scenario is the only one that applies a patch, and it does so
@@ -432,12 +443,22 @@ fn drive(
         ),
     };
     run_record.final_status = final_status;
+    // Spec 19's per-task accounting is the one definition of what a task
+    // spent, and `ChatTurnResult.usage` is that figure read back from the
+    // session log. The harness reports it rather than counting model calls
+    // itself, so an eval figure and a real session's figure cannot drift.
+    //
+    // A resumed turn re-reads the same task, so its total already includes the
+    // rounds before the approval; the resumed result therefore wins when there
+    // is one.
     run_record.tokens = Tokens {
-        input: 0,
-        output: 0,
-        measured: false,
+        input: recorded_usage.map(|usage| usage.input_tokens).unwrap_or(0),
+        output: recorded_usage.map(|usage| usage.output_tokens).unwrap_or(0),
+        measured: recorded_usage
+            .map(|usage| usage.source == UsageSource::Measured)
+            .unwrap_or(false),
     };
-    run_record.cost = None;
+    run_record.cost = recorded_usage.and_then(|usage| usage.reported_cost);
     run_record.sanitize(scanner);
 
     Ok(Run {

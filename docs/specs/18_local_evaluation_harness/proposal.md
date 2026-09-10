@@ -239,7 +239,7 @@ explicit. Every row of the roadmap's metric set, and where its value comes from:
 | Tool and model error rate | `toolCalls[].outcome != "ok"` over all tool calls |
 | Latency | `durationMs`, median and p90. Deterministic-tier latency measures Damaian's own work only, since the mock returns instantly — recorded as such, not as user-visible latency |
 | Model calls / tool rounds per task | Counted from the run record |
-| Input and output tokens | From [spec 19](../19_token_and_cost_accounting/proposal.md). Zero and `measured: false` in the deterministic tier |
+| Input and output tokens | From [spec 19](../19_token_and_cost_accounting/proposal.md), read back through `read_task_usage`. Reported `notApplicable: "spec-19"` until that spec landed; now a real sum. `measured: false` throughout the deterministic tier, whose mock reports no usage, so the figure is spec 19's `len / 4` estimate and the row's label says so |
 | Provider cost | Live tier only. `null` in the deterministic tier |
 | Manual repair rate | **Not machine-derivable.** A human-entered field in the baseline, defined as tasks needing correction after completion, recorded from live-tier runs with the sample size stated |
 | Patch acceptance rate | Accepted files and hunks over proposed, from live-tier runs where a human accepted |
@@ -330,6 +330,15 @@ restricted by default and excluded by `.gitignore`.
 tests, most of which materialize a fixture and drive a full turn. Well short of
 the point where someone would disable it, but it is the figure to watch: this
 tier runs on every test invocation.
+
+**The token row is no longer `notApplicable`.**
+[Spec 19](../19_token_and_cost_accounting/proposal.md) landed and the harness
+reads `read_task_usage` rather than counting anything itself, so an eval figure
+and a real session's figure cannot drift apart. Nothing pinned this row while
+it was a marker, so changing it broke no test — a gap now closed by
+`the_token_metric_reports_a_sum_and_admits_when_it_is_an_estimate`. The
+deterministic tier's figure is an *estimate*, carried in the row's label rather
+than left for a reader to infer.
 
 **The two human-sourced metrics are `null`, with reasons.** No live-tier runs
 have been performed, so there is no sample to draw from. `manual_repair_rate`
