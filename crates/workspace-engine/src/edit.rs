@@ -26,7 +26,8 @@ pub struct GeneratedEdit {
     pub changes: Vec<ProposedChange>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: it carries a `ModelRun`, whose `reported_cost` is an `Option<f64>`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct EditProposalResult {
     pub session: Session,
     pub task: Task,

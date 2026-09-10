@@ -165,7 +165,8 @@ pub struct AgentPatchProposal {
     pub files: Vec<ProposedFilePatch>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: it carries a `ModelRun`, whose `reported_cost` is an `Option<f64>`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatTurnResult {
     pub session: Session,
     pub task: Task,

@@ -149,6 +149,67 @@ pub struct ToolCall {
     pub arguments_json: String,
 }
 
+/// Whether a token figure came from the provider or from a local
+/// approximation.
+///
+/// Per run rather than per task, because one task mixes them: a provider that
+/// reports usage on a completed call reports nothing for a call whose stream
+/// was cut, and that run's figure is an estimate while its siblings are
+/// measured. Spec 19 §5.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UsageSource {
+    /// Reported by the provider for this call.
+    Measured,
+    /// Derived locally from payload size. Never presented as measured.
+    Estimated,
+}
+
+impl UsageSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Measured => "measured",
+            Self::Estimated => "estimated",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "measured" => Some(Self::Measured),
+            "estimated" => Some(Self::Estimated),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub source: UsageSource,
+}
+
+impl TokenUsage {
+    /// The only zero that is a fact rather than a guess: no request was sent,
+    /// so nothing was billed.
+    pub fn measured_zero() -> Self {
+        Self {
+            input_tokens: 0,
+            output_tokens: 0,
+            source: UsageSource::Measured,
+        }
+    }
+
+    pub fn estimated(input_tokens: u64, output_tokens: u64) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            source: UsageSource::Estimated,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequest {
     pub provider: String,
@@ -168,7 +229,9 @@ pub struct ModelRequest {
     pub max_tokens: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: `reported_cost` is an `Option<f64>`. Nothing uses a run as a map key
+// or in a set, and `PartialEq` is what `assert_eq!` needs.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelRun {
     pub run_id: String,
     pub provider: String,
@@ -188,6 +251,13 @@ pub struct ModelRun {
     /// display: its only use is being replayed on the assistant message that
     /// carries [`Self::tool_calls`] — see [`ModelMessage::reasoning_content`].
     pub reasoning_content: Option<String>,
+    /// What this call cost in tokens. Always populated: measured when the
+    /// provider reported it, estimated when it did not. Spec 19 §5.1.
+    pub usage: TokenUsage,
+    /// Cost as the provider reported it. `None` is the normal case — almost no
+    /// provider reports cost on a chat completion — and means "this provider
+    /// did not tell us", never "free".
+    pub reported_cost: Option<f64>,
 }
 
 impl ModelRun {
@@ -208,6 +278,8 @@ impl ModelRun {
             tool_calls: Vec::new(),
             truncated: false,
             reasoning_content: None,
+            usage: TokenUsage::measured_zero(),
+            reported_cost: None,
         }
     }
 }
@@ -332,6 +404,14 @@ impl ModelAdapter for MockModelAdapter {
             content.push_str(&token);
             on_token(&token);
         }
+        // Before the struct literal moves `content` out of scope. The mock is
+        // not a provider and reports no usage, so its figure is an estimate
+        // like any other unreported call.
+        let usage = TokenUsage::estimated(
+            model_request_json(request).len().div_ceil(4) as u64,
+            content.len().div_ceil(4) as u64,
+        );
+
         Ok(ModelRun {
             run_id: run_id.clone(),
             provider: "mock".to_string(),
@@ -344,6 +424,8 @@ impl ModelAdapter for MockModelAdapter {
             tool_calls,
             truncated: self.truncated.get(index).copied().unwrap_or(false),
             reasoning_content: self.reasoning_content.get(index).cloned().flatten(),
+            usage,
+            reported_cost: None,
         })
     }
 }
@@ -698,6 +780,12 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
             ));
         }
 
+        // Before the struct literal moves `content` out of scope.
+        let usage = TokenUsage::estimated(
+            self.estimate_tokens(&body) as u64,
+            self.estimate_tokens(&content) as u64,
+        );
+
         Ok(ModelRun {
             run_id: run_id.clone(),
             provider: self.provider.clone(),
@@ -714,6 +802,8 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
             tool_calls,
             truncated: response_was_truncated(&raw),
             reasoning_content: extract_reasoning_content(&raw),
+            usage,
+            reported_cost: None,
         })
     }
 }
@@ -1306,6 +1396,37 @@ mod tests {
             tools: None,
             max_tokens: None,
         }
+    }
+
+    #[test]
+    fn a_run_with_no_reported_usage_is_estimated_from_the_request_and_the_content() {
+        let transport =
+            MockModelTransport::new("{\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}");
+        let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
+        let request = test_request();
+        let run = adapter
+            .stream_response(&request, &CancelToken::new(), &mut |_token| {})
+            .expect("the mock stream should produce a run");
+
+        assert_eq!(run.usage.source, UsageSource::Estimated);
+        // Over the serialised request rather than the prompt alone, so it is
+        // larger than the user's text and never zero.
+        let body_estimate = model_request_json(&request).len().div_ceil(4) as u64;
+        assert_eq!(run.usage.input_tokens, body_estimate);
+        assert_eq!(run.usage.output_tokens, "hello".len().div_ceil(4) as u64);
+        assert_eq!(run.reported_cost, None);
+    }
+
+    #[test]
+    fn a_turn_cancelled_before_the_provider_was_called_is_a_measured_zero() {
+        // The one genuinely free case (spec 19 §5.5): nothing was sent, so
+        // nothing was billed, and that is a fact rather than an estimate.
+        let run = ModelRun::cancelled_before_start("openai-compatible", "test-model");
+
+        assert_eq!(run.usage.source, UsageSource::Measured);
+        assert_eq!(run.usage.input_tokens, 0);
+        assert_eq!(run.usage.output_tokens, 0);
+        assert_eq!(run.reported_cost, None);
     }
 
     #[test]

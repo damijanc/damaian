@@ -74,8 +74,8 @@ pub use mcp::{
 };
 pub use model::{
     CurlModelTransport, MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage,
-    ModelRequest, ModelRun, ModelTransport, OpenAICompatibleAdapter, ToolCall, ToolDefinition,
-    extract_model_tokens, model_request_json,
+    ModelRequest, ModelRun, ModelTransport, OpenAICompatibleAdapter, TokenUsage, ToolCall,
+    ToolDefinition, UsageSource, extract_model_tokens, model_request_json,
 };
 pub use patch_engine::{
     GeneratedSecretWarning, PatchApplyResult, PatchEngine, PatchRollbackResult, ProposedChange,
