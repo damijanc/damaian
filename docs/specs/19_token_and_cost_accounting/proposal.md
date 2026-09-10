@@ -5,73 +5,29 @@ Order: 19 of 19
 Roadmap: `docs/ROADMAP/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 6 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
+Also in this spec: [`context.md`](context.md) (motivation, current state, and
+the corrections found while planning), [`tasks.md`](tasks.md) (execution order
+and progress).
 Related spec sections: `ai_coding_assistant_specification.md` section 7.5 (model
 adapter), section 12.1 (performance). Related implementation specs:
-[`08_stop_and_progress.md`](08_stop_and_progress.md) (the turn lifecycle these
-figures attach to),
-[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
+[`../08_stop_and_progress.md`](../08_stop_and_progress.md) (the turn lifecycle
+these figures attach to),
+[`../17_durable_task_state_and_crash_recovery/proposal.md`](../17_durable_task_state_and_crash_recovery/proposal.md)
 (the session-log append rules and the lost-call case), and
-[`18_local_evaluation_harness/`](18_local_evaluation_harness/proposal.md)
+[`../18_local_evaluation_harness/proposal.md`](../18_local_evaluation_harness/proposal.md)
 (consumes these fields).
 
-## 1. Motivation
-
-Damaian spends the user's money and does not tell them how much.
-
-A chat turn can make many model calls — the agent loop runs up to
-`agent_max_tool_rounds` rounds, each with the assembled context resent — and the
-only bound on any of it is a round count. A user who runs a long task on a
-frontier model has no way to know afterwards whether it cost two cents or four
-dollars, and no way to compare a cheap approach against an expensive one, because
-nothing is recorded.
-
-The gap is total rather than partial. `ModelRun`
-(`crates/workspace-engine/src/model.rs:158-177`) has no usage fields at all, the
-streaming parser extracts message content and discards everything else, and
-`Task` (`crates/workspace-engine/src/session.rs:46-56`) has nowhere to put a
-number. The only token figure in the codebase is a `payload.len() / 4` estimate
-(`model.rs:209`) used for context budgeting, not reporting.
-
-This work package only measures. The enforced per-task ceiling lands in Phase 2
-alongside the plan machinery, because stopping a task cleanly needs it — but a
-ceiling cannot be built on numbers that do not exist, and
-[spec 18](18_local_evaluation_harness/proposal.md)'s metric set has four rows
-that stay empty until this ships.
-
-## 2. Current State
-
-- **`ModelRun` carries no usage data**: `run_id`, provider, model, timestamps,
-  content, `incomplete`, `retry_count`, `tool_calls`, `truncated`,
-  `reasoning_content` (`model.rs:158-177`). No token counts, no cost.
-- **The SSE parser discards everything but content.** `extract_model_tokens`
-  (`model.rs:823`) walks `data:` lines, skips `[DONE]`, and passes each payload
-  to `extract_content_values`. A provider's `usage` object in the final chunk is
-  parsed for nothing.
-- **The request body does not ask for usage.** `model_request_json`
-  (`model.rs:756`) emits `model`, `messages`, `stream`, and optionally
-  `temperature`, `max_tokens`, `reasoning_effort`, and `tools`. For
-  OpenAI-compatible streaming APIs, usage is omitted from the stream unless
-  `stream_options: {"include_usage": true}` is sent.
-- **An input-side estimate already exists.** `ContextBundle.token_estimate`
-  (`crates/workspace-engine/src/context_manager.rs:34`) accumulates the same
-  `len / 4` approximation, and `chat.rs:775` and `edit.rs:258` already audit it
-  as `tokenEstimate`.
-- **Retries are counted but not costed.** `ModelRun.retry_count`
-  (`model.rs:166`, set at `model.rs:675`) records attempts beyond the first. Each
-  retry is a billed call.
-- **`Task` has no usage fields** and is replayed from `task_created` and
-  `task_status_updated` events rather than stored as a record
-  (`session.rs:237-260`).
-- **Work is bounded by rounds, not tokens**: `agent_max_tool_rounds`,
-  `agent_tool_retry_limit`.
-- **No pricing information exists anywhere** in config or code.
+Motivation and current state moved to [`context.md`](context.md) when this spec
+took the folder layout. **Read its §3 before implementing:** five of this
+document's design statements assume behaviour the code does not have, and that
+section says what each one has to become.
 
 ## 3. Requirements
 
 1. Input tokens, output tokens, and provider-reported cost are recorded per task
    and stored alongside the task in `SessionStore`.
 2. The stored totals are exposed through task state and the completion report.
-3. The same fields feed the [spec 18](18_local_evaluation_harness/proposal.md) harness, so
+3. The same fields feed the [spec 18](../18_local_evaluation_harness/proposal.md) harness, so
    the metric set is populated by real sessions as well as eval runs.
 4. Where a provider does not report usage, the figure is estimated and labelled
    as an estimate. **An estimate is never presented as measured.**
@@ -188,7 +144,7 @@ is only as trustworthy as its weakest term.
 ### 5.4 Per-task aggregation
 
 A task's usage is the sum over its runs. Following
-[spec 17](17_durable_task_state_and_crash_recovery/proposal.md)'s rule that the session
+[spec 17](../17_durable_task_state_and_crash_recovery/proposal.md)'s rule that the session
 log is append-only, usage is appended, never rewritten:
 
 ```json
@@ -224,12 +180,12 @@ Requirement 5 is where honest accounting differs from convenient accounting.
   estimated from the request that was sent, since the input was transmitted and
   billed even though no answer came back.
 - **Cancelled turns**: a turn stopped by the user
-  ([spec 08](08_stop_and_progress.md)) has already sent its input and received
+  ([spec 08](../08_stop_and_progress.md)) has already sent its input and received
   partial output. Record what was streamed, estimated, rather than discarding the
   call. `ModelRun::cancelled_before_start` (`model.rs:180-183`) is the one case
   with genuinely zero usage, and it is recorded as measured zero.
 - **Crashed turns**: a call in flight when the app died was billed and its
-  response is gone. [Spec 17](17_durable_task_state_and_crash_recovery/proposal.md)
+  response is gone. [Spec 17](../17_durable_task_state_and_crash_recovery/proposal.md)
   classifies the task; recovery appends a usage event estimated from the request,
   marked `source: "estimated"` with the reason, so a crash does not silently
   reduce the reported spend.
@@ -248,7 +204,7 @@ than it is.
   and ids only — requirement 7 is satisfied by construction, since no prompt or
   file content enters the record.
 - **Eval harness**: `read_task_usage` is what
-  [spec 18](18_local_evaluation_harness/proposal.md)'s `tokens` and `cost`
+  [spec 18](../18_local_evaluation_harness/proposal.md)'s `tokens` and `cost`
   fields read, and `measured: false` there is this spec's
   `UsageSource::Estimated`.
 

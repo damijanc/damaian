@@ -347,9 +347,9 @@ Without adding a tokenizer dependency (§4), the improvement is a
 content-aware ratio: estimate per item using a ratio selected by the item's
 language and category — one for prose and Markdown, one for code, one for
 structured data like JSON — calibrated once against measured provider usage from
-[spec 19](19_token_and_cost_accounting.md) and recorded in §7.
+[spec 19](19_token_and_cost_accounting/proposal.md) and recorded in §7.
 
-The calibration is the point. [Spec 19](19_token_and_cost_accounting.md) records
+The calibration is the point. [Spec 19](19_token_and_cost_accounting/proposal.md) records
 measured input tokens per call; comparing those against the estimate for the
 same call gives a real ratio per content type instead of a guessed one, and
 turns `len / 4` from folklore into a number with a derivation.
@@ -393,7 +393,7 @@ one, and what to do when content is being excluded as
 - A `Required` item that does not fit produces a visible error rather than being
   dropped.
 - The improved estimate is calibrated against measured usage from
-  [spec 19](19_token_and_cost_accounting.md), and the calibration is recorded in
+  [spec 19](19_token_and_cost_accounting/proposal.md), and the calibration is recorded in
   §7.
 - The manifest is written through `AuditLog::record`.
 - Every quality-gate command from `AGENTS.md` passes, and the

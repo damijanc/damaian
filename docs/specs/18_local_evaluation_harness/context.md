@@ -51,7 +51,7 @@ baseline that makes a later regression a diff rather than a recollection.
   (`crates/workspace-engine/src/model.rs:158-177`) carries no usage fields, and
   the only token figure anywhere is the `payload.len() / 4` estimate in
   `ModelAdapter::estimate_tokens` (`model.rs:209`).
-  [Spec 19](../19_token_and_cost_accounting.md) supplies these.
+  [Spec 19](../19_token_and_cost_accounting/proposal.md) supplies these.
 - **Work is bounded by round count, not tokens**: `agent_max_tool_rounds` and
   `agent_tool_retry_limit` in `Config`.
 - **No fixture repositories exist**, and none can be committed with a nested

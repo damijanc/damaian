@@ -83,7 +83,7 @@ a crashed session ([spec 46](../46_process_registry_and_orphan_sweep.md)).
 
 - Resuming a model call mid-stream. A model call whose stream was cut is a lost
   call; the task resumes by making a new one, and the cost of the lost call is
-  reported by [spec 19](../19_token_and_cost_accounting.md), not hidden.
+  reported by [spec 19](../19_token_and_cost_accounting/proposal.md), not hidden.
 - Undoing what a crashed action did. That is rewind
   ([spec 16](../16_session_checkpoints_and_rewind.md)); this spec establishes what
   happened so the user can decide.

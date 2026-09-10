@@ -12,7 +12,7 @@ interface UI states), section 7.6 (tool and action orchestrator), section 11
 cancellation this extends to multi-step tasks),
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (the durable task state and append rules this persists through),
-[`19_token_and_cost_accounting.md`](19_token_and_cost_accounting.md) (supplies
+[`19_token_and_cost_accounting/proposal.md`](19_token_and_cost_accounting/proposal.md) (supplies
 the token figures the ceiling is enforced against),
 [`20_working_modes.md`](20_working_modes.md) (Plan mode produces plans it does
 not execute).
@@ -35,7 +35,7 @@ Two consequences follow, and the second is the more serious.
 `agent_max_tool_rounds` bounds the loop by round count
 (`crates/workspace-engine/src/config.rs:67`), which is a poor proxy: one round
 that resends a 100k-token context costs more than twenty rounds that read three
-small files. [Spec 19](19_token_and_cost_accounting.md) makes spend visible;
+small files. [Spec 19](19_token_and_cost_accounting/proposal.md) makes spend visible;
 without a ceiling, visible is all it is.
 
 **Completion is asserted, not demonstrated.** The model says it is done, and
@@ -65,7 +65,7 @@ completion report, and it cannot exist without steps that carry evidence.
   [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.2.
 - **No token accounting exists yet.** `ModelRun`
   (`crates/workspace-engine/src/model.rs:158-177`) has no usage fields;
-  [spec 19](19_token_and_cost_accounting.md) adds them and
+  [spec 19](19_token_and_cost_accounting/proposal.md) adds them and
   `read_task_usage`.
 - **Evidence sources already exist, unstructured.** `CommandExecution` carries
   `exit_code: Option<i32>`, `stdout`, `stderr`
@@ -89,7 +89,7 @@ completion report, and it cannot exist without steps that carry evidence.
    evidence is attached wherever one exists. Where none exists, the step is
    marked completed *unverified* and the completion report says so.
 7. An enforced per-task token ceiling exists alongside `agent_max_tool_rounds`,
-   using the accounting from [spec 19](19_token_and_cost_accounting.md). On
+   using the accounting from [spec 19](19_token_and_cost_accounting/proposal.md). On
    reaching it, work stops cleanly at a step boundary, the plan is persisted, and
    the remaining steps are reported.
 
@@ -104,7 +104,7 @@ completion report, and it cannot exist without steps that carry evidence.
 - A dependency solver. Dependencies are recorded and used to block a step whose
   prerequisite failed, not to reorder or optimise a plan.
 - Cost ceilings in currency. The ceiling is in tokens, because tokens are what
-  [spec 19](19_token_and_cost_accounting.md) can measure rather than estimate
+  [spec 19](19_token_and_cost_accounting/proposal.md) can measure rather than estimate
   from user-supplied rates.
 - Cross-task or per-session budgets. The ceiling is per task.
 - Replacing `agent_max_tool_rounds`. Both bounds apply; whichever is reached
@@ -235,7 +235,7 @@ Enforcement follows the existing `tool_budget_exhausted` pattern exactly
   ceiling that interrupts a model mid-response wastes the tokens already spent on
   that response, which is the opposite of the point.
 - The check reads `read_task_usage` from
-  [spec 19](19_token_and_cost_accounting.md). A task whose usage is
+  [spec 19](19_token_and_cost_accounting/proposal.md). A task whose usage is
   `Estimated` is still checked against the ceiling — an estimated total is the
   best available number, and declining to enforce on it would make the ceiling
   inoperative for every provider that does not report usage.

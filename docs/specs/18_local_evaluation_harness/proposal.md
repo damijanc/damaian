@@ -19,7 +19,7 @@ Related spec sections: `ai_coding_assistant_specification.md` section 19
 [`../07_generated_secret_override.md`](../07_generated_secret_override.md),
 [`../17_durable_task_state_and_crash_recovery/proposal.md`](../17_durable_task_state_and_crash_recovery/proposal.md)
 (the resume scenario), and
-[`../19_token_and_cost_accounting.md`](../19_token_and_cost_accounting.md) (supplies
+[`../19_token_and_cost_accounting/proposal.md`](../19_token_and_cost_accounting/proposal.md) (supplies
 the token and cost fields this harness reports).
 
 ## 3. Requirements
@@ -220,7 +220,7 @@ written, and file *contents* never enter a record — only paths. Requirement 9 
 asserted by the seeded-secret scenario, which greps the emitted records.
 
 `tokens.measured` distinguishes a provider-reported figure from an estimate, per
-[spec 19](../19_token_and_cost_accounting.md). The harness never presents an
+[spec 19](../19_token_and_cost_accounting/proposal.md). The harness never presents an
 estimate as measured.
 
 ### 5.6 Metric coverage
@@ -239,7 +239,7 @@ explicit. Every row of the roadmap's metric set, and where its value comes from:
 | Tool and model error rate | `toolCalls[].outcome != "ok"` over all tool calls |
 | Latency | `durationMs`, median and p90. Deterministic-tier latency measures Damaian's own work only, since the mock returns instantly — recorded as such, not as user-visible latency |
 | Model calls / tool rounds per task | Counted from the run record |
-| Input and output tokens | From [spec 19](../19_token_and_cost_accounting.md). Zero and `measured: false` in the deterministic tier |
+| Input and output tokens | From [spec 19](../19_token_and_cost_accounting/proposal.md). Zero and `measured: false` in the deterministic tier |
 | Provider cost | Live tier only. `null` in the deterministic tier |
 | Manual repair rate | **Not machine-derivable.** A human-entered field in the baseline, defined as tasks needing correction after completion, recorded from live-tier runs with the sample size stated |
 | Patch acceptance rate | Accepted files and hunks over proposed, from live-tier runs where a human accepted |

@@ -385,7 +385,7 @@ it.
 Each subagent's turn, time, and token limits are the lower of its request and
 the parent's *remaining* budget, so children cannot collectively exceed the
 parent's ceiling ([spec 21](21_task_plan_progress_and_budget.md) §5.4). Usage
-aggregates upward through [spec 19](19_token_and_cost_accounting.md)'s per-task
+aggregates upward through [spec 19](19_token_and_cost_accounting/proposal.md)'s per-task
 events, and the parent's total includes its descendants' — which is what makes
 [spec 40](40_autonomy_evaluations.md)'s cost-amplification figure computable.
 

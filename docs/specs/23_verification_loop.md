@@ -210,7 +210,7 @@ Two rules keep the loop from being worse than no loop:
   patch, the loop stops rather than spending the remaining attempts asking the
   same question. A model that cannot fix something on attempt one usually cannot
   fix it on attempt three, and the attempts cost real money
-  ([spec 19](19_token_and_cost_accounting.md)).
+  ([spec 19](19_token_and_cost_accounting/proposal.md)).
 - **Regression guard.** After a repair, checks that previously passed rerun. A
   repair that fixes one check by breaking another is a net loss, and the loop that
   only reruns the failing check would report success. A repair that newly breaks a

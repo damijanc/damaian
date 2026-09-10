@@ -17,7 +17,7 @@ surface this extends), [`04_hunk_level_patch_apply.md`](04_hunk_level_patch_appl
 progress channel), [`10_persistent_command_approval.md`](10_persistent_command_approval.md)
 and [`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)
 (the command trust boundary this must not widen),
-[`19_token_and_cost_accounting.md`](19_token_and_cost_accounting.md) and
+[`19_token_and_cost_accounting/proposal.md`](19_token_and_cost_accounting/proposal.md) and
 [`21_task_plan_progress_and_budget.md`](21_task_plan_progress_and_budget.md)
 (own the budget this defers to),
 [`24_repository_map_and_monorepo_boundaries.md`](24_repository_map_and_monorepo_boundaries.md),

@@ -10,7 +10,7 @@ Related spec sections: `ai_coding_assistant_specification.md` section 19
 [`18_local_evaluation_harness/`](18_local_evaluation_harness/proposal.md) (the
 harness this extends — this spec adds scenarios and metrics, it does not build a
 second harness),
-[`19_token_and_cost_accounting.md`](19_token_and_cost_accounting.md) (the usage
+[`19_token_and_cost_accounting/proposal.md`](19_token_and_cost_accounting/proposal.md) (the usage
 figures amplification is computed from),
 [`21_task_plan_progress_and_budget.md`](21_task_plan_progress_and_budget.md),
 [`38_subagent_model.md`](38_subagent_model.md),
@@ -59,7 +59,7 @@ Nothing in this phase exists. What it builds on:
   usefulness and memory correction rate `notApplicable: "phase-3b"`, and [spec 30](30_memory_retrieval_and_lifecycle.md) §5.8 supplies them. This spec adds
   rows rather than filling deferred ones.
 - **Per-task usage aggregates upward.**
-  [Spec 19](19_token_and_cost_accounting.md) §5.4 records usage per run and sums
+  [Spec 19](19_token_and_cost_accounting/proposal.md) §5.4 records usage per run and sums
   per task, and [spec 38](38_subagent_model.md) §5.10 makes a parent's total
   include its descendants' — which is what makes amplification computable
   without a second accounting path.
@@ -145,12 +145,12 @@ An absolute token delta means nothing without knowing the baseline.
 Three properties this needs to be honest:
 
 - **Children's usage is included in the parent's total.** Already true via
-  [spec 19](19_token_and_cost_accounting.md) and
+  [spec 19](19_token_and_cost_accounting/proposal.md) and
   [spec 38](38_subagent_model.md) §5.10. An amplification figure computed from
   the parent's own calls alone would understate the cost by most of it, which is
   the single easiest way to make delegation look free.
 - **Estimated usage is marked.** Where a provider does not report usage,
-  [spec 19](19_token_and_cost_accounting.md) §5.3 labels the figure estimated;
+  [spec 19](19_token_and_cost_accounting/proposal.md) §5.3 labels the figure estimated;
   an amplification ratio built from estimates is labelled the same way. A ratio
   of two estimates is not a measurement.
 - **Deterministic-tier duration measures Damaian's own work only**, since the

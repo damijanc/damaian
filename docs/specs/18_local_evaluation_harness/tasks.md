@@ -43,7 +43,7 @@ Every task's requirements implicitly include this section.
   `crates/workspace-engine/tests/foundation.rs:18` already uses for this purpose.
 - **`tokens.measured` must distinguish a provider-reported figure from an estimate.** The
   harness never presents an estimate as measured (§5.5). Until
-  [spec 19](../19_token_and_cost_accounting.md) lands, `ModelRun` carries no usage fields, so
+  [spec 19](../19_token_and_cost_accounting/proposal.md) lands, `ModelRun` carries no usage fields, so
   every tier reports `measured: false`.
 - **A run must refuse to start if `DAMAIAN_DATA_DIR` points inside
   `~/Library/Application Support`** (§5.2).
