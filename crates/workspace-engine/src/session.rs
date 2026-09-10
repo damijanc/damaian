@@ -1,6 +1,7 @@
 use crate::audit::escape_json;
 use crate::error::Result;
 use crate::hash::{create_id, now_millis};
+use crate::model::{TokenUsage, UsageSource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -190,6 +191,24 @@ pub struct DanglingAction {
     /// re-derive the action's nature after the code that knew it is gone.
     pub side_effecting: bool,
     pub seq: u64,
+}
+
+/// A task's total token usage, summed from its `task_usage_recorded` events.
+///
+/// Not a stored record, for the same reason [`Task`] is not: the event log is
+/// where task facts live, so a crash mid-task loses at most the run that was
+/// in flight while every completed run stays correctly accounted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TaskUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// [`UsageSource::Estimated`] when *any* contributing run was estimated: a
+    /// total is only as trustworthy as its weakest term.
+    pub source: UsageSource,
+    /// `Some` only when every contributing run reported a cost. A partial sum
+    /// would understate the bill while looking authoritative.
+    pub reported_cost: Option<f64>,
+    pub run_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -555,6 +574,151 @@ impl SessionStore {
             });
         }
         Ok(found)
+    }
+
+    /// Appends one run's token usage. One event per call that reached the
+    /// provider, never rewritten — spec 19 §5.4 follows spec 17's append-only
+    /// rule, so a partial total is correct rather than absent.
+    ///
+    /// `marker_id` ties the event to the `action_started` marker for that
+    /// call, so recovery can tell a call it has already accounted for from one
+    /// it has not. `reason` explains a non-obvious estimate — a stopped
+    /// stream, a lost call — and is always a fixed literal chosen here, never
+    /// free text from a model, a file, or a provider.
+    ///
+    /// Requirement 7 is satisfied by construction: every field written is a
+    /// number or an id.
+    pub fn record_task_usage(
+        &self,
+        task: &Task,
+        run_id: &str,
+        marker_id: Option<&str>,
+        usage: TokenUsage,
+        reported_cost: Option<f64>,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.record_task_usage_for_task_id(
+            &task.session_id,
+            &task.id,
+            run_id,
+            marker_id,
+            usage,
+            reported_cost,
+            reason,
+        )
+    }
+
+    /// [`Self::record_task_usage`] for a caller that holds ids rather than a
+    /// [`Task`] — recovery replays from the log and never rebuilds one.
+    #[allow(clippy::too_many_arguments)] // Every argument is one field of the event being written.
+    pub fn record_task_usage_for_task_id(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        run_id: &str,
+        marker_id: Option<&str>,
+        usage: TokenUsage,
+        reported_cost: Option<f64>,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let cost = match reported_cost {
+            Some(cost) => format!("{cost}"),
+            None => "null".to_string(),
+        };
+        let marker = match marker_id {
+            Some(marker_id) => format!(",\"markerId\":\"{}\"", escape_json(marker_id)),
+            None => String::new(),
+        };
+        let reason = match reason {
+            Some(reason) => format!(",\"reason\":\"{}\"", escape_json(reason)),
+            None => String::new(),
+        };
+        self.append_session_event(
+            session_id,
+            "task_usage_recorded",
+            &format!(
+                "{{\"taskId\":\"{}\",\"runId\":\"{}\"{},\"inputTokens\":{},\"outputTokens\":{},\"source\":\"{}\",\"reportedCost\":{}{}}}",
+                escape_json(task_id),
+                escape_json(run_id),
+                marker,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.source.as_str(),
+                cost,
+                reason
+            ),
+        )
+    }
+
+    /// Every task's summed usage, keyed by task id.
+    ///
+    /// A task with no usage events is **absent** from the map rather than
+    /// present with a zero. That is the difference between "not recorded" and
+    /// "used nothing", and it is what lets a session written before usage
+    /// existed report honestly instead of claiming a free turn.
+    ///
+    /// Reads **all** events rather than only the active conversation, for the
+    /// same reason [`Self::dangling_actions`] does: a rewind moves the
+    /// conversation back, but what was billed was billed.
+    pub fn read_task_usage(&self, session_id: &str) -> Result<HashMap<String, TaskUsage>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(HashMap::new());
+        };
+        let mut totals: HashMap<String, TaskUsage> = HashMap::new();
+        let mut every_run_costed: HashMap<String, bool> = HashMap::new();
+        for event in parsed_events(&content).0 {
+            if event.event_type != "task_usage_recorded" {
+                continue;
+            }
+            let Some(task_id) = event.text("taskId") else {
+                continue;
+            };
+            let input = event
+                .payload
+                .get("inputTokens")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let output = event
+                .payload
+                .get("outputTokens")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            // An absent or unrecognised source is treated as an estimate: the
+            // weaker claim is the safe default, and a version that does not
+            // understand a future source must not upgrade it to measured.
+            let source = event
+                .text("source")
+                .and_then(|value| UsageSource::parse(&value))
+                .unwrap_or(UsageSource::Estimated);
+            let cost = event
+                .payload
+                .get("reportedCost")
+                .and_then(|value| value.as_f64());
+
+            let costed = every_run_costed.entry(task_id.clone()).or_insert(true);
+            *costed = *costed && cost.is_some();
+
+            let total = totals.entry(task_id).or_insert(TaskUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+                source: UsageSource::Measured,
+                reported_cost: None,
+                run_count: 0,
+            });
+            total.input_tokens += input;
+            total.output_tokens += output;
+            total.run_count += 1;
+            if source == UsageSource::Estimated {
+                total.source = UsageSource::Estimated;
+            }
+            total.reported_cost = Some(total.reported_cost.unwrap_or(0.0) + cost.unwrap_or(0.0));
+        }
+        for (task_id, total) in totals.iter_mut() {
+            if !every_run_costed.get(task_id).copied().unwrap_or(false) {
+                total.reported_cost = None;
+            }
+        }
+        Ok(totals)
     }
 
     /// Records `action_started` and returns the marker that must be finished.
