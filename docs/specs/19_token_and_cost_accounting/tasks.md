@@ -58,7 +58,7 @@ Every task's requirements implicitly include this section.
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · `TokenUsage` on `ModelRun`, estimated everywhere | Not started | |
+| 1 · `TokenUsage` on `ModelRun`, estimated everywhere | Done | 2 tests, gate green at 440. Used the existing `test_request()` helper rather than the plan's inline literals, which localizes Task 3's new field to one place. **One plan error:** the usage estimate cannot live in the `ModelRun` literal — `content` is moved by an earlier field, so both adapters compute it into a local first. `Eq` dropped from `ModelRun`, `ChatTurnResult` and `EditProposalResult` as planned; nothing used them as a map key |
 | 2 · Read the provider's reported usage | Not started | |
 | 3 · Ask for usage, and the capability probe | Not started | |
 | 4 · The usage event and per-task aggregation | Not started | |

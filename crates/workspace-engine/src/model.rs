@@ -781,10 +781,18 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
         }
 
         // Before the struct literal moves `content` out of scope.
-        let usage = TokenUsage::estimated(
-            self.estimate_tokens(&body) as u64,
-            self.estimate_tokens(&content) as u64,
-        );
+        let reported = extract_usage(&raw);
+        let usage = match reported {
+            Some((input_tokens, output_tokens, _)) => TokenUsage {
+                input_tokens,
+                output_tokens,
+                source: UsageSource::Measured,
+            },
+            None => TokenUsage::estimated(
+                self.estimate_tokens(&body) as u64,
+                self.estimate_tokens(&content) as u64,
+            ),
+        };
 
         Ok(ModelRun {
             run_id: run_id.clone(),
@@ -803,7 +811,7 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
             truncated: response_was_truncated(&raw),
             reasoning_content: extract_reasoning_content(&raw),
             usage,
-            reported_cost: None,
+            reported_cost: reported.and_then(|(_, _, cost)| cost),
         })
     }
 }
@@ -922,6 +930,62 @@ fn api_reasoning_effort<'a>(
         "minimal" | "low" | "medium" | "high" => Some(level),
         _ => None,
     }
+}
+
+/// The provider's own token figures, when it reported any: input, output, and
+/// the cost it charged if it says.
+///
+/// Reads the whole body rather than hooking the incremental reader. Usage
+/// arrives on a final chunk whose `choices` array is empty, which
+/// [`extract_model_tokens`] already passes over, and `raw` holds the complete
+/// stream by the time this is called — the same way `extract_tool_calls` and
+/// `response_was_truncated` read it. The last `usage` object wins, so a
+/// provider that repeats it per chunk reports its final total rather than its
+/// first partial one.
+///
+/// `prompt_tokens`/`completion_tokens` is the OpenAI naming;
+/// `input_tokens`/`output_tokens` is accepted as an alias, because providers
+/// differ and a missed alias silently downgrades a measured figure to an
+/// estimate.
+pub fn extract_usage(raw: &str) -> Option<(u64, u64, Option<f64>)> {
+    let mut found = None;
+    for payload in usage_payloads(raw) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) else {
+            continue;
+        };
+        let input = usage
+            .get("prompt_tokens")
+            .or_else(|| usage.get("input_tokens"))
+            .and_then(serde_json::Value::as_u64);
+        let output = usage
+            .get("completion_tokens")
+            .or_else(|| usage.get("output_tokens"))
+            .and_then(serde_json::Value::as_u64);
+        // Both or neither. A half-read usage object would become a measured
+        // figure with a fabricated zero in it.
+        if let (Some(input), Some(output)) = (input, output) {
+            let cost = usage.get("cost").and_then(serde_json::Value::as_f64);
+            found = Some((input, output, cost));
+        }
+    }
+    found
+}
+
+/// The JSON payloads of a response body, whether it is an SSE stream or a
+/// single non-streaming object.
+fn usage_payloads(raw: &str) -> Vec<String> {
+    if !raw.contains("data:") {
+        return vec![raw.to_string()];
+    }
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("data:"))
+        .map(|line| line.trim_start_matches("data:").trim().to_string())
+        .filter(|payload| payload != "[DONE]")
+        .collect()
 }
 
 pub fn extract_model_tokens(raw: &str) -> Vec<String> {
@@ -1415,6 +1479,61 @@ mod tests {
         assert_eq!(run.usage.input_tokens, body_estimate);
         assert_eq!(run.usage.output_tokens, "hello".len().div_ceil(4) as u64);
         assert_eq!(run.reported_cost, None);
+    }
+
+    #[test]
+    fn usage_is_read_from_the_final_chunk_of_a_stream() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11902,\"completion_tokens\":812}}\n\n",
+            "data: [DONE]\n"
+        );
+        assert_eq!(extract_usage(raw), Some((11902, 812, None)));
+    }
+
+    #[test]
+    fn usage_accepts_the_input_output_naming_some_providers_use() {
+        let raw = "data: {\"choices\":[],\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}\n";
+        assert_eq!(extract_usage(raw), Some((7, 3, None)));
+    }
+
+    #[test]
+    fn a_reported_cost_is_carried_when_the_provider_sends_one() {
+        let raw = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"cost\":0.00031}}\n";
+        assert_eq!(extract_usage(raw), Some((5, 2, Some(0.00031))));
+    }
+
+    #[test]
+    fn a_stream_without_a_usage_object_reports_nothing_rather_than_zero() {
+        // The distinction requirement 4 rests on: absent is not the same as
+        // zero, and a zero here would be presented as measured.
+        let raw = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n";
+        assert_eq!(extract_usage(raw), None);
+    }
+
+    #[test]
+    fn a_half_reported_usage_object_is_not_treated_as_measured() {
+        // A missing half would otherwise become a fabricated zero wearing a
+        // measured label.
+        let raw = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5}}\n";
+        assert_eq!(extract_usage(raw), None);
+    }
+
+    #[test]
+    fn a_measured_run_carries_the_providers_figures_not_the_estimate() {
+        let transport = MockModelTransport::new(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":41,\"completion_tokens\":9}}\n\n",
+            "data: [DONE]\n"
+        ));
+        let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
+        let run = adapter
+            .stream_response(&test_request(), &CancelToken::new(), &mut |_token| {})
+            .expect("the mock stream should produce a run");
+
+        assert_eq!(run.usage.source, UsageSource::Measured);
+        assert_eq!(run.usage.input_tokens, 41);
+        assert_eq!(run.usage.output_tokens, 9);
     }
 
     #[test]
