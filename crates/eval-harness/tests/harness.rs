@@ -1262,3 +1262,31 @@ fn the_seeded_secret_reaches_neither_the_report_nor_the_baseline() {
         seeded.assertions
     );
 }
+
+/// A run that measured nothing must report nothing — not zero.
+///
+/// This is requirement 5 read strictly: every measure carries a value or an
+/// explicit not-applicable marker. A `0.0` completion rate and a `0` violation
+/// count are both *plausible* readings, so a reader comparing against the
+/// committed baseline cannot tell them from a run that never made a call.
+///
+/// Not hypothetical. The live tier selected no scenarios and produced exactly
+/// this report: `task_completion_rate: 0.0` and `restricted_or_secret_violations:
+/// 0` — a clean bill of health on the security metrics from a run that made no
+/// model call at all.
+#[test]
+fn an_empty_run_reports_no_data_rather_than_zero() {
+    let empty = MetricSet::compute(&[]);
+
+    for key in MetricSet::KEYS {
+        let metric = empty.get(key).unwrap_or_else(|| panic!("no `{key}` metric"));
+        match &metric.value {
+            MetricValue::NotApplicable { .. } | MetricValue::Human { .. } => {}
+            other => panic!(
+                "`{key}` reported {other:?} from zero records; a measure with no \
+                 observations must be notApplicable, because zero is a plausible \
+                 real value a baseline comparison cannot distinguish"
+            ),
+        }
+    }
+}
