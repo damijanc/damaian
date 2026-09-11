@@ -1449,3 +1449,75 @@ fn tool_calls_come_from_the_run_and_not_from_the_scenario_script() {
         "scripted file contents must not appear; the engine's record carries a summary, got: {arguments}"
     );
 }
+
+/// The error rate must count errors, not every outcome that is not `ok`.
+///
+/// The engine's marker vocabulary has no error value at all: a tool failure is
+/// fed back to the model as a tool result and the marker still finishes. So
+/// `outcome != "ok"` counted a patch awaiting review and a command awaiting
+/// approval — the outcomes most scenarios exist to produce — as errors. That
+/// was invisible while the list came from the scenario script, which stamped
+/// every entry `ok`, so the metric read 0.000 by construction rather than by
+/// measurement. Reading the real outcomes took it to 0.348 with nothing
+/// actually wrong.
+#[test]
+fn the_error_rate_counts_failures_and_not_outcomes_awaiting_a_human() {
+    let call = |outcome: &str| RecordedToolCall {
+        name: "propose_patch".to_string(),
+        arguments: serde_json::json!({ "ref": "a summary" }),
+        outcome: outcome.to_string(),
+    };
+    let record_with = |outcomes: &[&str], crashed: bool| {
+        let mut record = RunRecord::new("s", "1", "deterministic", "mock", "mock");
+        record.final_status = "completed".to_string();
+        record.tool_calls = outcomes.iter().map(|outcome| call(outcome)).collect();
+        if crashed {
+            record.recovery = Some(RecordedRecovery {
+                interrupted_action: "run_command".to_string(),
+                classification: "unknown_external_outcome".to_string(),
+                auto_resume_permitted: false,
+                resume_refused: true,
+            });
+        }
+        record
+    };
+    let rate = |record: RunRecord| match &MetricSet::compute(&[record])
+        .get("tool_and_model_error_rate")
+        .expect("the metric exists")
+        .value
+    {
+        MetricValue::Number { value } => *value,
+        other => panic!("expected a number, got {other:?}"),
+    };
+
+    assert_eq!(
+        rate(record_with(
+            &["ok", "awaiting_review", "awaiting_approval", "conflict"],
+            false
+        )),
+        0.0,
+        "every engine completion state is a success, including the ones waiting on a human"
+    );
+
+    // A crash left an action unfinished. In a scenario that injected one that
+    // is the signature being measured; anywhere else it is a call that did not
+    // complete.
+    assert_eq!(
+        rate(record_with(&["ok", "unknown"], true)),
+        0.0,
+        "a crash scenario is expected to leave an action unfinished"
+    );
+    assert_eq!(
+        rate(record_with(&["ok", "unknown"], false)),
+        0.5,
+        "an unfinished action outside a crash scenario is an error"
+    );
+
+    // Fail closed: an outcome the engine adds later must surface rather than
+    // quietly counting as a success.
+    assert_eq!(
+        rate(record_with(&["ok", "some_new_engine_outcome"], false)),
+        0.5,
+        "an unclassified outcome must count as an error, not a success"
+    );
+}

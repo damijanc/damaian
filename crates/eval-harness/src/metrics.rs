@@ -207,16 +207,22 @@ impl MetricSet {
             ),
         );
 
-        let all_calls: Vec<&str> = runnable
+        let classified: Vec<bool> = runnable
             .iter()
-            .flat_map(|record| record.tool_calls.iter().map(|call| call.outcome.as_str()))
+            .flat_map(|record| {
+                let crashed = record.recovery.is_some();
+                record
+                    .tool_calls
+                    .iter()
+                    .map(move |call| is_tool_error(&call.outcome, crashed))
+            })
             .collect();
         push(
             "tool_and_model_error_rate",
             "Tool and model error rate",
             rate_or_no_data(
-                all_calls.iter().filter(|outcome| **outcome != "ok").count(),
-                all_calls.len(),
+                classified.iter().filter(|failed| **failed).count(),
+                classified.len(),
                 "no-tool-calls",
             ),
         );
@@ -332,6 +338,35 @@ impl MetricSet {
         );
 
         MetricSet { metrics }
+    }
+}
+
+/// Whether one recorded tool call counts against §5.6's error rate.
+///
+/// The engine's marker vocabulary — `ok`, `awaiting_approval`,
+/// `awaiting_review`, `conflict` — contains no error value: a tool failure is
+/// fed back to the model as a tool result and the marker still finishes
+/// normally. So an error here is a call that reached *none* of those states,
+/// which in practice means a marker that never finished at all.
+///
+/// Reading this as `outcome != "ok"` counted a patch waiting for review and a
+/// command waiting for approval as errors, which are the outcomes most
+/// scenarios exist to produce. That went unnoticed while the tool-call list
+/// came from the scenario script, which stamped every entry `ok` — so the
+/// metric reported 0.000 by construction rather than by measurement, and
+/// nothing would have moved it.
+fn is_tool_error(outcome: &str, record_injected_a_crash: bool) -> bool {
+    match outcome {
+        "ok" | "awaiting_approval" | "awaiting_review" | "conflict" => false,
+        // An unfinished action is the crash signature spec 17 preserves. A
+        // scenario that injected a crash is *expected* to leave one, and
+        // counting it would report the harness's own interruption as the
+        // assistant erring. Anywhere else it is a call that did not complete.
+        "unknown" => !record_injected_a_crash,
+        // Fail closed. An outcome added to the engine and not classified here
+        // surfaces as an error rather than silently counting as a success,
+        // which is the direction that gets noticed.
+        _ => true,
     }
 }
 
