@@ -67,7 +67,7 @@ Every task's requirements implicitly include this section.
 | Task | State | Notes |
 |---|---|---|
 | 1. Tool outcomes tell success from failure | **done** | Also repairs #18's `tool_and_model_error_rate`; see the note below |
-| 2. `TaskPlan` and `PlanStep` types | not started | |
+| 2. `TaskPlan` and `PlanStep` types | **done** | `Evidence` is `#[non_exhaustive]`; see the note below |
 | 3. Plan persistence and replay | not started | |
 | 4. Evidence, minted at the call site | not started | |
 | 5. Step status is a function of evidence | not started | |
@@ -481,6 +481,32 @@ Expected: PASS.
 - [ ] **Step 5: Run the full gate, then ask before committing**
 
 Proposed message: `Add the plan and evidence types a turn works through`
+
+#### What this task actually did
+
+All seven gate commands pass; 23 test binaries, up from 22.
+
+Two additions beyond the plan's sketch, both about the same hazard:
+
+- **`PatchedFile` is a named struct, not a `Vec<(String, String)>`.** The
+  proposal's tuple pair gives no indication which element is the path and which
+  the hash, and both are strings, so transposing them would produce a plausible
+  record and a silently wrong one. The field name `applied_hash` also documents
+  at the type level that it is not `new_hash`.
+- **`an_absent_exit_code_survives_the_round_trip_as_absent`** was not in the
+  plan. Serde is exactly the boundary where `None` could become `0` without
+  anyone writing the `unwrap_or(0)` the spec warns about — a `#[serde(default)]`
+  added later for an unrelated reason would do it. The test pins the wire form
+  so that change fails loudly.
+
+Mutation-checked the predicate rather than only reading it: `> 1` → `> 2` fails
+`only_one_step_may_be_in_progress` and nothing else.
+
+`violates_single_in_progress` is a predicate rather than an invariant enforced
+in a setter, and the doc comment says why: a plan is replayed from an
+append-only log, so the violation that matters is one visible in the
+*assembled* plan after a crash or an out-of-order append — which a setter never
+sees.
 
 ---
 
