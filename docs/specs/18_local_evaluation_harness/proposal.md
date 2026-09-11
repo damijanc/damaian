@@ -7,8 +7,8 @@ measured value rather than a deferral marker. The deterministic tier takes **2.8
 standalone and runs inside `cargo test --workspace --locked`, adding no
 quality-gate command. `evals/baseline.json` is committed after review. The live
 tier **ran against a real provider for the first time on 2026-09-10**, which
-found and fixed five defects in it; one remains, and it means a live run's
-recorded tool calls come from the scenario script rather than the run — see §7.
+found seven defects in it, all now fixed — including two metrics that reported
+a plausible constant rather than a measurement. See §7.
 Order: 18 of 19
 Roadmap: `docs/ROADMAP/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 4 (Must). That directory is local-only and not committed, so the
@@ -400,18 +400,41 @@ way to propose anything. Both fixed; `RunRecord::native_tools` now carries the
 capability set into every record so the two tiers cannot silently diverge again.
 Failures fell from six to two.
 
-**Still broken: a live run's `tool_calls` are fiction.** `runner::drive` builds
-that list from `scenario.turns` — the *script* — and marks each entry `ok` or
-`error` by whether the whole turn succeeded. The live tier ignores those scripts,
-so a live record lists tool calls that never happened, complete with the
-scripted patch content the model never sent. This misled the session that found
-it into reading `propose_patch -> ok` as evidence the model had proposed a patch.
-Requirement 4 ("each run records ... tool calls with sanitized arguments") is
-therefore **not met by the live tier**, and `tool_and_model_error_rate` is
-computed from the script whenever that tier runs. The trace exists for exactly
-this reason — its own doc comment says records are "read rather than inferred
-from the scenario script" — so the fix is to build the list from audit events.
-Not yet done.
+**A run's `tool_calls` were the script, not the run.** `runner::drive` built
+that list from `scenario.turns` and marked each entry `ok` or `error` by
+whether the whole turn succeeded. The live tier ignores those scripts, so a
+live record listed tool calls that never happened, complete with the scripted
+patch content the model never sent — which misled the session that found it
+into reading `propose_patch -> ok` as evidence the model had proposed a patch.
+Requirement 4 was not met by the live tier at all.
+
+Fixed by reading spec 17's action markers, which bracket every tool dispatch
+with the tool name and the engine's own outcome. That source did not exist when
+the original comment claimed a per-call outcome "would need an engine-side
+event that does not exist". Two things improved beyond the defect itself: the
+record now shows the `failed_validation_retry` scenario dispatching its command
+**eight** times rather than the once the script listed, and tool arguments
+carry the marker's reference — a path, a command, a patch summary — instead of
+whole file contents, which §5.5 says a record must never hold and which the
+committed baseline had been carrying all along.
+
+**That fix then exposed a metric that had never measured anything.**
+`tool_and_model_error_rate` counted `outcome != "ok"`, and with real outcomes
+it jumped to **0.348** with nothing wrong: the engine's marker vocabulary is
+`ok`, `awaiting_approval`, `awaiting_review`, `conflict` and contains no error
+value at all, because a tool failure is fed back to the model as a tool result
+and the marker still finishes normally. A patch awaiting review — the outcome
+most scenarios exist to produce — was being counted as an error. The old
+predicate was invisible only because script-derived entries were always `ok`,
+so the metric reported 0.000 by construction and nothing could have moved it.
+It now classifies outcomes explicitly and fails closed on an unrecognized one,
+and an unfinished action counts as an error except in a scenario that injected
+the crash that caused it.
+
+That makes three metrics found reporting a plausible constant rather than a
+measurement, across two sessions. The pattern is worth naming: a metric whose
+expected value equals its failure value needs a test that moves it, not just
+one that reads it.
 
 `the_live_tier_refuses_without_credentials` still runs in CI and asserts the tier
 refuses rather than falling back to something local, joined now by
