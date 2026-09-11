@@ -37,6 +37,27 @@ use std::sync::Arc;
 
 type McpTokenResolverFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+/// What a tool arm observed, so its marker is finished with the tool's own
+/// answer rather than with the fact that dispatch returned.
+///
+/// Kept separate from the arm's text output because the text is for the model
+/// and this is for the log: a tool that reports an error in prose still has to
+/// record that it failed, and reading the prose back to find out would be
+/// guessing. See
+/// `docs/specs/21_task_plan_progress_and_budget/context.md` §3.4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionOutcome {
+    /// Dispatch succeeded and the tool reported nothing to the contrary.
+    Ok,
+    /// A command ran. The code is whatever the process reported, and `None`
+    /// means it was killed or signalled — not that it passed.
+    CommandExit(Option<i32>),
+    /// The tool itself reported a failure: an MCP `is_error` or transport
+    /// error, a browser diagnostic that could not run. Not a command, so there
+    /// is no exit code to carry.
+    Failed,
+}
+
 /// Which stage of a turn is running. Drives the progress indicator, so the user
 /// can tell a slow provider apart from a running tool apart from a hang.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1205,11 +1226,20 @@ impl ChatOrchestrator {
             )?;
 
             // Each non-terminal arm below produces the (assistant summary,
-            // tool result) pair to persist and feed back to the model.
-            // Terminal outcomes (a command needing approval, or a patch
+            // tool result, outcome) triple to persist and feed back to the
+            // model. Terminal outcomes (a command needing approval, or a patch
             // ready for review) `break` the loop directly instead, since
             // both always require the human before anything continues.
-            let (assistant_summary, tool_result_text) = match tool_action {
+            //
+            // The third element is what the tool *reported*, which is not the
+            // same as whether dispatching it worked. Every arm used to converge
+            // on `finish_action(marker, "ok")`, so a command that exited
+            // non-zero was indistinguishable in the log from one that passed —
+            // and spec 18's `tool_and_model_error_rate` consequently read 0.000
+            // by construction. Spec 21 requirement 6 reads a step's status from
+            // this value, so it has to be the tool's answer, not the
+            // dispatcher's.
+            let (assistant_summary, tool_result_text, action_outcome) = match tool_action {
                 ToolAction::Command(command_request) => {
                     let proposal = self.validation_orchestrator.propose_command(
                         repository_root,
@@ -1264,7 +1294,16 @@ impl ChatOrchestrator {
                         "sandbox",
                     )?;
                     let command_context = sandbox_command_context(&record.execution);
-                    (tool_call_summary(&command_request), command_context)
+                    // The exit code is in hand right here, one statement before
+                    // the marker is finished. Nothing downstream can recover it
+                    // — `CommandExecution` is never persisted to the session log
+                    // — so it is carried out of the arm rather than looked up.
+                    let exit_code = record.execution.exit_code;
+                    (
+                        tool_call_summary(&command_request),
+                        command_context,
+                        ActionOutcome::CommandExit(exit_code),
+                    )
                 }
                 ToolAction::ProposePatch(generated_edit) => {
                     match self.patch_engine.create_patch(
@@ -1296,11 +1335,12 @@ impl ChatOrchestrator {
                         Err(error) => (
                             format!("Attempted to propose a patch: {}", generated_edit.summary),
                             format!("Cannot propose that patch: {error}"),
+                            ActionOutcome::Failed,
                         ),
                     }
                 }
                 ToolAction::ReadFile(path) => {
-                    let content = match self.file_access.read_file(
+                    let (content, outcome) = match self.file_access.read_file(
                         repository_root,
                         &path,
                         Some(&task.id),
@@ -1308,12 +1348,16 @@ impl ChatOrchestrator {
                         false,
                         false,
                     ) {
-                        Ok(file_read) => {
-                            format!("Content of {}:\n{}", file_read.path, file_read.content)
-                        }
-                        Err(error) => format!("Cannot read {path}: {error}"),
+                        Ok(file_read) => (
+                            format!("Content of {}:\n{}", file_read.path, file_read.content),
+                            ActionOutcome::Ok,
+                        ),
+                        Err(error) => (
+                            format!("Cannot read {path}: {error}"),
+                            ActionOutcome::Failed,
+                        ),
                     };
-                    (format!("Read `{path}`"), content)
+                    (format!("Read `{path}`"), content, outcome)
                 }
                 ToolAction::SearchCodebase {
                     query,
@@ -1341,24 +1385,36 @@ impl ChatOrchestrator {
                     (
                         format!("Searched codebase for \"{query}\""),
                         format_search_results(&results),
+                        // A search that matched nothing still ran. "No results"
+                        // is an answer, not a failure.
+                        ActionOutcome::Ok,
                     )
                 }
                 ToolAction::ReadGitStatus => {
-                    let content = match self.git.status(repository_root) {
-                        Ok(status) => format_git_status(&status),
-                        Err(error) => format!("Cannot read git status: {error}"),
+                    let (content, outcome) = match self.git.status(repository_root) {
+                        Ok(status) => (format_git_status(&status), ActionOutcome::Ok),
+                        Err(error) => (
+                            format!("Cannot read git status: {error}"),
+                            ActionOutcome::Failed,
+                        ),
                     };
-                    ("Checked git status".to_string(), content)
+                    ("Checked git status".to_string(), content, outcome)
                 }
                 ToolAction::ReadGitDiff { staged } => {
-                    let content = match self.git.diff(repository_root, staged) {
-                        Ok(diff) if diff.trim().is_empty() => "No differences.".to_string(),
-                        Ok(diff) => diff,
-                        Err(error) => format!("Cannot read git diff: {error}"),
+                    let (content, outcome) = match self.git.diff(repository_root, staged) {
+                        Ok(diff) if diff.trim().is_empty() => {
+                            ("No differences.".to_string(), ActionOutcome::Ok)
+                        }
+                        Ok(diff) => (diff, ActionOutcome::Ok),
+                        Err(error) => (
+                            format!("Cannot read git diff: {error}"),
+                            ActionOutcome::Failed,
+                        ),
                     };
                     (
                         format!("Read git diff{}", if staged { " (staged)" } else { "" }),
                         content,
+                        outcome,
                     )
                 }
                 ToolAction::WebDiagnostic(call) => {
@@ -1420,22 +1476,31 @@ impl ChatOrchestrator {
 
                     let signature = web_diagnostic_signature(&call);
                     let retry_limit = self.config.agent_tool_retry_limit;
-                    let content = if failed_browser_calls
+                    let (content, outcome) = if failed_browser_calls
                         .get(&signature)
                         .copied()
                         .unwrap_or_default()
                         >= retry_limit
                     {
-                        browser_retry_limit_note(retry_limit)
+                        // Refused rather than attempted, because the same call
+                        // has already failed its retry limit. Still a failure:
+                        // the tool produced no diagnostic.
+                        (browser_retry_limit_note(retry_limit), ActionOutcome::Failed)
                     } else {
                         let report = self.run_web_diagnostic_report(&call);
                         let content = self.format_web_diagnostic_result(report);
-                        if browser_tool_result_failed(&content) {
+                        let failed = browser_tool_result_failed(&content);
+                        if failed {
                             *failed_browser_calls.entry(signature).or_insert(0) += 1;
                         }
-                        content
+                        let outcome = if failed {
+                            ActionOutcome::Failed
+                        } else {
+                            ActionOutcome::Ok
+                        };
+                        (content, outcome)
                     };
-                    (web_diagnostic_summary(&call), content)
+                    (web_diagnostic_summary(&call), content, outcome)
                 }
                 ToolAction::McpCall {
                     server_id,
@@ -1490,21 +1555,44 @@ impl ChatOrchestrator {
 
                     // No approval required: run it now and feed the result back.
                     let summary = mcp_call_summary(&server_id, &tool_name);
-                    let content = match mcp.call_tool(&server_id, &tool_name, &arguments_json) {
-                        Ok(result) => {
-                            let text = self.scanner.redact(&result.text).text;
-                            if result.is_error {
-                                format!("MCP tool reported an error:\n{text}")
-                            } else {
-                                text
+                    let (content, outcome) =
+                        match mcp.call_tool(&server_id, &tool_name, &arguments_json) {
+                            Ok(result) => {
+                                let text = self.scanner.redact(&result.text).text;
+                                // `is_error` is the server's own verdict on its
+                                // call. Reaching the server is not the same as
+                                // the call working, and only the server knows
+                                // which happened.
+                                if result.is_error {
+                                    (
+                                        format!("MCP tool reported an error:\n{text}"),
+                                        ActionOutcome::Failed,
+                                    )
+                                } else {
+                                    (text, ActionOutcome::Ok)
+                                }
                             }
-                        }
-                        Err(error) => format!("MCP tool call failed: {error}"),
-                    };
-                    (summary, content)
+                            Err(error) => (
+                                format!("MCP tool call failed: {error}"),
+                                ActionOutcome::Failed,
+                            ),
+                        };
+                    (summary, content, outcome)
                 }
             };
-            self.session_store.finish_action(action_marker, "ok")?;
+            // One finish per dispatch, on the tool's own answer. A command goes
+            // through `finish_command_action` so the outcome is derived from
+            // the exit code rather than passed beside it — the two cannot then
+            // disagree in the log.
+            match action_outcome {
+                ActionOutcome::CommandExit(exit_code) => self
+                    .session_store
+                    .finish_command_action(action_marker, exit_code)?,
+                ActionOutcome::Ok => self.session_store.finish_action(action_marker, "ok")?,
+                ActionOutcome::Failed => {
+                    self.session_store.finish_action(action_marker, "failed")?
+                }
+            }
 
             // Persist the tool call and its result so later turns in this
             // session can still see it (previously this context was

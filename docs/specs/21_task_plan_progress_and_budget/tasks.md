@@ -66,7 +66,7 @@ Every task's requirements implicitly include this section.
 
 | Task | State | Notes |
 |---|---|---|
-| 1. Tool outcomes tell success from failure | not started | Prerequisite for all evidence |
+| 1. Tool outcomes tell success from failure | **done** | Also repairs #18's `tool_and_model_error_rate`; see the note below |
 | 2. `TaskPlan` and `PlanStep` types | not started | |
 | 3. Plan persistence and replay | not started | |
 | 4. Evidence, minted at the call site | not started | |
@@ -269,6 +269,34 @@ point.
 
 Run all seven commands from `AGENTS.md`. Proposed message:
 `Record what a tool reported, not just that it was dispatched`
+
+#### What this task actually did
+
+All seven gate commands pass. Three departures from the plan as written, all
+widenings rather than narrowings:
+
+- **`ActionOutcome::Failed` covers the read-only arms too**, not just MCP and
+  the browser. A `read_file` on a restricted path, a `git status` that errored —
+  both previously recorded `"ok"`. The text fed back to the model already said
+  "Cannot read …", so the log was the only place the failure was invisible.
+- **`finish_action` and `finish_command_action` share a private
+  `write_action_finished`** rather than duplicating the event format. Two copies
+  of that `format!` would drift, and the exit-code field has to be optional in
+  exactly one of them.
+- **A clean exit records `exitCode: 0` as well as `"ok"`.** The plan only
+  required the failure cases to be distinguishable. Carrying the value on
+  success too is what lets Task 4 build `Evidence::CommandExit` from the log
+  alone rather than from a value it has to keep alive alongside it.
+
+The mutation check ran as specified: `None => "ok"` fails exactly
+`a_command_killed_without_an_exit_code_is_not_recorded_as_ok` and nothing else.
+
+One observation for proposal §7. The engine's outcome vocabulary is now `ok`,
+`failed`, `unknown`, `conflict`, `awaiting_approval`, `awaiting_review` — and
+`is_tool_error` in the harness already classified an unrecognised outcome as an
+error (fail-closed), so `"failed"` was counted correctly the moment it started
+being written. That is the fail-closed default earning its keep rather than a
+coincidence, and it is worth not "simplifying" away.
 
 ---
 

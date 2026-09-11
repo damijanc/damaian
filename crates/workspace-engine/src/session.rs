@@ -816,16 +816,56 @@ impl SessionStore {
 
     /// Records `action_finished`, consuming the marker.
     pub fn finish_action(&self, marker: ActionMarker, outcome: &str) -> Result<()> {
+        self.write_action_finished(&marker, outcome, None)
+    }
+
+    /// [`Self::finish_action`] for a command, recording the exit code and
+    /// deriving the outcome from it.
+    ///
+    /// Split out rather than folded into `finish_action` because the outcome is
+    /// a *function* of the exit code and must not be passed in beside it: two
+    /// callers could then disagree, and the log would carry a `"failed"` next
+    /// to an exit code of zero with nothing to say which was right.
+    ///
+    /// `None` maps to `"unknown"`, never to `"ok"`. A killed or signalled
+    /// command reports no code (`command_runner.rs`, `output.status.code()`),
+    /// and mapping absence to success is how "never represent an unrun check as
+    /// passed" gets violated by an `unwrap_or(0)`. See
+    /// `docs/specs/21_task_plan_progress_and_budget/proposal.md` §5.3.
+    pub fn finish_command_action(
+        &self,
+        marker: ActionMarker,
+        exit_code: Option<i32>,
+    ) -> Result<()> {
+        let outcome = match exit_code {
+            Some(0) => "ok",
+            Some(_) => "failed",
+            None => "unknown",
+        };
+        self.write_action_finished(&marker, outcome, exit_code)
+    }
+
+    fn write_action_finished(
+        &self,
+        marker: &ActionMarker,
+        outcome: &str,
+        exit_code: Option<i32>,
+    ) -> Result<()> {
+        let code = match exit_code {
+            Some(code) => format!(",\"exitCode\":{code}"),
+            None => String::new(),
+        };
         self.append_session_event(
             &marker.session_id,
             "action_finished",
             &format!(
-                "{{\"markerId\":\"{}\",\"taskId\":\"{}\",\"action\":\"{}\",\"ref\":\"{}\",\"outcome\":\"{}\"}}",
+                "{{\"markerId\":\"{}\",\"taskId\":\"{}\",\"action\":\"{}\",\"ref\":\"{}\",\"outcome\":\"{}\"{}}}",
                 escape_json(&marker.id),
                 escape_json(&marker.task_id),
                 escape_json(&marker.action),
                 escape_json(&marker.reference),
-                escape_json(outcome)
+                escape_json(outcome),
+                code
             ),
         )
     }

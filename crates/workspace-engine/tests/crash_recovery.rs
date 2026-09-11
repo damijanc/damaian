@@ -1087,3 +1087,105 @@ fn sigkill_helper_starts_a_side_effecting_action_and_waits_to_be_killed() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+// ---------------------------------------------------------------------------
+// What a tool reported, not just that it was dispatched.
+//
+// `docs/specs/21_task_plan_progress_and_budget/context.md` §3.4. Every tool arm
+// in the chat loop converged on one `finish_action(marker, "ok")`, so a command
+// that exited non-zero, an MCP call that returned `is_error`, and a browser
+// diagnostic that failed all recorded the same outcome as a success. Spec 21's
+// requirement 6 reads a step's status from that outcome, and spec 18's
+// `tool_and_model_error_rate` counts it — both were reading a constant.
+// ---------------------------------------------------------------------------
+
+/// Every `action_finished` event's outcome and exit code, in log order.
+fn read_action_outcomes(fixture: &Fixture) -> Vec<(String, Option<i64>)> {
+    let path = fixture
+        .data_dir
+        .join("sessions")
+        .join(format!("{}.jsonl", fixture.session_id));
+    let text = fs::read_to_string(path).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event.get("eventType").and_then(|v| v.as_str()) == Some("action_finished"))
+        .filter_map(|event| {
+            let payload = event.get("payload")?.clone();
+            Some((
+                payload.get("outcome")?.as_str()?.to_string(),
+                payload.get("exitCode").and_then(|v| v.as_i64()),
+            ))
+        })
+        .collect()
+}
+
+#[test]
+fn a_command_that_exits_non_zero_is_not_recorded_as_ok() {
+    let fixture = fixture("command-failed");
+    let task = fixture
+        .store
+        .create_task(&fixture.session_id, "run the failing check", "mock", "m")
+        .unwrap();
+    let marker = fixture
+        .store
+        .start_action(&task, "run_command", "false", true)
+        .unwrap();
+
+    fixture
+        .store
+        .finish_command_action(marker, Some(1))
+        .unwrap();
+
+    assert_eq!(
+        read_action_outcomes(&fixture),
+        vec![("failed".to_string(), Some(1))]
+    );
+}
+
+#[test]
+fn a_command_killed_without_an_exit_code_is_not_recorded_as_ok() {
+    let fixture = fixture("command-killed");
+    let task = fixture
+        .store
+        .create_task(&fixture.session_id, "run the killed check", "mock", "m")
+        .unwrap();
+    let marker = fixture
+        .store
+        .start_action(&task, "run_command", "sleep 100", true)
+        .unwrap();
+
+    fixture.store.finish_command_action(marker, None).unwrap();
+
+    // Not `ok`: absence of an exit code is absence of knowledge. A killed or
+    // signalled command reports no code (`output.status.code()`), and mapping
+    // that to success is the `unwrap_or(0)` failure mode spec 21 §5.3 names.
+    assert_eq!(
+        read_action_outcomes(&fixture),
+        vec![("unknown".to_string(), None)]
+    );
+}
+
+#[test]
+fn a_command_that_exits_cleanly_is_recorded_as_ok_with_its_code() {
+    let fixture = fixture("command-ok");
+    let task = fixture
+        .store
+        .create_task(&fixture.session_id, "run the passing check", "mock", "m")
+        .unwrap();
+    let marker = fixture
+        .store
+        .start_action(&task, "run_command", "true", true)
+        .unwrap();
+
+    fixture
+        .store
+        .finish_command_action(marker, Some(0))
+        .unwrap();
+
+    // The code rides along even on success: spec 21's evidence carries the
+    // value, not a pointer to a store that expires (context.md §3.5).
+    assert_eq!(
+        read_action_outcomes(&fixture),
+        vec![("ok".to_string(), Some(0))]
+    );
+}

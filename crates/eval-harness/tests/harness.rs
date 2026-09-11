@@ -1452,14 +1452,19 @@ fn tool_calls_come_from_the_run_and_not_from_the_scenario_script() {
 
 /// The error rate must count errors, not every outcome that is not `ok`.
 ///
-/// The engine's marker vocabulary has no error value at all: a tool failure is
-/// fed back to the model as a tool result and the marker still finishes. So
-/// `outcome != "ok"` counted a patch awaiting review and a command awaiting
-/// approval — the outcomes most scenarios exist to produce — as errors. That
-/// was invisible while the list came from the scenario script, which stamped
-/// every entry `ok`, so the metric read 0.000 by construction rather than by
-/// measurement. Reading the real outcomes took it to 0.348 with nothing
-/// actually wrong.
+/// A tool failure is fed back to the model as a tool result and the marker
+/// still finishes, so `outcome != "ok"` counted a patch awaiting review and a
+/// command awaiting approval — the outcomes most scenarios exist to produce —
+/// as errors. That was invisible while the list came from the scenario script,
+/// which stamped every entry `ok`, so the metric read 0.000 by construction
+/// rather than by measurement. Reading the real outcomes took it to 0.348 with
+/// nothing actually wrong.
+///
+/// The engine's marker vocabulary had no error value at all when this test was
+/// written. Spec 21 Task 1 added one, so `"failed"` now arrives from real runs;
+/// `a_real_run_whose_commands_all_fail_reports_a_non_zero_error_rate` is the
+/// test that the metric can actually move. This one stays as the
+/// classification's own pin, including the fail-closed default.
 #[test]
 fn the_error_rate_counts_failures_and_not_outcomes_awaiting_a_human() {
     let call = |outcome: &str| RecordedToolCall {
@@ -1519,5 +1524,58 @@ fn the_error_rate_counts_failures_and_not_outcomes_awaiting_a_human() {
         rate(record_with(&["ok", "some_new_engine_outcome"], false)),
         0.5,
         "an unclassified outcome must count as an error, not a success"
+    );
+}
+
+/// The error rate can now move, because the engine records what a tool
+/// reported rather than that it was dispatched.
+///
+/// `the_error_rate_counts_failures_and_not_outcomes_awaiting_a_human` pins the
+/// classification against hand-built records. That is necessary and not
+/// sufficient: until spec 21 Task 1, *no real run could produce a failing
+/// outcome at all*, because every tool arm in the chat loop finished its marker
+/// with `"ok"` whatever the tool said. A metric whose expected value equals its
+/// failure value needs a test that moves it, not just one that reads it —
+/// which is the pattern spec 18 §7 named after the live run found it.
+///
+/// `failed_validation_retry` is the right probe: `ls no-such-directory` is
+/// classified Low risk so it runs without approval, and it exits non-zero on
+/// every one of the eight rounds the bound allows.
+#[test]
+fn a_real_run_whose_commands_all_fail_reports_a_non_zero_error_rate() {
+    let path = scenario::scenarios_dir().join("failed_validation_retry.toml");
+    let loaded = scenario::load(&path).expect("scenario");
+    let run = eval_harness::runner::run(&loaded).expect("deterministic run");
+
+    let commands: Vec<&RecordedToolCall> = run
+        .record
+        .tool_calls
+        .iter()
+        .filter(|call| call.name == "run_command")
+        .collect();
+    assert!(
+        !commands.is_empty(),
+        "the scenario exists to run a failing command; it ran none"
+    );
+    assert!(
+        commands.iter().all(|call| call.outcome == "failed"),
+        "every one of these commands exited non-zero, got: {:?}",
+        commands
+            .iter()
+            .map(|call| &call.outcome)
+            .collect::<Vec<_>>()
+    );
+
+    let rate = match &MetricSet::compute(std::slice::from_ref(&run.record))
+        .get("tool_and_model_error_rate")
+        .expect("the metric exists")
+        .value
+    {
+        MetricValue::Number { value } => *value,
+        other => panic!("expected a number, got {other:?}"),
+    };
+    assert!(
+        rate > 0.0,
+        "a run whose every command failed must not report a zero error rate"
     );
 }
