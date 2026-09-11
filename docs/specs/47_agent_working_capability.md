@@ -18,7 +18,7 @@ progress channel), [`10_persistent_command_approval.md`](10_persistent_command_a
 and [`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)
 (the command trust boundary this must not widen),
 [`19_token_and_cost_accounting/proposal.md`](19_token_and_cost_accounting/proposal.md) and
-[`21_task_plan_progress_and_budget.md`](21_task_plan_progress_and_budget.md)
+[`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md)
 (own the budget this defers to),
 [`24_repository_map_and_monorepo_boundaries.md`](24_repository_map_and_monorepo_boundaries.md),
 [`25_symbol_and_relationship_index.md`](25_symbol_and_relationship_index.md) and
@@ -109,7 +109,7 @@ because those three cannot be built by an agent that lacks it.
   [#26](26_context_assembly.md). Those stay as specified.
 - Removing the tool-round cap. Requirement 6 replaces a fixed count with a
   bounded budget; an unbounded turn is not the goal, and the enforced ceiling
-  belongs to [#21](21_task_plan_progress_and_budget.md).
+  belongs to [#21](21_task_plan_progress_and_budget/proposal.md).
 - Changing hunk selection at review time — that is
   [#04](04_hunk_level_patch_apply.md), and it is unaffected.
 - Background or long-running processes as a feature (Phase 2 WP5), and
@@ -133,7 +133,7 @@ rather than assumed:
   place for the ignore and restriction rules to drift. `AGENTS.md` forbids a
   Node runtime dependency, so a shelled-out matcher is not an option either.
 - **How continuation interacts with [#17](17_durable_task_state_and_crash_recovery/proposal.md)
-  and [#21](21_task_plan_progress_and_budget.md).** #21 owns the enforced
+  and [#21](21_task_plan_progress_and_budget/proposal.md).** #21 owns the enforced
   ceiling and #19 the accounting beneath it; this spec must not invent a second
   budget that later has to be reconciled. The open question is sequencing —
   whether requirement 6 waits for #19 and #21, or ships a provisional round

@@ -12,7 +12,7 @@ implementation specs:
 [`08_stop_and_progress.md`](08_stop_and_progress.md),
 [`16_session_checkpoints_and_rewind.md`](16_session_checkpoints_and_rewind.md),
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md),
-[`21_task_plan_progress_and_budget.md`](21_task_plan_progress_and_budget.md),
+[`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md),
 [`22_findings_model_and_panel.md`](22_findings_model_and_panel.md),
 [`23_verification_loop.md`](23_verification_loop.md) (the checks §5.5 reruns),
 [`38_subagent_model.md`](38_subagent_model.md) (declares the agents this
@@ -66,7 +66,7 @@ Nothing in this phase exists. What it builds on:
   per-run file hashes, marking a run `stale_after_partial_acceptance` when the
   accepted set changes (§5.6 there) — the same staleness idea this spec needs for
   combined work.
-- **Plans and evidence exist** ([spec 21](21_task_plan_progress_and_budget.md)),
+- **Plans and evidence exist** ([spec 21](21_task_plan_progress_and_budget/proposal.md)),
   with `Evidence` deliberately having no model-asserted variant.
 - **Checkpoints are per repository path**
   ([spec 16](16_session_checkpoints_and_rewind.md) §5.1), keyed on
@@ -259,7 +259,7 @@ that fails, is cancelled, or exhausts its budget:
 
 The parent decides. A group's outcome is reported per child, and the parent's own
 status reflects whether it can still complete its plan
-([spec 21](21_task_plan_progress_and_budget.md)) — which may be yes with three of
+([spec 21](21_task_plan_progress_and_budget/proposal.md)) — which may be yes with three of
 four children's work, or no.
 
 One case needs stating: a child that failed **after** its patch was integrated

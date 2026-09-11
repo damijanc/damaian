@@ -354,7 +354,7 @@ source, which are produced by a command Damaian ran. Two rules follow:
 - Diagnostics are attributed to the task active when they arrive, or to no task
   when none is. A diagnostic with no task is still shown in the panel.
 - They do not, on their own, block a plan step
-  ([spec 21](21_task_plan_progress_and_budget.md)). A step is blocked by a check
+  ([spec 21](21_task_plan_progress_and_budget/proposal.md)). A step is blocked by a check
   that ran and failed; a language server reporting an error mid-edit is normal
   and transient, and treating it as a blocking failure would stall the loop on
   every intermediate state.

@@ -13,7 +13,7 @@ specs: [`10_persistent_command_approval.md`](10_persistent_command_approval.md),
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (the PID registry hook processes use, and the action markers hooks sit between),
 [`20_working_modes.md`](20_working_modes.md),
-[`21_task_plan_progress_and_budget.md`](21_task_plan_progress_and_budget.md),
+[`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md),
 [`22_findings_model_and_panel.md`](22_findings_model_and_panel.md) (hooks return
 `Finding`s), [`23_verification_loop.md`](23_verification_loop.md),
 [`31_permission_profiles.md`](31_permission_profiles.md) (the profile a hook

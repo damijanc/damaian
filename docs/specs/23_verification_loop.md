@@ -11,7 +11,7 @@ handling). Related implementation specs:
 [`04_hunk_level_patch_apply.md`](04_hunk_level_patch_apply.md),
 [`10_persistent_command_approval.md`](10_persistent_command_approval.md),
 [`12_web_app_troubleshooting.md`](12_web_app_troubleshooting.md),
-[`21_task_plan_progress_and_budget.md`](21_task_plan_progress_and_budget.md) (the
+[`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md) (the
 plan and evidence this loop populates),
 [`22_findings_model_and_panel.md`](22_findings_model_and_panel.md) (the finding
 model this loop produces and repairs against).
@@ -125,7 +125,7 @@ The loop is entered only in Code mode ([spec 20](20_working_modes.md)); in Ask,
 Plan, and Review there is nothing applied to verify.
 
 It appends steps to the task plan from
-[spec 21](21_task_plan_progress_and_budget.md) rather than tracking its own
+[spec 21](21_task_plan_progress_and_budget/proposal.md) rather than tracking its own
 state: a `validating` phase step per check, whose evidence is the
 `CommandExit` for that check. That reuse is what makes verification survive a
 restart and what makes the plan's completion status honest.
@@ -219,7 +219,7 @@ Two rules keep the loop from being worse than no loop:
 On exhausting the limit, the task does **not** succeed. Status is `failed` with
 the still-failing findings attached, and the report leads with what still fails.
 
-The token ceiling from [spec 21](21_task_plan_progress_and_budget.md) applies to
+The token ceiling from [spec 21](21_task_plan_progress_and_budget/proposal.md) applies to
 repair as to any other work: reaching it stops the loop at a step boundary with
 the plan intact.
 
@@ -265,7 +265,7 @@ Construction rules, which are the requirement rather than the formatting:
 - **A check is listed exactly once**, in exactly one of passed, failed, or
   skipped. A check appearing nowhere is a bug the report's own test asserts
   against by comparing the union against the set of proposed checks.
-- **`Unverified steps`** comes from [spec 21](21_task_plan_progress_and_budget.md)'s
+- **`Unverified steps`** comes from [spec 21](21_task_plan_progress_and_budget/proposal.md)'s
   steps with empty evidence.
 - **The summary line never says "complete"** when anything is in `Checks failed`
   or when the repair limit was exhausted.

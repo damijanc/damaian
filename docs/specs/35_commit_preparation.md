@@ -253,7 +253,7 @@ replace it. Today it is a template that never sees the diff and always prefixes
 
 The extension keeps that function as the **deterministic fallback** and adds a
 model-backed path in front of it: given the accepted diff and the task's plan
-([spec 21](21_task_plan_progress_and_budget.md)), draft a subject and body. When
+([spec 21](21_task_plan_progress_and_budget/proposal.md)), draft a subject and body. When
 no model is configured, when the call fails, or when the result is empty, the
 existing template answers — so a commit is never blocked on a model call.
 

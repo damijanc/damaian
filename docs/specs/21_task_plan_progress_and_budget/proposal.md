@@ -1,77 +1,36 @@
 # Feature Spec: Task Plan, Progress, and Budget
 
-Status: Not started
+Status: Planned, not started. Planning read this design against the tree on
+2026-09-11 and found eight statements the code contradicts — including that a
+"task" is one turn, that the round-budget pattern §5.4 says to copy would make
+the ceiling spend *more* than the ceiling, and that the session log has no
+failure outcome for evidence to be read from. All eight are reconciled in
+[`context.md`](context.md) §3 and accounted for in [`tasks.md`](tasks.md).
 Order: 21 of 23
 Roadmap: `docs/ROADMAP/02_phase_2_complete_task_workflow.md`, Phase 2, Work
 Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
+Also in this spec: [`context.md`](context.md) (motivation, current state, and
+the corrections found while planning), [`tasks.md`](tasks.md) (execution order
+and progress).
 Related spec sections: `ai_coding_assistant_specification.md` section 7.1 (chat
 interface UI states), section 7.6 (tool and action orchestrator), section 11
 (error handling). Related implementation specs:
-[`08_stop_and_progress.md`](08_stop_and_progress.md) (the per-turn progress and
+[`08_stop_and_progress.md`](../08_stop_and_progress.md) (the per-turn progress and
 cancellation this extends to multi-step tasks),
-[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
+[`17_durable_task_state_and_crash_recovery/proposal.md`](../17_durable_task_state_and_crash_recovery/proposal.md)
 (the durable task state and append rules this persists through),
-[`19_token_and_cost_accounting/proposal.md`](19_token_and_cost_accounting/proposal.md) (supplies
+[`19_token_and_cost_accounting/proposal.md`](../19_token_and_cost_accounting/proposal.md) (supplies
 the token figures the ceiling is enforced against),
-[`20_working_modes.md`](20_working_modes.md) (Plan mode produces plans it does
+[`20_working_modes.md`](../20_working_modes.md) (Plan mode produces plans it does
 not execute).
 
-## 1. Motivation
-
-Damaian has no representation of work larger than a turn.
-
-[Spec 08](08_stop_and_progress.md) made a turn stoppable and gave it distinct UI
-states, and that was the right scope for the problem it solved. But a real task —
-"add retry handling to the upload client and cover it with tests" — is a sequence
-of steps whose intermediate state is currently invisible and unrecoverable. The
-user sees a spinner and a stream of tool calls. If it goes wrong at step four,
-there is nothing that says steps one through three happened, and nothing to
-resume.
-
-Two consequences follow, and the second is the more serious.
-
-**Work is unbounded in the dimension that costs money.**
-`agent_max_tool_rounds` bounds the loop by round count
-(`crates/workspace-engine/src/config.rs:67`), which is a poor proxy: one round
-that resends a 100k-token context costs more than twenty rounds that read three
-small files. [Spec 19](19_token_and_cost_accounting/proposal.md) makes spend visible;
-without a ceiling, visible is all it is.
-
-**Completion is asserted, not demonstrated.** The model says it is done, and
-Damaian relays that. There is no distinction between "the test passed" and "the
-model believes the test would pass". That distinction is the whole value of the
-completion report, and it cannot exist without steps that carry evidence.
-
-## 2. Current State
-
-- **No plan or progress model exists.** [Spec 08](08_stop_and_progress.md)
-  delivered turn-level cancellation and UI states. There is no multi-step
-  representation, no step status, and nothing to recover after restart beyond
-  `TaskStatus`.
-- **`TaskStatus` is per task, not per step.** Seven variants today
-  (`crates/workspace-engine/src/session.rs:21-29`), extended to twelve by
-  [spec 17](17_durable_task_state_and_crash_recovery/proposal.md).
-- **A budget-stop shape already exists and works.** `agent_max_tool_rounds` is
-  enforced in the chat loop, producing `tool_budget_exhausted_response`
-  (`crates/workspace-engine/src/chat.rs:841`) and
-  `TaskStatus::ToolBudgetExhausted` (`chat.rs:1205-1206`, `chat.rs:1227`). This
-  is the pattern the token ceiling should follow rather than invent.
-- **Related bounds**: `agent_tool_retry_limit` (`config.rs:73`) and
-  `agent_web_debug_max_tool_rounds` (`config.rs:70`), both overlayable from
-  repository config (`config.rs:308-315`).
-- **Sessions are an append-only event log** with replay-based readers
-  (`session.rs:237-260`), gaining a monotonic `seq` in
-  [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.2.
-- **No token accounting exists yet.** `ModelRun`
-  (`crates/workspace-engine/src/model.rs:158-177`) has no usage fields;
-  [spec 19](19_token_and_cost_accounting/proposal.md) adds them and
-  `read_task_usage`.
-- **Evidence sources already exist, unstructured.** `CommandExecution` carries
-  `exit_code: Option<i32>`, `stdout`, `stderr`
-  (`crates/workspace-engine/src/command_runner.rs:11-22`). `ProposedFilePatch`
-  carries `base_hash` and the patch engine computes applied hashes
-  (`patch_engine.rs:291`, `patch_engine.rs:79`).
+Motivation and current state moved to [`context.md`](context.md) when this spec
+took the folder layout. **Read its §3 before implementing:** eight of this
+document's statements assume behaviour the code does not have, and that section
+says what each one has to become. The three that change this design rather than
+just its facts are §3.1 (a task is one turn), §3.3 (the round-budget pattern
+cannot be copied) and §3.4 (no failure outcome exists to read evidence from).
 
 ## 3. Requirements
 
@@ -84,12 +43,12 @@ completion report, and it cannot exist without steps that carry evidence.
    reviewing, or complete.
 4. Users can inspect and adjust a plan before implementation begins.
 5. Progress persists and is recovered after restart, through the durable task
-   state from [spec 17](17_durable_task_state_and_crash_recovery/proposal.md).
+   state from [spec 17](../17_durable_task_state_and_crash_recovery/proposal.md).
 6. **A step is never marked complete only because the model says so.** Observable
    evidence is attached wherever one exists. Where none exists, the step is
    marked completed *unverified* and the completion report says so.
 7. An enforced per-task token ceiling exists alongside `agent_max_tool_rounds`,
-   using the accounting from [spec 19](19_token_and_cost_accounting/proposal.md). On
+   using the accounting from [spec 19](../19_token_and_cost_accounting/proposal.md). On
    reaching it, work stops cleanly at a step boundary, the plan is persisted, and
    the remaining steps are reported.
 
@@ -97,14 +56,14 @@ completion report, and it cannot exist without steps that carry evidence.
 
 - Automatic plan generation quality. This spec defines the plan's structure,
   persistence, evidence rules, and budget behaviour. How good the model's plans
-  are is measured by [spec 18](18_local_evaluation_harness/proposal.md), not
+  are is measured by [spec 18](../18_local_evaluation_harness/proposal.md), not
   fixed here.
 - Parallel step execution. Requirement 2 leaves room for it; nothing in this spec
   runs steps concurrently. Subagents are Phase 6.
 - A dependency solver. Dependencies are recorded and used to block a step whose
   prerequisite failed, not to reorder or optimise a plan.
 - Cost ceilings in currency. The ceiling is in tokens, because tokens are what
-  [spec 19](19_token_and_cost_accounting/proposal.md) can measure rather than estimate
+  [spec 19](../19_token_and_cost_accounting/proposal.md) can measure rather than estimate
   from user-supplied rates.
 - Cross-task or per-session budgets. The ceiling is per task.
 - Replacing `agent_max_tool_rounds`. Both bounds apply; whichever is reached
@@ -145,15 +104,25 @@ validating, reviewing, complete) is recorded on the task and is derived from
 step progress rather than set independently, so the phase cannot say "validating"
 while every validation step is `pending`.
 
+> `TaskPhase` is a **new type**, not an extension of the existing `PhaseKind`
+> ([`context.md`](context.md) §3.7). `PhaseKind` says which stage of the agent
+> loop is executing and drives the spinner; `TaskPhase` says what the work is
+> about. They are orthogonal — a `Model` phase occurs during all six — and
+> merging them yields a type whose variants are not mutually exclusive.
+>
+> §3.1: a task is one turn, so a plan's steps are steps of the agent loop,
+> bounded by `agent_max_tool_rounds` (default 8), not stages of a multi-turn
+> project.
+
 **When a plan is created**: a turn gets a plan when it is non-trivial, defined
 mechanically as a turn that will propose a patch, run a mutating command, or has
 more than one step in the model's own proposal. A single question, a single file
 read, or a one-command turn gets no plan, because a one-step plan is ceremony —
-[spec 08](08_stop_and_progress.md)'s turn states already cover it.
+[spec 08](../08_stop_and_progress.md)'s turn states already cover it.
 
 ### 5.2 Persistence: appended, replayed
 
-Following [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.2, plan state
+Following [spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) §5.2, plan state
 is appended to the session log, never rewritten:
 
 ```json
@@ -174,7 +143,7 @@ This satisfies requirement 5 without a second store, per the roadmap's
 instruction to extend the durable task state rather than add a parallel one. It
 also means a crash mid-step loses nothing already recorded: the step's last
 persisted status is its status, and
-[spec 17](17_durable_task_state_and_crash_recovery/proposal.md)'s dangling
+[spec 17](../17_durable_task_state_and_crash_recovery/proposal.md)'s dangling
 `action_started` marker says what was in flight inside it.
 
 ### 5.3 Evidence, and what "completed" is allowed to mean
@@ -201,12 +170,20 @@ pub enum Evidence {
 Every variant references something Damaian observed itself. There is no
 `ModelAsserted` variant, and adding one would defeat the requirement.
 
+> Two corrections to the sketch above, from [`context.md`](context.md) §3.5 and
+> §3.6. The `ref` is a `markerId` from spec 17, not a `cmd_…` id: execution ids
+> never reach the session log and the audit log that holds them expires, so the
+> exit code is the evidence and the reference is only a breadcrumb. And
+> `Findings` is deferred until [spec 22](../22_findings_model_and_panel.md)
+> exists to produce the ids it holds; the enum is `#[non_exhaustive]` so adding
+> it later breaks nothing.
+
 The status rule:
 
 | Evidence present | Status |
 |---|---|
 | `CommandExit` with `exit_code: Some(0)` | `completed` |
-| `CommandExit` with a non-zero code | `blocked`, and the failure becomes a finding ([spec 22](22_findings_model_and_panel.md)) |
+| `CommandExit` with a non-zero code | `blocked`, and the failure becomes a finding ([spec 22](../22_findings_model_and_panel.md)) |
 | `CommandExit` with `exit_code: None` | **not** `completed`. The command did not report an exit status, so nothing is known. `blocked` |
 | `PatchApplied` with hashes matching what was written | `completed` |
 | No evidence of any kind | `completed_unverified` in the report; `completed` in the plan, with an empty `evidence` vec |
@@ -224,18 +201,28 @@ admitting it.
 
 ### 5.4 The token ceiling
 
-`agent_max_task_tokens` in `Config`, overlayable from repository config the same
-way `agent_max_tool_rounds` is (`config.rs:308-315`). Default: unset, meaning no
-ceiling, so this cannot break an existing configuration on upgrade.
+`agent_max_task_tokens` in `Config`. Default: unset, meaning no ceiling, so this
+cannot break an existing configuration on upgrade.
 
-Enforcement follows the existing `tool_budget_exhausted` pattern exactly
-(`chat.rs:841`, `chat.rs:1205`):
+> Corrected by [`context.md`](context.md) §3.8: **not** overlayable the same way
+> `agent_max_tool_rounds` is. That key is in the "Free" block, which a
+> repository may set freely. A repository that raises a ceiling the user set low
+> spends the user's money, so the ceiling is restrict-only — a repository may
+> lower it or set one where none existed, never raise one and never remove one.
+
+Enforcement reuses the `tool_budget_exhausted` *plumbing* — a flag carried out
+of the loop, a distinct `TaskStatus`, a distinct audit status — but **not its
+control flow**. [`context.md`](context.md) §3.3: `force_final` does not stop the
+loop, it makes one more model call with tools dropped, and on a context that has
+grown all turn that is the most expensive call of the turn. A ceiling whose
+enforcement action is to spend more than the ceiling is not a ceiling, so the
+token check stops before the call rather than forcing a final one.
 
 - Checked **at step boundaries and between tool rounds**, not mid-stream. A
   ceiling that interrupts a model mid-response wastes the tokens already spent on
   that response, which is the opposite of the point.
 - The check reads `read_task_usage` from
-  [spec 19](19_token_and_cost_accounting/proposal.md). A task whose usage is
+  [spec 19](../19_token_and_cost_accounting/proposal.md). A task whose usage is
   `Estimated` is still checked against the ceiling — an estimated total is the
   best available number, and declining to enforce on it would make the ceiling
   inoperative for every provider that does not report usage.
@@ -252,21 +239,28 @@ distinguish them.
 The stop is recoverable: the plan survives, so the user can raise the ceiling and
 resume, and the remaining steps are what resumption starts from.
 
+> [`context.md`](context.md) §3.1 makes this concrete. A task is one turn, so a
+> resumed turn is a *new* task with a new id, and `read_task_plan` keyed on task
+> id would not find the plan that was persisted. Resumption carries the plan
+> forward explicitly through a `plan_resumed` event naming the task it came
+> from; without that mechanism "the plan survives" is true of the log and false
+> of the user.
+
 ### 5.5 Plan review before implementation
 
 Requirement 4: after a plan is created and before any mutating step runs, the
 plan is presented and the user may reorder, edit titles, delete steps, or
 approve. This is a gate in Code mode and the natural terminus in Plan mode
-([spec 20](20_working_modes.md)) — Plan mode produces the plan and stops, and
+([spec 20](../20_working_modes.md)) — Plan mode produces the plan and stops, and
 switching to Code carries it over intact.
 
 Mid-execution editing is a non-goal, and the reason is worth recording: a step
 already `completed` has evidence attached to a state of the repository, and
 allowing the plan to be rewritten underneath that evidence produces a plan whose
 history no longer describes what happened. A user who wants a different plan
-mid-task should stop the task ([spec 08](08_stop_and_progress.md)) and start
+mid-task should stop the task ([spec 08](../08_stop_and_progress.md)) and start
 another, with the checkpoint from
-[spec 16](16_session_checkpoints_and_rewind.md) available to rewind first.
+[spec 16](../16_session_checkpoints_and_rewind.md) available to rewind first.
 
 Adjustments are recorded as a `plan_revised` event carrying the new step list, so
 the original plan and the user's revision are both in the log.
@@ -311,9 +305,23 @@ statuses.
 - An unset ceiling imposes no limit, so existing configurations are unaffected.
 - A plan revised by the user records both the original and the revision.
 - The task phase is derived from step state and cannot contradict it.
-- Every quality-gate command from `AGENTS.md` passes, and the end-to-end
-  fixture from [spec 23](23_verification_loop.md) exercises a plan through to a
-  completion report.
+- A non-zero exit reaches the session log at all — asserted directly, because
+  today every tool arm records `"ok"` regardless of outcome
+  ([`context.md`](context.md) §3.4) and every evidence criterion above is
+  vacuous until it does.
+- A resumed turn recovers the plan of the task it resumes, not an empty one
+  (§3.1).
+- A repository config may lower `agent_max_task_tokens` and may not raise it
+  (§3.8).
+- `update_task_status` stamps `completed_at_ms` for `TokenBudgetExhausted` —
+  asserted directly, since its terminal list is hand-written and no existing
+  test covers an omission (§3.2).
+- Every quality-gate command from `AGENTS.md` passes, and a plan runs end to end
+  through to a completion report in
+  [spec 18](../18_local_evaluation_harness/proposal.md)'s harness. **Restated
+  from spec 23**, which is Not started and cannot supply a fixture; §3.6. The
+  harness is Done, runs deterministically in CI, and has been exercised against
+  a live provider, which is the stronger gate of the two.
 
 ## 7. Implementation Notes
 

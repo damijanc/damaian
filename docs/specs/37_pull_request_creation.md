@@ -290,7 +290,7 @@ Three rules carried through to the body:
   is stated. A check that passed against five files when three were accepted did
   not verify what is in the PR, and saying so is the difference between evidence
   and decoration.
-- **Unverified plan steps** ([spec 21](21_task_plan_progress_and_budget.md)) go
+- **Unverified plan steps** ([spec 21](21_task_plan_progress_and_budget/proposal.md)) go
   in known limitations. A step completed with no observable evidence is exactly
   what a reviewer should look at first.
 

@@ -174,7 +174,7 @@ function that turns a model suggestion into a stored entry without a
 `UserConfirmation`, so a future caller cannot add one by mistake — only by
 deliberately adding a constructor, which is a reviewable change.
 
-This is the same reasoning as [spec 21](21_task_plan_progress_and_budget.md)'s
+This is the same reasoning as [spec 21](21_task_plan_progress_and_budget/proposal.md)'s
 `Evidence` having no `ModelAsserted` variant: make the unsafe state
 unrepresentable rather than checked.
 

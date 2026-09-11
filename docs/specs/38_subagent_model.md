@@ -15,7 +15,7 @@ Related implementation specs:
 (measures the readiness gates), [`20_working_modes.md`](20_working_modes.md) and
 [`31_permission_profiles.md`](31_permission_profiles.md) (the boundary a
 subagent inherits and cannot widen),
-[`21_task_plan_progress_and_budget.md`](21_task_plan_progress_and_budget.md),
+[`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md),
 [`22_findings_model_and_panel.md`](22_findings_model_and_panel.md),
 [`26_context_assembly.md`](26_context_assembly.md),
 [`39_coordination_and_conflict_handling.md`](39_coordination_and_conflict_handling.md),
@@ -33,7 +33,7 @@ because they affect whether the gates can be evaluated at all:
   approval-policy violations, restricted-path and secret violations, and
   cost/latency/iteration ceilings come from
   [spec 18](18_local_evaluation_harness/proposal.md) and
-  [spec 21](21_task_plan_progress_and_budget.md); crash-recovery fixtures from
+  [spec 21](21_task_plan_progress_and_budget/proposal.md); crash-recovery fixtures from
   [spec 17](17_durable_task_state_and_crash_recovery/proposal.md); external-write
   handling from [specs 35–37](37_pull_request_creation.md). Trace completeness
   is a manual review.
@@ -311,7 +311,7 @@ approval for these commands" adds a sentence to a context window and changes
 nothing, because approval is not read from context.
 
 The parent's task remains the one that reports to the user, holds the plan
-([spec 21](21_task_plan_progress_and_budget.md)), and owns the completion
+([spec 21](21_task_plan_progress_and_budget/proposal.md)), and owns the completion
 report. Per the phase's UX section, the UI does not present a subagent as an
 independent authority — no "the reviewer agent thinks", because it is the same
 model with a narrower prompt, and framing it as a second opinion invites
@@ -384,7 +384,7 @@ it.
 
 Each subagent's turn, time, and token limits are the lower of its request and
 the parent's *remaining* budget, so children cannot collectively exceed the
-parent's ceiling ([spec 21](21_task_plan_progress_and_budget.md) §5.4). Usage
+parent's ceiling ([spec 21](21_task_plan_progress_and_budget/proposal.md) §5.4). Usage
 aggregates upward through [spec 19](19_token_and_cost_accounting/proposal.md)'s per-task
 events, and the parent's total includes its descendants' — which is what makes
 [spec 40](40_autonomy_evaluations.md)'s cost-amplification figure computable.

@@ -143,7 +143,7 @@ merge-base from `git merge-base <base> HEAD`. Both are pure reads.
 
 ### 5.2 Suggested branch name
 
-Derived from the task's plan title ([spec 21](21_task_plan_progress_and_budget.md))
+Derived from the task's plan title ([spec 21](21_task_plan_progress_and_budget/proposal.md))
 or the user's original request: lowercased, non-alphanumerics collapsed to `-`,
 truncated, and prefixed per a configurable pattern (default
 `damaian/<slug>`).

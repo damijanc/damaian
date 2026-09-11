@@ -316,7 +316,7 @@ Findings are appended to the session log per
 
 `SessionStore::read_findings(session_id)` replays them, newest status per ID
 winning. Findings therefore survive restart, which
-[spec 21](21_task_plan_progress_and_budget.md) needs — a step blocked by a finding
+[spec 21](21_task_plan_progress_and_budget/proposal.md) needs — a step blocked by a finding
 must still be blocked by it after a crash.
 
 ### 5.8 Documentation

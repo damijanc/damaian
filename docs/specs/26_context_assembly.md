@@ -10,7 +10,7 @@ and secret policy), section 7.5 (model adapter), section 7.9 (context assembly).
 Related implementation specs:
 [`02_semantic_search.md`](02_semantic_search.md),
 [`11_agents_md_support.md`](11_agents_md_support.md) (instruction resolution and
-precedence), [`21_task_plan_progress_and_budget.md`](21_task_plan_progress_and_budget.md)
+precedence), [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md)
 (plan state as a context category),
 [`22_findings_model_and_panel.md`](22_findings_model_and_panel.md) (findings as a
 category), [`24_repository_map_and_monorepo_boundaries.md`](24_repository_map_and_monorepo_boundaries.md),

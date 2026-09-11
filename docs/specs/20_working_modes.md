@@ -267,7 +267,7 @@ selection; switching to a more restrictive one needs no confirmation.
 
 Moving from Plan to Code is the common transition and the one worth making
 smooth: a plan produced in Plan mode stays intact when the user switches to Code
-to execute it ([spec 21](21_task_plan_progress_and_budget.md) owns the plan).
+to execute it ([spec 21](21_task_plan_progress_and_budget/proposal.md) owns the plan).
 
 Where a tool was refused by mode, the turn says which mode blocked it and what
 mode would allow it, so the user is not left guessing why the agent declined.

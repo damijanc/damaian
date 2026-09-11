@@ -12,7 +12,7 @@ harness this extends — this spec adds scenarios and metrics, it does not build
 second harness),
 [`19_token_and_cost_accounting/proposal.md`](19_token_and_cost_accounting/proposal.md) (the usage
 figures amplification is computed from),
-[`21_task_plan_progress_and_budget.md`](21_task_plan_progress_and_budget.md),
+[`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md),
 [`38_subagent_model.md`](38_subagent_model.md),
 [`39_coordination_and_conflict_handling.md`](39_coordination_and_conflict_handling.md).
 
