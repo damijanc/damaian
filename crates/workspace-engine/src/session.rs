@@ -870,6 +870,123 @@ impl SessionStore {
         )
     }
 
+    /// Appends the plan a turn will work through.
+    ///
+    /// See `docs/specs/21_task_plan_progress_and_budget/proposal.md` §5.2. Plan
+    /// state goes in the session log rather than a second store, so
+    /// requirement 5's "recovered after restart" is the same replay that
+    /// already recovers task status — and a crash mid-step loses nothing
+    /// already recorded.
+    pub fn create_plan(&self, task: &Task, plan: &crate::plan::TaskPlan) -> Result<()> {
+        self.append_plan(task, "plan_created", plan)
+    }
+
+    /// Appends the user's revision of a plan, keeping the original in the log.
+    ///
+    /// §5.5: both the plan Damaian proposed and the plan the user approved are
+    /// history, and a revision that overwrote the original would leave the log
+    /// unable to say what was suggested.
+    pub fn revise_plan(&self, task: &Task, plan: &crate::plan::TaskPlan) -> Result<()> {
+        self.append_plan(task, "plan_revised", plan)
+    }
+
+    fn append_plan(
+        &self,
+        task: &Task,
+        event_type: &str,
+        plan: &crate::plan::TaskPlan,
+    ) -> Result<()> {
+        // The plan's own `task_id` is authoritative and is not re-derived from
+        // `task` here: `resume_plan` writes a plan whose `task_id` it has
+        // deliberately rewritten, and silently overwriting that would send the
+        // carried plan back to the task it came from.
+        let payload = serde_json::to_string(plan).map_err(|error| {
+            crate::error::ClientError::Io(format!("plan serialization: {error}"))
+        })?;
+        self.append_session_event(&task.session_id, event_type, &payload)
+    }
+
+    /// Appends one step's new state.
+    ///
+    /// The step is written **whole** rather than as a delta. A partial update
+    /// would need the reader to know which absent field means "unchanged" and
+    /// which means "cleared" — and spec 17's rule is that the log says what is
+    /// true, not what changed, precisely so a reader never has to guess.
+    pub fn update_plan_step(&self, task: &Task, step: &crate::plan::PlanStep) -> Result<()> {
+        let step_json = serde_json::to_string(step).map_err(|error| {
+            crate::error::ClientError::Io(format!("plan step serialization: {error}"))
+        })?;
+        self.append_session_event(
+            &task.session_id,
+            "plan_step_updated",
+            &format!(
+                "{{\"taskId\":\"{}\",\"step\":{}}}",
+                escape_json(&task.id),
+                step_json
+            ),
+        )
+    }
+
+    /// The task's plan as of the newest event for each step, or `None` when the
+    /// task has no plan at all.
+    ///
+    /// `None` and an empty plan are different facts: a trivial turn gets no
+    /// plan (§5.1), which is not the same as a plan that proposed no steps.
+    ///
+    /// Reads **active** events, unlike [`Self::read_task_usage`]. A rewind
+    /// moves the conversation back, and a plan is part of the conversation —
+    /// whereas what was billed was billed regardless of where the conversation
+    /// now sits.
+    pub fn read_task_plan(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<crate::plan::TaskPlan>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(None);
+        };
+        let mut plan: Option<crate::plan::TaskPlan> = None;
+        for event in active_events(&content) {
+            match event.event_type.as_str() {
+                "plan_created" | "plan_revised" => {
+                    let Ok(created) =
+                        serde_json::from_value::<crate::plan::TaskPlan>(event.payload.clone())
+                    else {
+                        continue;
+                    };
+                    // A session holds every task's plan, so the reader selects.
+                    if created.task_id == task_id {
+                        plan = Some(created);
+                    }
+                }
+                "plan_step_updated" => {
+                    let Some(current) = plan.as_mut() else {
+                        continue;
+                    };
+                    if event.text("taskId").as_deref() != Some(task_id) {
+                        continue;
+                    }
+                    let Some(updated) = event.payload.get("step").cloned().and_then(|value| {
+                        serde_json::from_value::<crate::plan::PlanStep>(value).ok()
+                    }) else {
+                        continue;
+                    };
+                    // A step id the plan does not contain is ignored rather
+                    // than appended. The step list is set by `plan_created` and
+                    // `plan_revised`; letting an update introduce a step would
+                    // let the log grow a plan nobody wrote.
+                    if let Some(existing) =
+                        current.steps.iter_mut().find(|step| step.id == updated.id)
+                    {
+                        *existing = updated;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(plan)
+    }
+
     /// Every action that started and never finished, in log order.
     ///
     /// Paired by `markerId` rather than by action name: the same action can run

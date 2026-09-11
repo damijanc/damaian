@@ -5,7 +5,16 @@
 //! complete only because the model said so. Every assertion about `Evidence`
 //! and about `status_from_evidence` is an assertion about that guarantee.
 
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use workspace_engine::plan::{Evidence, PlanStep, StepStatus, TaskPlan};
+use workspace_engine::{SessionStore, Task};
+
+static COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// A step with nothing but an id and a status, so a test that cares about one
 /// field is not obscured by six it does not.
@@ -19,6 +28,71 @@ fn step(id: &str, status: StepStatus) -> PlanStep {
         started_at_ms: None,
         completed_at_ms: None,
         evidence: Vec::new(),
+    }
+}
+
+struct Fixture {
+    data_dir: PathBuf,
+    store: SessionStore,
+    session_id: String,
+}
+
+impl Fixture {
+    fn new(name: &str) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should work")
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!(
+            "damaian-plan-{name}-{now}-{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&data_dir).expect("temp dir should be created");
+        let store = SessionStore::new(&data_dir);
+        let session = store
+            .create_session("repo_1", "Plan")
+            .expect("a session should be created");
+        Self {
+            data_dir,
+            store,
+            session_id: session.id,
+        }
+    }
+
+    fn task(&self, prompt: &str) -> Task {
+        self.store
+            .create_task(&self.session_id, prompt, "mock", "m")
+            .expect("a task should be created")
+    }
+
+    fn log_path(&self) -> PathBuf {
+        self.data_dir
+            .join("sessions")
+            .join(format!("{}.jsonl", self.session_id))
+    }
+
+    /// Appends a raw line, so a test can write what a crash mid-write leaves
+    /// rather than describe it.
+    fn append_raw(&self, line: &str) {
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(self.log_path())
+            .expect("the log should exist");
+        writeln!(file, "{line}").expect("append should succeed");
+    }
+
+    fn plan_event_kinds(&self) -> Vec<String> {
+        let text = fs::read_to_string(self.log_path()).unwrap_or_default();
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|event| {
+                event
+                    .get("eventType")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .filter(|kind| kind.starts_with("plan_"))
+            .collect()
     }
 }
 
@@ -93,4 +167,184 @@ fn a_plan_with_no_step_in_progress_is_not_a_violation() {
     plan.steps.push(step("step_1", StepStatus::Pending));
     plan.steps.push(step("step_2", StepStatus::Completed));
     assert!(!plan.violates_single_in_progress());
+}
+
+// ---------------------------------------------------------------------------
+// Persistence: appended, replayed. Proposal §5.2.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_newest_event_per_step_wins_on_replay() {
+    let fixture = Fixture::new("replay");
+    let task = fixture.task("add retry handling");
+    let mut plan = TaskPlan::new(&task.id, 0);
+    plan.steps.push(step("step_1", StepStatus::Pending));
+    plan.steps.push(step("step_2", StepStatus::Pending));
+    fixture.store.create_plan(&task, &plan).unwrap();
+
+    let mut first = plan.steps[0].clone();
+    first.status = StepStatus::InProgress;
+    fixture.store.update_plan_step(&task, &first).unwrap();
+    first.status = StepStatus::Completed;
+    first.evidence = vec![Evidence::CommandExit {
+        marker_id: "action_1".to_string(),
+        exit_code: Some(0),
+    }];
+    fixture.store.update_plan_step(&task, &first).unwrap();
+
+    let replayed = fixture
+        .store
+        .read_task_plan(&fixture.session_id, &task.id)
+        .unwrap()
+        .expect("a plan was created");
+    assert_eq!(replayed.steps[0].status, StepStatus::Completed);
+    assert_eq!(replayed.steps[0].evidence.len(), 1);
+    // Untouched, and still in its original position: a fold that rebuilt the
+    // list from the updates would lose the order the plan was written in.
+    assert_eq!(replayed.steps[1].status, StepStatus::Pending);
+    assert_eq!(replayed.steps[1].id, "step_2");
+}
+
+#[test]
+fn a_plan_from_another_task_in_the_same_session_is_not_returned() {
+    let fixture = Fixture::new("other-task");
+    let first = fixture.task("one");
+    let second = fixture.task("two");
+    let mut plan = TaskPlan::new(&first.id, 0);
+    plan.steps.push(step("step_1", StepStatus::Pending));
+    fixture.store.create_plan(&first, &plan).unwrap();
+
+    assert!(
+        fixture
+            .store
+            .read_task_plan(&fixture.session_id, &second.id)
+            .unwrap()
+            .is_none(),
+        "a session holds every task's plan; the reader must select one"
+    );
+}
+
+#[test]
+fn a_torn_final_line_does_not_discard_the_plan_before_it() {
+    let fixture = Fixture::new("torn");
+    let task = fixture.task("add retry handling");
+    let mut plan = TaskPlan::new(&task.id, 0);
+    plan.steps.push(step("step_1", StepStatus::Pending));
+    fixture.store.create_plan(&task, &plan).unwrap();
+
+    // What a crash mid-append leaves. The log is append-only and a plan is
+    // written during a turn, so this is the expected shape of a bad shutdown,
+    // not a corruption to refuse.
+    fixture.append_raw("{\"seq\":99,\"eventType\":\"plan_step_upda");
+
+    assert!(
+        fixture
+            .store
+            .read_task_plan(&fixture.session_id, &task.id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn an_update_naming_a_step_the_plan_does_not_have_is_ignored() {
+    // The step list is set by `plan_created` and `plan_revised`. Letting an
+    // update introduce one would let the log grow a plan nobody wrote — and a
+    // torn line that happened to parse could then add a step.
+    let fixture = Fixture::new("unknown-step");
+    let task = fixture.task("add retry handling");
+    let mut plan = TaskPlan::new(&task.id, 0);
+    plan.steps.push(step("step_1", StepStatus::Pending));
+    fixture.store.create_plan(&task, &plan).unwrap();
+
+    fixture
+        .store
+        .update_plan_step(&task, &step("step_99", StepStatus::Completed))
+        .unwrap();
+
+    let replayed = fixture
+        .store
+        .read_task_plan(&fixture.session_id, &task.id)
+        .unwrap()
+        .expect("a plan was created");
+    assert_eq!(replayed.steps.len(), 1);
+    assert_eq!(replayed.steps[0].id, "step_1");
+}
+
+#[test]
+fn a_task_with_no_plan_reports_none_rather_than_an_empty_plan() {
+    // A trivial turn gets no plan at all (§5.1), which is a different fact
+    // from a plan with no steps. The completion report has to tell them apart:
+    // one has nothing to say, the other proposed nothing.
+    let fixture = Fixture::new("no-plan");
+    let task = fixture.task("what does this function do");
+
+    assert!(
+        fixture
+            .store
+            .read_task_plan(&fixture.session_id, &task.id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn a_plan_event_records_its_kind_so_the_log_is_readable_by_hand() {
+    // `docs/TROUBLESHOOTING.md` tells a user to find plan events in the log.
+    let fixture = Fixture::new("kinds");
+    let task = fixture.task("add retry handling");
+    let mut plan = TaskPlan::new(&task.id, 0);
+    plan.steps.push(step("step_1", StepStatus::Pending));
+    fixture.store.create_plan(&task, &plan).unwrap();
+    fixture
+        .store
+        .update_plan_step(&task, &step("step_1", StepStatus::InProgress))
+        .unwrap();
+
+    assert_eq!(
+        fixture.plan_event_kinds(),
+        vec!["plan_created", "plan_step_updated"]
+    );
+}
+
+#[test]
+fn a_rewind_past_a_plan_takes_the_plan_with_it() {
+    // `read_task_plan` reads *active* events, unlike `read_task_usage`, and
+    // this is the test for that choice rather than only a doc comment about
+    // it. A plan is part of the conversation: rewinding to before it was
+    // proposed must not leave the panel showing steps the user rewound away.
+    // (Usage is the opposite case — what was billed was billed regardless of
+    // where the conversation now sits.)
+    let fixture = Fixture::new("rewind");
+    let task = fixture.task("add retry handling");
+    let before = fixture
+        .store
+        .latest_event_seq(&fixture.session_id)
+        .expect("a seq");
+
+    let mut plan = TaskPlan::new(&task.id, 0);
+    plan.steps.push(step("step_1", StepStatus::Pending));
+    fixture.store.create_plan(&task, &plan).unwrap();
+    assert!(
+        fixture
+            .store
+            .read_task_plan(&fixture.session_id, &task.id)
+            .unwrap()
+            .is_some(),
+        "the plan should be readable before the rewind"
+    );
+
+    fixture
+        .store
+        .rewind_conversation(&fixture.session_id, before)
+        .unwrap();
+
+    assert!(
+        fixture
+            .store
+            .read_task_plan(&fixture.session_id, &task.id)
+            .unwrap()
+            .is_none(),
+        "a rewound plan must not survive as the task's current plan"
+    );
 }

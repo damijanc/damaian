@@ -68,7 +68,7 @@ Every task's requirements implicitly include this section.
 |---|---|---|
 | 1. Tool outcomes tell success from failure | **done** | Also repairs #18's `tool_and_model_error_rate`; see the note below |
 | 2. `TaskPlan` and `PlanStep` types | **done** | `Evidence` is `#[non_exhaustive]`; see the note below |
-| 3. Plan persistence and replay | not started | |
+| 3. Plan persistence and replay | **done** | `revise_plan` landed here rather than in Task 11; see the note below |
 | 4. Evidence, minted at the call site | not started | |
 | 5. Step status is a function of evidence | not started | |
 | 6. `TaskPhase`, derived | not started | |
@@ -698,6 +698,40 @@ Restore it.
 - [ ] **Step 6: Run the full gate, then ask before committing**
 
 Proposed message: `Persist a turn's plan in the session log and replay it back`
+
+#### What this task actually did
+
+All seven gate commands pass; 11 tests in `tests/plan.rs`.
+
+**`revise_plan` landed here, not in Task 11.** The reader already had to treat
+`plan_revised` as a plan-establishing event to fold updates correctly, so
+writing the event in a later task would have left a reader handling a case
+nothing could produce — untestable, and the kind of dead branch that rots.
+Task 11 now only has to call it and gate on it.
+
+**Four tests beyond the plan's three**, each pinning a decision the plan stated
+but did not verify:
+
+- `an_update_naming_a_step_the_plan_does_not_have_is_ignored` — the plan's prose
+  said a step list comes only from `plan_created`/`plan_revised`. Mutation-checked
+  by making the reader `push` the unknown step: fails exactly this test.
+- `a_task_with_no_plan_reports_none_rather_than_an_empty_plan` — `None` and a
+  zero-step plan are different facts (a trivial turn versus a plan that proposed
+  nothing), and the completion report will have to tell them apart.
+- `a_plan_event_records_its_kind_so_the_log_is_readable_by_hand` — §5.7 promises
+  `TROUBLESHOOTING.md` will tell a user where plan events are. That promise is
+  now a test rather than an intention.
+- `a_rewind_past_a_plan_takes_the_plan_with_it` — **the one worth reading twice.**
+  `read_task_plan` uses `active_events` while `read_task_usage` deliberately does
+  not, and that asymmetry was a doc comment with nothing behind it. Swapping
+  `active_events` for `parsed_events` fails only this test. Without it the
+  distinction was an assertion about intent, not behaviour.
+
+**One thing deliberately not done.** `append_plan` does not overwrite the plan's
+own `task_id` from the `Task` it is handed, even though that would look like
+tightening. Task 10's `resume_plan` writes a plan whose `task_id` it has
+rewritten on purpose; re-deriving it here would send the carried plan straight
+back to the task it came from, and the carry-over would silently do nothing.
 
 ---
 
