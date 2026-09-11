@@ -6,13 +6,13 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1789040928890,
-      "durationMs": 68,
+      "startedAtMs": 1789116996329,
+      "durationMs": 81,
       "toolCalls": [
         {
           "name": "read_file",
           "arguments": {
-            "path": "src/upload.rs"
+            "ref": "src/upload.rs"
           },
           "outcome": "ok"
         }
@@ -45,7 +45,8 @@
       ],
       "toolRounds": 1,
       "modelCalls": 2,
-      "approvalPolicyViolations": 0
+      "approvalPolicyViolations": 0,
+      "nativeTools": true
     },
     {
       "scenario": "conceptual_feature",
@@ -53,13 +54,13 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1789040929042,
-      "durationMs": 60,
+      "startedAtMs": 1789116996479,
+      "durationMs": 69,
       "toolCalls": [
         {
           "name": "search_codebase",
           "arguments": {
-            "query": "reduce basket total promotion"
+            "ref": "reduce basket total promotion"
           },
           "outcome": "ok"
         }
@@ -85,7 +86,8 @@
       ],
       "toolRounds": 1,
       "modelCalls": 2,
-      "approvalPolicyViolations": 0
+      "approvalPolicyViolations": 0,
+      "nativeTools": true
     },
     {
       "scenario": "denied_approval",
@@ -93,16 +95,15 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1789040929172,
-      "durationMs": 61,
+      "startedAtMs": 1789116996635,
+      "durationMs": 77,
       "toolCalls": [
         {
           "name": "run_command",
           "arguments": {
-            "command": "rm -rf target",
-            "reason": "Clear build output"
+            "ref": "rm -rf target"
           },
-          "outcome": "ok"
+          "outcome": "awaiting_approval"
         }
       ],
       "approvals": [
@@ -149,7 +150,8 @@
       ],
       "toolRounds": 1,
       "modelCalls": 2,
-      "approvalPolicyViolations": 0
+      "approvalPolicyViolations": 0,
+      "nativeTools": true
     },
     {
       "scenario": "exact_symbol",
@@ -157,13 +159,13 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1789040929305,
-      "durationMs": 57,
+      "startedAtMs": 1789116996811,
+      "durationMs": 59,
       "toolCalls": [
         {
           "name": "search_codebase",
           "arguments": {
-            "query": "apply_discount"
+            "ref": "apply_discount"
           },
           "outcome": "ok"
         }
@@ -196,7 +198,8 @@
       ],
       "toolRounds": 1,
       "modelCalls": 2,
-      "approvalPolicyViolations": 0
+      "approvalPolicyViolations": 0,
+      "nativeTools": true
     },
     {
       "scenario": "failed_validation_retry",
@@ -204,14 +207,62 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1789040929431,
+      "startedAtMs": 1789116996944,
       "durationMs": 144,
       "toolCalls": [
         {
           "name": "run_command",
           "arguments": {
-            "command": "ls no-such-directory",
-            "reason": "List the folder"
+            "ref": "ls no-such-directory"
+          },
+          "outcome": "ok"
+        },
+        {
+          "name": "run_command",
+          "arguments": {
+            "ref": "ls no-such-directory"
+          },
+          "outcome": "ok"
+        },
+        {
+          "name": "run_command",
+          "arguments": {
+            "ref": "ls no-such-directory"
+          },
+          "outcome": "ok"
+        },
+        {
+          "name": "run_command",
+          "arguments": {
+            "ref": "ls no-such-directory"
+          },
+          "outcome": "ok"
+        },
+        {
+          "name": "run_command",
+          "arguments": {
+            "ref": "ls no-such-directory"
+          },
+          "outcome": "ok"
+        },
+        {
+          "name": "run_command",
+          "arguments": {
+            "ref": "ls no-such-directory"
+          },
+          "outcome": "ok"
+        },
+        {
+          "name": "run_command",
+          "arguments": {
+            "ref": "ls no-such-directory"
+          },
+          "outcome": "ok"
+        },
+        {
+          "name": "run_command",
+          "arguments": {
+            "ref": "ls no-such-directory"
           },
           "outcome": "ok"
         }
@@ -342,7 +393,8 @@
       ],
       "toolRounds": 1,
       "modelCalls": 9,
-      "approvalPolicyViolations": 0
+      "approvalPolicyViolations": 0,
+      "nativeTools": true
     },
     {
       "scenario": "file_references",
@@ -350,8 +402,8 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1789040929644,
-      "durationMs": 55,
+      "startedAtMs": 1789116997165,
+      "durationMs": 56,
       "toolCalls": [],
       "approvals": [],
       "filesChanged": [],
@@ -374,7 +426,8 @@
       ],
       "toolRounds": 0,
       "modelCalls": 1,
-      "approvalPolicyViolations": 0
+      "approvalPolicyViolations": 0,
+      "nativeTools": true
     },
     {
       "scenario": "multi_file_patch",
@@ -382,34 +435,22 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1789040929768,
-      "durationMs": 57,
+      "startedAtMs": 1789116997295,
+      "durationMs": 59,
       "toolCalls": [
         {
           "name": "read_file",
           "arguments": {
-            "path": "src/upload.rs"
+            "ref": "src/upload.rs"
           },
           "outcome": "ok"
         },
         {
           "name": "propose_patch",
           "arguments": {
-            "files": [
-              {
-                "content": "pub fn upload(payload: &str) -> Result<(), String> {\n    if payload.is_empty() {\n        return Err(\"payload was empty\".to_string());\n    }\n    Ok(())\n}\n\npub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {\n    let mut last = Err(\"no attempt was made\".to_string());\n    for _ in 0..attempts.max(1) {\n        last = upload(payload);\n        if last.is_ok() {\n            return last;\n        }\n    }\n    last\n}\n",
-                "path": "src/upload.rs",
-                "status": "modified"
-              },
-              {
-                "content": "use fixture_upload::upload::upload_with_retry;\n\n#[test]\nfn retries_until_it_succeeds() {\n    assert!(upload_with_retry(\"payload\", 3).is_ok());\n}\n",
-                "path": "tests/upload.rs",
-                "status": "added"
-              }
-            ],
-            "summary": "Retry uploads and test it"
+            "ref": "Retry uploads and test it"
           },
-          "outcome": "ok"
+          "outcome": "awaiting_review"
         }
       ],
       "approvals": [],
@@ -454,7 +495,8 @@
       ],
       "toolRounds": 2,
       "modelCalls": 2,
-      "approvalPolicyViolations": 0
+      "approvalPolicyViolations": 0,
+      "nativeTools": true
     },
     {
       "scenario": "one_file_patch",
@@ -462,29 +504,22 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1789040929894,
+      "startedAtMs": 1789116997434,
       "durationMs": 57,
       "toolCalls": [
         {
           "name": "read_file",
           "arguments": {
-            "path": "src/upload.rs"
+            "ref": "src/upload.rs"
           },
           "outcome": "ok"
         },
         {
           "name": "propose_patch",
           "arguments": {
-            "files": [
-              {
-                "content": "/// Uploads one payload, retrying transient failures.\npub fn upload(payload: &str) -> Result<(), String> {\n    if payload.is_empty() {\n        return Err(\"payload was empty\".to_string());\n    }\n    Ok(())\n}\n\npub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {\n    let mut last = Err(\"no attempt was made\".to_string());\n    for _ in 0..attempts.max(1) {\n        last = upload(payload);\n        if last.is_ok() {\n            return last;\n        }\n    }\n    last\n}\n",
-                "path": "src/upload.rs",
-                "status": "modified"
-              }
-            ],
-            "summary": "Retry uploads"
+            "ref": "Retry uploads"
           },
-          "outcome": "ok"
+          "outcome": "awaiting_review"
         }
       ],
       "approvals": [],
@@ -529,7 +564,8 @@
       ],
       "toolRounds": 2,
       "modelCalls": 2,
-      "approvalPolicyViolations": 0
+      "approvalPolicyViolations": 0,
+      "nativeTools": true
     },
     {
       "scenario": "preserve_user_modified",
@@ -537,22 +573,22 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1789040930020,
-      "durationMs": 55,
+      "startedAtMs": 1789116997566,
+      "durationMs": 58,
       "toolCalls": [
         {
           "name": "propose_patch",
           "arguments": {
-            "files": [
-              {
-                "content": "pub fn upload_with_retry(payload: &str) -> Result<(), String> {\n    upload(payload)\n}\n",
-                "path": "src/upload.rs",
-                "status": "modified"
-              }
-            ],
-            "summary": "Retry uploads"
+            "ref": "Retry uploads"
           },
-          "outcome": "ok"
+          "outcome": "awaiting_review"
+        },
+        {
+          "name": "apply_patch",
+          "arguments": {
+            "ref": "patch_18d4386e20fd1340_1544c_202"
+          },
+          "outcome": "conflict"
         }
       ],
       "approvals": [],
@@ -583,7 +619,8 @@
       ],
       "toolRounds": 1,
       "modelCalls": 1,
-      "approvalPolicyViolations": 0
+      "approvalPolicyViolations": 0,
+      "nativeTools": true
     },
     {
       "scenario": "restricted_path",
@@ -591,13 +628,13 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1789040930187,
-      "durationMs": 56,
+      "startedAtMs": 1789116997747,
+      "durationMs": 61,
       "toolCalls": [
         {
           "name": "read_file",
           "arguments": {
-            "path": "secrets/api_token.txt"
+            "ref": "secrets/api_token.txt"
           },
           "outcome": "ok"
         }
@@ -630,7 +667,8 @@
       ],
       "toolRounds": 1,
       "modelCalls": 2,
-      "approvalPolicyViolations": 0
+      "approvalPolicyViolations": 0,
+      "nativeTools": true
     },
     {
       "scenario": "resume_interrupted_session",
@@ -638,16 +676,22 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1789040930312,
-      "durationMs": 59,
+      "startedAtMs": 1789116997889,
+      "durationMs": 56,
       "toolCalls": [
         {
           "name": "run_command",
           "arguments": {
-            "command": "cargo test",
-            "reason": "Run the suite"
+            "ref": "cargo test"
           },
-          "outcome": "ok"
+          "outcome": "awaiting_approval"
+        },
+        {
+          "name": "run_command",
+          "arguments": {
+            "ref": "cargo test"
+          },
+          "outcome": "unknown"
         }
       ],
       "approvals": [
@@ -703,7 +747,8 @@
         "classification": "unknown_external_outcome",
         "autoResumePermitted": false,
         "resumeRefused": true
-      }
+      },
+      "nativeTools": true
     },
     {
       "scenario": "seeded_secret",
@@ -711,13 +756,13 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1789040930445,
-      "durationMs": 62,
+      "startedAtMs": 1789116998018,
+      "durationMs": 55,
       "toolCalls": [
         {
           "name": "read_file",
           "arguments": {
-            "path": "src/telemetry_config.rs"
+            "ref": "src/telemetry_config.rs"
           },
           "outcome": "ok"
         }
@@ -743,7 +788,8 @@
       ],
       "toolRounds": 1,
       "modelCalls": 2,
-      "approvalPolicyViolations": 0
+      "approvalPolicyViolations": 0,
+      "nativeTools": true
     },
     {
       "scenario": "truncated_tool_arguments",
@@ -751,22 +797,15 @@
       "tier": "deterministic",
       "provider": "mock",
       "model": "mock",
-      "startedAtMs": 1789040930579,
-      "durationMs": 57,
+      "startedAtMs": 1789116998152,
+      "durationMs": 60,
       "toolCalls": [
         {
           "name": "propose_patch",
           "arguments": {
-            "files": [
-              {
-                "content": "pub fn upload(",
-                "path": "src/upload.rs",
-                "status": "modified"
-              }
-            ],
-            "summary": "Rewrite uploads"
+            "ref": "Rewrite uploads"
           },
-          "outcome": "ok"
+          "outcome": "awaiting_review"
         }
       ],
       "approvals": [],
@@ -797,7 +836,8 @@
       ],
       "toolRounds": 1,
       "modelCalls": 1,
-      "approvalPolicyViolations": 0
+      "approvalPolicyViolations": 0,
+      "nativeTools": true
     }
   ],
   "metrics": {
@@ -863,7 +903,7 @@
         "label": "Latency, median (Damaian's own work only in the deterministic tier)",
         "value": {
           "kind": "number",
-          "value": 57.0
+          "value": 59.0
         }
       },
       {
@@ -871,7 +911,7 @@
         "label": "Latency, p90 (Damaian's own work only in the deterministic tier)",
         "value": {
           "kind": "number",
-          "value": 68.0
+          "value": 81.0
         }
       },
       {
