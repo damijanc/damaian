@@ -69,7 +69,8 @@ Every task's requirements implicitly include this section.
 | 1. Tool outcomes tell success from failure | **done** | Also repairs #18's `tool_and_model_error_rate`; see the note below |
 | 2. `TaskPlan` and `PlanStep` types | **done** | `Evidence` is `#[non_exhaustive]`; see the note below |
 | 3. Plan persistence and replay | **done** | `revise_plan` landed here rather than in Task 11; see the note below |
-| 4. Evidence, minted at the call site | not started | |
+| 4. Evidence, minted at the call site | **done** | Construction only; attachment moved to 4b — see the note below |
+| **4b. The plan lifecycle in a turn** | **not started** | **Missing from the original plan.** Creates the plan and advances its steps |
 | 5. Step status is a function of evidence | not started | |
 | 6. `TaskPhase`, derived | not started | |
 | 7. `TokenBudgetExhausted` status | not started | |
@@ -846,6 +847,101 @@ Expected: PASS.
 - [ ] **Step 5: Run the full gate, then ask before committing**
 
 Proposed message: `Attach evidence to a step from what the tool arm observed`
+
+#### What this task actually did — and the gap it exposed
+
+**This plan has no task that creates a plan or advances its steps.** Task 4 as
+written says "push `evidence_for(...)` onto the in-progress step", which
+presumes a plan with an in-progress step exists. Nothing produces one. Task 11
+*gates* on a plan, Task 6 derives a phase *from* steps, Task 12 renders them —
+but §5.1's creation rule ("a turn gets a plan when it will propose a patch, run
+a mutating command, or has more than one step in the model's own proposal") and
+requirement 1's step advancement were never given a task. That is a real hole in
+the plan, not a detail, and it is now **Task 4b** below.
+
+So Task 4 delivered the half that is testable today — evidence *construction* —
+and left attachment to 4b. What landed:
+
+- **`evidence_for` in `chat.rs`**, the single place an `ActionOutcome` becomes
+  an `Evidence`. Five unit tests, including the two the plan did not ask for:
+  `ActionOutcome::Ok` and `ActionOutcome::Failed` both yield `None`. A
+  `read_file` that worked says nothing about whether the step it served is done,
+  and minting a success record from it would make every step look verified.
+- **`PatchApplyResult::applied`**, carrying the hash actually written per file.
+  Mutation-checked against the obvious wrong version: using the patch's
+  `new_hash` fails `applies_only_selected_hunk_and_allows_rollback_afterward`,
+  because a partial-hunk accept writes content the proposal never described.
+- **The structural guard** that no `ModelAsserted` variant exists. Adding one
+  fails the test by name.
+
+**One thing tried and reverted.** `edit.rs`'s apply path builds an
+`Evidence::PatchApplied` naturally — marker and hashes are both in hand there —
+but with nothing to attach it to the statement was `let _evidence = …`:
+construction whose result is discarded. That is dead code wearing the costume of
+wiring, and it would have read as "done" in review. It belongs in 4b, where
+there is a step to attach it to.
+
+**A note on the guard test's first failure.** It failed immediately — on
+`plan.rs`'s own doc comment explaining why `ModelAsserted` does not exist. The
+fix was to strip comments before scanning, and the reason is worth keeping: a
+guard that cannot tell a declaration from prose about the absence of one gets
+deleted by the next person who documents the rule, who is exactly the person it
+protects.
+
+---
+
+### Task 4b: The plan lifecycle in a turn
+
+Missing from the original plan; see Task 4's note. This is what makes a plan
+exist during a turn, and every later task that reads one depends on it.
+
+**Files:**
+- Modify: `crates/workspace-engine/src/chat.rs`
+- Modify: `crates/workspace-engine/src/edit.rs` (attach `PatchApplied`)
+- Test: `crates/workspace-engine/tests/plan.rs`
+
+**Interfaces:**
+- Consumes: `SessionStore::create_plan` / `update_plan_step` (Task 3),
+  `evidence_for` (Task 4), `status_from_evidence` (Task 5).
+- Produces: a plan created during a non-trivial turn, with exactly one step
+  `InProgress` at a time and evidence attached as each completes.
+
+- [ ] **Step 1: Decide the triviality rule, and write its test first**
+
+§5.1 defines non-trivial as "will propose a patch, run a mutating command, or
+has more than one step in the model's own proposal". The first two are only
+knowable *after* the model's first response, which is the constraint the rule
+has to be written around — a plan cannot be created before the turn starts
+without guessing. Assert both directions: a single-question turn produces
+`read_task_plan == None`, and a patch-proposing turn produces a plan.
+
+Record the rule actually used in proposal §7, which asks for it by name along
+with how often it produced a plan for a turn that did not need one.
+
+- [ ] **Step 2: Assert the single-in-progress invariant against a real turn**
+
+`TaskPlan::violates_single_in_progress` exists and is unit-tested against
+hand-built plans. Requirement 2 is about *runs*, so drive a multi-step turn and
+assert the replayed plan never violates it — checking after each
+`update_plan_step`, not only at the end, since a transient double would be
+exactly the bug and invisible at the terminus.
+
+- [ ] **Step 3: Attach evidence as each step completes**
+
+Push `evidence_for(&action_outcome, marker_id)` onto the in-progress step and
+persist with `update_plan_step`. In `edit.rs`, attach the
+`Evidence::PatchApplied` built from `result.applied` — the construction Task 4
+deliberately did not leave behind as dead code.
+
+- [ ] **Step 4: Set the step's status with `status_from_evidence`, never directly**
+
+The model never writes a step status (§5.3). Assert it: a turn whose model
+output claims completion while its command exited non-zero must leave the step
+`Blocked`.
+
+- [ ] **Step 5: Run the full gate, then ask before committing**
+
+Proposed message: `Give a non-trivial turn a plan and advance it as work lands`
 
 ---
 

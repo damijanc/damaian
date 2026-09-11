@@ -52,6 +52,18 @@ pub struct ProposedPatch {
 pub struct PatchApplyResult {
     pub patch_id: String,
     pub applied_files: Vec<String>,
+    /// The same files, each with the hash of what was actually written.
+    ///
+    /// Separate from `applied_files` rather than replacing it: every existing
+    /// caller wants the path list and nothing else, and widening their type to
+    /// carry a hash they ignore would be churn for no gain.
+    ///
+    /// The hash is the *applied* one, which for a partial-hunk accept differs
+    /// from the patch's `new_hash` — see `RollbackSnapshot::applied_hash`.
+    /// Spec 21's `Evidence::PatchApplied` is built from this, and a step's
+    /// status rests on it, so reporting the proposal's hash would make the
+    /// evidence assert a file Damaian never wrote.
+    pub applied: Vec<crate::plan::PatchedFile>,
     pub warnings: Vec<String>,
 }
 
@@ -431,6 +443,7 @@ impl PatchEngine {
         let rollback_dir = self.config.data_dir.join("rollback").join(&patch.id);
         fs::create_dir_all(&rollback_dir)?;
         let mut applied_files = Vec::new();
+        let mut applied = Vec::new();
 
         for PreparedFile {
             file,
@@ -496,6 +509,13 @@ impl PatchEngine {
                 ],
             )?;
             applied_files.push(file.path.clone());
+            // Taken from the snapshot rather than recomputed: it is the hash of
+            // the bytes this loop wrote, and a second read could observe a file
+            // something else has since touched.
+            applied.push(crate::plan::PatchedFile {
+                path: file.path.clone(),
+                applied_hash: snapshot.applied_hash.clone(),
+            });
         }
 
         self.audit_log.record(
@@ -528,6 +548,7 @@ impl PatchEngine {
         Ok(PatchApplyResult {
             patch_id: patch.id.clone(),
             applied_files,
+            applied,
             warnings,
         })
     }

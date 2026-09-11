@@ -659,6 +659,21 @@ fn applies_only_selected_hunk_and_allows_rollback_afterward() {
         .unwrap();
     assert_eq!(result.applied_files, vec!["src/app.js"]);
 
+    // The hash of what *landed*, which for a partial accept is not the patch's
+    // own `new_hash`. Spec 21's `Evidence::PatchApplied` records this, and
+    // recording `new_hash` instead would claim the repository is in a state it
+    // is not — the evidence would assert a file Damaian never wrote.
+    assert_eq!(result.applied.len(), 1);
+    assert_eq!(result.applied[0].path, "src/app.js");
+    assert_eq!(
+        result.applied[0].applied_hash,
+        workspace_engine::hash::file_hash(repo.join("src/app.js")).unwrap()
+    );
+    assert_ne!(
+        result.applied[0].applied_hash, patch.files[0].new_hash,
+        "a partial accept must not report the whole patch's hash"
+    );
+
     let mut expected_lines: Vec<String> = (1..=30).map(|n| format!("line{n}\n")).collect();
     expected_lines[27] = "CHANGED_28\n".to_string();
     let expected_content = expected_lines.concat();

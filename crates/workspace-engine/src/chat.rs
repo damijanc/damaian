@@ -58,6 +58,37 @@ enum ActionOutcome {
     Failed,
 }
 
+/// The evidence an arm's outcome supports, or `None` where the engine observed
+/// nothing a step's status could honestly rest on.
+///
+/// Requirement 6 lives here as much as in the enum: this is the only place a
+/// tool dispatch becomes [`Evidence`], the inputs are values the engine holds,
+/// and no model output reaches it. Nothing constructs `Evidence` from a tool
+/// argument, and nothing should.
+///
+/// [`ActionOutcome::Ok`] yields `None` rather than a synthetic success record.
+/// A `read_file` that worked says nothing about whether the step it served is
+/// done, and minting evidence from it would make every step look verified —
+/// the letter-not-spirit failure requirement 6 exists to prevent.
+/// [`ActionOutcome::Failed`] likewise: it carries no code, so there is nothing
+/// to record that would not be invented, and the step's status follows from
+/// the *absence* of confirming evidence.
+// Unused until Task 4b attaches evidence to a step, because nothing in the turn
+// creates a plan yet. Landed here with its tests rather than alongside the
+// wiring: the rule about what does and does not count as evidence is the
+// substance of requirement 6, and it is worth pinning before the code that
+// consumes it exists to shape it.
+#[allow(dead_code)]
+fn evidence_for(outcome: &ActionOutcome, marker_id: &str) -> Option<crate::plan::Evidence> {
+    match outcome {
+        ActionOutcome::CommandExit(exit_code) => Some(crate::plan::Evidence::CommandExit {
+            marker_id: marker_id.to_string(),
+            exit_code: *exit_code,
+        }),
+        ActionOutcome::Ok | ActionOutcome::Failed => None,
+    }
+}
+
 /// Which stage of a turn is running. Drives the progress indicator, so the user
 /// can tell a slow provider apart from a running tool apart from a hang.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2618,5 +2649,81 @@ fn session_title(prompt: &str) -> String {
         format!("Chat {}", create_id("session_title"))
     } else {
         title
+    }
+}
+
+#[cfg(test)]
+mod evidence_tests {
+    use super::*;
+    use crate::plan::Evidence;
+
+    /// Requirement 6, structurally. The rule is that a step's status is a
+    /// function of what Damaian observed, and the enum is where that is
+    /// enforced: there is no variant a model claim could be poured into.
+    ///
+    /// Asserted against the source rather than the type system because the
+    /// failure mode is someone *adding* a variant under deadline, which no
+    /// type-level assertion can catch. This makes that a deliberate, visible
+    /// act — the test names the requirement it would be breaking.
+    ///
+    /// Comments are stripped before the scan, and that is not a convenience:
+    /// the first version of this test failed on `plan.rs`'s own doc comment
+    /// explaining why the variant does not exist. A guard that cannot tell a
+    /// declaration from prose about the absence of one would be removed by the
+    /// next person who documents the rule, which is precisely the person it
+    /// exists to protect.
+    #[test]
+    fn evidence_has_no_variant_a_model_could_fill() {
+        let code: String = include_str!("plan.rs")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("ModelAsserted"),
+            "requirement 6: evidence is what Damaian observed, never what the model claimed"
+        );
+    }
+
+    #[test]
+    fn a_failing_command_produces_evidence_carrying_its_code() {
+        assert_eq!(
+            evidence_for(&ActionOutcome::CommandExit(Some(1)), "action_1"),
+            Some(Evidence::CommandExit {
+                marker_id: "action_1".to_string(),
+                exit_code: Some(1),
+            })
+        );
+    }
+
+    #[test]
+    fn a_command_with_no_exit_code_still_produces_evidence() {
+        // Not `None`. "We ran it and learned nothing" is a different fact from
+        // "we did not run it", and the status rule needs the difference to
+        // block the step rather than complete it unverified.
+        assert_eq!(
+            evidence_for(&ActionOutcome::CommandExit(None), "action_1"),
+            Some(Evidence::CommandExit {
+                marker_id: "action_1".to_string(),
+                exit_code: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_read_only_tool_that_succeeded_produces_no_evidence() {
+        // A `read_file` that worked says nothing about whether the step it
+        // served is done. Manufacturing a success record from it is exactly
+        // the letter-not-spirit failure requirement 6 guards against — it
+        // would make every step look verified.
+        assert_eq!(evidence_for(&ActionOutcome::Ok, "action_1"), None);
+    }
+
+    #[test]
+    fn a_tool_that_reported_failure_produces_no_false_success() {
+        // `Failed` carries no exit code, so there is nothing to record that
+        // would not be invented. The step's own status comes from the absence
+        // of confirming evidence, not from a fabricated failure record.
+        assert_eq!(evidence_for(&ActionOutcome::Failed, "action_1"), None);
     }
 }
