@@ -9,11 +9,9 @@ use workspace_engine::{
 };
 
 use crate::fixture::{self, Materialized};
-use crate::record::{
-    RecordedApproval, RecordedCheck, RecordedRecovery, RecordedToolCall, RunRecord, Tokens,
-};
+use crate::record::{RecordedApproval, RecordedCheck, RecordedRecovery, RunRecord, Tokens};
 use crate::scenario::{CrashMidAction, Scenario, Tier};
-use crate::trace::Trace;
+use crate::trace::{self, Trace};
 
 #[derive(Debug)]
 pub struct Run {
@@ -431,20 +429,14 @@ fn drive(
         .filter(|executed| rejected_ids.contains(executed))
         .count() as u64;
 
-    // Tool-call outcomes: scripted name, outcome from whether the turn survived.
-    // A finer-grained per-call outcome would need an engine-side event that does
-    // not exist; recording the turn's outcome is honest, and the tool-error
-    // metric in §5.6 reads it. The live tier has no script, so it records none.
-    let turn_ok = outcome.is_ok();
-    for turn in &scenario.turns {
-        for call in &turn.tool_calls {
-            run_record.tool_calls.push(RecordedToolCall {
-                name: call.name.clone(),
-                arguments: call.arguments.clone(),
-                outcome: if turn_ok { "ok" } else { "error" }.to_string(),
-            });
-        }
-    }
+    // What the run dispatched, from the engine's action markers — not from
+    // `scenario.turns`. The script was the wrong source twice over: the live
+    // tier ignores it, so a live record listed calls that never happened and
+    // carried scripted payloads the model never sent; and a script cannot say
+    // how a call ended, so every entry was stamped with whether the turn as a
+    // whole survived. Spec 17's markers carry the engine's own per-call
+    // outcome, which did not exist when this was first written.
+    run_record.tool_calls = trace::tool_actions(&materialized.data_dir)?;
 
     let (final_status, response, context_files, command_proposal, patch_proposal) = match outcome {
         Ok(result) => (

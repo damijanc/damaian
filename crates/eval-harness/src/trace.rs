@@ -2,6 +2,8 @@ use std::path::Path;
 
 use workspace_engine::{ClientError, Result};
 
+use crate::record::RecordedToolCall;
+
 /// One audit event. `AuditLog::record` writes a flat JSON object per line with
 /// `eventId`, `timestampMs`, `userId`, `eventType` plus caller fields, every
 /// value already redacted (`crates/workspace-engine/src/audit.rs:42`).
@@ -111,4 +113,102 @@ impl Trace {
         }
         seen
     }
+}
+
+/// The tool calls a run actually dispatched, read from the engine's session
+/// log rather than from the scenario script.
+///
+/// The script is the wrong source for two reasons. The live tier ignores the
+/// `[[turn]]` blocks entirely, so a live record built from them lists calls
+/// that never happened; and even in the deterministic tier the script cannot
+/// say how a call *ended*, which left every entry stamped with whether the
+/// turn as a whole succeeded.
+///
+/// Each tool dispatch is bracketed by `action_started` / `action_finished`
+/// markers carrying the tool name and the engine's own outcome
+/// (`crates/workspace-engine/src/chat.rs`, `tool_action_marker`). An action
+/// that started and never finished is reported `unknown` rather than dropped —
+/// that is the crash signature spec 17 exists to preserve, and silently
+/// omitting it would hide a call that may well have been billed.
+///
+/// `model_call` markers are excluded: they are not tool calls, and
+/// `model_calls` counts them separately.
+pub fn tool_actions(data_dir: &Path) -> Result<Vec<RecordedToolCall>> {
+    let sessions = data_dir.join("sessions");
+    let Ok(entries) = std::fs::read_dir(&sessions) else {
+        // No session log means no turn ran — a refusal scenario is exactly
+        // that, so this is not an error.
+        return Ok(Vec::new());
+    };
+
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| ClientError::Io(format!("{}: {error}", sessions.display())))?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
+            paths.push(path);
+        }
+    }
+    // Sorted so a run with more than one session log produces a stable record
+    // rather than one that depends on directory order.
+    paths.sort();
+
+    let mut started = Vec::new();
+    let mut outcomes: Vec<(String, String)> = Vec::new();
+    for path in &paths {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
+        for line in text.lines() {
+            // A torn final line is plausible in an append-only log a crash
+            // scenario deliberately interrupts; skip it rather than failing.
+            let Ok(serde_json::Value::Object(event)) = serde_json::from_str(line.trim()) else {
+                continue;
+            };
+            let event_type = event.get("eventType").and_then(|value| value.as_str());
+            let Some(payload) = event.get("payload").and_then(|value| value.as_object()) else {
+                continue;
+            };
+            let text_field = |key: &str| {
+                payload
+                    .get(key)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            match event_type {
+                Some("action_started") => {
+                    let action = text_field("action");
+                    if action == "model_call" {
+                        continue;
+                    }
+                    started.push((text_field("markerId"), action, text_field("ref")));
+                }
+                Some("action_finished") => {
+                    outcomes.push((text_field("markerId"), text_field("outcome")));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(started
+        .into_iter()
+        .map(|(marker_id, name, reference)| RecordedToolCall {
+            name,
+            // The marker's reference is what the engine recorded of the call:
+            // the command, the path, the query, the patch summary. It is not
+            // the full argument object the script carries, and deliberately
+            // so — this is what the run can testify to.
+            arguments: serde_json::json!({ "ref": reference }),
+            outcome: outcomes
+                .iter()
+                .find(|(id, _)| *id == marker_id)
+                .map(|(_, outcome)| outcome.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+        })
+        .collect())
 }

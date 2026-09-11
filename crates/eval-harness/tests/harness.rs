@@ -1410,3 +1410,42 @@ fn both_tiers_offer_the_model_the_same_tools() {
         "the deterministic tier's capability set must be recorded, and it offers native tools"
     );
 }
+
+/// A run record's tool calls must describe the run, not the script.
+///
+/// `drive` built the list from `scenario.turns` and stamped every entry with
+/// whether the *whole turn* succeeded. In the deterministic tier that merely
+/// duplicated the script; in the live tier, which ignores the scripts
+/// entirely, it was fiction — a live record listed calls that never happened,
+/// carrying scripted patch content the model never sent, and
+/// `tool_and_model_error_rate` was computed from it. Requirement 4 asks for
+/// what the run did.
+///
+/// Two things separate the sources. The engine finishes a patch proposal's
+/// marker `awaiting_review`, not `ok` — the turn succeeded, the patch did not
+/// complete. And the marker carries the patch *summary*, where the script
+/// carries whole file contents.
+#[test]
+fn tool_calls_come_from_the_run_and_not_from_the_scenario_script() {
+    let path = scenario::scenarios_dir().join("one_file_patch.toml");
+    let loaded = scenario::load(&path).expect("scenario");
+    let run = eval_harness::runner::run(&loaded).expect("deterministic run");
+
+    let patch = run
+        .record
+        .tool_calls
+        .iter()
+        .find(|call| call.name == "propose_patch")
+        .expect("the run proposed a patch");
+
+    assert_eq!(
+        patch.outcome, "awaiting_review",
+        "the outcome must be the engine's, not whether the turn as a whole succeeded"
+    );
+
+    let arguments = serde_json::to_string(&patch.arguments).expect("arguments serialize");
+    assert!(
+        !arguments.contains("pub fn upload"),
+        "scripted file contents must not appear; the engine's record carries a summary, got: {arguments}"
+    );
+}
