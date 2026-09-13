@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::plan::{
-    Evidence, PlanStep, StepStatus, TaskPhase, TaskPlan, status_from_evidence,
+    Evidence, PlanStep, StepOutcome, StepStatus, TaskPhase, TaskPlan, status_from_evidence,
 };
 use workspace_engine::{SessionStore, Task};
 
@@ -862,4 +862,201 @@ fn a_step_whose_patch_landed_reports_the_editing_phase() {
         .unwrap()
         .expect("the plan is still there");
     assert_eq!(updated.phase(false), TaskPhase::Editing);
+}
+
+// ---------------------------------------------------------------------------
+// The completion report. Proposal §5.6.
+//
+// The rule these hold is that the summary never overstates. A blocked step and
+// an unverified one are different kinds of "not confirmed", and collapsing
+// either into "complete" is the failure requirement 6 exists to prevent.
+// ---------------------------------------------------------------------------
+
+fn reported(plan: &TaskPlan) -> Vec<StepOutcome> {
+    plan.report()
+        .steps
+        .iter()
+        .map(|step| step.outcome)
+        .collect()
+}
+
+#[test]
+fn each_step_reports_one_of_the_four_outcomes() {
+    let mut plan = TaskPlan::new("task_1", 0);
+    let mut verified = step("step_1", StepStatus::Completed);
+    verified.evidence.push(command_exit(Some(0)));
+    plan.steps.push(verified);
+    plan.steps.push(step("step_2", StepStatus::Completed));
+    plan.steps.push(step("step_3", StepStatus::Blocked));
+    plan.steps.push(step("step_4", StepStatus::Skipped));
+
+    assert_eq!(
+        reported(&plan),
+        vec![
+            StepOutcome::Verified,
+            StepOutcome::Unverified,
+            StepOutcome::Blocked,
+            StepOutcome::Skipped,
+        ]
+    );
+}
+
+#[test]
+fn a_step_still_running_is_not_reported_as_an_outcome() {
+    // A turn can end with a step open — a token stop, a stop button, a plan
+    // held for review. Reporting it beside the finished ones would say the
+    // work reached an outcome it has not reached.
+    let mut plan = TaskPlan::new("task_1", 0);
+    plan.steps.push(step("step_1", StepStatus::Completed));
+    plan.steps.push(step("step_2", StepStatus::InProgress));
+    plan.steps.push(step("step_3", StepStatus::Pending));
+
+    let report = plan.report();
+    assert_eq!(report.steps.len(), 3);
+    assert_eq!(report.steps[1].outcome, StepOutcome::Outstanding);
+    assert_eq!(report.outstanding, 2);
+    assert!(
+        !report.is_complete,
+        "a plan with work still open is not complete"
+    );
+    assert!(
+        !report.summary().to_lowercase().contains("complete"),
+        "the summary said complete while two steps were still open: {}",
+        report.summary()
+    );
+}
+
+#[test]
+fn a_plan_with_a_blocked_step_is_never_summarised_as_complete() {
+    // The line the spec names by hand. Every other step passing does not make
+    // the plan complete, and a summary that said so would be the single most
+    // misleading thing the panel could print.
+    let mut plan = TaskPlan::new("task_1", 0);
+    let mut verified = step("step_1", StepStatus::Completed);
+    verified.evidence.push(command_exit(Some(0)));
+    plan.steps.push(verified);
+    plan.steps.push(step("step_2", StepStatus::Blocked));
+
+    let report = plan.report();
+    assert!(!report.is_complete);
+    assert_eq!(report.blocked, 1);
+    assert!(
+        !report.summary().to_lowercase().contains("complete"),
+        "the summary said complete for a plan with a blocked step: {}",
+        report.summary()
+    );
+}
+
+#[test]
+fn a_plan_whose_steps_all_carry_evidence_is_complete() {
+    let mut plan = TaskPlan::new("task_1", 0);
+    for id in ["step_1", "step_2"] {
+        let mut done = step(id, StepStatus::Completed);
+        done.evidence.push(command_exit(Some(0)));
+        plan.steps.push(done);
+    }
+
+    let report = plan.report();
+    assert!(report.is_complete);
+    assert_eq!(report.verified, 2);
+    assert_eq!(report.unverified, 0);
+    assert!(report.summary().contains("2 steps complete"));
+}
+
+#[test]
+fn an_unverified_step_is_still_complete_but_the_summary_says_so() {
+    // §5.3's last row, carried into the report: a step with nothing observable
+    // behind it did finish, and the honest thing is to say it finished without
+    // confirmation rather than either hiding the gap or calling it a failure.
+    let mut plan = TaskPlan::new("task_1", 0);
+    let mut verified = step("step_1", StepStatus::Completed);
+    verified.evidence.push(command_exit(Some(0)));
+    plan.steps.push(verified);
+    plan.steps.push(step("step_2", StepStatus::Completed));
+
+    let report = plan.report();
+    assert!(report.is_complete);
+    assert_eq!(report.unverified, 1);
+    assert!(
+        report.summary().contains("1 unverified"),
+        "an unverified step must be visible in the summary: {}",
+        report.summary()
+    );
+}
+
+#[test]
+fn a_plan_with_no_steps_reports_nothing_rather_than_success() {
+    // A zero-step plan and a finished one are different facts. Counting "all
+    // zero steps complete" as success is the vacuous-truth bug that would make
+    // an empty plan the best-looking outcome in the report.
+    let plan = TaskPlan::new("task_1", 0);
+    let report = plan.report();
+
+    assert!(!report.is_complete);
+    assert_eq!(report.summary(), "No steps planned.");
+}
+
+#[test]
+fn the_session_reader_agrees_with_the_per_task_reader() {
+    // `read_session_plans` exists only to avoid re-reading the log once per
+    // task. The moment it disagrees with `read_task_plan` about any plan it
+    // has stopped being an optimisation and become a second implementation.
+    let fixture = Fixture::new("session-plans");
+    let first = fixture.task("add retry handling");
+    let second = fixture.task("rewrite the parser");
+
+    let mut plan_one = TaskPlan::new(&first.id, 0);
+    plan_one.steps.push(step("step_1", StepStatus::InProgress));
+    plan_one.steps.push(step("step_2", StepStatus::Pending));
+    fixture.store.create_plan(&first, &plan_one).unwrap();
+
+    let mut plan_two = TaskPlan::new(&second.id, 0);
+    plan_two.steps.push(step("step_1", StepStatus::Pending));
+    fixture.store.create_plan(&second, &plan_two).unwrap();
+
+    // An update to the first plan, and one naming a step nothing has.
+    let mut closed = step("step_1", StepStatus::Completed);
+    closed.evidence.push(command_exit(Some(0)));
+    fixture.store.update_plan_step(&first, &closed).unwrap();
+    fixture
+        .store
+        .update_plan_step(&first, &step("step_99", StepStatus::Completed))
+        .unwrap();
+
+    let all = fixture
+        .store
+        .read_session_plans(&fixture.session_id)
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    for task in [&first, &second] {
+        assert_eq!(
+            all.get(&task.id),
+            fixture
+                .store
+                .read_task_plan(&fixture.session_id, &task.id)
+                .unwrap()
+                .as_ref(),
+            "the two readers disagree about {}",
+            task.id
+        );
+    }
+    assert_eq!(all[&first.id].steps[0].status, StepStatus::Completed);
+    assert_eq!(
+        all[&first.id].steps.len(),
+        2,
+        "the unknown step was ignored"
+    );
+}
+
+#[test]
+fn a_session_with_no_plans_reads_as_empty_rather_than_failing() {
+    let fixture = Fixture::new("session-plans-empty");
+    fixture.task("what does this do?");
+    assert!(
+        fixture
+            .store
+            .read_session_plans(&fixture.session_id)
+            .unwrap()
+            .is_empty()
+    );
 }

@@ -78,7 +78,7 @@ Every task's requirements implicitly include this section.
 | 9. Ceiling enforcement in the loop | **done** | A weak assertion here survived the mutation — see the note below |
 | 10. Plan carry-over on resume | **done** | Unblocks 4b's patch evidence and 6's `Editing` phase — see the note below |
 | 11. Plan review gate | **done** | "Mutating" is not decidable from the action alone — see the note below |
-| 12. Plan panel and completion report | not started | **Must also label a token stop** (Task 7) **and render the plan proposal** (Task 11) — see both notes |
+| 12. Plan panel and completion report | **done** | Closed Task 7's and Task 11's debts; found a pre-existing duplicate-stop-row bug — see the note below |
 | 13. Harness coverage and documentation | not started | |
 
 ## File Structure
@@ -1997,6 +1997,80 @@ or you will be looking at the previous build. Kill by PID, never by name.
 that gets missed after an `app.js` edit.
 
 Proposed message: `Show the plan, its steps, and what confirms each one`
+
+#### What this task actually did
+
+**The completion report lives in `plan.rs`, not in the UI.** `PlanReport`,
+`StepOutcome` and `PlanReport::summary` are pure and tested without a browser.
+Writing the summary in `app.js` would have put the sentence "this plan is
+complete" in a different place from the rule that decides whether it is — and
+those two drift.
+
+`StepOutcome` has five variants, not the four §5.6 names. The fifth,
+`Outstanding`, is not an outcome: a turn can end with a step still open (a
+token stop, the stop button, a plan held for review), and reporting that step
+beside the finished ones claims it reached somewhere it has not. Four
+mutations, four tests: an empty plan counting as complete, a blocked step not
+stopping completion, an outstanding step not stopping completion, and
+`Unverified` collapsing into `Verified` each fail exactly one.
+
+**The panel is sent whole, every time.** `TurnProgress::Plan(TaskPlan)` carries
+the entire plan rather than a delta. A client that missed one delta — a
+reconnect, a dropped frame — would render a plan that never existed, and the
+plan is small enough that there is nothing to save by being clever. The panel
+rebuilds in place on each event for the same reason: there is no accumulated
+state a missed event could corrupt.
+
+`violatesSingleInProgress` crosses the wire rather than being re-derived in the
+frontend, and the panel prints a warning when it is set. A panel that silently
+rendered the first of two in-progress steps would conceal the exact invariant
+requirement 2 exists to catch.
+
+**Task 11's debt is closed.** `planProposal` on the turn result, a
+`/api/resume-plan-stream` route, and a review card in `appendProposals` — the
+shared site, so a plan proposed after a command approval is not dropped the way
+a patch once was. The card offers reorder, retitle, delete and approve; steps
+that already ran are shown but have no controls, because the engine refuses to
+delete one and offering the control would offer something that does not work.
+Whether a decision counts as a revision is decided by comparing against what
+was proposed, not by whether the user touched a control: a reorder and a
+reorder back is not a revision, and recording one would put a `plan_revised`
+event in the log describing no change.
+
+**Task 7's debt is closed**, and the fix was not the three-line one. A token
+stop now has its own row with no button — continuing means raising
+`agent_max_task_tokens` first, and a one-click button beside the number that
+stopped the spending is the wrong shape of control. The three call sites became
+one `markMessageTurnStop`, which is what let the next finding surface.
+
+**A defect found by testing the reload, pre-existing and not mine.** A turn
+that dispatched tools writes one assistant message per tool before its answer,
+and `renderMessages` marked *every* one of them — so a tool-budget stop already
+rendered a duplicate "Tool budget exhausted" row under each. The per-message
+dedupe guard inside the helper could not catch it: each row was the first under
+its own message. Whatever a turn appends after its answer now hangs off the
+turn's last assistant message, which fixes the token row, the tool row, and the
+plan panel's anchor at once. Verified in the running app: two assistant
+messages, one stop row.
+
+**A gap closed rather than documented.** The panel was live-turn-only, like
+`appendContextDisclosure`'s context files — but the completion report is the
+part a user reopens a session *for*, and losing it on reload would have made
+the report ceremony. `/api/session` now carries each turn's plan.
+`SessionStore::read_session_plans` folds every plan in one pass: calling
+`read_task_plan` per task would read the whole log once per task, quadratic in
+exactly the sessions that are already the longest. It is tested by agreeing
+with `read_task_plan` on every plan — the moment it disagrees it has stopped
+being an optimisation and become a second implementation.
+
+Absent, not empty, throughout: a task with no plan carries no `plan` field, so
+a trivial turn stays panel-free (§5.1).
+
+**Verified in the running app** at 1280×800 against a rebuilt binary on an
+isolated data dir and port (static assets are `include_str!`-embedded), driving
+the real `app.js`: the panel, the confirmed/unverified/blocked/skipped tones,
+the evidence disclosures, the violation warning, the review card's editable and
+settled rows, the token-stop row, and the reload join.
 
 ---
 

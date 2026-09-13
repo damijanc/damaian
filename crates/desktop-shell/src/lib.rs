@@ -8,14 +8,15 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult, Config,
-    CurlModelTransport, DataSchemaOutcome, GeneratedSecretWarning, McpClient, McpServerConfig,
-    McpTokenResolver, McpTransport, OpenAICompatibleAdapter, ProposedFilePatch,
-    ResumeDecisionOptions, Session, TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink,
-    WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticReport, WebDiagnosticsRunner,
-    WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible, command_approval_prompt,
-    ensure_data_dir_schema, normalize_mcp_server_id, normalize_model_provider,
-    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    AgentPlanProposal, CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions,
+    ChatTurnResult, Config, CurlModelTransport, DataSchemaOutcome, GeneratedSecretWarning,
+    McpClient, McpServerConfig, McpTokenResolver, McpTransport, OpenAICompatibleAdapter,
+    PlanRevisionStep, ProposedFilePatch, ResumeDecisionOptions, Session, StepStatus, TaskPlan,
+    TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind,
+    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
+    allow_always_eligible, command_approval_prompt, ensure_data_dir_schema,
+    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
+    parse_hunk_selection, parse_mcp_transport, patch_diff_text,
 };
 
 mod keychain;
@@ -467,6 +468,15 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .session_store
                 .read_task_usage(&session_id)
                 .map_err(|error| error.to_string())?;
+            // The plan each turn worked through, joined by the same `taskId`
+            // (spec 21 §5.6). Without this the panel — and with it the
+            // completion report — would live only for the turn that produced
+            // it, so reopening a session would lose the record of what a plan
+            // came to, which is the part a user comes back for.
+            let task_plans = engine
+                .session_store
+                .read_session_plans(&session_id)
+                .map_err(|error| error.to_string())?;
             write_response(
                 stream,
                 &request,
@@ -476,7 +486,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                     "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}]}}",
                     session_json(&session),
                     messages_json(&messages),
-                    task_states_json(&task_statuses, &task_usage, &engine.config)
+                    task_states_json(&task_statuses, &task_usage, &task_plans, &engine.config)
                 ),
             )
         }
@@ -614,6 +624,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         }
         ("POST", "/api/ask-stream") => handle_ask_stream(stream, &request),
         ("POST", "/api/resume-command-stream") => handle_resume_command_stream(stream, &request),
+        ("POST", "/api/resume-plan-stream") => handle_resume_plan_stream(stream, &request),
         ("POST", "/api/ask") => {
             let form = parse_form(&request.body);
             // The non-streaming fallback: there is no stream for a client to
@@ -1106,6 +1117,14 @@ fn handle_resume_command_stream(stream: &mut TcpStream, request: &Request) -> Re
     })
 }
 
+fn handle_resume_plan_stream(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    write_event_stream_headers(stream, request)?;
+    stream_turn(stream, move |cancel, events| {
+        run_resume_plan_request(&form, cancel, events)
+    })
+}
+
 /// Encode raw pty bytes for transport across the IPC boundary as UTF-8-safe
 /// text. Shared with the desktop app's terminal commands.
 pub fn base64_encode(input: &[u8]) -> String {
@@ -1193,12 +1212,87 @@ fn run_resume_command_request(
         .map_err(|error| error.to_string())
 }
 
+/// Continues a turn paused for plan review (spec 21 §5.5).
+///
+/// The revision arrives as `steps`: a JSON array of `{id, title}` in the order
+/// the user wants them to run. Absent means "approved as proposed" — which is
+/// not the same as an empty array, and the difference matters: an empty array
+/// is a revision that deletes every step the engine would let it delete.
+fn run_resume_plan_request(
+    form: &HashMap<String, String>,
+    cancel: &CancelToken,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
+) -> Result<ChatTurnResult, String> {
+    let repo = required_form(form, "repo")?;
+    let proposal_id = required_form(form, "proposal_id")?;
+    let approved = form.get("approved").map(String::as_str) == Some("true");
+    let revised = match form.get("steps").filter(|value| !value.is_empty()) {
+        Some(raw) => Some(parse_plan_revision(raw)?),
+        None => None,
+    };
+    let mut engine = engine_for_repo(&repo)?;
+    configure_chat_integrations(&mut engine);
+
+    let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
+    let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
+    let mut adapter = OpenAICompatibleAdapter::with_provider(
+        &engine.config.model_provider,
+        &engine.config.model_name,
+        transport,
+    );
+    let mut on_token = |token: &str| {
+        let _ = events.send(TurnEvent::Token(token.to_string()));
+    };
+    let mut on_progress = |progress: TurnProgress| {
+        let _ = events.send(turn_progress_event(progress));
+    };
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel,
+    };
+    engine
+        .chat_orchestrator
+        .resume_after_plan_decision(
+            &proposal_id,
+            approved,
+            revised,
+            "desktop_user",
+            &mut adapter,
+            &mut sink,
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn parse_plan_revision(raw: &str) -> Result<Vec<PlanRevisionStep>, String> {
+    let parsed: Vec<serde_json::Value> =
+        serde_json::from_str(raw).map_err(|error| format!("Invalid plan revision: {error}"))?;
+    parsed
+        .into_iter()
+        .map(|entry| {
+            let id = entry
+                .get("id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "Each revised step needs an id".to_string())?;
+            let title = entry
+                .get("title")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "Each revised step needs a title".to_string())?;
+            Ok(PlanRevisionStep {
+                id: id.to_string(),
+                title: title.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// A send failure only means the relay has gone, and the cancel token is what
 /// stops the turn in that case, so the result is deliberately discarded.
 fn turn_progress_event(progress: TurnProgress) -> TurnEvent {
     match progress {
         TurnProgress::Session(session_id) => TurnEvent::Session(session_id),
         TurnProgress::Phase(phase) => TurnEvent::Phase(phase),
+        TurnProgress::Plan(plan) => TurnEvent::Plan(Box::new(plan)),
     }
 }
 
@@ -2550,6 +2644,10 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 enum TurnEvent {
     Session(String),
     Phase(TurnPhase),
+    /// Boxed because a `TaskPlan` is much larger than the other variants, and
+    /// an unboxed one would make every `TurnEvent` — one per streamed token —
+    /// carry its footprint.
+    Plan(Box<TaskPlan>),
     Token(String),
     Done(Box<ChatTurnResult>),
     Failed(String),
@@ -2562,6 +2660,77 @@ fn phase_json(phase: &TurnPhase) -> String {
         escape_json(&phase.label),
         phase.round,
         phase.max_rounds
+    )
+}
+
+/// The plan as the panel needs it: the steps as the engine holds them, plus
+/// the two things the engine has already decided and the frontend must not
+/// decide again — each step's outcome and the plan's own summary line.
+///
+/// `violatesSingleInProgress` is sent rather than left for the panel to work
+/// out, because a panel that silently rendered the first of two in-progress
+/// steps would conceal exactly the invariant requirement 2 exists to catch.
+fn plan_json(plan: &TaskPlan) -> String {
+    let report = plan.report();
+    let steps = plan
+        .steps
+        .iter()
+        .zip(report.steps.iter())
+        .map(|(step, reported)| {
+            format!(
+                "{{\"id\":\"{}\",\"title\":\"{}\",\"detail\":{},\"status\":\"{}\",\"outcome\":\"{}\",\"evidence\":{}}}",
+                escape_json(&step.id),
+                escape_json(&step.title),
+                step.detail
+                    .as_ref()
+                    .map(|detail| format!("\"{}\"", escape_json(detail)))
+                    .unwrap_or_else(|| "null".to_string()),
+                serde_status(step.status),
+                reported.outcome.as_str(),
+                serde_json::to_string(&step.evidence).unwrap_or_else(|_| "[]".to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"taskId\":\"{}\",\"steps\":[{}],\"summary\":\"{}\",\"isComplete\":{},\"verified\":{},\"unverified\":{},\"blocked\":{},\"skipped\":{},\"outstanding\":{},\"violatesSingleInProgress\":{}}}",
+        escape_json(&plan.task_id),
+        steps,
+        escape_json(&report.summary()),
+        report.is_complete,
+        report.verified,
+        report.unverified,
+        report.blocked,
+        report.skipped,
+        report.outstanding,
+        plan.violates_single_in_progress()
+    )
+}
+
+/// The wire spelling of a step status — the same `snake_case` serde writes into
+/// the session log, so the panel and a hand-read log agree.
+fn serde_status(status: StepStatus) -> &'static str {
+    match status {
+        StepStatus::Pending => "pending",
+        StepStatus::InProgress => "in_progress",
+        StepStatus::Completed => "completed",
+        StepStatus::Blocked => "blocked",
+        StepStatus::Skipped => "skipped",
+    }
+}
+
+/// A plan stopped for review (spec 21 §5.5). Shaped like `plan_json` plus the
+/// proposal id and what the approval unblocks, so the review card and the live
+/// panel render from the same fields.
+fn plan_proposal_json(proposal: Option<&AgentPlanProposal>) -> String {
+    let Some(proposal) = proposal else {
+        return "null".to_string();
+    };
+    format!(
+        "{{\"proposalId\":\"{}\",\"deferredAction\":\"{}\",\"plan\":{}}}",
+        escape_json(&proposal.id),
+        escape_json(&proposal.deferred_action),
+        plan_json(&proposal.plan)
     )
 }
 
@@ -2592,6 +2761,7 @@ fn relay_turn_events<W: Write>(
                         TurnEvent::Phase(phase) => {
                             write_sse_event(out, "phase", &phase_json(phase))
                         }
+                        TurnEvent::Plan(plan) => write_sse_event(out, "plan", &plan_json(plan)),
                         TurnEvent::Token(token) => write_sse_event(
                             out,
                             "token",
@@ -2663,7 +2833,7 @@ where
 
 fn chat_result_json(result: &ChatTurnResult) -> String {
     format!(
-        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"usage\":{}}}",
+        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"usage\":{}}}",
         escape_json(&result.response),
         json_string_array(&result.context_files),
         escape_json(&result.session.id),
@@ -2674,6 +2844,7 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         result.cancelled,
         command_proposal_json(result),
         patch_proposal_json(result),
+        plan_proposal_json(result.plan_proposal.as_ref()),
         task_usage_json(result.usage.as_ref(), result.estimated_cost)
     )
 }
@@ -2788,6 +2959,7 @@ fn session_json(session: &Session) -> String {
 fn task_states_json(
     statuses: &HashMap<String, String>,
     usage: &HashMap<String, TaskUsage>,
+    plans: &HashMap<String, TaskPlan>,
     config: &Config,
 ) -> String {
     let mut entries: Vec<&String> = statuses.keys().collect();
@@ -2811,11 +2983,19 @@ fn task_states_json(
                 }
                 None => String::new(),
             };
+            // Absent rather than an empty plan when the turn had none: a
+            // trivial turn and a plan that proposed nothing are different
+            // facts, and the panel must not appear for the first.
+            let plan_json_field = match plans.get(*id) {
+                Some(plan) => format!(",\"plan\":{}", plan_json(plan)),
+                None => String::new(),
+            };
             format!(
-                "{{\"id\":\"{}\",\"status\":\"{}\"{}}}",
+                "{{\"id\":\"{}\",\"status\":\"{}\"{}{}}}",
                 escape_json(id),
                 escape_json(&statuses[*id]),
-                usage_json
+                usage_json,
+                plan_json_field
             )
         })
         .collect::<Vec<_>>()
@@ -3008,7 +3188,7 @@ mod tests {
         desktop_settings_config_path, effective_policy_for_repo, engine_for_repo,
         forget_model_api_key, generated_secret_warnings_json, handle_connection, index_html,
         json_optional_string, keychain, mcp_browser_arguments, parse_form, parse_path_list,
-        percent_decode, relay_turn_events, remember_model_api_key,
+        percent_decode, plan_json, plan_proposal_json, relay_turn_events, remember_model_api_key,
         render_markdown_with_optional_file_links, repository_config_review_json, require_api_token,
         run_server, run_terminal_command, save_config_file, task_states_json,
         terminal_cwd_for_repo, validate_context_files, validate_working_folder,
@@ -3023,7 +3203,8 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use workspace_engine::CheckpointRestoreResult;
     use workspace_engine::{
-        CancelToken, Config, GeneratedSecretWarning, TaskUsage, UsageSource, WorkspaceEngine,
+        AgentPlanProposal, CancelToken, Config, Evidence, GeneratedSecretWarning, PlanStep,
+        StepStatus, TaskPlan, TaskUsage, UsageSource, WorkspaceEngine,
     };
 
     /// Points every engine built in this test binary at a throwaway data
@@ -3100,6 +3281,119 @@ mod tests {
         assert!(text.contains(": keepalive"), "got {text:?}");
         assert!(text.contains("\"token\":\"hi\""), "got {text:?}");
         assert!(!cancel.is_cancelled());
+    }
+
+    /// A plan mid-turn: one step confirmed by a command, one still running.
+    fn sample_plan() -> TaskPlan {
+        let mut plan = TaskPlan::new("task_1", 7);
+        plan.steps.push(PlanStep {
+            id: "step_1".to_string(),
+            title: "Read the retry helper".to_string(),
+            detail: None,
+            status: StepStatus::Completed,
+            depends_on: Vec::new(),
+            started_at_ms: Some(7),
+            completed_at_ms: Some(8),
+            evidence: vec![Evidence::CommandExit {
+                marker_id: "action_1".to_string(),
+                exit_code: Some(0),
+            }],
+        });
+        plan.steps.push(PlanStep {
+            id: "step_2".to_string(),
+            title: "Add a bounded backoff".to_string(),
+            detail: None,
+            status: StepStatus::InProgress,
+            depends_on: Vec::new(),
+            started_at_ms: Some(8),
+            completed_at_ms: None,
+            evidence: Vec::new(),
+        });
+        plan
+    }
+
+    #[test]
+    fn the_plan_event_carries_each_step_with_its_status_and_evidence() {
+        // The panel has to distinguish a step confirmed by something Damaian
+        // watched from one merely claimed, so the evidence has to cross the
+        // wire — a status alone cannot tell the two apart (§5.3, §5.6).
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancel = CancelToken::new();
+        std::thread::spawn(move || {
+            let _ = sender.send(TurnEvent::Plan(Box::new(sample_plan())));
+        });
+
+        let mut out = FlakyWriter {
+            written: Vec::new(),
+            writes_before_failure: usize::MAX,
+        };
+        relay_turn_events(&mut out, &cancel, receiver, Duration::from_millis(25)).expect("relay");
+
+        let text = String::from_utf8_lossy(&out.written);
+        assert!(text.contains("event: plan"), "got {text:?}");
+        assert!(text.contains("\"title\":\"Read the retry helper\""));
+        assert!(text.contains("\"status\":\"completed\""));
+        assert!(text.contains("\"status\":\"in_progress\""));
+        assert!(
+            text.contains("\"kind\":\"commandExit\""),
+            "the evidence must reach the panel, not just the status: {text:?}"
+        );
+        // And the outcome the report will print, so the panel does not have to
+        // re-derive "completed with nothing behind it" for itself.
+        assert!(text.contains("\"outcome\":\"verified\""), "got {text:?}");
+        assert!(text.contains("\"outcome\":\"outstanding\""), "got {text:?}");
+    }
+
+    #[test]
+    fn a_plan_with_two_steps_in_progress_says_so_rather_than_picking_one() {
+        // Requirement 2 is an invariant, and a panel that quietly rendered the
+        // first of two in-progress steps would hide exactly the bug the
+        // invariant exists to catch.
+        let mut plan = sample_plan();
+        plan.steps[0].status = StepStatus::InProgress;
+        assert!(plan.violates_single_in_progress());
+
+        let json = plan_json(&plan);
+        assert!(
+            json.contains("\"violatesSingleInProgress\":true"),
+            "got {json}"
+        );
+
+        let json = plan_json(&sample_plan());
+        assert!(json.contains("\"violatesSingleInProgress\":false"));
+    }
+
+    #[test]
+    fn a_blocked_plan_is_never_summarised_as_complete_over_the_wire() {
+        let mut plan = sample_plan();
+        plan.steps[1].status = StepStatus::Blocked;
+
+        let json = plan_json(&plan);
+        assert!(json.contains("\"isComplete\":false"), "got {json}");
+        assert!(
+            !json.to_lowercase().contains("\"summary\":\"complete"),
+            "got {json}"
+        );
+        assert!(json.contains("\"outcome\":\"blocked\""));
+    }
+
+    #[test]
+    fn the_chat_result_carries_a_plan_put_up_for_review() {
+        // Task 11's gate stops the turn with a `plan_proposal`; without this
+        // field the frontend has no way to know it happened, and the turn
+        // reads as an ordinary answer that mysteriously did nothing.
+        let json = plan_proposal_json(Some(&AgentPlanProposal {
+            id: "planreview_1".to_string(),
+            plan: sample_plan(),
+            deferred_action: "Preparing a patch".to_string(),
+        }));
+        assert!(
+            json.contains("\"proposalId\":\"planreview_1\""),
+            "got {json}"
+        );
+        assert!(json.contains("\"deferredAction\":\"Preparing a patch\""));
+        assert!(json.contains("\"title\":\"Add a bounded backoff\""));
+        assert_eq!(plan_proposal_json(None), "null");
     }
 
     #[test]
@@ -4131,7 +4425,7 @@ mod tests {
             },
         )]);
 
-        let json = task_states_json(&statuses, &usage, &Config::default());
+        let json = task_states_json(&statuses, &usage, &HashMap::new(), &Config::default());
 
         assert!(json.contains("\"inputTokens\":1200"), "{json}");
         assert!(json.contains("\"outputTokens\":340"), "{json}");
@@ -4150,10 +4444,50 @@ mod tests {
         // indistinguishable from a real measurement of nothing.
         let statuses = HashMap::from([("task_1".to_string(), "complete".to_string())]);
 
-        let json = task_states_json(&statuses, &HashMap::new(), &Config::default());
+        let json = task_states_json(
+            &statuses,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Config::default(),
+        );
 
         assert!(json.contains("\"id\":\"task_1\""), "{json}");
         assert!(!json.contains("inputTokens"), "{json}");
+    }
+
+    #[test]
+    fn a_reopened_session_still_carries_each_turns_plan() {
+        // The completion report is the part a user comes back for, and it
+        // would be the one thing a reload lost if the plan travelled only on
+        // the live turn's SSE channel.
+        let statuses = HashMap::from([("task_1".to_string(), "complete".to_string())]);
+        let plans = HashMap::from([("task_1".to_string(), sample_plan())]);
+
+        let json = task_states_json(&statuses, &HashMap::new(), &plans, &Config::default());
+
+        assert!(json.contains("\"plan\":{"), "{json}");
+        assert!(
+            json.contains("\"title\":\"Read the retry helper\""),
+            "{json}"
+        );
+        assert!(json.contains("\"outcome\":\"verified\""), "{json}");
+    }
+
+    #[test]
+    fn a_turn_that_never_planned_carries_no_plan_field() {
+        // Absent, not an empty plan: a trivial turn and a plan that proposed
+        // nothing are different facts, and the panel must not appear for the
+        // first (§5.1).
+        let statuses = HashMap::from([("task_1".to_string(), "complete".to_string())]);
+
+        let json = task_states_json(
+            &statuses,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Config::default(),
+        );
+
+        assert!(!json.contains("\"plan\""), "{json}");
     }
 
     // The list view needs the counts and the coverage flag, and must not grow

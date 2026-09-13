@@ -3111,6 +3111,156 @@ code.command-approval-command {
   margin-left: 0;
 }
 
+/* A token stop has no button — continuing means editing a config value first —
+   so the remedy is a quiet line of prose where the action would be. */
+.turn-indicator-hint {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* The plan panel. Spec 21 §5.6. Sits under the answer, not inside the bubble:
+   it describes the turn rather than being part of what the model said. */
+.plan-panel {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  margin: 8px 0 0;
+  padding: 10px 12px;
+}
+
+.plan-panel-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.plan-panel-summary {
+  color: var(--warn);
+  font-size: 11px;
+}
+
+/* Only a plan that actually completed gets the settled colour. Everything else
+   — blocked, still running, nothing planned — stays in the warning tone, so
+   the panel cannot look finished while it is not. */
+.plan-panel-summary[data-complete="true"] {
+  color: var(--ok);
+}
+
+.plan-panel-warning {
+  margin: 0;
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.plan-step-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+}
+
+.plan-step {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: baseline;
+  gap: 4px 10px;
+  color: var(--ink);
+}
+
+.plan-step[data-outcome="skipped"],
+.plan-step[data-outcome="outstanding"] {
+  color: var(--muted);
+}
+
+.plan-step[data-status="in_progress"] {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.plan-step-outcome {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* "Completed, unverified" and "blocked" are the two the user most needs to
+   catch, so neither is allowed to read as quiet chrome. */
+.plan-step[data-outcome="unverified"] .plan-step-outcome {
+  color: var(--warn);
+}
+
+.plan-step[data-outcome="blocked"] .plan-step-outcome {
+  color: var(--danger);
+}
+
+.plan-step[data-outcome="verified"] .plan-step-outcome {
+  color: var(--ok);
+}
+
+.plan-step-evidence {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 2px;
+  margin: 2px 0 0;
+  padding-left: 16px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.plan-step-evidence[hidden] {
+  display: none;
+}
+
+/* The review card's editable rows. Spec 21 §5.5. */
+.plan-review-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.plan-review-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+}
+
+.plan-review-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* A step that already ran is shown but not editable: the engine refuses to
+   delete one, so offering the control would offer something that does not
+   work. */
+.plan-review-row[data-settled="true"] {
+  color: var(--muted);
+}
+
+.plan-review-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 12px;
+  padding: 3px 7px;
+}
+
 @keyframes turn-indicator-pulse {
   0%,
   100% {

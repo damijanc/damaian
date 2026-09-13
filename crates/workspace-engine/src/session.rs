@@ -1075,6 +1075,56 @@ impl SessionStore {
         Ok(plan)
     }
 
+    /// Every task's plan in the session, in one pass.
+    ///
+    /// [`Self::read_task_plan`] answers for one task and re-reads the log to do
+    /// it, which is right for a turn that only has its own plan in hand. A
+    /// session view needs all of them, and calling the single-task reader once
+    /// per task would read the whole log once per task — quadratic in exactly
+    /// the sessions that are already the longest.
+    pub fn read_session_plans(
+        &self,
+        session_id: &str,
+    ) -> Result<HashMap<String, crate::plan::TaskPlan>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(HashMap::new());
+        };
+        let mut plans: HashMap<String, crate::plan::TaskPlan> = HashMap::new();
+        for event in active_events(&content) {
+            match event.event_type.as_str() {
+                "plan_created" | "plan_revised" | "plan_resumed" => {
+                    if let Ok(created) =
+                        serde_json::from_value::<crate::plan::TaskPlan>(event.payload.clone())
+                    {
+                        plans.insert(created.task_id.clone(), created);
+                    }
+                }
+                "plan_step_updated" => {
+                    let Some(task_id) = event.text("taskId") else {
+                        continue;
+                    };
+                    let Some(current) = plans.get_mut(&task_id) else {
+                        continue;
+                    };
+                    let Some(updated) = event.payload.get("step").cloned().and_then(|value| {
+                        serde_json::from_value::<crate::plan::PlanStep>(value).ok()
+                    }) else {
+                        continue;
+                    };
+                    // Same rule as the single-task reader: an update may not
+                    // introduce a step the plan does not have.
+                    if let Some(existing) =
+                        current.steps.iter_mut().find(|step| step.id == updated.id)
+                    {
+                        *existing = updated;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(plans)
+    }
+
     /// Records that the user reviewed this task's plan and let the work go
     /// ahead. Spec 21 §5.5.
     ///

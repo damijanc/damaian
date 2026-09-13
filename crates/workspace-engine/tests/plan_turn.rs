@@ -61,6 +61,33 @@ fn ask(
         .expect("the turn should run")
 }
 
+/// [`ask`], keeping every plan the turn reported as it went.
+fn ask_watching_plans(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    prompt: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> (ChatTurnResult, Vec<TaskPlan>) {
+    let cancel = CancelToken::new();
+    let mut seen: Vec<TaskPlan> = Vec::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |event: TurnProgress| {
+        if let TurnProgress::Plan(plan) = event {
+            seen.push(plan);
+        }
+    };
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+    };
+    let result = engine
+        .chat_orchestrator
+        .ask_with_session(repo, prompt, &[], None, adapter, &mut sink)
+        .expect("the turn should run");
+    (result, seen)
+}
+
 fn call(name: &str, arguments_json: &str) -> ToolCall {
     ToolCall {
         id: format!("call_{name}"),
@@ -581,4 +608,111 @@ fn replay(log: &str, task_id: &str) -> Option<TaskPlan> {
         }
     }
     plan
+}
+
+// ---------------------------------------------------------------------------
+// The panel's side channel. Proposal §5.6.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_turn_reports_the_plan_as_it_advances() {
+    // The panel is driven by `TurnProgress::Plan`, and without these emissions
+    // it would stay empty for the whole turn and then appear complete — the
+    // one shape of progress reporting worse than none.
+    let repo = temp_repo("progress");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"List the source"},{"title":"Report"}]}"#,
+        )],
+        vec![call(
+            "run_command",
+            r#"{"command":"ls src","reason":"List"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+    ]);
+
+    let (result, reported) = ask_watching_plans(&engine, &repo, "What is in src?", &mut adapter);
+
+    // Once when the plan is created, once when the step hands off.
+    assert_eq!(
+        reported.len(),
+        2,
+        "expected a report on creation and on the handoff, got {reported:?}"
+    );
+    assert_eq!(reported[0].steps[0].status, StepStatus::InProgress);
+    assert!(
+        reported[0].steps[0].evidence.is_empty(),
+        "nothing has been observed yet when the plan is first shown"
+    );
+    assert_eq!(reported[1].steps[0].status, StepStatus::Completed);
+    assert_eq!(
+        reported[1].steps[1].status,
+        StepStatus::InProgress,
+        "the handoff is reported once, after both writes — never with no step running"
+    );
+    // And every report matches what the log would replay.
+    assert_eq!(
+        reported.last(),
+        plan_of(&engine, &result).as_ref(),
+        "the panel and the log must not disagree about the same plan"
+    );
+}
+
+#[test]
+fn a_turn_that_arrives_with_a_plan_reports_it_before_doing_anything() {
+    // A resumed turn — after a token stop, or after the user approved the plan
+    // — already has one in hand. Without this the panel stays empty until the
+    // first `complete_step`, which is the longest stretch of the turn.
+    let repo = temp_repo("progress-resumed");
+    let engine = engine_for(&repo);
+    let mut first = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"List the source"},{"title":"Report"}]}"#,
+        )],
+        vec![patch_call("src/retry.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut first);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+
+    let cancel = CancelToken::new();
+    let mut seen: Vec<TaskPlan> = Vec::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |event: TurnProgress| {
+        if let TurnProgress::Plan(plan) = event {
+            seen.push(plan);
+        }
+    };
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+    };
+    let mut after = scripted(vec![vec![patch_call("src/retry.rs")]]);
+    engine
+        .chat_orchestrator
+        .resume_after_plan_decision(&proposal.id, true, None, "tester", &mut after, &mut sink)
+        .expect("the resumed turn should run");
+
+    assert!(
+        !seen.is_empty(),
+        "a resumed turn must show its plan before it starts working"
+    );
+    assert_eq!(seen[0].steps.len(), 2);
+    assert_eq!(seen[0].steps[0].title, "List the source");
+}
+
+#[test]
+fn a_turn_without_a_plan_reports_none() {
+    // The panel appears only when there is a plan. A turn that answered a
+    // question must not emit an empty one for the frontend to render (§5.1).
+    let repo = temp_repo("progress-trivial");
+    let engine = engine_for(&repo);
+    let mut adapter = MockModelAdapter::new("It defines main.");
+
+    let (_, reported) = ask_watching_plans(&engine, &repo, "What does src/a.rs do?", &mut adapter);
+
+    assert!(reported.is_empty(), "got {reported:?}");
 }

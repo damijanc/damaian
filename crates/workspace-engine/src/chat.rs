@@ -151,6 +151,14 @@ pub enum TurnProgress {
     /// stops before the turn finishes can still identify what it stopped.
     Session(String),
     Phase(TurnPhase),
+    /// The turn's plan, whole, each time it changes (spec 21 §5.6).
+    ///
+    /// Sent whole rather than as a delta because the panel's job is to show
+    /// the current state of every step at once, and a client that missed one
+    /// delta — a reconnect, a dropped frame — would then render a plan that
+    /// never existed. The plan is small and changes a handful of times per
+    /// turn, so there is nothing to save by being clever here.
+    Plan(TaskPlan),
 }
 
 /// The per-turn side channel: where answer tokens go, where progress goes, and
@@ -175,6 +183,10 @@ impl TurnSink<'_> {
         (self.on_progress)(TurnProgress::Phase(TurnPhase::new(
             kind, label, round, max_rounds,
         )));
+    }
+
+    fn plan(&mut self, plan: &TaskPlan) {
+        (self.on_progress)(TurnProgress::Plan(plan.clone()));
     }
 }
 
@@ -1222,6 +1234,13 @@ impl ChatOrchestrator {
             .read_task_plan(&session.id, &task.id)
             .unwrap_or_default();
         let mut step_evidence: Vec<crate::plan::Evidence> = Vec::new();
+        // A turn that arrives with a plan already in hand — resumed after a
+        // token stop, or after the user approved or revised it — shows it
+        // before doing any work. Without this the panel would stay empty until
+        // the first `complete_step`, which is the longest stretch of the turn.
+        if let Some(current) = plan.as_ref() {
+            sink.plan(current);
+        }
         // Read from the log for the same reason the plan is: the approval is a
         // decision the user took, and a turn resumed after a restart must not
         // ask for it again. It is only ever read here — the gate below is the
@@ -1812,6 +1831,7 @@ impl ChatOrchestrator {
                             });
                         }
                         self.session_store.create_plan(&task, &proposed)?;
+                        sink.plan(&proposed);
                         let summary = format!("Planned {} steps.", proposed.steps.len());
                         let first = proposed.steps[0].title.clone();
                         plan = Some(proposed);
@@ -1878,6 +1898,13 @@ impl ChatOrchestrator {
                             let started = next.clone();
                             self.session_store.update_plan_step(&task, &started)?;
                         }
+                        // Once, after the handoff rather than after each of its
+                        // two writes: between them the closing step is already
+                        // terminal and the next has not opened, so a panel
+                        // updated mid-handoff would blink through a state with
+                        // no current step. The log keeps both writes; the panel
+                        // does not need them.
+                        sink.plan(current);
 
                         let result = match (status, &next_title) {
                             (crate::plan::StepStatus::Blocked, _) => format!(

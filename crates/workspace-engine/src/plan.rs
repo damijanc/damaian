@@ -263,4 +263,154 @@ impl TaskPlan {
             Some(Evidence::FileRead { .. }) | None => TaskPhase::Understanding,
         }
     }
+
+    /// What to tell the user this plan came to (§5.6).
+    pub fn report(&self) -> PlanReport {
+        let steps: Vec<ReportedStep> = self
+            .steps
+            .iter()
+            .map(|step| ReportedStep {
+                id: step.id.clone(),
+                title: step.title.clone(),
+                outcome: StepOutcome::of(step),
+            })
+            .collect();
+        let count =
+            |wanted: StepOutcome| steps.iter().filter(|step| step.outcome == wanted).count();
+        let verified = count(StepOutcome::Verified);
+        let unverified = count(StepOutcome::Unverified);
+        let blocked = count(StepOutcome::Blocked);
+        let skipped = count(StepOutcome::Skipped);
+        let outstanding = count(StepOutcome::Outstanding);
+        PlanReport {
+            // A plan with no steps is not complete. "All zero steps finished"
+            // is true and useless: it would make an empty plan the
+            // best-looking outcome in the report.
+            is_complete: !steps.is_empty() && blocked == 0 && outstanding == 0,
+            verified,
+            unverified,
+            blocked,
+            skipped,
+            outstanding,
+            steps,
+        }
+    }
+}
+
+/// What became of one step, as the completion report puts it.
+///
+/// Four terminal outcomes plus `Outstanding`, which is not an outcome at all
+/// but the absence of one — a turn can end with a step still open (a token
+/// stop, the stop button, a plan held for review), and reporting that step
+/// beside the finished ones would claim it reached somewhere it has not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepOutcome {
+    /// Completed, with evidence behind it.
+    Verified,
+    /// Completed, with nothing observable behind it. Said out loud rather than
+    /// folded into `Verified`: requirement 6's whole point is that "the model
+    /// said it was done" is not confirmation.
+    Unverified,
+    Blocked,
+    Skipped,
+    /// Still pending or in progress when the turn ended.
+    Outstanding,
+}
+
+impl StepOutcome {
+    pub fn of(step: &PlanStep) -> Self {
+        match step.status {
+            StepStatus::Completed if step.evidence.is_empty() => Self::Unverified,
+            StepStatus::Completed => Self::Verified,
+            StepStatus::Blocked => Self::Blocked,
+            StepStatus::Skipped => Self::Skipped,
+            StepStatus::Pending | StepStatus::InProgress => Self::Outstanding,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Unverified => "unverified",
+            Self::Blocked => "blocked",
+            Self::Skipped => "skipped",
+            Self::Outstanding => "outstanding",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportedStep {
+    pub id: String,
+    pub title: String,
+    pub outcome: StepOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanReport {
+    pub steps: Vec<ReportedStep>,
+    pub is_complete: bool,
+    pub verified: usize,
+    pub unverified: usize,
+    pub blocked: usize,
+    pub skipped: usize,
+    pub outstanding: usize,
+}
+
+impl PlanReport {
+    /// One line for the top of the panel.
+    ///
+    /// Written here rather than in the UI so there is one place that decides
+    /// what a plan "came to" — a second wording in the frontend is how the
+    /// panel and the report start disagreeing about the same plan.
+    ///
+    /// The word "complete" appears only when
+    /// [`Self::is_complete`] holds. An unverified step does not withhold it —
+    /// the step did finish — but the count is always named, because a plan
+    /// reported as complete with three unverified steps and one reported as
+    /// complete with none are different results.
+    pub fn summary(&self) -> String {
+        if self.steps.is_empty() {
+            return "No steps planned.".to_string();
+        }
+        let mut parts = Vec::new();
+        if self.is_complete {
+            parts.push(format!(
+                "{} complete",
+                pluralise(self.verified + self.unverified, "step")
+            ));
+        } else {
+            if self.blocked > 0 {
+                parts.push(format!("{} blocked", pluralise(self.blocked, "step")));
+            }
+            if self.outstanding > 0 {
+                parts.push(format!(
+                    "{} outstanding",
+                    pluralise(self.outstanding, "step")
+                ));
+            }
+            let finished = self.verified + self.unverified;
+            if finished > 0 {
+                parts.push(format!("{finished} finished"));
+            }
+        }
+        if self.unverified > 0 {
+            parts.push(format!("{} unverified", self.unverified));
+        }
+        if self.skipped > 0 {
+            parts.push(format!("{} skipped", self.skipped));
+        }
+        format!("{}.", parts.join(", "))
+    }
+}
+
+fn pluralise(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("{count} {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
 }

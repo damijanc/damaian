@@ -3187,6 +3187,25 @@ function renderMessages(messages, tasks = []) {
   const toolBudgetExhaustedTasks = new Set(
     tasks.filter((task) => task.status === "tool_budget_exhausted").map((task) => task.id),
   );
+  const tokenBudgetExhaustedTasks = new Set(
+    tasks.filter((task) => task.status === "token_budget_exhausted").map((task) => task.id),
+  );
+  // A task with no plan carries no `plan` field at all, which is how a trivial
+  // turn stays panel-free rather than showing an empty plan.
+  const planByTask = new Map(tasks.filter((task) => task.plan).map((task) => [task.id, task.plan]));
+  // Whatever a turn appends *after* its answer — a stop row, the plan panel —
+  // belongs to the turn, not to each of its messages. A turn that dispatched
+  // tools wrote one assistant message per tool before its answer, and marking
+  // every one of them put a duplicate "Tool budget exhausted" row under each.
+  // The per-message guard inside those helpers could not catch it: each row
+  // was the first under its own message.
+  const lastAssistantByTask = new Map();
+  messages.forEach((message) => {
+    if (message.role === "assistant" && message.taskId) {
+      lastAssistantByTask.set(message.taskId, message.id);
+    }
+  });
+  const endsTheTurn = (message) => lastAssistantByTask.get(message.taskId) === message.id;
   // A task with no usage events carries no token fields at all, which is how
   // a session written before token accounting stays silent instead of
   // claiming a free turn.
@@ -3201,10 +3220,17 @@ function renderMessages(messages, tasks = []) {
     }
     if (message.role === "assistant") {
       void finalizeChatMessage(bubble, message.content);
-      if (message.taskId && cancelledTasks.has(message.taskId)) {
-        markMessageStopped(bubble);
-      } else if (message.taskId && toolBudgetExhaustedTasks.has(message.taskId)) {
-        markMessageToolBudgetExhausted(bubble, message.sessionId);
+      if (message.taskId && endsTheTurn(message)) {
+        if (cancelledTasks.has(message.taskId)) {
+          markMessageStopped(bubble);
+        } else if (toolBudgetExhaustedTasks.has(message.taskId)) {
+          markMessageToolBudgetExhausted(bubble, message.sessionId);
+        } else if (tokenBudgetExhaustedTasks.has(message.taskId)) {
+          markMessageTokenBudgetExhausted(bubble);
+        }
+        if (planByTask.has(message.taskId)) {
+          renderPlanPanel(bubble, planByTask.get(message.taskId));
+        }
       }
       if (message.taskId) markMessageUsage(bubble, usageByTask.get(message.taskId));
     }
@@ -3912,9 +3938,45 @@ function markMessageToolBudgetExhausted(target, sessionId = currentSessionId) {
   target.body.after(row);
 }
 
+// A turn stopped at its token ceiling (spec 21 §5.4). Deliberately not folded
+// into the tool-budget row: one means the work needed more rounds, the other
+// that it needed more money, and the remedies are different. There is no
+// "continue" button here on purpose — continuing means raising
+// `agent_max_task_tokens` first, and a one-click button beside the number that
+// stopped the spending would be the wrong shape of control.
+function markMessageTokenBudgetExhausted(target) {
+  if (target.body.nextElementSibling?.dataset?.state === "incomplete") return;
+  const row = document.createElement("div");
+  row.className = "turn-indicator";
+  row.dataset.state = "incomplete";
+  const label = document.createElement("span");
+  label.className = "turn-indicator-label";
+  label.textContent = "Token budget exhausted";
+  const hint = document.createElement("span");
+  hint.className = "turn-indicator-hint";
+  hint.textContent = "Raise agent_max_task_tokens to go further.";
+  row.append(label, hint);
+  target.body.after(row);
+}
+
+// The one place that turns a stopped turn's status into a row under the
+// answer. Both stops used to be handled at each call site, which is how a
+// token stop rendered as an ordinary completed turn everywhere except the one
+// site that knew about it.
+function markMessageTurnStop(target, payload, sessionId = currentSessionId) {
+  if (payload.taskStatus === "tool_budget_exhausted") {
+    markMessageToolBudgetExhausted(target, payload.sessionId || sessionId);
+  } else if (payload.taskStatus === "token_budget_exhausted") {
+    markMessageTokenBudgetExhausted(target);
+  }
+}
+
 function chatCompletionStatus(payload) {
   if (payload.taskStatus === "tool_budget_exhausted") {
     return { label: "Tool budget exhausted", tone: "warn", indicator: "incomplete" };
+  }
+  if (payload.taskStatus === "token_budget_exhausted") {
+    return { label: "Token budget exhausted", tone: "warn", indicator: "incomplete" };
   }
   if (payload.incomplete) {
     return { label: "Incomplete", tone: "warn", indicator: "incomplete" };
@@ -3953,6 +4015,126 @@ function appendContextDisclosure(body, files) {
 
   const label = files.length === 1 ? "Read 1 file" : `Read ${files.length} files`;
   body.append(createDisclosure(label, panel), panel);
+}
+
+// The plan panel, per docs/specs/21_task_plan_progress_and_budget §5.6.
+//
+// One panel per assistant message, replaced in place as `plan` events arrive.
+// The engine sends the whole plan each time rather than a delta, so a rebuild
+// is the correct update: there is no accumulated state here that a missed
+// event could corrupt.
+const STEP_OUTCOME_LABELS = {
+  verified: "confirmed",
+  // Said out loud rather than shown as a plain tick. Requirement 6's whole
+  // point is that "the model said it was done" is not confirmation, and a
+  // panel that rendered the two identically would undo the distinction the
+  // engine works to preserve.
+  unverified: "completed, unverified",
+  blocked: "blocked",
+  skipped: "skipped",
+  outstanding: "",
+};
+
+function renderPlanPanel(message, plan) {
+  if (!plan || !Array.isArray(plan.steps) || !plan.steps.length) return;
+
+  const panel = document.createElement("section");
+  panel.className = "plan-panel";
+  panel.dataset.planPanel = "true";
+
+  const header = document.createElement("div");
+  header.className = "plan-panel-header";
+  const title = document.createElement("strong");
+  title.textContent = "Plan";
+  const summary = document.createElement("span");
+  summary.className = "plan-panel-summary";
+  summary.dataset.complete = plan.isComplete ? "true" : "false";
+  summary.textContent = plan.summary || "";
+  header.append(title, summary);
+  panel.append(header);
+
+  // Requirement 2 says one step runs at a time. If the log ever says otherwise
+  // the panel says so too: rendering the first of two in-progress steps and
+  // moving on would hide the exact bug the invariant exists to catch.
+  if (plan.violatesSingleInProgress) {
+    const warning = document.createElement("p");
+    warning.className = "plan-panel-warning";
+    warning.textContent =
+      "More than one step is marked in progress. That should not happen — the plan below is shown as recorded.";
+    panel.append(warning);
+  }
+
+  const list = document.createElement("ol");
+  list.className = "plan-step-list";
+  plan.steps.forEach((step) => {
+    const item = document.createElement("li");
+    item.className = "plan-step";
+    item.dataset.status = step.status || "pending";
+    item.dataset.outcome = step.outcome || "outstanding";
+
+    const label = document.createElement("span");
+    label.className = "plan-step-title";
+    label.textContent = step.title || "";
+    item.append(label);
+
+    const outcome = STEP_OUTCOME_LABELS[step.outcome] || "";
+    if (outcome) {
+      const note = document.createElement("span");
+      note.className = "plan-step-outcome";
+      note.textContent = outcome;
+      item.append(note);
+    }
+    if (step.status === "in_progress") {
+      const running = document.createElement("span");
+      running.className = "plan-step-outcome";
+      running.textContent = "running";
+      item.append(running);
+    }
+
+    const evidence = Array.isArray(step.evidence) ? step.evidence : [];
+    if (evidence.length) {
+      const detail = document.createElement("ul");
+      detail.className = "plan-step-evidence";
+      evidence.forEach((entry) => {
+        const line = document.createElement("li");
+        line.textContent = describeEvidence(entry);
+        detail.append(line);
+      });
+      item.append(createDisclosure(`What confirms this (${evidence.length})`, detail), detail);
+    }
+    list.append(item);
+  });
+  panel.append(list);
+
+  const existing = message.body.parentElement?.querySelector('[data-plan-panel="true"]');
+  if (existing) {
+    existing.replaceWith(panel);
+  } else {
+    message.body.after(panel);
+  }
+}
+
+// Evidence in the user's words. The engine's `Evidence` is a tagged union and
+// this is the only place that maps it to prose, so a variant added later shows
+// up as "recorded" rather than as `[object Object]`.
+function describeEvidence(entry) {
+  if (!entry || typeof entry !== "object") return "recorded";
+  if (entry.kind === "commandExit") {
+    return entry.exitCode === 0
+      ? "a command ran and exited 0"
+      : entry.exitCode === null || entry.exitCode === undefined
+        ? "a command ran but reported no exit code"
+        : `a command ran and exited ${entry.exitCode}`;
+  }
+  if (entry.kind === "patchApplied") {
+    const files = Array.isArray(entry.files) ? entry.files : [];
+    const names = files.map((file) => file.path).join(", ");
+    return files.length ? `a patch was applied to ${names}` : "a patch was applied";
+  }
+  if (entry.kind === "fileRead") {
+    return `${entry.path} was read`;
+  }
+  return "recorded";
 }
 
 function renderProjectList() {
@@ -4343,6 +4525,215 @@ function appendProposals(message, payload, repo) {
   if (payload.patchProposal) {
     message.body.append(createPatchPreview(payload.patchProposal, repo));
   }
+  if (payload.planProposal) {
+    message.body.append(createPlanReview(payload.planProposal, repo));
+  }
+}
+
+// The plan review gate, per spec 21 §5.5: the turn has stopped before its
+// first mutating step and the user may reorder, retitle, delete or approve.
+//
+// Steps that already reached an outcome are shown but not editable — their
+// evidence is tied to a state of the repository, and the engine refuses to
+// delete one, so offering the control would be offering something that does
+// not work.
+function createPlanReview(proposal, proposalRepo) {
+  const plan = proposal.plan || { steps: [] };
+  const editable = (plan.steps || []).filter((step) => step.outcome === "outstanding");
+  const settled = (plan.steps || []).filter((step) => step.outcome !== "outstanding");
+  let steps = editable.map((step) => ({ id: step.id, title: step.title }));
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "command-approval";
+
+  const header = document.createElement("div");
+  header.className = "command-approval-header";
+  const title = document.createElement("strong");
+  title.textContent = "Review the plan";
+  const meta = document.createElement("span");
+  meta.className = "command-approval-risk";
+  meta.textContent = proposal.deferredAction || "review";
+  meta.dataset.blocked = "false";
+  header.append(title, meta);
+
+  const note = document.createElement("p");
+  note.className = "plan-review-note";
+  note.textContent = settled.length
+    ? `Nothing has changed yet. ${settled.length === 1 ? "One step has" : `${settled.length} steps have`} already finished and cannot be removed.`
+    : "Nothing has changed yet. Adjust the steps or approve them as they stand.";
+
+  const list = document.createElement("ol");
+  list.className = "plan-review-list";
+
+  function renderRows() {
+    list.innerHTML = "";
+    settled.forEach((step) => {
+      const row = document.createElement("li");
+      row.className = "plan-review-row";
+      row.dataset.settled = "true";
+      const text = document.createElement("span");
+      text.className = "plan-step-title";
+      text.textContent = step.title;
+      const outcome = document.createElement("span");
+      outcome.className = "plan-step-outcome";
+      outcome.textContent = STEP_OUTCOME_LABELS[step.outcome] || "";
+      row.append(text, outcome);
+      list.append(row);
+    });
+    steps.forEach((step, index) => {
+      const row = document.createElement("li");
+      row.className = "plan-review-row";
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "plan-review-title";
+      input.value = step.title;
+      input.setAttribute("aria-label", `Step ${index + 1} title`);
+      input.addEventListener("input", () => {
+        steps[index].title = input.value;
+      });
+      const up = document.createElement("button");
+      up.type = "button";
+      up.className = "btn-icon";
+      up.title = "Move up";
+      up.setAttribute("aria-label", `Move step ${index + 1} up`);
+      up.textContent = "↑";
+      up.disabled = index === 0;
+      up.addEventListener("click", () => {
+        [steps[index - 1], steps[index]] = [steps[index], steps[index - 1]];
+        renderRows();
+      });
+      const down = document.createElement("button");
+      down.type = "button";
+      down.className = "btn-icon";
+      down.title = "Move down";
+      down.setAttribute("aria-label", `Move step ${index + 1} down`);
+      down.textContent = "↓";
+      down.disabled = index === steps.length - 1;
+      down.addEventListener("click", () => {
+        [steps[index], steps[index + 1]] = [steps[index + 1], steps[index]];
+        renderRows();
+      });
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn-icon";
+      remove.title = "Remove this step";
+      remove.setAttribute("aria-label", `Remove step ${index + 1}`);
+      remove.textContent = "×";
+      remove.addEventListener("click", () => {
+        steps = steps.filter((_, position) => position !== index);
+        renderRows();
+      });
+      row.append(input, up, down, remove);
+      list.append(row);
+    });
+  }
+  renderRows();
+
+  const actions = document.createElement("div");
+  actions.className = "command-approval-actions";
+  const approveButton = document.createElement("button");
+  approveButton.type = "button";
+  approveButton.className = "btn-sm btn-primary";
+  approveButton.textContent = "Approve";
+  const declineButton = document.createElement("button");
+  declineButton.type = "button";
+  declineButton.className = "btn-sm btn-quiet";
+  declineButton.textContent = "Decline";
+  actions.append(approveButton, declineButton);
+
+  const output = document.createElement("pre");
+  output.className = "command-approval-output";
+  output.hidden = true;
+
+  // Whether this counts as a revision is decided by comparing against what was
+  // proposed, not by whether the user touched a control: a reorder followed by
+  // a reorder back is not a revision, and recording one would put a
+  // `plan_revised` event in the log describing no change.
+  function revisionOrNull() {
+    const same =
+      steps.length === editable.length &&
+      steps.every(
+        (step, index) => step.id === editable[index].id && step.title === editable[index].title,
+      );
+    return same ? null : steps;
+  }
+
+  async function decide(approved) {
+    approveButton.disabled = true;
+    declineButton.disabled = true;
+    list.querySelectorAll("input, button").forEach((control) => {
+      control.disabled = true;
+    });
+    output.hidden = false;
+    output.textContent = approved ? "Continuing…" : "Declining…";
+
+    const revision = approved ? revisionOrNull() : null;
+    const assistantMessage = appendChatMessage("assistant", "");
+    let assistantText = "";
+    let streamError = null;
+    await streamResumePlanRequest(
+      {
+        repo: proposalRepo,
+        proposal_id: proposal.proposalId,
+        approved: approved ? "true" : "false",
+        steps: revision ? JSON.stringify(revision) : "",
+      },
+      {
+        plan(planPayload) {
+          renderPlanPanel(assistantMessage, planPayload);
+        },
+        token(token) {
+          assistantText += token;
+          updateChatMessage(assistantMessage, assistantText);
+          setChatStatus("Streaming", "running");
+        },
+        done(payload) {
+          if (payload.response && payload.response !== assistantText) {
+            assistantText = payload.response;
+            updateChatMessage(assistantMessage, assistantText);
+          }
+          appendProposals(assistantMessage, payload, proposalRepo);
+          if (payload.sessionId) {
+            currentSessionId = payload.sessionId;
+            localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+          }
+          appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+          markMessageUsage(assistantMessage, payload.usage);
+          markMessageTurnStop(assistantMessage, payload);
+          const status = chatCompletionStatus(payload);
+          setChatStatus(status.label, status.tone);
+        },
+        error(payload) {
+          streamError = new Error(payload.error || "Plan decision failed");
+        },
+      },
+    );
+    if (streamError) throw streamError;
+    output.textContent = approved
+      ? revision
+        ? "Plan revised and approved — see the assistant's answer above."
+        : "Plan approved — see the assistant's answer above."
+      : "Plan declined — see the assistant's answer above.";
+    await loadSessions(currentSessionId, false);
+  }
+
+  approveButton.addEventListener("click", async () => {
+    try {
+      await decide(true);
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+  declineButton.addEventListener("click", async () => {
+    try {
+      await decide(false);
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+
+  wrapper.append(header, note, list, actions, output);
+  return wrapper;
 }
 
 // `onResolved` is called once no file is left pending, for a patch reattached
@@ -4839,6 +5230,9 @@ function createCommandApprovalPreview(
         allow_browser_diagnostics_for_session: allowBrowserDiagnosticsForSession ? "true" : "false",
       },
       {
+        plan(planPayload) {
+          renderPlanPanel(assistantMessage, planPayload);
+        },
         token(token) {
           assistantText += token;
           updateChatMessage(assistantMessage, assistantText);
@@ -4856,6 +5250,7 @@ function createCommandApprovalPreview(
           }
           appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
           markMessageUsage(assistantMessage, payload.usage);
+          markMessageTurnStop(assistantMessage, payload);
           const status = chatCompletionStatus(payload);
           setChatStatus(status.label, status.tone);
         },
@@ -4990,6 +5385,13 @@ async function streamResumeCommandRequest(data, handlers) {
   return streamRequest("/api/resume-command-stream", fallbackPath, data, handlers);
 }
 
+// No non-streaming fallback: resuming a plan decision *is* a turn, and there is
+// no one-shot endpoint that could stand in for one. `streamRequest` raises
+// rather than posting the decision somewhere that would not carry it.
+async function streamResumePlanRequest(data, handlers) {
+  return streamRequest("/api/resume-plan-stream", null, data, handlers);
+}
+
 async function streamRequest(streamPath, fallbackPath, data, handlers, signal) {
   const options = withApiToken(streamPath, form(data));
   // Aborting closes the socket, which is what the server notices on its next
@@ -5000,6 +5402,9 @@ async function streamRequest(streamPath, fallbackPath, data, handlers, signal) {
     throw new Error(await response.text());
   }
   if (!response.body) {
+    if (!fallbackPath) {
+      throw new Error("This request needs a streaming response and the browser gave none.");
+    }
     const payload = await api(fallbackPath, form(data));
     handlers.done(payload);
     return;
@@ -5039,6 +5444,7 @@ function processSseEvent(raw, handlers) {
   if (event === "token") handlers.token(payload.token || "");
   if (event === "session" && handlers.session) handlers.session(payload.sessionId || "");
   if (event === "phase" && handlers.phase) handlers.phase(payload);
+  if (event === "plan" && handlers.plan) handlers.plan(payload);
   if (event === "done") handlers.done(payload);
   if (event === "error") handlers.error(payload);
 }
@@ -5284,6 +5690,9 @@ async function sendChatPrompt(options = {}) {
         phase(payload) {
           if (indicator) indicator.phase(payload);
         },
+        plan(payload) {
+          renderPlanPanel(assistantMessage, payload);
+        },
         token(token) {
           assistantText += token;
           updateChatMessage(assistantMessage, assistantText);
@@ -5310,9 +5719,7 @@ async function sendChatPrompt(options = {}) {
           }
           const status = chatCompletionStatus(payload);
           if (indicator) indicator.finish(status.indicator);
-          if (payload.taskStatus === "tool_budget_exhausted") {
-            markMessageToolBudgetExhausted(assistantMessage, payload.sessionId);
-          }
+          markMessageTurnStop(assistantMessage, payload);
           setChatStatus(status.label, status.tone);
         },
         error(payload) {
