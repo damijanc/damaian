@@ -94,6 +94,49 @@ pub struct PlanStep {
     pub evidence: Vec<Evidence>,
 }
 
+impl PlanStep {
+    /// Completed with nothing observable behind it — requirement 6's second
+    /// sentence, and what the completion report prints as "completed
+    /// unverified".
+    ///
+    /// A `Blocked` step is deliberately **not** unverified. It is not completed
+    /// at all, and reporting it as completed-unverified would turn a failure
+    /// into a soft pass, which is precisely the laundering §5.3 forbids.
+    pub fn is_unverified(&self) -> bool {
+        self.status == StepStatus::Completed && self.evidence.is_empty()
+    }
+}
+
+/// Requirement 6's rule, mechanically.
+///
+/// The model does not appear in this function's inputs. That is the whole
+/// design: a step's status is derived from what Damaian observed, so there is
+/// no code path by which "the model said it was done" becomes `Completed`.
+///
+/// Empty evidence completes the step. A step like "understand the existing
+/// retry logic" genuinely has nothing observable behind it, and forcing a fake
+/// observation would be worse than admitting the gap —
+/// [`PlanStep::is_unverified`] is how the completion report admits it.
+pub fn status_from_evidence(evidence: &[Evidence]) -> StepStatus {
+    let blocked = evidence.iter().any(|item| match item {
+        // `Some(0)` and nothing else. `None` means the command was killed or
+        // signalled, so nothing is known — and "nothing is known" is not "it
+        // passed". Writing this as `matches!(code, Some(c) if *c != 0)` would
+        // let `None` fall through as success, which is the same defect as an
+        // `unwrap_or(0)` wearing different clothes.
+        Evidence::CommandExit { exit_code, .. } => *exit_code != Some(0),
+        // Neither has a failure mode to encode: a patch that did not apply
+        // returns an error and produces no evidence, and a file that could not
+        // be read produces none either.
+        Evidence::PatchApplied { .. } | Evidence::FileRead { .. } => false,
+    });
+    if blocked {
+        StepStatus::Blocked
+    } else {
+        StepStatus::Completed
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskPlan {

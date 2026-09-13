@@ -70,8 +70,8 @@ Every task's requirements implicitly include this section.
 | 2. `TaskPlan` and `PlanStep` types | **done** | `Evidence` is `#[non_exhaustive]`; see the note below |
 | 3. Plan persistence and replay | **done** | `revise_plan` landed here rather than in Task 11; see the note below |
 | 4. Evidence, minted at the call site | **done** | Construction only; attachment moved to 4b — see the note below |
-| **4b. The plan lifecycle in a turn** | **not started** | **Missing from the original plan.** Creates the plan and advances its steps |
-| 5. Step status is a function of evidence | not started | |
+| **4b. The plan lifecycle in a turn** | **done** | Two new tools; `PatchApplied` attachment blocked on Task 10 — see the note below |
+| 5. Step status is a function of evidence | **done** | Done before 4b, which depends on it |
 | 6. `TaskPhase`, derived | not started | |
 | 7. `TokenBudgetExhausted` status | not started | |
 | 8. `agent_max_task_tokens` config, restrict-only | not started | |
@@ -943,6 +943,77 @@ output claims completion while its command exited non-zero must leave the step
 
 Proposed message: `Give a non-trivial turn a plan and advance it as work lands`
 
+#### What this task actually did
+
+All seven gate commands pass; 24 test binaries, 7 tests in the new
+`tests/plan_turn.rs`. **Task 5 was done first**, since step 4 here depends on
+`status_from_evidence`.
+
+**The design decision §5.1 left open: who writes the plan.** §5.1 defines
+non-trivial as a turn that "will propose a patch, run a mutating command, or has
+more than one step in the model's own proposal". The first two are only knowable
+*after* the model's first response, and the third presumes the model can propose
+steps — which nothing let it do. A plan derived from the tool calls a turn
+happened to make would not be a plan at all: it is a log, it cannot exist before
+the work, and §5.5 requires the plan to be reviewable *before* any mutating step
+runs. So the model must author it.
+
+Two tools, and the split between them is requirement 6:
+
+- **`propose_plan { steps: [{title, detail?}] }`** — the model supplies titles
+  and nothing else. Status, timings and evidence are the engine's to write. A
+  proposal of fewer than two steps decodes to `None`, so §5.1's "a one-step plan
+  is ceremony" is enforced at the one place that decides rather than left to the
+  prompt.
+- **`complete_step {}`** — takes no arguments *by design*. The model asks to move
+  on; it does not say how the step ended. The engine calls
+  `status_from_evidence` on what accrued while the step was open. An `outcome`
+  argument here would have handed the model the exact field this spec exists to
+  keep out of its reach, and it would have looked perfectly reasonable in a
+  schema.
+
+Titles and details are redacted through `SecretScanner` before they are written:
+they are model-authored text rendered in the panel and stored in the log, so a
+secret echoed into one must not survive there.
+
+**A blocked step does not hand off.** When `status_from_evidence` returns
+`Blocked`, the next step stays `Pending` — its prerequisite failed, and opening
+it would build on work that did not happen. That is §4's "dependencies are
+recorded and used to block a step whose prerequisite failed", falling out of the
+status rule rather than needing a solver.
+
+**`no_point_in_the_log_ever_has_two_steps_in_progress` is the test to read.**
+Requirement 2 is about runs, and asserting it on the final plan would have been
+worthless: the handoff writes the closing step and the opening one as two
+separate appends, so a transient double is exactly the shape the bug takes and
+is invisible at the terminus. The test replays every log prefix instead.
+Mutation-checked by writing the two appends in the wrong order — it fails with
+`two steps in progress after 24 events`, while the **final** state stays
+correct. An end-state assertion would have passed.
+
+**One piece is genuinely blocked, and not by choice.** `Evidence::PatchApplied`
+cannot be attached yet. A patch is *proposed* in one turn — the chat loop breaks
+out to await review — and *applied* later through
+`edit.rs::apply_stored_patch`, after that turn has ended. The proposing turn's
+step is still open, but `step_evidence` is turn-local and gone, and the plan
+itself is keyed to a task that is over. Attaching it needs the cross-turn plan
+continuation from **Task 10**, which is the same mechanism resume needs for the
+same underlying reason: a task is one turn (`context.md` §3.1).
+
+Two consequences for Task 10 to honour:
+
+- `CompleteStep` currently does `open.evidence = evidence` (replace). Once
+  something else can append evidence to a persisted step, that must become an
+  extend, or the apply-path evidence will be silently dropped by the next
+  `complete_step`.
+- `PatchApplyResult::applied` (added in Task 4) has no consumer until then. It
+  is tested and correct; it is waiting.
+
+**A turn that never calls `complete_step` leaves its step `InProgress`.** That is
+honest — the work was not declared finished — but it means a completed task can
+hold an open step, and Task 6's phase derivation must not read that as
+"Complete". Noted there rather than papered over here.
+
 ---
 
 ### Task 5: Step status is a function of evidence
@@ -1068,6 +1139,30 @@ Change `*exit_code != Some(0)` to `matches!(exit_code, Some(code) if *code != 0)
 - [ ] **Step 6: Run the full gate, then ask before committing**
 
 Proposed message: `Decide a step's status from its evidence rather than a claim`
+
+#### What this task actually did
+
+Done **before** Task 4b, which depends on it — the plan's numbering had them the
+other way round.
+
+Mutation ran exactly as specified: `*exit_code != Some(0)` rewritten as
+`matches!(exit_code, Some(code) if *code != 0)` — the plausible version someone
+writes when "simplifying" — fails only `an_absent_exit_code_blocks_the_step`.
+
+Two tests beyond the plan's six:
+
+- `a_blocked_step_is_not_reported_as_unverified`. "Unverified" means completed
+  with nothing behind it; a blocked step is not completed at all. Without this,
+  `is_unverified` could have been written as `evidence.is_empty()` and a blocked
+  step with no evidence would have been reported as a soft pass — turning a
+  failure into a completion, which is the laundering §5.3 exists to forbid.
+- `a_patch_applied_completes_the_step`, so the non-`CommandExit` arms are pinned
+  rather than left to the `_ => false` reading.
+
+The match over `Evidence` is exhaustive in-crate even though the enum is
+`#[non_exhaustive]`, so `Findings` cannot be added later without someone
+deciding here whether it blocks a step. That is the deferral from
+`context.md` §3.6 doing work rather than merely postponing it.
 
 ---
 

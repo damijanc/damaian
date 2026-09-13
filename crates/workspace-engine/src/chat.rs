@@ -11,7 +11,7 @@ use crate::edit::{GeneratedEdit, PatchStore};
 use crate::error::{ClientError, Result};
 use crate::file_access::FileAccessController;
 use crate::git_service::{GitService, GitStatus};
-use crate::hash::create_id;
+use crate::hash::{create_id, now_millis};
 use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
 use crate::model::{
@@ -73,12 +73,6 @@ enum ActionOutcome {
 /// [`ActionOutcome::Failed`] likewise: it carries no code, so there is nothing
 /// to record that would not be invented, and the step's status follows from
 /// the *absence* of confirming evidence.
-// Unused until Task 4b attaches evidence to a step, because nothing in the turn
-// creates a plan yet. Landed here with its tests rather than alongside the
-// wiring: the rule about what does and does not count as evidence is the
-// substance of requirement 6, and it is worth pinning before the code that
-// consumes it exists to shape it.
-#[allow(dead_code)]
 fn evidence_for(outcome: &ActionOutcome, marker_id: &str) -> Option<crate::plan::Evidence> {
     match outcome {
         ActionOutcome::CommandExit(exit_code) => Some(crate::plan::Evidence::CommandExit {
@@ -935,6 +929,8 @@ impl ChatOrchestrator {
             let mut tools = vec![
                 run_command_tool_definition(),
                 propose_patch_tool_definition(),
+                propose_plan_tool_definition(),
+                complete_step_tool_definition(),
                 read_file_tool_definition(),
                 search_codebase_tool_definition(),
                 read_git_status_tool_definition(),
@@ -963,6 +959,17 @@ impl ChatOrchestrator {
         let mut web_debug_mode =
             turn_options.continue_debugging || prompt_enters_web_debug_mode(&task.user_prompt);
         let mut failed_browser_calls = HashMap::new();
+        // The turn's plan, once the model has proposed one, and the evidence
+        // accrued since the current step started.
+        //
+        // Held here rather than re-read from the log each round because the
+        // *accrual* has no home on disk until the step closes: evidence belongs
+        // to a step, and which step is open is a fact about this turn. The plan
+        // itself is written through as it changes, so a crash loses at most the
+        // evidence of the step that was still running — which is the step whose
+        // outcome was genuinely unknown.
+        let mut plan: Option<crate::plan::TaskPlan> = None;
+        let mut step_evidence: Vec<crate::plan::Evidence> = Vec::new();
 
         let (final_run, response, command_proposal, patch_proposal, tool_budget_exhausted) = loop {
             // Checked before each round rather than only mid-stream: stopping
@@ -1370,6 +1377,122 @@ impl ChatOrchestrator {
                         ),
                     }
                 }
+                ToolAction::ProposePlan(steps) => {
+                    if plan.is_some() {
+                        // Refused rather than replaced. Steps already carry
+                        // evidence tied to a state of the repository, and
+                        // rewriting the plan underneath that evidence produces
+                        // a history that no longer describes what happened —
+                        // the same reason §5.5 rules out mid-execution edits.
+                        (
+                            "Attempted to propose a second plan.".to_string(),
+                            "This turn already has a plan. Work through its remaining steps with complete_step, or stop and start a new turn if the plan is wrong.".to_string(),
+                            ActionOutcome::Failed,
+                        )
+                    } else {
+                        let now = now_millis();
+                        let mut proposed = crate::plan::TaskPlan::new(&task.id, now);
+                        for (index, step) in steps.iter().enumerate() {
+                            proposed.steps.push(crate::plan::PlanStep {
+                                id: format!("step_{}", index + 1),
+                                // Model-authored text, redacted like any other:
+                                // a title is rendered in the panel and written
+                                // to the log, so a secret echoed into one must
+                                // not survive there.
+                                title: self.scanner.redact(&step.title).text,
+                                detail: step
+                                    .detail
+                                    .as_ref()
+                                    .map(|detail| self.scanner.redact(detail).text),
+                                // The engine's to set, not the model's.
+                                status: if index == 0 {
+                                    crate::plan::StepStatus::InProgress
+                                } else {
+                                    crate::plan::StepStatus::Pending
+                                },
+                                depends_on: Vec::new(),
+                                started_at_ms: (index == 0).then_some(now),
+                                completed_at_ms: None,
+                                evidence: Vec::new(),
+                            });
+                        }
+                        self.session_store.create_plan(&task, &proposed)?;
+                        let summary = format!("Planned {} steps.", proposed.steps.len());
+                        let first = proposed.steps[0].title.clone();
+                        plan = Some(proposed);
+                        (
+                            summary,
+                            format!(
+                                "Plan recorded. The current step is: {first}. Call complete_step when its work is done."
+                            ),
+                            ActionOutcome::Ok,
+                        )
+                    }
+                }
+                ToolAction::CompleteStep => match plan.as_mut() {
+                    None => (
+                        "Attempted to complete a step.".to_string(),
+                        "There is no plan for this turn, so there is no step to complete."
+                            .to_string(),
+                        ActionOutcome::Failed,
+                    ),
+                    Some(current) => {
+                        // The model asked to move on; it does not get to say
+                        // how the step ended. §5.3: the status is a function
+                        // of the evidence, and this is the only place a step
+                        // reaches a terminal status.
+                        let evidence = std::mem::take(&mut step_evidence);
+                        let status = crate::plan::status_from_evidence(&evidence);
+                        let now = now_millis();
+                        let mut finished_title = String::new();
+                        if let Some(open) = current
+                            .steps
+                            .iter_mut()
+                            .find(|step| step.status == crate::plan::StepStatus::InProgress)
+                        {
+                            open.status = status;
+                            open.completed_at_ms = Some(now);
+                            open.evidence = evidence;
+                            finished_title = open.title.clone();
+                            let closed = open.clone();
+                            self.session_store.update_plan_step(&task, &closed)?;
+                        }
+
+                        // A blocked step does not hand off: the next step's
+                        // prerequisite failed, and starting it anyway would
+                        // build on work that did not happen.
+                        let mut next_title = None;
+                        if status == crate::plan::StepStatus::Completed
+                            && let Some(next) = current
+                                .steps
+                                .iter_mut()
+                                .find(|step| step.status == crate::plan::StepStatus::Pending)
+                        {
+                            next.status = crate::plan::StepStatus::InProgress;
+                            next.started_at_ms = Some(now);
+                            next_title = Some(next.title.clone());
+                            let started = next.clone();
+                            self.session_store.update_plan_step(&task, &started)?;
+                        }
+
+                        let result = match (status, &next_title) {
+                            (crate::plan::StepStatus::Blocked, _) => format!(
+                                "Step \"{finished_title}\" is blocked: a command it ran did not succeed. Fix that before moving on; the remaining steps are still pending."
+                            ),
+                            (_, Some(next)) => format!(
+                                "Step \"{finished_title}\" is complete. The current step is now: {next}."
+                            ),
+                            (_, None) => format!(
+                                "Step \"{finished_title}\" is complete. That was the last step."
+                            ),
+                        };
+                        (
+                            format!("Finished: {finished_title}"),
+                            result,
+                            ActionOutcome::Ok,
+                        )
+                    }
+                },
                 ToolAction::ReadFile(path) => {
                     let (content, outcome) = match self.file_access.read_file(
                         repository_root,
@@ -1611,6 +1734,15 @@ impl ChatOrchestrator {
                     (summary, content, outcome)
                 }
             };
+            // Accrued before the marker is consumed, since the marker id is
+            // what ties this evidence back to the action in the log. Evidence
+            // belongs to whichever step is open; with no plan there is nothing
+            // to attach it to and this is a no-op.
+            if plan.is_some()
+                && let Some(evidence) = evidence_for(&action_outcome, action_marker.id())
+            {
+                step_evidence.push(evidence);
+            }
             // One finish per dispatch, on the tool's own answer. A command goes
             // through `finish_command_action` so the outcome is derived from
             // the exit code rather than passed beside it — the two cannot then
@@ -1985,6 +2117,16 @@ struct CommandRequest {
     reason: String,
 }
 
+/// One step as the model proposed it. Only a title and an optional detail: the
+/// status, the timings and the evidence are the engine's to write, and letting
+/// the model supply them would hand it the very field requirement 6 exists to
+/// keep out of its reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProposedStep {
+    title: String,
+    detail: Option<String>,
+}
+
 /// What a matched tool call (native `tools`/`tool_calls`, or the
 /// `DAMAIAN_COMMAND_V1` text envelope for `Command`) asked the client to do.
 /// `run_agentic_turn` dispatches on this rather than on raw tool names so
@@ -1994,6 +2136,14 @@ struct CommandRequest {
 enum ToolAction {
     Command(CommandRequest),
     ProposePatch(GeneratedEdit),
+    /// The model's plan for this turn. §5.1: a turn is non-trivial when the
+    /// model proposes more than one step for it, so this call *is* the
+    /// triviality decision rather than a guess made before the turn starts.
+    ProposePlan(Vec<ProposedStep>),
+    /// The model asks to move on from the current step. It does not say how
+    /// the step ended — the engine derives that from the evidence accrued
+    /// while the step was in progress (§5.3).
+    CompleteStep,
     ReadFile(String),
     SearchCodebase {
         query: String,
@@ -2024,6 +2174,11 @@ fn tool_action_marker(action: &ToolAction) -> (&'static str, String, bool) {
     match action {
         ToolAction::Command(request) => ("run_command", request.command.clone(), true),
         ToolAction::ProposePatch(edit) => ("propose_patch", edit.summary.clone(), false),
+        // Both write only to the session log, which is append-only and
+        // idempotent to re-read, so a crash in either leaves nothing
+        // half-applied in the world.
+        ToolAction::ProposePlan(steps) => ("propose_plan", steps.len().to_string(), false),
+        ToolAction::CompleteStep => ("complete_step", String::new(), false),
         ToolAction::ReadFile(path) => ("read_file", path.clone(), false),
         ToolAction::SearchCodebase { query, .. } => ("search_codebase", query.clone(), false),
         ToolAction::ReadGitStatus => ("read_git_status", String::new(), false),
@@ -2047,6 +2202,8 @@ fn tool_action_label(action: &ToolAction) -> String {
     match action {
         ToolAction::Command(request) => format!("Proposing `{}`", request.command),
         ToolAction::ProposePatch(_) => "Preparing a patch".to_string(),
+        ToolAction::ProposePlan(steps) => format!("Planning {} steps", steps.len()),
+        ToolAction::CompleteStep => "Finishing a step".to_string(),
         ToolAction::ReadFile(path) => format!("Reading {path}"),
         ToolAction::SearchCodebase { query, .. } => format!("Searching for \"{query}\""),
         ToolAction::ReadGitStatus => "Reading git status".to_string(),
@@ -2093,6 +2250,22 @@ fn propose_patch_tool_definition() -> ToolDefinition {
         name: "propose_patch".to_string(),
         description: "Propose a code change as a reviewable patch. Nothing is written to disk until the user approves it.".to_string(),
         parameters_json: "{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"string\",\"description\":\"Short summary of the change\"},\"files\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Repository-relative file path\"},\"status\":{\"type\":\"string\",\"enum\":[\"added\",\"modified\",\"deleted\"],\"description\":\"Optional; inferred from whether the file currently exists if omitted\"},\"content\":{\"type\":\"string\",\"description\":\"Full replacement file content; use an empty string for deleted files\"}},\"required\":[\"path\",\"content\"]}}},\"required\":[\"summary\",\"files\"]}".to_string(),
+    }
+}
+
+fn propose_plan_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "propose_plan".to_string(),
+        description: "Propose an ordered plan for non-trivial work, before starting it. Use this when the task needs more than one step — a single question or a single file read needs no plan. Do not report a step's outcome here; call complete_step when a step's work is done and Damaian will record how it ended from what it observed.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"steps\":{\"type\":\"array\",\"minItems\":2,\"items\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"description\":\"Short imperative title for the step\"},\"detail\":{\"type\":\"string\",\"description\":\"Optional longer description\"}},\"required\":[\"title\"]}}},\"required\":[\"steps\"]}".to_string(),
+    }
+}
+
+fn complete_step_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "complete_step".to_string(),
+        description: "Move on from the current plan step. Damaian decides whether the step is completed or blocked from the commands and patches it observed while the step was running, so there is no outcome to supply here.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{},\"required\":[]}".to_string(),
     }
 }
 
@@ -2160,6 +2333,42 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
     match call.name.as_str() {
         "run_command" => Ok(command_request_from_tool_call(call).map(ToolAction::Command)),
         "propose_patch" => Ok(generated_edit_from_tool_call(call).map(ToolAction::ProposePatch)),
+        "propose_plan" => {
+            let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+            else {
+                return Ok(None);
+            };
+            let Some(entries) = arguments.get("steps").and_then(|value| value.as_array()) else {
+                return Ok(None);
+            };
+            let steps: Vec<ProposedStep> = entries
+                .iter()
+                .filter_map(|entry| {
+                    let title = entry
+                        .get("title")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())?;
+                    Some(ProposedStep {
+                        title: title.to_string(),
+                        detail: entry
+                            .get("detail")
+                            .and_then(|value| value.as_str())
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string),
+                    })
+                })
+                .collect();
+            // A plan of one step is not a plan (§5.1). Decoding it to `None`
+            // rather than accepting it keeps the ceremony out of trivial turns
+            // at the one place that decides.
+            if steps.len() < 2 {
+                return Ok(None);
+            }
+            Ok(Some(ToolAction::ProposePlan(steps)))
+        }
+        "complete_step" => Ok(Some(ToolAction::CompleteStep)),
         "read_file" => {
             let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
             else {

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use workspace_engine::plan::{Evidence, PlanStep, StepStatus, TaskPlan};
+use workspace_engine::plan::{Evidence, PlanStep, StepStatus, TaskPlan, status_from_evidence};
 use workspace_engine::{SessionStore, Task};
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -347,4 +347,103 @@ fn a_rewind_past_a_plan_takes_the_plan_with_it() {
             .is_none(),
         "a rewound plan must not survive as the task's current plan"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A step's status is a function of its evidence. Proposal §5.3.
+//
+// The model does not appear in any of these inputs, which is the point.
+// ---------------------------------------------------------------------------
+
+fn command_exit(exit_code: Option<i32>) -> Evidence {
+    Evidence::CommandExit {
+        marker_id: "action_1".to_string(),
+        exit_code,
+    }
+}
+
+fn completed_step() -> PlanStep {
+    let mut step = step("step_1", StepStatus::Completed);
+    step.completed_at_ms = Some(2);
+    step
+}
+
+#[test]
+fn a_clean_exit_completes_the_step() {
+    assert_eq!(
+        status_from_evidence(&[command_exit(Some(0))]),
+        StepStatus::Completed
+    );
+}
+
+#[test]
+fn a_non_zero_exit_blocks_the_step() {
+    assert_eq!(
+        status_from_evidence(&[command_exit(Some(1))]),
+        StepStatus::Blocked
+    );
+}
+
+#[test]
+fn an_absent_exit_code_blocks_the_step() {
+    // The `unwrap_or(0)` failure mode, asserted directly per §6. A killed or
+    // signalled command reported nothing, and nothing is not success.
+    assert_eq!(
+        status_from_evidence(&[command_exit(None)]),
+        StepStatus::Blocked
+    );
+}
+
+#[test]
+fn one_failure_among_successes_still_blocks() {
+    // A step is not done because most of its checks passed.
+    assert_eq!(
+        status_from_evidence(&[command_exit(Some(0)), command_exit(Some(1))]),
+        StepStatus::Blocked
+    );
+    assert_eq!(
+        status_from_evidence(&[command_exit(Some(1)), command_exit(Some(0))]),
+        StepStatus::Blocked
+    );
+}
+
+#[test]
+fn no_evidence_completes_the_step_but_marks_it_unverified() {
+    // Requirement 6's second sentence. A step like "understand the existing
+    // retry logic" genuinely has nothing observable behind it, and inventing a
+    // fake observation would be worse than admitting the gap.
+    assert_eq!(status_from_evidence(&[]), StepStatus::Completed);
+    assert!(completed_step().is_unverified());
+}
+
+#[test]
+fn a_step_with_evidence_is_not_unverified() {
+    let mut step = completed_step();
+    step.evidence = vec![command_exit(Some(0))];
+    assert!(!step.is_unverified());
+}
+
+#[test]
+fn a_blocked_step_is_not_reported_as_unverified() {
+    // "Unverified" means completed with nothing behind it. A blocked step is
+    // not completed at all, and reporting it as completed-unverified would
+    // turn a failure into a soft pass — the exact laundering §5.3 forbids.
+    let mut step = step("step_1", StepStatus::Blocked);
+    step.evidence = Vec::new();
+    assert!(!step.is_unverified());
+}
+
+#[test]
+fn a_patch_applied_completes_the_step() {
+    // Applying a patch is something Damaian observed itself, and there is no
+    // failure mode to encode: a patch that did not apply returns an error and
+    // produces no evidence at all.
+    let evidence = Evidence::PatchApplied {
+        marker_id: "action_1".to_string(),
+        files: vec![workspace_engine::plan::PatchedFile {
+            path: "src/upload.rs".to_string(),
+            applied_hash: "abc".to_string(),
+        }],
+    };
+    assert_eq!(status_from_evidence(&[evidence]), StepStatus::Completed);
 }
