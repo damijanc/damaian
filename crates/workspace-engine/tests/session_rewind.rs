@@ -466,7 +466,16 @@ fn terminal_states_are_exactly_these() {
         .collect();
     assert_eq!(
         terminal,
-        vec!["complete", "failed", "cancelled", "tool_budget_exhausted"]
+        vec![
+            "complete",
+            "failed",
+            "cancelled",
+            "tool_budget_exhausted",
+            // Spec 21 §5.4. Beside the round budget rather than folded into
+            // it: one means the work needed more rounds, the other that it
+            // needed more money, and the remedies differ.
+            "token_budget_exhausted"
+        ]
     );
 }
 

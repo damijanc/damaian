@@ -73,12 +73,12 @@ Every task's requirements implicitly include this section.
 | **4b. The plan lifecycle in a turn** | **done** | Two new tools; `PatchApplied` attachment blocked on Task 10 — see the note below |
 | 5. Step status is a function of evidence | **done** | Done before 4b, which depends on it |
 | 6. `TaskPhase`, derived | **done** | `awaiting_review` is an argument, not a guess — see the note below |
-| 7. `TokenBudgetExhausted` status | not started | |
+| 7. `TokenBudgetExhausted` status | **done** | Three guards caught the change; the UI still has no label — see the note below |
 | 8. `agent_max_task_tokens` config, restrict-only | not started | |
 | 9. Ceiling enforcement in the loop | not started | |
 | 10. Plan carry-over on resume | not started | |
 | 11. Plan review gate | not started | |
-| 12. Plan panel and completion report | not started | |
+| 12. Plan panel and completion report | not started | **Must also label a token stop** — see Task 7's note |
 | 13. Harness coverage and documentation | not started | |
 
 ## File Structure
@@ -1348,6 +1348,43 @@ the new variant classified; that is the mechanism working as designed.
 - [ ] **Step 5: Run the full gate, then ask before committing**
 
 Proposed message: `Tell a turn stopped for tokens from one stopped for rounds`
+
+#### What this task actually did
+
+All seven gate commands pass; 24 test binaries.
+
+**The prediction in `context.md` §3.2 held exactly.** The compiler and the
+existing tests caught the variant in three places, and the fourth — the one they
+could not reach — was the one the plan singled out:
+
+1. `crash_recovery.rs`'s `expected()` matrix refused to compile until recovery's
+   answer for the new state was written down. Classified `NotRecovered`, and for
+   a reason of its own beyond "it is terminal": the token check runs *before* a
+   model call rather than after one (§3.3), so the stop lands where nothing was
+   in flight to begin with.
+2. `every_state_and_crash_shape_recovers_the_way_the_matrix_says` failed on
+   `cells`: 42 against an expected 39. That guard exists so the matrix cannot
+   silently shrink, and it correctly reported that it had grown.
+3. `terminal_states_are_exactly_these` failed with the new value in the list.
+4. **`update_task_status` failed nothing.** Its hand-written terminal list is
+   outside everything `TaskStatus::all()` reaches, so `TokenBudgetExhausted`
+   would have been written with no `completedAtMs` and no test would have
+   noticed.
+
+Point 4 is now structurally impossible: the `matches!` is replaced by
+`updated.status.is_terminal()`, so the two cannot disagree again. Mutation-checked
+by restoring the hand-written list — both
+`a_token_budget_stop_records_a_completion_time` and
+`every_terminal_status_records_a_completion_time` fail, which is what "silent"
+looked like before.
+
+**One thing deliberately left for Task 12.** `app.js` reads
+`taskStatus === "tool_budget_exhausted"` in three places to mark a turn that ran
+out of rounds. A token stop currently renders as an ordinary completed turn —
+wrong, and invisible. It needs its own label with its own remedy ("raise the
+ceiling" rather than "narrow the request"), and that is UI work belonging with
+the plan panel. **Task 12 must not ship without it**, or the distinction this
+task exists to create stops at the engine boundary.
 
 ---
 

@@ -831,10 +831,15 @@ fn expected(status: &TaskStatus, shape: CrashShape) -> Expected {
         // Nothing further happens to a terminal task, whatever the log holds.
         // A dangling marker under a terminal status means the crash landed
         // between the action and the status write, and the status won.
+        // `TokenBudgetExhausted` joins them for the same reason and one of its
+        // own: the token check runs *before* a model call rather than after one
+        // (spec 21 `context.md` §3.3), so the stop lands at a point where
+        // nothing was in flight to begin with.
         TaskStatus::Complete
         | TaskStatus::Failed
         | TaskStatus::Cancelled
-        | TaskStatus::ToolBudgetExhausted => Expected::NotRecovered,
+        | TaskStatus::ToolBudgetExhausted
+        | TaskStatus::TokenBudgetExhausted => Expected::NotRecovered,
 
         // §5.4 rule 3: a task awaiting a human was not interrupted mid-action.
         // Its proposal is reattached (§5.5) instead.
@@ -920,10 +925,10 @@ fn every_state_and_crash_shape_recovers_the_way_the_matrix_says() {
             cells += 1;
         }
     }
-    // Thirteen states by three crash shapes. If this number moves, a state or
+    // Fourteen states by three crash shapes. If this number moves, a state or
     // a shape was added or removed — check the matrix is still complete before
-    // updating it.
-    assert_eq!(cells, 39, "the matrix must not shrink");
+    // updating it. It moved from 39 when spec 21 added `TokenBudgetExhausted`.
+    assert_eq!(cells, 42, "the matrix must not shrink");
 }
 
 /// The row `TaskStatus::all()` cannot reach: a status written by a *later*
@@ -1188,4 +1193,81 @@ fn a_command_that_exits_cleanly_is_recorded_as_ok_with_its_code() {
         read_action_outcomes(&fixture),
         vec![("ok".to_string(), Some(0))]
     );
+}
+
+// ---------------------------------------------------------------------------
+// A turn stopped for tokens is not a turn stopped for rounds.
+//
+// `docs/specs/21_task_plan_progress_and_budget/proposal.md` §5.4. Two facts
+// with different remedies — one means the work needed more rounds, the other
+// that it needed more money — so collapsing them would leave the eval harness
+// and the user unable to tell which happened.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_token_budget_stop_records_a_completion_time() {
+    // `update_task_status` decides this from a hand-written list of terminal
+    // statuses, which `TaskStatus::all()` does not reach
+    // (`context.md` §3.2). A new terminal status omitted there gets no
+    // completion timestamp and nothing else fails — so this asserts it
+    // directly rather than trusting the enumeration.
+    let fixture = fixture("token-budget-time");
+    let task = task_left_in(&fixture, TaskStatus::WaitingForModel, None);
+
+    let stopped = fixture
+        .store
+        .update_task_status(&task, TaskStatus::TokenBudgetExhausted, None)
+        .unwrap();
+
+    assert!(stopped.completed_at_ms.is_some());
+}
+
+#[test]
+fn every_terminal_status_records_a_completion_time() {
+    // The general form, so the next terminal status added cannot repeat the
+    // omission this test was written for.
+    let fixture = fixture("terminal-times");
+    for status in TaskStatus::all()
+        .into_iter()
+        .filter(TaskStatus::is_terminal)
+    {
+        let task = task_left_in(&fixture, TaskStatus::WaitingForModel, None);
+        let stopped = fixture
+            .store
+            .update_task_status(&task, status.clone(), None)
+            .unwrap();
+        assert!(
+            stopped.completed_at_ms.is_some(),
+            "{} is terminal but records no completion time",
+            status.as_str()
+        );
+    }
+}
+
+#[test]
+fn a_token_budget_stop_is_terminal_with_nothing_in_flight() {
+    // The stop happens *before* a model call rather than after one
+    // (`context.md` §3.3), so unlike `RunningTool` or `ApplyingPatch` there is
+    // no half-done side effect for recovery to worry about.
+    assert!(TaskStatus::TokenBudgetExhausted.is_terminal());
+    assert!(!TaskStatus::TokenBudgetExhausted.may_have_side_effect_in_flight());
+}
+
+#[test]
+fn the_two_budget_stops_are_distinct_values_that_both_round_trip() {
+    assert_ne!(
+        TaskStatus::TokenBudgetExhausted.as_str(),
+        TaskStatus::ToolBudgetExhausted.as_str()
+    );
+    for status in [
+        TaskStatus::TokenBudgetExhausted,
+        TaskStatus::ToolBudgetExhausted,
+    ] {
+        assert_eq!(
+            TaskStatus::parse(status.as_str()),
+            Some(status.clone()),
+            "{} must survive a write and a read",
+            status.as_str()
+        );
+    }
 }

@@ -42,6 +42,13 @@ pub enum TaskStatus {
     Failed,
     Cancelled,
     ToolBudgetExhausted,
+    /// Stopped because the task reached `agent_max_task_tokens`.
+    ///
+    /// Beside `ToolBudgetExhausted` rather than reusing it: they are different
+    /// facts with different remedies — one means the work needed more rounds,
+    /// the other that it needed more money — and collapsing them would leave
+    /// the eval harness unable to tell them apart. Spec 21 §5.4.
+    TokenBudgetExhausted,
     Interrupted,
     UnknownExternalOutcome,
 }
@@ -63,6 +70,7 @@ impl TaskStatus {
             Self::Failed,
             Self::Cancelled,
             Self::ToolBudgetExhausted,
+            Self::TokenBudgetExhausted,
             Self::Interrupted,
             Self::UnknownExternalOutcome,
         ]
@@ -81,6 +89,7 @@ impl TaskStatus {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::ToolBudgetExhausted => "tool_budget_exhausted",
+            Self::TokenBudgetExhausted => "token_budget_exhausted",
             Self::Interrupted => "interrupted",
             Self::UnknownExternalOutcome => "unknown_external_outcome",
         }
@@ -103,7 +112,11 @@ impl TaskStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Complete | Self::Failed | Self::Cancelled | Self::ToolBudgetExhausted
+            Self::Complete
+                | Self::Failed
+                | Self::Cancelled
+                | Self::ToolBudgetExhausted
+                | Self::TokenBudgetExhausted
         )
     }
 
@@ -303,13 +316,12 @@ impl SessionStore {
     ) -> Result<Task> {
         let mut updated = task.clone();
         updated.status = status;
-        if matches!(
-            updated.status,
-            TaskStatus::Complete
-                | TaskStatus::Failed
-                | TaskStatus::Cancelled
-                | TaskStatus::ToolBudgetExhausted
-        ) {
+        // Asks the status rather than re-listing the terminal ones here. The
+        // hand-written list this replaces was the one place `TaskStatus::all()`
+        // could not reach: a new terminal status omitted from it silently got
+        // no completion timestamp, and nothing failed. Spec 21 `context.md`
+        // §3.2.
+        if updated.status.is_terminal() {
             updated.completed_at_ms = Some(now_millis());
         }
         let mut payload = task_json(&updated);
