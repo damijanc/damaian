@@ -83,6 +83,23 @@ fn evidence_for(outcome: &ActionOutcome, marker_id: &str) -> Option<crate::plan:
     }
 }
 
+/// Why the agent loop ended.
+///
+/// An enum rather than two booleans: two flags admit a state where both are
+/// set, and the audit status string and the task status would then each have to
+/// pick one arbitrarily. The loop can only stop for one reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    /// The model produced an answer, or the turn is pausing for a human.
+    Answered,
+    /// `agent_max_tool_rounds` was reached and the model still wanted a tool.
+    ToolBudget,
+    /// `agent_max_task_tokens` was reached. Unlike [`Self::ToolBudget`] this is
+    /// detected *before* a model call rather than after one, so no tokens are
+    /// spent discovering it (`context.md` §3.3).
+    TokenBudget,
+}
+
 /// Which stage of a turn is running. Drives the progress indicator, so the user
 /// can tell a slow provider apart from a running tool apart from a hang.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -971,7 +988,7 @@ impl ChatOrchestrator {
         let mut plan: Option<crate::plan::TaskPlan> = None;
         let mut step_evidence: Vec<crate::plan::Evidence> = Vec::new();
 
-        let (final_run, response, command_proposal, patch_proposal, tool_budget_exhausted) = loop {
+        let (final_run, response, command_proposal, patch_proposal, stop_reason) = loop {
             // Checked before each round rather than only mid-stream: stopping
             // here is what saves a whole model call, and it is the only point
             // that catches a stop arriving during context assembly or a tool.
@@ -1001,6 +1018,41 @@ impl ChatOrchestrator {
                     &partial_response,
                     cancelled_run,
                 );
+            }
+
+            // Before the request is built, not after the response arrives.
+            // `force_final` — the round budget's shape — deliberately spends
+            // one more model call on crossing, which is right for a bound on
+            // rounds and backwards for a bound on money: context grows across
+            // rounds, so that call is the most expensive of the turn. A ceiling
+            // whose enforcement action is to spend more than the ceiling is not
+            // a ceiling. `context.md` §3.3.
+            if let Some(ceiling) = self.config.agent_max_task_tokens {
+                // Absent usage is zero here, not "unknown". `read_task_usage`
+                // omits a task with no events because "not recorded" and "used
+                // nothing" differ for a *report*; for a *ceiling* nothing spent
+                // is nothing spent, and treating absence as unenforceable would
+                // disable the bound for the first call of every turn — the only
+                // call some turns make. `context.md` §3.9.
+                //
+                // An `Estimated` total is checked like any other: declining to
+                // enforce on one would make the ceiling inoperative for every
+                // provider that does not report usage (§5.4).
+                let spent = self
+                    .session_store
+                    .read_task_usage(&session.id)?
+                    .get(&task.id)
+                    .map(|usage| usage.input_tokens + usage.output_tokens)
+                    .unwrap_or(0);
+                if spent >= ceiling {
+                    let response = token_budget_exhausted_response(ceiling, spent, plan.as_ref());
+                    let mut stopped = ModelRun::cancelled_before_start(
+                        &self.config.model_provider,
+                        &self.config.model_name,
+                    );
+                    stopped.content = response.clone();
+                    break (stopped, response, None, None, StopReason::TokenBudget);
+                }
             }
 
             let max_rounds = self.tool_round_limit(web_debug_mode, turn_options);
@@ -1182,9 +1234,9 @@ impl ChatOrchestrator {
                     let response = tool_budget_exhausted_response(max_rounds);
                     let mut exhausted_run = model_run;
                     exhausted_run.content = response.clone();
-                    break (exhausted_run, response, None, None, true);
+                    break (exhausted_run, response, None, None, StopReason::ToolBudget);
                 }
-                break (model_run, redacted, None, None, false);
+                break (model_run, redacted, None, None, StopReason::Answered);
             }
 
             let (matched_tool_call, decoded_tool_action, tool_decode_error) =
@@ -1202,7 +1254,7 @@ impl ChatOrchestrator {
                 // instead so the model can retry within the remaining rounds —
                 // the same recovery the restricted-path patch arm uses.
                 let Some(undecodable) = model_run.tool_calls.first().cloned() else {
-                    break (model_run, redacted, None, None, false);
+                    break (model_run, redacted, None, None, StopReason::Answered);
                 };
                 let note = tool_decode_error.unwrap_or_else(|| {
                     undecodable_tool_call_note(&undecodable, model_run.truncated)
@@ -1322,7 +1374,7 @@ impl ChatOrchestrator {
                             response,
                             Some(agent_command_proposal(&self.config, &proposal)),
                             None,
-                            false,
+                            StopReason::Answered,
                         );
                     }
 
@@ -1364,7 +1416,13 @@ impl ChatOrchestrator {
                             let proposal = agent_patch_proposal(&patch);
                             let mut proposal_run = model_run;
                             proposal_run.content = response.clone();
-                            break (proposal_run, response, None, Some(proposal), false);
+                            break (
+                                proposal_run,
+                                response,
+                                None,
+                                Some(proposal),
+                                StopReason::Answered,
+                            );
                         }
                         // Fed back as a tool result rather than aborting the
                         // turn, so the model can see why (e.g. a restricted
@@ -1613,7 +1671,13 @@ impl ChatOrchestrator {
                             .finish_action(action_marker, "awaiting_approval")?;
                         let mut proposal_run = model_run;
                         proposal_run.content = response.clone();
-                        break (proposal_run, response, Some(proposal), None, false);
+                        break (
+                            proposal_run,
+                            response,
+                            Some(proposal),
+                            None,
+                            StopReason::Answered,
+                        );
                     }
                     if session_approved {
                         self.audit_log.record(
@@ -1704,7 +1768,13 @@ impl ChatOrchestrator {
                         );
                         let mut proposal_run = model_run;
                         proposal_run.content = response.clone();
-                        break (proposal_run, response, Some(proposal), None, false);
+                        break (
+                            proposal_run,
+                            response,
+                            Some(proposal),
+                            None,
+                            StopReason::Answered,
+                        );
                     }
 
                     // No approval required: run it now and feed the result back.
@@ -1818,10 +1888,10 @@ impl ChatOrchestrator {
         task = match &pending {
             Some(pending) => self.session_store.await_approval(&task, pending)?,
             None => {
-                let final_status = if tool_budget_exhausted {
-                    TaskStatus::ToolBudgetExhausted
-                } else {
-                    TaskStatus::Complete
+                let final_status = match stop_reason {
+                    StopReason::ToolBudget => TaskStatus::ToolBudgetExhausted,
+                    StopReason::TokenBudget => TaskStatus::TokenBudgetExhausted,
+                    StopReason::Answered => TaskStatus::Complete,
                 };
                 self.session_store
                     .update_task_status(&task, final_status, None)?
@@ -1841,8 +1911,10 @@ impl ChatOrchestrator {
                         "command_approval_required".to_string()
                     } else if patch_proposal.is_some() {
                         "patch_proposal_ready".to_string()
-                    } else if tool_budget_exhausted {
+                    } else if stop_reason == StopReason::ToolBudget {
                         "tool_budget_exhausted".to_string()
+                    } else if stop_reason == StopReason::TokenBudget {
+                        "token_budget_exhausted".to_string()
                     } else if round > 0 {
                         "complete_with_sandbox_command".to_string()
                     } else {
@@ -2669,6 +2741,42 @@ fn model_output_requests_tool(model_run: &ModelRun, content: &str) -> bool {
         || content.contains("DAMAIAN_COMMAND_V1")
         || content.contains("tool_calls")
         || content.contains("DSML")
+}
+
+/// Names the ceiling, what was actually spent, and what is left undone.
+///
+/// §5.4 requires the usage consumed and the remaining steps. Without the
+/// figures the user cannot tell a ceiling set too low from a turn that
+/// genuinely ran away, which are opposite problems with opposite fixes.
+fn token_budget_exhausted_response(
+    ceiling: u64,
+    spent: u64,
+    plan: Option<&crate::plan::TaskPlan>,
+) -> String {
+    let remaining: Vec<&str> = plan
+        .map(|plan| {
+            plan.steps
+                .iter()
+                .filter(|step| {
+                    matches!(
+                        step.status,
+                        crate::plan::StepStatus::Pending | crate::plan::StepStatus::InProgress
+                    )
+                })
+                .map(|step| step.title.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut message = format!(
+        "This task reached its token ceiling of {ceiling} after spending {spent}. I stopped at a step boundary rather than continue, so nothing is half-done."
+    );
+    if !remaining.is_empty() {
+        message.push_str(&format!("\n\nStill to do: {}.", remaining.join("; ")));
+    }
+    message.push_str(
+        "\n\nRaise `agent_max_task_tokens` and ask again to carry on, or narrow the request.",
+    );
+    message
 }
 
 fn tool_budget_exhausted_response(max_rounds: u32) -> String {

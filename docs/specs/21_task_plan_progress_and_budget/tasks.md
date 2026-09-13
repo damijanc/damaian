@@ -75,7 +75,7 @@ Every task's requirements implicitly include this section.
 | 6. `TaskPhase`, derived | **done** | `awaiting_review` is an argument, not a guess — see the note below |
 | 7. `TokenBudgetExhausted` status | **done** | Three guards caught the change; the UI still has no label — see the note below |
 | 8. `agent_max_task_tokens` config, restrict-only | **done** | Restrict-only, diverging from the three existing `agent_*` bounds — see the note below |
-| 9. Ceiling enforcement in the loop | not started | |
+| 9. Ceiling enforcement in the loop | **done** | A weak assertion here survived the mutation — see the note below |
 | 10. Plan carry-over on resume | not started | |
 | 11. Plan review gate | not started | |
 | 12. Plan panel and completion report | not started | **Must also label a token stop** — see Task 7's note |
@@ -1658,6 +1658,58 @@ Restore.
 - [ ] **Step 5: Run the full gate, then ask before committing**
 
 Proposed message: `Stop a turn before the call that would cross its token ceiling`
+
+#### What this task actually did
+
+All seven gate commands pass; 25 test binaries, 5 tests in the new
+`tests/token_ceiling.rs`. (New file rather than `token_accounting.rs`, which is
+store-level and has no turn harness. Its name says what it holds.)
+
+**The finding: my first version of the key test was worthless, and the mutation
+is what showed it.**
+
+`a_turn_stops_before_the_call_that_would_cross_the_ceiling` was written as
+`calls < unbounded` — the ceiling turn makes fewer model calls than an
+unconstrained one. It passed. Then the mutation — moving the check to the loop
+tail — **also passed**, and so did a version enforcing it the round budget's
+way. Of course they did: any early stop makes fewer calls than a turn that runs
+to the round limit. The assertion measured "stopped early", which was never in
+doubt, and not "stopped without paying for the discovery", which is the entire
+point.
+
+It is now an **exact** count: 3, measured rather than assumed. Two calls record
+enough estimated usage to reach 1000 tokens, and the third iteration stops
+before its request is built. Re-running the `force_final` mutation now fails
+with `left: 4, right: 3` — the one extra call that shape spends. That single
+call is the most expensive of the turn, because context grows monotonically
+across rounds.
+
+This is the pattern spec 18 §7 named, hit again from the other side: *a metric
+whose expected value equals its failure value needs a test that moves it*. Here
+the expected and failure values differed by one call, and a `<` comparison
+could not see the difference. Worth remembering that a passing mutation check
+is a result about the **test**, not about the code.
+
+**`StopReason` replaces the loop's `tool_budget_exhausted: bool`.** Two booleans
+would admit a state where both are set, and the task status and the audit
+status string would each have to pick one arbitrarily. Seven `break` sites
+converted; the compiler found them all.
+
+**Absent usage is zero here, not "unknown".** `read_task_usage` omits a task
+with no events on purpose — "not recorded" and "used nothing" differ for a
+*report*. For a *ceiling* they do not: nothing spent is nothing spent, and
+treating absence as unenforceable would disable the bound for the first call of
+every turn, which is the only call some turns make (`context.md` §3.9).
+
+**An estimated total is enforced against**, and the test says why it is
+meaningful: `MockModelAdapter` reports no usage, so everything it records is
+`Estimated`. The test asserts that precondition rather than assuming it, so it
+fails loudly if the mock ever starts reporting measured usage — at which point
+it would be silently testing the wrong thing.
+
+The stop message names the ceiling, the actual spend, and the steps still
+outstanding. Without the figures a user cannot tell a ceiling set too low from a
+turn that genuinely ran away — opposite problems with opposite fixes.
 
 ---
 
