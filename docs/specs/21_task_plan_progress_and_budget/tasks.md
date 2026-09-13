@@ -74,7 +74,7 @@ Every task's requirements implicitly include this section.
 | 5. Step status is a function of evidence | **done** | Done before 4b, which depends on it |
 | 6. `TaskPhase`, derived | **done** | `awaiting_review` is an argument, not a guess — see the note below |
 | 7. `TokenBudgetExhausted` status | **done** | Three guards caught the change; the UI still has no label — see the note below |
-| 8. `agent_max_task_tokens` config, restrict-only | not started | |
+| 8. `agent_max_task_tokens` config, restrict-only | **done** | Restrict-only, diverging from the three existing `agent_*` bounds — see the note below |
 | 9. Ceiling enforcement in the loop | not started | |
 | 10. Plan carry-over on resume | not started | |
 | 11. Plan review gate | not started | |
@@ -1499,6 +1499,53 @@ which is indistinguishable from Damaian being broken. Reject below 1000.
 - [ ] **Step 3: Run to verify they pass, run the full gate, then ask**
 
 Proposed message: `Add a per-task token ceiling a repository may lower but not raise`
+
+#### What this task actually did
+
+All seven gate commands pass; 138 tests in `tests/foundation.rs`.
+
+**The classification is the whole task, and it diverges from its neighbours.**
+`agent_max_tool_rounds`, `agent_web_debug_max_tool_rounds` and
+`agent_tool_retry_limit` all sit in the block commented "Free: preferences and
+budgets, with no capability behind them", which a cloned repository may set in
+either direction. `agent_max_task_tokens` does not go there. Lowering a ceiling
+is a nuisance; **raising one the user deliberately set low spends the user's
+money**, which is a capability, and spec 34 exists to stop exactly that. So it
+uses the `restrict_only_*` shape instead: a repository may lower a ceiling or
+set one where none existed, never raise one and never remove one.
+
+`None` means no ceiling, so any value is a tightening — which is why a
+repository setting the first ceiling is allowed rather than refused.
+
+Three mutations, each caught:
+
+- Classified as Free (`self.agent_max_task_tokens = Some(value)`) — the change
+  someone makes to match the neighbouring keys. Fails
+  `a_repository_may_lower_a_token_ceiling_but_not_raise_it`.
+- Over-tightened so an existing ceiling can never be lowered either. Fails the
+  same test's second half. (It does *not* fail
+  `a_repository_may_set_a_ceiling_where_the_user_set_none`, because that path
+  goes through the `None` arm — the mutation is narrower than "forbid
+  everything", and the tests pin the two cases separately for that reason.)
+- Minimum dropped to zero. Fails `config_rejects_a_ceiling_too_low_to_be_meaningful`.
+
+**A minimum of 1000, refused at parse time.** A ceiling of zero — or of ten —
+stops every turn before its first model call, which from the user's side is
+indistinguishable from Damaian being broken. Refusing the typo where it is
+typed beats surfacing it later as a hang nobody can explain.
+
+**Two touch points the compiler does not catch**, exactly as `context.md` §3.8
+predicted. The exhaustive destructure in `apply_overlay_scoped` forced six of
+the eight; `config_show` and the overlay serializer it did not.
+
+The `config_show` line is emitted **only when the ceiling is set** — printing
+`0` for "no ceiling" would read back as a ceiling of zero, a far worse
+configuration than the default. And
+`an_unset_ceiling_is_omitted_rather_than_written_as_zero` asserts *both*
+directions: absence when unset, and presence when set. Without the second half
+the test would have passed even if the key were never emitted at all, which is
+what it looked like before I added the `config_show` line — a green test proving
+nothing.
 
 ---
 

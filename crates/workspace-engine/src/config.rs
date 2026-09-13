@@ -193,6 +193,16 @@ pub struct Config {
     /// How many substantially identical failed tool calls may be retried before
     /// the model is told to change approach.
     pub agent_tool_retry_limit: u32,
+    /// Total tokens one task may spend before it is stopped at a step boundary.
+    ///
+    /// `None` means no ceiling, which is the default so that upgrading cannot
+    /// break an existing configuration. Spec 21 §5.4.
+    ///
+    /// **Per task, and a task is one turn** (spec 21 `context.md` §3.1), so a
+    /// session of five turns under a 100k ceiling can spend 500k. §4 rules out
+    /// per-session budgets deliberately; the user guide has to say so plainly
+    /// rather than let a reader assume otherwise.
+    pub agent_max_task_tokens: Option<u64>,
     pub shell: String,
     pub model_provider: String,
     pub model_name: String,
@@ -509,6 +519,7 @@ impl Config {
             agent_max_tool_rounds,
             agent_web_debug_max_tool_rounds,
             agent_tool_retry_limit,
+            agent_max_task_tokens,
             shell,
             model_provider,
             model_name,
@@ -705,6 +716,20 @@ impl Config {
             } else {
                 self.upsert_mcp_server_from_repository(server, &mut rejected);
             }
+        }
+
+        // Restrict-only, unlike the three `agent_*` round bounds in the "Free"
+        // block below. Lowering a ceiling is a nuisance; raising one the user
+        // set low spends the user's money, which is a capability rather than a
+        // preference. `context.md` §3.8.
+        if let Some(value) = agent_max_task_tokens {
+            restrict_only_ceiling(
+                &mut self.agent_max_task_tokens,
+                value,
+                "agent_max_task_tokens",
+                trusted,
+                &mut rejected,
+            );
         }
 
         // Forbidden: lowering a checkpoint budget destroys the user's own
@@ -1243,6 +1268,13 @@ impl Config {
             "agent_tool_retry_limit",
             &self.agent_tool_retry_limit.to_string(),
         );
+        // Only when set. Printing `0` for "no ceiling" would read as a ceiling
+        // of zero, which is a different and much worse configuration than the
+        // default — and `config-show` is one of the two touch points the
+        // exhaustive destructure does not catch (`context.md` §3.8).
+        if let Some(value) = self.agent_max_task_tokens {
+            push_line(&mut output, "agent_max_task_tokens", &value.to_string());
+        }
         push_line(&mut output, "shell", &self.shell);
         push_line(&mut output, "model_provider", &self.model_provider);
         push_line(&mut output, "model_name", &self.model_name);
@@ -1303,6 +1335,9 @@ impl Default for Config {
             agent_max_tool_rounds: 8,
             agent_web_debug_max_tool_rounds: 12,
             agent_tool_retry_limit: 2,
+            // No ceiling by default: this must not change what an existing
+            // configuration does on upgrade (§5.4).
+            agent_max_task_tokens: None,
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()),
             model_provider: "openai".to_string(),
             model_name: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1".to_string()),
@@ -1345,6 +1380,7 @@ pub struct ConfigOverlay {
     pub agent_max_tool_rounds: Option<u32>,
     pub agent_web_debug_max_tool_rounds: Option<u32>,
     pub agent_tool_retry_limit: Option<u32>,
+    pub agent_max_task_tokens: Option<u64>,
     pub shell: Option<String>,
     pub model_provider: Option<String>,
     pub model_name: Option<String>,
@@ -1499,6 +1535,9 @@ impl ConfigOverlay {
             }
             "agent_tool_retry_limit" => {
                 self.agent_tool_retry_limit = Some(parse_retry_limit(key, value)?)
+            }
+            "agent_max_task_tokens" => {
+                self.agent_max_task_tokens = Some(parse_task_token_ceiling(key, value)?)
             }
             "shell" => self.shell = Some(value.to_string()),
             "model_provider" => self.model_provider = Some(normalize_model_provider(value)?),
@@ -1729,6 +1768,9 @@ impl ConfigOverlay {
                 "agent_web_debug_max_tool_rounds",
                 &value.to_string(),
             );
+        }
+        if let Some(value) = self.agent_max_task_tokens {
+            push_line(&mut output, "agent_max_task_tokens", &value.to_string());
         }
         if let Some(value) = self.agent_tool_retry_limit {
             push_line(&mut output, "agent_tool_retry_limit", &value.to_string());
@@ -2386,6 +2428,49 @@ fn parse_round_count(key: &str, value: &str) -> Result<u32> {
     } else {
         Err(ClientError::InvalidInput(format!(
             "{key} must be between 1 and 16"
+        )))
+    }
+}
+
+/// Takes the *lower* of the two at an untrusted scope, and whatever was given
+/// at a trusted one.
+///
+/// `None` means no ceiling, so any value at all is a tightening and a
+/// repository may set one where the user set none. What it may not do is raise
+/// a ceiling the user chose, or remove one — both spend the user's money on the
+/// repository's say-so. `context.md` §3.8.
+fn restrict_only_ceiling(
+    current: &mut Option<u64>,
+    value: u64,
+    key: &str,
+    trusted: bool,
+    rejected: &mut Vec<RejectedConfigKey>,
+) {
+    if trusted {
+        *current = Some(value);
+        return;
+    }
+    match *current {
+        Some(existing) if value >= existing => {
+            rejected.push(RejectedConfigKey::new(
+                key,
+                RepositoryKeyClass::RestrictOnly,
+            ));
+        }
+        _ => *current = Some(value),
+    }
+}
+
+/// A ceiling low enough to stop every turn before its first call is
+/// indistinguishable from Damaian being broken, so a typo is refused at parse
+/// time rather than surfacing later as a hang nobody can explain.
+fn parse_task_token_ceiling(key: &str, value: &str) -> Result<u64> {
+    let parsed = parse_u64(key, value)?;
+    if parsed >= 1000 {
+        Ok(parsed)
+    } else {
+        Err(ClientError::InvalidInput(format!(
+            "{key} must be at least 1000"
         )))
     }
 }

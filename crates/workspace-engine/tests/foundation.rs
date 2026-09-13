@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
     AuditLog, CancelToken, ChatTurnOptions, ChatTurnResult, ClientError, CommandPolicy,
-    CommandRisk, Config, ConfigOverlay, DEFAULT_CONTEXT_TOKEN_BUDGET, IndexCache, McpClient,
-    McpServerConfig, McpTransport, MockModelAdapter, MockModelTransport, ModelAdapter,
+    CommandRisk, Config, ConfigOverlay, ConfigScope, DEFAULT_CONTEXT_TOKEN_BUDGET, IndexCache,
+    McpClient, McpServerConfig, McpTransport, MockModelAdapter, MockModelTransport, ModelAdapter,
     ModelMessage, ModelProviderConfig, ModelRequest, ModelTransport, OpenAICompatibleAdapter,
     PatchEngine, PatchStore, PathPolicy, PhaseKind, ProjectIndexer, ProposedChange, Result,
     ResumeDecisionOptions, SecretScanner, SessionStore, TaskStatus, TokenUsage, ToolCall,
@@ -4789,4 +4789,124 @@ fn setting_one_field_on_a_builtin_provider_keeps_the_rest_of_it() {
     // first level of resolution, which would outrank the per-model table and
     // drop a V4 install to the 8192 legacy ceiling.
     assert_eq!(config.max_output_tokens(), Some(65_536));
+}
+
+// ---------------------------------------------------------------------------
+// The per-task token ceiling, and why it is not a "free" budget.
+//
+// `docs/specs/21_task_plan_progress_and_budget/context.md` §3.8.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_repository_may_lower_a_token_ceiling_but_not_raise_it() {
+    // The three existing `agent_*` bounds sit in the "Free" block, which a
+    // cloned repository may set either way. A ceiling is money: lowering it is
+    // a nuisance, raising one the user deliberately set low spends the user's
+    // money, which is a capability — and spec 34 exists to stop exactly that.
+    let mut config = Config {
+        agent_max_task_tokens: Some(50_000),
+        ..Config::default()
+    };
+
+    let rejected = config.apply_overlay_scoped(
+        ConfigOverlay::parse("agent_max_task_tokens=200000\n").unwrap(),
+        ConfigScope::Repository,
+    );
+
+    assert_eq!(config.agent_max_task_tokens, Some(50_000));
+    assert!(
+        rejected
+            .iter()
+            .any(|key| key.key == "agent_max_task_tokens"),
+        "a refusal must be reported, not silent: got {rejected:?}"
+    );
+
+    config.apply_overlay_scoped(
+        ConfigOverlay::parse("agent_max_task_tokens=10000\n").unwrap(),
+        ConfigScope::Repository,
+    );
+    assert_eq!(config.agent_max_task_tokens, Some(10_000));
+}
+
+#[test]
+fn a_repository_may_set_a_ceiling_where_the_user_set_none() {
+    // `None` means no ceiling, so any value at all is a tightening.
+    let mut config = Config::default();
+    assert_eq!(config.agent_max_task_tokens, None);
+
+    config.apply_overlay_scoped(
+        ConfigOverlay::parse("agent_max_task_tokens=10000\n").unwrap(),
+        ConfigScope::Repository,
+    );
+
+    assert_eq!(config.agent_max_task_tokens, Some(10_000));
+}
+
+#[test]
+fn a_user_may_raise_or_remove_their_own_ceiling() {
+    // The complement. Asserting only the refusal would pass even if the key
+    // were refused at every scope, which would make the ceiling unsettable.
+    let mut config = Config {
+        agent_max_task_tokens: Some(10_000),
+        ..Config::default()
+    };
+
+    config.apply_overlay_scoped(
+        ConfigOverlay::parse("agent_max_task_tokens=200000\n").unwrap(),
+        ConfigScope::User,
+    );
+
+    assert_eq!(config.agent_max_task_tokens, Some(200_000));
+}
+
+#[test]
+fn an_unset_ceiling_is_omitted_rather_than_written_as_zero() {
+    // A `0` read back would be a ceiling of zero, which stops every turn
+    // before its first call. Absence has to stay absence through the
+    // round trip that `config-show` and the overlay serializer make.
+    let config = Config::default();
+    assert!(
+        !config.to_policy_text().contains("agent_max_task_tokens"),
+        "an unset ceiling must not appear at all"
+    );
+
+    let overlay = ConfigOverlay::parse("agent_max_tool_rounds=9\n").unwrap();
+    assert!(!overlay.to_policy_text().contains("agent_max_task_tokens"));
+
+    // And the complement, so this cannot pass by the key simply never being
+    // emitted: a ceiling that *is* set must show up in `config-show`, which is
+    // how a user checks what a repository did to their configuration.
+    let configured = Config {
+        agent_max_task_tokens: Some(120_000),
+        ..Config::default()
+    };
+    assert!(
+        configured
+            .to_policy_text()
+            .contains("agent_max_task_tokens=120000"),
+        "got: {}",
+        configured.to_policy_text()
+    );
+}
+
+#[test]
+fn a_set_ceiling_survives_a_round_trip_through_the_overlay_text() {
+    let overlay = ConfigOverlay::parse("agent_max_task_tokens=120000\n").unwrap();
+    let text = overlay.to_policy_text();
+    assert!(text.contains("agent_max_task_tokens=120000"), "got: {text}");
+
+    let reparsed = ConfigOverlay::parse(&text).unwrap();
+    let mut config = Config::default();
+    config.apply_overlay(reparsed);
+    assert_eq!(config.agent_max_task_tokens, Some(120_000));
+}
+
+#[test]
+fn config_rejects_a_ceiling_too_low_to_be_meaningful() {
+    // A ceiling of zero — or of ten — stops every turn before its first call,
+    // which is indistinguishable from Damaian being broken. Refuse it at parse
+    // time rather than let a typo look like a hang.
+    assert!(ConfigOverlay::parse("agent_max_task_tokens=0\n").is_err());
+    assert!(ConfigOverlay::parse("agent_max_task_tokens=999\n").is_err());
+    assert!(ConfigOverlay::parse("agent_max_task_tokens=1000\n").is_ok());
 }
