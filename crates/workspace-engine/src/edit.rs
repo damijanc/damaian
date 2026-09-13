@@ -503,6 +503,25 @@ impl EditOrchestrator {
             ],
         )?;
         if let Some(marker) = apply_marker {
+            // Spec 21 §5.3. A patch is proposed in one turn and applied here,
+            // after that turn has ended, so there is no in-memory plan to
+            // attach this to — it goes onto whichever step is still open, via
+            // the log. The hashes are the *applied* ones: for a partial-hunk
+            // accept they differ from the patch's `new_hash`, and recording the
+            // proposal's hash would make the evidence assert a file Damaian
+            // never wrote.
+            if let Some(task_id) = patch.task_id.as_deref()
+                && !patch.session_id.is_empty()
+            {
+                self.session_store.append_step_evidence(
+                    &patch.session_id,
+                    task_id,
+                    crate::plan::Evidence::PatchApplied {
+                        marker_id: marker.id().to_string(),
+                        files: result.applied.clone(),
+                    },
+                )?;
+            }
             self.session_store.finish_action(marker, "ok")?;
         }
         Ok(result)

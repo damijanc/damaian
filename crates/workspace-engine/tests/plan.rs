@@ -352,6 +352,135 @@ fn a_rewind_past_a_plan_takes_the_plan_with_it() {
 }
 
 // ---------------------------------------------------------------------------
+// The review gate. Proposal §5.5.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_revision_keeps_the_original_plan_in_the_log() {
+    // §5.5: both the original and the user's revision are in the log, so the
+    // history still describes what was proposed as well as what was run. A
+    // revision that overwrote the original would leave no way to see that the
+    // user removed a step — which is exactly the fact a reviewer wants.
+    let fixture = Fixture::new("revision");
+    let task = fixture.task("add retry handling");
+    let mut original = TaskPlan::new(&task.id, 0);
+    original.steps.push(step("step_1", StepStatus::InProgress));
+    original.steps.push(step("step_2", StepStatus::Pending));
+    fixture.store.create_plan(&task, &original).unwrap();
+
+    let mut revised = original.clone();
+    revised.steps.remove(1);
+    fixture.store.revise_plan(&task, &revised).unwrap();
+
+    assert_eq!(
+        fixture.plan_event_kinds(),
+        vec!["plan_created", "plan_revised"]
+    );
+    assert_eq!(
+        fixture
+            .store
+            .read_task_plan(&fixture.session_id, &task.id)
+            .unwrap()
+            .unwrap()
+            .steps
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_task_whose_plan_was_never_approved_reads_as_unapproved() {
+    // The default has to be "not approved" rather than "unknown": the gate
+    // reads this to decide whether to pause, and an unknown that fell through
+    // to `true` would let the first mutating step run unreviewed.
+    let fixture = Fixture::new("unapproved");
+    let task = fixture.task("add retry handling");
+    let mut plan = TaskPlan::new(&task.id, 0);
+    plan.steps.push(step("step_1", StepStatus::InProgress));
+    fixture.store.create_plan(&task, &plan).unwrap();
+
+    assert!(
+        !fixture
+            .store
+            .read_plan_approved(&fixture.session_id, &task.id)
+            .unwrap()
+    );
+}
+
+#[test]
+fn an_approval_outlives_the_turn_that_recorded_it() {
+    // The approval is a fact in the log, not turn-local state, so a restart
+    // between the decision and the work does not re-ask.
+    let fixture = Fixture::new("approved");
+    let task = fixture.task("add retry handling");
+    let mut plan = TaskPlan::new(&task.id, 0);
+    plan.steps.push(step("step_1", StepStatus::InProgress));
+    fixture.store.create_plan(&task, &plan).unwrap();
+    fixture.store.approve_plan(&task, "tester").unwrap();
+
+    let reread = SessionStore::new(&fixture.data_dir);
+    assert!(
+        reread
+            .read_plan_approved(&fixture.session_id, &task.id)
+            .unwrap()
+    );
+}
+
+#[test]
+fn an_approval_belongs_to_the_task_that_earned_it() {
+    // Approving one task's plan must not clear the gate for another task in
+    // the same session — the user reviewed those steps, not these.
+    let fixture = Fixture::new("approval-scope");
+    let approved = fixture.task("add retry handling");
+    let other = fixture.task("rewrite the parser");
+    fixture.store.approve_plan(&approved, "tester").unwrap();
+
+    assert!(
+        fixture
+            .store
+            .read_plan_approved(&fixture.session_id, &approved.id)
+            .unwrap()
+    );
+    assert!(
+        !fixture
+            .store
+            .read_plan_approved(&fixture.session_id, &other.id)
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_rewind_past_an_approval_takes_the_approval_with_it() {
+    // Same asymmetry as `a_rewind_past_a_plan_takes_the_plan_with_it`: the
+    // approval is part of the conversation. Rewinding to before the user saw
+    // the plan and then letting the work proceed unreviewed would mean the
+    // rewind quietly widened what the agent may do.
+    let fixture = Fixture::new("approval-rewind");
+    let task = fixture.task("add retry handling");
+    let mut plan = TaskPlan::new(&task.id, 0);
+    plan.steps.push(step("step_1", StepStatus::InProgress));
+    fixture.store.create_plan(&task, &plan).unwrap();
+    let before = fixture
+        .store
+        .latest_event_seq(&fixture.session_id)
+        .expect("a seq");
+    fixture.store.approve_plan(&task, "tester").unwrap();
+
+    fixture
+        .store
+        .rewind_conversation(&fixture.session_id, before)
+        .unwrap();
+
+    assert!(
+        !fixture
+            .store
+            .read_plan_approved(&fixture.session_id, &task.id)
+            .unwrap(),
+        "a rewound approval must not still clear the gate"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // A step's status is a function of its evidence. Proposal §5.3.
 //
 // The model does not appear in any of these inputs, which is the point.
@@ -551,4 +680,186 @@ fn a_finished_plan_is_complete_even_while_something_awaits_review() {
     let mut plan = TaskPlan::new("task_1", 0);
     plan.steps.push(step("step_1", StepStatus::Completed));
     assert_eq!(plan.phase(true), TaskPhase::Complete);
+}
+
+// ---------------------------------------------------------------------------
+// Carrying a plan across a task boundary.
+//
+// `context.md` §3.1: a task is one turn, so "the plan survives" (§5.4) is true
+// of the log and false of the user unless something carries it. A resumed turn
+// is a *new* task with a new id, and `read_task_plan` is keyed on that id.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_resumed_turn_recovers_the_plan_of_the_task_it_resumes() {
+    let fixture = Fixture::new("resume");
+    let first = fixture.task("add retry handling");
+    let mut plan = TaskPlan::new(&first.id, 0);
+    let mut done = step("step_1", StepStatus::Completed);
+    done.evidence = vec![command_exit(Some(0))];
+    done.completed_at_ms = Some(5);
+    plan.steps.push(done);
+    plan.steps.push(step("step_2", StepStatus::Pending));
+    fixture.store.create_plan(&first, &plan).unwrap();
+
+    let second = fixture.task("add retry handling");
+    fixture.store.resume_plan(&second, &first.id).unwrap();
+
+    let carried = fixture
+        .store
+        .read_task_plan(&fixture.session_id, &second.id)
+        .unwrap()
+        .expect("the plan carried over");
+    assert_eq!(carried.steps.len(), 2);
+    assert_eq!(carried.steps[0].status, StepStatus::Completed);
+    assert_eq!(carried.steps[1].status, StepStatus::Pending);
+    // The evidence came with it. Dropping it would make the resumed plan
+    // re-run work it can already show was done, and would turn a verified step
+    // into an unverified one on the way through.
+    assert_eq!(carried.steps[0].evidence, plan.steps[0].evidence);
+    assert!(!carried.steps[0].is_unverified());
+}
+
+#[test]
+fn resuming_leaves_the_original_plan_readable_under_its_own_task() {
+    // Append-only: the carried copy is a new event, not a rewrite. The first
+    // task's history still says what it did.
+    let fixture = Fixture::new("resume-original");
+    let first = fixture.task("add retry handling");
+    let mut plan = TaskPlan::new(&first.id, 0);
+    plan.steps.push(step("step_1", StepStatus::Completed));
+    plan.steps.push(step("step_2", StepStatus::Pending));
+    fixture.store.create_plan(&first, &plan).unwrap();
+
+    let second = fixture.task("add retry handling");
+    fixture.store.resume_plan(&second, &first.id).unwrap();
+
+    assert!(
+        fixture
+            .store
+            .read_task_plan(&fixture.session_id, &first.id)
+            .unwrap()
+            .is_some(),
+        "the original task must keep its plan"
+    );
+    assert_eq!(
+        fixture.plan_event_kinds(),
+        vec!["plan_created", "plan_resumed"],
+        "the carry must be visible in the log as its own kind"
+    );
+}
+
+#[test]
+fn resuming_a_task_that_never_had_a_plan_carries_nothing() {
+    let fixture = Fixture::new("resume-none");
+    let first = fixture.task("what does this do");
+    let second = fixture.task("and this");
+
+    fixture.store.resume_plan(&second, &first.id).unwrap();
+
+    assert!(
+        fixture
+            .store
+            .read_task_plan(&fixture.session_id, &second.id)
+            .unwrap()
+            .is_none(),
+        "there was no plan to carry, and inventing an empty one would be worse"
+    );
+}
+
+#[test]
+fn evidence_appended_to_a_step_outside_its_turn_survives() {
+    // A patch is *proposed* in one turn and *applied* later, after that turn
+    // has ended, so the apply path appends evidence to a step whose turn is
+    // over. This is the path `PatchApplyResult::applied` exists for.
+    let fixture = Fixture::new("append-evidence");
+    let task = fixture.task("add retry handling");
+    let mut plan = TaskPlan::new(&task.id, 0);
+    plan.steps.push(step("step_1", StepStatus::InProgress));
+    fixture.store.create_plan(&task, &plan).unwrap();
+
+    fixture
+        .store
+        .append_step_evidence(
+            &fixture.session_id,
+            &task.id,
+            Evidence::PatchApplied {
+                marker_id: "action_1".to_string(),
+                files: vec![workspace_engine::plan::PatchedFile {
+                    path: "src/upload.rs".to_string(),
+                    applied_hash: "abc".to_string(),
+                }],
+            },
+        )
+        .unwrap();
+
+    let updated = fixture
+        .store
+        .read_task_plan(&fixture.session_id, &task.id)
+        .unwrap()
+        .expect("the plan is still there");
+    assert_eq!(updated.steps[0].evidence.len(), 1);
+    // Still open: appending evidence records what happened, it does not decide
+    // the step is finished. Only `complete_step` does that, from the evidence.
+    assert_eq!(updated.steps[0].status, StepStatus::InProgress);
+}
+
+#[test]
+fn appending_evidence_with_no_open_step_changes_nothing() {
+    let fixture = Fixture::new("append-closed");
+    let task = fixture.task("add retry handling");
+    let mut plan = TaskPlan::new(&task.id, 0);
+    plan.steps.push(step("step_1", StepStatus::Completed));
+    fixture.store.create_plan(&task, &plan).unwrap();
+
+    fixture
+        .store
+        .append_step_evidence(&fixture.session_id, &task.id, command_exit(Some(0)))
+        .unwrap();
+
+    let updated = fixture
+        .store
+        .read_task_plan(&fixture.session_id, &task.id)
+        .unwrap()
+        .expect("the plan is still there");
+    assert!(
+        updated.steps[0].evidence.is_empty(),
+        "evidence must not be attached to a step that already closed on its own evidence"
+    );
+}
+
+#[test]
+fn a_step_whose_patch_landed_reports_the_editing_phase() {
+    // Task 6 could not reach `TaskPhase::Editing` because nothing produced
+    // `Evidence::PatchApplied` — a patch is applied after the turn that
+    // proposed it has ended. `append_step_evidence` is that producer, so this
+    // closes the gap Task 6 recorded rather than leaving a variant nothing can
+    // ever return.
+    let fixture = Fixture::new("editing-phase");
+    let task = fixture.task("add retry handling");
+    let mut plan = TaskPlan::new(&task.id, 0);
+    plan.steps.push(step("step_1", StepStatus::InProgress));
+    fixture.store.create_plan(&task, &plan).unwrap();
+
+    fixture
+        .store
+        .append_step_evidence(
+            &fixture.session_id,
+            &task.id,
+            Evidence::PatchApplied {
+                marker_id: "action_1".to_string(),
+                files: vec![workspace_engine::plan::PatchedFile {
+                    path: "src/upload.rs".to_string(),
+                    applied_hash: "abc".to_string(),
+                }],
+            },
+        )
+        .unwrap();
+
+    let updated = fixture
+        .store
+        .read_task_plan(&fixture.session_id, &task.id)
+        .unwrap()
+        .expect("the plan is still there");
+    assert_eq!(updated.phase(false), TaskPhase::Editing);
 }

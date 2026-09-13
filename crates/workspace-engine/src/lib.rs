@@ -36,8 +36,9 @@ pub mod workspace_engine;
 pub use audit::AuditLog;
 pub use cancel::CancelToken;
 pub use chat::{
-    AgentCommandProposal, AgentPatchProposal, ChatOrchestrator, ChatTurnOptions, ChatTurnResult,
-    McpTokenResolver, PhaseKind, ResumeDecisionOptions, TurnPhase, TurnProgress, TurnSink,
+    AgentCommandProposal, AgentPatchProposal, AgentPlanProposal, ChatOrchestrator, ChatTurnOptions,
+    ChatTurnResult, McpTokenResolver, PhaseKind, PlanRevisionStep, ResumeDecisionOptions,
+    TurnPhase, TurnProgress, TurnSink,
 };
 pub use checkpoint::{
     CheckpointConversation, CheckpointExclusion, CheckpointFile, CheckpointManifest,

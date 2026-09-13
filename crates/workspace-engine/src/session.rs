@@ -918,6 +918,82 @@ impl SessionStore {
         self.append_session_event(&task.session_id, event_type, &payload)
     }
 
+    /// Carries a plan forward onto a new task, keeping the original readable
+    /// under the task that made it.
+    ///
+    /// `context.md` §3.1: a task is one turn, so the resumed turn is a *new*
+    /// task with a new id and [`Self::read_task_plan`] is keyed on that id.
+    /// Without this, §5.4's "the plan survives, so the user can raise the
+    /// ceiling and resume" is true of the log and false of the user.
+    ///
+    /// Step state comes across verbatim, evidence included. A step that was
+    /// `InProgress` stays open — work resumes on it — and a completed step
+    /// keeps what confirmed it, or the resumed plan would re-run work it can
+    /// already show was done and downgrade a verified step to an unverified one
+    /// on the way through.
+    ///
+    /// A task with no plan carries nothing rather than an empty plan: `None`
+    /// and a zero-step plan are different facts.
+    pub fn resume_plan(&self, task: &Task, from_task_id: &str) -> Result<()> {
+        let Some(mut plan) = self.read_task_plan(&task.session_id, from_task_id)? else {
+            return Ok(());
+        };
+        plan.task_id = task.id.clone();
+        let mut payload = serde_json::to_value(&plan).map_err(|error| {
+            crate::error::ClientError::Io(format!("plan serialization: {error}"))
+        })?;
+        if let Some(object) = payload.as_object_mut() {
+            // Alongside the plan's own fields rather than wrapping it, so the
+            // reader needs no special case: `TaskPlan` ignores the extra key.
+            object.insert(
+                "resumedFrom".to_string(),
+                serde_json::Value::String(from_task_id.to_string()),
+            );
+        }
+        self.append_session_event(&task.session_id, "plan_resumed", &payload.to_string())
+    }
+
+    /// Appends one more piece of evidence to whichever step is open.
+    ///
+    /// For work that lands *outside* the turn that planned it: a patch is
+    /// proposed in one turn and applied later, after that turn has ended, so
+    /// the apply path has evidence and no in-memory plan to put it on.
+    ///
+    /// Appends rather than replaces, and does nothing when no step is open. A
+    /// step that has already closed reached its status from its own evidence,
+    /// and adding to it afterwards would change the answer to a question that
+    /// was already settled.
+    pub fn append_step_evidence(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        evidence: crate::plan::Evidence,
+    ) -> Result<()> {
+        let Some(plan) = self.read_task_plan(session_id, task_id)? else {
+            return Ok(());
+        };
+        let Some(mut open) = plan
+            .steps
+            .into_iter()
+            .find(|step| step.status == crate::plan::StepStatus::InProgress)
+        else {
+            return Ok(());
+        };
+        open.evidence.push(evidence);
+        let step_json = serde_json::to_string(&open).map_err(|error| {
+            crate::error::ClientError::Io(format!("plan step serialization: {error}"))
+        })?;
+        self.append_session_event(
+            session_id,
+            "plan_step_updated",
+            &format!(
+                "{{\"taskId\":\"{}\",\"step\":{}}}",
+                escape_json(task_id),
+                step_json
+            ),
+        )
+    }
+
     /// Appends one step's new state.
     ///
     /// The step is written **whole** rather than as a delta. A partial update
@@ -960,7 +1036,7 @@ impl SessionStore {
         let mut plan: Option<crate::plan::TaskPlan> = None;
         for event in active_events(&content) {
             match event.event_type.as_str() {
-                "plan_created" | "plan_revised" => {
+                "plan_created" | "plan_revised" | "plan_resumed" => {
                     let Ok(created) =
                         serde_json::from_value::<crate::plan::TaskPlan>(event.payload.clone())
                     else {
@@ -997,6 +1073,48 @@ impl SessionStore {
             }
         }
         Ok(plan)
+    }
+
+    /// Records that the user reviewed this task's plan and let the work go
+    /// ahead. Spec 21 §5.5.
+    ///
+    /// A separate event rather than a field on the plan, for the same reason
+    /// the log is append-only everywhere else: the approval is a decision
+    /// taken at a moment, and rewriting the plan to carry it would lose which
+    /// version of the steps the user was actually looking at. A revision
+    /// writes `plan_revised` and then this, so there is one event to read
+    /// whether the user approved as-proposed or edited first.
+    pub fn approve_plan(&self, task: &Task, approved_by: &str) -> Result<()> {
+        self.append_session_event(
+            &task.session_id,
+            "plan_approved",
+            &format!(
+                "{{\"taskId\":\"{}\",\"approvedBy\":\"{}\"}}",
+                escape_json(&task.id),
+                escape_json(approved_by)
+            ),
+        )
+    }
+
+    /// Whether this task's plan has been approved.
+    ///
+    /// Reads *active* events, like [`Self::read_task_plan`] and unlike
+    /// [`Self::read_task_usage`]: an approval is part of the conversation, so
+    /// rewinding to before the user saw the plan must take the approval with
+    /// it. The alternative — a rewind that keeps the clearance but drops the
+    /// plan it was granted for — would let a rewind quietly widen what the
+    /// agent may do without asking again.
+    ///
+    /// Absence is `false`, never "unknown": the gate reads this to decide
+    /// whether to pause, and anything that fell through to `true` would let a
+    /// mutating step run unreviewed.
+    pub fn read_plan_approved(&self, session_id: &str, task_id: &str) -> Result<bool> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(false);
+        };
+        Ok(active_events(&content).iter().any(|event| {
+            event.event_type == "plan_approved" && event.text("taskId").as_deref() == Some(task_id)
+        }))
     }
 
     /// Every action that started and never finished, in log order.

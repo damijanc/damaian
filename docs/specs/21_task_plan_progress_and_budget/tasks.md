@@ -76,9 +76,9 @@ Every task's requirements implicitly include this section.
 | 7. `TokenBudgetExhausted` status | **done** | Three guards caught the change; the UI still has no label — see the note below |
 | 8. `agent_max_task_tokens` config, restrict-only | **done** | Restrict-only, diverging from the three existing `agent_*` bounds — see the note below |
 | 9. Ceiling enforcement in the loop | **done** | A weak assertion here survived the mutation — see the note below |
-| 10. Plan carry-over on resume | not started | |
-| 11. Plan review gate | not started | |
-| 12. Plan panel and completion report | not started | **Must also label a token stop** — see Task 7's note |
+| 10. Plan carry-over on resume | **done** | Unblocks 4b's patch evidence and 6's `Editing` phase — see the note below |
+| 11. Plan review gate | **done** | "Mutating" is not decidable from the action alone — see the note below |
+| 12. Plan panel and completion report | not started | **Must also label a token stop** (Task 7) **and render the plan proposal** (Task 11) — see both notes |
 | 13. Harness coverage and documentation | not started | |
 
 ## File Structure
@@ -1764,6 +1764,53 @@ Both plans stay in the log; neither is rewritten.
 
 Proposed message: `Carry a plan forward when a stopped turn is resumed`
 
+#### What this task actually did
+
+All seven gate commands pass; 25 test binaries. This task closes the two debts
+Tasks 4b and 6 recorded against it.
+
+**`resume_plan` carries a plan onto a new task, and the carry is narrow.** Only
+when the previous task in the session ended `TokenBudgetExhausted` *and* its
+plan still has work outstanding. A normally-completed task has nothing to
+resume, and carrying a plan into an unrelated next question would put steps on
+the panel the user never asked for. `plan_resumed` is its own event kind, so the
+log shows the carry rather than hiding it as a second `plan_created`, and the
+original task keeps its plan readable under its own id.
+
+**`append_step_evidence` is the producer that was missing.** A patch is proposed
+in one turn and applied later, after that turn has ended — so `edit.rs` has
+evidence and no in-memory plan to put it on. It appends to whichever step is
+open, and does nothing when none is: a closed step reached its status from its
+own evidence, and adding to it afterwards would change the answer to a question
+already settled. `PatchApplyResult::applied` (Task 4) finally has its consumer.
+
+**Task 6's `TaskPhase::Editing` is now reachable**, and
+`a_step_whose_patch_landed_reports_the_editing_phase` covers it. Until this task
+it was a variant nothing could ever return.
+
+**The mutation that survived, and what it cost to fix.** Task 4b predicted that
+`complete_step`'s `open.evidence = accrued` would silently drop evidence
+recorded outside the turn, and I changed it to `extend` here. Then the mutation
+— putting `= accrued` back — **passed every test**. The fix was correct and
+completely unproven: nothing in the suite had a step carrying evidence at
+`complete_step` time.
+
+`completing_a_carried_step_keeps_evidence_the_turn_never_saw` now drives the
+real path end to end: a turn stops at the ceiling with a step open, the patch it
+proposed is applied afterwards, the user raises the ceiling, the resumed turn
+carries the plan and closes the step. Re-running the mutation fails it with
+`left: 0, right: 1` — the evidence gone, and with it the step's verification.
+
+Second time in two tasks that a mutation check reported on the *test* rather
+than the code. Both times the code was right and the test was worthless, which
+is the failure mode that ships quietly.
+
+**One ordering subtlety.** `complete_step` now computes
+`status_from_evidence(&open.evidence)` *after* the extend, not from the accrual
+alone. Judging a step on a fraction of what is known about it is the same defect
+as dropping the evidence, one step removed — a carried step with a failing
+command behind it would have come out `Completed`.
+
 ---
 
 ### Task 11: Plan review gate
@@ -1832,6 +1879,76 @@ user learns to click through.
 
 Proposed message: `Show a plan for approval before the first mutating step`
 
+#### What this task actually did
+
+**"Mutating" is not decidable from the action alone, and guessing was the
+trap.** The plan said "gate only on the first mutating step", and the obvious
+reading — reuse `tool_action_marker`'s `sideEffecting` flag — would have gated
+every `run_command`, including the sandbox-safe `ls src` that three existing
+tests run inside a plan. That flag answers a different question: *could a crash
+here have left a side effect*, which is conservative on purpose. Whether a
+command *mutates* depends on the command, and `CommandPolicy::classify` is the
+only thing that knows. `action_awaits_plan_review` therefore takes the command
+answer as a closure and the arm passes
+`ValidationOrchestrator::command_needs_approval`, a new pure wrapper over the
+same classifier `propose_command` uses so the two cannot disagree.
+
+Gating on a step's *title* was never on the table: a title is model-authored
+text, and deciding whether work is dangerous from what the model called it is
+the exact pattern §5.3 exists to refuse.
+
+**`propose_patch` is gated even though it is correctly not side-effecting.**
+Proposing writes nothing, and `tool_action_marker` is right to say so. But it
+is the front door to an edit, and a plan first seen *alongside* a prepared
+patch is a plan seen too late to redirect — which is the whole point of the
+gate. That is the one deliberate departure, and it is written down where the
+departure is.
+
+**The approval is a log fact, not turn state.** `plan_approved` /
+`read_plan_approved` sit beside `read_task_plan` and read `active_events` for
+the same reason: an approval is part of the conversation, so a rewind past it
+takes it with it. The alternative — a rewind that drops the plan but keeps the
+clearance granted for it — would let a rewind quietly widen what the agent may
+do. Absence reads as `false`, never "unknown"; the gate is the only consumer,
+and anything falling through to `true` would run a mutating step unreviewed.
+
+**A revision may not delete a step that already ran.** Steps can reach a
+terminal status before the first mutating action (the model can complete
+read-only steps first), so the gate is not always hit on a pristine plan.
+`apply_plan_revision` keeps terminal steps ahead of the user's list and ignores
+a deletion that names one — §5.5's own reason for ruling out mid-execution
+editing, applied to the one moment where editing *is* allowed. `StepStatus`
+gained `is_terminal` for it.
+
+**The deferred tool call is dropped, not replayed.** Nothing was dispatched
+when the turn paused, so there is no marker to finish and nothing to undo. On
+resume the decision goes to the model as a message and it asks again. Replaying
+the stored call would run the step the user may have just revised away, which
+would make the revision cosmetic.
+
+**Five mutations, five distinct tests.** Each of the gate's decisions was
+inverted and failed exactly the test written for it: dropping `!plan_approved`
+fails `approving_the_plan_lets_the_patch_through`; making every command
+mutating fails `a_plan_that_only_reads_is_never_put_up_for_approval` (and three
+pre-existing tests, which is how the `sideEffecting` misreading surfaced);
+letting a revision delete a completed step fails
+`a_revision_may_not_delete_a_step_that_already_ran`; treating a decline as an
+approval fails `a_declined_plan_stops_the_work_it_was_holding_back`; gating a
+turn with no plan fails `a_turn_with_no_plan_is_not_gated`.
+
+**Loop break value refactored.** Three kinds of pause did not fit a
+`(run, response, Option<command>, Option<patch>, stop_reason)` tuple that eight
+`break` sites each had to spell out. They now carry a `TurnProposals` struct,
+so a fourth pause does not mean editing eight sites with no opinion about it.
+
+**One debt, recorded against Task 12.** `resume_after_plan_decision` exists and
+is tested, but nothing in `desktop-shell` calls it yet: `ChatTurnResult`
+carries `plan_proposal` and neither `chat_result_json` nor `appendProposals`
+knows about it. In the app a gated turn shows the plan as readable prose and
+stops — recoverable (the user can start another turn), but with no approve
+control. A shell endpoint with no caller would have been dead code dressed as
+wiring, so it waits for the task that renders the panel.
+
 ---
 
 ### Task 12: Plan panel and completion report
@@ -1855,6 +1972,15 @@ visibly rather than silently picking one.
 Extend `TurnProgress` with `Plan(TaskPlan)`, map it in `turn_progress_event`,
 add the `plan` case to `write_sse_event`, and add a `plan(payload)` handler in
 `app.js` beside the existing `phase(payload)` handler at the dispatch site.
+
+**Also close Task 11's debt:** `ChatTurnResult::plan_proposal` reaches nothing.
+Add `planProposal` to `chat_result_json`, a `/api/resume-plan-stream` route
+calling `ChatOrchestrator::resume_after_plan_decision`, and a
+`payload.planProposal` branch in `appendProposals` — the shared site, so a plan
+proposed after the user approved a command is not silently dropped the way a
+patch once was. The card has to offer reorder, retitle, delete and approve
+(§5.5), and a deletion aimed at a step that already ran is refused by the
+engine, so the card should not offer it.
 
 The completion report distinguishes four outcomes per step — verified complete,
 completed unverified, blocked, skipped — and the summary line never says

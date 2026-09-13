@@ -21,6 +21,19 @@ pub enum StepStatus {
     Skipped,
 }
 
+impl StepStatus {
+    /// Whether this step's outcome is already settled.
+    ///
+    /// `Blocked` counts: the step is not going to finish, and treating it as
+    /// still open would let a plan whose prerequisite failed look like one
+    /// still making progress. What a settled step mainly earns is protection —
+    /// a plan revision may not delete one, because its evidence is tied to a
+    /// state of the repository (§5.5).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Blocked | Self::Skipped)
+    }
+}
+
 /// A file a patch wrote, and the hash of what landed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

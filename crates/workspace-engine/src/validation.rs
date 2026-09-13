@@ -137,6 +137,25 @@ impl ValidationOrchestrator {
         }
     }
 
+    /// Whether this command would stop for a human, answered without storing
+    /// a proposal or writing an audit entry.
+    ///
+    /// Runs the same classifier [`Self::propose_command`] does, so the two
+    /// cannot disagree about a command. It exists separately because spec 21's
+    /// plan review gate has to ask "would this step change anything?" *before*
+    /// the turn commits to proposing it — a proposal stored for a step that
+    /// then never runs would leave a pending command nobody asked about.
+    pub fn command_needs_approval(
+        &self,
+        working_directory: impl AsRef<Path>,
+        command: &str,
+    ) -> bool {
+        let classification = self
+            .command_policy
+            .classify(command, working_directory.as_ref());
+        classification.requires_approval || classification.blocked
+    }
+
     pub fn propose_command(
         &self,
         working_directory: impl AsRef<Path>,

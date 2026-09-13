@@ -14,8 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::plan::{StepStatus, TaskPlan};
 use workspace_engine::{
-    CancelToken, ChatTurnResult, Config, MockModelAdapter, ModelAdapter, ToolCall, TurnProgress,
-    TurnSink, WorkspaceEngine,
+    CancelToken, ChatTurnResult, Config, MockModelAdapter, ModelAdapter, PlanRevisionStep,
+    ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -78,6 +78,39 @@ fn scripted(rounds: Vec<Vec<ToolCall>>) -> MockModelAdapter {
     responses.push("Done.".to_string());
     calls.push(Vec::new());
     MockModelAdapter::new_sequence_with_tool_calls(responses, calls)
+}
+
+/// Continues a turn that stopped for plan review, the way the UI's decision
+/// would.
+fn decide(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    approved: bool,
+    revised: Option<Vec<PlanRevisionStep>>,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+    };
+    engine
+        .chat_orchestrator
+        .resume_after_plan_decision(proposal_id, approved, revised, "tester", adapter, &mut sink)
+        .expect("the resumed turn should run")
+}
+
+/// A `propose_patch` call that would create one new file.
+fn patch_call(path: &str) -> ToolCall {
+    call(
+        "propose_patch",
+        &format!(
+            r#"{{"summary":"Add {path}","files":[{{"path":"{path}","content":"pub fn added() {{}}\n"}}]}}"#
+        ),
+    )
 }
 
 fn plan_of(engine: &WorkspaceEngine, result: &ChatTurnResult) -> Option<TaskPlan> {
@@ -280,6 +313,237 @@ fn no_point_in_the_log_ever_has_two_steps_in_progress() {
         );
     }
     assert!(checked > 3, "the replay should have seen the plan evolve");
+}
+
+// ---------------------------------------------------------------------------
+// The review gate. Proposal §5.5.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_mutating_step_runs_before_the_plan_is_approved() {
+    // Requirement 4. The model plans, then reaches for a patch; the turn stops
+    // and shows the plan instead. A patch proposal here would mean the user's
+    // first sight of the plan came *with* the edit already prepared — too late
+    // to redirect, which is the whole thing the gate is for.
+    let repo = temp_repo("gate");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"Read the retry helper"},{"title":"Add a bounded backoff"}]}"#,
+        )],
+        vec![patch_call("src/retry.rs")],
+    ]);
+
+    let result = ask(&engine, &repo, "Add retry handling", &mut adapter);
+
+    let proposal = result.plan_proposal.expect("the plan should be put up");
+    assert_eq!(proposal.plan.steps.len(), 2);
+    assert_eq!(proposal.deferred_action, "Preparing a patch");
+    assert!(
+        result.patch_proposal.is_none(),
+        "the patch must not be prepared before the plan is reviewed"
+    );
+    assert_eq!(result.task.status.as_str(), "waiting_for_approval");
+}
+
+#[test]
+fn a_plan_that_only_reads_is_never_put_up_for_approval() {
+    // §5.5's other half: a plan whose steps only look at things needs no
+    // approval. `ls src` is sandbox-safe, so the turn runs it, finishes the
+    // step and answers without ever interrupting. A gate that fired here
+    // would be the noise a user learns to click through, which would cost the
+    // gate its meaning on the turn that matters.
+    let repo = temp_repo("readonly");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"List the source"},{"title":"Report"}]}"#,
+        )],
+        vec![call(
+            "run_command",
+            r#"{"command":"ls src","reason":"List"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+    ]);
+
+    let result = ask(&engine, &repo, "What is in src?", &mut adapter);
+
+    assert!(result.plan_proposal.is_none());
+    let plan = plan_of(&engine, &result).expect("the turn proposed a plan");
+    assert_eq!(
+        plan.steps[0].status,
+        StepStatus::Completed,
+        "the read-only step should have run to completion uninterrupted"
+    );
+}
+
+#[test]
+fn a_turn_with_no_plan_is_not_gated() {
+    // The gate reviews a plan. With no plan there is nothing to review, and
+    // manufacturing one to have something to approve would put a panel in
+    // front of every one-line question (§5.1).
+    let repo = temp_repo("noplan");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![vec![patch_call("src/retry.rs")]]);
+
+    let result = ask(&engine, &repo, "Add retry handling", &mut adapter);
+
+    assert!(result.plan_proposal.is_none());
+    assert!(
+        result.patch_proposal.is_some(),
+        "an unplanned patch still reaches its own review, as it did before the gate"
+    );
+}
+
+#[test]
+fn approving_the_plan_lets_the_patch_through() {
+    let repo = temp_repo("approve");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"Read the retry helper"},{"title":"Add a bounded backoff"}]}"#,
+        )],
+        vec![patch_call("src/retry.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+
+    let mut after = scripted(vec![vec![patch_call("src/retry.rs")]]);
+    let result = decide(&engine, &proposal.id, true, None, &mut after);
+
+    assert!(
+        result.patch_proposal.is_some(),
+        "an approved plan should not be asked about again"
+    );
+    assert!(result.plan_proposal.is_none());
+}
+
+#[test]
+fn a_declined_plan_stops_the_work_it_was_holding_back() {
+    let repo = temp_repo("decline");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"Read the retry helper"},{"title":"Add a bounded backoff"}]}"#,
+        )],
+        vec![patch_call("src/retry.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+
+    let mut after = MockModelAdapter::new("I won't make that change.");
+    let result = decide(&engine, &proposal.id, false, None, &mut after);
+
+    assert!(result.patch_proposal.is_none());
+    assert!(
+        !engine
+            .session_store
+            .read_plan_approved(&result.session.id, &result.task.id)
+            .unwrap(),
+        "declining must not record an approval; the next mutating step is still gated"
+    );
+}
+
+#[test]
+fn a_revision_is_what_the_work_goes_on_to_follow() {
+    // §5.5: the user may delete and retitle steps, and both the original and
+    // the revision stay in the log. What runs afterwards is the revision.
+    let repo = temp_repo("revise");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"Read the retry helper"},{"title":"Add a bounded backoff"},{"title":"Rewrite the scheduler"}]}"#,
+        )],
+        vec![patch_call("src/retry.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+    let ids: Vec<String> = proposal
+        .plan
+        .steps
+        .iter()
+        .map(|step| step.id.clone())
+        .collect();
+
+    // Drop the third step and retitle the second.
+    let revision = vec![
+        PlanRevisionStep {
+            id: ids[0].clone(),
+            title: "Read the retry helper".to_string(),
+        },
+        PlanRevisionStep {
+            id: ids[1].clone(),
+            title: "Add a backoff capped at 30s".to_string(),
+        },
+    ];
+    let mut after = scripted(vec![vec![patch_call("src/retry.rs")]]);
+    let result = decide(&engine, &proposal.id, true, Some(revision), &mut after);
+
+    let plan = plan_of(&engine, &result).expect("the revised plan should read back");
+    assert_eq!(plan.steps.len(), 2, "the deleted step is gone");
+    assert_eq!(plan.steps[1].title, "Add a backoff capped at 30s");
+    assert!(
+        log_of(&repo, &result.session.id).contains("plan_revised"),
+        "the revision is its own event, so the log holds both versions"
+    );
+}
+
+#[test]
+fn a_revision_may_not_delete_a_step_that_already_ran() {
+    // A completed step carries evidence tied to a state of the repository.
+    // Honouring a deletion would leave a plan whose history no longer
+    // describes what happened — §5.5's own reason for ruling out mid-execution
+    // editing. The step survives the revision that omits it.
+    let repo = temp_repo("revise-done");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"List the source"},{"title":"Add a bounded backoff"}]}"#,
+        )],
+        vec![call(
+            "run_command",
+            r#"{"command":"ls src","reason":"List"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+        vec![patch_call("src/retry.rs")],
+    ]);
+    let paused = ask(&engine, &repo, "Add retry handling", &mut adapter);
+    let proposal = paused.plan_proposal.expect("the plan should be put up");
+    assert_eq!(proposal.plan.steps[0].status, StepStatus::Completed);
+    let second = proposal.plan.steps[1].id.clone();
+
+    // A revision naming only the second step: the user is trying to drop the
+    // one that already ran.
+    let revision = vec![PlanRevisionStep {
+        id: second,
+        title: "Add a backoff capped at 30s".to_string(),
+    }];
+    let mut after = scripted(vec![vec![patch_call("src/retry.rs")]]);
+    let result = decide(&engine, &proposal.id, true, Some(revision), &mut after);
+
+    let plan = plan_of(&engine, &result).expect("the revised plan should read back");
+    assert_eq!(plan.steps.len(), 2, "the completed step is not deletable");
+    assert_eq!(plan.steps[0].title, "List the source");
+    assert_eq!(plan.steps[0].status, StepStatus::Completed);
+    assert!(
+        !plan.steps[0].evidence.is_empty(),
+        "and it still carries what confirmed it"
+    );
+}
+
+fn log_of(repo: &Path, session_id: &str) -> String {
+    fs::read_to_string(
+        repo.join(".damaian")
+            .join("sessions")
+            .join(format!("{session_id}.jsonl")),
+    )
+    .expect("the session log should exist")
 }
 
 /// Folds a log prefix the way `SessionStore::read_task_plan` does, so a

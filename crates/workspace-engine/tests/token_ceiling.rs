@@ -189,3 +189,211 @@ fn a_ceiling_the_turn_never_approaches_changes_nothing() {
     assert_ne!(result.task.status, TaskStatus::TokenBudgetExhausted);
     assert!(calls > 2, "got {calls} calls");
 }
+
+#[test]
+fn raising_the_ceiling_and_asking_again_resumes_the_plan() {
+    // §5.4: "the plan survives, so the user can raise the ceiling and resume,
+    // and the remaining steps are what resumption starts from." A task is one
+    // turn (`context.md` §3.1), so the second turn is a *new* task and this is
+    // only true if something carries the plan across.
+    let repo = temp_repo("resume");
+    let engine = engine_with_ceiling(&repo, Some(1_000));
+    // Plans first, then keeps working. The mock repeats its last response once
+    // the sequence is exhausted, so the command envelope runs until the ceiling
+    // stops it — which is the situation §5.4 describes.
+    let mut planner = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            "DAMAIAN_COMMAND_V1\nCOMMAND: ls src\nREASON: Look again.\nEND_COMMAND\n".to_string(),
+        ],
+        vec![
+            vec![workspace_engine::ToolCall {
+                id: "c1".to_string(),
+                name: "propose_plan".to_string(),
+                arguments_json: r#"{"steps":[{"title":"Look around"},{"title":"Report back"}]}"#
+                    .to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let (stopped, _) = ask(&engine, &repo, "Look at the source", &mut planner);
+    assert_eq!(stopped.task.status, TaskStatus::TokenBudgetExhausted);
+    let first_plan = engine
+        .session_store
+        .read_task_plan(&stopped.session.id, &stopped.task.id)
+        .unwrap()
+        .expect("the stopped turn had a plan");
+    assert_eq!(first_plan.steps.len(), 2);
+
+    // Raise it and ask again in the same session.
+    let roomy = engine_with_ceiling(&repo, Some(10_000_000));
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+    };
+    let resumed = roomy
+        .chat_orchestrator
+        .ask_with_session(
+            &repo,
+            "Carry on",
+            &[],
+            Some(&stopped.session.id),
+            &mut MockModelAdapter::new("Carrying on."),
+            &mut sink,
+        )
+        .expect("the resumed turn should run");
+
+    let carried = roomy
+        .session_store
+        .read_task_plan(&resumed.session.id, &resumed.task.id)
+        .unwrap()
+        .expect("the plan carried onto the resumed task");
+    assert_eq!(carried.steps.len(), 2);
+    assert_eq!(carried.steps[0].title, first_plan.steps[0].title);
+    assert_ne!(resumed.task.id, stopped.task.id, "resuming is a new task");
+}
+
+#[test]
+fn a_turn_after_a_completed_task_starts_with_no_plan() {
+    // The complement. Carrying a plan into an unrelated next question would put
+    // steps on the panel the user never asked for, so the carry is narrow: only
+    // a ceiling stop, only with work outstanding.
+    let repo = temp_repo("no-carry");
+    let engine = engine_with_ceiling(&repo, None);
+    let mut planner = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Done.".to_string()],
+        vec![
+            vec![workspace_engine::ToolCall {
+                id: "c1".to_string(),
+                name: "propose_plan".to_string(),
+                arguments_json: r#"{"steps":[{"title":"One"},{"title":"Two"}]}"#.to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let (first, _) = ask(&engine, &repo, "Do the thing", &mut planner);
+    assert_eq!(first.task.status, TaskStatus::Complete);
+
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+    };
+    let second = engine
+        .chat_orchestrator
+        .ask_with_session(
+            &repo,
+            "Unrelated question",
+            &[],
+            Some(&first.session.id),
+            &mut MockModelAdapter::new("An answer."),
+            &mut sink,
+        )
+        .expect("the second turn should run");
+
+    assert!(
+        engine
+            .session_store
+            .read_task_plan(&second.session.id, &second.task.id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn completing_a_carried_step_keeps_evidence_the_turn_never_saw() {
+    // Task 4b predicted this and it was right: `complete_step` assigning
+    // `open.evidence = accrued` silently drops anything recorded outside the
+    // current turn. A patch applied *after* the turn that proposed it appends
+    // through the log, and a resumed plan arrives carrying it — so the step
+    // would be judged on this turn's accrual alone, and a verified step would
+    // come out unverified.
+    let repo = temp_repo("carried-evidence");
+    let engine = engine_with_ceiling(&repo, Some(1_000));
+    let mut planner = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            "DAMAIAN_COMMAND_V1\nCOMMAND: ls src\nREASON: Look again.\nEND_COMMAND\n".to_string(),
+        ],
+        vec![
+            vec![workspace_engine::ToolCall {
+                id: "c1".to_string(),
+                name: "propose_plan".to_string(),
+                arguments_json: r#"{"steps":[{"title":"Edit it"},{"title":"Report"}]}"#.to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let (stopped, _) = ask(&engine, &repo, "Edit the source", &mut planner);
+    assert_eq!(stopped.task.status, TaskStatus::TokenBudgetExhausted);
+
+    // What `edit.rs` does when the patch this turn proposed is applied later.
+    engine
+        .session_store
+        .append_step_evidence(
+            &stopped.session.id,
+            &stopped.task.id,
+            workspace_engine::plan::Evidence::PatchApplied {
+                marker_id: "action_1".to_string(),
+                files: vec![workspace_engine::plan::PatchedFile {
+                    path: "src/a.rs".to_string(),
+                    applied_hash: "abc".to_string(),
+                }],
+            },
+        )
+        .unwrap();
+
+    // Raise the ceiling, resume, and close the step out.
+    let roomy = engine_with_ceiling(&repo, Some(10_000_000));
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+    };
+    let resumed = roomy
+        .chat_orchestrator
+        .ask_with_session(
+            &repo,
+            "Carry on",
+            &[],
+            Some(&stopped.session.id),
+            &mut MockModelAdapter::new_sequence_with_tool_calls(
+                vec![String::new(), "Done.".to_string()],
+                vec![
+                    vec![workspace_engine::ToolCall {
+                        id: "c2".to_string(),
+                        name: "complete_step".to_string(),
+                        arguments_json: "{}".to_string(),
+                    }],
+                    Vec::new(),
+                ],
+            ),
+            &mut sink,
+        )
+        .expect("the resumed turn should run");
+
+    let plan = roomy
+        .session_store
+        .read_task_plan(&resumed.session.id, &resumed.task.id)
+        .unwrap()
+        .expect("the plan carried onto the resumed task");
+    assert_eq!(
+        plan.steps[0].evidence.len(),
+        1,
+        "the applied patch must still be behind this step"
+    );
+    assert!(
+        !plan.steps[0].is_unverified(),
+        "a step with an applied patch behind it is not unverified"
+    );
+}

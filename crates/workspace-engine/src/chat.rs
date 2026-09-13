@@ -19,6 +19,7 @@ use crate::model::{
     model_request_json,
 };
 use crate::patch_engine::{PatchEngine, ProposedChange, ProposedFilePatch, ProposedPatch};
+use crate::plan::TaskPlan;
 use crate::secret_scanner::SecretScanner;
 use crate::session::{ChatMessage, Session, SessionStore, Task, TaskStatus, TaskUsage};
 use crate::validation::{
@@ -231,6 +232,37 @@ pub struct AgentPatchProposal {
     pub files: Vec<ProposedFilePatch>,
 }
 
+/// A plan put up for review before the turn takes its first mutating step
+/// (spec 21 §5.5).
+///
+/// Carries the whole plan rather than a summary: the user is being asked to
+/// reorder, retitle or delete steps, and cannot do that from a count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPlanProposal {
+    /// The id to hand back to
+    /// [`ChatOrchestrator::resume_after_plan_decision`]. Distinct from the
+    /// task id: a task may be reviewed once, but the pending turn behind the
+    /// pause is what the id addresses.
+    pub id: String,
+    pub plan: TaskPlan,
+    /// What the turn was about to do when it stopped, in the same words the
+    /// progress line uses — so the card can say what the approval unblocks
+    /// rather than asking the user to approve in the abstract.
+    pub deferred_action: String,
+}
+
+/// One step of a user's revision to a proposed plan.
+///
+/// Identifies the step by id rather than position so a reorder and a deletion
+/// in the same revision cannot be misread as each other. A step the plan does
+/// not contain is ignored, and one the user omits is dropped — that is how
+/// deletion is expressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanRevisionStep {
+    pub id: String,
+    pub title: String,
+}
+
 // No `Eq`: it carries a `ModelRun`, whose `reported_cost` is an `Option<f64>`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatTurnResult {
@@ -241,6 +273,10 @@ pub struct ChatTurnResult {
     pub response: String,
     pub command_proposal: Option<AgentCommandProposal>,
     pub patch_proposal: Option<AgentPatchProposal>,
+    /// The turn stopped to have its plan reviewed before taking its first
+    /// mutating step. Resumed through
+    /// [`ChatOrchestrator::resume_after_plan_decision`].
+    pub plan_proposal: Option<AgentPlanProposal>,
     /// The user stopped this turn. Distinct from a failure: `response` holds
     /// whatever had been generated, and it is persisted.
     pub cancelled: bool,
@@ -256,6 +292,19 @@ pub struct ChatTurnResult {
     /// what the provider charged, the other is the user's own arithmetic, and
     /// presenting the second as the first would launder a guess into a fact.
     pub estimated_cost: Option<f64>,
+}
+
+/// What a turn ended holding out for a human, if anything.
+///
+/// Grouped rather than carried as three separate `Option`s through the loop's
+/// break value: every `break` site has to name all of them, and a fourth kind
+/// of pause would otherwise mean editing eight places that have no opinion
+/// about it.
+#[derive(Debug, Default)]
+struct TurnProposals {
+    command: Option<AgentCommandProposal>,
+    patch: Option<AgentPatchProposal>,
+    plan: Option<AgentPlanProposal>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -559,6 +608,16 @@ impl ChatOrchestrator {
         task = self
             .session_store
             .update_task_status(&task, TaskStatus::PreparingContext, None)?;
+        // §5.4: a turn stopped by the token ceiling is recoverable — "the user
+        // can raise the ceiling and resume, and the remaining steps are what
+        // resumption starts from". A task is one turn, so this new task would
+        // otherwise start with no plan at all (`context.md` §3.1).
+        //
+        // Narrow on purpose: only a task stopped by the *ceiling*, and only
+        // while its plan still has work outstanding. Carrying a plan into an
+        // unrelated next question would put steps on the panel the user never
+        // asked for, and a normally-completed task has nothing to resume.
+        self.carry_plan_from_a_token_stop(&session.id, &task)?;
         let user_message =
             self.session_store
                 .append_message(&session.id, Some(&task.id), "user", prompt)?;
@@ -642,6 +701,17 @@ impl ChatOrchestrator {
         decision_options: ResumeDecisionOptions,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(proposal_id)?;
+        // A plan review shares the pending-turn file but not this path: there
+        // is no dispatched call to execute or decline, and falling through to
+        // the shell-command branch below would run `last_content` as a
+        // command. Refused loudly rather than guessed at — and the pending
+        // turn is put back, so the right resume can still find it.
+        if pending.plan_review.is_some() {
+            self.pending_commands.save(&pending)?;
+            return Err(ClientError::InvalidInput(format!(
+                "Proposal {proposal_id} is a plan review; resume it with resume_after_plan_decision"
+            )));
+        }
         let repository_root = PathBuf::from(&pending.repository_root);
         let mut messages = pending.messages;
 
@@ -800,6 +870,131 @@ impl ChatOrchestrator {
         )
     }
 
+    /// Continues a chat turn that stopped to have its plan reviewed before
+    /// taking its first mutating step (spec 21 §5.5).
+    ///
+    /// `revised` is the user's edit of the step list: steps in the order they
+    /// should run, each naming an existing step id, with whatever title the
+    /// user wants it to carry. Omitting a step deletes it. `None` means the
+    /// plan was approved as proposed.
+    ///
+    /// A revision is recorded as `plan_revised` and the approval as
+    /// `plan_approved`, in that order, so the log holds both what the model
+    /// proposed and what the user decided to run — and `approved: false`
+    /// records neither, because nothing was approved.
+    ///
+    /// Nothing was dispatched when the turn paused, so there is no call to
+    /// execute or discard here: the turn resumes with the decision put to the
+    /// model as a message, and the model asks again for whatever it still
+    /// needs. Replaying the deferred call instead would run the step the user
+    /// may have just deleted.
+    pub fn resume_after_plan_decision(
+        &self,
+        proposal_id: &str,
+        approved: bool,
+        revised: Option<Vec<PlanRevisionStep>>,
+        approved_by: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let pending = self.pending_commands.take(proposal_id)?;
+        let Some(review) = pending.plan_review.clone() else {
+            self.pending_commands.save(&pending)?;
+            return Err(ClientError::InvalidInput(format!(
+                "Proposal {proposal_id} is not a plan review"
+            )));
+        };
+        let repository_root = PathBuf::from(&pending.repository_root);
+        let mut messages = pending.messages;
+
+        let plan = self
+            .session_store
+            .read_task_plan(&pending.session.id, &pending.task.id)?;
+        let note = if !approved {
+            // The same shape as a declined command: the work does not happen,
+            // and the model is told plainly rather than left to infer it from
+            // a tool result that never arrives.
+            "The user reviewed this plan and declined it. Do not make any change to the repository. Explain briefly what you were going to do and what you would need from the user to proceed differently."
+                .to_string()
+        } else {
+            let applied = match (revised, plan) {
+                (Some(revision), Some(current)) => {
+                    let revised_plan = apply_plan_revision(&current, &revision);
+                    self.session_store
+                        .revise_plan(&pending.task, &revised_plan)?;
+                    Some(revised_plan)
+                }
+                // A revision with no plan to revise, or no revision at all:
+                // either way there is nothing to rewrite, and approving is
+                // still a decision worth recording.
+                (_, plan) => plan,
+            };
+            self.session_store
+                .approve_plan(&pending.task, approved_by)?;
+            match applied {
+                Some(plan) => format!(
+                    "The user reviewed the plan and approved it. The plan is now:\n{}\nContinue with the current step. You were about to: {}.",
+                    plan.steps
+                        .iter()
+                        .enumerate()
+                        .map(|(index, step)| format!("{}. {}", index + 1, step.title))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    review.deferred_action
+                ),
+                None => format!(
+                    "The user reviewed the plan and approved it. Continue with the current step. You were about to: {}.",
+                    review.deferred_action
+                ),
+            }
+        };
+
+        self.audit_log.record(
+            "plan_review_decision",
+            &[
+                ("actor", approved_by.to_string()),
+                ("sessionId", pending.session.id.clone()),
+                ("taskId", pending.task.id.clone()),
+                ("proposalId", proposal_id.to_string()),
+                (
+                    "decision",
+                    if approved { "approved" } else { "declined" }.to_string(),
+                ),
+            ],
+        )?;
+
+        self.session_store.append_message(
+            &pending.session.id,
+            Some(&pending.task.id),
+            "user",
+            &note,
+        )?;
+        messages.push(
+            ModelMessage::assistant(pending.last_content.clone())
+                .with_reasoning_content(pending.reasoning_content.clone()),
+        );
+        messages.push(ModelMessage::user(note));
+
+        self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
+        let task = self.session_store.update_task_status(
+            &pending.task,
+            TaskStatus::PreparingContext,
+            None,
+        )?;
+
+        self.run_agentic_turn(
+            &repository_root,
+            pending.session,
+            task,
+            pending.context_files,
+            messages,
+            pending.round + 1,
+            model_adapter,
+            sink,
+            pending.turn_options,
+        )
+    }
+
     /// Takes the checkpoint the turn can be rewound to. Best-effort: a store
     /// that cannot be written is recorded in the audit log and the turn still
     /// runs, because refusing to answer at all would be a worse failure than
@@ -925,6 +1120,39 @@ impl ChatOrchestrator {
     /// resumed later via [`Self::resume_after_command_decision`].
     // Threads the full per-turn state (session, task, messages, round) plus the
     // model adapter and token sink through one recursive-ish loop.
+    /// Carries a plan onto `task` when the previous task in the session was
+    /// stopped by the token ceiling with work still outstanding.
+    ///
+    /// Best-effort by design: a session whose log cannot be read should not
+    /// stop the user asking a question, and the worst case of skipping it is a
+    /// turn that starts a fresh plan.
+    fn carry_plan_from_a_token_stop(&self, session_id: &str, task: &Task) -> Result<()> {
+        let tasks = self.session_store.read_tasks(session_id)?;
+        // The one before this turn's own, which was appended a moment ago.
+        let Some(previous) = tasks.iter().rev().find(|candidate| candidate.id != task.id) else {
+            return Ok(());
+        };
+        if previous.status != TaskStatus::TokenBudgetExhausted {
+            return Ok(());
+        }
+        let Some(plan) = self
+            .session_store
+            .read_task_plan(session_id, &previous.id)?
+        else {
+            return Ok(());
+        };
+        let outstanding = plan.steps.iter().any(|step| {
+            matches!(
+                step.status,
+                crate::plan::StepStatus::Pending | crate::plan::StepStatus::InProgress
+            )
+        });
+        if !outstanding {
+            return Ok(());
+        }
+        self.session_store.resume_plan(task, &previous.id)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_agentic_turn(
         &self,
@@ -985,10 +1213,25 @@ impl ChatOrchestrator {
         // itself is written through as it changes, so a crash loses at most the
         // evidence of the step that was still running — which is the step whose
         // outcome was genuinely unknown.
-        let mut plan: Option<crate::plan::TaskPlan> = None;
+        // Seeded from the log rather than left empty: a resumed turn already
+        // has a plan (see `carry_plan_from_a_token_stop`), and starting this
+        // at `None` would make `complete_step` report "there is no plan" while
+        // the panel showed one.
+        let mut plan = self
+            .session_store
+            .read_task_plan(&session.id, &task.id)
+            .unwrap_or_default();
         let mut step_evidence: Vec<crate::plan::Evidence> = Vec::new();
+        // Read from the log for the same reason the plan is: the approval is a
+        // decision the user took, and a turn resumed after a restart must not
+        // ask for it again. It is only ever read here — the gate below is the
+        // single place it decides anything.
+        let plan_approved = self
+            .session_store
+            .read_plan_approved(&session.id, &task.id)
+            .unwrap_or(false);
 
-        let (final_run, response, command_proposal, patch_proposal, stop_reason) = loop {
+        let (final_run, response, proposals, stop_reason) = loop {
             // Checked before each round rather than only mid-stream: stopping
             // here is what saves a whole model call, and it is the only point
             // that catches a stop arriving during context assembly or a tool.
@@ -1051,7 +1294,12 @@ impl ChatOrchestrator {
                         &self.config.model_name,
                     );
                     stopped.content = response.clone();
-                    break (stopped, response, None, None, StopReason::TokenBudget);
+                    break (
+                        stopped,
+                        response,
+                        TurnProposals::default(),
+                        StopReason::TokenBudget,
+                    );
                 }
             }
 
@@ -1234,9 +1482,19 @@ impl ChatOrchestrator {
                     let response = tool_budget_exhausted_response(max_rounds);
                     let mut exhausted_run = model_run;
                     exhausted_run.content = response.clone();
-                    break (exhausted_run, response, None, None, StopReason::ToolBudget);
+                    break (
+                        exhausted_run,
+                        response,
+                        TurnProposals::default(),
+                        StopReason::ToolBudget,
+                    );
                 }
-                break (model_run, redacted, None, None, StopReason::Answered);
+                break (
+                    model_run,
+                    redacted,
+                    TurnProposals::default(),
+                    StopReason::Answered,
+                );
             }
 
             let (matched_tool_call, decoded_tool_action, tool_decode_error) =
@@ -1254,7 +1512,12 @@ impl ChatOrchestrator {
                 // instead so the model can retry within the remaining rounds —
                 // the same recovery the restricted-path patch arm uses.
                 let Some(undecodable) = model_run.tool_calls.first().cloned() else {
-                    break (model_run, redacted, None, None, StopReason::Answered);
+                    break (
+                        model_run,
+                        redacted,
+                        TurnProposals::default(),
+                        StopReason::Answered,
+                    );
                 };
                 let note = tool_decode_error.unwrap_or_else(|| {
                     undecodable_tool_call_note(&undecodable, model_run.truncated)
@@ -1287,6 +1550,75 @@ impl ChatOrchestrator {
                 round += 1;
                 continue;
             };
+
+            // The review gate (§5.5). Checked before the action is bracketed,
+            // let alone dispatched: there is no marker to finish and nothing
+            // to undo, because nothing has happened yet. That is the whole
+            // point of putting it here rather than beside the approval card
+            // the action would have raised on its own — the user is being
+            // asked about the plan, not about this one step, and asking after
+            // the first edit had already been prepared would be asking too
+            // late to redirect.
+            //
+            // A turn with no plan is not gated. The gate exists to review a
+            // plan, and inventing one to have something to approve would put a
+            // panel in front of every trivial question (§5.1).
+            if let Some(current) = plan.as_ref()
+                && !plan_approved
+                && action_awaits_plan_review(&tool_action, |command| {
+                    self.validation_orchestrator
+                        .command_needs_approval(repository_root, command)
+                })
+            {
+                let deferred_action = tool_action_label(&tool_action);
+                let response = plan_review_response(current, &deferred_action);
+                let proposal_id = create_id("planreview");
+                self.pending_commands.save(&PendingChatTurn {
+                    proposal_id: proposal_id.clone(),
+                    session: session.clone(),
+                    task: task.clone(),
+                    repository_root: repository_root.to_string_lossy().to_string(),
+                    context_files: context_files.clone(),
+                    round,
+                    messages: messages.clone(),
+                    // The deferred call is deliberately dropped rather than
+                    // stored: it was never dispatched, and the resumed turn
+                    // asks the model again rather than replaying a request the
+                    // user may have just revised out of the plan.
+                    matched_tool_call: None,
+                    last_content: redacted.clone(),
+                    turn_options,
+                    reasoning_content: model_run.reasoning_content.clone(),
+                    mcp_call: None,
+                    web_diagnostic_call: None,
+                    plan_review: Some(PendingPlanReview {
+                        deferred_action: deferred_action.clone(),
+                    }),
+                })?;
+                self.note_pending_approvals(
+                    &session,
+                    &task,
+                    vec![PendingApproval {
+                        kind: "plan".to_string(),
+                        proposal_id: proposal_id.clone(),
+                    }],
+                );
+                let mut proposal_run = model_run;
+                proposal_run.content = response.clone();
+                break (
+                    proposal_run,
+                    response,
+                    TurnProposals {
+                        plan: Some(AgentPlanProposal {
+                            id: proposal_id,
+                            plan: current.clone(),
+                            deferred_action,
+                        }),
+                        ..Default::default()
+                    },
+                    StopReason::Answered,
+                );
+            }
 
             if matches!(tool_action, ToolAction::WebDiagnostic(_)) {
                 web_debug_mode = true;
@@ -1353,6 +1685,7 @@ impl ChatOrchestrator {
                             reasoning_content: model_run.reasoning_content.clone(),
                             mcp_call: None,
                             web_diagnostic_call: None,
+                            plan_review: None,
                         })?;
                         self.note_pending_approvals(
                             &session,
@@ -1372,8 +1705,10 @@ impl ChatOrchestrator {
                         break (
                             proposal_run,
                             response,
-                            Some(agent_command_proposal(&self.config, &proposal)),
-                            None,
+                            TurnProposals {
+                                command: Some(agent_command_proposal(&self.config, &proposal)),
+                                ..Default::default()
+                            },
                             StopReason::Answered,
                         );
                     }
@@ -1419,8 +1754,10 @@ impl ChatOrchestrator {
                             break (
                                 proposal_run,
                                 response,
-                                None,
-                                Some(proposal),
+                                TurnProposals {
+                                    patch: Some(proposal),
+                                    ..Default::default()
+                                },
                                 StopReason::Answered,
                             );
                         }
@@ -1499,18 +1836,27 @@ impl ChatOrchestrator {
                         // how the step ended. §5.3: the status is a function
                         // of the evidence, and this is the only place a step
                         // reaches a terminal status.
-                        let evidence = std::mem::take(&mut step_evidence);
-                        let status = crate::plan::status_from_evidence(&evidence);
+                        let accrued = std::mem::take(&mut step_evidence);
                         let now = now_millis();
                         let mut finished_title = String::new();
+                        let mut status = crate::plan::StepStatus::Completed;
                         if let Some(open) = current
                             .steps
                             .iter_mut()
                             .find(|step| step.status == crate::plan::StepStatus::InProgress)
                         {
+                            // Extends rather than replaces. A step can already
+                            // carry evidence this turn never saw: a patch
+                            // applied after the turn that proposed it appends
+                            // through the log (`edit.rs`), and a resumed plan
+                            // arrives with everything its earlier turns
+                            // recorded. Assigning here would silently drop
+                            // both, and the step would then be judged on a
+                            // fraction of what is known about it.
+                            open.evidence.extend(accrued);
+                            status = crate::plan::status_from_evidence(&open.evidence);
                             open.status = status;
                             open.completed_at_ms = Some(now);
-                            open.evidence = evidence;
                             finished_title = open.title.clone();
                             let closed = open.clone();
                             self.session_store.update_plan_step(&task, &closed)?;
@@ -1655,6 +2001,7 @@ impl ChatOrchestrator {
                             reasoning_content: model_run.reasoning_content.clone(),
                             mcp_call: None,
                             web_diagnostic_call: Some(PendingWebDiagnosticCall { call }),
+                            plan_review: None,
                         })?;
                         self.note_pending_approvals(
                             &session,
@@ -1674,8 +2021,10 @@ impl ChatOrchestrator {
                         break (
                             proposal_run,
                             response,
-                            Some(proposal),
-                            None,
+                            TurnProposals {
+                                command: Some(proposal),
+                                ..Default::default()
+                            },
                             StopReason::Answered,
                         );
                     }
@@ -1757,6 +2106,7 @@ impl ChatOrchestrator {
                                 arguments_json,
                             }),
                             web_diagnostic_call: None,
+                            plan_review: None,
                         })?;
                         self.note_pending_approvals(
                             &session,
@@ -1771,8 +2121,10 @@ impl ChatOrchestrator {
                         break (
                             proposal_run,
                             response,
-                            Some(proposal),
-                            None,
+                            TurnProposals {
+                                command: Some(proposal),
+                                ..Default::default()
+                            },
                             StopReason::Answered,
                         );
                     }
@@ -1871,18 +2223,29 @@ impl ChatOrchestrator {
         // A turn that ends awaiting a decision records *which* proposal, so a
         // restart reattaches it instead of rebuilding a card from partial data
         // (§5.5).
-        let pending = command_proposal
+        let pending = proposals
+            .command
             .as_ref()
             .map(|proposal| crate::session::PendingApprovalRef {
                 kind: "command".to_string(),
                 proposal_id: proposal.id.clone(),
             })
             .or_else(|| {
-                patch_proposal
+                proposals
+                    .patch
                     .as_ref()
                     .map(|proposal| crate::session::PendingApprovalRef {
                         kind: "patch".to_string(),
                         proposal_id: proposal.patch_id.clone(),
+                    })
+            })
+            .or_else(|| {
+                proposals
+                    .plan
+                    .as_ref()
+                    .map(|proposal| crate::session::PendingApprovalRef {
+                        kind: "plan".to_string(),
+                        proposal_id: proposal.id.clone(),
                     })
             });
         task = match &pending {
@@ -1907,10 +2270,12 @@ impl ChatOrchestrator {
                 ("model", final_run.model.clone()),
                 (
                     "status",
-                    if command_proposal.is_some() {
+                    if proposals.command.is_some() {
                         "command_approval_required".to_string()
-                    } else if patch_proposal.is_some() {
+                    } else if proposals.patch.is_some() {
                         "patch_proposal_ready".to_string()
+                    } else if proposals.plan.is_some() {
+                        "plan_review_required".to_string()
                     } else if stop_reason == StopReason::ToolBudget {
                         "tool_budget_exhausted".to_string()
                     } else if stop_reason == StopReason::TokenBudget {
@@ -1924,9 +2289,11 @@ impl ChatOrchestrator {
             ],
         )?;
         // A turn waiting on a command decision is not over: it resumes through
-        // `resume_after_command_decision` and seals then. Anything else has
-        // left the repository in the state a rewind must compare against.
-        if command_proposal.is_none() {
+        // `resume_after_command_decision` and seals then. A plan review is the
+        // same shape — nothing has happened yet and the turn continues through
+        // `resume_after_plan_decision`. Anything else has left the repository
+        // in the state a rewind must compare against.
+        if proposals.command.is_none() && proposals.plan.is_none() {
             self.seal_turn_checkpoint(repository_root, &session, &task);
         }
         // From the log, not from a running total: the number the client shows
@@ -1949,8 +2316,9 @@ impl ChatOrchestrator {
             model_run: final_run,
             context_files,
             response,
-            command_proposal,
-            patch_proposal,
+            command_proposal: proposals.command,
+            patch_proposal: proposals.patch,
+            plan_proposal: proposals.plan,
             cancelled: false,
             usage,
             estimated_cost,
@@ -2021,6 +2389,7 @@ impl ChatOrchestrator {
             response,
             command_proposal: None,
             patch_proposal: None,
+            plan_proposal: None,
             cancelled: true,
             usage,
             estimated_cost,
@@ -2058,6 +2427,18 @@ struct PendingChatTurn {
     mcp_call: Option<PendingMcpCall>,
     #[serde(default)]
     web_diagnostic_call: Option<PendingWebDiagnosticCall>,
+    /// Present when the pause is a plan review rather than an action approval
+    /// (spec 21 §5.5). Nothing was dispatched, so there is no call to carry —
+    /// only what the turn was about to do, which the review card shows and the
+    /// resumed turn puts back in front of the model. `#[serde(default)]` keeps
+    /// pending turns written before the gate existed loadable.
+    #[serde(default)]
+    plan_review: Option<PendingPlanReview>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingPlanReview {
+    deferred_action: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2266,6 +2647,84 @@ fn tool_action_marker(action: &ToolAction) -> (&'static str, String, bool) {
             ..
         } => ("mcp_call", format!("{server_id}/{tool_name}"), true),
     }
+}
+
+/// Whether taking this action would change something outside the session log,
+/// and so must wait for the plan to be reviewed (spec 21 §5.5).
+///
+/// Derived from [`tool_action_marker`]'s side-effect answer so that question
+/// keeps living in one place, with two deliberate departures:
+///
+/// * `propose_patch` writes nothing to the repository and is correctly *not*
+///   side-effecting for crash recovery — but it is the front door to an edit,
+///   and §5.5 exists to put the plan in front of the user before edits start.
+/// * `run_command` is answered by `command_needs_approval`, not by the action
+///   alone. Whether a command mutates depends on the command, and the command
+///   policy is the only thing that knows: a sandbox-safe `ls` is a read, and
+///   gating on it would put a plan up for approval for a turn that only looks
+///   at things — the noise §5.5 warns the user learns to click through.
+fn action_awaits_plan_review(
+    action: &ToolAction,
+    command_needs_approval: impl FnOnce(&str) -> bool,
+) -> bool {
+    match action {
+        ToolAction::ProposePatch(_) => true,
+        ToolAction::Command(request) => command_needs_approval(&request.command),
+        other => tool_action_marker(other).2,
+    }
+}
+
+/// Rebuilds a plan from the user's revision, in the order the user put the
+/// steps in.
+///
+/// A step the user omits is dropped — **unless it has already reached a
+/// terminal status**. A completed or blocked step carries evidence tied to a
+/// state of the repository, and deleting it would leave a plan whose history
+/// no longer describes what happened: the reason §5.5 rules out mid-execution
+/// editing in the first place. Terminal steps keep their original order, ahead
+/// of whatever the user chose to keep, so what already ran still reads as
+/// having run first.
+///
+/// A revision naming a step the plan does not have is ignored, for the same
+/// reason `read_task_plan` ignores an update for an unknown step id: the step
+/// list is not something a revision may grow.
+///
+/// Everything but the title is carried over from the existing step. The user
+/// is reordering and retitling work, not asserting anything about its status
+/// or its evidence — those remain the engine's to decide (§5.3).
+fn apply_plan_revision(current: &TaskPlan, revision: &[PlanRevisionStep]) -> TaskPlan {
+    let mut revised = current.clone();
+    let mut steps: Vec<crate::plan::PlanStep> = current
+        .steps
+        .iter()
+        .filter(|step| step.status.is_terminal())
+        .cloned()
+        .collect();
+    for edit in revision {
+        let Some(existing) = current.steps.iter().find(|step| step.id == edit.id) else {
+            continue;
+        };
+        if existing.status.is_terminal() {
+            continue;
+        }
+        let mut step = existing.clone();
+        step.title = edit.title.clone();
+        steps.push(step);
+    }
+    revised.steps = steps;
+    revised
+}
+
+/// The text a paused turn shows while its plan is under review.
+fn plan_review_response(plan: &TaskPlan, deferred_action: &str) -> String {
+    let mut text = String::from("Before going further, here is the plan:\n");
+    for (index, step) in plan.steps.iter().enumerate() {
+        text.push_str(&format!("{}. {}\n", index + 1, step.title));
+    }
+    text.push_str(&format!(
+        "\nWaiting for your review before the first step that changes anything ({deferred_action}). You can reorder the steps, retitle them, remove any you do not want, or approve the plan as it stands."
+    ));
+    text
 }
 
 /// What to show the user while a tool runs. Lives here rather than in the UI so
