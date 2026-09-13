@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use workspace_engine::plan::{Evidence, PlanStep, StepStatus, TaskPlan, status_from_evidence};
+use workspace_engine::plan::{
+    Evidence, PlanStep, StepStatus, TaskPhase, TaskPlan, status_from_evidence,
+};
 use workspace_engine::{SessionStore, Task};
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -446,4 +448,107 @@ fn a_patch_applied_completes_the_step() {
         }],
     };
     assert_eq!(status_from_evidence(&[evidence]), StepStatus::Completed);
+}
+
+// ---------------------------------------------------------------------------
+// The phase is derived, never set. Requirement 3 and §5.1.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_phase_cannot_contradict_the_steps() {
+    // §6: derived from step state. A plan with work still in flight must not
+    // report Complete however its steps are titled.
+    let mut plan = TaskPlan::new("task_1", 0);
+    plan.steps.push(step("step_1", StepStatus::InProgress));
+    plan.steps.push(step("step_2", StepStatus::Pending));
+    assert_ne!(plan.phase(false), TaskPhase::Complete);
+
+    for item in plan.steps.iter_mut() {
+        item.status = StepStatus::Completed;
+    }
+    assert_eq!(plan.phase(false), TaskPhase::Complete);
+}
+
+#[test]
+fn a_blocked_step_keeps_the_plan_out_of_complete() {
+    let mut plan = TaskPlan::new("task_1", 0);
+    plan.steps.push(step("step_1", StepStatus::Completed));
+    plan.steps.push(step("step_2", StepStatus::Blocked));
+    assert_ne!(plan.phase(false), TaskPhase::Complete);
+}
+
+#[test]
+fn a_skipped_step_does_not_block_completion() {
+    // Skipped is a terminal answer — the user or the plan decided it was not
+    // needed — unlike Blocked, which is work that failed.
+    let mut plan = TaskPlan::new("task_1", 0);
+    plan.steps.push(step("step_1", StepStatus::Completed));
+    plan.steps.push(step("step_2", StepStatus::Skipped));
+    assert_eq!(plan.phase(false), TaskPhase::Complete);
+}
+
+#[test]
+fn a_turn_that_never_finished_its_step_is_not_complete() {
+    // A turn can end without calling complete_step, which leaves the step open.
+    // That is honest — the work was never declared finished — and the phase
+    // must not round it up to Complete.
+    let mut plan = TaskPlan::new("task_1", 0);
+    plan.steps.push(step("step_1", StepStatus::Completed));
+    plan.steps.push(step("step_2", StepStatus::InProgress));
+    assert_ne!(plan.phase(false), TaskPhase::Complete);
+}
+
+#[test]
+fn the_phase_follows_the_newest_evidence_rather_than_the_oldest() {
+    // Chronological, not "any". A step that read a file and then ran a check is
+    // validating; treating it as understanding because a read happened at some
+    // point would pin the phase to whatever the turn did first.
+    let mut plan = TaskPlan::new("task_1", 0);
+    let mut first = step("step_1", StepStatus::Completed);
+    first.evidence = vec![Evidence::FileRead {
+        path: "src/upload.rs".to_string(),
+        hash: "abc".to_string(),
+    }];
+    plan.steps.push(first);
+    let mut second = step("step_2", StepStatus::InProgress);
+    second.evidence = vec![command_exit(Some(0))];
+    plan.steps.push(second);
+
+    assert_eq!(plan.phase(false), TaskPhase::Validating);
+}
+
+#[test]
+fn a_plan_whose_work_has_not_started_is_planning() {
+    let plan = TaskPlan::new("task_1", 0);
+    assert_eq!(plan.phase(false), TaskPhase::Planning);
+}
+
+#[test]
+fn work_with_nothing_observed_yet_is_understanding() {
+    let mut plan = TaskPlan::new("task_1", 0);
+    plan.steps.push(step("step_1", StepStatus::InProgress));
+    assert_eq!(plan.phase(false), TaskPhase::Understanding);
+}
+
+#[test]
+fn awaiting_review_is_reviewing_even_with_a_command_behind_it() {
+    // `Reviewing` is the one phase the plan cannot see for itself: a patch
+    // waiting on a human is a fact about the task, not about the steps. It is
+    // passed in rather than guessed, which is why it can outrank the evidence.
+    let mut plan = TaskPlan::new("task_1", 0);
+    let mut open = step("step_1", StepStatus::InProgress);
+    open.evidence = vec![command_exit(Some(0))];
+    plan.steps.push(open);
+
+    assert_eq!(plan.phase(false), TaskPhase::Validating);
+    assert_eq!(plan.phase(true), TaskPhase::Reviewing);
+}
+
+#[test]
+fn a_finished_plan_is_complete_even_while_something_awaits_review() {
+    // Completion outranks review: every step is terminal, so there is no work
+    // left for a review to gate.
+    let mut plan = TaskPlan::new("task_1", 0);
+    plan.steps.push(step("step_1", StepStatus::Completed));
+    assert_eq!(plan.phase(true), TaskPhase::Complete);
 }

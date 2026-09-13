@@ -83,7 +83,7 @@ pub use patch_engine::{
     ProposedFilePatch, ProposedPatch, parse_hunk_selection,
 };
 pub use path_policy::PathPolicy;
-pub use plan::{Evidence, PatchedFile, PlanStep, StepStatus, TaskPlan};
+pub use plan::{Evidence, PatchedFile, PlanStep, StepStatus, TaskPhase, TaskPlan};
 pub use recovery::{
     ReattachedApproval, RecoveredTask, abandon, classify_all, classify_session, headline,
     mark_failed, reattach_pending_approvals, resume, resume_allowed, resume_blocked_reason,

@@ -107,6 +107,25 @@ impl PlanStep {
     }
 }
 
+/// What the work is about, as distinct from which stage of the agent loop is
+/// executing.
+///
+/// Deliberately **not** an extension of `chat::PhaseKind`
+/// (`Context`/`Model`/`Tool`/`Finalizing`), which drives the spinner. Those are
+/// orthogonal axes: a `PhaseKind::Model` occurs during every one of these six,
+/// and merging them would produce a type whose variants are not mutually
+/// exclusive. See `context.md` §3.7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPhase {
+    Understanding,
+    Planning,
+    Editing,
+    Validating,
+    Reviewing,
+    Complete,
+}
+
 /// Requirement 6's rule, mechanically.
 ///
 /// The model does not appear in this function's inputs. That is the whole
@@ -168,5 +187,67 @@ impl TaskPlan {
             .filter(|step| step.status == StepStatus::InProgress)
             .count()
             > 1
+    }
+
+    /// Requirement 3's phase, **derived** from step state and never stored.
+    ///
+    /// §5.1: derived rather than set independently, so the phase cannot say
+    /// "validating" while every validation step is still pending. There is no
+    /// setter, and that is the design — a stored phase is a second source of
+    /// truth that can disagree with the first.
+    ///
+    /// `awaiting_review` is passed in because it is the one phase a plan cannot
+    /// see for itself: a patch waiting on a human is a fact about the *task*,
+    /// not about its steps. Guessing it from the steps would mean inventing it;
+    /// taking it as an argument makes the dependency visible at every call site.
+    ///
+    /// The rule, in precedence order:
+    ///
+    /// 1. Every step terminal (`Completed` or `Skipped`) → `Complete`. A
+    ///    `Blocked` step is *not* terminal here: work that failed is work
+    ///    outstanding, and §5.6 requires the summary never to say "complete"
+    ///    for a plan holding one.
+    /// 2. `awaiting_review` → `Reviewing`. Ranked below completion because a
+    ///    finished plan has no work left for a review to gate.
+    /// 3. Otherwise the **newest** evidence anywhere in the plan, in step
+    ///    order: a command → `Validating`, an applied patch → `Editing`, a file
+    ///    read → `Understanding`.
+    /// 4. Work started but nothing observed yet → `Understanding`.
+    /// 5. No steps at all → `Planning`.
+    ///
+    /// Newest rather than "any", because "any" pins the phase to whatever the
+    /// turn did first: a step that read a file and then ran a check is
+    /// validating, not understanding.
+    ///
+    /// Two honest limits, recorded in proposal §7 rather than hidden:
+    /// `Planning` is nearly unreachable, because a plan is created with its
+    /// first step already open in the same event; and `Editing` cannot be
+    /// reached until `Evidence::PatchApplied` can be attached, which needs the
+    /// cross-turn continuation from the resume work — a patch is applied after
+    /// the turn that proposed it has ended.
+    pub fn phase(&self, awaiting_review: bool) -> TaskPhase {
+        if self.steps.is_empty() {
+            return TaskPhase::Planning;
+        }
+        let all_terminal = self
+            .steps
+            .iter()
+            .all(|step| matches!(step.status, StepStatus::Completed | StepStatus::Skipped));
+        if all_terminal {
+            return TaskPhase::Complete;
+        }
+        if awaiting_review {
+            return TaskPhase::Reviewing;
+        }
+        match self
+            .steps
+            .iter()
+            .flat_map(|step| step.evidence.iter())
+            .next_back()
+        {
+            Some(Evidence::CommandExit { .. }) => TaskPhase::Validating,
+            Some(Evidence::PatchApplied { .. }) => TaskPhase::Editing,
+            Some(Evidence::FileRead { .. }) | None => TaskPhase::Understanding,
+        }
     }
 }

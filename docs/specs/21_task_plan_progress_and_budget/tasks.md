@@ -72,7 +72,7 @@ Every task's requirements implicitly include this section.
 | 4. Evidence, minted at the call site | **done** | Construction only; attachment moved to 4b — see the note below |
 | **4b. The plan lifecycle in a turn** | **done** | Two new tools; `PatchApplied` attachment blocked on Task 10 — see the note below |
 | 5. Step status is a function of evidence | **done** | Done before 4b, which depends on it |
-| 6. `TaskPhase`, derived | not started | |
+| 6. `TaskPhase`, derived | **done** | `awaiting_review` is an argument, not a guess — see the note below |
 | 7. `TokenBudgetExhausted` status | not started | |
 | 8. `agent_max_task_tokens` config, restrict-only | not started | |
 | 9. Ceiling enforcement in the loop | not started | |
@@ -1232,6 +1232,50 @@ proposal §7, since §7 asks for it.
 - [ ] **Step 4: Run to verify it passes, then run the full gate and ask**
 
 Proposed message: `Derive the task phase from step state so it cannot contradict it`
+
+#### What this task actually did
+
+All seven gate commands pass; 28 tests in `tests/plan.rs`.
+
+**`phase(awaiting_review: bool)` takes an argument, and that is the finding.**
+Five of requirement 3's six phases are derivable from steps. `Reviewing` is not:
+a patch waiting on a human is a fact about the *task*, not about its steps.
+Three ways out, and only one is honest — guess it from the steps (inventing it),
+drop the variant (contradicting requirement 3), or take it as an argument. The
+argument makes the dependency visible at every call site instead of burying a
+guess inside the derivation. There is still no setter, so §5.1's rule holds: the
+phase cannot be stored, and so cannot disagree with the steps.
+
+**Precedence, and why `Blocked` is not terminal here.** Completion outranks
+review — a finished plan has no work left for a review to gate. And a `Blocked`
+step keeps the plan out of `Complete`, because work that failed is work
+outstanding; §5.6 requires the summary never to say "complete" for a plan
+holding one. `Skipped` *is* terminal: someone decided it was not needed, which
+is an answer rather than a failure.
+
+**Newest evidence, not "any".** "Any command anywhere" would pin the phase to
+whatever the turn did first — a step that read a file and then ran a check is
+validating, not understanding.
+
+Three mutations run, each killing exactly one test: `Blocked` counted as
+terminal, `.next_back()` → `.next()`, and review ranked above completion.
+
+**Two honest limits, recorded here and belonging in proposal §7.**
+
+- **`Planning` is nearly unreachable.** A plan is created with its first step
+  already `InProgress` in the same event, so the only way to observe `Planning`
+  is an empty plan. Not a bug, but the phase set is effectively five in
+  practice, and §7 should say so rather than let a reader infer six working
+  phases from the enum.
+- **`Editing` cannot be reached yet.** It needs `Evidence::PatchApplied`, which
+  cannot be attached until Task 10's cross-turn continuation exists — a patch is
+  applied after the turn that proposed it has ended (see Task 4b). The arm is
+  written and covered through `status_from_evidence`; what is missing is a
+  producer. **Task 10 should re-check this when that lands.**
+
+`a_turn_that_never_finished_its_step_is_not_complete` pins the case Task 4b
+flagged: a turn can end without calling `complete_step`, leaving the step open,
+and the phase must not round that up to `Complete`.
 
 ---
 
