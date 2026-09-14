@@ -3341,6 +3341,8 @@ function createRecoveryCard(task) {
     note.textContent = "Continuing sends the same request to the model again.";
   }
 
+  const spend = recoverySpendLine(task);
+
   const footer = document.createElement("div");
   footer.className = "recovery-card-footer";
   const detail = createRecoveryDetail(task);
@@ -3439,8 +3441,42 @@ function createRecoveryCard(task) {
   footer.append(createDisclosure("Inspect", detail), actions);
   wrapper.append(eyebrow, headline);
   if (note.textContent) wrapper.append(note);
+  if (spend) wrapper.append(spend);
   wrapper.append(detail, footer);
   return wrapper;
+}
+
+// What the interrupted turn had already spent, per
+// docs/specs/19_token_and_cost_accounting/. A crash that cost money must not
+// read as free, and the figure the sweep records for the call that was in
+// flight is an estimate — so it is marked as one, the same way a turn's own
+// usage line is.
+//
+// Returns null when nothing was recorded, which is not the same as zero: a
+// session written before spec 19 has no figures, and a "0 tokens" line would
+// claim the crash was free.
+function recoverySpendLine(task) {
+  if (typeof task.inputTokens !== "number") return null;
+  const row = document.createElement("p");
+  row.className = "recovery-card-note recovery-card-spend";
+  const estimated = task.usageSource === "estimated";
+  const total = task.inputTokens + task.outputTokens;
+  const calls = task.runCount === 1 ? "1 model call" : `${task.runCount} model calls`;
+  const parts = [
+    `${estimated ? "~" : ""}${total.toLocaleString()} tokens${estimated ? " (estimated)" : ""}`,
+    calls,
+  ];
+  if (typeof task.reportedCost === "number") {
+    parts.push(formatCost(task.reportedCost));
+  } else if (typeof task.estimatedCost === "number") {
+    parts.push(`${formatCost(task.estimatedCost)} at your rates`);
+  }
+  const spent = `Spent before it stopped: ${parts.join(" · ")}.`;
+  row.textContent = task.includesLostCall
+    ? `${spent} That includes the model call that was still in flight, which was billed even ` +
+      "though its answer was lost."
+    : spent;
+  return row;
 }
 
 // What `Inspect` shows: the turn, the action that never finished, the files it
@@ -3535,31 +3571,50 @@ function createReattachedApprovalCard(approval) {
     return wrapper;
   }
 
-  headline.textContent =
-    approval.kind === "command"
-      ? "A command was waiting for your approval when Damaian stopped"
-      : "A patch was waiting for your review when Damaian stopped";
-  note.textContent =
-    approval.kind === "command"
-      ? "Approving runs the command on its own: the conversation that proposed it ended with " +
-        "the crash, so nothing is fed back to the model."
-      : "The patch is still on disk and still applies. Reviewing it here changes nothing else.";
+  const headlines = {
+    command: "A command was waiting for your approval when Damaian stopped",
+    patch: "A patch was waiting for your review when Damaian stopped",
+    plan: "A plan was waiting for your review when Damaian stopped",
+  };
+  const notes = {
+    command:
+      "Approving runs the command on its own: the conversation that proposed it ended with " +
+      "the crash, so nothing is fed back to the model.",
+    patch: "The patch is still on disk and still applies. Reviewing it here changes nothing else.",
+    // The one reattached approval that genuinely continues: a paused plan
+    // review keeps its turn on disk, so approving picks the work back up
+    // rather than running something in isolation.
+    plan:
+      "The turn that raised this plan was paused waiting for you, and it was saved. Approving " +
+      "the plan continues that turn from where it stopped.",
+  };
+  headline.textContent = headlines[approval.kind];
+  note.textContent = notes[approval.kind];
 
   wrapper.append(eyebrow, headline, note);
-  wrapper.append(
-    approval.kind === "command"
-      ? createCommandApprovalPreview(approval.payload, repo(), {
-          detached: true,
-          // A command is one decision, so its outcome is the decision.
-          onResolved: (approved) =>
-            resolveReattachedApproval(approval, approved ? "approved" : "rejected"),
-        })
-      : createPatchPreview(approval.payload, repo(), {
-          // A patch is answered per file and can end up part applied and part
-          // rejected, so "resolved" is the only honest single word for it.
-          onResolved: () => resolveReattachedApproval(approval, "resolved"),
-        }),
-  );
+  if (approval.kind === "command") {
+    wrapper.append(
+      createCommandApprovalPreview(approval.payload, repo(), {
+        detached: true,
+        // A command is one decision, so its outcome is the decision.
+        onResolved: (approved) =>
+          resolveReattachedApproval(approval, approved ? "approved" : "rejected"),
+      }),
+    );
+  } else if (approval.kind === "plan") {
+    // No `onResolved`: resuming the plan resumes the turn that owns the task,
+    // which reaches a terminal status on its own. Closing it out here would
+    // cancel a task that is about to run.
+    wrapper.append(createPlanReview(approval.payload, repo()));
+  } else {
+    wrapper.append(
+      createPatchPreview(approval.payload, repo(), {
+        // A patch is answered per file and can end up part applied and part
+        // rejected, so "resolved" is the only honest single word for it.
+        onResolved: () => resolveReattachedApproval(approval, "resolved"),
+      }),
+    );
+  }
   return wrapper;
 }
 

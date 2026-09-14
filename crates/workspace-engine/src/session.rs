@@ -1167,6 +1167,74 @@ impl SessionStore {
         }))
     }
 
+    /// Tasks carrying a usage entry for a model call lost to a crash, written
+    /// by `recovery::account_for_lost_model_calls` (spec 19 §5.5).
+    ///
+    /// The totals from [`Self::read_task_usage`] already include that call, but
+    /// they cannot say so, and a recovery prompt that claimed "this includes
+    /// the interrupted call" from the dangling marker alone would be wrong
+    /// whenever the marker predates spec 19 and carried no estimate to record.
+    /// So the claim is read back from what was actually written.
+    pub fn lost_to_crash_task_ids(&self, session_id: &str) -> Result<HashSet<String>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(HashSet::new());
+        };
+        Ok(parsed_events(&content)
+            .0
+            .iter()
+            .filter(|event| {
+                event.event_type == "task_usage_recorded"
+                    && event.text("reason").as_deref() == Some("lost_to_crash")
+            })
+            .filter_map(|event| event.text("taskId"))
+            .collect())
+    }
+
+    /// Records that this task's work was handed to another turn, so recovery
+    /// stops asking about it.
+    ///
+    /// The status is deliberately **left alone**. A task resumed from the crash
+    /// prompt (`docs/specs/45_crash_recovery_prompt.md` §5.4) is re-sent as a
+    /// fresh turn with a task of its own, which leaves the original
+    /// non-terminal forever — so every later launch classifies it as
+    /// interrupted and offers the same card again. Writing a terminal status
+    /// instead would mean choosing one that lies: `complete` (it never
+    /// finished), `failed` (nothing failed), or `cancelled` (it *was* retried).
+    /// What is true is that it was superseded, so that is what is recorded, and
+    /// the prompt filters on it.
+    pub fn mark_task_superseded(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.append_session_event(
+            session_id,
+            "task_superseded",
+            &format!(
+                "{{\"taskId\":\"{}\",\"reason\":\"{}\"}}",
+                escape_json(task_id),
+                escape_json(reason)
+            ),
+        )
+    }
+
+    /// Tasks whose work was handed to another turn, by [`Self::mark_task_superseded`].
+    ///
+    /// Reads *active* events, so a rewind past the resume takes the supersession
+    /// with it and the task becomes a live question again — which is correct:
+    /// the turn that superseded it is no longer in the conversation either.
+    pub fn superseded_task_ids(&self, session_id: &str) -> Result<HashSet<String>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(HashSet::new());
+        };
+        Ok(active_events(&content)
+            .iter()
+            .filter(|event| event.event_type == "task_superseded")
+            .filter_map(|event| event.text("taskId"))
+            .collect())
+    }
+
     /// Every action that started and never finished, in log order.
     ///
     /// Paired by `markerId` rather than by action name: the same action can run

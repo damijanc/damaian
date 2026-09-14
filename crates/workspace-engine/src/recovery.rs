@@ -17,10 +17,12 @@
 //! a guarantee enforced only in a webview is not enforced.
 
 use crate::audit::AuditLog;
+use crate::chat::PausedTurns;
 use crate::edit::PatchStore;
 use crate::error::{ClientError, Result};
 use crate::model::TokenUsage;
 use crate::patch_engine::ProposedPatch;
+use crate::plan::TaskPlan;
 use crate::session::{DanglingAction, PendingApprovalRef, SessionStore, TaskStatus};
 use crate::validation::{CommandProposal, CommandStore};
 
@@ -257,6 +259,21 @@ pub enum ReattachedApproval {
         task_id: String,
         patch: ProposedPatch,
     },
+    /// A plan the turn had paused to have reviewed. Added when spec 21 made
+    /// plan review a third kind of pending approval; before that, a crash
+    /// during a review failed the task with "unknown pending approval kind
+    /// plan" and destroyed a turn that was in fact recoverable.
+    ///
+    /// The plan comes from the session log and the deferred action from the
+    /// paused turn, so both halves of the card are read back rather than
+    /// rebuilt — and the paused turn's absence is what makes the review
+    /// unrestorable, since approving the plan would have nothing to continue.
+    Plan {
+        task_id: String,
+        proposal_id: String,
+        plan: TaskPlan,
+        deferred_action: String,
+    },
     /// The link or the proposal file is gone, so the task was failed.
     ///
     /// §5.5: never an approval card reconstructed from partial data. The user
@@ -275,6 +292,7 @@ pub fn reattach_pending_approvals(
     audit: &AuditLog,
     commands: &CommandStore,
     patches: &PatchStore,
+    paused: &PausedTurns,
     session_id: &str,
 ) -> Result<Vec<ReattachedApproval>> {
     let mut reattached = Vec::new();
@@ -304,6 +322,9 @@ pub fn reattach_pending_approvals(
                     patch,
                 })
                 .map_err(|error| format!("patch {proposal_id} is unreadable: {error:?}")),
+            Some(PendingApprovalRef { kind, proposal_id }) if kind == "plan" => {
+                reattach_plan(store, paused, session_id, &task_id, proposal_id)
+            }
             Some(PendingApprovalRef { kind, .. }) => {
                 Err(format!("unknown pending approval kind {kind}"))
             }
@@ -318,6 +339,36 @@ pub fn reattach_pending_approvals(
         }
     }
     Ok(reattached)
+}
+
+/// The plan a task paused to have reviewed, and the action that review is
+/// holding back.
+///
+/// Two halves from two places, because that is where spec 21 put them: the plan
+/// is replayed from the session log, and the deferred action lives in the
+/// paused turn. Either one missing makes the review unrestorable — a plan with
+/// no paused turn is a card whose buttons would have nothing to resume, which
+/// is the dead-card case §5.5 rules out just as firmly as a guessed command.
+fn reattach_plan(
+    store: &SessionStore,
+    paused: &PausedTurns,
+    session_id: &str,
+    task_id: &str,
+    proposal_id: &str,
+) -> std::result::Result<ReattachedApproval, String> {
+    let plan = store
+        .read_task_plan(session_id, task_id)
+        .map_err(|error| format!("the plan for {proposal_id} is unreadable: {error:?}"))?
+        .ok_or_else(|| format!("no plan was recorded for review {proposal_id}"))?;
+    let deferred_action = paused
+        .plan_review_deferred_action(proposal_id)
+        .ok_or_else(|| format!("the paused turn behind plan review {proposal_id} is gone"))?;
+    Ok(ReattachedApproval::Plan {
+        task_id: task_id.to_string(),
+        proposal_id: proposal_id.to_string(),
+        plan,
+        deferred_action,
+    })
 }
 
 /// Moves a task to terminal `failed` with a stated reason, and records it.
@@ -395,6 +446,11 @@ fn action_subject(action: &str) -> &str {
     match action {
         "apply_patch" => "A patch application",
         "propose_patch" => "Preparing a patch",
+        // Spec 21's two markers. Named here rather than left to the fallback:
+        // the fallback exists so a *new* action still says something specific,
+        // not as a resting place for actions this version knows about.
+        "propose_plan" => "Drawing up a plan",
+        "complete_step" => "Finishing a plan step",
         "run_command" => "A command",
         "model_call" => "A model request",
         "mcp_call" => "An MCP tool call",

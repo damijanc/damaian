@@ -316,6 +316,9 @@ statuses.
   ([`context.md`](context.md) §3.4) and every evidence criterion above is
   vacuous until it does.
 - A resumed turn recovers the plan of the task it resumes, not an empty one
+  (both ways a turn hands work over: a ceiling stop, and a crash resume from
+  [spec 45](../45_crash_recovery_prompt.md) §5.8, which was added after this
+  spec landed — until then the crash case silently re-planned from scratch)
   (§3.1).
 - A repository config may lower `agent_max_task_tokens` and may not raise it
   (§3.8).

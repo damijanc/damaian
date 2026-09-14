@@ -478,6 +478,8 @@
         Two shapes of the same card. With a resume there is one filled action and the terminal
         choices are behind the overflow. Without one there is no filled action at all: the only
         remaining answers close the turn out, and the card states why resuming is not on offer.
+        The spend line appears only when the turn had recorded usage — absent, never a zero,
+        which would read as a crash that was free.
       </p>
       <div class="sg-card">
         <section class="recovery-card">
@@ -487,6 +489,10 @@
             Nothing that could have changed anything outside Damaian was in flight, so this turn
             was marked safe to pick up again. It has not run yet — continuing sends the same
             request to the model again.
+          </p>
+          <p class="recovery-card-note recovery-card-spend">
+            Spent before it stopped: ~4,820 tokens (estimated) · 1 model call. That includes the
+            model call that was still in flight, which was billed even though its answer was lost.
           </p>
           <div class="recovery-card-footer">
             <button type="button" class="disclosure" aria-expanded="false">

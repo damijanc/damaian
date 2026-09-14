@@ -118,10 +118,12 @@ If Damaian stops while a turn is in flight — a crash, a force quit, a machine 
 
 Each card offers up to four choices:
 
-- **Resume** or **Continue** — sends your original request again as a new turn. Offered only when Damaian can account for everything that was in flight.
+- **Resume** or **Continue** — sends your original request again as a new turn, carrying over the plan the interrupted turn had made so the steps it already finished are not redone. Offered only when Damaian can account for everything that was in flight.
 - **Inspect** — expands to show your request, the action that never finished, the files it may have touched, and the checkpoint taken before the turn, so you can rewind if you want to.
 - **Mark failed** — closes the turn out and records that its outcome was unknown.
 - **Abandon** — closes the turn without retrying it.
+
+If the turn had already spent anything, the card says so — including the model call that was in flight when Damaian stopped, which the provider billed even though its answer was lost. That figure is an estimate and is marked as one. A turn with nothing recorded shows no figure at all rather than a zero, which would read as a crash that was free.
 
 Neither `Mark failed` nor `Abandon` changes or undoes anything on disk. They settle what the *turn* is, not what happened to your files. Putting files back is `Rewind`, which is what the checkpoint link in `Inspect` opens.
 
@@ -129,7 +131,7 @@ Neither `Mark failed` nor `Abandon` changes or undoes anything on disk. They set
 
 Where something was running that could have changed the world — a command, a patch being written to disk, a call out to an MCP server — `Resume` is not offered at all, and the card says why. There is no way to find out whether a command finished, whether the patch wrote three files or ten, or whether the remote call went through. Damaian will not run it again and hope, and it will not do so even if you ask: the refusal is in the engine, not in a button that could be worked around. Look at what actually happened with `Inspect`, put files back with `Rewind` if you need to, and then mark the turn failed or abandon it.
 
-If a turn was waiting for your approval when Damaian stopped, that approval comes back: the command or the patch is re-presented exactly as it was, and nothing runs until you approve it. A command approved this way runs on its own — the conversation that proposed it ended with the crash, so its output is not fed back to the model. Occasionally an approval cannot be restored, because an older version of Damaian recorded that a turn was waiting without recording what it was waiting for. That turn is closed with the reason stated rather than shown as a rebuilt approval card: approving a command Damaian is guessing at would be worse than losing the turn. Your stored patches and commands are untouched either way.
+If a turn was waiting for your approval when Damaian stopped, that approval comes back: the command, the patch, or the plan is re-presented exactly as it was, and nothing runs until you approve it. A command approved this way runs on its own — the conversation that proposed it ended with the crash, so its output is not fed back to the model. A plan is the exception: the turn that asked you to review it was saved, so approving the plan continues that turn from where it stopped. Occasionally an approval cannot be restored, because an older version of Damaian recorded that a turn was waiting without recording what it was waiting for. That turn is closed with the reason stated rather than shown as a rebuilt approval card: approving a command Damaian is guessing at would be worse than losing the turn. Your stored patches and commands are untouched either way.
 
 ## Settings
 

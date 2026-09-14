@@ -2670,7 +2670,7 @@ fn phase_json(phase: &TurnPhase) -> String {
 /// `violatesSingleInProgress` is sent rather than left for the panel to work
 /// out, because a panel that silently rendered the first of two in-progress
 /// steps would conceal exactly the invariant requirement 2 exists to catch.
-fn plan_json(plan: &TaskPlan) -> String {
+pub(crate) fn plan_json(plan: &TaskPlan) -> String {
     let report = plan.report();
     let steps = plan
         .steps
@@ -2855,7 +2855,7 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
 /// `estimated_cost` is the user's own rates applied to these tokens, and is a
 /// separate field from `reportedCost` on purpose: one is what the provider
 /// charged, the other is arithmetic the user configured.
-fn task_usage_json(usage: Option<&TaskUsage>, estimated_cost: Option<f64>) -> String {
+pub(crate) fn task_usage_json(usage: Option<&TaskUsage>, estimated_cost: Option<f64>) -> String {
     let Some(usage) = usage else {
         return "null".to_string();
     };
@@ -3962,6 +3962,20 @@ mod tests {
             .session_store
             .create_task(&session.id, "explain the retry helper", "mock", "mock")
             .unwrap();
+        // What spec 19's sweep records for a model call cut off by the crash,
+        // so the card's spend line can be looked at (spec 45 §5.9).
+        engine
+            .session_store
+            .record_task_usage_for_task_id(
+                &session.id,
+                &interrupted.id,
+                "lost_marker_inspection",
+                Some("marker_inspection"),
+                workspace_engine::TokenUsage::estimated(4820, 0),
+                None,
+                Some("lost_to_crash"),
+            )
+            .unwrap();
         let interrupted = engine
             .session_store
             .update_task_status(
@@ -3989,6 +4003,53 @@ mod tests {
                 &workspace_engine::PendingApprovalRef {
                     kind: "command".to_string(),
                     proposal_id: proposal.id.clone(),
+                },
+            )
+            .unwrap();
+
+        // A plan review caught mid-crash: the plan in the log, its paused turn
+        // on disk where the orchestrator parks one.
+        let reviewing = engine
+            .session_store
+            .create_task(
+                &session.id,
+                "add retry to the upload client",
+                "mock",
+                "mock",
+            )
+            .unwrap();
+        let mut plan = workspace_engine::TaskPlan::new(&reviewing.id, 1);
+        for (id, title) in [
+            ("step_1", "Read the upload client"),
+            ("step_2", "Add a retry helper"),
+            ("step_3", "Wire it into upload()"),
+        ] {
+            plan.steps.push(workspace_engine::PlanStep {
+                id: id.to_string(),
+                title: title.to_string(),
+                detail: None,
+                status: workspace_engine::StepStatus::Pending,
+                depends_on: Vec::new(),
+                started_at_ms: None,
+                completed_at_ms: None,
+                evidence: Vec::new(),
+            });
+        }
+        engine.session_store.create_plan(&reviewing, &plan).unwrap();
+        let pending_dir = data_dir.join("chat").join("pending");
+        fs::create_dir_all(&pending_dir).unwrap();
+        fs::write(
+            pending_dir.join("planprop_inspection.json"),
+            r#"{"proposal_id":"planprop_inspection","plan_review":{"deferred_action":"apply a patch to upload.rs"}}"#,
+        )
+        .unwrap();
+        engine
+            .session_store
+            .await_approval(
+                &reviewing,
+                &workspace_engine::PendingApprovalRef {
+                    kind: "plan".to_string(),
+                    proposal_id: "planprop_inspection".to_string(),
                 },
             )
             .unwrap();

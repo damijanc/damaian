@@ -12,13 +12,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, SecretScanner, SessionStore, Task, TaskStatus, classify_session, headline,
-    resume_blocked_reason,
+    AuditLog, CommandStore, PatchStore, PausedTurns, PendingApprovalRef, PlanStep,
+    ReattachedApproval, SecretScanner, SessionStore, StepStatus, Task, TaskPlan, TaskStatus,
+    classify_session, headline, reattach_pending_approvals, resume_blocked_reason,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct Fixture {
+    data_dir: PathBuf,
     store: SessionStore,
     audit: AuditLog,
     session_id: String,
@@ -38,10 +40,72 @@ fn fixture(name: &str) -> Fixture {
     let audit = AuditLog::new(&data_dir, true, SecretScanner::default());
     let session = store.create_session("repo_1", "Recovery").unwrap();
     Fixture {
+        data_dir,
         store,
         audit,
         session_id: session.id,
     }
+}
+
+/// A task paused for plan review, with the plan in the log and — unless
+/// `paused_turn_survives` is false — the paused turn on disk where
+/// `ChatOrchestrator` writes it.
+fn task_awaiting_plan_review(
+    fixture: &Fixture,
+    proposal_id: &str,
+    paused_turn_survives: bool,
+) -> Task {
+    let task = fixture
+        .store
+        .create_task(&fixture.session_id, "add retry to the client", "mock", "m")
+        .unwrap();
+    let mut plan = TaskPlan::new(&task.id, 1);
+    plan.steps.push(PlanStep {
+        id: "step_1".to_string(),
+        title: "Add a retry helper".to_string(),
+        detail: None,
+        status: StepStatus::Pending,
+        depends_on: Vec::new(),
+        started_at_ms: None,
+        completed_at_ms: None,
+        evidence: Vec::new(),
+    });
+    fixture.store.create_plan(&task, &plan).unwrap();
+    if paused_turn_survives {
+        let pending = fixture.data_dir.join("chat").join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        // The on-disk shape `PendingCommandStore` writes. Written by hand
+        // because `PendingChatTurn` is private, which is the point: `PausedTurns`
+        // reads this file as loose JSON, so the field names are the contract.
+        fs::write(
+            pending.join(format!("{proposal_id}.json")),
+            r#"{"proposal_id":"x","plan_review":{"deferred_action":"apply a patch to client.rs"}}"#,
+        )
+        .unwrap();
+    }
+    fixture
+        .store
+        .await_approval(
+            &task,
+            &PendingApprovalRef {
+                kind: "plan".to_string(),
+                proposal_id: proposal_id.to_string(),
+            },
+        )
+        .unwrap();
+    task
+}
+
+fn reattach(fixture: &Fixture) -> Vec<ReattachedApproval> {
+    reattach_pending_approvals(
+        &fixture.store,
+        &fixture.audit,
+        &CommandStore::new(&fixture.data_dir),
+        &PatchStore::new(&fixture.data_dir),
+        &PausedTurns::new(&fixture.data_dir),
+        &fixture.session_id,
+    )
+    .unwrap()
 }
 
 fn task_left_in(
@@ -148,6 +212,44 @@ fn an_unrecognised_action_is_named_verbatim() {
     assert_eq!(
         headline(&recovered[0]),
         "teleport_files was in progress and its outcome is unknown"
+    );
+}
+
+/// Spec 21's markers, which the fallback was printing raw as "propose_plan was
+/// interrupted before it finished". The fallback is for actions this version
+/// has never heard of, not for ones it ships alongside.
+#[test]
+fn the_headline_names_spec_21s_plan_actions() {
+    let planning_fixture = fixture("headline-plan-actions");
+    task_left_in(
+        &planning_fixture,
+        "add retry",
+        TaskStatus::PreparingContext,
+        Some(("propose_plan", "plan_1", false)),
+    );
+    let other = fixture("headline-step-actions");
+    task_left_in(
+        &other,
+        "add retry",
+        TaskStatus::RunningTool,
+        Some(("complete_step", "step_2", false)),
+    );
+
+    let planning = classify_session(
+        &planning_fixture.store,
+        &planning_fixture.audit,
+        &planning_fixture.session_id,
+    )
+    .unwrap();
+    let stepping = classify_session(&other.store, &other.audit, &other.session_id).unwrap();
+
+    assert_eq!(
+        headline(&planning[0]),
+        "Drawing up a plan was interrupted before it finished"
+    );
+    assert_eq!(
+        headline(&stepping[0]),
+        "Finishing a plan step was interrupted before it finished"
     );
 }
 
@@ -263,5 +365,73 @@ fn read_tasks_reports_the_latest_status() {
             .find(|candidate| candidate.id == task.id)
             .map(|candidate| candidate.status.clone()),
         Some(TaskStatus::Complete)
+    );
+}
+
+/// Spec 21 added a third kind of pending approval, and this surface did not
+/// know it: a crash during a plan review failed the task with "unknown pending
+/// approval kind plan" and destroyed a turn that was in fact recoverable, since
+/// its paused turn is on disk the whole time.
+#[test]
+fn a_plan_review_interrupted_by_a_crash_is_re_presented() {
+    let fixture = fixture("plan-review");
+    let task = task_awaiting_plan_review(&fixture, "planprop_1", true);
+
+    let reattached = reattach(&fixture);
+
+    match &reattached[0] {
+        ReattachedApproval::Plan {
+            task_id,
+            proposal_id,
+            plan,
+            deferred_action,
+        } => {
+            assert_eq!(task_id, &task.id);
+            assert_eq!(proposal_id, "planprop_1");
+            assert_eq!(plan.steps[0].title, "Add a retry helper");
+            assert_eq!(deferred_action, "apply a patch to client.rs");
+        }
+        other => panic!("a plan review should be reattached, got {other:?}"),
+    }
+    // Still the user's to answer. Failing it was the bug.
+    assert_eq!(
+        fixture
+            .store
+            .read_task_statuses(&fixture.session_id)
+            .unwrap()
+            .get(&task.id)
+            .map(String::as_str),
+        Some("waiting_for_approval")
+    );
+}
+
+/// The half that keeps §5.5's rule: a plan whose paused turn is gone cannot be
+/// resumed, so presenting it would give the user a card whose buttons have
+/// nothing to continue. That fails the task, with the reason said out loud.
+#[test]
+fn a_plan_review_whose_paused_turn_is_gone_fails_the_task() {
+    let fixture = fixture("plan-review-orphan");
+    let task = task_awaiting_plan_review(&fixture, "planprop_2", false);
+
+    let reattached = reattach(&fixture);
+
+    match &reattached[0] {
+        ReattachedApproval::Unavailable { task_id, reason } => {
+            assert_eq!(task_id, &task.id);
+            assert!(
+                reason.contains("paused turn behind plan review planprop_2 is gone"),
+                "got {reason}"
+            );
+        }
+        other => panic!("an unresumable review should be unavailable, got {other:?}"),
+    }
+    assert_eq!(
+        fixture
+            .store
+            .read_task_statuses(&fixture.session_id)
+            .unwrap()
+            .get(&task.id)
+            .map(String::as_str),
+        Some("failed")
     );
 }

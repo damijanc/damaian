@@ -10,12 +10,13 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use workspace_engine::{
-    CommandProposal, ProposedPatch, ReattachedApproval, RecoveredTask, TaskStatus, WorkspaceEngine,
-    allow_always_eligible, classify_all, classify_session, command_approval_prompt, headline,
-    reattach_pending_approvals, resume_allowed, resume_blocked_reason,
+    CommandProposal, PausedTurns, ProposedPatch, ReattachedApproval, RecoveredTask, TaskStatus,
+    WorkspaceEngine, allow_always_eligible, classify_all, classify_session,
+    command_approval_prompt, headline, reattach_pending_approvals, resume_allowed,
+    resume_blocked_reason,
 };
 
-use crate::{escape_json, patch_files_json};
+use crate::{escape_json, patch_files_json, plan_json};
 
 /// One recovered task, with everything the card needs already resolved.
 struct Recovered {
@@ -37,6 +38,15 @@ struct Recovered {
     /// for a command — the card says which of the two it is.
     files: Vec<String>,
     checkpoint_id: Option<String>,
+    /// What this task spent, as `task_usage_json` fields spliced into the
+    /// entry — the same shape a turn's own response sends, so the frontend
+    /// reads both with one piece of code. Empty when nothing was recorded,
+    /// which is not the same as zero (spec 19).
+    usage_fields: String,
+    /// Whether that total includes a model call lost to the crash. Read back
+    /// from what was recorded rather than inferred from the dangling marker,
+    /// which can name a model call whose cost was never estimable.
+    includes_lost_call: bool,
 }
 
 /// A reattached approval, as a payload the existing approval cards can render.
@@ -51,6 +61,47 @@ struct Approval {
 struct Sweep {
     recovered: Vec<Recovered>,
     approvals: Vec<Approval>,
+}
+
+/// Everything the sweep needs from one session log, read once.
+///
+/// Each of these is a full replay of the log, and the sweep asks four questions
+/// per recovered task. Asked per task they would make the launch cost quadratic
+/// in tasks-per-session — the same shape spec 17 measured and removed from
+/// `append_session_event`, which is reason enough not to reintroduce it one
+/// caller later.
+struct SessionFacts {
+    statuses: HashMap<String, String>,
+    tasks: HashMap<String, String>,
+    usage: HashMap<String, workspace_engine::TaskUsage>,
+    superseded: std::collections::HashSet<String>,
+    lost_to_crash: std::collections::HashSet<String>,
+}
+
+impl SessionFacts {
+    fn read(engine: &WorkspaceEngine, session_id: &str) -> Result<Self, String> {
+        let store = &engine.session_store;
+        Ok(Self {
+            statuses: store
+                .read_task_statuses(session_id)
+                .map_err(|error| error.to_string())?,
+            tasks: store
+                .read_tasks(session_id)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|task| (task.id, task.user_prompt))
+                .collect(),
+            usage: store
+                .read_task_usage(session_id)
+                .map_err(|error| error.to_string())?,
+            superseded: store
+                .superseded_task_ids(session_id)
+                .map_err(|error| error.to_string())?,
+            lost_to_crash: store
+                .lost_to_crash_task_ids(session_id)
+                .map_err(|error| error.to_string())?,
+        })
+    }
 }
 
 /// The sweep runs once per process. Once is correct rather than merely cheap: a
@@ -77,20 +128,22 @@ fn sweep_payload(engine: &WorkspaceEngine, sweep: &Sweep) -> Result<String, Stri
     // run of the UI, or completed by a resumed turn — is no longer a question.
     // Re-read the statuses rather than trusting the snapshot, so reloading the
     // webview does not bring a settled card back.
-    let mut statuses: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut facts: HashMap<String, SessionFacts> = HashMap::new();
     let mut open = Vec::new();
     for task in &sweep.recovered {
-        if !statuses.contains_key(&task.session_id) {
-            let read = engine
-                .session_store
-                .read_task_statuses(&task.session_id)
-                .map_err(|error| error.to_string())?;
-            statuses.insert(task.session_id.clone(), read);
+        if !facts.contains_key(&task.session_id) {
+            facts.insert(
+                task.session_id.clone(),
+                SessionFacts::read(engine, &task.session_id)?,
+            );
         }
-        let settled = statuses[&task.session_id]
+        let session = &facts[&task.session_id];
+        let settled = session
+            .statuses
             .get(&task.task_id)
             .and_then(|status| TaskStatus::parse(status))
-            .is_some_and(|status| status.is_terminal());
+            .is_some_and(|status| status.is_terminal())
+            || session.superseded.contains(&task.task_id);
         if !settled {
             open.push(recovered_json(task));
         }
@@ -142,12 +195,37 @@ fn apply_decision(
         .into_iter()
         .find(|candidate| candidate.task_id == task_id)
         .ok_or_else(|| format!("{task_id} is not a recovered task in {session_id}"))?;
+    // A card from a stale webview must not resume the same turn twice.
+    if engine
+        .session_store
+        .superseded_task_ids(&session_id)
+        .map_err(|error| error.to_string())?
+        .contains(&task_id)
+    {
+        return Err(format!(
+            "{task_id} was already resumed; its work was handed to a later turn"
+        ));
+    }
 
     let prompt = match decision.as_str() {
         "resume" => {
             workspace_engine::resume(&engine.session_store, &engine.audit_log, &task)
                 .map_err(|error| error.to_string())?;
-            task_prompt(engine, &session_id, &task_id)?
+            let prompt = task_prompt(engine, &session_id, &task_id)?;
+            // The resumed work runs as a *new* turn with a task of its own, so
+            // without this the original stays non-terminal and every later
+            // launch offers the same card again. Recorded before the prompt is
+            // handed back, so a client that dies on the way to sending it still
+            // leaves the question settled.
+            engine
+                .session_store
+                .mark_task_superseded(
+                    &session_id,
+                    &task_id,
+                    "Resumed after a crash: its request was re-sent as a new turn",
+                )
+                .map_err(|error| error.to_string())?;
+            prompt
         }
         "mark_failed" => {
             workspace_engine::mark_failed(&engine.session_store, &engine.audit_log, &task)
@@ -277,8 +355,20 @@ fn run_sweep(engine: &WorkspaceEngine) -> Result<Sweep, String> {
         .map(|session| (session.id.clone(), session.repository_id.clone()))
         .collect();
 
+    let mut facts: HashMap<String, SessionFacts> = HashMap::new();
     let mut recovered = Vec::new();
     for task in &classified {
+        if !facts.contains_key(&task.session_id) {
+            facts.insert(
+                task.session_id.clone(),
+                SessionFacts::read(engine, &task.session_id)?,
+            );
+        }
+        // Already handed to a later turn, so it is not a question any more —
+        // and must not be auto-resumed a second time.
+        if facts[&task.session_id].superseded.contains(&task.task_id) {
+            continue;
+        }
         // §5.5: authorized automatically, so the status change is the engine's
         // and is audited — but the turn does not re-run until the user asks.
         // Otherwise opening the app would fire a billed model call for every
@@ -290,7 +380,13 @@ fn run_sweep(engine: &WorkspaceEngine) -> Result<Sweep, String> {
         } else {
             false
         };
-        recovered.push(describe(engine, task, &repository_ids, auto_resumed)?);
+        recovered.push(describe(
+            engine,
+            task,
+            &facts[&task.session_id],
+            &repository_ids,
+            auto_resumed,
+        )?);
     }
 
     let mut approvals = Vec::new();
@@ -300,6 +396,7 @@ fn run_sweep(engine: &WorkspaceEngine) -> Result<Sweep, String> {
             &engine.audit_log,
             &engine.command_store,
             &engine.patch_store,
+            &PausedTurns::new(&engine.config.data_dir),
             &session.id,
         )
         .map_err(|error| error.to_string())?;
@@ -317,9 +414,28 @@ fn run_sweep(engine: &WorkspaceEngine) -> Result<Sweep, String> {
 fn describe(
     engine: &WorkspaceEngine,
     task: &RecoveredTask,
+    facts: &SessionFacts,
     repository_ids: &HashMap<String, String>,
     auto_resumed: bool,
 ) -> Result<Recovered, String> {
+    // Spec 19 §5.5 accounts for the model call a crash interrupted, during this
+    // very sweep. Without surfacing it the spend is recorded and invisible,
+    // which leaves the crash looking free on the one screen that exists to
+    // explain it.
+    let usage_fields = match facts.usage.get(&task.task_id) {
+        Some(total) => {
+            let estimated_cost = engine.config.estimated_cost(&workspace_engine::TokenUsage {
+                input_tokens: total.input_tokens,
+                output_tokens: total.output_tokens,
+                source: total.source,
+            });
+            let body = crate::task_usage_json(Some(total), estimated_cost);
+            // Spliced rather than nested, matching `task_states_json`.
+            format!(",{}", body.trim_start_matches('{').trim_end_matches('}'))
+        }
+        None => String::new(),
+    };
+    let includes_lost_call = facts.lost_to_crash.contains(&task.task_id);
     let dangling = task.dangling.as_ref();
     let files = dangling
         .filter(|action| action.action == "apply_patch" || action.action == "propose_patch")
@@ -346,7 +462,7 @@ fn describe(
                 .map(|manifest| manifest.checkpoint_id)
         });
 
-    let prompt = task_prompt(engine, &task.session_id, &task.task_id)?;
+    let prompt = facts.tasks.get(&task.task_id).cloned().unwrap_or_default();
     // Two separate ways for `Resume` to be unavailable, each with its own
     // reason. §5.6 leaves the card with no primary action either way, so the
     // reason is the only thing that tells the user which case they are in.
@@ -380,6 +496,8 @@ fn describe(
         prompt,
         files,
         checkpoint_id,
+        usage_fields,
+        includes_lost_call,
     })
 }
 
@@ -405,6 +523,28 @@ fn describe_approval(
                 escape_json(&patch.id),
                 escape_json(&patch.summary),
                 patch_files_json(&patch.files)
+            ),
+            unavailable_reason: None,
+        },
+        // Shaped exactly like `plan_proposal_json`, so the reattached review is
+        // the same `createPlanReview` card the live turn raises. It also resumes
+        // through the same endpoint: unlike a command, whose turn died with the
+        // process, a plan review's paused turn is on disk and picks up where it
+        // stopped.
+        ReattachedApproval::Plan {
+            task_id,
+            proposal_id,
+            plan,
+            deferred_action,
+        } => Approval {
+            session_id: session_id.to_string(),
+            task_id,
+            kind: "plan",
+            payload: format!(
+                "{{\"proposalId\":\"{}\",\"deferredAction\":\"{}\",\"plan\":{}}}",
+                escape_json(&proposal_id),
+                escape_json(&deferred_action),
+                plan_json(&plan)
             ),
             unavailable_reason: None,
         },
@@ -453,7 +593,7 @@ fn task_prompt(
 
 fn recovered_json(task: &Recovered) -> String {
     format!(
-        "{{\"sessionId\":\"{}\",\"taskId\":\"{}\",\"headline\":\"{}\",\"classification\":\"{}\",\"previousStatus\":\"{}\",\"danglingAction\":{},\"danglingRef\":{},\"danglingSeq\":{},\"resumeAllowed\":{},\"resumeBlockedReason\":{},\"autoResumed\":{},\"prompt\":\"{}\",\"files\":[{}],\"checkpointId\":{}}}",
+        "{{\"sessionId\":\"{}\",\"taskId\":\"{}\",\"headline\":\"{}\",\"classification\":\"{}\",\"previousStatus\":\"{}\",\"danglingAction\":{},\"danglingRef\":{},\"danglingSeq\":{},\"resumeAllowed\":{},\"resumeBlockedReason\":{},\"autoResumed\":{},\"prompt\":\"{}\",\"files\":[{}],\"checkpointId\":{},\"includesLostCall\":{}{}}}",
         escape_json(&task.session_id),
         escape_json(&task.task_id),
         escape_json(&task.headline),
@@ -473,7 +613,9 @@ fn recovered_json(task: &Recovered) -> String {
             .map(|path| format!("\"{}\"", escape_json(path)))
             .collect::<Vec<_>>()
             .join(","),
-        json_optional(task.checkpoint_id.as_deref())
+        json_optional(task.checkpoint_id.as_deref()),
+        task.includes_lost_call,
+        task.usage_fields
     )
 }
 
@@ -506,7 +648,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use workspace_engine::{Config, PendingApprovalRef, Task, TaskStatus, WorkspaceEngine};
+    use workspace_engine::{
+        Config, PendingApprovalRef, PlanStep, StepStatus, Task, TaskPlan, TaskStatus,
+        WorkspaceEngine,
+    };
 
     static COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -735,6 +880,180 @@ mod tests {
                 .unwrap()
                 .status,
             "pending"
+        );
+    }
+
+    /// Spec 21 made plan review a third kind of pending approval. Before this,
+    /// the sweep hit its catch-all, failed the task with "unknown pending
+    /// approval kind plan", and told the user a recoverable turn could not be
+    /// restored — while its paused turn sat on disk the whole time.
+    #[test]
+    fn a_reattached_plan_review_is_offered_for_review() {
+        let (engine, dir) = engine("plan-review");
+        let session = engine
+            .session_store
+            .create_session("repo_1", "Recovery")
+            .unwrap();
+        let task = engine
+            .session_store
+            .create_task(&session.id, "add retry", "mock", "m")
+            .unwrap();
+        let mut plan = TaskPlan::new(&task.id, 1);
+        plan.steps.push(PlanStep {
+            id: "step_1".to_string(),
+            title: "Add a retry helper".to_string(),
+            detail: None,
+            status: StepStatus::Pending,
+            depends_on: Vec::new(),
+            started_at_ms: None,
+            completed_at_ms: None,
+            evidence: Vec::new(),
+        });
+        engine.session_store.create_plan(&task, &plan).unwrap();
+        let pending = dir.join("chat").join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(
+            pending.join("planprop_1.json"),
+            r#"{"proposal_id":"planprop_1","plan_review":{"deferred_action":"apply a patch"}}"#,
+        )
+        .unwrap();
+        engine
+            .session_store
+            .await_approval(
+                &task,
+                &PendingApprovalRef {
+                    kind: "plan".to_string(),
+                    proposal_id: "planprop_1".to_string(),
+                },
+            )
+            .unwrap();
+
+        let (_, payload) = sweep(&engine);
+
+        assert!(payload.contains("\"kind\":\"plan\""), "got {payload}");
+        assert!(payload.contains("planprop_1"), "got {payload}");
+        // Both halves the card needs: the plan from the log, the deferred
+        // action from the paused turn.
+        assert!(payload.contains("Add a retry helper"), "got {payload}");
+        assert!(
+            payload.contains("\"deferredAction\":\"apply a patch\""),
+            "got {payload}"
+        );
+        assert_eq!(
+            engine
+                .session_store
+                .read_task_statuses(&session.id)
+                .unwrap()
+                .get(&task.id)
+                .map(String::as_str),
+            Some("waiting_for_approval")
+        );
+    }
+
+    /// A resumed task's work is handed to a new turn, so the original never
+    /// reaches a terminal status. Without a record of that, the next launch
+    /// classifies it as interrupted again and offers the identical card —
+    /// forever. The in-process snapshot hid this: only a *fresh* sweep shows it.
+    #[test]
+    fn a_resumed_task_is_not_offered_again_on_the_next_launch() {
+        let (engine, _dir) = engine("superseded");
+        let session = engine
+            .session_store
+            .create_session("repo_1", "Recovery")
+            .unwrap();
+        let task = task_left_in(
+            &engine,
+            &session.id,
+            "explain the indexer",
+            TaskStatus::PreparingContext,
+            Some(("read_file", "src/lib.rs", false)),
+        );
+        let (_, before) = sweep(&engine);
+        assert!(before.contains(&task.id), "got {before}");
+
+        let resumed = apply_decision(&engine, &decision(&session.id, &task.id, "resume")).unwrap();
+        assert!(resumed.contains("explain the indexer"), "got {resumed}");
+
+        // A fresh sweep, standing in for the next launch: a new snapshot, not
+        // the one `forget` pruned.
+        let (_, after) = sweep(&engine);
+        assert!(!after.contains(&task.id), "got {after}");
+        // And a stale card cannot resume the same work twice.
+        let repeat = apply_decision(&engine, &decision(&session.id, &task.id, "resume"))
+            .expect_err("the second resume should be refused");
+        assert!(repeat.contains("already resumed"), "got {repeat}");
+    }
+
+    /// Spec 19 §5.5 accounts for the model call a crash interrupted — during
+    /// this sweep, in fact — but until now the figure went straight to the log
+    /// and the card said nothing, leaving the crash looking free on the one
+    /// screen meant to explain it.
+    #[test]
+    fn the_card_reports_what_the_interrupted_turn_spent() {
+        let (engine, _dir) = engine("lost-call");
+        let session = engine
+            .session_store
+            .create_session("repo_1", "Recovery")
+            .unwrap();
+        let task = task_left_in(
+            &engine,
+            &session.id,
+            "summarise the diff",
+            TaskStatus::WaitingForModel,
+            None,
+        );
+        // What `account_for_lost_model_calls` writes for a call that was in
+        // flight: an estimate, marked as lost to the crash.
+        engine
+            .session_store
+            .record_task_usage_for_task_id(
+                &session.id,
+                &task.id,
+                "lost_marker_1",
+                Some("marker_1"),
+                workspace_engine::TokenUsage::estimated(1200, 0),
+                None,
+                Some("lost_to_crash"),
+            )
+            .unwrap();
+
+        let (_, payload) = sweep(&engine);
+
+        assert!(payload.contains("\"inputTokens\":1200"), "got {payload}");
+        assert!(
+            payload.contains("\"usageSource\":\"estimated\""),
+            "got {payload}"
+        );
+        assert!(
+            payload.contains("\"includesLostCall\":true"),
+            "got {payload}"
+        );
+    }
+
+    /// The complement, and the one that keeps the claim honest: a task with no
+    /// usage recorded carries no figures at all. Zero would read as a crash
+    /// that cost nothing, and a session written before spec 19 has no numbers.
+    #[test]
+    fn a_task_with_no_recorded_usage_reports_no_figure() {
+        let (engine, _dir) = engine("no-usage");
+        let session = engine
+            .session_store
+            .create_session("repo_1", "Recovery")
+            .unwrap();
+        task_left_in(
+            &engine,
+            &session.id,
+            "summarise the diff",
+            TaskStatus::WaitingForModel,
+            None,
+        );
+
+        let (_, payload) = sweep(&engine);
+
+        assert!(!payload.contains("inputTokens"), "got {payload}");
+        assert!(
+            payload.contains("\"includesLostCall\":false"),
+            "got {payload}"
         );
     }
 

@@ -572,7 +572,14 @@ curl -s -H "x-damaian-api-token: $TOKEN" http://127.0.0.1:4765/api/recovery | jq
 
 A task that was resumed shows as `preparing_context` afterwards. That is
 authorization, not execution: the turn re-runs only when the user presses
-`Continue`, which re-sends the recorded prompt as an ordinary turn.
+`Continue`, which re-sends the recorded prompt as an ordinary turn. It also
+gets a `task_superseded` event, which is what stops the next launch asking about
+it again — the task never becomes terminal, because its work moved to the new
+turn:
+
+```bash
+jq -r 'select(.eventType=="task_superseded") | "\(.payload.taskId) — \(.payload.reason)"' "$SESSION_FILE"
+```
 
 One consequence of the first launch after upgrading: a task left awaiting
 approval by a version older than spec 17 recorded its status but not *which*

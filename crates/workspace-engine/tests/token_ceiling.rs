@@ -397,3 +397,125 @@ fn completing_a_carried_step_keeps_evidence_the_turn_never_saw() {
         "a step with an applied patch behind it is not unverified"
     );
 }
+
+/// The other way a turn hands its work to the next one: a crash, and the user
+/// pressing `Continue` on the recovery card
+/// (`docs/specs/45_crash_recovery_prompt.md` §5.4). That re-sends the same
+/// request as a new task, so without a carry the resumed turn re-plans from
+/// nothing and can redo steps whose work already landed.
+///
+/// Lives beside the ceiling case because they are the same mechanism with two
+/// triggers, and a change to one must be checked against the other.
+#[test]
+fn continuing_after_a_crash_resumes_the_plan() {
+    let repo = temp_repo("crash-resume");
+    let engine = engine_with_ceiling(&repo, None);
+    let mut planner = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Planned.".to_string()],
+        vec![
+            vec![workspace_engine::ToolCall {
+                id: "c1".to_string(),
+                name: "propose_plan".to_string(),
+                arguments_json: r#"{"steps":[{"title":"Read the client"},{"title":"Add retry"}]}"#
+                    .to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let (crashed, _) = ask(&engine, &repo, "Add retry to the client", &mut planner);
+    let planned = engine
+        .session_store
+        .read_task_plan(&crashed.session.id, &crashed.task.id)
+        .unwrap()
+        .expect("the first turn planned");
+
+    // What the recovery prompt records when the user presses `Continue`: the
+    // old task's work moves to the turn about to be sent.
+    engine
+        .session_store
+        .mark_task_superseded(
+            &crashed.session.id,
+            &crashed.task.id,
+            "Resumed after a crash: its request was re-sent as a new turn",
+        )
+        .unwrap();
+
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+    };
+    let resumed = engine
+        .chat_orchestrator
+        .ask_with_session(
+            &repo,
+            "Add retry to the client",
+            &[],
+            Some(&crashed.session.id),
+            &mut MockModelAdapter::new("Carrying on."),
+            &mut sink,
+        )
+        .expect("the resumed turn should run");
+
+    let carried = engine
+        .session_store
+        .read_task_plan(&resumed.session.id, &resumed.task.id)
+        .unwrap()
+        .expect("the plan carried onto the resumed task");
+    assert_ne!(resumed.task.id, crashed.task.id, "resuming is a new task");
+    assert_eq!(carried.steps.len(), planned.steps.len());
+    assert_eq!(carried.steps[0].title, planned.steps[0].title);
+}
+
+/// The carry stays narrow. A turn following one that merely *failed* — nothing
+/// superseded it, no ceiling stop — starts clean, so an unrelated next question
+/// does not inherit somebody else's steps.
+#[test]
+fn a_turn_after_an_unsuperseded_task_starts_with_no_plan() {
+    let repo = temp_repo("crash-no-carry");
+    let engine = engine_with_ceiling(&repo, None);
+    let mut planner = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Planned.".to_string()],
+        vec![
+            vec![workspace_engine::ToolCall {
+                id: "c1".to_string(),
+                name: "propose_plan".to_string(),
+                arguments_json: r#"{"steps":[{"title":"One"},{"title":"Two"}]}"#.to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let (first, _) = ask(&engine, &repo, "Do the thing", &mut planner);
+
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+    };
+    let second = engine
+        .chat_orchestrator
+        .ask_with_session(
+            &repo,
+            "Unrelated question",
+            &[],
+            Some(&first.session.id),
+            &mut MockModelAdapter::new("An answer."),
+            &mut sink,
+        )
+        .expect("the second turn should run");
+
+    assert!(
+        engine
+            .session_store
+            .read_task_plan(&second.session.id, &second.task.id)
+            .unwrap()
+            .is_none(),
+        "nothing handed work over, so nothing should carry"
+    );
+}

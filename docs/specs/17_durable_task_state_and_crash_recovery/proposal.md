@@ -410,6 +410,14 @@ satisfied on a real launch path, and the 24 stale `waiting_for_approval` tasks
 described below are failed with their stated reason on the first launch after
 that change.
 
+Since then, spec 21 added a third pending-approval kind (`plan`).
+`reattach_pending_approvals` gained an arm for it and a `PausedTurns` parameter
+— see [spec 45](../45_crash_recovery_prompt.md) §5.7 — because its catch-all had
+been failing those tasks with "unknown pending approval kind plan". Worth noting
+for the next kind: that catch-all treats an unknown kind as unrecoverable, which
+is right for a proposal that cannot be read and wrong for one that merely
+postdates this code, and nothing fails loudly when a new kind appears.
+
 One finding from that work belongs here, because it was a latent bug in this
 spec's code rather than a limitation of it. `set_status` and `fail_task` write a
 `Task` whose fields other than `id` and `session_id` are blank, since tasks are

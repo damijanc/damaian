@@ -148,6 +148,23 @@ so `SessionStore::read_tasks` is added alongside it, replaying full `Task`
 records from `task_created` and `task_status_updated`. `read_task_statuses`
 stays as the cheap path for the conversation view, which wants nothing else.
 
+**The resumed task is then recorded as superseded**, by
+`SessionStore::mark_task_superseded`, and the sweep skips a superseded task
+everywhere it would otherwise consider one. Because the work runs as a *new*
+turn with a task of its own, the original never reaches a terminal status —
+so without this every later launch classifies it as interrupted again and
+offers the identical card, forever. (See §7: this was found by audit, not by
+the implementation's own tests, because the in-process snapshot hid it.)
+
+A status is deliberately not written instead. Every terminal one available
+would be a lie: `complete` never happened, `failed` did not fail, and
+`cancelled` says the turn was not retried when retrying is exactly what
+happened. What is true is that the work moved to another turn, so that is the
+fact recorded, and the *presentation* filters on it — the same split this spec
+already uses, where the engine classifies and the shell decides what to ask
+about. Supersession is an active event, so a rewind past the resume brings the
+question back, which is correct: the turn that superseded it is gone too.
+
 ### 5.5 Auto-resume is authorized automatically and run on request
 
 A deliberate narrowing of requirement 4, stated rather than buried.
@@ -189,9 +206,30 @@ checkpoint. Restoring stays spec 16's, per §4.
 
 ### 5.7 Re-presented approvals approve nothing
 
-A reattached `CommandProposal` or `ProposedPatch` re-renders through the existing
-`createCommandApprovalPreview` and `createPatchPreview`, so the card is
-presented and nothing runs until the user acts.
+A reattached `CommandProposal`, `ProposedPatch` or plan review re-renders through
+the existing `createCommandApprovalPreview`, `createPatchPreview` and
+`createPlanReview`, so the card is presented and nothing runs until the user
+acts.
+
+**Plan review is the third kind**, added by
+[spec 21](21_task_plan_progress_and_budget/proposal.md) after this spec landed.
+Until it was handled here, `reattach_pending_approvals` fell through to its
+catch-all and failed the task with "unknown pending approval kind plan" — the
+card then told the user a turn could not be restored while its paused turn sat
+on disk the whole time. A reattached review is assembled from two places,
+because that is where spec 21 put them: the plan is replayed from the session
+log, and the deferred action comes out of the paused turn via `PausedTurns`, a
+read-only view of `chat/pending/`. Read-only on purpose — resuming a paused turn
+stays `ChatOrchestrator`'s — and keyed on the data directory rather than on an
+orchestrator, which takes thirteen dependencies to build.
+
+A plan review is also the one reattached approval that genuinely *continues*:
+its paused turn survived, so it resumes through the ordinary
+`/api/resume-plan-stream` and picks the work back up. It therefore needs no
+`detached` mode and no closing-out — the turn it resumes reaches a terminal
+status on its own. A review whose paused turn is gone is refused rather than
+shown, since approving it would have nothing to continue; that fails the task
+with the reason stated, exactly as an unreadable command proposal does.
 
 A command approved this way runs standalone: the chat turn that proposed it died
 with the process, so there is no model round to feed the result back into. The
@@ -220,7 +258,51 @@ That endpoint writes a status and audits it; it authorizes nothing, which is why
 it does not go through the engine's recovery operations. None of them fit a task
 the classifier deliberately skips.
 
-### 5.8 First launch fails 24 stale approval tasks
+### 5.8 The crashed turn's plan carries onto the resumed one
+
+Spec 21 gave a turn a plan, and `carry_plan_from_a_token_stop` carried it onto
+the next task when the previous one stopped at the token ceiling. A crash resume
+is the same situation and was not covered: the resumed work is a new task, so
+the plan stayed behind and the new turn re-planned from nothing, free to redo
+steps whose work had already landed.
+
+It now carries in both cases — the function is
+`carry_plan_from_the_previous_turn` — keyed on the same supersession record §5.4
+writes. **The crash case is safe for exactly the reason the resume was offered
+at all:** a carried plan brings its completed steps and their evidence, which
+would be wrong if a step could have half-happened, and it cannot, because a
+resume is refused outright for `unknown_external_outcome`. Every crash that
+reaches here had nothing side-effecting in flight.
+
+The carry stays narrow either way: only with steps outstanding, and only from a
+turn that actually handed its work over, so an unrelated next question never
+inherits somebody else's steps.
+
+### 5.9 What the crash cost
+
+[Spec 19](19_token_and_cost_accounting/proposal.md) §5.5 accounts for a model
+call lost to a crash — and does it inside *this* spec's sweep, since the
+classifier is the only thing that knows a call was lost. The figure went to the
+session log and nowhere else, so the one screen that exists to explain a crash
+said nothing about what it cost.
+
+The card now carries the task's spend, in the same `task_usage_json` shape a
+turn's own response sends, so the frontend reads both with one piece of code.
+Two rules come with it, both from spec 19:
+
+- **Absent, not zero.** A task with no usage recorded carries no figures at all.
+  A session written before spec 19 has none, and "0 tokens" would read as a
+  crash that was free.
+- **The estimate is marked.** A lost call's figure is an estimate taken before
+  the request went out, so the whole total renders as `~N tokens (estimated)`.
+
+Whether the total includes the lost call is read back from the recorded usage
+(`SessionStore::lost_to_crash_task_ids`) rather than inferred from the dangling
+marker being a `model_call` — a marker written before spec 19 carries no
+estimate, so nothing was added for it, and claiming otherwise would be a
+sentence the log does not support.
+
+### 5.10 First launch fails 24 stale approval tasks
 
 This is the first caller of `reattach_pending_approvals`, and spec 17's
 implementation notes measured the consequence against real data: 24 tasks left
@@ -314,6 +396,53 @@ offer to run a command that had already run. A feature whose entire purpose is
 that no side effect is repeated would have repeated one. §5.7 says what closes
 it, and `an_answered_approval_is_not_reattached_again` holds it.
 
+### What an audit found after specs 19 and 21 landed
+
+Both of these were introduced by *other* specs changing the ground under this
+one, and neither broke a test here — the suite stayed green throughout, which is
+the point worth keeping.
+
+**A plan review was destroyed rather than re-presented.** Spec 21 added a third
+pending-approval kind; `reattach_pending_approvals` knew two, and its catch-all
+marked the task `failed` with "unknown pending approval kind plan". The user was
+told a turn could not be restored while its paused turn was on disk and
+`/api/resume-plan-stream` stood ready to continue it. §5.7 now handles it. The
+general lesson is about the shape of that catch-all: it treats an unknown kind
+as unrecoverable, which is right for data it cannot read but wrong for a kind
+that simply postdates it, and nothing fails loudly when a new kind appears.
+
+**A resumed turn's plan was dropped.** Spec 21 carries a plan across a token
+stop; a crash resume left it behind, so the new turn re-planned from scratch.
+§5.8 covers both, and the safety argument is written down there rather than
+left implicit.
+
+**Two of spec 21's action markers had no phrasing.** `propose_plan` and
+`complete_step` fell through `action_subject` to the raw name — "propose_plan
+was interrupted before it finished". The fallback did its job, but it exists so
+an action this version has *never heard of* still says something specific, not
+as a resting place for actions shipped alongside it.
+
+**The crash's cost was recorded and invisible.** §5.9.
+
+**A resumed task was offered again on every later launch.** `recovery::resume`
+leaves the task non-terminal by design, the replacement work runs as a new task,
+and nothing ever closed the original — so the sweep re-classified it as
+interrupted at each start. Within the run that made the decision, the in-process
+`forget()` hid it completely, which is exactly why implementation-time testing
+missed it: the bug was only visible across a process boundary. §5.4 records
+supersession instead, and the test that holds it takes a *fresh* sweep rather
+than re-rendering the snapshot.
+
+### One thing kept out: a quadratic launch
+
+The sweep asks four questions of a session log per recovered task — statuses,
+tasks, usage, and the two id sets §5.4 and §5.9 added. Each is a full replay, so
+asking them per task makes launch cost quadratic in tasks-per-session. That is
+the same shape spec 17 measured out of `append_session_event` (17.5s to append
+2000 events, 135× better once it stopped rescanning), which is reason enough not
+to put it back one caller later. `SessionFacts` reads each log once per session
+and the per-task work is map lookups.
+
 ### Measured
 
 In the running shell at 1280×800, conversation column 980px — measured, not
@@ -323,7 +452,9 @@ estimated:
 |---|---|
 | Recovery, resume offered | 149px |
 | Recovery, resume absent | 132px |
+| Recovery, resume offered, with a spend line (§5.9) | 192px |
 | Reattached command approval | 216px |
+| Reattached plan review, three steps (§5.7) | 313px |
 
 The resume-offered card is the taller of the two because its note explains what
 continuing will do; the card without a resume says less because there is less to
@@ -341,7 +472,7 @@ did not crash.
   why the payload carries prose rather than codes.
 
 The surface was driven by hand instead, through
-`serves_the_ui_for_manual_inspection`, which now seeds both card shapes and a
-reattached approval so the next person does not have to stage a crash to see
-them. Both specimen shapes were also added to
+`serves_the_ui_for_manual_inspection`, which now seeds both card shapes, a
+reattached command approval and a reattached plan review, so the next person
+does not have to stage a crash to see them. Both specimen shapes were also added to
 [`../ui-style-guide.html`](../ui-style-guide.html).

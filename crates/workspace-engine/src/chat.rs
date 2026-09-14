@@ -640,11 +640,15 @@ impl ChatOrchestrator {
         // resumption starts from". A task is one turn, so this new task would
         // otherwise start with no plan at all (`context.md` §3.1).
         //
-        // Narrow on purpose: only a task stopped by the *ceiling*, and only
-        // while its plan still has work outstanding. Carrying a plan into an
-        // unrelated next question would put steps on the panel the user never
-        // asked for, and a normally-completed task has nothing to resume.
-        self.carry_plan_from_a_token_stop(&session.id, &task)?;
+        // The same is true of a turn a crash interrupted and the user chose to
+        // continue (`docs/specs/45_crash_recovery_prompt.md` §5.8).
+        //
+        // Narrow on purpose: only a task that actually handed its work to this
+        // one — a ceiling stop or a recorded supersession — and only while its
+        // plan still has work outstanding. Carrying a plan into an unrelated
+        // next question would put steps on the panel the user never asked for,
+        // and a normally-completed task has nothing to resume.
+        self.carry_plan_from_the_previous_turn(&session.id, &task)?;
         let user_message =
             self.session_store
                 .append_message(&session.id, Some(&task.id), "user", prompt)?;
@@ -1147,19 +1151,39 @@ impl ChatOrchestrator {
     /// resumed later via [`Self::resume_after_command_decision`].
     // Threads the full per-turn state (session, task, messages, round) plus the
     // model adapter and token sink through one recursive-ish loop.
-    /// Carries a plan onto `task` when the previous task in the session was
-    /// stopped by the token ceiling with work still outstanding.
+    /// Carries a plan onto `task` when the previous task in the session handed
+    /// its work to this one with steps still outstanding.
+    ///
+    /// Two ways that happens, and they are the only two: the previous turn hit
+    /// the token ceiling and the user raised it (spec 21 §5.4), or it was
+    /// interrupted by a crash and the user pressed `Continue`
+    /// (`docs/specs/45_crash_recovery_prompt.md` §5.4), which re-sends the same
+    /// request as a new turn and records the old task as superseded.
+    ///
+    /// **The crash case is safe for the same reason the resume was offered at
+    /// all.** A plan carries the steps already completed and the evidence
+    /// behind them, so carrying one after a crash would be wrong if a step
+    /// could have half-happened. It cannot: a resume is refused outright for
+    /// `unknown_external_outcome`, so the only crashes that reach here had
+    /// nothing side-effecting in flight. Without this the resumed turn
+    /// re-plans from nothing and can redo steps whose work already landed —
+    /// which is worse than the token-stop case it was already avoiding.
     ///
     /// Best-effort by design: a session whose log cannot be read should not
     /// stop the user asking a question, and the worst case of skipping it is a
     /// turn that starts a fresh plan.
-    fn carry_plan_from_a_token_stop(&self, session_id: &str, task: &Task) -> Result<()> {
+    fn carry_plan_from_the_previous_turn(&self, session_id: &str, task: &Task) -> Result<()> {
         let tasks = self.session_store.read_tasks(session_id)?;
         // The one before this turn's own, which was appended a moment ago.
         let Some(previous) = tasks.iter().rev().find(|candidate| candidate.id != task.id) else {
             return Ok(());
         };
-        if previous.status != TaskStatus::TokenBudgetExhausted {
+        let handed_over = previous.status == TaskStatus::TokenBudgetExhausted
+            || self
+                .session_store
+                .superseded_task_ids(session_id)?
+                .contains(&previous.id);
+        if !handed_over {
             return Ok(());
         }
         let Some(plan) = self
@@ -1241,7 +1265,7 @@ impl ChatOrchestrator {
         // evidence of the step that was still running — which is the step whose
         // outcome was genuinely unknown.
         // Seeded from the log rather than left empty: a resumed turn already
-        // has a plan (see `carry_plan_from_a_token_stop`), and starting this
+        // has a plan (see `carry_plan_from_the_previous_turn`), and starting this
         // at `None` would make `complete_step` report "there is no plan" while
         // the panel showed one.
         let mut plan = self
@@ -2501,6 +2525,47 @@ struct PendingMcpCall {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PendingWebDiagnosticCall {
     call: WebDiagnosticCall,
+}
+
+/// A read-only view of the turns [`ChatOrchestrator`] has parked on disk.
+///
+/// Crash recovery needs one fact out of a paused turn — what a plan review is
+/// holding back — and needs it without an orchestrator, which takes thirteen
+/// dependencies to build and belongs to a repository rather than to the
+/// data directory recovery sweeps. Read-only on purpose: *resuming* a paused
+/// turn stays the orchestrator's, and nothing here can take one.
+///
+/// It parses the file as loose JSON rather than as [`PendingChatTurn`], so a
+/// pending turn written by a different version still answers this question
+/// instead of failing to deserialise and looking like an absent one.
+#[derive(Debug, Clone)]
+pub struct PausedTurns {
+    data_dir: PathBuf,
+}
+
+impl PausedTurns {
+    pub fn new(data_dir: impl AsRef<Path>) -> Self {
+        Self {
+            data_dir: data_dir.as_ref().to_path_buf(),
+        }
+    }
+
+    /// What a paused plan review is holding back, or `None` when the id names
+    /// no paused turn, or one that is not a plan review.
+    ///
+    /// `None` is the signal that a plan review cannot be re-presented: the
+    /// turn behind it is gone, so approving the plan would have nothing to
+    /// continue.
+    pub fn plan_review_deferred_action(&self, proposal_id: &str) -> Option<String> {
+        let path = PendingCommandStore::new(&self.data_dir).path_for(proposal_id);
+        let content = fs::read_to_string(path).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+        value
+            .get("plan_review")?
+            .get("deferred_action")?
+            .as_str()
+            .map(str::to_string)
+    }
 }
 
 #[derive(Debug, Clone)]

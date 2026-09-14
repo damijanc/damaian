@@ -330,6 +330,7 @@ fn a_pending_approval_survives_restart_with_its_proposal() {
         &fixture.audit,
         &commands,
         &patches,
+        &workspace_engine::PausedTurns::new(&fixture.data_dir),
         &fixture.session_id,
     )
     .unwrap();
@@ -372,6 +373,7 @@ fn a_missing_proposal_file_fails_the_task_with_a_reason() {
         &fixture.audit,
         &commands,
         &patches,
+        &workspace_engine::PausedTurns::new(&fixture.data_dir),
         &fixture.session_id,
     )
     .unwrap();
@@ -436,6 +438,7 @@ fn a_corrupt_proposal_file_fails_the_task_rather_than_reconstructing_a_card() {
         &fixture.audit,
         &commands,
         &patches,
+        &workspace_engine::PausedTurns::new(&fixture.data_dir),
         &fixture.session_id,
     )
     .unwrap();
@@ -464,6 +467,7 @@ fn a_task_awaiting_approval_with_no_recorded_link_fails() {
         &fixture.audit,
         &commands,
         &patches,
+        &workspace_engine::PausedTurns::new(&fixture.data_dir),
         &fixture.session_id,
     )
     .unwrap();
@@ -729,6 +733,7 @@ fn a_legacy_task_awaiting_approval_is_failed_because_no_link_was_recorded() {
         &fixture.audit,
         &commands,
         &patches,
+        &workspace_engine::PausedTurns::new(&fixture.data_dir),
         session_id,
     )
     .unwrap();
