@@ -1,0 +1,54 @@
+name = "planned_task"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Work out what the upload client does, then say so"
+
+# Spec 21's acceptance criterion, restated against this harness: a plan runs end
+# to end and reaches a completion report. Every other scenario is short enough
+# that §5.1 says a plan would be ceremony, so without this one the plan metrics
+# would report `notApplicable` on every CI run — which is honest, and measures
+# nothing.
+#
+# The shape matters. The first step closes on a command that exits 0, so it
+# reaches `verified` and the report has something with evidence behind it. The
+# second closes on nothing observable, so it reaches `completed unverified` —
+# the outcome requirement 6 exists to keep visible, and the one a harness that
+# folded the four outcomes into "done" would hide.
+#
+# `ls src` is sandbox-safe (Low risk, `requires_approval = false`), so it runs
+# without an approval stop and without tripping the §5.5 review gate: a plan
+# whose steps only read is never put up for approval, which is exactly what
+# keeps this scenario a measurement of planning rather than of approval.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "propose_plan", arguments = { steps = [
+    { title = "List the source files" },
+    { title = "Summarise what the upload client does" },
+  ] } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [{ name = "complete_step", arguments = {} }]
+
+[[turn]]
+content = ""
+tool_calls = [{ name = "complete_step", arguments = {} }]
+
+[[turn]]
+content = "The upload client sends a payload and reports an error when it is empty."
+
+[assert]
+# A plan that only reads must reach neither the approval gate nor the file
+# system. Both are the scenario's premise rather than incidental: an approval
+# stop would end the turn before the second step, and a changed file would mean
+# a read-only plan mutated something.
+approval_required = false
+files_changed_outside_patch = 0

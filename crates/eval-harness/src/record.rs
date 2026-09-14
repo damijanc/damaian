@@ -61,6 +61,31 @@ pub struct RecordedRecovery {
     pub resume_refused: bool,
 }
 
+/// What became of a run's plan, per spec 21 §5.6.
+///
+/// Counts rather than the plan itself: the harness measures runs, and a record
+/// carrying every step's title and evidence would put model-authored prose and
+/// repository paths into a committed baseline for no measurement gained.
+///
+/// `steps_verified` and `steps_unverified` stay separate for the reason
+/// requirement 6 exists — a step that finished with nothing observable behind
+/// it is not the same result as one a command confirmed, and a single
+/// "completed" count would hide exactly the trend worth watching: whether the
+/// evidence model is missing a source (§7).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordedPlan {
+    pub steps_planned: u64,
+    pub steps_verified: u64,
+    pub steps_unverified: u64,
+    pub steps_blocked: u64,
+    pub steps_skipped: u64,
+    /// Still pending or in progress when the turn ended — a token stop, a
+    /// stopped turn, or a plan left waiting on review. Not an outcome, and
+    /// counted apart from the four that are.
+    pub steps_outstanding: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssertionOutcome {
@@ -112,6 +137,12 @@ pub struct RunRecord {
     /// one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecordedRecovery>,
+    /// Present only when the turn worked through a plan. `None` means the turn
+    /// was trivial enough not to need one (spec 21 §5.1), which is a different
+    /// fact from a plan with no steps — and `metrics.rs` counts only the
+    /// records that carry one, so a planless run cannot report a zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<RecordedPlan>,
     /// Whether the model was offered the native tool contract, which is what
     /// gates `propose_patch` and therefore every patch assertion.
     ///
@@ -156,6 +187,7 @@ impl RunRecord {
             model_calls: 0,
             approval_policy_violations: 0,
             recovery: None,
+            plan: None,
             native_tools: false,
         }
     }

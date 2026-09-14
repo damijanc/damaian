@@ -9,7 +9,9 @@ use workspace_engine::{
 };
 
 use crate::fixture::{self, Materialized};
-use crate::record::{RecordedApproval, RecordedCheck, RecordedRecovery, RunRecord, Tokens};
+use crate::record::{
+    RecordedApproval, RecordedCheck, RecordedPlan, RecordedRecovery, RunRecord, Tokens,
+};
 use crate::scenario::{CrashMidAction, Scenario, Tier};
 use crate::trace::{self, Trace};
 
@@ -437,6 +439,36 @@ fn drive(
     // whole survived. Spec 17's markers carry the engine's own per-call
     // outcome, which did not exist when this was first written.
     run_record.tool_calls = trace::tool_actions(&materialized.data_dir)?;
+
+    // Read before the match below consumes `outcome`. The plan comes from the
+    // session log rather than being accumulated here — the same reason tokens
+    // are read back rather than counted: an eval figure and a real session's
+    // figure must not be able to drift.
+    //
+    // `None` when the turn planned nothing, which is most of the deterministic
+    // tier: those scenarios are short enough that §5.1 says a plan would be
+    // ceremony, and the metric reports `notApplicable` rather than a zero.
+    run_record.plan = outcome
+        .as_ref()
+        .ok()
+        .and_then(|result| {
+            engine
+                .session_store
+                .read_task_plan(&result.session.id, &result.task.id)
+                .ok()
+                .flatten()
+        })
+        .map(|plan| {
+            let report = plan.report();
+            RecordedPlan {
+                steps_planned: report.steps.len() as u64,
+                steps_verified: report.verified as u64,
+                steps_unverified: report.unverified as u64,
+                steps_blocked: report.blocked as u64,
+                steps_skipped: report.skipped as u64,
+                steps_outstanding: report.outstanding as u64,
+            }
+        });
 
     let (final_status, response, context_files, command_proposal, patch_proposal) = match outcome {
         Ok(result) => (

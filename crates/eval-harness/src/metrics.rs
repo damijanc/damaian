@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::record::RunRecord;
+use crate::record::{RecordedPlan, RunRecord};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -40,8 +40,9 @@ pub struct MetricSet {
 }
 
 impl MetricSet {
-    /// Every row of §5.6, in the spec's order. The array exists so a test can
-    /// enumerate it: requirement 5 is that no measure quietly disappears.
+    /// Every row of spec 18 §5.6, in the spec's order, then spec 21's. The
+    /// array exists so a test can enumerate it: requirement 5 is that no
+    /// measure quietly disappears.
     ///
     /// Sixteen keys for §5.6's fifteen rows. Latency is one row reported as two
     /// values (median and p90, as that row itself asks for), and the two memory
@@ -49,7 +50,11 @@ impl MetricSet {
     /// `notApplicable: "phase-3b"` marker — merging them would leave one of the
     /// spec's named measures absent from the output, which is the exact failure
     /// requirement 5 guards against.
-    pub const KEYS: [&'static str; 16] = [
+    ///
+    /// The last four are spec 21's plan rows. They live here rather than in a
+    /// metric set of their own because requirement 5 is about *the* report — a
+    /// measure kept somewhere else is a measure a baseline diff does not cover.
+    pub const KEYS: [&'static str; 20] = [
         "task_completion_rate",
         "check_pass_rate",
         "approval_policy_violations",
@@ -66,6 +71,10 @@ impl MetricSet {
         "patch_acceptance_rate",
         "memory_recall_usefulness",
         "memory_correction_rate",
+        "plan_steps_planned",
+        "plan_steps_verified",
+        "plan_steps_completed_unverified",
+        "plan_steps_blocked",
     ];
 
     pub fn get(&self, key: &str) -> Option<&Metric> {
@@ -336,6 +345,50 @@ impl MetricSet {
                 phase: "phase-3b".to_string(),
             },
         );
+
+        // Spec 21 §5.6, counted only over runs that actually produced a plan.
+        // A run too trivial to plan carries no `plan` at all, and folding it in
+        // as a zero would be the fabrication requirement 5 forbids — worse
+        // here than for most rows, because "0 steps planned" reads perfectly
+        // well as a plan that proposed nothing.
+        let planned: Vec<&RecordedPlan> = runnable
+            .iter()
+            .filter_map(|record| record.plan.as_ref())
+            .collect();
+        let sum = |field: fn(&RecordedPlan) -> u64| planned.iter().map(|plan| field(plan)).sum();
+        for (key, label, total) in [
+            (
+                "plan_steps_planned",
+                "Plan steps planned",
+                sum(|plan| plan.steps_planned),
+            ),
+            (
+                "plan_steps_verified",
+                "Plan steps completed with evidence",
+                sum(|plan| plan.steps_verified),
+            ),
+            (
+                // Kept apart from the row above for the reason requirement 6
+                // exists: a step that finished with nothing observable behind
+                // it is a different result from one a command confirmed, and a
+                // rising share of these means the evidence model is missing a
+                // source rather than that the work is unobservable (§7).
+                "plan_steps_completed_unverified",
+                "Plan steps completed unverified",
+                sum(|plan| plan.steps_unverified),
+            ),
+            (
+                "plan_steps_blocked",
+                "Plan steps blocked",
+                sum(|plan| plan.steps_blocked),
+            ),
+        ] {
+            push(
+                key,
+                label,
+                count_or_no_data(total, planned.len(), "no-plans"),
+            );
+        }
 
         MetricSet { metrics }
     }

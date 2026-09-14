@@ -266,6 +266,106 @@ model_provider.deepseek.max_output_tokens=384000
 
 Setting a value higher than the model actually allows causes the provider to reject the request outright, so prefer the built-in defaults unless you know the model's real limit.
 
+## The Plan Panel
+
+When a request needs more than one piece of work, the assistant writes a plan
+before starting and a panel appears under its answer showing every step and
+what became of it.
+
+Short requests get no plan. A question answered by reading one file is a single
+step, and a panel for it would be ceremony you learn to scroll past — which
+would cost the panel its meaning on the turn where it matters.
+
+Exactly one step runs at a time. If the panel ever shows two as running, it
+says so in red: that is a fault, not a feature, and hiding it by drawing only
+the first would conceal the bug.
+
+### What each step says
+
+Every finished step carries one of four outcomes:
+
+- **Confirmed** — the step finished and something Damaian watched confirms it: a
+  command that exited cleanly, or a patch that was applied.
+- **Completed, unverified** — the step finished, and nothing observable stands
+  behind it. "Understand the retry logic" is a real step with nothing to
+  measure. Damaian says so rather than implying a confirmation it does not
+  have.
+- **Blocked** — a command the step ran did not succeed. The steps after it stay
+  pending: continuing would build on work that did not happen.
+- **Skipped** — the step was not needed.
+
+The one-line summary at the top of the panel **never says "complete" while any
+step is blocked or still open**. A plan where four steps passed and one failed
+is not a plan that worked.
+
+Open *What confirms this* on any step to see the evidence itself — the command
+and its exit code, or the files a patch wrote. This is what Damaian observed,
+never what the model said about its own work. A step whose command exited 3 is
+blocked no matter how confidently the reply describes it as done.
+
+The panel survives a reload, so you can reopen an old session and still see
+what a turn came to.
+
+### Reviewing a plan before it runs
+
+Before the first step that changes anything, Damaian stops and shows you the
+plan. Nothing has happened yet at that point — no file written, no command run.
+You can:
+
+- **Reorder** steps with the arrows.
+- **Retitle** a step by typing in its box.
+- **Delete** a step with `×`.
+- **Approve** the plan as it stands, or **Decline** it.
+
+A plan whose steps only read things — listing files, searching, reading source
+— is never put up for approval. There is nothing to undo, and a prompt for
+every lookup is a prompt you stop reading.
+
+A step that has already run is shown but has no controls. Its result is tied to
+the state of your repository, and deleting it would leave a plan whose history
+no longer describes what actually happened. If you want a genuinely different
+plan mid-task, stop the task and start another — [Rewind](#rewind) can take the
+repository back first.
+
+Approving is remembered for that task, so you are asked once, not before every
+edit. A [rewind](#rewind) past the point where you approved takes the approval
+with it: you are asked again, because you have moved the conversation back to
+before you saw the plan.
+
+## Capping What One Turn May Spend
+
+`agent_max_task_tokens` stops a turn once it has spent that many tokens, rather
+than letting a stuck agent run up a bill:
+
+```text
+agent_max_task_tokens=120000
+```
+
+**The cap is per turn, not per session or per day.** One turn is one thing you
+asked for — one message and everything Damaian does to answer it, including
+every tool call and every model call it makes along the way. Ten turns with a
+120000 cap can spend 1.2M tokens between them. Read it as "no single request
+may cost more than this", and set it against what one large request should
+reasonably cost, not against your budget for the week.
+
+There is no default: without this setting, nothing caps a turn's tokens and
+`agent_max_tool_rounds` remains the only bound. The minimum accepted value is
+1000 — below that, a turn would stop before it could do anything.
+
+When a turn stops this way you see **Token budget exhausted** under the answer,
+and the reply names what was finished and what was left. Nothing is lost:
+raise the cap and ask again, and the turn picks the plan up where it stopped,
+keeping the evidence its earlier steps had already gathered.
+
+This is different from **Tool budget exhausted**, which means the work needed
+more tool rounds than `agent_max_tool_rounds` allows. One ran out of rounds;
+the other ran out of money.
+
+A repository's own `.damaian/config.toml` may only tighten this cap: it can
+lower one you set, or introduce one where you had none, but it can never raise
+or remove yours. A repository you cloned cannot widen what an agent may spend
+on your machine.
+
 ## What a Turn Cost
 
 Every assistant reply carries a line underneath it saying what the turn used:

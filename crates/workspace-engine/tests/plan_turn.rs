@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use workspace_engine::plan::{StepStatus, TaskPlan};
+use workspace_engine::plan::{Evidence, StepStatus, TaskPlan};
 use workspace_engine::{
     CancelToken, ChatTurnResult, Config, MockModelAdapter, ModelAdapter, PlanRevisionStep,
     ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
@@ -715,4 +715,67 @@ fn a_turn_without_a_plan_reports_none() {
     let (_, reported) = ask_watching_plans(&engine, &repo, "What does src/a.rs do?", &mut adapter);
 
     assert!(reported.is_empty(), "got {reported:?}");
+}
+
+#[test]
+fn a_step_that_read_a_file_is_confirmed_by_the_read() {
+    // §7 asks whether any step type ends up with no available evidence. A
+    // reading step did: `Evidence::FileRead` existed in the enum and nothing
+    // ever built one, so "read the retry helper" reported *completed
+    // unverified* even though Damaian had the path and the content hash in
+    // hand. The evidence was available and simply not recorded, which is a
+    // missing source rather than genuinely unobservable work.
+    let repo = temp_repo("read-evidence");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"Read the source"},{"title":"Report"}]}"#,
+        )],
+        vec![call("read_file", r#"{"path":"src/a.rs"}"#)],
+        vec![call("complete_step", "{}")],
+    ]);
+
+    let result = ask(&engine, &repo, "What does src/a.rs do?", &mut adapter);
+    let plan = plan_of(&engine, &result).expect("the turn proposed a plan");
+
+    assert_eq!(plan.steps[0].status, StepStatus::Completed);
+    assert!(
+        !plan.steps[0].is_unverified(),
+        "the read is observable, so the step is confirmed rather than unverified"
+    );
+    match plan.steps[0].evidence.as_slice() {
+        [Evidence::FileRead { path, hash }] => {
+            assert_eq!(path, "src/a.rs");
+            assert!(!hash.is_empty(), "the hash says *which* content was read");
+        }
+        other => panic!("expected one file-read evidence, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_file_that_could_not_be_read_confirms_nothing() {
+    // The failure direction, and the one that matters: a read that was refused
+    // or missing must not mint evidence. Recording it would confirm a step
+    // with the fact that Damaian *tried* to look at something.
+    let repo = temp_repo("read-evidence-failed");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"Read the source"},{"title":"Report"}]}"#,
+        )],
+        vec![call("read_file", r#"{"path":"src/no-such-file.rs"}"#)],
+        vec![call("complete_step", "{}")],
+    ]);
+
+    let result = ask(&engine, &repo, "What does it do?", &mut adapter);
+    let plan = plan_of(&engine, &result).expect("the turn proposed a plan");
+
+    assert!(
+        plan.steps[0].evidence.is_empty(),
+        "a failed read is not evidence of anything, got {:?}",
+        plan.steps[0].evidence
+    );
+    assert!(plan.steps[0].is_unverified());
 }

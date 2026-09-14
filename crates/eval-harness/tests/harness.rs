@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use eval_harness::assertions;
 use eval_harness::metrics::{MetricSet, MetricValue};
 use eval_harness::record::{
-    AssertionOutcome, RecordedRecovery, RecordedToolCall, RunRecord, Tokens,
+    AssertionOutcome, RecordedPlan, RecordedRecovery, RecordedToolCall, RunRecord, Tokens,
 };
 use eval_harness::report;
 use eval_harness::scenario::{self, Tier};
@@ -826,10 +826,10 @@ fn a_blocked_scenario_is_still_skipped_and_says_why() {
     );
 }
 
-/// Guards the count in proposal §6, now that spec 17 has landed: all thirteen
-/// scenarios run and none is blocked.
+/// Guards the count in spec 18 §6, now that spec 17 has landed: every scenario
+/// runs and none is blocked. Fourteen since spec 21 added `planned_task`.
 #[test]
-fn thirteen_scenarios_run_and_none_is_blocked() {
+fn every_scenario_runs_and_none_is_blocked() {
     let all = scenario::load_all().expect("scenarios should load");
     let blocked: Vec<&str> = all
         .iter()
@@ -842,7 +842,7 @@ fn thirteen_scenarios_run_and_none_is_blocked() {
         Vec::<&str>::new(),
         "no scenario is deferred any more"
     );
-    assert_eq!(all.len(), 13, "thirteen scenarios should run");
+    assert_eq!(all.len(), 14, "fourteen scenarios should run");
 }
 
 #[test]
@@ -1129,8 +1129,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
     assert_eq!(
         built.records.len(),
-        13,
-        "all thirteen scenario files should be accounted for"
+        14,
+        "all fourteen scenario files should be accounted for"
     );
     assert_eq!(
         built
@@ -1578,4 +1578,157 @@ fn a_real_run_whose_commands_all_fail_reports_a_non_zero_error_rate() {
         rate > 0.0,
         "a run whose every command failed must not report a zero error rate"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Plan metrics. Spec 21 §6, measured through spec 18's harness.
+// ---------------------------------------------------------------------------
+
+fn record_with_plan(scenario: &str, plan: RecordedPlan) -> RunRecord {
+    let mut record = RunRecord::new(scenario, "4", "deterministic", "mock", "mock");
+    record.plan = Some(plan);
+    record
+}
+
+#[test]
+fn a_run_that_worked_through_a_plan_reports_what_became_of_its_steps() {
+    // Spec 21's acceptance criterion, restated against spec 18's harness: a
+    // plan runs end to end and the run's record says what it came to.
+    let records = vec![
+        record_with_plan(
+            "a",
+            RecordedPlan {
+                steps_planned: 3,
+                steps_verified: 1,
+                steps_unverified: 1,
+                steps_blocked: 1,
+                steps_skipped: 0,
+                steps_outstanding: 0,
+            },
+        ),
+        record_with_plan(
+            "b",
+            RecordedPlan {
+                steps_planned: 2,
+                steps_verified: 2,
+                steps_unverified: 0,
+                steps_blocked: 0,
+                steps_skipped: 0,
+                steps_outstanding: 0,
+            },
+        ),
+    ];
+
+    let set = MetricSet::compute(&records);
+
+    let count = |key: &str| match &set.get(key).unwrap_or_else(|| panic!("no `{key}`")).value {
+        MetricValue::Count { value } => *value,
+        other => panic!("`{key}` should be a count, got {other:?}"),
+    };
+    assert_eq!(count("plan_steps_planned"), 5);
+    assert_eq!(count("plan_steps_verified"), 3);
+    assert_eq!(count("plan_steps_completed_unverified"), 1);
+    assert_eq!(count("plan_steps_blocked"), 1);
+}
+
+#[test]
+fn a_run_that_never_planned_reports_not_applicable_rather_than_zero() {
+    // The distinction requirement 5 exists for, and it bites harder here than
+    // almost anywhere: "0 steps planned" is a perfectly plausible reading of a
+    // plan that proposed nothing, and a baseline diff cannot tell it from a
+    // turn that was too trivial to plan at all (spec 21 §5.1).
+    let records = vec![RunRecord::new("a", "4", "deterministic", "mock", "mock")];
+
+    let set = MetricSet::compute(&records);
+
+    for key in [
+        "plan_steps_planned",
+        "plan_steps_verified",
+        "plan_steps_completed_unverified",
+        "plan_steps_blocked",
+    ] {
+        match &set.get(key).unwrap_or_else(|| panic!("no `{key}`")).value {
+            MetricValue::NotApplicable { phase } => {
+                assert_eq!(phase, "no-plans");
+            }
+            other => panic!(
+                "`{key}` reported {other:?} for a run with no plan; zero would read \
+                 as a plan that planned nothing"
+            ),
+        }
+    }
+}
+
+#[test]
+fn a_blocked_step_is_never_counted_among_the_completed_ones() {
+    // The laundering §5.3 forbids, carried into the report. A harness that
+    // folded blocked into completed would show a clean plan for a run whose
+    // command failed.
+    let records = vec![record_with_plan(
+        "a",
+        RecordedPlan {
+            steps_planned: 2,
+            steps_verified: 0,
+            steps_unverified: 0,
+            steps_blocked: 2,
+            steps_skipped: 0,
+            steps_outstanding: 0,
+        },
+    )];
+
+    let set = MetricSet::compute(&records);
+
+    let count = |key: &str| match &set.get(key).unwrap_or_else(|| panic!("no `{key}`")).value {
+        MetricValue::Count { value } => *value,
+        other => panic!("`{key}` should be a count, got {other:?}"),
+    };
+    assert_eq!(count("plan_steps_blocked"), 2);
+    assert_eq!(count("plan_steps_verified"), 0);
+    assert_eq!(count("plan_steps_completed_unverified"), 0);
+}
+
+/// Spec 21 §6's last acceptance criterion, restated against this harness: a
+/// plan runs end to end and reaches a completion report. Every other scenario
+/// is too short to plan, so without this one the plan metrics would report
+/// `notApplicable` on every CI run — honest, and measuring nothing.
+#[test]
+fn a_planned_scenario_runs_end_to_end_and_reports_what_its_steps_came_to() {
+    let path = scenario::scenarios_dir().join("planned_task.toml");
+    let loaded = scenario::load(&path).expect("scenario");
+    let run = eval_harness::runner::run(&loaded).expect("run");
+
+    let plan = run
+        .record
+        .plan
+        .as_ref()
+        .expect("the scenario proposes a plan, so the record must carry one");
+    assert_eq!(plan.steps_planned, 2);
+    assert_eq!(
+        plan.steps_verified, 1,
+        "the step that ran a command is confirmed by its exit code"
+    );
+    assert_eq!(
+        plan.steps_unverified, 1,
+        "the step with nothing observable behind it is completed *unverified*, and \
+         the report has to keep saying so"
+    );
+    assert_eq!(plan.steps_blocked, 0);
+    assert_eq!(
+        plan.steps_outstanding, 0,
+        "both steps closed, so the plan is finished rather than abandoned"
+    );
+
+    // And the metric set built from it reports counts rather than no-data.
+    let set = MetricSet::compute(std::slice::from_ref(&run.record));
+    for (key, expected) in [
+        ("plan_steps_planned", 2),
+        ("plan_steps_verified", 1),
+        ("plan_steps_completed_unverified", 1),
+        ("plan_steps_blocked", 0),
+    ] {
+        match &set.get(key).unwrap_or_else(|| panic!("no `{key}`")).value {
+            MetricValue::Count { value } => assert_eq!(*value, expected, "`{key}`"),
+            other => panic!("`{key}` should be a count from a planned run, got {other:?}"),
+        }
+    }
 }

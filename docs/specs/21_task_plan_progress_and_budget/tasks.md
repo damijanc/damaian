@@ -79,7 +79,7 @@ Every task's requirements implicitly include this section.
 | 10. Plan carry-over on resume | **done** | Unblocks 4b's patch evidence and 6's `Editing` phase — see the note below |
 | 11. Plan review gate | **done** | "Mutating" is not decidable from the action alone — see the note below |
 | 12. Plan panel and completion report | **done** | Closed Task 7's and Task 11's debts; found a pre-existing duplicate-stop-row bug — see the note below |
-| 13. Harness coverage and documentation | not started | |
+| 13. Harness coverage and documentation | **done** | §7's own question found a missing evidence source — see the note below |
 
 ## File Structure
 
@@ -2126,6 +2126,71 @@ Set the proposal's `Status:` to what is actually true, and update
 - [ ] **Step 6: Run the full gate, then ask before committing**
 
 Proposed message: `Measure plans in the harness and document what a plan means`
+
+#### What this task actually did
+
+**§7's third question found a real defect.** It asked whether any step type
+ends up with no available evidence, warning that a large share of unverified
+steps would mean the evidence model is missing a source. It did.
+`Evidence::FileRead` had existed since Task 2 — `status_from_evidence` handled
+it, `phase()` mapped it to `Understanding` — and **nothing ever constructed
+one**. `evidence_for` covered `CommandExit` and `PatchApplied` and returned
+`None` for everything else, so "read the retry helper" reported *completed
+unverified* while the path and content hash sat in `FileRead` at the moment of
+the read. Fixed here rather than recorded as a known gap: the fix is an
+`ActionOutcome::FileRead` variant carrying both out of the arm, and writing
+"we know a source is missing" while leaving it would have been the worse
+choice. A failed read still mints nothing, mutation-checked — a step must not
+be confirmed by the fact that Damaian *tried* to look at something. It also
+makes `TaskPhase::Understanding` a derived answer rather than only the `None`
+fallback.
+
+**§7's first question has no answer, and that is the finding.** It asked for
+"the mechanical rule actually used to decide a turn is non-trivial". There is
+none and there cannot be one: anything the engine could measure before the work
+starts is a guess about work nobody has begun, and §5.1 needs the plan to exist
+*before* the first mutating step, so a rule derived from what the turn went on
+to do arrives too late to be a plan. The decision is the model's, guided by the
+tool description and held by two structural guards (`minItems: 2`, and a second
+`propose_plan` is refused rather than replacing the first). **How often it
+over-fires is unmeasured and CI cannot measure it** — the deterministic tier
+scripts every tool call, so the model is not choosing there. Recorded as
+unquantified rather than given an invented number.
+
+**No default ceiling was chosen**, and §7 now says why: the right value depends
+on the user's rates, repository size, and what they consider a request worth,
+and `agent_max_tool_rounds` is already the runaway-loop net. A budget with a
+default nobody chose is a budget nobody owns.
+
+**The baseline had been stale since Task 1.** Regenerating it for the new
+scenario surfaced that `tool_and_model_error_rate` moved 0.000 → 0.333 and
+`check_pass_rate` 0.000 → 0.111 — not from anything in this task, but because
+Task 1 made those metrics capable of moving at all and nobody regenerated
+`evals/baseline.json` across tasks 1–12. `failed_validation_retry`'s eight
+failing commands had been recorded `ok`, and `restricted_path`'s denied read
+likewise. This is what the human review gate exists to catch; the numbers are
+now correct rather than correct-looking.
+
+**A scenario, not just a metric.** Every existing scenario is too short to plan,
+so the plan metrics would have reported `notApplicable` on every CI run —
+honest, and measuring nothing. `planned_task` runs a plan end to end: one step
+closes on a command that exits 0 (verified), the other on nothing observable
+(completed unverified), so the scenario exercises the distinction requirement 6
+exists for rather than only the happy path. Two scenario-count guards caught
+the addition, which is what they are for.
+
+Both metric decisions were mutation-checked: counting planless runs as zeros
+fails `a_run_that_never_planned_reports_not_applicable_rather_than_zero`, and
+folding blocked into completed fails two tests.
+
+**Documentation.** `USER_GUIDE.md` gets the plan panel, the four outcomes, the
+review gate, and the ceiling — stating plainly that it is **per turn**, since a
+reader who assumes per-session will set a number that does not do what they
+meant and find out from a bill. `TROUBLESHOOTING.md` gets the five plan event
+types, the evidence shapes (including that a missing `exitCode` is not a zero),
+and how to tell the two budget stops apart. Every `jq` snippet in it was run
+against a real session log from the `planned_task` eval run rather than written
+from the code.
 
 ---
 

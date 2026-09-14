@@ -46,13 +46,20 @@ type McpTokenResolverFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 /// record that it failed, and reading the prose back to find out would be
 /// guessing. See
 /// `docs/specs/21_task_plan_progress_and_budget/context.md` §3.4.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ActionOutcome {
     /// Dispatch succeeded and the tool reported nothing to the contrary.
     Ok,
     /// A command ran. The code is whatever the process reported, and `None`
     /// means it was killed or signalled — not that it passed.
     CommandExit(Option<i32>),
+    /// A file was read, carrying what was read and the hash of the content.
+    ///
+    /// Both travel out of the arm for the same reason the exit code does:
+    /// nothing downstream can recover them, and a step whose only work was
+    /// reading would otherwise report *completed unverified* despite the
+    /// engine having watched the read happen.
+    FileRead { path: String, hash: String },
     /// The tool itself reported a failure: an MCP `is_error` or transport
     /// error, a browser diagnostic that could not run. Not a command, so there
     /// is no exit code to carry.
@@ -79,6 +86,14 @@ fn evidence_for(outcome: &ActionOutcome, marker_id: &str) -> Option<crate::plan:
         ActionOutcome::CommandExit(exit_code) => Some(crate::plan::Evidence::CommandExit {
             marker_id: marker_id.to_string(),
             exit_code: *exit_code,
+        }),
+        // No marker id: unlike a command, the fact worth keeping is *which
+        // content* was read, and the hash says that across turns while a
+        // marker id only points at the call. §5.3's rule that evidence must
+        // carry the fact rather than a pointer into a store that expires.
+        ActionOutcome::FileRead { path, hash } => Some(crate::plan::Evidence::FileRead {
+            path: path.clone(),
+            hash: hash.clone(),
         }),
         ActionOutcome::Ok | ActionOutcome::Failed => None,
     }
@@ -1935,7 +1950,10 @@ impl ChatOrchestrator {
                     ) {
                         Ok(file_read) => (
                             format!("Content of {}:\n{}", file_read.path, file_read.content),
-                            ActionOutcome::Ok,
+                            ActionOutcome::FileRead {
+                                path: file_read.path.clone(),
+                                hash: file_read.hash.clone(),
+                            },
                         ),
                         Err(error) => (
                             format!("Cannot read {path}: {error}"),
@@ -2200,7 +2218,12 @@ impl ChatOrchestrator {
                 ActionOutcome::CommandExit(exit_code) => self
                     .session_store
                     .finish_command_action(action_marker, exit_code)?,
-                ActionOutcome::Ok => self.session_store.finish_action(action_marker, "ok")?,
+                // A successful read is an `ok` dispatch like any other; the
+                // path and hash it carries are for the step's evidence, not
+                // for the marker.
+                ActionOutcome::Ok | ActionOutcome::FileRead { .. } => {
+                    self.session_store.finish_action(action_marker, "ok")?
+                }
                 ActionOutcome::Failed => {
                     self.session_store.finish_action(action_marker, "failed")?
                 }

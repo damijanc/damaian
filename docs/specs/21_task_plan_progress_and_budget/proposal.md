@@ -1,11 +1,17 @@
 # Feature Spec: Task Plan, Progress, and Budget
 
-Status: Planned, not started. Planning read this design against the tree on
-2026-09-11 and found eight statements the code contradicts — including that a
-"task" is one turn, that the round-budget pattern §5.4 says to copy would make
-the ceiling spend *more* than the ceiling, and that the session log has no
-failure outcome for evidence to be read from. All eight are reconciled in
-[`context.md`](context.md) §3 and accounted for in [`tasks.md`](tasks.md).
+Status: Done. Planning read this design against the tree on 2026-09-11 and
+found eight statements the code contradicts — including that a "task" is one
+turn, that the round-budget pattern §5.4 says to copy would make the ceiling
+spend *more* than the ceiling, and that the session log has no failure outcome
+for evidence to be read from. All eight are reconciled in
+[`context.md`](context.md) §3 and were carried through
+[`tasks.md`](tasks.md)'s fourteen tasks.
+
+Two questions §7 asked turned out to have answers worth reading before the
+design: there is **no mechanical triviality rule** and there cannot be one, and
+one step type had no evidence because a source the enum already allowed for was
+never recorded. Both are in §7.
 Order: 21 of 23
 Roadmap: `docs/ROADMAP/02_phase_2_complete_task_workflow.md`, Phase 2, Work
 Package 2 (Must). That directory is local-only and not committed, so the
@@ -325,11 +331,122 @@ statuses.
 
 ## 7. Implementation Notes
 
-To be completed during implementation. Record:
+### There is no mechanical triviality rule, and that is the answer
 
-- The mechanical rule actually used to decide a turn is non-trivial, and how
-  often it produced a plan for a turn that did not need one during testing.
-- The default `agent_max_task_tokens` if one is chosen later, and the reasoning.
-- Whether any step type in practice ends up with no available evidence, since a
-  large share of unverified steps would mean the evidence model is missing a
-  source rather than the work being genuinely unobservable.
+This section asked for "the mechanical rule actually used to decide a turn is
+non-trivial". None exists, and the reason is worth recording rather than
+papering over: **the engine cannot make that judgement before the work starts.**
+Anything it could measure up front — prompt length, keyword shape, file count
+— would be a guess about work nobody has begun. §5.1 also requires the plan to
+exist *before* the first mutating step, so a rule derived from what the turn
+went on to do arrives too late to be a plan at all.
+
+So the decision belongs to the model, expressed as a tool it may call. The only
+guidance is the `propose_plan` description:
+
+> Propose an ordered plan for non-trivial work, before starting it. Use this
+> when the task needs more than one step — a single question or a single file
+> read needs no plan.
+
+Two structural guards back it up. The schema sets `minItems: 2`, so a one-step
+plan cannot be expressed; and a turn may propose a plan only once — a second
+call is refused rather than replacing the first, because steps already carry
+evidence tied to a state of the repository.
+
+**How often it over-fires is not yet measured, and cannot be measured by CI.**
+The deterministic tier scripts every tool call, so the model is not choosing
+there: `planned_task` produces a plan because the scenario file says to. The
+question needs the live tier and a corpus of real prompts. Until then the
+honest position is that this is unquantified — recording an unmeasured number
+would be worse than recording none.
+
+### No default `agent_max_task_tokens` was chosen
+
+The setting is `Option<u64>` and defaults to `None`. No default was picked
+because no honest one exists: the right ceiling depends on the user's provider
+rates, repository size, and what they consider a request worth. A number low
+enough to protect a careless user would truncate legitimate large refactors on
+a big repository, and one high enough never to interfere would not protect
+anyone.
+
+Runaway loops are already bounded by `agent_max_tool_rounds`, which defaults to
+8. That is the safety net; this ceiling is a *budget*, and a budget with a
+default nobody chose is a budget nobody owns. The minimum accepted value is
+1000 — below that a turn would stop before doing anything, which is
+indistinguishable from Damaian being broken, so a typo is refused at parse time
+rather than surfacing later as a hang.
+
+### One step type had no evidence, and the evidence was there all along
+
+This section anticipated that a large share of unverified steps would mean "the
+evidence model is missing a source rather than the work being genuinely
+unobservable". That is exactly what happened, and it was found by asking this
+question rather than by a failing test.
+
+`Evidence::FileRead` existed in the enum from Task 2. `status_from_evidence`
+handled it and `TaskPhase` mapped it to `Understanding` — but **nothing ever
+constructed one**. `evidence_for` covered `CommandExit` and `PatchApplied` and
+returned `None` for everything else, so a step whose work was "read the retry
+helper" reported *completed unverified* even though the engine had the path and
+the content hash in hand at the moment of the read. Now fixed:
+`ActionOutcome::FileRead` carries both out of the arm, and a failed read still
+mints nothing — a step must not be confirmed by the fact that Damaian *tried*
+to look at something.
+
+It also makes `TaskPhase::Understanding` a derived answer rather than only the
+`None` fallback.
+
+**What still mints no evidence,** deliberately or otherwise:
+
+| Tool | Evidence | Why |
+|------|----------|-----|
+| `run_command` | `CommandExit` | — |
+| patch apply | `PatchApplied` | recorded from `edit.rs`, after the proposing turn ends |
+| `read_file` | `FileRead` | — |
+| `search_codebase` | none | a result list is a claim about relevance, not an observation about the repository |
+| `read_git_status`, `read_git_diff` | none | worth revisiting: both observe real state and could carry a hash |
+| `mcp_call`, `web_diagnostic` | none | the outcome is a remote system's, and §4 rules out probing to find out what it did |
+| spec 22 findings | `Evidence::Findings` | **not implemented** — spec 22 does not exist to produce the ids it would hold |
+
+`Evidence` is `#[non_exhaustive]` and `status_from_evidence`'s match is
+exhaustive in-crate, so adding a variant is a compile error at the one place
+that must decide what it means. That is the intended behaviour, not an
+oversight.
+
+The one measured figure, from `planned_task` in CI: 2 steps planned, 1 verified,
+1 completed unverified. The unverified one is a summarising step with genuinely
+nothing to observe, which is the honest half of the distinction.
+
+### How the phase is derived
+
+`TaskPhase` is computed from the plan rather than tracked, so it cannot
+contradict the steps it describes. In order:
+
+1. No steps at all → `Planning`.
+2. Every step `Completed` or `Skipped` → `Complete`.
+3. `awaiting_review` → `Reviewing`.
+4. Otherwise, the **newest** piece of evidence across all steps:
+   `CommandExit` → `Validating`, `PatchApplied` → `Editing`, `FileRead` or no
+   evidence at all → `Understanding`.
+
+`awaiting_review` is a parameter rather than something the plan knows. Whether a
+patch is sitting in front of a human is a fact about the task, not about the
+step list, and guessing it from the steps would have been a fabrication — the
+alternative was dropping the variant, which would have made the phase lie by
+omission during the one state a user most wants named.
+
+**`Planning` is nearly unreachable in practice.** A plan is created with its
+steps already in it, so a zero-step plan only exists between `TaskPlan::new`
+and the first push — a window inside one function that never reaches the log.
+It is kept because it is the honest answer for a plan with no steps, and
+because a `phase()` that had to assume non-empty input would be a precondition
+nothing enforces.
+
+### The ceiling is checked before the call, not after it
+
+§5.4 said to follow the `tool_budget_exhausted` pattern "exactly". That pattern
+detects exhaustion *after* a model call and then makes one more with tools
+dropped, which for a token ceiling would spend past the ceiling to discover it
+had been crossed — see [`context.md`](context.md) §3.3. The check therefore sits
+at the top of the loop, before the call: a turn stops at the last round whose
+spending was under the ceiling, never after the one that crossed it.

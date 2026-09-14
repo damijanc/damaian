@@ -361,7 +361,8 @@ events. This is where **message content** lives.
 
 Event types: `session_created`, `session_renamed`, `task_created`,
 `task_status_updated`, `message_appended`, `action_started`, `action_finished`,
-`browser_diagnostics_approval_updated`, `conversation_rewound`.
+`browser_diagnostics_approval_updated`, `conversation_rewound`, `plan_created`,
+`plan_revised`, `plan_resumed`, `plan_step_updated`, `plan_approved`.
 
 Every event carries a monotonic `seq`. Events written before that field existed
 are numbered by line order on read, which is their append order, so old
@@ -380,8 +381,8 @@ jq -r 'select(.eventType=="message_appended") | "[\(.payload.role)] \(.payload.c
 ```
 
 Follow task state, which is how you spot a turn that died mid-flight — a task
-whose last status is not `complete`, `failed`, `cancelled` or
-`tool_budget_exhausted` never finished:
+whose last status is not `complete`, `failed`, `cancelled`,
+`tool_budget_exhausted` or `token_budget_exhausted` never finished:
 
 ```bash
 jq -r 'select(.eventType=="task_status_updated") | "\(.payload.task.status // .payload.status) \(.payload.task.id // .payload.id)"' "$SESSION_FILE"
@@ -405,6 +406,92 @@ unreadable *directory* is the case that stays quiet. To check a file yourself:
 ```bash
 jq -e . "$SESSION_FILE" > /dev/null
 ```
+
+### Plans and step evidence
+
+A turn that needed more than one piece of work writes a plan. Five event types
+carry it, and reading them in order is how you reconstruct what the panel
+showed:
+
+| Event | Written when |
+|-------|--------------|
+| `plan_created` | the model proposed the plan |
+| `plan_revised` | the user edited it at the review gate |
+| `plan_resumed` | a plan was carried onto a new task after a token stop |
+| `plan_step_updated` | one step changed status or gained evidence |
+| `plan_approved` | the user cleared the review gate |
+
+The full-plan events carry the whole step list; `plan_step_updated` carries one
+step under `.payload.step`. On replay the step list comes **only** from the
+first three — an update naming a step the plan does not have is ignored, so the
+log cannot grow a plan nobody wrote.
+
+See every plan event in order:
+
+```bash
+jq -r 'select(.eventType | startswith("plan_")) | "\(.seq) \(.eventType)"' "$SESSION_FILE"
+```
+
+Read the final state of each step, which is what the panel renders:
+
+```bash
+jq -r 'select(.eventType=="plan_step_updated") | "\(.payload.step.id) \(.payload.step.status) evidence=\(.payload.step.evidence | length)"' "$SESSION_FILE"
+```
+
+A step's `evidence` array is what Damaian itself observed, never what the model
+claimed. Three kinds:
+
+- `{"kind":"commandExit","markerId":…,"exitCode":0}` — a command ran. **A
+  missing `exitCode` is not a zero**: the process was killed or signalled and
+  reported no code, which blocks the step rather than passing it.
+- `{"kind":"patchApplied","markerId":…,"files":[{"path":…,"appliedHash":…}]}` —
+  a patch landed. `appliedHash` is what was actually written, which differs
+  from the proposal's hash when the user accepted only some hunks.
+- `{"kind":"fileRead","path":…,"hash":…}` — a file was read.
+
+`markerId` ties evidence back to the `action_started` / `action_finished` pair
+for that call, so you can find the command's stored output under
+`commands/output/`.
+
+A step showing `"status":"completed"` with `"evidence":[]` is **completed
+unverified** — it finished with nothing observable behind it. That is a
+reported outcome, not a missing record. A step showing `"status":"blocked"` had
+a command that did not succeed; the steps after it stay `pending` on purpose.
+
+Rewinding takes plans and approvals with it: `read_task_plan` and
+`read_plan_approved` both read only events after the last
+`conversation_rewound`, unlike token usage, which is read from every event
+because what was billed was billed regardless of where the conversation now
+sits.
+
+### A turn stopped early: which budget ran out
+
+Two statuses look alike in the UI and mean different things:
+
+- `tool_budget_exhausted` — the work needed more tool rounds than
+  `agent_max_tool_rounds` allows (default 8, plus one closing model call). The
+  agent was going round in circles, or the task genuinely needs more steps.
+- `token_budget_exhausted` — the turn reached `agent_max_task_tokens`, which is
+  **per turn**, not per session. Nothing is wrong; it cost more than the cap
+  allows.
+
+Tell them apart in the log:
+
+```bash
+jq -r 'select(.eventType=="task_status_updated") | .payload.task.status // .payload.status' "$SESSION_FILE" | sort | uniq -c
+```
+
+A token stop is recoverable without losing work. Raise the cap and ask again:
+the next turn reads the stopped task's plan, carries it forward as
+`plan_resumed`, and keeps the evidence the earlier steps had already gathered.
+Confirm the carry happened:
+
+```bash
+jq -r 'select(.eventType=="plan_resumed") | "\(.payload.taskId) resumed from \(.payload.resumedFrom)"' "$SESSION_FILE"
+```
+
+If no `plan_resumed` appears, the previous task either had no plan or had
+nothing outstanding — a plan whose steps all finished has nothing to resume.
 
 ### After a crash: what recovery decided
 
