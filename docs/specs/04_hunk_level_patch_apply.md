@@ -2,6 +2,9 @@
 
 Status: Done
 Order: 4 of 5
+Depends on: [#3](03_structured_tool_calling.md) (the tool-call surface patch
+actions use) — built. Everything else named below is a cross-reference, not a
+prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` §7.7 (Diff and Patch Engine — "Support hunk-level acceptance when feasible"), §13 (MVP Release Scope — "Basic hunk-level support if implementation cost is acceptable").
 
 ## 1. Correction to initial gap analysis

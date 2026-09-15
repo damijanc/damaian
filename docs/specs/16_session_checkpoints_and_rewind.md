@@ -5,9 +5,10 @@ implemented and tested, the storage bound and census cost are measured, and the
 UI has been driven by hand. See §7 for the deviations from the design above and
 the defects the verification pass found.
 Order: 16 of 19
-Roadmap: `docs/ROADMAP/01_phase_1_trust_and_recovery.md`, Phase 1, Work
+Plan: `docs/PLAN/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 1 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
+Depends on: nothing in this directory.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.7 (Diff
 and Patch Engine), section 7.3 (path policy), section 7.10 (secret detection).
 Related implementation specs:

@@ -2,13 +2,14 @@
 
 Status: Not started
 Order: 47 of 47
-Roadmap: none. Like [`07`](07_generated_secret_override.md),
+Plan: none. Like [`07`](07_generated_secret_override.md),
 [`08`](08_stop_and_progress.md), [`13`](13_docker_command_support.md) and
 [`34`](34_repository_config_trust_boundary.md), this spec is evidence-driven
 rather than a roadmap graduation — a fourth exception to the rule in
 [`README.md`](README.md). It came from measuring Damaian against its own
 backlog: a session asked what capabilities Damaian needs to implement the
 remaining specs, and ran out of tool rounds before it could answer.
+Depends on: nothing in this directory.
 Related implementation specs:
 [`03_structured_tool_calling.md`](03_structured_tool_calling.md) (owns the tool
 surface this extends), [`04_hunk_level_patch_apply.md`](04_hunk_level_patch_apply.md)
@@ -96,6 +97,9 @@ because those three cannot be built by an agent that lacks it.
    intact, under a budget that is explicit, bounded, and recorded.
 7. Every new tool records through `AuditLog::record`, on the same terms as the
    tools it sits beside.
+8. Where a model requests several read-only tool calls in one round, they are
+   executed concurrently rather than one after another, with the order of
+   results and of log entries unchanged from the sequential case.
 
 ## 4. Non-goals
 
@@ -113,8 +117,12 @@ because those three cannot be built by an agent that lacks it.
 - Changing hunk selection at review time — that is
   [#04](04_hunk_level_patch_apply.md), and it is unaffected.
 - Background or long-running processes as a feature (Phase 2 WP5), and
-  subagents or parallelism ([#38](38_subagent_model.md),
-  [#39](39_coordination_and_conflict_handling.md)).
+  subagents ([#38](38_subagent_model.md),
+  [#39](39_coordination_and_conflict_handling.md)). Requirement 8 is
+  *within-round* dispatch of read-only calls the model already made in one
+  response: no second agent, no second conversation, no second context, and
+  nothing that outlives the round. Multi-agent parallelism and its ownership
+  and conflict rules remain #38 and #39 entirely.
 
 ## 5. Design
 
@@ -144,6 +152,21 @@ rather than assumed:
   command's outcome is unknown, which is exactly the classification #17 exists
   to record — so cancellation must finish its marker honestly rather than
   reporting a clean stop.
+- **What makes a tool safe to run concurrently, and who declares it.**
+  `ModelResponse` already carries `tool_calls: Vec<ToolCall>`, so several calls
+  in one round is a shape the code has; executing them concurrently is the
+  cheapest latency win available to requirement 6, since a round spent reading
+  four files sequentially is four round-trips of nothing. The decision is
+  whether concurrency safety is a per-tool declaration or derived from an
+  existing property — a declaration is explicit and can be wrong, a derivation
+  cannot drift but may not exist. Three constraints hold either way: a call that
+  can mutate, approve, or spend is never in a concurrent batch; results are
+  reassembled in the order the model requested them, so the conversation is
+  identical to the sequential case; and session-log ordering stays
+  deterministic, because [#17](17_durable_task_state_and_crash_recovery/proposal.md)'s
+  `seq` is what recovery replays and a race in it would make a crash classify
+  differently from one run to the next. Cancellation must reach every call in a
+  batch, not only the first.
 - **What a ranged read means to context accounting.** [#26](26_context_assembly.md)
   adds line ranges to `ContextItem` and range deduplication; a ranged read is
   the thing that produces them. The two should agree on one representation
@@ -165,6 +188,15 @@ rather than assumed:
   running command takes effect during that command rather than after it.
 - A task exceeding its tool-round budget continues with its state intact, and
   the continuation is bounded and appears in the audit log.
+- Four read-only calls in one round complete in materially less wall-clock time
+  than the same four run sequentially, and produce byte-identical results in
+  identical order — asserted by comparing a concurrent run against a sequential
+  one, not by timing alone.
+- A round mixing read-only and mutating calls runs the mutating ones
+  sequentially, asserted by test.
+- A stop issued during a concurrent batch cancels every call in it.
+- Session-log `seq` ordering after a concurrent round is deterministic across
+  repeated runs of the same scenario.
 - An edit proposed as a region replacement reaches disk through the same
   `PatchEngine` path as a whole-file proposal — same review, same hunks, same
   checkpoint, asserted by comparing the resulting patch record.

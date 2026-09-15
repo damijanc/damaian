@@ -14,6 +14,7 @@ order and progress).
 Reference: [`../../UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md) — this spec introduces
 the button scale and action-hierarchy rules recorded there, and is the first
 consumer of them. Later UI specs refer to the guide rather than restating it.
+Depends on: nothing in this directory.
 Related spec sections: `ai_coding_assistant_specification.md` §7.1 (distinct UI
 states), §7.4 (command approval), §7.7 (diff and patch engine).
 Related implementation specs:

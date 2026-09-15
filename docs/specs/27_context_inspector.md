@@ -2,9 +2,12 @@
 
 Status: Not started
 Order: 27 of 27
-Roadmap: `docs/ROADMAP/03_phase_3_code_understanding.md`, Phase 3, Work
+Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 5 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
+Depends on: [#26](26_context_assembly.md) (the context manifest it renders) —
+**not built**. Everything else named below is a cross-reference, not a
+prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.1 (chat
 interface), section 7.3 (path and secret policy), section 7.9 (context
 assembly). Related implementation specs:

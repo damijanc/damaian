@@ -5,9 +5,12 @@ Status: Partially done, remainder skipped. The data-directory schema version
 Keychain measurement, the documentation rewrite, and the second-person install
 were skipped as verified in practice. See §7.
 Order: 15 of 15
-Roadmap: `docs/ROADMAP/00b_phase_0_distributable_build.md`, Phase 0, Work
+Plan: `docs/PLAN/00b_phase_0_distributable_build.md`, Phase 0, Work
 Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
+Depends on: [#14](14_developer_id_signing_and_notarization.md) (signing and
+notarization) — built. Everything else named below is a cross-reference, not a
+prerequisite.
 Related spec sections: none in `ai_coding_assistant_specification.md`. This is
 release engineering, not product behaviour. Depends on
 [`14_developer_id_signing_and_notarization.md`](14_developer_id_signing_and_notarization.md);

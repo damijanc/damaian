@@ -2,9 +2,12 @@
 
 Status: Done. Shipped in v0.31.0; see §7 for the validation runs.
 Order: 14 of 15
-Roadmap: `docs/ROADMAP/00b_phase_0_distributable_build.md`, Phase 0, Work
+Plan: `docs/PLAN/00b_phase_0_distributable_build.md`, Phase 0, Work
 Package 1 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
+Depends on: [#9](09_release_quality_gate.md) (the quality gate a release must
+pass) — built. Everything else named below is a cross-reference, not a
+prerequisite.
 Related spec sections: none in `ai_coding_assistant_specification.md`. This is
 release engineering, not product behaviour. Related implementation specs:
 [`09_release_quality_gate.md`](09_release_quality_gate.md) (the Quality gate this

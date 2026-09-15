@@ -2,16 +2,19 @@
 
 Status: Not started
 Order: 46 of 46
-Roadmap: `docs/ROADMAP/01_phase_1_trust_and_recovery.md`, Phase 1, Work
+Plan: `docs/PLAN/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 2 (Must) — the process-cleanup half. That directory is local-only and
 not committed, so the reference is a name rather than a link; this spec is
 self-contained.
+Depends on: [#17](../17_durable_task_state_and_crash_recovery/proposal.md) (the
+session scope a registry is keyed on) — built. Everything else named below is a
+cross-reference, not a prerequisite.
 Related implementation specs:
-[`17_durable_task_state_and_crash_recovery/`](17_durable_task_state_and_crash_recovery/proposal.md)
+[`17_durable_task_state_and_crash_recovery/`](../17_durable_task_state_and_crash_recovery/proposal.md)
 (split from it; its sweep runs at launch, earlier than spec 17's — see §5.7),
-[`06_mcp_support.md`](06_mcp_support.md) and
-[`33_mcp_management_and_deferred_discovery.md`](33_mcp_management_and_deferred_discovery.md)
-(MCP stdio servers), [`12_web_app_troubleshooting.md`](12_web_app_troubleshooting.md).
+[`06_mcp_support.md`](../06_mcp_support.md) and
+[`33_mcp_management_and_deferred_discovery.md`](../33_mcp_management_and_deferred_discovery.md)
+(MCP stdio servers), [`12_web_app_troubleshooting.md`](../12_web_app_troubleshooting.md).
 
 ## 1. Motivation
 
@@ -77,7 +80,7 @@ the mechanical form of the `AGENTS.md` rule against matching by name.
 ## 4. Non-goals
 
 - Classifying what a crashed action did. That is
-  [spec 17](17_durable_task_state_and_crash_recovery/proposal.md); a killed
+  [spec 17](../17_durable_task_state_and_crash_recovery/proposal.md); a killed
   command's outcome is unknown whether or not its child was reaped.
 - Background or long-running processes as a feature — Phase 2 WP5.
 - Supervising or restarting anything. This sweep only cleans up.

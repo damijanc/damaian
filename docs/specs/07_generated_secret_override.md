@@ -2,6 +2,7 @@
 
 Status: Done
 Order: 7 of 7
+Depends on: nothing in this directory.
 Related spec sections: `ai_coding_assistant_specification.md` §7.10 (Secret Detection — "Warn: tell the user generated code may contain a hardcoded secret", "Override: allow explicit user or admin override when policy permits"), §7.7 (Diff and Patch Engine).
 
 ## 1. Motivation

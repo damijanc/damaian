@@ -8,6 +8,7 @@ not a roadmap graduation — like [`07_generated_secret_override.md`](07_generat
 (defect found in CI), and [`10_persistent_command_approval.md`](10_persistent_command_approval.md)
 (usability with a safety edge). Its number is last because numbers are assigned
 in creation order; its implementation order is first.
+Depends on: nothing in this directory.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
 and secret policy), section 7.4 (command approval), section 7.8 (risk
 classification and approval). Related implementation specs:

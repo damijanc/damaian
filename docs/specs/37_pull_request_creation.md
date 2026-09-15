@@ -2,9 +2,14 @@
 
 Status: Not started
 Order: 37 of 37
-Roadmap: `docs/ROADMAP/05_phase_5_delivery_workflows.md`, Phase 5, Work
+Plan: `docs/PLAN/05_phase_5_delivery_workflows.md`, Phase 5, Work
 Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
+Depends on: [#33](33_mcp_management_and_deferred_discovery.md) (the MCP client
+it publishes through) — **not built**; [#35](35_commit_preparation.md) (commit
+preparation) — **not built**; [#36](36_branch_and_worktree_delivery.md) (branch
+delivery) — **not built**. Everything else named below is a cross-reference,
+not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 (command approval), section 7.8 (risk classification and approval), section 7.10
 (secret detection). Related implementation specs:

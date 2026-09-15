@@ -2,9 +2,14 @@
 
 Status: Not started
 Order: 40 of 40
-Roadmap: `docs/ROADMAP/06_phase_6_advanced_autonomy.md`, Phase 6, Work
+Plan: `docs/PLAN/06_phase_6_advanced_autonomy.md`, Phase 6, Work
 Package 7 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
+Depends on: [#18](18_local_evaluation_harness/proposal.md) (the harness) —
+built; [#19](19_token_and_cost_accounting/proposal.md) (token accounting) —
+built; [#38](38_subagent_model.md) (subagents) — **not built**;
+[#39](39_coordination_and_conflict_handling.md) (coordination) — **not built**.
+Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 19
 (recommended technology direction). Related implementation specs:
 [`18_local_evaluation_harness/`](18_local_evaluation_harness/proposal.md) (the

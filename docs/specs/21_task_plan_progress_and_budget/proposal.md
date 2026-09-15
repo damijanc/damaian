@@ -13,12 +13,18 @@ design: there is **no mechanical triviality rule** and there cannot be one, and
 one step type had no evidence because a source the enum already allowed for was
 never recorded. Both are in §7.
 Order: 21 of 23
-Roadmap: `docs/ROADMAP/02_phase_2_complete_task_workflow.md`, Phase 2, Work
+Plan: `docs/PLAN/02_phase_2_complete_task_workflow.md`, Phase 2, Work
 Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Also in this spec: [`context.md`](context.md) (motivation, current state, and
 the corrections found while planning), [`tasks.md`](tasks.md) (execution order
 and progress).
+Depends on: [#16](../16_session_checkpoints_and_rewind.md) (checkpoints) —
+built; [#17](../17_durable_task_state_and_crash_recovery/proposal.md) (durable
+task state) — built; [#18](../18_local_evaluation_harness/proposal.md) (the
+harness) — built; [#19](../19_token_and_cost_accounting/proposal.md) (token
+accounting) — built. Everything else named below is a cross-reference, not a
+prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.1 (chat
 interface UI states), section 7.6 (tool and action orchestrator), section 11
 (error handling). Related implementation specs:

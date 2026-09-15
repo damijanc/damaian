@@ -42,6 +42,63 @@ The two root documents `ai_coding_assistant_specification.md` and
 background: they describe intent, and the `docs/specs/` files describe what was
 actually built.
 
+Planning is split across three documents, and writing in the wrong one is the
+easy mistake:
+
+- [`CHANGELOG.md`](CHANGELOG.md) — committed, public. Every release newest
+  first as a two-column table — version on the left, what changed on the right,
+  grouped by component (Engine / App / CLI / Evaluation / Release) — plus an
+  `Unreleased` table listing what is specified but not built. No dates anywhere:
+  a released version needs no date to be findable, and a specification is a
+  decision rather than a schedule. It replaced a themed roadmap document on
+  2026-09-15, because the changelog says what actually happened and what is
+  written down — the same information without the guesswork.
+
+  **After tagging, run `npm run changelog:update`.** It adds a row to the
+  releases table for every tag the file does not yet document, from the commit
+  subjects in that tag's range, and it never rewrites an existing row — so edit
+  a generated row freely, and re-running leaves it alone. Rows are inserted
+  under the `<!-- releases -->` marker's separator line; do not remove that
+  marker. A tag with no commits in its range is omitted, and
+  `npm run changelog:check` exits non-zero when a tag is undocumented. Moving an
+  entry out of `Unreleased` when it ships is still a judgement call, so the
+  script only reminds you.
+- `docs/PLAN/` — **local-only and not committed**, so never link to it from a
+  committed file; name it instead. Phases, work packages, the execution
+  dashboard, and `OBSERVATIONS.md`, the inbox for things noticed but not yet
+  decided.
+- `docs/specs/` — committed. What was decided and built. A work package
+  graduates into a numbered spec carrying a `Plan:` line naming its phase.
+
+### Picking up a piece of work
+
+Before writing code for a spec, in this order:
+
+1. **Read the spec.** Its `Status:` line says whether it is built. Its §2
+   Current State names the files, and its §7 Implementation Notes may already
+   record what the last person learned.
+2. **Check the plan's dashboard** (`docs/PLAN/README.md`) for that work
+   package's status, priority and dependencies. A spec can exist for work that
+   is blocked on something unspecified.
+3. **Read `docs/PLAN/OBSERVATIONS.md` for open entries touching the same
+   area.** This is the step most easily skipped and the one that wastes the most
+   time. Entries there are known, evidenced problems that have deliberately not
+   been decided yet, and one of them may change what you should build — or tell
+   you that the thing you are about to measure is already known to be blocked by
+   something else. Skipping it means re-deriving a finding someone already paid
+   for.
+4. **Add an entry yourself** for anything you notice that is out of scope,
+   rather than widening the change or letting it evaporate when the session
+   ends. The file states its own rules: a falsifiable one-sentence claim,
+   evidence a reader can check, and a disposition. There is no quality bar for
+   adding one.
+
+**If `docs/PLAN/` is not present, you are working from a clone that does not
+have it** — the directory is deliberately not committed. Do not conclude there
+is no planning context and do not reconstruct it: say it is missing, and ask.
+`docs/specs/` and `CHANGELOG.md` are committed and are enough to understand what
+exists, but not what was decided against, deferred, or noticed and parked.
+
 ## Quality gate
 
 CI (`.github/workflows/quality.yml`) runs exactly these. Run them before you

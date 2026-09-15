@@ -2,11 +2,12 @@
 
 Status: Done
 Order: 17 of 19
-Roadmap: `docs/ROADMAP/01_phase_1_trust_and_recovery.md`, Phase 1, Work
+Plan: `docs/PLAN/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Also in this spec: [`context.md`](context.md) (motivation and current state),
 [`tasks.md`](tasks.md) (execution order and progress).
+Depends on: nothing in this directory.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 (command approval), section 7.5 (model adapter cancellation), section 7.6 (tool
 and action orchestrator), section 11 (error handling). Related implementation
@@ -16,7 +17,7 @@ cancellation and UI-state work this extends),
 [`../16_session_checkpoints_and_rewind.md`](../16_session_checkpoints_and_rewind.md)
 (shares the session event log and the `seq` field),
 [`../45_crash_recovery_prompt.md`](../45_crash_recovery_prompt.md) and
-[`../46_process_registry_and_orphan_sweep.md`](../46_process_registry_and_orphan_sweep.md)
+[`../46_process_registry_and_orphan_sweep/proposal.md`](../46_process_registry_and_orphan_sweep/proposal.md)
 (split out of this spec — see §0).
 
 ## 0. Scope: this spec is the engine core
@@ -30,7 +31,7 @@ first and can be tested headlessly.
 |---|---|
 | State machine, durable reads, action markers, recovery **classification**, migration, pending-approval reattach, audit | **This spec** |
 | The recovery prompt and its four user choices in the desktop shell | [`../45_crash_recovery_prompt.md`](../45_crash_recovery_prompt.md) |
-| Process registry for MCP stdio, `curl` and PTY, and the orphan sweep | [`../46_process_registry_and_orphan_sweep.md`](../46_process_registry_and_orphan_sweep.md) |
+| Process registry for MCP stdio, `curl` and PTY, and the orphan sweep | [`../46_process_registry_and_orphan_sweep/proposal.md`](../46_process_registry_and_orphan_sweep/proposal.md) |
 
 The split is along a real seam. Classification is a pure function of the session
 log; the prompt is presentation over its output; the registry shares no code with
@@ -77,7 +78,7 @@ do not rebuild it.
 
 Moved out of this spec: the recovery prompt and the `Inspect` view
 ([spec 45](../45_crash_recovery_prompt.md)), and cleaning up processes owned by
-a crashed session ([spec 46](../46_process_registry_and_orphan_sweep.md)).
+a crashed session ([spec 46](../46_process_registry_and_orphan_sweep/proposal.md)).
 
 ## 4. Non-goals
 
@@ -101,7 +102,7 @@ a crashed session ([spec 46](../46_process_registry_and_orphan_sweep.md)).
   `Inspect` view are [spec 45](../45_crash_recovery_prompt.md). This spec is
   engine-only and every acceptance criterion below is testable headlessly.
 - Cleaning up processes owned by a crashed session —
-  [spec 46](../46_process_registry_and_orphan_sweep.md).
+  [spec 46](../46_process_registry_and_orphan_sweep/proposal.md).
 - Background or long-running processes as a feature — Phase 2 WP5.
 
 ## 5. Design
@@ -262,7 +263,7 @@ from the current version.
 ### 5.7 Orphaned processes — moved to spec 46
 
 Requirement 9 and this section moved wholesale to
-[spec 46](../46_process_registry_and_orphan_sweep.md). It shares no code with
+[spec 46](../46_process_registry_and_orphan_sweep/proposal.md). It shares no code with
 the state machine, touches three unrelated subsystems (`mcp.rs`, `model.rs`,
 `terminal.rs`), and its correctness rests on a different question — whether a
 recorded PID still belongs to the process that was recorded.

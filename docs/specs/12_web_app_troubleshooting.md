@@ -2,6 +2,10 @@
 
 Status: In progress
 Order: 12 of 12
+Depends on: [#6](06_mcp_support.md) (MCP) — built;
+[#8](08_stop_and_progress.md) (cancellation and progress) — built;
+[#10](10_persistent_command_approval.md) (command approval) — built. Everything
+else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.5
 (tool/function calling), section 7.6 (tool and action orchestrator), section 11
 (error handling), and `docs/specs/06_mcp_support.md`,

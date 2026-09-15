@@ -2,10 +2,14 @@
 
 Status: Done
 Order: 45 of 46
-Roadmap: `docs/ROADMAP/01_phase_1_trust_and_recovery.md`, Phase 1, Work
+Plan: `docs/PLAN/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 2 (Must) — the user-facing half. That directory is local-only and not
 committed, so the reference is a name rather than a link; this spec is
 self-contained.
+Depends on: [#17](17_durable_task_state_and_crash_recovery/proposal.md) (the
+classification it renders) — built; [#16](16_session_checkpoints_and_rewind.md)
+(the checkpoint Inspect links to) — built. Everything else named below is a
+cross-reference, not a prerequisite.
 Related implementation specs:
 [`17_durable_task_state_and_crash_recovery/`](17_durable_task_state_and_crash_recovery/proposal.md)
 (supplies the classification and the three engine operations this presents),

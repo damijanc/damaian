@@ -2,6 +2,9 @@
 
 Status: Done
 Order: 13 of 13
+Depends on: [#3](03_structured_tool_calling.md) (structured tool calls) —
+built; [#10](10_persistent_command_approval.md) (persistent approval) — built.
+Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 (command approval), section 7.6 (tool and action orchestrator), section 7.8
 (risk classification and approval), and `docs/specs/03_structured_tool_calling.md`,

@@ -2,6 +2,9 @@
 
 Status: Done
 Order: 5 of 5
+Depends on: [#1](01_response_formatting.md) (the markdown renderer references
+render through) — built. Everything else named below is a cross-reference, not
+a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` §7.1 (Chat Interface — "File reference links that open the local file in the app or configured editor").
 
 ## 1. Motivation

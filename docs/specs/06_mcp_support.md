@@ -2,6 +2,9 @@
 
 Status: Done
 Order: 6 of 6
+Depends on: [#3](03_structured_tool_calling.md) (the native tool-call loop MCP
+tools plug into) — built. Everything else named below is a cross-reference, not
+a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` §7.5 (Model Adapter — tool/function-calling), §7.6 (Tool and Action Orchestrator), §7.3 (path/secret policy), §7.8 (risk classification & approval).
 
 ## 1. Motivation

@@ -11,6 +11,9 @@ the reload limitation), [`tasks.md`](tasks.md) (execution order and progress).
 Reference: [`../../UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md) — this spec
 consumes the button scale and disclosure pattern spec 41 established, and
 promotes the disclosure to a shared class.
+Depends on: [#41](../41_ui_density_and_action_hierarchy/proposal.md) (the
+button scale and disclosure pattern) — built. Everything else named below is a
+cross-reference, not a prerequisite.
 Related implementation specs:
 [`../41_ui_density_and_action_hierarchy/proposal.md`](../41_ui_density_and_action_hierarchy/proposal.md)
 (the scale and disclosure pattern this builds on; §2 of that spec names the

@@ -2,6 +2,7 @@
 
 Status: Done
 Order: 11 of 11
+Depends on: nothing in this directory.
 Related spec sections: `ai_coding_assistant_specification.md` §7.4 and
 `ai_coding_assistant_must_have.md` §12.
 

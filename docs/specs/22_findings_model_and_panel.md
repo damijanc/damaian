@@ -2,9 +2,12 @@
 
 Status: Not started
 Order: 22 of 23
-Roadmap: `docs/ROADMAP/02_phase_2_complete_task_workflow.md`, Phase 2, Work
+Plan: `docs/PLAN/02_phase_2_complete_task_workflow.md`, Phase 2, Work
 Package 6 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
+Depends on: [#20](20_working_modes.md) (the mode that gates tools) — **not
+built**; [#21](21_task_plan_progress_and_budget/proposal.md) (plan state) —
+built. Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.1 (chat
 interface), section 7.10 (secret detection), section 11 (error handling).
 Related implementation specs:

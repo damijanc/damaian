@@ -11,12 +11,13 @@ call; the `len / 4` estimate measured 2.5–6.3% high, always in the safe
 direction. OpenAI remains untested. See §7. Requirement 2's completion report
 waits on spec 23.
 Order: 19 of 19
-Roadmap: `docs/ROADMAP/01_phase_1_trust_and_recovery.md`, Phase 1, Work
+Plan: `docs/PLAN/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 6 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Also in this spec: [`context.md`](context.md) (motivation, current state, and
 the corrections found while planning), [`tasks.md`](tasks.md) (execution order
 and progress).
+Depends on: nothing in this directory.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.5 (model
 adapter), section 12.1 (performance). Related implementation specs:
 [`../08_stop_and_progress.md`](../08_stop_and_progress.md) (the turn lifecycle

@@ -2,6 +2,7 @@
 
 Status: Done
 Order: 8 of 8
+Depends on: nothing in this directory.
 Related spec sections: `ai_coding_assistant_specification.md` §7.1 (Chat Interface — "Distinct UI states for thinking, waiting for approval, running command, applying patch, failed, and complete"), §7.5 (Model Adapter — `cancel(runId): void`, "Timeout and cancellation preserve user work", "Partial streamed output is clearly marked if incomplete"), §11 (Error Handling), §12.1 (Performance — "Chat streaming should begin as soon as provider streaming starts").
 
 ## 1. Motivation

@@ -2,6 +2,7 @@
 
 Status: Done
 Order: 1 of 5
+Depends on: nothing in this directory.
 Related spec sections: `ai_coding_assistant_specification.md` §7.1 (Chat Interface), acceptance criteria "Markdown rendering with syntax highlighting."
 
 ## 1. Motivation

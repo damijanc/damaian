@@ -2,9 +2,15 @@
 
 Status: Not started
 Order: 26 of 27
-Roadmap: `docs/ROADMAP/03_phase_3_code_understanding.md`, Phase 3, Work
+Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
+Depends on: [#21](21_task_plan_progress_and_budget/proposal.md) (plan state) —
+built; [#22](22_findings_model_and_panel.md) (findings) — **not built**;
+[#24](24_repository_map_and_monorepo_boundaries.md) (the repository map) —
+**not built**; [#25](25_symbol_and_relationship_index.md) (the symbol index) —
+**not built**. Everything else named below is a cross-reference, not a
+prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
 and secret policy), section 7.5 (model adapter), section 7.9 (context assembly).
 Related implementation specs:

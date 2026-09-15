@@ -2,6 +2,7 @@
 
 Status: Done
 Order: 3 of 5
+Depends on: nothing in this directory.
 Related spec sections: `ai_coding_assistant_specification.md` §7.5 (Model Adapter — "Support tool/function-calling workflows"), §7.6 (Tool and Action Orchestrator — full action list).
 
 ## 1. Motivation

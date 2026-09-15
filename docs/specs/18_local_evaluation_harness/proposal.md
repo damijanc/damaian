@@ -10,11 +10,12 @@ tier **ran against a real provider for the first time on 2026-09-10**, which
 found seven defects in it, all now fixed — including two metrics that reported
 a plausible constant rather than a measurement. See §7.
 Order: 18 of 19
-Roadmap: `docs/ROADMAP/01_phase_1_trust_and_recovery.md`, Phase 1, Work
+Plan: `docs/PLAN/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Also in this spec: [`context.md`](context.md) (motivation and current state),
 [`tasks.md`](tasks.md) (execution order and progress).
+Depends on: nothing in this directory.
 Related spec sections: `ai_coding_assistant_specification.md` section 19
 (recommended technology direction). Related implementation specs:
 [`../11_agents_md_support.md`](../11_agents_md_support.md),

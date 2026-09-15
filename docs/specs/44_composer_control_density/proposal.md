@@ -14,6 +14,11 @@ order, baseline measurements and progress).
 Reference: [`../../UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md) — this spec adds
 the `.btn-trigger` step, the composer action-row pattern, and one anti-pattern
 to the guide, then applies them to the composer.
+Depends on: [#41](../41_ui_density_and_action_hierarchy/proposal.md) (the
+button scale) — built; [#42](../42_conversation_column_density/proposal.md)
+(the conversation column) — built;
+[#43](../43_chrome_density_and_hierarchy/proposal.md) (the type scale) — built.
+Everything else named below is a cross-reference, not a prerequisite.
 Related implementation specs:
 [`../41_ui_density_and_action_hierarchy/proposal.md`](../41_ui_density_and_action_hierarchy/proposal.md)
 (the button scale and the specimen page this extends),

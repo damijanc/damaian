@@ -2,9 +2,10 @@
 
 Status: Not started
 Order: 38 of 40
-Roadmap: `docs/ROADMAP/06_phase_6_advanced_autonomy.md`, Phase 6, Work
+Plan: `docs/PLAN/06_phase_6_advanced_autonomy.md`, Phase 6, Work
 Package 1 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
+Depends on: nothing in this directory.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.6 (tool
 and action orchestrator), section 7.8 (risk classification and approval).
 Related implementation specs:

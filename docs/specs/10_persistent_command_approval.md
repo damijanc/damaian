@@ -2,6 +2,7 @@
 
 Status: Done
 Order: 10 of 10
+Depends on: nothing in this directory.
 Related spec sections: `ai_coding_assistant_specification.md` §7.4 (command
 approval), §7.10 (policy configuration). **Superseded in part:**
 [`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)

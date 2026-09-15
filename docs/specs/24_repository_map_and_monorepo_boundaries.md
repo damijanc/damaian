@@ -2,9 +2,12 @@
 
 Status: Not started
 Order: 24 of 27
-Roadmap: `docs/ROADMAP/03_phase_3_code_understanding.md`, Phase 3, Work
+Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
+Depends on: [#21](21_task_plan_progress_and_budget/proposal.md) (plan state) —
+built; [#22](22_findings_model_and_panel.md) (findings) — **not built**.
+Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.2
 (project indexer), section 7.4 (command approval). Related implementation specs:
 [`02_semantic_search.md`](02_semantic_search.md),

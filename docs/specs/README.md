@@ -23,12 +23,42 @@ directory rather than from using the product: a session asked what capabilities
 Damaian needs to implement the remaining specs, and ran out of tool rounds
 before it could answer.
 
-From #14 onward, specs graduate from the roadmap in `docs/ROADMAP/`, one spec per
-roadmap work package, per that directory's governance section. Each carries a
-`Roadmap:` line naming its phase and work package, and the roadmap dashboard
-records the spec number under `Spec target`. `docs/ROADMAP/` is local-only and
-not committed, so those references are names rather than links, and each spec is
+#48 through #54 are roadmap graduations, not exceptions, but they share an
+origin worth recording: a capability survey comparing Damaian against the
+published feature surface of mainstream terminal coding agents, run on
+2026-09-14. The survey produced seven capabilities with no home anywhere in the
+roadmap — provider rate limiting, prompt-cache accounting, a way for the model
+to ask a question, reading a page from the internet, serving Damaian's own reads
+over MCP, finding anything in a past session, and image input — plus a set of
+deliberate non-goals now recorded in the roadmap's deferred-work section so they
+stop resurfacing. Each became a work package first and a spec second, per the
+governance rule below.
+
+#54 came from a second pass on 2026-09-15 asking what the first pass had missed.
+It is the sharpest of the seven, because the capability was already half paid
+for: #12 captures screenshots and nothing can look at them.
+
+#55 is an ordinary roadmap graduation, written the same day. It is worth noting
+here only because writing it corrected the work package it came from *and* the
+justification this session had given for promoting that package — both recorded
+in its §1. Specs in this directory are expected to contradict the plan where the
+code says otherwise; that is what writing them is for.
+
+From #14 onward, specs graduate from the delivery plan in `docs/PLAN/`, one spec
+per work package, per that directory's governance section. Each carries a
+`Plan:` line naming its phase and work package, and the plan's dashboard records
+the spec number under `Spec target`. `docs/PLAN/` is local-only and not
+committed, so those references are names rather than links, and each spec is
 written to stand on its own.
+
+**Three documents, three jobs** — separated on 2026-09-15, when the planning
+directory was renamed from `ROADMAP` to `PLAN` because it was never a roadmap:
+
+| Document | Committed | Holds |
+|---|---|---|
+| [`../../CHANGELOG.md`](../../CHANGELOG.md) | yes | Every release, newest first, plus an `Unreleased` section naming what is specified but not built |
+| `docs/PLAN/` | no | The delivery plan: phases, work packages, dashboard, and `OBSERVATIONS.md`, the inbox for things noticed but not yet decided |
+| This directory | yes | What was decided and built |
 
 ## Implementation order
 
@@ -79,8 +109,16 @@ written to stand on its own.
 | 43 | [43_chrome_density_and_hierarchy/](43_chrome_density_and_hierarchy/proposal.md) | **Done.** Third of the UI specs. Applies the scale to the surfaces #41 and #42 did not reach: settings action buttons 456 → 129px with one primary per group and `.btn-danger` on the destructive ones, every font-size brought onto a type scale that now documents its heading steps, and the terminal tab bar slimmed with the working directory folded into it (body 142 → 183px). Supersedes #41 §3.1 on `.inline-actions`. |
 | 44 | [44_composer_control_density/](44_composer_control_density/proposal.md) | **Done.** Composer 149 → 129px, and the 58px right gutter every line paid is gone. Fourth UI spec from the same usability review, covering the one surface #41–#43 did not reach: the attach, model and send controls were 38px and positioned *over* the textarea, which reserved 70px of height and 58px of every line as padding to clear them, and the 220px model pill truncated its own effort label away because model and effort shared one string. Controls moved to a content-sized row below the box, model and effort split into separate `.btn-trigger` entry points onto the one existing popover, and pinned chips moved inside the frame. Adds `.btn-trigger`, the footer-row pattern and two anti-patterns to [`../UI_STYLE_GUIDE.md`](../UI_STYLE_GUIDE.md). Presentation only — model persistence, send/stop behaviour and the menu's contents are untouched. Leaves room in the row for #31's working-mode control without building it. |
 | 45 | [45_crash_recovery_prompt.md](45_crash_recovery_prompt.md) | **Done.** Split out of #17: the user-facing half. A card at the top of the affected session names the specific in-flight action ("A patch application was in progress and its outcome is unknown"), offers Resume, Inspect, Mark failed and Abandon, and links `Inspect` to #16's checkpoint. Renders a decision #17 already constrained — the sentence and the reason a resume is absent are built in `recovery.rs`, and every decision is re-classified server-side before it reaches the engine, so a webview cannot claim a classification it was not given. Also the first caller of #17's launch sweep, which authorizes safe tasks without running them: a `waiting_for_model` task must not fire a billed model call because the app was opened. |
-| 46 | [46_process_registry_and_orphan_sweep.md](46_process_registry_and_orphan_sweep.md) | **Not started.** Split out of #17. A session-scoped registry of PIDs for MCP stdio servers, `curl` model calls and PTY sessions, plus the launch-time sweep that kills them. Turns on one question: a PID is reused, so a recorded PID is killed only when it is still alive *and* its start time matches. Killing a stranger's process is a worse bug than the leak. Independent of #17's state machine, which is now done, so nothing blocks this. |
-| 47 | [47_agent_working_capability.md](47_agent_working_capability.md) | **Not started.** Evidence-driven, not a roadmap graduation: a session asked what capabilities Damaian needs to implement the remaining specs and ran out of tool rounds before it could answer. Asks whether Damaian can do a spec's worth of work in one sitting — today it cannot, and the reason is the tool surface rather than the model. Ranged reads, listing and content search as first-class tools, region-bounded edits so an edit payload scales with the change rather than the file, cancellable commands with a timeout, and a bounded continuation past the eight-round limit. Adds no autonomy: every capability is read-only or produces the same reviewable patch. The cheap deterministic floor beneath #24, #25 and #26, specified first because those three cannot be built by an agent that lacks it. Defers its budget to #19 and #21 rather than inventing a second one. |
+| 46 | [46_process_registry_and_orphan_sweep/proposal.md](46_process_registry_and_orphan_sweep/proposal.md) | **Not started.** Split out of #17. A session-scoped registry of PIDs for MCP stdio servers, `curl` model calls and PTY sessions, plus the launch-time sweep that kills them. Turns on one question: a PID is reused, so a recorded PID is killed only when it is still alive *and* its start time matches. Killing a stranger's process is a worse bug than the leak. Independent of #17's state machine, which is now done, so nothing blocks this. |
+| 47 | [47_agent_working_capability.md](47_agent_working_capability.md) | **Not started.** Evidence-driven, not a roadmap graduation: a session asked what capabilities Damaian needs to implement the remaining specs and ran out of tool rounds before it could answer. Asks whether Damaian can do a spec's worth of work in one sitting — today it cannot, and the reason is the tool surface rather than the model. Ranged reads, listing and content search as first-class tools, region-bounded edits so an edit payload scales with the change rather than the file, cancellable commands with a timeout, and a bounded continuation past the eight-round limit. Adds no autonomy: every capability is read-only or produces the same reviewable patch. The cheap deterministic floor beneath #24, #25 and #26, specified first because those three cannot be built by an agent that lacks it. Defers its budget to #19 and #21 rather than inventing a second one. Extended by the capability survey with requirement 8, within-round concurrent dispatch of read-only tool calls — the cheapest latency win on the tool surface, and explicitly not subagent parallelism, which stays #38 and #39. |
+| 48 | [48_provider_limits_and_backpressure.md](48_provider_limits_and_backpressure.md) | **Not started.** Roadmap Phase 1 WP7. A provider rate limit ends the turn, and the code written to prevent that cannot see it: a 429 arrives as a parsed error body and returns immediately with no retry, while `is_retryable_message`'s `"rate limit"` and `"429"` arms are reachable only from the transport-failure path — where they never fire, because `curl -sS` exits zero on a 4xx. Captures status and headers via `dump-header` rather than a stdout sentinel a model could emit, classifies refusals from status first and never from prose, honours `Retry-After` under both an attempt count and a wall-clock ceiling, and makes the outcome a `failureKind` on the existing failed state rather than a fourteenth state — three fewer kill-matrix cells for the same information. A refused call records measured zero, so it cannot inflate #19's totals through the estimate written before the call. |
+| 49 | [49_prompt_cache_accounting_and_reuse.md](49_prompt_cache_accounting_and_reuse.md) | **Not started.** Roadmap Phase 1 WP8. Not a future problem: `estimated_cost` applies one input rate to every input token, so for any provider that caches automatically and reports the split, the cost figures #19 made honest are already overstated — and the overstatement grows with the conversation. Adds `cached_input_tokens: Option<u64>` as a subset of the input count, distinguishing "the provider did not say" from "none were cached", and a cached rate; where cached tokens are reported and no cached rate is set, cost is computed at the full rate and labelled an upper bound, which is a deliberate softening of #19's both-rates-or-nothing rule justified by the direction of the error. The reuse half is prefix ordering, with a test that fails the day a clock value enters the system prompt. |
+| 50 | [50_model_initiated_clarification.md](50_model_initiated_clarification.md) | **Not started.** Roadmap Phase 2 WP8. The engine can ask for permission and cannot ask a question, so an ambiguous task is guessed at — and #21's enforced token ceiling made that sharper, since rounds spent on a misread instruction are rounds the correct work no longer has. An `ask_user` tool whose load-bearing rule is that an answer can never satisfy an approval, enforced by types rather than discipline: `PendingApprovalRef.kind` is a `String` today, so the cheap implementation is one string away from treating "yes, the CLI" as command approval. Reuses the existing waiting state and reattach machinery rather than adding a state, is bounded to two questions per turn, and is absent from the tool list entirely where no user can answer. |
+| 51 | [51_external_reference_retrieval.md](51_external_reference_retrieval.md) | **Not started.** Roadmap Phase 3 WP8. Damaian cannot read a page, so every task against a third-party API runs on what the model remembers about an unnamed version of it. `fetch_url` and an optional `search_web`, with fetched content entering as a lowest-priority provenance-labelled `ContextItem` proven non-authoritative by injection evals rather than by argument — #30's treatment of memory, reused. Its §5.3 is the reason it is Should-tier: a URL is the first place the model chooses what leaves the machine, so host approval lives in user scope on the forbidden-for-repository list, a URL carrying repository content or a secret is refused *before* the approval dialog rather than by it, and cross-host redirects are not followed. |
+| 52 | [52_mcp_server_mode.md](52_mcp_server_mode.md) | **Not started.** Roadmap Phase 4 WP6. #06 and #33 are client-side only, so Damaian's indexed search, redaction and path policy are reachable only from its own window — the alternative being to give another tool raw filesystem access. Exposes a read-only subset over stdio, with the set computed as the intersection of read-only and profile-permitted rather than listed, so a tool added later is excluded until classified. The repository is fixed at launch and unreachable from the wire; a server has no user, therefore no approval, therefore nothing that writes. |
+| 53 | [53_session_search_and_export.md](53_session_search_and_export.md) | **Not started.** Roadmap Phase 1 WP9. A rescope, not greenfield: listing, renaming and deleting already work end to end, and what is missing is finding anything and getting anything out. A bounded scan through #17's parse-first reader rather than a second index, anchored on `seq` because it survives rewinds. Its sharp edge is inherited from #16: `append_message` stores content verbatim and deliberately does not redact, so that a rewind restores what was actually said — which makes export a display path that writes a file, and redaction on the way out mandatory, with the redaction count stated rather than silently applied. |
+| 54 | [54_image_input.md](54_image_input.md) | **Not started.** Roadmap Phase 3 WP9. Damaian takes screenshots it cannot look at: #12's diagnostics capture them as artifacts carrying a path and dimensions, and the model that asked receives the report text and a file reference. From the other side `ModelMessage.content` is a `String` and the composer offers "Add file" and a disabled "Add folder", so a user cannot paste a picture of the bug they are reporting. Its hard part is that **an image defeats `SecretScanner`** — a screenshot of a terminal can carry a key and no rule can match a pixel. OCR is rejected on three independent grounds, one being that a guarantee holding most of the time is worse than a stated limitation, because the user stops checking. The guarantee becomes informed consent plus one asymmetry: a user-attached image was chosen by the person accountable for it, an agent-captured screenshot was framed by Damaian, so no unseen image is ever sent and no setting can make screenshot inclusion automatic. |
+| 55 | [55_conversation_compaction.md](55_conversation_compaction.md) | **Not started.** Roadmap Phase 3 WP6 (Must, and in that phase's minimum slice). Corrects the work package's premise: conversations do not grow until a provider refuses, they are **clipped to the last eight messages, each cut to 2,000 characters**, by two literals in `build_model_prompt` with no configuration behind them. So the defect is silent unmarked loss, not growth — a constraint stated in the first message is gone from the model's view at the ninth, with nothing on screen saying so, which is a worse failure than the loud one the plan describes. Its load-bearing rule is that **a model never writes a field the engine can compute**: files changed, plan steps, approvals and validation status are read from the session log, and only objective, constraints, decisions, failed approaches and uncertainty come from a model — because a summary is re-sent every turn, so an invented fact becomes a false belief the agent holds for the rest of the session. Compaction appends a `conversation_compacted` event rather than rewriting anything, which makes #16's rewind work with no special case and keeps #17's append-only rule intact.
 
 **Ordering exception.** Numbers are assigned in creation order, so #34 is last in
 the table but is the next thing to implement. It is a bug-driven spec covering a
@@ -89,6 +127,37 @@ security weakness found while writing #31, and it does not depend on any of
 trust boundary and #31 for the profile machinery built on it.
 
 Each spec's status is tracked at the top of its file: `Not started`, `In progress`, or `Done`.
+
+## Every spec names its prerequisites
+
+Each spec carries a `Depends on:` line under its header, added on 2026-09-15.
+It names the specs that must exist before this one can be built, marks each as
+built or **not built**, and states that everything else the spec references is a
+cross-reference rather than a prerequisite.
+
+It exists because that distinction was previously unrecoverable from a spec. A
+spec links to half a dozen others — some it builds on, some it deliberately is
+*not*, some it merely cites — and an agent picking up the work had to go to the
+delivery plan's dashboard to learn which was which. The goal is that a spec is
+enough on its own to start from.
+
+Two rules follow, and the second is the one worth enforcing:
+
+- Dependencies are taken from the plan's dashboard where the spec graduated from
+  a work package, so the two cannot disagree. Where a spec is not a graduation
+  (#1–#13, #34, #41–#47), they come from its own stated ordering.
+- **A dependency marked *not built* must be answered in the design.** Either the
+  spec states what to do until it lands — as [#55](55_conversation_compaction.md)
+  §5.1 does for the context budget, [#49](49_prompt_cache_accounting_and_reuse.md)
+  §5.3 for its prefix test, and [#31](31_permission_profiles.md) §7 for #34 — or
+  it says plainly that the work is blocked. The pattern
+  [#18](18_local_evaluation_harness/proposal.md) established is the model:
+  ship the part you can, report the rest as `notApplicable` naming what will
+  supply it, and never be quietly absent.
+
+Writing the line is also the point at which "what if this isn't built yet?"
+becomes unavoidable. That question is cheap to answer while specifying and
+expensive to answer halfway through an implementation.
 
 ## Spec layout
 

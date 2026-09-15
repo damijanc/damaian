@@ -2,9 +2,14 @@
 
 Status: Not started
 Order: 35 of 37
-Roadmap: `docs/ROADMAP/05_phase_5_delivery_workflows.md`, Phase 5, Work
+Plan: `docs/PLAN/05_phase_5_delivery_workflows.md`, Phase 5, Work
 Package 1 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
+Depends on: [#16](16_session_checkpoints_and_rewind.md) (checkpoints) — built;
+[#22](22_findings_model_and_panel.md) (findings) — **not built**;
+[#23](23_verification_loop.md) (the verification loop) — **not built**;
+[#31](31_permission_profiles.md) (profiles) — **not built**. Everything else
+named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.7 (diff
 and patch engine), section 7.4 (command approval), section 7.10 (secret
 detection). Related implementation specs:

@@ -19,6 +19,9 @@ tmp/
 *.app/
 .claude/
 docs/devtalk*
-docs/ROADMAP/
+# The detailed delivery plan: phases, work packages, execution dashboard.
+# Deliberately local — it is engineering planning, not a product roadmap.
+# What ships and what is specified next is public in /CHANGELOG.md instead.
+docs/PLAN/
 docs/roadmap*
 .superpowers/

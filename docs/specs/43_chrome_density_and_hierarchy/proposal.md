@@ -13,6 +13,10 @@ and progress).
 Reference: [`../../UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md) — this spec
 completes the scale by documenting its heading steps and adding the danger
 variant, then applies the whole thing to the surfaces 41 and 42 did not reach.
+Depends on: [#41](../41_ui_density_and_action_hierarchy/proposal.md) (the
+button scale) — built; [#42](../42_conversation_column_density/proposal.md)
+(the shared disclosure class) — built. Everything else named below is a
+cross-reference, not a prerequisite.
 Related implementation specs:
 [`../41_ui_density_and_action_hierarchy/proposal.md`](../41_ui_density_and_action_hierarchy/proposal.md)
 (**supersedes its §3.1 decision to leave `.inline-actions` alone** — see

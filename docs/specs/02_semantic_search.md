@@ -2,6 +2,7 @@
 
 Status: Done
 Order: 2 of 5
+Depends on: nothing in this directory.
 Related spec sections: `ai_coding_assistant_specification.md` §7.2 (Project Indexer), §18 (Open Questions — "Which semantic search backend..."), §19 (Recommended Technology Direction — "A local vector index for semantic search").
 
 ## 1. Motivation

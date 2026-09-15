@@ -2,9 +2,14 @@
 
 Status: Not started
 Order: 32 of 33
-Roadmap: `docs/ROADMAP/04_phase_4_customization_and_extensibility.md`, Phase 4,
+Plan: `docs/PLAN/04_phase_4_customization_and_extensibility.md`, Phase 4,
 Work Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
+Depends on: [#17](17_durable_task_state_and_crash_recovery/proposal.md)
+(durable state) — built; [#22](22_findings_model_and_panel.md) (hook findings)
+— **not built**; [#31](31_permission_profiles.md) (the profile hooks cannot
+widen) — **not built**. Everything else named below is a cross-reference, not a
+prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 (command approval), section 7.6 (tool and action orchestrator), section 7.8 (risk
 classification and approval), section 11 (error handling). Related implementation

@@ -2,9 +2,12 @@
 
 Status: Not started
 Order: 36 of 37
-Roadmap: `docs/ROADMAP/05_phase_5_delivery_workflows.md`, Phase 5, Work
+Plan: `docs/PLAN/05_phase_5_delivery_workflows.md`, Phase 5, Work
 Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
+Depends on: [#35](35_commit_preparation.md) (commit preparation) — **not
+built**; Phase 2 WP4 (worktree isolation, optional) — **unspecified**.
+Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 (command approval), section 7.8 (risk classification and approval). Related
 implementation specs:
