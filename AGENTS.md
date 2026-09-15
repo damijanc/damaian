@@ -37,6 +37,21 @@ spec carries a `Status:` line. Read the relevant spec before changing behaviour
 it covers, and update the spec when you change the design — not just the code.
 `docs/specs/README.md` lists them in implementation order.
 
+**A spec is summarised in three places, and they move together.** Its own
+`Status:` line, its row in `docs/specs/README.md`, and — for a folder spec — the
+progress table in its `tasks.md`. When you change what a spec says or what is
+true of it, update all three in the same change. Leaving one behind is the
+easiest way to make this directory lie.
+
+The reason is measured, not theoretical. On 2026-09-15 three such summaries were
+found asserting the **opposite** of what their own specs recorded: the index
+still said the eval harness's live tier was "not yet verified against a real
+provider" and that "no provider has been tested for usage reporting", five days
+after both had been done and written up in those specs' §7. The proposals were
+correct the whole time; only the summaries around them were not. The index is
+where a reader starts, so a stale row is not a cosmetic problem — it is work
+someone repeats.
+
 The two root documents `ai_coding_assistant_specification.md` and
 `ai_coding_assistant_must_have.md` are the original product spec. Treat them as
 background: they describe intent, and the `docs/specs/` files describe what was
