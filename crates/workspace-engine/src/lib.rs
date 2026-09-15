@@ -23,6 +23,7 @@ pub mod model;
 pub mod patch_engine;
 pub mod path_policy;
 pub mod plan;
+pub mod process_registry;
 pub mod recovery;
 mod render;
 pub mod repository_trust;
@@ -88,6 +89,7 @@ pub use plan::{
     Evidence, PatchedFile, PlanReport, PlanStep, ReportedStep, StepOutcome, StepStatus, TaskPhase,
     TaskPlan,
 };
+pub use process_registry::ProcessIdentity;
 pub use recovery::{
     ReattachedApproval, RecoveredTask, abandon, classify_all, classify_session, headline,
     mark_failed, reattach_pending_approvals, resume, resume_allowed, resume_blocked_reason,
