@@ -86,8 +86,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-quality-
 
+      # The action pin fixes the nextest version too: each release carries the
+      # manifest it installs from, so this resolves the same way every run.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2.62.19
+        uses: taiki-e/install-action@v2.87.13
         with:
           tool: cargo-nextest
 
