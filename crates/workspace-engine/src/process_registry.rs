@@ -409,6 +409,84 @@ impl ProcessRegistry {
     }
 }
 
+/// The write end of the self-pipe. The signal handler may touch this and
+/// nothing else.
+static WAKE_WRITE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// The only code that runs in signal context.
+///
+/// `write` is on POSIX's async-signal-safe list. The identity-checked kill is
+/// not — it needs `proc_pidinfo`, allocation and file I/O — so it happens on
+/// the watchdog thread, which is ordinary code. Killing from here would mean
+/// killing by *number*, which is the one thing `proposal.md` §1 forbids.
+extern "C" fn on_signal(signal: libc::c_int) {
+    let fd = WAKE_WRITE.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        // The byte *is* the signal number, so the watchdog can re-raise the
+        // one that actually arrived rather than a hardcoded `SIGINT`. `SIGHUP`
+        // (1), `SIGINT` (2) and `SIGTERM` (15) all fit in a byte, and carrying
+        // it this way keeps the handler to a single `write`.
+        let byte = signal as u8;
+        // SAFETY: a one-byte write to a pipe created at install time and never
+        // closed. The result is deliberately ignored: there is no recovery
+        // available in signal context, and a full pipe means a wake-up is
+        // already queued.
+        unsafe {
+            libc::write(fd, std::ptr::from_ref(&byte).cast::<libc::c_void>(), 1);
+        }
+    }
+}
+
+impl ProcessRegistry {
+    /// Kills this instance's registered processes when the process is signalled.
+    ///
+    /// Call it from `main`, never from library code: a Tauri host and the test
+    /// harness must keep their own signal dispositions.
+    ///
+    /// Registry entries are deliberately not removed here. A killed process is
+    /// gone, so the next launch's sweep finds no identity for it and removes it
+    /// as `orphan_process_already_exited` anyway. Leaving the entry is also the
+    /// honest record if this thread is itself killed part way through.
+    pub fn install_shutdown_handler(self, audit: AuditLog) -> Result<()> {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe` writes exactly two file descriptors into the array.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(ClientError::Io(
+                "could not create the shutdown pipe".to_string(),
+            ));
+        }
+        WAKE_WRITE.store(fds[1], std::sync::atomic::Ordering::Relaxed);
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: installs a handler that only calls `write`.
+            unsafe { libc::signal(signal, on_signal as *const () as libc::sighandler_t) };
+        }
+
+        let read_fd = fds[0];
+        std::thread::spawn(move || {
+            let mut byte = [0_u8; 1];
+            // SAFETY: a one-byte read into a local buffer from a pipe we own.
+            let read = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast::<libc::c_void>(), 1) };
+            if read != 1 {
+                return;
+            }
+            // Ordinary code from here, so the full identity check is available.
+            let _ = self.sweep_own(&audit);
+            // Restore the default disposition and re-raise *the signal that
+            // arrived*, so the process reports the correct `WIFSIGNALED` status
+            // to whatever ran it — a `SIGTERM`ed instance must not report
+            // `SIGINT`. A second signal forces an exit if this ever wedges.
+            let arrived = libc::c_int::from(byte[0]);
+            // SAFETY: both calls take integers by value. `arrived` is one of
+            // the three signals installed below, read back out of the pipe.
+            unsafe {
+                libc::signal(arrived, libc::SIG_DFL);
+                libc::raise(arrived);
+            }
+        });
+        Ok(())
+    }
+}
+
 /// Removes its entry when dropped, so requirement 4 holds on every path that
 /// unwinds or returns normally without a caller remembering anything.
 #[derive(Debug)]
