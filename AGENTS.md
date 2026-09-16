@@ -122,7 +122,7 @@ claim work is done — all seven must pass:
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+cargo nextest run --workspace --locked
 node --check crates/desktop-shell/static/app.js
 npm run lint:web
 typos
@@ -136,6 +136,13 @@ Notes:
   explaining why is acceptable — see the `too_many_arguments` allowances on the
   dependency-injection constructors.
 - `npm run lint:web:fix` auto-fixes most web-asset findings.
+- `cargo nextest` needs `cargo install cargo-nextest --locked`; CI installs it
+  with `taiki-e/install-action`. It replaced `cargo test` because it runs test
+  binaries concurrently instead of one after another, and reports the slowest
+  tests so a suite cannot quietly rot into a forty-five-minute one again
+  (`--final-status-level slow`). Nothing is lost in the swap: nextest does not
+  run doctests, and this workspace has none. Plain `cargo test` still works for
+  a single test while you iterate.
 - `typos` needs `cargo install typos-cli`; CI pins the `crate-ci/typos` action
   to the same version. Prefer fixing the prose. Where the word is deliberate,
   add it to `_typos.toml` with a comment saying why — as `mis` is, since the
@@ -159,7 +166,8 @@ Notes:
   and crash recovery. Run it after changing prompt, context-assembly,
   tool-dispatch, path-policy or recovery code: a regression there passes the
   unit tests and fails here. Its
-  deterministic tier is already part of `cargo test --workspace --locked`, so it
+  deterministic tier is already part of `cargo nextest run --workspace
+  --locked`, so it
   adds no quality-gate command. See
   [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md#evaluation-harness).
 - Some tests are `#[ignore]`d because they have real side effects: one opens

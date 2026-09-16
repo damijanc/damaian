@@ -54,7 +54,8 @@ cargo run -p eval-harness -- run --tier deterministic
 cargo run -p eval-harness -- run --tier deterministic --format json
 ```
 
-The deterministic tier also runs inside `cargo test --workspace --locked`, so it
+The deterministic tier also runs inside `cargo nextest run --workspace --locked`,
+so it
 is already covered by the quality gate and adds no command to it. The binary
 exits non-zero when any assertion fails, so it is usable from a script.
 
@@ -113,7 +114,7 @@ checks run locally:
 ```sh
 cargo fmt --all -- --check                                   # formatting
 cargo clippy --workspace --all-targets --locked -- -D warnings  # lints (warnings fail)
-cargo test --workspace --locked                              # test suite
+cargo nextest run --workspace --locked                       # test suite
 npm run lint:web                                             # app.js / style.css
 cargo deny check                                             # advisories + licenses
 ```

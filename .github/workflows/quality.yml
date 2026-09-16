@@ -86,8 +86,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-quality-
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2.62.19
+        with:
+          tool: cargo-nextest
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # `--final-status-level slow` prints the tests nextest considered slow, so
+      # a suite drifting back towards forty-five minutes shows up in the log
+      # rather than only in the job duration.
       - name: Run tests
-        run: cargo test --workspace --locked
+        run: cargo nextest run --workspace --locked --final-status-level slow
