@@ -4565,7 +4565,19 @@ done
         require_approval: true,
     };
 
-    let mut client = McpClient::connect(&config, None).expect("connect + initialize");
+    let registry = workspace_engine::ProcessRegistry::open(&root).expect("registry");
+    let mut client =
+        McpClient::connect(&config, None, &registry, "ses_1").expect("connect + initialize");
+    assert_eq!(
+        registry.entries().unwrap().len(),
+        1,
+        "a running server must be recorded, or a crash leaks it"
+    );
+    assert_eq!(
+        registry.entries().unwrap()[0].1.as_ref().unwrap().kind,
+        workspace_engine::ProcessKind::McpServer.as_str()
+    );
+
     let tools = client.list_tools().expect("tools/list");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, "echo");
@@ -4576,6 +4588,12 @@ done
         .expect("tools/call");
     assert!(!result.is_error);
     assert_eq!(result.text, "echoed: hi");
+
+    drop(client);
+    assert!(
+        registry.entries().unwrap().is_empty(),
+        "requirement 4: a clean shutdown leaves no registry entry"
+    );
 }
 
 #[test]

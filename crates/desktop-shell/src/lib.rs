@@ -11,12 +11,12 @@ use workspace_engine::{
     AgentPlanProposal, CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions,
     ChatTurnResult, Config, CurlModelTransport, DataSchemaOutcome, GeneratedSecretWarning,
     McpClient, McpServerConfig, McpTokenResolver, McpTransport, OpenAICompatibleAdapter,
-    PlanRevisionStep, ProposedFilePatch, ResumeDecisionOptions, Session, StepStatus, TaskPlan,
-    TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind,
-    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
-    allow_always_eligible, command_approval_prompt, ensure_data_dir_schema,
-    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
-    parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    PlanRevisionStep, ProcessRegistry, ProposedFilePatch, ResumeDecisionOptions, Session,
+    StepStatus, TaskPlan, TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink,
+    WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticReport, WebDiagnosticsRunner,
+    WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible, command_approval_prompt,
+    ensure_data_dir_schema, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
 };
 
 mod keychain;
@@ -1079,7 +1079,8 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         }
         ("POST", "/api/mcp-test") => {
             let form = parse_form(&request.body);
-            let body = match mcp_test_connection(&form) {
+            let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
+            let body = match mcp_test_connection(&form, &config.data_dir) {
                 Ok(tools) => format!(
                     "{{\"ok\":true,\"toolCount\":{},\"tools\":[{}]}}",
                     tools.len(),
@@ -1528,8 +1529,16 @@ impl McpBrowserDiagnosticsRunner {
         call: &WebDiagnosticCall,
     ) -> workspace_engine::Result<WebDiagnosticReport> {
         let mut last_error = None;
+        // Diagnostics run outside any turn, so there is no session to attribute
+        // these servers to — the entry's kind still identifies them.
+        let registry = ProcessRegistry::open(&self.data_dir)?;
         for server in &self.servers {
-            let mut client = match McpClient::connect(&server.config, server.auth_token.clone()) {
+            let mut client = match McpClient::connect(
+                &server.config,
+                server.auth_token.clone(),
+                &registry,
+                "",
+            ) {
                 Ok(client) => client,
                 Err(error) => {
                     last_error = Some(format!("{}: {error}", server.config.id));
@@ -1804,7 +1813,10 @@ fn mcp_config_from_form(
 
 /// Connects to the server described by the form and lists its tools. Returns
 /// the discovered tool names on success.
-fn mcp_test_connection(form: &HashMap<String, String>) -> Result<Vec<String>, String> {
+fn mcp_test_connection(
+    form: &HashMap<String, String>,
+    data_dir: &Path,
+) -> Result<Vec<String>, String> {
     let (config, token) = mcp_config_from_form(form)?;
     if config.transport == McpTransport::Stdio && config.command.trim().is_empty() {
         return Err("A command is required for a local (stdio) server.".to_string());
@@ -1812,7 +1824,11 @@ fn mcp_test_connection(form: &HashMap<String, String>) -> Result<Vec<String>, St
     if config.transport == McpTransport::Http && config.url.trim().is_empty() {
         return Err("A URL is required for a remote (http) server.".to_string());
     }
-    let mut client = McpClient::connect(&config, token).map_err(|error| error.to_string())?;
+    // Testing a server still spawns one, so it is registered like any other.
+    // No session: the user is on the settings screen, not in a turn.
+    let registry = ProcessRegistry::open(data_dir).map_err(|error| error.to_string())?;
+    let mut client =
+        McpClient::connect(&config, token, &registry, "").map_err(|error| error.to_string())?;
     let tools = client.list_tools().map_err(|error| error.to_string())?;
     Ok(tools.into_iter().map(|tool| tool.name).collect())
 }

@@ -12,9 +12,12 @@ use crate::audit::AuditLog;
 use crate::config::{McpServerConfig, McpTransport};
 use crate::error::{ClientError, Result};
 use crate::model::{ToolDefinition, escape_curl_config_value};
+use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -139,9 +142,14 @@ impl McpClient {
     /// Connects and completes the `initialize` handshake. `auth_token` is the
     /// already-resolved bearer token for HTTP servers (the engine never reads
     /// the keychain itself — the caller resolves it and passes the value in).
-    pub fn connect(config: &McpServerConfig, auth_token: Option<String>) -> Result<Self> {
+    pub fn connect(
+        config: &McpServerConfig,
+        auth_token: Option<String>,
+        registry: &ProcessRegistry,
+        session_id: &str,
+    ) -> Result<Self> {
         let transport: Box<dyn RpcTransport> = match config.transport {
-            McpTransport::Stdio => Box::new(StdioTransport::spawn(config)?),
+            McpTransport::Stdio => Box::new(StdioTransport::spawn(config, registry, session_id)?),
             McpTransport::Http => Box::new(HttpTransport::new(config, auth_token)?),
         };
         let mut client = Self {
@@ -282,10 +290,17 @@ struct StdioTransport {
     child: Child,
     stdin: ChildStdin,
     lines: Receiver<String>,
+    /// Removes this server's registry entry when the transport is dropped.
+    /// Declared last so it is dropped after the child has been killed.
+    _registration: RegistrationHandle,
 }
 
 impl StdioTransport {
-    fn spawn(config: &McpServerConfig) -> Result<Self> {
+    fn spawn(
+        config: &McpServerConfig,
+        registry: &ProcessRegistry,
+        session_id: &str,
+    ) -> Result<Self> {
         if config.command.trim().is_empty() {
             return Err(ClientError::InvalidInput(
                 "MCP stdio server requires a command".to_string(),
@@ -319,13 +334,19 @@ impl StdioTransport {
             // stderr is the MCP logging channel (stdout is reserved for the
             // protocol). Discard it so a chatty server can't fill the pipe and
             // block, and so it never pollutes the app's own stderr.
-            .stderr(Stdio::null());
+            .stderr(Stdio::null())
+            // Its own group, so the sweep can reach a server that exec'd a
+            // worker — `npx` leaving a `node` behind is the common case.
+            .process_group(0);
         let mut child = command.spawn().map_err(|error| {
             ClientError::Io(format!(
                 "Failed to start MCP server '{}': {error}",
                 config.command
             ))
         })?;
+        // Before anything else touches the child: a server that is running and
+        // unrecorded is exactly what requirement 3 forbids.
+        let registration = registry.register(ProcessKind::McpServer, session_id, child.id())?;
         let stdin = child
             .stdin
             .take()
@@ -352,6 +373,7 @@ impl StdioTransport {
             child,
             stdin,
             lines,
+            _registration: registration,
         })
     }
 
@@ -589,15 +611,28 @@ pub struct McpRuntime {
     connections: HashMap<String, McpClient>,
     tools: HashMap<String, Vec<McpTool>>,
     audit_log: Option<AuditLog>,
+    /// Where to open the process registry when a stdio server is spawned. The
+    /// registry is opened per connection rather than held, because opening it
+    /// can fail and `build_mcp_runtime` cannot.
+    data_dir: Option<PathBuf>,
+    /// Attribution for any server this runtime spawns.
+    session_id: String,
 }
 
 impl McpRuntime {
-    pub fn new(servers: Vec<McpServerRuntime>, audit_log: AuditLog) -> Self {
+    pub fn new(
+        servers: Vec<McpServerRuntime>,
+        audit_log: AuditLog,
+        data_dir: PathBuf,
+        session_id: &str,
+    ) -> Self {
         Self {
             servers,
             connections: HashMap::new(),
             tools: HashMap::new(),
             audit_log: Some(audit_log),
+            data_dir: Some(data_dir),
+            session_id: session_id.to_string(),
         }
     }
 
@@ -609,6 +644,8 @@ impl McpRuntime {
             connections: HashMap::new(),
             tools: HashMap::new(),
             audit_log: None,
+            data_dir: None,
+            session_id: String::new(),
         }
     }
 
@@ -644,7 +681,21 @@ impl McpRuntime {
                     "Unknown MCP server: {server_id}"
                 )));
             };
-            let client = McpClient::connect(&server.config, server.auth_token.clone())?;
+            // An inert runtime has no servers, so this is unreachable there —
+            // but a stdio server must never be spawned without somewhere to
+            // record it, so the absence is an error rather than a silent skip.
+            let Some(data_dir) = &self.data_dir else {
+                return Err(ClientError::InvalidInput(
+                    "MCP runtime has no data directory to record server processes in".to_string(),
+                ));
+            };
+            let registry = ProcessRegistry::open(data_dir)?;
+            let client = McpClient::connect(
+                &server.config,
+                server.auth_token.clone(),
+                &registry,
+                &self.session_id,
+            )?;
             self.connections.insert(server_id.to_string(), client);
         }
         Ok(self.connections.get_mut(server_id).expect("just inserted"))

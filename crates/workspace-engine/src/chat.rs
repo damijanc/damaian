@@ -444,7 +444,7 @@ impl ChatOrchestrator {
     /// each HTTP server's auth token up front. Returns an inert runtime when no
     /// servers are active (the common case), so there's zero overhead and no
     /// behavior change for users who don't configure MCP.
-    fn build_mcp_runtime(&self) -> McpRuntime {
+    fn build_mcp_runtime(&self, session_id: &str) -> McpRuntime {
         let servers: Vec<McpServerRuntime> = self
             .config
             .active_mcp_servers()
@@ -464,7 +464,12 @@ impl ChatOrchestrator {
         if servers.is_empty() {
             McpRuntime::disabled()
         } else {
-            McpRuntime::new(servers, self.audit_log.clone())
+            McpRuntime::new(
+                servers,
+                self.audit_log.clone(),
+                self.config.data_dir.clone(),
+                session_id,
+            )
         }
     }
 
@@ -787,7 +792,7 @@ impl ChatOrchestrator {
         } else if let Some(mcp_call) = &pending.mcp_call {
             let summary = mcp_call_summary(&mcp_call.server_id, &mcp_call.tool_name);
             let content = if approved {
-                let mut mcp = self.build_mcp_runtime();
+                let mut mcp = self.build_mcp_runtime(&pending.session.id);
                 match mcp.call_tool(
                     &mcp_call.server_id,
                     &mcp_call.tool_name,
@@ -1219,7 +1224,7 @@ impl ChatOrchestrator {
     ) -> Result<ChatTurnResult> {
         // Per-turn MCP runtime: connects lazily, caches tool lists and
         // connections for this turn, and tears everything down on drop.
-        let mut mcp = self.build_mcp_runtime();
+        let mut mcp = self.build_mcp_runtime(&session.id);
         let browser_mcp_server_ids = self.browser_diagnostic_mcp_server_ids();
         let native_tools = self.config.supports_native_tools().then(|| {
             let mut tools = vec![
