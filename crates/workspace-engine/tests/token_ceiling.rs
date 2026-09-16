@@ -41,6 +41,8 @@ fn engine_with_ceiling(repo: &Path, ceiling: Option<u64>) -> WorkspaceEngine {
     WorkspaceEngine::new(Config {
         data_dir: repo.join(".damaian"),
         agent_max_task_tokens: ceiling,
+        // Throwaway repository: a watcher would only cost FSEvents registration.
+        enable_index_watcher: false,
         ..Config::default()
     })
 }

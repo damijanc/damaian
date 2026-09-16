@@ -184,6 +184,16 @@ pub struct Config {
     /// embedding model on first use (a one-time network fetch), which the
     /// user should opt into rather than have happen implicitly.
     pub enable_semantic_search: bool,
+    /// On by default: the filesystem watcher in `index_cache.rs` is what keeps
+    /// a cached index fresh between the periodic full rescans.
+    ///
+    /// Callers that build many short-lived repositories in one process — the
+    /// test suites and the eval harness — turn it off. Registering an FSEvents
+    /// stream costs seconds of waiting on `fseventsd` per repository, and those
+    /// callers index a repository once and throw it away, so a watcher is pure
+    /// cost to them. Leaving it on is right for the app, where one repository
+    /// is watched for the length of a session.
+    pub enable_index_watcher: bool,
     /// Default number of tool/model rounds an agentic chat turn may spend
     /// before the model is asked to answer with the evidence it has.
     pub agent_max_tool_rounds: u32,
@@ -1332,6 +1342,7 @@ impl Default for Config {
             checkpoint_max_total_bytes: 1_073_741_824,
             checkpoint_census_max_paths: 1_000,
             enable_semantic_search: false,
+            enable_index_watcher: true,
             agent_max_tool_rounds: 8,
             agent_web_debug_max_tool_rounds: 12,
             agent_tool_retry_limit: 2,

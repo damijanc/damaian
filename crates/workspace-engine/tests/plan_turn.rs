@@ -37,6 +37,8 @@ fn temp_repo(name: &str) -> PathBuf {
 fn engine_for(repo: &Path) -> WorkspaceEngine {
     WorkspaceEngine::new(Config {
         data_dir: repo.join(".damaian"),
+        // Throwaway repository: a watcher would only cost FSEvents registration.
+        enable_index_watcher: false,
         ..Config::default()
     })
 }

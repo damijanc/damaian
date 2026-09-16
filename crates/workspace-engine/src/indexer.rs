@@ -143,6 +143,12 @@ impl ProjectIndexer {
         }
     }
 
+    /// The configuration this indexer was built with, so callers that own an
+    /// indexer rather than a `Config` (such as `IndexCache`) can read it.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     pub fn index_repository(&self, root_path: impl AsRef<Path>) -> Result<RepositoryIndex> {
         let root = fs::canonicalize(root_path)?;
         let repository_id = repository_id_for_root(&root);

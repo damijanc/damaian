@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::hash::now_millis;
 use crate::indexer::{ProjectIndexer, RepositoryIndex};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -17,9 +17,10 @@ const FULL_RESCAN_INTERVAL_MS: u128 = 5 * 60 * 1000;
 struct CachedIndex {
     index: Option<RepositoryIndex>,
     last_full_rescan_ms: u128,
-    /// Kept alive only to keep the watcher running; dropping it stops
-    /// watching. Never read directly.
-    _watcher: Option<RecommendedWatcher>,
+    /// Whether this repository already has a watcher. The watcher itself is
+    /// owned by the thread `spawn_watcher` starts, not by this struct, so that
+    /// registering it never blocks a caller — see `spawn_watcher`.
+    watcher_started: bool,
 }
 
 type Registry = Mutex<HashMap<String, Arc<Mutex<CachedIndex>>>>;
@@ -54,7 +55,7 @@ impl IndexCache {
                 Arc::new(Mutex::new(CachedIndex {
                     index: None,
                     last_full_rescan_ms: 0,
-                    _watcher: None,
+                    watcher_started: false,
                 }))
             })
             .clone();
@@ -68,8 +69,9 @@ impl IndexCache {
             cached.index = Some(indexer.index_repository(&root)?);
             cached.last_full_rescan_ms = now_millis();
         }
-        if cached._watcher.is_none() {
-            cached._watcher = spawn_watcher(indexer.clone(), root.clone(), entry.clone());
+        if !cached.watcher_started && indexer.config().enable_index_watcher {
+            cached.watcher_started = true;
+            spawn_watcher(indexer.clone(), root.clone(), entry.clone());
         }
         Ok(cached
             .index
@@ -88,18 +90,40 @@ impl IndexCache {
     }
 }
 
-fn spawn_watcher(
-    indexer: ProjectIndexer,
-    root: PathBuf,
-    entry: Arc<Mutex<CachedIndex>>,
-) -> Option<RecommendedWatcher> {
-    let (tx, rx) = mpsc::channel();
-    let mut watcher = notify::recommended_watcher(tx).ok()?;
-    if watcher.watch(&root, RecursiveMode::Recursive).is_err() {
-        return None;
-    }
-
+/// Starts watching `root`, off the calling thread.
+///
+/// Registration happens on the spawned thread rather than here on purpose.
+/// `notify`'s FSEvents backend blocks inside `watch()` until `fseventsd` has
+/// registered the stream, and on macOS that routinely costs ten seconds or
+/// more. Paying it here stalled the first turn against every newly opened
+/// repository, and — because each test builds its own throwaway repository —
+/// it was where the test suite spent the bulk of its wall time.
+///
+/// The watcher is owned by the spawned thread, which parks on `rx` for as long
+/// as the process lives. That matches the lifetime of the cache entry it
+/// feeds: the registry is process-wide and entries are never evicted.
+fn spawn_watcher(indexer: ProjectIndexer, root: PathBuf, entry: Arc<Mutex<CachedIndex>>) {
     thread::spawn(move || {
+        let (tx, rx) = mpsc::channel();
+        let Ok(mut watcher) = notify::recommended_watcher(tx) else {
+            return;
+        };
+        if watcher.watch(&root, RecursiveMode::Recursive).is_err() {
+            return;
+        }
+
+        // FSEvents only reports what happens after registration, and
+        // registration finished well after `get_or_build` handed the index
+        // back. Anything that changed in between was seen by neither the walk
+        // nor the watcher, so the index cannot be vouched for: force one
+        // rescan on next access rather than serve it until the periodic one
+        // comes round.
+        if let Ok(mut cached) = entry.lock() {
+            cached.last_full_rescan_ms = 0;
+        }
+
+        // `watcher` holds the sending half, so keeping it alive for the rest of
+        // this scope is what keeps `rx` connected.
         for event in rx {
             match event {
                 Ok(event) => {
@@ -118,8 +142,6 @@ fn spawn_watcher(
             }
         }
     });
-
-    Some(watcher)
 }
 
 fn apply_single_path_change(

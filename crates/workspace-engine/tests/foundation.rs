@@ -47,9 +47,14 @@ fn run_git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git {:?} failed", args);
 }
 
+/// Every test here builds a throwaway repository, and registering an FSEvents
+/// watcher for each one costs seconds of waiting on `fseventsd` for freshness
+/// no test in this file needs. `index_cache_picks_up_file_changes_via_watcher`
+/// is the exception and turns it back on.
 fn test_config(repo: &Path) -> Config {
     Config {
         data_dir: repo.join(".damaian"),
+        enable_index_watcher: false,
         ..Config::default()
     }
 }
@@ -367,6 +372,27 @@ fn indexes_source_files_while_respecting_gitignore_and_redacting_secrets() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+/// Polls the cached index until `present` is indexed and `absent` is gone, or
+/// `attempts` 100ms rounds have passed. Returns whether it happened.
+fn poll_for(
+    indexer: &ProjectIndexer,
+    repo: &Path,
+    present: &str,
+    absent: &str,
+    attempts: u32,
+) -> bool {
+    for _ in 0..attempts {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let refreshed = IndexCache::get_or_build(indexer, repo).unwrap();
+        if refreshed.keyword_search(present, 1).len() == 1
+            && refreshed.keyword_search(absent, 1).is_empty()
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[test]
 fn index_cache_picks_up_file_changes_via_watcher_without_full_rescan() {
     let repo = temp_dir("index-cache-watcher");
@@ -374,7 +400,10 @@ fn index_cache_picks_up_file_changes_via_watcher_without_full_rescan() {
 
     let scanner = SecretScanner::default();
     let indexer = ProjectIndexer::new(
-        test_config(&repo),
+        Config {
+            enable_index_watcher: true,
+            ..test_config(&repo)
+        },
         scanner.clone(),
         test_audit(&repo, scanner),
     );
@@ -382,30 +411,34 @@ fn index_cache_picks_up_file_changes_via_watcher_without_full_rescan() {
     let first = IndexCache::get_or_build(&indexer, &repo).unwrap();
     assert_eq!(first.keyword_search("original", 1).len(), 1);
 
-    // Modify the file on disk after the index was built; the background
-    // watcher (not the 5-minute periodic rescan) is responsible for picking
-    // this up, so poll with a short bounded timeout rather than sleeping for
-    // the rescan interval.
+    // Registering the watcher is asynchronous — `get_or_build` returns without
+    // waiting for `fseventsd`, which can take ten seconds or more — so this
+    // first change may land inside the registration window and be reported by
+    // nobody. The watcher covers that by marking the index stale once it is
+    // live, so the change surfaces either way. Bound generously: a tighter one
+    // would measure how busy `fseventsd` is, not whether watching works.
     fs::write(
         repo.join("src/app.js"),
         "export const value = \"updated\";\n",
     )
     .unwrap();
-
-    let mut picked_up = false;
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let refreshed = IndexCache::get_or_build(&indexer, &repo).unwrap();
-        if refreshed.keyword_search("updated", 1).len() == 1
-            && refreshed.keyword_search("original", 1).is_empty()
-        {
-            picked_up = true;
-            break;
-        }
-    }
     assert!(
-        picked_up,
-        "expected the watcher to reindex the changed file within 5 seconds"
+        poll_for(&indexer, &repo, "updated", "original", 600),
+        "expected the change made during watcher startup to surface within 60 seconds"
+    );
+
+    // The watcher is demonstrably live now, and the rescan it forced on
+    // startup has already happened — the next periodic one is five minutes
+    // out. So this second change can only reach the index through a watch
+    // event, which is what this test exists to prove.
+    fs::write(
+        repo.join("src/app.js"),
+        "export const value = \"watched\";\n",
+    )
+    .unwrap();
+    assert!(
+        poll_for(&indexer, &repo, "watched", "updated", 100),
+        "expected the watcher to reindex the changed file without a full rescan"
     );
 
     fs::remove_dir_all(repo).unwrap();

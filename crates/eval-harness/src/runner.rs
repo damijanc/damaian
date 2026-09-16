@@ -230,6 +230,11 @@ fn skip_if_blocked(scenario: &Scenario) -> Option<Run> {
 fn base_config(materialized: &Materialized) -> Config {
     Config {
         data_dir: materialized.data_dir.clone(),
+        // Every scenario materializes a fresh fixture repository, runs one turn
+        // against it and discards it. Nothing ever changes underneath the
+        // index, so a watcher buys no freshness here and costs seconds of
+        // FSEvents registration per scenario.
+        enable_index_watcher: false,
         ..Config::default()
     }
 }

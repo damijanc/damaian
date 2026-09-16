@@ -47,6 +47,8 @@ fn fixture_with(name: &str, adjust: impl FnOnce(&mut Config)) -> Fixture {
     let mut config = Config {
         data_dir: data_dir.clone(),
         audit_enabled: true,
+        // Throwaway repository: a watcher would only cost FSEvents registration.
+        enable_index_watcher: false,
         ..Config::default()
     };
     adjust(&mut config);

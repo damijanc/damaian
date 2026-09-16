@@ -39,6 +39,8 @@ fn write_fixture(root: &Path, relative_path: &str, content: &str) {
 fn test_config(repo: &Path) -> Config {
     Config {
         data_dir: repo.join(".damaian"),
+        // Throwaway repository: a watcher would only cost FSEvents registration.
+        enable_index_watcher: false,
         ..Config::default()
     }
 }
