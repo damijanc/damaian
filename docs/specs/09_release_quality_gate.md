@@ -106,8 +106,10 @@ Two steps in `build` become dead weight once `quality` runs first:
 
 - `Check desktop JavaScript` — `quality.checks` runs the identical
   `node --check` on the same file.
-- `Run Rust tests` (`cargo test --locked`) — `quality.rust` runs
-  `cargo test --workspace --locked`, a strict superset.
+- `Run Rust tests` (`cargo test --locked`) — `quality.rust` runs the same tests
+  across the whole workspace, a strict superset. (That step was
+  `cargo test --workspace --locked` when this was written; the runner changed
+  on 2026-09-16, see §7.)
 
 Both are deleted. Every other step in `build` (version stamping, updater
 artifact configuration, Tauri CLI install, the build itself, bundle
@@ -165,3 +167,33 @@ narrow: one path, not a word added to a repo-wide allow list.
 Criterion 7 cannot be observed without pushing a tag against a failing tree.
 Criteria 3–6 establish the wiring statically; criterion 7 is what that wiring
 is for.
+
+## 7. Implementation notes
+
+**2026-09-16 — the test step became `cargo nextest run`.** `quality.rust` now
+runs `cargo nextest run --workspace --locked --final-status-level slow`, with
+`cargo-nextest` installed by a pinned `taiki-e/install-action`. The gate is
+still the same seven checks and still a strict superset of what `build` used to
+run; only the runner changed. Criterion 2 above records what was verified when
+this spec was executed and is left as written.
+
+The reason was cost, not preference. The suite had reached about forty-five
+minutes, and compilation was not the cause: it ran at roughly 92% idle — 51s of
+user time against 1307s of wall — blocked in `register_with_server`, waiting on
+macOS `fseventsd`. `IndexCache::get_or_build` registered a filesystem watcher
+synchronously, and because every test builds its own throwaway repository, each
+one paid ten to fifteen seconds for freshness it never used. Two test binaries
+alone held 29 minutes of it.
+
+Registration now happens off the calling thread, which also removes the same
+stall from opening a repository in the app, and the suites that index-and-
+discard set `Config.enable_index_watcher: false`. Nextest compounds that by
+running the test binaries concurrently instead of one after another — which
+pays off here precisely because the residual time is wait rather than compute.
+
+Measured on the runner: 651 tests in 28s, the whole `rust` job in 2m44s, of
+which the Cargo cache restore is now the largest step at 72s. Nothing was lost
+in the swap: nextest does not run doctests and this workspace has none, and the
+14 skipped tests are the pre-existing `#[ignore]`d ones, so the 665 total is
+unchanged. `--final-status-level slow` prints the slowest tests, so the same
+drift shows up in the log next time rather than only in the job duration.
