@@ -212,7 +212,7 @@ Damaian — of a page the user may not have been looking at, possibly showing a
 logged-in session, a token in a URL bar, or a staging environment's data. It
 must be displayed and explicitly included by the user before any of its bytes
 reach a provider. There is no "always include screenshots" setting, for the same
-reason [spec 48](48_provider_limits_and_backpressure.md) refuses a remembered
+reason [spec 48](48_provider_limits_and_backpressure/proposal.md) refuses a remembered
 model fallback: the risk is not repeatable, so consent cannot be either.
 
 `docs/USER_GUIDE.md` and `docs/TROUBLESHOOTING.md` must both carry the

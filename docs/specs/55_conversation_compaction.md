@@ -350,7 +350,7 @@ the following turn does not act on it — not by the paragraph above.
 ### 5.7 Failure never fails the turn
 
 Requirement 8. If the summarisation call fails, is refused by the provider
-([spec 48](48_provider_limits_and_backpressure.md)), is cancelled, or returns
+([spec 48](48_provider_limits_and_backpressure/proposal.md)), is cancelled, or returns
 something unusable, compaction does not happen: no event is appended, and the
 turn proceeds with the existing recency window. The user is told that compaction
 did not run and why.

@@ -18,7 +18,7 @@ this spec extends it additively and changes none of its rules),
 ordering this spec depends on),
 [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md)
 (owns the per-turn ceiling the saved tokens are counted against), and
-[`48_provider_limits_and_backpressure.md`](48_provider_limits_and_backpressure.md)
+[`48_provider_limits_and_backpressure/proposal.md`](48_provider_limits_and_backpressure/proposal.md)
 (sibling work package reading the same response metadata).
 
 ## 1. Motivation
