@@ -1962,8 +1962,12 @@ mod tests {
     // request reaches the (nonexistent) host.
     #[test]
     fn curl_transport_does_not_send_a_request_for_an_already_cancelled_turn() {
-        let mut transport =
-            CurlModelTransport::new("https://api.example.test/", "sk_test", test_registry(), test_data_dir());
+        let mut transport = CurlModelTransport::new(
+            "https://api.example.test/",
+            "sk_test",
+            test_registry(),
+            test_data_dir(),
+        );
         let cancel = CancelToken::new();
         cancel.cancel();
 
@@ -1985,8 +1989,12 @@ mod tests {
     // freezes the whole UI until the app is killed.
     #[test]
     fn curl_transport_bounds_connect_stall_and_total_time() {
-        let transport =
-            CurlModelTransport::new("https://api.example.test/", "sk_test", test_registry(), test_data_dir());
+        let transport = CurlModelTransport::new(
+            "https://api.example.test/",
+            "sk_test",
+            test_registry(),
+            test_data_dir(),
+        );
         let config = transport.curl_config(
             "{\"model\":\"test\",\"messages\":[]}",
             Path::new("h.headers"),
@@ -2004,8 +2012,12 @@ mod tests {
     #[test]
     fn curl_transport_does_not_put_api_key_in_argv() {
         let api_key = "sk_test_12345678901234567890";
-        let transport =
-            CurlModelTransport::new("https://api.example.test/", api_key, test_registry(), test_data_dir());
+        let transport = CurlModelTransport::new(
+            "https://api.example.test/",
+            api_key,
+            test_registry(),
+            test_data_dir(),
+        );
         let args = CurlModelTransport::curl_args();
 
         assert!(!args.iter().any(|arg| arg.contains(api_key)));
