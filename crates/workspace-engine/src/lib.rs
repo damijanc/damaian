@@ -65,7 +65,7 @@ pub use edit::{
     EditOrchestrator, EditProposalResult, GeneratedEdit, PatchStore, parse_generated_edit,
     patch_diff_text, patch_hunk_summary,
 };
-pub use error::{ClientError, Result};
+pub use error::{ClientError, ProviderRefusal, Result};
 pub use file_access::{FileAccessController, FileRead};
 pub use git_service::{GitFileStatus, GitService, GitStatus};
 pub use hash::repository_id_for_root;
@@ -77,8 +77,8 @@ pub use mcp::{
 };
 pub use model::{
     CurlModelTransport, MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage,
-    ModelRequest, ModelRun, ModelTransport, OpenAICompatibleAdapter, TokenUsage, ToolCall,
-    ToolDefinition, UsageSource, extract_model_tokens, model_request_json,
+    ModelRequest, ModelRun, ModelTransport, OpenAICompatibleAdapter, ResponseMeta, TokenUsage,
+    ToolCall, ToolDefinition, UsageSource, extract_model_tokens, model_request_json,
 };
 pub use patch_engine::{
     GeneratedSecretWarning, PatchApplyResult, PatchEngine, PatchRollbackResult, ProposedChange,

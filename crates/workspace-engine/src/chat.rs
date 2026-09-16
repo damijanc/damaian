@@ -1430,11 +1430,23 @@ impl ChatOrchestrator {
             let mut round_output = String::new();
             let stream_result = {
                 let on_token = &mut *sink.on_token;
+                let on_progress = &mut *sink.on_progress;
                 let mut accumulate = |token: &str| {
                     round_output.push_str(token);
                     on_token(token);
                 };
-                model_adapter.stream_response(&request, sink.cancel, &mut accumulate)
+                // The refusal wait is out-of-band: the token stream stays
+                // clean, and the phase carries the remaining seconds so the
+                // user watching "retrying in 47s" can stop it. Spec 48 §5.3.
+                let mut on_wait = |seconds: u64| {
+                    on_progress(TurnProgress::Phase(TurnPhase::new(
+                        PhaseKind::Model,
+                        format!("Provider refused — retrying in {seconds}s"),
+                        round,
+                        max_rounds,
+                    )));
+                };
+                model_adapter.stream_response(&request, sink.cancel, &mut accumulate, &mut on_wait)
             };
             let model_run = match stream_result {
                 Ok(model_run) => model_run,
@@ -1468,6 +1480,56 @@ impl ChatOrchestrator {
                         &partial_response,
                         cancelled_run,
                     );
+                }
+                Err(ClientError::Provider(refusal, message)) => {
+                    // A refusal is a named failure: the marker closes "refused"
+                    // and the pre-call estimate is overridden, so a call the
+                    // provider rejected before generating anything cannot
+                    // inflate the task's reported spend. A refusal that arrived
+                    // *mid-stream* is different — the provider streamed and
+                    // billed something, so it is estimated from what went out
+                    // and what came back, exactly as a cancelled run is
+                    // (spec 48 §5.5).
+                    self.session_store.finish_action(model_marker, "refused")?;
+                    let usage = if round_output.is_empty() {
+                        TokenUsage::measured_zero()
+                    } else {
+                        TokenUsage::estimated(
+                            model_request_json(&request).len().div_ceil(4) as u64,
+                            round_output.len().div_ceil(4) as u64,
+                        )
+                    };
+                    self.session_store.record_task_usage(
+                        &task,
+                        &create_id("modelrun"),
+                        Some(&model_marker_id),
+                        usage,
+                        None,
+                        Some("refused"),
+                    )?;
+                    // Requirement 8: every refusal is audited with its
+                    // classification — never the request body or the key, so
+                    // the fields are ids, names, the typed kind, and the
+                    // provider's own message, nothing that was sent.
+                    self.audit_log.record(
+                        "provider_refusal",
+                        &[
+                            ("actor", "system".to_string()),
+                            ("sessionId", session.id.clone()),
+                            ("taskId", task.id.clone()),
+                            ("provider", self.config.model_provider.clone()),
+                            ("model", self.config.model_name.clone()),
+                            ("classification", refusal.code().to_string()),
+                            ("message", message.clone()),
+                        ],
+                    )?;
+                    let _ = self.session_store.update_task_status_with_kind(
+                        &task,
+                        TaskStatus::Failed,
+                        Some(message.as_str()),
+                        Some(refusal.code()),
+                    );
+                    return Err(ClientError::Provider(refusal, message));
                 }
                 Err(error) => {
                     let _ = self.session_store.update_task_status(

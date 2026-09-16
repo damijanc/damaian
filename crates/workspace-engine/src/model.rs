@@ -1,11 +1,13 @@
 use crate::audit::escape_json as audit_escape_json;
 use crate::cancel::CancelToken;
-use crate::error::{ClientError, Result};
+use crate::error::{ClientError, ProviderRefusal, Result};
 use crate::hash::{create_id, now_millis};
 use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -28,6 +30,13 @@ const STALL_TIMEOUT_SECS: u64 = 90;
 /// Backstop for the pathological case where a provider dribbles bytes forever,
 /// staying just above the stall threshold without ever finishing.
 const MAX_TIME_SECS: u64 = 900;
+
+/// Refusal retries beyond the first, per spec 48 §5.3: enough to cross a
+/// per-minute rate-limit window without turning the turn into a hang.
+const MAX_REFUSAL_ATTEMPTS: u32 = 4;
+/// The total time a single call may spend waiting on refusal retries. A
+/// provider asking for more than this is refused rather than slept through.
+const RETRY_WAIT_CEILING: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelMessage {
@@ -249,6 +258,12 @@ pub struct ModelRun {
     pub content: String,
     pub incomplete: bool,
     pub retry_count: u32,
+    /// Refusal retries — attempts the provider rejected before generating
+    /// anything, retried under spec 48's bounds. Kept separate from
+    /// [`Self::retry_count`] because a refused attempt was billed for nothing,
+    /// whereas a connection retry sent the body and may have been billed: the
+    /// caller books them differently (spec 48 §5.5, context.md §3.7).
+    pub refusal_retries: u32,
     pub tool_calls: Vec<ToolCall>,
     /// The provider stopped because it hit the output-token ceiling
     /// (`finish_reason: "length"`) rather than finishing its answer. Anything
@@ -292,6 +307,7 @@ impl ModelRun {
             content: String::new(),
             incomplete: true,
             retry_count: 0,
+            refusal_retries: 0,
             tool_calls: Vec::new(),
             truncated: false,
             reasoning_content: None,
@@ -308,6 +324,7 @@ pub trait ModelAdapter {
         request: &ModelRequest,
         cancel: &CancelToken,
         on_token: &mut dyn FnMut(&str),
+        on_wait: &mut dyn FnMut(u64),
     ) -> Result<ModelRun>;
 
     fn estimate_tokens(&self, payload: &str) -> usize {
@@ -393,6 +410,7 @@ impl ModelAdapter for MockModelAdapter {
         request: &ModelRequest,
         cancel: &CancelToken,
         on_token: &mut dyn FnMut(&str),
+        _on_wait: &mut dyn FnMut(u64),
     ) -> Result<ModelRun> {
         let run_id = create_id("modelrun");
         let started_at_ms = now_millis();
@@ -439,6 +457,7 @@ impl ModelAdapter for MockModelAdapter {
             content,
             incomplete: cancel.is_cancelled(),
             retry_count: 0,
+            refusal_retries: 0,
             tool_calls,
             truncated: self.truncated.get(index).copied().unwrap_or(false),
             reasoning_content: self.reasoning_content.get(index).cloned().flatten(),
@@ -447,6 +466,19 @@ impl ModelAdapter for MockModelAdapter {
             usage_reporting_unsupported: false,
         })
     }
+}
+
+/// What the transport knows about the most recent response: the HTTP status and
+/// the retry signal. Both are `Option` because a transport that cannot see them
+/// (a mock, or curl dying before the response) must say so rather than invent a
+/// 200 — a fabricated success is how a classifier would silently assert the
+/// provider answered. Spec 48 §5.1.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResponseMeta {
+    /// `None` when the transport cannot report one. Never defaulted to 200.
+    pub status: Option<u16>,
+    /// Seconds to wait, parsed from `Retry-After` in either of its two forms.
+    pub retry_after_secs: Option<u64>,
 }
 
 pub trait ModelTransport {
@@ -463,6 +495,11 @@ pub trait ModelTransport {
         on_chunk(&raw);
         Ok(raw)
     }
+
+    /// Metadata for the most recent `send_stream`. Default: nothing known.
+    fn last_response_meta(&self) -> ResponseMeta {
+        ResponseMeta::default()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -475,6 +512,13 @@ pub struct CurlModelTransport {
     /// Attribution for the spawned `curl`. Empty where the caller has no
     /// session — a settings-screen connection test, say.
     pub(crate) session_id: String,
+    /// Where the per-call `dump-header` file is written, under the data
+    /// directory. Read after the call and removed on every path, so a status is
+    /// available to the classifier without contaminating the token stream.
+    tmp_dir: PathBuf,
+    /// The metadata of the most recent `send_stream`, cleared before each send
+    /// so a caller reading it after a failure never sees the previous call's.
+    last_meta: ResponseMeta,
 }
 
 impl CurlModelTransport {
@@ -482,12 +526,19 @@ impl CurlModelTransport {
         base_url: impl Into<String>,
         api_key: impl Into<String>,
         registry: ProcessRegistry,
+        data_dir: impl AsRef<Path>,
     ) -> Self {
+        let tmp_dir = data_dir.as_ref().join("tmp");
+        // Best-effort: `send_stream` surfaces a transport error if curl cannot
+        // write the header file, and a missing directory would be that.
+        let _ = fs::create_dir_all(&tmp_dir);
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
             registry,
             session_id: String::new(),
+            tmp_dir,
+            last_meta: ResponseMeta::default(),
         }
     }
 
@@ -505,12 +556,13 @@ impl CurlModelTransport {
         format!("{}/v1/chat/completions", self.base_url)
     }
 
-    fn curl_config(&self, request_body: &str) -> String {
+    fn curl_config(&self, request_body: &str, header_path: &Path) -> String {
         format!(
-            "request = \"POST\"\nurl = \"{}\"\nheader = \"content-type: application/json\"\nheader = \"authorization: Bearer {}\"\ndata-binary = \"{}\"\nconnect-timeout = {CONNECT_TIMEOUT_SECS}\nspeed-limit = 1\nspeed-time = {STALL_TIMEOUT_SECS}\nmax-time = {MAX_TIME_SECS}\n",
+            "request = \"POST\"\nurl = \"{}\"\nheader = \"content-type: application/json\"\nheader = \"authorization: Bearer {}\"\ndata-binary = \"{}\"\ndump-header = \"{}\"\nconnect-timeout = {CONNECT_TIMEOUT_SECS}\nspeed-limit = 1\nspeed-time = {STALL_TIMEOUT_SECS}\nmax-time = {MAX_TIME_SECS}\n",
             escape_curl_config_value(&self.chat_completions_url()),
             escape_curl_config_value(&self.api_key),
-            escape_curl_config_value(request_body)
+            escape_curl_config_value(request_body),
+            escape_curl_config_value(&header_path.display().to_string())
         )
     }
 }
@@ -529,6 +581,18 @@ impl ModelTransport for CurlModelTransport {
         // Before spawning, so a turn stopped while queued never reaches the
         // provider and never gets billed.
         cancel.check()?;
+
+        // Fresh per call, so two concurrent calls cannot collide on one file,
+        // and cleared before the send so a caller reading the metadata after a
+        // failure never sees the previous call's answer.
+        self.last_meta = ResponseMeta::default();
+        let header_path = self
+            .tmp_dir
+            .join(format!("{}.headers", create_id("headers")));
+        // The file is removed on every exit, success or error, by the guard.
+        let _header_guard = HeaderFileGuard {
+            path: header_path.clone(),
+        };
 
         let spawned = Command::new("curl")
             .args(Self::curl_args())
@@ -550,7 +614,7 @@ impl ModelTransport for CurlModelTransport {
         };
 
         if let Some(mut stdin) = child.child().stdin.take() {
-            stdin.write_all(self.curl_config(request_body).as_bytes())?;
+            stdin.write_all(self.curl_config(request_body, &header_path).as_bytes())?;
         }
 
         // Taken out first so the borrow for the scrutinee ends before the
@@ -570,6 +634,11 @@ impl ModelTransport for CurlModelTransport {
         if let Some(mut stderr_pipe) = child.child().stderr.take() {
             stderr_pipe.read_to_string(&mut stderr)?;
         }
+
+        // Read before the guard removes the file, so the classifier has the
+        // status and `Retry-After` even once the file is gone.
+        self.last_meta = read_header_file(&header_path);
+
         if !status.success() {
             return Err(ClientError::Io(format!(
                 "Model provider transport failed: {}",
@@ -578,6 +647,116 @@ impl ModelTransport for CurlModelTransport {
         }
         Ok(raw)
     }
+
+    fn last_response_meta(&self) -> ResponseMeta {
+        self.last_meta.clone()
+    }
+}
+
+/// Removes the `dump-header` file on every exit path, so a crashed or cancelled
+/// call does not leave response headers on disk. Created only after the request
+/// is sent, so a removal of a file that never existed is the normal no-op.
+struct HeaderFileGuard {
+    path: PathBuf,
+}
+
+impl Drop for HeaderFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// The status and `Retry-After` from a curl `dump-header` file, or nothing when
+/// the file is absent or unreadable. A missing file is "the transport could not
+/// report", never a fabricated 200.
+fn read_header_file(path: &Path) -> ResponseMeta {
+    let Ok(content) = fs::read_to_string(path) else {
+        return ResponseMeta::default();
+    };
+    ResponseMeta {
+        status: parse_status_line(&content),
+        retry_after_secs: parse_retry_after_header(&content),
+    }
+}
+
+/// The HTTP status from a header file's first line: `HTTP/2 429` or
+/// `HTTP/1.1 200 OK`.
+fn parse_status_line(header: &str) -> Option<u16> {
+    let first = header.lines().next()?;
+    let mut fields = first.split_whitespace();
+    let _version = fields.next()?;
+    fields.next()?.parse().ok()
+}
+
+/// The `retry-after` header, case-insensitive, parsed into seconds.
+fn parse_retry_after_header(header: &str) -> Option<u64> {
+    header.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("retry-after")
+            .then_some(parse_retry_after(value.trim()))?
+    })
+}
+
+/// Parses a `Retry-After` value into seconds, in either of RFC 9110's two
+/// forms: a non-negative delta-seconds integer, or an HTTP-date in
+/// IMF-fixdate format. `None` for anything else, including a date already past,
+/// so a caller treats it as "no guidance" rather than a negative wait.
+fn parse_retry_after(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds);
+    }
+    let deadline = parse_http_date(value)?;
+    let remaining = deadline - now_millis() as i64 / 1000;
+    (remaining > 0).then_some(remaining as u64)
+}
+
+/// An IMF-fixdate HTTP-date (`Sun, 06 Nov 1994 08:49:37 GMT`) to epoch seconds.
+fn parse_http_date(value: &str) -> Option<i64> {
+    let (_, rest) = value.split_once(',')?;
+    let mut fields = rest.split_whitespace();
+    let day: i64 = fields.next()?.parse().ok()?;
+    let month = month_number(fields.next()?)?;
+    let year: i64 = fields.next()?.parse().ok()?;
+    let mut time = fields.next()?.split(':');
+    let hour: i64 = time.next()?.parse().ok()?;
+    let minute: i64 = time.next()?.parse().ok()?;
+    let second: i64 = time.next()?.parse().ok()?;
+    let days = days_from_civil(year, month, day);
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+fn month_number(month: &str) -> Option<i64> {
+    Some(match month {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    })
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Reads `reader` to EOF, handing each chunk to `on_chunk`, and gives up as soon
@@ -706,6 +885,16 @@ pub struct MockModelTransport {
     /// same request without it — and one `response` cannot express that.
     pub responses: Vec<String>,
     pub next_response: usize,
+    /// The HTTP status the double reports for its next response, so a test can
+    /// exercise the status-first classification path without real curl.
+    pub status: Option<u16>,
+    /// The `Retry-After` seconds the double reports alongside `status`.
+    pub retry_after_secs: Option<u64>,
+    /// Per-response statuses, parallel to [`Self::responses`], set on each
+    /// `send` so a sequenced double can express "429 then 200".
+    statuses: Vec<Option<u16>>,
+    /// Per-response `Retry-After`, parallel to [`Self::responses`].
+    retry_afters: Vec<Option<u64>>,
 }
 
 impl MockModelTransport {
@@ -717,6 +906,10 @@ impl MockModelTransport {
             failure_message: "connection reset by peer".to_string(),
             responses: Vec::new(),
             next_response: 0,
+            status: None,
+            retry_after_secs: None,
+            statuses: Vec::new(),
+            retry_afters: Vec::new(),
         }
     }
 
@@ -734,6 +927,25 @@ impl MockModelTransport {
             ..Self::new(String::new())
         }
     }
+
+    /// A sequence whose responses each carry their own status and `Retry-After`,
+    /// so a test can express "429 then 200" — the shape a refusal retry needs.
+    pub fn sequence_with_status(responses: Vec<(String, Option<u16>, Option<u64>)>) -> Self {
+        let mut bodies = Vec::with_capacity(responses.len());
+        let mut statuses = Vec::with_capacity(responses.len());
+        let mut retry_afters = Vec::with_capacity(responses.len());
+        for (body, status, retry_after) in responses {
+            bodies.push(body);
+            statuses.push(status);
+            retry_afters.push(retry_after);
+        }
+        Self {
+            responses: bodies,
+            statuses,
+            retry_afters,
+            ..Self::new(String::new())
+        }
+    }
 }
 
 impl ModelTransport for MockModelTransport {
@@ -748,7 +960,16 @@ impl ModelTransport for MockModelTransport {
         }
         let index = self.next_response.min(self.responses.len() - 1);
         self.next_response += 1;
+        self.status = self.statuses.get(index).copied().flatten();
+        self.retry_after_secs = self.retry_afters.get(index).copied().flatten();
         Ok(self.responses[index].clone())
+    }
+
+    fn last_response_meta(&self) -> ResponseMeta {
+        ResponseMeta {
+            status: self.status,
+            retry_after_secs: self.retry_after_secs,
+        }
     }
 }
 
@@ -874,12 +1095,45 @@ fn mentions_unsupported_usage_option(message: &str) -> bool {
     lowered.contains("stream_options") || lowered.contains("include_usage")
 }
 
+/// A refusal's user-facing message: the provider's own words when it sent any,
+/// else the classification's code, plus how many attempts were spent. The
+/// provider's message is the only place the user learns what to fix, so it is
+/// carried verbatim rather than paraphrased.
+fn refusal_message(refusal: &ProviderRefusal, raw: &str, attempts: u32) -> String {
+    let detail = extract_error_message(raw).unwrap_or_else(|| refusal.code().to_string());
+    format!("{detail} (provider refused after {attempts} attempts)")
+}
+
+/// A refusal retry's sleep in seconds: exponential from 1s, with clock-derived
+/// jitter so two Damaian windows that hit the same limit do not retry in
+/// lockstep. Spec 48 §5.3.
+fn refusal_backoff_secs(attempt: u32) -> u64 {
+    let base_secs = 1u64 << attempt.min(4); // 1, 2, 4, 8
+    let jitter_ms = (now_millis() % (base_secs * 1000) as u128) as u64;
+    base_secs + jitter_ms / 1000
+}
+
+/// Sleeps `seconds`, polling the stop flag every [`CANCEL_POLL_INTERVAL`], so a
+/// user watching "retrying in 47s" can stop it rather than wait the whole
+/// duration out.
+fn wait_cancellable(seconds: u64, cancel: &CancelToken) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+    loop {
+        cancel.check()?;
+        if std::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        std::thread::sleep(CANCEL_POLL_INTERVAL);
+    }
+}
+
 impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
     fn stream_response(
         &mut self,
         request: &ModelRequest,
         cancel: &CancelToken,
         on_token: &mut dyn FnMut(&str),
+        on_wait: &mut dyn FnMut(u64),
     ) -> Result<ModelRun> {
         let run_id = create_id("modelrun");
         let started_at_ms = now_millis();
@@ -888,31 +1142,85 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
         // says it does not know the field — one without it. Spec 19 §5.2.
         let mut ask_for_usage = request.request_usage && self.probe_supports_usage();
         let mut usage_reporting_unsupported = false;
+        let mut total_retries: u32 = 0;
+        let mut refusal_attempts: u32 = 0;
+        let refusal_deadline = std::time::Instant::now() + RETRY_WAIT_CEILING;
         let (raw, content, retry_count, body) = loop {
             let body = model_request_json(&ModelRequest {
                 request_usage: ask_for_usage,
                 ..request.clone()
             });
             let (raw, content, retry_count) = self.send_with_retries(&body, cancel, on_token)?;
+            total_retries += retry_count;
 
-            // A provider that rejects the field says so in the body of an
-            // error response, not through a transport failure: `curl -sS`
-            // exits zero on a 4xx, so the status never reaches us. The retry
-            // is a capability probe rather than a failed call, so it does not
-            // count towards `retry_count`.
-            if let Some(message) = extract_error_message(&raw) {
-                if ask_for_usage && mentions_unsupported_usage_option(&message) {
-                    self.supports_usage = Some(false);
-                    usage_reporting_unsupported = true;
-                    ask_for_usage = false;
-                    continue;
+            // A provider that rejects `stream_options` says so in the body of
+            // an error response, not through a transport failure: `curl -sS`
+            // exits zero on a 4xx, so the status never reaches the connection
+            // layer. Checked *before* the refusal classification, because its
+            // 400-shaped body is a capability probe, not a refusal.
+            if let Some(message) = extract_error_message(&raw)
+                && ask_for_usage
+                && mentions_unsupported_usage_option(&message)
+            {
+                self.supports_usage = Some(false);
+                usage_reporting_unsupported = true;
+                ask_for_usage = false;
+                continue;
+            }
+
+            // Classify the refusal from status first, body second (spec 48
+            // §5.2). This runs only after `send_with_retries` returned `Ok`,
+            // which is where a provider 429 actually arrives.
+            if let Some(refusal) = classify_refusal(&self.transport.last_response_meta(), &raw) {
+                // Mid-stream: tokens already reached the user, so retrying
+                // would blend two responses. Treated as permanent; the caller
+                // books what streamed (spec 48 §5.5).
+                let retryable = refusal.is_transient() && content.is_empty();
+                if !retryable {
+                    let message = refusal_message(&refusal, &raw, refusal_attempts + 1);
+                    return Err(ClientError::Provider(refusal, message));
                 }
+                if refusal_attempts >= MAX_REFUSAL_ATTEMPTS
+                    || std::time::Instant::now() >= refusal_deadline
+                {
+                    let message = refusal_message(&refusal, &raw, refusal_attempts + 1);
+                    return Err(ClientError::Provider(refusal, message));
+                }
+
+                let remaining =
+                    refusal_deadline.saturating_duration_since(std::time::Instant::now());
+                let wait = match refusal.retry_after_secs() {
+                    Some(retry_after) => {
+                        if retry_after > remaining.as_secs() {
+                            // The provider's figure is not slept through: eleven
+                            // minutes is indistinguishable from a hang, so the
+                            // call fails carrying that figure.
+                            let message = format!(
+                                "Provider asked to wait {retry_after}s, beyond the \
+                                 {}s retry ceiling",
+                                RETRY_WAIT_CEILING.as_secs()
+                            );
+                            return Err(ClientError::Provider(refusal, message));
+                        }
+                        retry_after
+                    }
+                    None => refusal_backoff_secs(refusal_attempts),
+                };
+
+                on_wait(wait);
+                wait_cancellable(wait, cancel)?;
+                refusal_attempts += 1;
+                continue;
+            }
+
+            // Not a refusal: any other error object is a plain provider error.
+            if let Some(message) = extract_error_message(&raw) {
                 return Err(ClientError::Io(format!("Model provider error: {message}")));
             }
             if ask_for_usage && extract_usage(&raw).is_some() {
                 self.supports_usage = Some(true);
             }
-            break (raw, content, retry_count, body);
+            break (raw, content, total_retries, body);
         };
 
         let tool_calls = extract_tool_calls(&raw);
@@ -949,6 +1257,7 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
             content,
             incomplete: cancel.is_cancelled(),
             retry_count,
+            refusal_retries: refusal_attempts,
             tool_calls,
             truncated: response_was_truncated(&raw),
             reasoning_content: extract_reasoning_content(&raw),
@@ -1353,6 +1662,99 @@ fn extract_error_message(raw: &str) -> Option<String> {
     extract_string_field(raw, "message")
 }
 
+/// Classifies a provider's refusal, status first and body second — never by
+/// substring search over prose. `None` means "not a refusal": a 2xx with no
+/// error object, or a transport that reported neither a status nor an error
+/// body. Spec 48 §5.2.
+pub fn classify_refusal(meta: &ResponseMeta, raw: &str) -> Option<ProviderRefusal> {
+    if let Some(status) = meta.status {
+        match status {
+            429 => {
+                return Some(ProviderRefusal::RateLimited {
+                    retry_after_secs: meta.retry_after_secs,
+                });
+            }
+            500 | 502 | 503 | 504 => {
+                return Some(ProviderRefusal::Overloaded {
+                    retry_after_secs: meta.retry_after_secs,
+                });
+            }
+            402 => return Some(ProviderRefusal::QuotaExhausted),
+            401 | 403 => return Some(ProviderRefusal::AuthFailed),
+            400 | 404 | 422 => return Some(ProviderRefusal::BadRequest),
+            // Any other 4xx is a refusal we cannot classify from its status
+            // alone; the body may name a quota, otherwise it is permanent.
+            400..=499 => {
+                return Some(if body_mentions_quota(raw) {
+                    ProviderRefusal::QuotaExhausted
+                } else {
+                    ProviderRefusal::Unknown
+                });
+            }
+            // A 5xx outside the overload list is still a refusal, just not one
+            // we can promise is transient.
+            500..=599 => return Some(ProviderRefusal::Unknown),
+            // 1xx, 2xx, 3xx: not a refusal by status. Fall through to the body
+            // check, for a provider that returns 200 with an error object.
+            _ => {}
+        }
+    }
+    classify_refusal_from_body(raw)
+}
+
+/// The body-only fallback: a provider error object's structured `code`/`type`
+/// field, examined only when no status classified the response. Free prose is
+/// never the signal — a message mentioning "connection" or a request id
+/// carrying "429" must not drive a refusal, which is the point of reading the
+/// `code`/`type` field rather than the `message`.
+fn classify_refusal_from_body(raw: &str) -> Option<ProviderRefusal> {
+    if !raw.contains("\"error\"") {
+        return None;
+    }
+    let code = extract_string_field(raw, "code")
+        .or_else(|| extract_string_field(raw, "type"))
+        .unwrap_or_default()
+        .to_lowercase();
+    Some(
+        if code.contains("rate_limit") || code.contains("too_many") {
+            ProviderRefusal::RateLimited {
+                retry_after_secs: None,
+            }
+        } else if code.contains("quota") || code.contains("billing") || code.contains("balance") {
+            ProviderRefusal::QuotaExhausted
+        } else if code.contains("auth")
+            || code.contains("api_key")
+            || code.contains("unauthorized")
+            || code.contains("forbidden")
+        {
+            ProviderRefusal::AuthFailed
+        } else if code.contains("server")
+            || code.contains("overload")
+            || code.contains("unavailable")
+            || code.contains("timeout")
+        {
+            ProviderRefusal::Overloaded {
+                retry_after_secs: None,
+            }
+        } else if code.contains("invalid") || code.contains("not_found") {
+            ProviderRefusal::BadRequest
+        } else {
+            ProviderRefusal::Unknown
+        },
+    )
+}
+
+/// Whether an error object's structured field names an exhausted balance or
+/// quota, for the "4xx whose body says quota" case in §5.2.
+fn body_mentions_quota(raw: &str) -> bool {
+    extract_string_field(raw, "code")
+        .or_else(|| extract_string_field(raw, "type"))
+        .is_some_and(|value| {
+            let lowered = value.to_lowercase();
+            lowered.contains("quota") || lowered.contains("billing") || lowered.contains("balance")
+        })
+}
+
 fn extract_string_field(raw: &str, field: &str) -> Option<String> {
     let needle = format!("\"{field}\"");
     let bytes = raw.as_bytes();
@@ -1561,7 +1963,7 @@ mod tests {
     #[test]
     fn curl_transport_does_not_send_a_request_for_an_already_cancelled_turn() {
         let mut transport =
-            CurlModelTransport::new("https://api.example.test/", "sk_test", test_registry());
+            CurlModelTransport::new("https://api.example.test/", "sk_test", test_registry(), test_data_dir());
         let cancel = CancelToken::new();
         cancel.cancel();
 
@@ -1584,8 +1986,11 @@ mod tests {
     #[test]
     fn curl_transport_bounds_connect_stall_and_total_time() {
         let transport =
-            CurlModelTransport::new("https://api.example.test/", "sk_test", test_registry());
-        let config = transport.curl_config("{\"model\":\"test\",\"messages\":[]}");
+            CurlModelTransport::new("https://api.example.test/", "sk_test", test_registry(), test_data_dir());
+        let config = transport.curl_config(
+            "{\"model\":\"test\",\"messages\":[]}",
+            Path::new("h.headers"),
+        );
 
         assert!(config.contains(&format!("connect-timeout = {CONNECT_TIMEOUT_SECS}")));
         // Progress-based, not duration-based: a long generation that keeps
@@ -1593,22 +1998,324 @@ mod tests {
         assert!(config.contains("speed-limit = 1"));
         assert!(config.contains(&format!("speed-time = {STALL_TIMEOUT_SECS}")));
         assert!(config.contains(&format!("max-time = {MAX_TIME_SECS}")));
+        assert!(config.contains("dump-header = \"h.headers\""));
     }
 
     #[test]
     fn curl_transport_does_not_put_api_key_in_argv() {
         let api_key = "sk_test_12345678901234567890";
         let transport =
-            CurlModelTransport::new("https://api.example.test/", api_key, test_registry());
+            CurlModelTransport::new("https://api.example.test/", api_key, test_registry(), test_data_dir());
         let args = CurlModelTransport::curl_args();
 
         assert!(!args.iter().any(|arg| arg.contains(api_key)));
         assert_eq!(args, ["-sS", "--no-buffer", "--config", "-"]);
 
-        let config = transport.curl_config("{\"model\":\"test\",\"messages\":[]}");
+        let config = transport.curl_config(
+            "{\"model\":\"test\",\"messages\":[]}",
+            Path::new("h.headers"),
+        );
         assert!(config.contains(&format!("authorization: Bearer {api_key}")));
         assert!(
             config.contains("data-binary = \"{\\\"model\\\":\\\"test\\\",\\\"messages\\\":[]}\"")
+        );
+    }
+
+    /// A scratch data directory, so constructing a transport never writes into
+    /// the user's real `~/Library/Application Support/DamaianClient`.
+    fn test_data_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "damaian-model-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    #[test]
+    fn a_transport_with_no_metadata_reports_none_by_default() {
+        // The default must be "unknown", never "200": a fabricated success is
+        // how a mock would silently assert the provider answered.
+        let transport = MockModelTransport::new("data: [DONE]\n");
+        assert_eq!(transport.last_response_meta().status, None);
+        assert_eq!(transport.last_response_meta().retry_after_secs, None);
+    }
+
+    #[test]
+    fn a_mock_can_report_a_status_and_a_retry_after() {
+        let mut transport = MockModelTransport::new("data: [DONE]\n");
+        transport.status = Some(429);
+        transport.retry_after_secs = Some(3);
+        // `send` must leave the metadata readable afterwards.
+        transport.send("{}").expect("send");
+        assert_eq!(transport.last_response_meta().status, Some(429));
+        assert_eq!(transport.last_response_meta().retry_after_secs, Some(3));
+    }
+
+    #[test]
+    fn the_status_and_retry_after_are_read_from_a_header_file() {
+        let header = "HTTP/2 429\nretry-after: 3\ncontent-type: application/json\n";
+        assert_eq!(parse_status_line(header), Some(429));
+        assert_eq!(parse_retry_after_header(header), Some(3));
+    }
+
+    #[test]
+    fn the_retry_after_header_is_case_insensitive() {
+        let header = "HTTP/1.1 503 Service Unavailable\nRetry-After: 7\n";
+        assert_eq!(parse_retry_after_header(header), Some(7));
+    }
+
+    #[test]
+    fn retry_after_delta_seconds_parse_directly() {
+        assert_eq!(parse_retry_after("3"), Some(3));
+        assert_eq!(parse_retry_after(" 17 "), Some(17));
+    }
+
+    #[test]
+    fn an_http_date_parses_to_epoch_seconds() {
+        // The RFC 7231 example; its epoch value is a fixed, well-known number.
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+    }
+
+    #[test]
+    fn retry_after_accepts_a_future_http_date_and_rejects_a_past_one() {
+        // 2100 is far in the future; the day name before the comma is ignored.
+        let seconds = parse_retry_after("Mon, 01 Jan 2100 00:00:00 GMT").unwrap();
+        assert!(seconds > 0);
+        assert_eq!(parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT"), None);
+    }
+
+    #[test]
+    fn a_429_status_classifies_as_rate_limited_regardless_of_prose() {
+        // The message says "connection", the request id carries "429": status
+        // must win over both.
+        let meta = ResponseMeta {
+            status: Some(429),
+            retry_after_secs: Some(3),
+        };
+        let raw = "{\"error\":{\"message\":\"connection failed\",\"request_id\":\"req_429ab\"}}";
+        assert_eq!(
+            classify_refusal(&meta, raw),
+            Some(ProviderRefusal::RateLimited {
+                retry_after_secs: Some(3)
+            })
+        );
+    }
+
+    #[test]
+    fn a_permanent_status_is_not_retried_even_when_prose_names_a_rate_limit() {
+        let meta = ResponseMeta {
+            status: Some(401),
+            retry_after_secs: None,
+        };
+        let raw = "{\"error\":{\"message\":\"connection failed\",\"request_id\":\"req_429ab\"}}";
+        let refusal = classify_refusal(&meta, raw).unwrap();
+        assert_eq!(refusal, ProviderRefusal::AuthFailed);
+        assert!(!refusal.is_transient());
+    }
+
+    #[test]
+    fn a_503_status_classifies_as_overloaded_and_is_transient() {
+        let meta = ResponseMeta {
+            status: Some(503),
+            retry_after_secs: Some(5),
+        };
+        assert_eq!(
+            classify_refusal(&meta, "{}").unwrap(),
+            ProviderRefusal::Overloaded {
+                retry_after_secs: Some(5)
+            }
+        );
+    }
+
+    #[test]
+    fn a_402_status_is_quota_exhausted_even_without_a_body() {
+        let meta = ResponseMeta {
+            status: Some(402),
+            retry_after_secs: None,
+        };
+        assert_eq!(
+            classify_refusal(&meta, "{}"),
+            Some(ProviderRefusal::QuotaExhausted)
+        );
+    }
+
+    #[test]
+    fn a_2xx_with_no_error_object_is_not_a_refusal() {
+        let meta = ResponseMeta {
+            status: Some(200),
+            retry_after_secs: None,
+        };
+        assert_eq!(classify_refusal(&meta, "data: [DONE]\n"), None);
+    }
+
+    #[test]
+    fn a_2xx_with_an_error_object_is_classified_from_the_code_field() {
+        // Some providers return 200 with an error body; the `code` field is
+        // the signal, never the `message`.
+        let meta = ResponseMeta {
+            status: Some(200),
+            retry_after_secs: None,
+        };
+        let raw = "{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}";
+        assert_eq!(
+            classify_refusal(&meta, raw),
+            Some(ProviderRefusal::RateLimited {
+                retry_after_secs: None
+            })
+        );
+    }
+
+    #[test]
+    fn a_body_naming_quota_is_exhausted_only_when_no_status_classified() {
+        let meta = ResponseMeta::default();
+        let raw = "{\"error\":{\"code\":\"insufficient_quota\",\"message\":\"out of credit\"}}";
+        assert_eq!(
+            classify_refusal(&meta, raw),
+            Some(ProviderRefusal::QuotaExhausted)
+        );
+    }
+
+    #[test]
+    fn an_unclassified_4xx_naming_quota_is_quota_exhausted() {
+        let meta = ResponseMeta {
+            status: Some(428),
+            retry_after_secs: None,
+        };
+        let raw = "{\"error\":{\"code\":\"billing_not_active\"}}";
+        assert_eq!(
+            classify_refusal(&meta, raw),
+            Some(ProviderRefusal::QuotaExhausted)
+        );
+    }
+
+    #[test]
+    fn an_unclassified_4xx_without_a_quota_body_is_unknown_and_permanent() {
+        let meta = ResponseMeta {
+            status: Some(428),
+            retry_after_secs: None,
+        };
+        let refusal = classify_refusal(&meta, "{\"error\":{\"message\":\"weird\"}}").unwrap();
+        assert_eq!(refusal, ProviderRefusal::Unknown);
+        assert!(!refusal.is_transient());
+    }
+
+    #[test]
+    fn a_429_then_200_is_retried_and_succeeds() {
+        // `retry_after: 0` keeps the test from sleeping through the backoff.
+        let transport = MockModelTransport::sequence_with_status(vec![
+            (
+                "{\"error\":{\"message\":\"rate limited\"}}".to_string(),
+                Some(429),
+                Some(0),
+            ),
+            (
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n"
+                    .to_string(),
+                Some(200),
+                None,
+            ),
+        ]);
+        let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
+        let run = adapter
+            .stream_response(
+                &test_request(),
+                &CancelToken::new(),
+                &mut |_| {},
+                &mut |_| {},
+            )
+            .expect("the retry should succeed");
+        assert_eq!(run.content, "ok");
+        assert_eq!(run.refusal_retries, 1, "one refusal retry beyond the first");
+        assert_eq!(
+            adapter.transport.requests.len(),
+            2,
+            "the provider was asked twice"
+        );
+    }
+
+    #[test]
+    fn a_retry_after_beyond_the_ceiling_fails_with_the_providers_figure() {
+        let transport = MockModelTransport::sequence_with_status(vec![(
+            "{\"error\":{\"message\":\"rate limited\"}}".to_string(),
+            Some(429),
+            Some(10_000),
+        )]);
+        let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
+        let error = adapter
+            .stream_response(
+                &test_request(),
+                &CancelToken::new(),
+                &mut |_| {},
+                &mut |_| {},
+            )
+            .expect_err("a wait beyond the ceiling is not slept through");
+        assert_eq!(error.code(), "provider_rate_limited");
+        assert!(
+            format!("{error}").contains("10000"),
+            "the message carries the provider's own figure"
+        );
+        assert_eq!(
+            adapter.transport.requests.len(),
+            1,
+            "no retry was attempted"
+        );
+    }
+
+    #[test]
+    fn a_permanent_refusal_is_not_retried() {
+        let transport = MockModelTransport::sequence_with_status(vec![
+            (
+                "{\"error\":{\"message\":\"bad key\"}}".to_string(),
+                Some(401),
+                None,
+            ),
+            ("data: [DONE]\n".to_string(), Some(200), None),
+        ]);
+        let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
+        let error = adapter
+            .stream_response(
+                &test_request(),
+                &CancelToken::new(),
+                &mut |_| {},
+                &mut |_| {},
+            )
+            .expect_err("a 401 must not be retried");
+        assert_eq!(error.code(), "provider_auth_failed");
+        assert_eq!(
+            adapter.transport.requests.len(),
+            1,
+            "the second response was never asked for"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_wait_is_interrupted_by_a_stop() {
+        let transport = MockModelTransport::sequence_with_status(vec![
+            (
+                "{\"error\":{\"message\":\"rate limited\"}}".to_string(),
+                Some(429),
+                Some(30),
+            ),
+            ("data: [DONE]\n".to_string(), Some(200), None),
+        ]);
+        let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
+        let cancel = CancelToken::new();
+        let stopper = cancel.clone();
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            stopper.cancel();
+        });
+
+        let result = adapter.stream_response(&test_request(), &cancel, &mut |_| {}, &mut |_| {});
+        assert_eq!(result.unwrap_err(), ClientError::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the stop must interrupt the wait, not sleep it out: {:?}",
+            started.elapsed()
         );
     }
 
@@ -1633,7 +2340,7 @@ mod tests {
         let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
         let request = test_request();
         let run = adapter
-            .stream_response(&request, &CancelToken::new(), &mut |_token| {})
+            .stream_response(&request, &CancelToken::new(), &mut |_token| {}, &mut |_| {})
             .expect("the mock stream should produce a run");
 
         assert_eq!(run.usage.source, UsageSource::Estimated);
@@ -1686,7 +2393,12 @@ mod tests {
         ]);
         let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
         let run = adapter
-            .stream_response(&usage_request(), &CancelToken::new(), &mut |_token| {})
+            .stream_response(
+                &usage_request(),
+                &CancelToken::new(),
+                &mut |_token| {},
+                &mut |_| {},
+            )
             .expect("the second attempt should succeed");
 
         assert_eq!(run.content, "hello");
@@ -1709,10 +2421,20 @@ mod tests {
         ]);
         let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
         adapter
-            .stream_response(&usage_request(), &CancelToken::new(), &mut |_token| {})
+            .stream_response(
+                &usage_request(),
+                &CancelToken::new(),
+                &mut |_token| {},
+                &mut |_| {},
+            )
             .expect("the first call succeeds after the probe");
         let second = adapter
-            .stream_response(&usage_request(), &CancelToken::new(), &mut |_token| {})
+            .stream_response(
+                &usage_request(),
+                &CancelToken::new(),
+                &mut |_token| {},
+                &mut |_| {},
+            )
             .expect("the second call succeeds directly");
 
         // A fourth body would mean the second turn probed again.
@@ -1735,7 +2457,12 @@ mod tests {
         ]);
         let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
         let error = adapter
-            .stream_response(&usage_request(), &CancelToken::new(), &mut |_token| {})
+            .stream_response(
+                &usage_request(),
+                &CancelToken::new(),
+                &mut |_token| {},
+                &mut |_| {},
+            )
             .expect_err("a balance error must not be retried as a capability probe");
 
         assert!(format!("{error}").contains("Insufficient balance"));
@@ -1789,7 +2516,12 @@ mod tests {
         ));
         let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
         let run = adapter
-            .stream_response(&test_request(), &CancelToken::new(), &mut |_token| {})
+            .stream_response(
+                &test_request(),
+                &CancelToken::new(),
+                &mut |_token| {},
+                &mut |_| {},
+            )
             .expect("the mock stream should produce a run");
 
         assert_eq!(run.usage.source, UsageSource::Measured);
@@ -1816,9 +2548,12 @@ mod tests {
         let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
         let mut tokens = Vec::new();
         let run = adapter
-            .stream_response(&test_request(), &CancelToken::new(), &mut |token| {
-                tokens.push(token.to_string())
-            })
+            .stream_response(
+                &test_request(),
+                &CancelToken::new(),
+                &mut |token| tokens.push(token.to_string()),
+                &mut |_| {},
+            )
             .expect("should succeed after retries");
 
         assert_eq!(run.retry_count, 2);
@@ -1830,8 +2565,12 @@ mod tests {
     fn gives_up_after_max_attempts_on_persistent_transient_failure() {
         let transport = MockModelTransport::failing("unused", 10);
         let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
-        let result =
-            adapter.stream_response(&test_request(), &CancelToken::new(), &mut |_token| {});
+        let result = adapter.stream_response(
+            &test_request(),
+            &CancelToken::new(),
+            &mut |_token| {},
+            &mut |_| {},
+        );
 
         assert!(result.is_err());
         let error = result.unwrap_err();
@@ -1843,8 +2582,12 @@ mod tests {
         let mut transport = MockModelTransport::failing("unused", 1);
         transport.failure_message = "invalid api key".to_string();
         let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
-        let result =
-            adapter.stream_response(&test_request(), &CancelToken::new(), &mut |_token| {});
+        let result = adapter.stream_response(
+            &test_request(),
+            &CancelToken::new(),
+            &mut |_token| {},
+            &mut |_| {},
+        );
 
         assert!(result.is_err());
         assert!(!result.unwrap_err().is_retryable());
@@ -1876,9 +2619,12 @@ mod tests {
         let mut adapter =
             OpenAICompatibleAdapter::new("test-model", FlakyMidStreamTransport { calls: 0 });
         let mut tokens = Vec::new();
-        let result = adapter.stream_response(&test_request(), &CancelToken::new(), &mut |token| {
-            tokens.push(token.to_string())
-        });
+        let result = adapter.stream_response(
+            &test_request(),
+            &CancelToken::new(),
+            &mut |token| tokens.push(token.to_string()),
+            &mut |_| {},
+        );
 
         assert!(result.is_err());
         assert_eq!(adapter.transport.calls, 1);
@@ -2063,7 +2809,12 @@ mod tests {
         let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
 
         let run = adapter
-            .stream_response(&test_request(), &CancelToken::new(), &mut |_token| {})
+            .stream_response(
+                &test_request(),
+                &CancelToken::new(),
+                &mut |_token| {},
+                &mut |_| {},
+            )
             .expect("tool-call-only response should not be treated as empty");
 
         assert!(run.content.is_empty());

@@ -314,6 +314,24 @@ impl SessionStore {
         status: TaskStatus,
         error: Option<&str>,
     ) -> Result<Task> {
+        self.update_task_status_with_kind(task, status, error, None)
+    }
+
+    /// [`Self::update_task_status`] with an optional typed failure reason, so a
+    /// failure can be *named* rather than only described. Spec 48 §5.4: a task
+    /// refused by the provider fails with `failureKind: "provider_rate_limited"`
+    /// and a UI can branch on that code instead of parsing a sentence.
+    ///
+    /// `failure_kind` travels as a sibling of the wrapped `task` object —
+    /// `{"task":…,"error":…,"failureKind":…}` — and is absent on every event
+    /// written before this spec, so the read side defaults it to `None`.
+    pub fn update_task_status_with_kind(
+        &self,
+        task: &Task,
+        status: TaskStatus,
+        error: Option<&str>,
+        failure_kind: Option<&str>,
+    ) -> Result<Task> {
         let mut updated = task.clone();
         updated.status = status;
         // Asks the status rather than re-listing the terminal ones here. The
@@ -324,16 +342,55 @@ impl SessionStore {
         if updated.status.is_terminal() {
             updated.completed_at_ms = Some(now_millis());
         }
-        let mut payload = task_json(&updated);
+        let mut extra = Vec::new();
         if let Some(error) = error {
-            payload = format!(
-                "{{\"task\":{},\"error\":\"{}\"}}",
-                payload,
-                escape_json(error)
-            );
+            extra.push(format!("\"error\":\"{}\"", escape_json(error)));
         }
+        if let Some(kind) = failure_kind {
+            extra.push(format!("\"failureKind\":\"{}\"", escape_json(kind)));
+        }
+        let payload = if extra.is_empty() {
+            task_json(&updated)
+        } else {
+            format!("{{\"task\":{},{}}}", task_json(&updated), extra.join(","))
+        };
         self.append_session_event(&task.session_id, "task_status_updated", &payload)?;
         Ok(updated)
+    }
+
+    /// The latest `failureKind` of every task in the session, keyed by task id.
+    ///
+    /// Mirrors [`Self::read_task_statuses`], reading only the sibling the
+    /// wrapped `task_status_updated` event carries when a failure was named.
+    /// A task without one is simply absent, so the two maps stay independent.
+    pub fn read_task_failure_kinds(&self, session_id: &str) -> Result<HashMap<String, String>> {
+        let path = self.session_log_path(session_id);
+        let Ok(content) = fs::read_to_string(path) else {
+            return Ok(HashMap::new());
+        };
+        let mut kinds = HashMap::new();
+        for event in active_events(&content) {
+            if event.event_type != "task_status_updated" {
+                continue;
+            }
+            let Some(task_id) = event
+                .payload
+                .get("task")
+                .and_then(|value| value.get("id"))
+                .and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            let Some(kind) = event
+                .payload
+                .get("failureKind")
+                .and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            kinds.insert(task_id.to_string(), kind.to_string());
+        }
+        Ok(kinds)
     }
 
     pub fn append_message(

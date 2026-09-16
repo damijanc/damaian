@@ -477,6 +477,12 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .session_store
                 .read_session_plans(&session_id)
                 .map_err(|error| error.to_string())?;
+            // A named failure reason, joined by `taskId` (spec 48 §5.4), so a
+            // refused turn says *why* it failed rather than only that it did.
+            let task_failure_kinds = engine
+                .session_store
+                .read_task_failure_kinds(&session_id)
+                .map_err(|error| error.to_string())?;
             write_response(
                 stream,
                 &request,
@@ -486,7 +492,13 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                     "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}]}}",
                     session_json(&session),
                     messages_json(&messages),
-                    task_states_json(&task_statuses, &task_usage, &task_plans, &engine.config)
+                    task_states_json(
+                        &task_statuses,
+                        &task_usage,
+                        &task_plans,
+                        &task_failure_kinds,
+                        &engine.config
+                    )
                 ),
             )
         }
@@ -655,6 +667,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 api_key,
                 ProcessRegistry::open(&engine.config.data_dir)
                     .map_err(|error| error.to_string())?,
+                &engine.config.data_dir,
             );
             let mut adapter = OpenAICompatibleAdapter::with_provider(
                 &engine.config.model_provider,
@@ -1192,6 +1205,7 @@ fn run_resume_command_request(
         &engine.config.model_base_url,
         api_key,
         ProcessRegistry::open(&engine.config.data_dir).map_err(|error| error.to_string())?,
+        &engine.config.data_dir,
     );
     let mut adapter = OpenAICompatibleAdapter::with_provider(
         &engine.config.model_provider,
@@ -1248,6 +1262,7 @@ fn run_resume_plan_request(
         &engine.config.model_base_url,
         api_key,
         ProcessRegistry::open(&engine.config.data_dir).map_err(|error| error.to_string())?,
+        &engine.config.data_dir,
     );
     let mut adapter = OpenAICompatibleAdapter::with_provider(
         &engine.config.model_provider,
@@ -1334,6 +1349,7 @@ fn run_chat_request(
         &engine.config.model_base_url,
         api_key,
         ProcessRegistry::open(&engine.config.data_dir).map_err(|error| error.to_string())?,
+        &engine.config.data_dir,
     );
     let mut adapter = OpenAICompatibleAdapter::with_provider(
         &engine.config.model_provider,
@@ -1385,6 +1401,7 @@ fn resume_chat_command(
         &engine.config.model_base_url,
         api_key,
         ProcessRegistry::open(&engine.config.data_dir).map_err(|error| error.to_string())?,
+        &engine.config.data_dir,
     );
     let mut adapter = OpenAICompatibleAdapter::with_provider(
         &engine.config.model_provider,
@@ -3005,6 +3022,7 @@ fn task_states_json(
     statuses: &HashMap<String, String>,
     usage: &HashMap<String, TaskUsage>,
     plans: &HashMap<String, TaskPlan>,
+    failure_kinds: &HashMap<String, String>,
     config: &Config,
 ) -> String {
     let mut entries: Vec<&String> = statuses.keys().collect();
@@ -3035,11 +3053,19 @@ fn task_states_json(
                 Some(plan) => format!(",\"plan\":{}", plan_json(plan)),
                 None => String::new(),
             };
+            // A named failure reason, when the turn failed with one (spec 48
+            // §5.4). Absent for every other outcome, so old sessions and
+            // successful turns are unchanged.
+            let failure_kind_field = match failure_kinds.get(*id) {
+                Some(kind) => format!(",\"failureKind\":\"{}\"", escape_json(kind)),
+                None => String::new(),
+            };
             format!(
-                "{{\"id\":\"{}\",\"status\":\"{}\"{}{}}}",
+                "{{\"id\":\"{}\",\"status\":\"{}\"{}{}{}}}",
                 escape_json(id),
                 escape_json(&statuses[*id]),
                 usage_json,
+                failure_kind_field,
                 plan_json_field
             )
         })
@@ -4531,7 +4557,13 @@ mod tests {
             },
         )]);
 
-        let json = task_states_json(&statuses, &usage, &HashMap::new(), &Config::default());
+        let json = task_states_json(
+            &statuses,
+            &usage,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Config::default(),
+        );
 
         assert!(json.contains("\"inputTokens\":1200"), "{json}");
         assert!(json.contains("\"outputTokens\":340"), "{json}");
@@ -4554,6 +4586,7 @@ mod tests {
             &statuses,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             &Config::default(),
         );
 
@@ -4569,7 +4602,13 @@ mod tests {
         let statuses = HashMap::from([("task_1".to_string(), "complete".to_string())]);
         let plans = HashMap::from([("task_1".to_string(), sample_plan())]);
 
-        let json = task_states_json(&statuses, &HashMap::new(), &plans, &Config::default());
+        let json = task_states_json(
+            &statuses,
+            &HashMap::new(),
+            &plans,
+            &HashMap::new(),
+            &Config::default(),
+        );
 
         assert!(json.contains("\"plan\":{"), "{json}");
         assert!(
@@ -4588,6 +4627,7 @@ mod tests {
 
         let json = task_states_json(
             &statuses,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &Config::default(),

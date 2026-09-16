@@ -69,6 +69,25 @@ Sessions are shown under their project folder in the sidebar. Select an existing
 
 Context file buttons open the referenced file in Visual Studio Code.
 
+## Provider Limits and Retries
+
+A model provider can refuse a call — rate limiting ("you are going too fast"), a
+transient overload, or an exhausted quota or balance. When the refusal is
+transient, Damaian retries automatically: the progress indicator says how long
+it is waiting (for example "Provider refused — retrying in 12s"), and you can
+stop the turn at any point during that wait. Retrying gives up after a bounded
+number of attempts and at most 90 seconds of total waiting.
+
+If the provider still refuses, the turn ends with a message that names the
+reason and carries the provider's own words — which is where you learn what to
+top up. The task keeps its plan, so you can resume the same work once the
+provider recovers or after you fix your account.
+
+Damaian never switches to a different provider on its own. If you have a second
+provider configured, the turn still fails rather than silently rerouting your
+request — changing the model is your decision, not something done behind your
+back.
+
 ## File Changes
 
 Use the conversation box to request file changes.

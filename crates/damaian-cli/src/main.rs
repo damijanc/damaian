@@ -318,6 +318,7 @@ fn run() -> workspace_engine::Result<()> {
                     &engine.config.model_base_url,
                     api_key,
                     ProcessRegistry::open(&engine.config.data_dir)?,
+                    &engine.config.data_dir,
                 );
                 let mut adapter = OpenAICompatibleAdapter::with_provider(
                     &engine.config.model_provider,
@@ -371,6 +372,7 @@ fn run() -> workspace_engine::Result<()> {
                     &engine.config.model_base_url,
                     api_key,
                     ProcessRegistry::open(&engine.config.data_dir)?,
+                    &engine.config.data_dir,
                 );
                 let mut adapter = OpenAICompatibleAdapter::with_provider(
                     &engine.config.model_provider,

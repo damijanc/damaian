@@ -309,7 +309,7 @@ impl EditOrchestrator {
         // named a file policy refuses, and those used to leave the task stuck at
         // `running` with nothing in the audit log to explain it.
         let run = model_adapter
-            .stream_response(&request, &never_cancelled, &mut sink)
+            .stream_response(&request, &never_cancelled, &mut sink, &mut |_seconds| {})
             .map_err(|error| self.record_edit_failure(&session.id, &task, error))?;
         // The other place a model is called, and just as billed as the chat
         // loop's. No marker id: this call site has no action marker, because

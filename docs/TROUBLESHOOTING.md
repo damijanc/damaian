@@ -784,11 +784,28 @@ Check in this order:
    `model_response_completed` means the request left and the response never
    arrived. Compare against stderr for the transport error.
 
-`ClientError::is_retryable` treats rate limits, `429`, timeouts, connection
-failures, and DNS failures as transient
-([error.rs:43](../crates/workspace-engine/src/error.rs:43)); everything else,
-including auth failures, is permanent. If a failure is being retried, it was
-classified transient — the message text drives that decision.
+A provider refusal is audited as `provider_refusal` carrying its classification;
+a refused turn's task state also carries a `failureKind`. See
+[Provider refusal classifications](#provider-refusal-classifications).
+
+### Provider refusal classifications
+
+A provider can refuse a call. The refusal is classified from the HTTP **status
+first** and the error object's structured `code`/`type` field second — never
+from a substring of the message. The classification decides whether Damaian
+retries, and it is recorded as the task's `failureKind` and in the audit log.
+
+| Classification | Status | Retried? | What to do |
+|---|---|---|---|
+| `provider_rate_limited` | 429 | Yes, up to 4 attempts / 90s | Wait, or retry later by resuming the task. |
+| `provider_overloaded` | 500, 502, 503, 504 | Yes, up to 4 attempts / 90s | Wait; it is the provider, not your request. |
+| `provider_quota_exhausted` | 402, or a body naming quota | No | Top up the account; the provider's message says what is owed. |
+| `provider_auth_failed` | 401, 403 | No | The key is wrong, expired, or lacks access. |
+| `provider_bad_request` | 400, 404, 422 | No | The request will not succeed if repeated. |
+| `provider_refused` | other 4xx/5xx | No | Recognised as a refusal but not classified further; treated as permanent. |
+
+A refused task keeps its plan, so resuming it after the provider recovers (or
+after you fix your account) re-runs the same work rather than re-asking.
 
 ### The assistant replies but never proposes a patch
 

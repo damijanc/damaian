@@ -3661,7 +3661,7 @@ fn reports_openai_compatible_error_payloads() {
     let transport = MockModelTransport::new("{\"error\":{\"message\":\"Rate limit exceeded\"}}\n");
     let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
     let error = adapter
-        .stream_response(&request, &CancelToken::new(), &mut |_token| {})
+        .stream_response(&request, &CancelToken::new(), &mut |_token| {}, &mut |_| {})
         .unwrap_err();
     assert!(error.to_string().contains("Rate limit exceeded"));
 }

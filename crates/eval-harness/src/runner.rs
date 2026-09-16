@@ -136,6 +136,7 @@ pub fn run_live(scenario: &Scenario) -> Result<Run> {
         &config.model_base_url,
         api_key,
         ProcessRegistry::open(&config.data_dir)?,
+        &config.data_dir,
     );
     let scanner = SecretScanner::new(config.secret_patterns.clone());
     let mut adapter = OpenAICompatibleAdapter::with_provider(&provider, &model, transport);
