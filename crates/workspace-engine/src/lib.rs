@@ -89,7 +89,10 @@ pub use plan::{
     Evidence, PatchedFile, PlanReport, PlanStep, ReportedStep, StepOutcome, StepStatus, TaskPhase,
     TaskPlan,
 };
-pub use process_registry::ProcessIdentity;
+pub use process_registry::{
+    ProcessIdentity, ProcessKind, ProcessRegistry, RegisteredProcess, RegistrationHandle,
+    SweepDecision, SweepReport, SweepScope,
+};
 pub use recovery::{
     ReattachedApproval, RecoveredTask, abandon, classify_all, classify_session, headline,
     mark_failed, reattach_pending_approvals, resume, resume_allowed, resume_blocked_reason,
