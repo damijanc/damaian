@@ -152,7 +152,8 @@ fn terminal_open(
     on_output: Channel<TerminalEvent>,
 ) -> Result<TerminalOpened, String> {
     let cwd = desktop_shell::terminal_cwd_for_repo(&repo)?;
-    let id = desktop_shell::terminal::open(&cwd, cols, rows)?;
+    let data_dir = desktop_shell::effective_data_dir()?;
+    let id = desktop_shell::terminal::open(&cwd, cols, rows, &data_dir)?;
     let receiver = desktop_shell::terminal::take_output(&id)?;
 
     // Forward pty output to the webview until the shell exits or the channel

@@ -2024,6 +2024,14 @@ struct TerminalCommandResult {
     stderr: String,
 }
 
+/// The effective data directory, for callers outside this crate that need one
+/// without building a whole engine — the Tauri app opening a terminal, say.
+pub fn effective_data_dir() -> Result<PathBuf, String> {
+    Config::load_for_repository(None)
+        .map(|config| config.data_dir)
+        .map_err(|error| error.to_string())
+}
+
 pub fn terminal_cwd_for_repo(repo: &str) -> Result<PathBuf, String> {
     if repo.trim().is_empty() {
         home_dir()
@@ -4745,7 +4753,23 @@ mod tests {
     #[ignore]
     fn terminal_pty_round_trips_shell_output() {
         let cwd = super::terminal_cwd_for_repo("").expect("resolve terminal cwd");
-        let id = super::terminal::open(&cwd, 80, 24).expect("open pty session");
+        let data_dir = std::env::temp_dir().join(format!(
+            "damaian-pty-registry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let registry = workspace_engine::ProcessRegistry::open(&data_dir).expect("registry");
+        let id = super::terminal::open(&cwd, 80, 24, &data_dir).expect("open pty session");
+        assert_eq!(
+            registry.entries().unwrap().len(),
+            1,
+            "a running shell must be recorded, or a crash leaks it"
+        );
+        assert_eq!(
+            registry.entries().unwrap()[0].1.as_ref().unwrap().kind,
+            workspace_engine::ProcessKind::Terminal.as_str()
+        );
         let receiver = super::terminal::take_output(&id).expect("take output channel");
 
         let marker = "pty_marker_9931";
@@ -4770,6 +4794,10 @@ mod tests {
         assert!(
             super::terminal::close(&id).is_some(),
             "close should reap the shell"
+        );
+        assert!(
+            registry.entries().unwrap().is_empty(),
+            "requirement 4: closing a terminal is a clean exit and leaves no entry"
         );
     }
 }

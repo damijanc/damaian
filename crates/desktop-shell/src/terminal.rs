@@ -15,6 +15,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use workspace_engine::{ProcessKind, ProcessRegistry, RegistrationHandle};
 
 /// Largest keystroke/output payload we will move in a single message. Guards
 /// against a pathological client flooding the pty.
@@ -26,6 +27,9 @@ struct PtySession {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Output channel, taken by the streaming endpoint on first connect.
     receiver: Option<Receiver<Vec<u8>>>,
+    /// Removes this session's registry entry when the session is dropped.
+    /// Declared last so it goes after the child has been killed.
+    _registration: RegistrationHandle,
 }
 
 fn sessions() -> &'static Mutex<HashMap<String, PtySession>> {
@@ -46,7 +50,7 @@ fn lock() -> std::sync::MutexGuard<'static, HashMap<String, PtySession>> {
 }
 
 /// Spawn a login shell on a fresh pty in `cwd` and return its session id.
-pub fn open(cwd: &Path, cols: u16, rows: u16) -> Result<String, String> {
+pub fn open(cwd: &Path, cols: u16, rows: u16, data_dir: &Path) -> Result<String, String> {
     let size = PtySize {
         rows: rows.max(1),
         cols: cols.max(1),
@@ -72,6 +76,20 @@ pub fn open(cwd: &Path, cols: u16, rows: u16) -> Result<String, String> {
         .slave
         .spawn_command(cmd)
         .map_err(|error| format!("failed to start shell: {error}"))?;
+    // Recorded before the session is usable, so a crash cannot leave a login
+    // shell running that nothing knows about. No `process_group` call here:
+    // `portable_pty` already puts the child in its own session via `setsid` so
+    // it can own the terminal, which makes its group id its own pid.
+    let registration = {
+        let pid = child
+            .process_id()
+            .ok_or_else(|| "the pty shell reported no pid".to_string())?;
+        let registry = ProcessRegistry::open(data_dir).map_err(|error| error.to_string())?;
+        registry
+            .register(ProcessKind::Terminal, "", pid)
+            .map_err(|error| error.to_string())?
+    };
+
     // Dropping the slave ensures the master sees EOF once the shell exits.
     drop(pair.slave);
 
@@ -95,6 +113,7 @@ pub fn open(cwd: &Path, cols: u16, rows: u16) -> Result<String, String> {
             writer,
             child,
             receiver: Some(receiver),
+            _registration: registration,
         },
     );
     Ok(id)
