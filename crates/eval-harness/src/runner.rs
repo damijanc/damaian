@@ -3,9 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::{
     AgentCommandProposal, AgentPatchProposal, CancelToken, ClientError, Config, CurlModelTransport,
-    MockModelAdapter, ModelAdapter, ModelProviderConfig, OpenAICompatibleAdapter, Result,
-    SecretScanner, SessionStore, Task, TaskStatus, ToolCall, TurnProgress, TurnSink, UsageSource,
-    WorkspaceEngine, classify_session, resume,
+    MockModelAdapter, ModelAdapter, ModelProviderConfig, OpenAICompatibleAdapter, ProcessRegistry,
+    Result, SecretScanner, SessionStore, Task, TaskStatus, ToolCall, TurnProgress, TurnSink,
+    UsageSource, WorkspaceEngine, classify_session, resume,
 };
 
 use crate::fixture::{self, Materialized};
@@ -132,7 +132,11 @@ pub fn run_live(scenario: &Scenario) -> Result<Run> {
             config.model_api_key_env
         ))
     })?;
-    let transport = CurlModelTransport::new(&config.model_base_url, api_key);
+    let transport = CurlModelTransport::new(
+        &config.model_base_url,
+        api_key,
+        ProcessRegistry::open(&config.data_dir)?,
+    );
     let scanner = SecretScanner::new(config.secret_patterns.clone());
     let mut adapter = OpenAICompatibleAdapter::with_provider(&provider, &model, transport);
     let engine = WorkspaceEngine::new(config);

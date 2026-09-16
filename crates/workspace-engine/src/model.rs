@@ -2,8 +2,10 @@ use crate::audit::escape_json as audit_escape_json;
 use crate::cancel::CancelToken;
 use crate::error::{ClientError, Result};
 use crate::hash::{create_id, now_millis};
+use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -467,14 +469,32 @@ pub trait ModelTransport {
 pub struct CurlModelTransport {
     pub base_url: String,
     pub api_key: String,
+    /// So a `curl` streaming a paid-for completion is swept if this process is
+    /// killed before `KillOnDrop` can run.
+    pub(crate) registry: ProcessRegistry,
+    /// Attribution for the spawned `curl`. Empty where the caller has no
+    /// session — a settings-screen connection test, say.
+    pub(crate) session_id: String,
 }
 
 impl CurlModelTransport {
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        registry: ProcessRegistry,
+    ) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
+            registry,
+            session_id: String::new(),
         }
+    }
+
+    /// Attributes any `curl` this transport spawns to a session.
+    pub fn for_session(mut self, session_id: &str) -> Self {
+        self.session_id = session_id.to_string();
+        self
     }
 
     fn curl_args() -> [&'static str; 4] {
@@ -510,14 +530,24 @@ impl ModelTransport for CurlModelTransport {
         // provider and never gets billed.
         cancel.check()?;
 
-        let mut child = KillOnDrop(
-            Command::new("curl")
-                .args(Self::curl_args())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?,
-        );
+        let spawned = Command::new("curl")
+            .args(Self::curl_args())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Its own group, so a sweep reaches the whole call rather than a
+            // leader that may have exec'd.
+            .process_group(0)
+            .spawn()?;
+        // Before the request body is written: a `curl` that is running and
+        // unrecorded cannot be swept, and this one is billing.
+        let registration =
+            self.registry
+                .register(ProcessKind::ModelCall, &self.session_id, spawned.id())?;
+        let mut child = KillOnDrop {
+            child: spawned,
+            _registration: registration,
+        };
 
         if let Some(mut stdin) = child.child().stdin.take() {
             stdin.write_all(self.curl_config(request_body).as_bytes())?;
@@ -615,11 +645,19 @@ where
 /// Kills the child if it is still running when this is dropped, so a panic on
 /// the calling thread cannot leave `curl` streaming a paid-for completion into
 /// nothing for the rest of `max-time`.
-struct KillOnDrop(Child);
+///
+/// The second field removes the registry entry on the same path. A `SIGKILL`
+/// skips this entirely, which is exactly why the entry is written at spawn:
+/// the next launch's sweep is what catches that case.
+struct KillOnDrop {
+    child: Child,
+    /// Held, never read: dropping it is what removes the registry entry.
+    _registration: RegistrationHandle,
+}
 
 impl KillOnDrop {
     fn child(&mut self) -> &mut Child {
-        &mut self.0
+        &mut self.child
     }
 }
 
@@ -627,8 +665,8 @@ impl Drop for KillOnDrop {
     fn drop(&mut self) {
         // Already-exited is the normal case and reports an error here; either
         // way there is nothing to recover from at drop time.
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -1400,6 +1438,18 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// A registry over a scratch directory, so a transport can be built in a
+    /// test without writing to the user's real data directory. None of these
+    /// tests spawn `curl`, so nothing is ever recorded in it.
+    fn test_registry() -> ProcessRegistry {
+        let dir = std::env::temp_dir().join(format!(
+            "damaian-model-registry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        ProcessRegistry::open(dir).expect("scratch registry")
+    }
+
     /// Behaves like a provider connection that has accepted the request but
     /// sent nothing yet: `read` blocks. Returns EOF once `closed` flips, which
     /// is what happens to `child.stdout` after the child is killed.
@@ -1510,7 +1560,8 @@ mod tests {
     // request reaches the (nonexistent) host.
     #[test]
     fn curl_transport_does_not_send_a_request_for_an_already_cancelled_turn() {
-        let mut transport = CurlModelTransport::new("https://api.example.test/", "sk_test");
+        let mut transport =
+            CurlModelTransport::new("https://api.example.test/", "sk_test", test_registry());
         let cancel = CancelToken::new();
         cancel.cancel();
 
@@ -1532,7 +1583,8 @@ mod tests {
     // freezes the whole UI until the app is killed.
     #[test]
     fn curl_transport_bounds_connect_stall_and_total_time() {
-        let transport = CurlModelTransport::new("https://api.example.test/", "sk_test");
+        let transport =
+            CurlModelTransport::new("https://api.example.test/", "sk_test", test_registry());
         let config = transport.curl_config("{\"model\":\"test\",\"messages\":[]}");
 
         assert!(config.contains(&format!("connect-timeout = {CONNECT_TIMEOUT_SECS}")));
@@ -1546,7 +1598,8 @@ mod tests {
     #[test]
     fn curl_transport_does_not_put_api_key_in_argv() {
         let api_key = "sk_test_12345678901234567890";
-        let transport = CurlModelTransport::new("https://api.example.test/", api_key);
+        let transport =
+            CurlModelTransport::new("https://api.example.test/", api_key, test_registry());
         let args = CurlModelTransport::curl_args();
 
         assert!(!args.iter().any(|arg| arg.contains(api_key)));

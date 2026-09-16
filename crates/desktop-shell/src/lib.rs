@@ -650,7 +650,12 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .transpose()?
                 .unwrap_or_default();
             let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
-            let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
+            let transport = CurlModelTransport::new(
+                &engine.config.model_base_url,
+                api_key,
+                ProcessRegistry::open(&engine.config.data_dir)
+                    .map_err(|error| error.to_string())?,
+            );
             let mut adapter = OpenAICompatibleAdapter::with_provider(
                 &engine.config.model_provider,
                 &engine.config.model_name,
@@ -1183,7 +1188,11 @@ fn run_resume_command_request(
     }
 
     let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
-    let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
+    let transport = CurlModelTransport::new(
+        &engine.config.model_base_url,
+        api_key,
+        ProcessRegistry::open(&engine.config.data_dir).map_err(|error| error.to_string())?,
+    );
     let mut adapter = OpenAICompatibleAdapter::with_provider(
         &engine.config.model_provider,
         &engine.config.model_name,
@@ -1235,7 +1244,11 @@ fn run_resume_plan_request(
     configure_chat_integrations(&mut engine);
 
     let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
-    let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
+    let transport = CurlModelTransport::new(
+        &engine.config.model_base_url,
+        api_key,
+        ProcessRegistry::open(&engine.config.data_dir).map_err(|error| error.to_string())?,
+    );
     let mut adapter = OpenAICompatibleAdapter::with_provider(
         &engine.config.model_provider,
         &engine.config.model_name,
@@ -1317,7 +1330,11 @@ fn run_chat_request(
         .unwrap_or_default();
 
     let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
-    let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
+    let transport = CurlModelTransport::new(
+        &engine.config.model_base_url,
+        api_key,
+        ProcessRegistry::open(&engine.config.data_dir).map_err(|error| error.to_string())?,
+    );
     let mut adapter = OpenAICompatibleAdapter::with_provider(
         &engine.config.model_provider,
         &engine.config.model_name,
@@ -1364,7 +1381,11 @@ fn resume_chat_command(
 ) -> Result<ChatTurnResult, String> {
     configure_chat_integrations(engine);
     let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
-    let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
+    let transport = CurlModelTransport::new(
+        &engine.config.model_base_url,
+        api_key,
+        ProcessRegistry::open(&engine.config.data_dir).map_err(|error| error.to_string())?,
+    );
     let mut adapter = OpenAICompatibleAdapter::with_provider(
         &engine.config.model_provider,
         &engine.config.model_name,

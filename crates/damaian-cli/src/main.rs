@@ -3,9 +3,10 @@ use std::io::IsTerminal;
 use std::path::Path;
 use workspace_engine::{
     CURRENT_DATA_SCHEMA_VERSION, CommandProposal, CommandRisk, Config, ConfigOverlay, ConfigScope,
-    CurlModelTransport, DataSchemaOutcome, MockModelAdapter, OpenAICompatibleAdapter, SearchResult,
-    WorkspaceEngine, command_approval_prompt, ensure_data_dir_schema, parse_hunk_selection,
-    patch_diff_text, patch_hunk_summary, render_markdown_to_ansi,
+    CurlModelTransport, DataSchemaOutcome, MockModelAdapter, OpenAICompatibleAdapter,
+    ProcessRegistry, SearchResult, WorkspaceEngine, command_approval_prompt,
+    ensure_data_dir_schema, parse_hunk_selection, patch_diff_text, patch_hunk_summary,
+    render_markdown_to_ansi,
 };
 
 fn usage() -> &'static str {
@@ -313,7 +314,11 @@ fn run() -> workspace_engine::Result<()> {
                         engine.config.model_api_key_env
                     ))
                 })?;
-                let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
+                let transport = CurlModelTransport::new(
+                    &engine.config.model_base_url,
+                    api_key,
+                    ProcessRegistry::open(&engine.config.data_dir)?,
+                );
                 let mut adapter = OpenAICompatibleAdapter::with_provider(
                     &engine.config.model_provider,
                     &engine.config.model_name,
@@ -362,7 +367,11 @@ fn run() -> workspace_engine::Result<()> {
                         engine.config.model_api_key_env
                     ))
                 })?;
-                let transport = CurlModelTransport::new(&engine.config.model_base_url, api_key);
+                let transport = CurlModelTransport::new(
+                    &engine.config.model_base_url,
+                    api_key,
+                    ProcessRegistry::open(&engine.config.data_dir)?,
+                );
                 let mut adapter = OpenAICompatibleAdapter::with_provider(
                     &engine.config.model_provider,
                     &engine.config.model_name,
