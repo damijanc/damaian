@@ -3,9 +3,11 @@ use crate::command_policy::{CommandPolicy, CommandRisk};
 use crate::config::Config;
 use crate::error::{ClientError, Result};
 use crate::hash::{create_id, now_millis};
+use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
 use crate::secret_scanner::SecretScanner;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandExecution {
@@ -86,11 +88,33 @@ impl CommandRunner {
         }
 
         let started_at_ms = now_millis();
-        let output = Command::new(&self.config.shell)
+        // `spawn` rather than `output` so the child's pid is knowable. `output`
+        // hides it, which is the only reason spec 17 concluded a command could
+        // not be cleaned up — it orphans under `SIGKILL` like anything else.
+        // Its own group so a pipeline's members are reachable too.
+        let child = Command::new(&self.config.shell)
             .arg("-lc")
             .arg(command)
             .current_dir(cwd.as_ref())
-            .output()?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()?;
+        let mut guard = CommandGuard {
+            pid: child.id(),
+            armed: true,
+            _registration: ProcessRegistry::open(&self.config.data_dir)?.register(
+                ProcessKind::Command,
+                task_id.unwrap_or_default(),
+                child.id(),
+            )?,
+        };
+        let output = child.wait_with_output()?;
+        // Reaped, so the pid is free and its group may already be someone
+        // else's. Disarm the kill — but let the guard drop normally, because
+        // its handle is what removes the registry entry.
+        guard.armed = false;
+        drop(guard);
         let completed_at_ms = now_millis();
         let stdout = truncate_output(
             String::from_utf8_lossy(&output.stdout).as_ref(),
@@ -143,6 +167,34 @@ impl CommandRunner {
         )?;
 
         Ok(execution)
+    }
+}
+
+/// Kills the command's process group if this frame unwinds — a panic between
+/// the spawn and the reap would otherwise leave the command running with
+/// nothing waiting on it. A `SIGKILL` skips this, which is what the registry
+/// entry is for.
+///
+/// `armed` is cleared once the child is reaped. After that its pid is free and
+/// its group may belong to someone else, so killing would be exactly the
+/// widening `docs/specs/46_process_registry_and_orphan_sweep/proposal.md` §5.5
+/// forbids. The handle drops either way, so the registry entry goes on both
+/// paths.
+struct CommandGuard {
+    pid: u32,
+    armed: bool,
+    _registration: RegistrationHandle,
+}
+
+impl Drop for CommandGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: `kill` takes two integers by value and touches no memory.
+        // The group id is this child's own pid, because it was spawned with
+        // `process_group(0)`, and the child is known not to have been reaped.
+        unsafe { libc::kill(-(self.pid as libc::pid_t), libc::SIGKILL) };
     }
 }
 
@@ -245,7 +297,108 @@ fn is_docker_compose_invocation(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::append_docker_diagnostic;
+    use super::{CommandRunner, append_docker_diagnostic};
+    use crate::audit::AuditLog;
+    use crate::command_policy::CommandPolicy;
+    use crate::config::Config;
+    use crate::process_registry::ProcessRegistry;
+    use crate::secret_scanner::SecretScanner;
+    use std::path::PathBuf;
+
+    /// A runner whose data directory is a scratch path, so a test never writes
+    /// to the user's real `~/Library/Application Support/DamaianClient`.
+    fn runner_with_scratch_data_dir() -> (CommandRunner, PathBuf) {
+        let data_dir = std::env::temp_dir().join(format!(
+            "damaian-cmd-registry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("scratch data dir");
+        let config = Config {
+            data_dir: data_dir.clone(),
+            ..Config::default()
+        };
+        let scanner = SecretScanner::new(config.secret_patterns.clone());
+        let policy = CommandPolicy::new(config.clone());
+        let audit = AuditLog::new(&data_dir, false, scanner.clone());
+        (CommandRunner::new(config, policy, audit, scanner), data_dir)
+    }
+
+    /// A command that runs to completion must leave nothing behind, and the
+    /// child must be in its own group so the sweep can reach a pipeline.
+    ///
+    /// `#[ignore]`d per `AGENTS.md` because it runs a real shell command. Run
+    /// it by hand:
+    ///
+    /// ```sh
+    /// cargo test -p workspace-engine --lib -- --ignored --exact \
+    ///   command_runner::tests::a_completed_command_leaves_no_registry_entry
+    /// ```
+    #[test]
+    #[ignore]
+    fn a_completed_command_leaves_no_registry_entry() {
+        let (runner, data_dir) = runner_with_scratch_data_dir();
+        let registry = ProcessRegistry::open(&data_dir).unwrap();
+
+        let execution = runner
+            .run(
+                "echo hello",
+                &data_dir,
+                "test",
+                true,
+                Some("local_user"),
+                None,
+            )
+            .expect("the command should run");
+
+        assert_eq!(execution.exit_code, Some(0));
+        assert!(execution.stdout.contains("hello"));
+        assert!(
+            registry.entries().unwrap().is_empty(),
+            "requirement 4: a command that exited leaves no entry"
+        );
+    }
+
+    /// The child must be its own group leader, or the sweep's `kill(-pgid)`
+    /// would either miss a pipeline's members or reach outside the command.
+    ///
+    /// `#[ignore]`d per `AGENTS.md` because it runs a real shell command. Run
+    /// it by hand:
+    ///
+    /// ```sh
+    /// cargo test -p workspace-engine --lib -- --ignored --exact \
+    ///   command_runner::tests::a_command_runs_as_its_own_process_group_leader
+    /// ```
+    #[test]
+    #[ignore]
+    fn a_command_runs_as_its_own_process_group_leader() {
+        let (runner, data_dir) = runner_with_scratch_data_dir();
+
+        // `$$` is the shell's own pid; `ps` reports the group it belongs to.
+        let execution = runner
+            .run(
+                "ps -o pgid= -p $$",
+                &data_dir,
+                "test",
+                true,
+                Some("local_user"),
+                None,
+            )
+            .expect("the command should run");
+        let pgid: u32 = execution
+            .stdout
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("expected a pgid, got {:?}", execution.stdout));
+
+        assert_ne!(
+            pgid,
+            std::process::id(),
+            "the command must not share this process's group, or a sweep \
+             would signal Damaian itself"
+        );
+    }
 
     #[test]
     fn appends_diagnostic_when_docker_cli_is_missing() {
