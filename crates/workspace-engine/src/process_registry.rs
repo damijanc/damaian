@@ -349,6 +349,66 @@ impl ProcessRegistry {
     }
 }
 
+/// How long a swept process is given to act on `SIGTERM` before `SIGKILL`.
+///
+/// A swept entry is often a shell command, and a `git` or `npm` part way
+/// through writing the user's repository is worth this much delay. The
+/// escalation means "not still running after recovery" holds either way.
+const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// `SIGTERM`, then `SIGKILL` if it is still there.
+///
+/// The group is signalled only when the leader is the process whose identity
+/// the caller just matched. A group whose leader is gone may already belong to
+/// someone else, so widening past the evidence is exactly the bug `proposal.md`
+/// §1 forbids.
+fn terminate(entry: &RegisteredProcess) {
+    let target = if entry.pgid == entry.pid {
+        -(entry.pgid as libc::pid_t)
+    } else {
+        entry.pid as libc::pid_t
+    };
+    // SAFETY: `kill` takes two integers by value and touches no memory. A
+    // negative target is a process group, which is why the branch above gates
+    // it on the leader's identity having matched.
+    unsafe { libc::kill(target, libc::SIGTERM) };
+
+    let deadline = std::time::Instant::now() + TERMINATE_GRACE;
+    while std::time::Instant::now() < deadline {
+        if ProcessIdentity::of(entry.pid).is_none() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // SAFETY: as above.
+    unsafe { libc::kill(target, libc::SIGKILL) };
+}
+
+impl ProcessRegistry {
+    /// The launch-time sweep: entries whose owning instance is gone.
+    pub fn sweep(&self, audit: &AuditLog) -> Result<SweepReport> {
+        // Closures rather than `&ProcessIdentity::of` / `&mut terminate`: a
+        // function *item* has no place to borrow from, so it will not coerce
+        // to `&dyn Fn` / `&mut dyn FnMut` directly.
+        self.sweep_with(
+            audit,
+            SweepScope::CrashedOwners,
+            &|pid| ProcessIdentity::of(pid),
+            &mut |entry: &RegisteredProcess| terminate(entry),
+        )
+    }
+
+    /// The shutdown sweep: this instance's own entries.
+    pub fn sweep_own(&self, audit: &AuditLog) -> Result<SweepReport> {
+        self.sweep_with(
+            audit,
+            SweepScope::OwnProcess,
+            &|pid| ProcessIdentity::of(pid),
+            &mut |entry: &RegisteredProcess| terminate(entry),
+        )
+    }
+}
+
 /// Removes its entry when dropped, so requirement 4 holds on every path that
 /// unwinds or returns normally without a caller remembering anything.
 #[derive(Debug)]
@@ -684,6 +744,105 @@ mod tests {
         assert_eq!(report.decisions, vec![SweepDecision::Unreadable]);
         let log = std::fs::read_to_string(data_dir.join("audit").join("events.jsonl")).unwrap();
         assert!(log.contains("process_registry_entry_unreadable"));
+    }
+
+    /// The kill path against a real child: `SIGTERM` first, `SIGKILL` if it
+    /// refuses, and the group reached rather than just the leader.
+    ///
+    /// `#[ignore]`d per `AGENTS.md` because it spawns and kills real processes.
+    /// Run it by hand:
+    ///
+    /// ```sh
+    /// cargo test -p workspace-engine --lib -- --ignored --exact \
+    ///   process_registry::tests::terminating_reaches_the_whole_group
+    /// ```
+    #[test]
+    #[ignore]
+    fn terminating_reaches_the_whole_group() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let data_dir = scratch("terminate");
+        let registry = ProcessRegistry::open(&data_dir).unwrap();
+        let audit = audit_for(&data_dir);
+
+        // A shell with a background job, so the group holds three processes.
+        // A bare `kill(pid)` would leave both sleeps behind and this test
+        // would fail — which is the point of reaching the group.
+        let mut child = Command::new("/bin/sh")
+            .arg("-lc")
+            .arg("sleep 120 & sleep 120")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("child should spawn");
+        let pid = child.id();
+        let handle = registry
+            .register(ProcessKind::Command, "ses_1", pid)
+            .unwrap();
+        // The entry must outlive this instance, exactly as a crash would leave
+        // it, so the handle must not unlink on the way out.
+        std::mem::forget(handle);
+
+        // The group's members, captured before the sweep. Asserting only that
+        // the leader died would pass just as well against `kill(pid)`, which
+        // is the bug this test exists to catch.
+        let settle = Instant::now() + Duration::from_secs(5);
+        let members = loop {
+            let members = group_members(pid);
+            if members.len() >= 3 || Instant::now() > settle {
+                break members;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            members.len() >= 3,
+            "expected the shell and both sleeps in group {pid}, got {members:?}"
+        );
+
+        let report = registry.sweep_own(&audit).unwrap();
+        assert_eq!(report.killed(), 1);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let alive: Vec<u32> = members
+                .iter()
+                .copied()
+                .filter(|member| ProcessIdentity::of(*member).is_some())
+                .collect();
+            if alive.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "these group members survived the sweep: {alive:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.wait();
+    }
+
+    /// Every pid in one process group. Test-only: the sweep itself never
+    /// enumerates a group, it only signals one.
+    ///
+    /// `ps -g` is not this — on macOS it selects by session leader, not by
+    /// process-group membership — so the pgid column is read and filtered here.
+    fn group_members(pgid: u32) -> Vec<u32> {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-ax", "-o", "pid=,pgid="])
+            .output()
+            .expect("ps should run");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid = fields.next()?.parse::<u32>().ok()?;
+                let group = fields.next()?.parse::<u32>().ok()?;
+                (group == pgid).then_some(pid)
+            })
+            .collect()
     }
 
     #[test]
