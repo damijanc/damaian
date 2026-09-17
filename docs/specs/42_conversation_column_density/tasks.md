@@ -2,7 +2,7 @@
 
 **Implements:** [`proposal.md`](proposal.md) · background in [`context.md`](context.md)
 **Style reference:** [`../../UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md) · rendered at `docs/ui-style-guide.html`
-**Started:** 2026-09-04
+**Started:** 2026-09-04 — **Done:** 2026-09-06
 
 ## Progress
 
@@ -65,14 +65,14 @@ change, or you are looking at stale UI.
 
 Spec 41 named the disclosure after its only caller. Two callers now.
 
-- [ ] Rename `.command-approval-disclosure` to `.disclosure` in `style.css`,
+- [x] Rename `.command-approval-disclosure` to `.disclosure` in `style.css`,
       keeping every declaration including the `min-height: 24px` hit-target
       floor and the `[aria-expanded="true"] .disclosure-caret` rotation. Update
       the selector on the caret rotation rule to match.
-- [ ] Rename `.session-select-hidden` (`style.css:156`, used once at
+- [x] Rename `.session-select-hidden` (`style.css:156`, used once at
       `index.html:46`) to `.visually-hidden`. Same clip-rect declarations,
       general name, two callers after Task 4.
-- [ ] Add the builder to `app.js`, near the other DOM helpers:
+- [x] Add the builder to `app.js`, near the other DOM helpers:
 
 ```js
 // One disclosure implementation for every caller. Returns the trigger; the
@@ -97,17 +97,17 @@ function createDisclosure(label, panel) {
 }
 ```
 
-- [ ] Rewrite the approval card's inline disclosure construction in
+- [x] Rewrite the approval card's inline disclosure construction in
       `createCommandApprovalPreview` to call `createDisclosure("Why this command", details)`.
       Its behaviour must not change.
-- [ ] Rebuild, restart, and confirm the approval card still measures 104px
+- [x] Rebuild, restart, and confirm the approval card still measures 104px
       collapsed and 162px expanded, with the caret still rotating. Lint. Commit.
 
 ## Task 2 · Context files into the turn
 
 **Files:** `app.js`, `style.css`, `index.html`
 
-- [ ] Replace `renderContextFiles` (`app.js:3435`) with:
+- [x] Replace `renderContextFiles` (`app.js:3435`) with:
 
 ```js
 // The files a turn read, folded into that turn rather than a docked strip.
@@ -139,20 +139,20 @@ function appendContextDisclosure(body, files) {
 }
 ```
 
-- [ ] Update the three populating call sites to pass the turn's message body:
+- [x] Update the three populating call sites to pass the turn's message body:
       `app.js:4327` and `app.js:4756` (both have `assistantMessage` in scope) and
       `app.js:4654` (has `assistantMessage`). Each becomes
       `appendContextDisclosure(assistantMessage.body, payload.contextFiles || [])`.
-- [ ] Delete the two clearing calls at `app.js:581` and `app.js:4447`.
-- [ ] Delete `#chat-context` from `index.html:118`, and `.chat-context-strip`
+- [x] Delete the two clearing calls at `app.js:581` and `app.js:4447`.
+- [x] Delete `#chat-context` from `index.html:118`, and `.chat-context-strip`
       plus the old `.context-list` rule from `style.css`. Change `.conversation`'s
       `grid-template-rows` from five tracks to four.
-- [ ] Restyle `.context-file` as a quiet link rather than a button: 12px,
+- [x] Restyle `.context-file` as a quiet link rather than a button: 12px,
       `--muted`, no border or background, hover to `--ink`, and
       `direction: rtl; text-align: left` with `text-overflow: ellipsis` so a long
       path truncates from the left and keeps its filename visible. Give
       `.context-file-list` `display: grid; gap: 2px` and a top margin.
-- [ ] Verify: seven files render one row collapsed; expanding lists all seven;
+- [x] Verify: seven files render one row collapsed; expanding lists all seven;
       the strip is gone from the DOM; a zero-file turn appends nothing; clicking
       a path still calls `/api/open-vscode-file`. Lint. Commit.
 
@@ -160,18 +160,18 @@ function appendContextDisclosure(body, files) {
 
 **Files:** `index.html`, `app.js`, `style.css`
 
-- [ ] Replace the static caption at `index.html:70-73` with two elements
+- [x] Replace the static caption at `index.html:70-73` with two elements
       carrying ids — a session title and a repository line — keeping the
       existing `.eyebrow` treatment for the smaller of the two.
-- [ ] Add a `renderThreadHeader()` to `app.js` that reads the current repo and
+- [x] Add a `renderThreadHeader()` to `app.js` that reads the current repo and
       the active session's title, writes the folder basename with the full path
       as `title`, and falls back to "No repository selected" with an empty
       session line when there is no repo.
-- [ ] Call it wherever the header's inputs change: alongside the existing
+- [x] Call it wherever the header's inputs change: alongside the existing
       `$("repo-state").textContent` write (`app.js:261`), after
       `loadSessions`, after a session is selected, and after a session is
       renamed (`app.js:3671`).
-- [ ] Verify: switching project updates it, switching session updates it,
+- [x] Verify: switching project updates it, switching session updates it,
       renaming a session updates it, clearing the project shows the empty
       state, and a deep path does not widen the header or push the buttons off.
       Lint. Commit.
@@ -180,10 +180,10 @@ function appendContextDisclosure(body, files) {
 
 **Files:** `app.js`, `style.css`
 
-- [ ] In `appendChatMessage` (`app.js:2840`), change the label's class from
+- [x] In `appendChatMessage` (`app.js:2840`), change the label's class from
       `message-role` to `visually-hidden`. Keep the element and its text.
-- [ ] Delete `.message-role` and `.message.user .message-role` from `style.css`.
-- [ ] Verify with the accessibility tree, not the screenshot: the message's
+- [x] Delete `.message-role` and `.message.user .message-role` from `style.css`.
+- [x] Verify with the accessibility tree, not the screenshot: the message's
       accessible name still begins "Assistant" or "You", and the label
       contributes zero height. Lint. Commit.
 
@@ -191,11 +191,11 @@ function appendContextDisclosure(body, files) {
 
 **Files:** `index.html`, `app.js`, `style.css`
 
-- [ ] Change `#chat-prompt` to `rows="2"` and stop the base
+- [x] Change `#chat-prompt` to `rows="2"` and stop the base
       `textarea { min-height: 78px }` from applying to it — scope the base rule
       or override on the id. Do not remove the base minimum; the settings
       textareas rely on it.
-- [ ] Add to `app.js`:
+- [x] Add to `app.js`:
 
 ```js
 // Grows with content up to a cap, so a short prompt costs two rows and a long
@@ -210,10 +210,10 @@ function autoGrowPrompt() {
 }
 ```
 
-- [ ] Call it on the field's `input` event, and after each of the three places
+- [x] Call it on the field's `input` event, and after each of the three places
       that change the value without one: after send clears it (`app.js:4706`),
       after a session load, and on startup.
-- [ ] Verify: two rows at rest; grows line by line; shrinks on delete; stops at
+- [x] Verify: two rows at rest; grows line by line; shrinks on delete; stops at
       the cap and scrolls past it; returns to two rows after send; the window
       resizing does not leave it stuck at a stale cap. Lint. Commit.
 
@@ -221,14 +221,14 @@ function autoGrowPrompt() {
 
 **Files:** `docs/ui-style-guide.html`, `docs/UI_STYLE_GUIDE.md`, spec folder, `docs/specs/README.md`
 
-- [ ] Add a context-disclosure specimen to `docs/ui-style-guide.html`, both
+- [x] Add a context-disclosure specimen to `docs/ui-style-guide.html`, both
       states, and rename the disclosure specimen so it is not
       approval-specific. Confirm no class it uses is missing from the
       stylesheet, the same check spec 41 used.
-- [ ] Update the style guide: the disclosure section names `.disclosure`, and
+- [x] Update the style guide: the disclosure section names `.disclosure`, and
       the "per-turn information docked in chrome" anti-pattern gains the
       context strip as its worked example.
-- [ ] Measure the chat log at 1280×800 with the same two-message,
+- [x] Measure the chat log at 1280×800 with the same two-message,
       seven-file exchange. Record the number against the 459px baseline and the
       589px target in `proposal.md`'s status line, whether or not it is met.
-- [ ] Set the spec status and the `docs/specs/README.md` row to Done. Commit.
+- [x] Set the spec status and the `docs/specs/README.md` row to Done. Commit.

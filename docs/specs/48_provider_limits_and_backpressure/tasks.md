@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md) · background and corrections in [`context.md`](context.md)
-**Started:** yes
+**Started:** 2026-09-16 — **Done:** 2026-09-16
 
 ## Progress
 
@@ -127,7 +127,7 @@ and make the transport say so through a default trait method.
 **Interfaces:**
 - Produces: `ResponseMeta { status: Option<u16>, retry_after_secs: Option<u64> }`; `ModelTransport::last_response_meta` (default `None`/`None`); `CurlModelTransport::new(base_url, api_key, data_dir)`; a per-response `status`/`retry_after` on `MockModelTransport`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `model.rs` `mod tests`:
 
@@ -152,13 +152,13 @@ fn a_mock_can_report_a_status_and_a_retry_after() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 `cargo test -p workspace-engine --lib a_transport_with_no_metadata a_mock_can_report`
 
 Expected: FAIL to compile — `no method named last_response_meta`, no `status` field on `MockModelTransport`.
 
-- [ ] **Step 3: Add `ResponseMeta` and the default method**
+- [x] **Step 3: Add `ResponseMeta` and the default method**
 
 In `model.rs`, above `ModelTransport`:
 
@@ -183,7 +183,7 @@ Add to `ModelTransport`:
     }
 ```
 
-- [ ] **Step 4: Capture the header file in `CurlModelTransport`**
+- [x] **Step 4: Capture the header file in `CurlModelTransport`**
 
 Add `data_dir: PathBuf` to the struct and constructor. Give the transport a
 `last_meta: ResponseMeta` field (cleared to `None` before each send). In
@@ -196,18 +196,18 @@ delta-seconds and the HTTP-date form), then remove the file on every exit path.
 The header path is created under `data_dir/tmp`; create that directory once in
 the constructor.
 
-- [ ] **Step 5: Give `MockModelTransport` a status**
+- [x] **Step 5: Give `MockModelTransport` a status**
 
 Add `pub status: Option<u16>` and `pub retry_after_secs: Option<u64>` to
 `MockModelTransport`, and implement `last_response_meta` on it returning them.
 Nothing else changes: the fields default to `None`.
 
-- [ ] **Step 6: Thread `data_dir` through the eight real call sites**
+- [x] **Step 6: Thread `data_dir` through the eight real call sites**
 
 Each already has `engine.config.data_dir` or `config.data_dir` in scope. The
 three test sites inside `model.rs` use a scratch temp dir.
 
-- [ ] **Step 7: Run the tests, the full gate, then show before committing**
+- [x] **Step 7: Run the tests, the full gate, then show before committing**
 
 Suggested subject line: `Capture a model call's HTTP status and retry header`
 
@@ -226,7 +226,7 @@ removed from the prose classifier.
 **Interfaces:**
 - Produces: `ProviderRefusal` (six variants per §5.2), `ClientError::Provider(ProviderRefusal, String)`, `code()` strings `provider_rate_limited` / `provider_overloaded` / `provider_quota_exhausted` / `provider_auth_failed` / `provider_bad_request` / `provider_refused`, `ProviderRefusal::is_transient`, and a classifier `classify_refusal(meta: &ResponseMeta, raw: &str) -> Option<ProviderRefusal>`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -280,11 +280,11 @@ fn the_message_classifier_no_longer_names_rate_limits() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Expected: FAIL to compile — no `classify_refusal`, no `ProviderRefusal`.
 
-- [ ] **Step 3: Add `ProviderRefusal`, the variant, and the classifier**
+- [x] **Step 3: Add `ProviderRefusal`, the variant, and the classifier**
 
 Put `ProviderRefusal`, `classify_refusal`, and the `type`/`code`-reading body
 helper in `model.rs` (the classifier needs `extract_error_message`'s sibling
@@ -297,7 +297,7 @@ In `error.rs`, add the variant, its `code()` arms, and narrow
 `is_retryable_message` to drop `"rate limit"` and `"429"`, with a comment naming
 where rate limits are classified now.
 
-- [ ] **Step 4: Run the tests, the full gate, then show before committing**
+- [x] **Step 4: Run the tests, the full gate, then show before committing**
 
 Suggested subject line: `Classify provider refusals from status, with a typed error`
 
@@ -315,7 +315,7 @@ Fold the refusal into `stream_response`'s loop under two bounds, honouring
 - Consumes: `ResponseMeta`, `classify_refusal`, `ProviderRefusal::is_transient`.
 - Produces: the refusal retry in `stream_response` (attempts bounded at 4 beyond the first, wall-clock 90s, `Retry-After`-first then exponential-with-jitter), counted in `retry_count`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -371,11 +371,11 @@ duration is injected or the wall-clock ceiling is lowered in the test — make t
 ceiling a parameter on the adapter (`retry_wait_ceiling`) defaulting to 90s,
 and set it small in the ceiling test.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Expected: FAIL — no `sequence_with_status`, no `parse_retry_after`, refusal not retried.
 
-- [ ] **Step 3: Implement the refusal retry**
+- [x] **Step 3: Implement the refusal retry**
 
 After `send_with_retries` returns `Ok(raw)` in `stream_response`, read
 `self.transport.last_response_meta()` and `classify_refusal`. If it is
@@ -390,7 +390,7 @@ The wait is a sibling of `send_with_retries`, not a rewrite of it: the
 connection-level loop keeps its fixed 500/1500ms backoff and its
 `!emitted_any` rule.
 
-- [ ] **Step 4: Run the tests, the full gate, then show before committing**
+- [x] **Step 4: Run the tests, the full gate, then show before committing**
 
 Suggested subject line: `Retry rate-limited calls under bounds, with a stoppable wait`
 
@@ -409,7 +409,7 @@ measured zero so the refusal cannot inflate cost.
 **Interfaces:**
 - Produces: `failure_kind` on the `task_status_updated` write and read; `finish_action(marker, "refused")` + `record_task_usage(measured_zero, reason "refused")` on the refusal arm; a `read` that surfaces `failureKind` on the task state.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -427,11 +427,11 @@ fn a_task_failed_by_a_refusal_keeps_its_plan() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Expected: FAIL — no `failure_kind` written, the refusal arm books the estimate.
 
-- [ ] **Step 3: Add `failure_kind` to the status write and read**
+- [x] **Step 3: Add `failure_kind` to the status write and read**
 
 `update_task_status` gains `failure_kind: Option<&str>`, folded into the wrapped
 payload as `"failureKind":"…"` beside `"error"`. `read_task_statuses` (and the
@@ -439,7 +439,7 @@ task-state surface the shell renders) reads it back. Existing callers pass
 `None`; the refusal arm in `chat.rs` passes `"provider_rate_limited"` or
 `"provider_quota_exhausted"` per the classification.
 
-- [ ] **Step 4: Finish the marker and book the zero on the refusal arm**
+- [x] **Step 4: Finish the marker and book the zero on the refusal arm**
 
 In `chat.rs`, the refusal branch (distinct from the `Cancelled` arm and the
 generic `Err` arm) calls `finish_action(model_marker, "refused")` and
@@ -449,7 +449,7 @@ arm stays as-is for now (it is out of scope; `context.md` §3.8 records that it
 leaves the marker dangling, and that remains true for the connection-failure
 case).
 
-- [ ] **Step 5: Run the tests, the full gate, then show before committing**
+- [x] **Step 5: Run the tests, the full gate, then show before committing**
 
 Suggested subject line: `Record a provider refusal as a named failure that costs nothing`
 
@@ -466,7 +466,7 @@ message.
 - Modify: `crates/desktop-shell/src/lib.rs` (the approval-shaped decision)
 - Test: `crates/workspace-engine/tests/provider_limits.rs`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -482,14 +482,14 @@ fn a_quota_exhaustion_fails_permanently_with_the_providers_message() {
 }
 ```
 
-- [ ] **Step 2: Implement the consent gate and quota handling**
+- [x] **Step 2: Implement the consent gate and quota handling**
 
 The fallback offer is refused by default, not remembered, with no "always". The
 switch, when approved, is recorded on the task and shown in the transcript.
 `QuotaExhausted` fails with `failureKind: "provider_quota_exhausted"` and the
 provider's message verbatim, and its plan survives.
 
-- [ ] **Step 3: Run the tests, the full gate, then show before committing**
+- [x] **Step 3: Run the tests, the full gate, then show before committing**
 
 Suggested subject line: `Offer a model fallback only with explicit consent`
 
@@ -504,24 +504,24 @@ Requirement 8, §5.8, and §7.
 - Modify: `docs/USER_GUIDE.md`, `docs/TROUBLESHOOTING.md`
 - Modify: `proposal.md` §7, and its `Status:` line; `docs/specs/README.md` row
 
-- [ ] **Step 1: Audit every refusal**
+- [x] **Step 1: Audit every refusal**
 
 `AuditLog::record("provider_refusal", …)` carrying the classification and
 status — never the request body or the API key. Assert in a test that no audit
 line contains the body or the key.
 
-- [ ] **Step 2: Document**
+- [x] **Step 2: Document**
 
 `USER_GUIDE.md` gains what a rate-limit wait looks like, that it is stoppable,
 and that a fallback is always asked for. `TROUBLESHOOTING.md` gains the six
 classifications, what each means, and which are worth retrying by hand.
 
-- [ ] **Step 3: Fill §7 and close the spec**
+- [x] **Step 3: Fill §7 and close the spec**
 
 Record the §7 findings (provider 200-with-error-object behaviour, observed
 `Retry-After` honesty, whether 90s was right). Update the three summaries
 together: the `Status:` line, the `README.md` row, and this table.
 
-- [ ] **Step 4: Run the full gate, then show before committing**
+- [x] **Step 4: Run the full gate, then show before committing**
 
 Suggested subject line: `Document provider refusals and their audit trail`

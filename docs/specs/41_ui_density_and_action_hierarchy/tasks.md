@@ -2,7 +2,7 @@
 
 **Implements:** [`proposal.md`](proposal.md) · background in [`context.md`](context.md)
 **Style reference:** [`../../UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md) · rendered at `docs/ui-style-guide.html` once Task 2 lands
-**Started:** 2026-09-04
+**Started:** 2026-09-04 — **Done:** 2026-09-04
 
 ## Progress
 
@@ -365,7 +365,7 @@ Built before the cards are rebuilt, on purpose: it gives Tasks 3-5 a single scre
 - Consumes: `.btn-sm`, `.btn-primary`, `.btn-quiet`, `.btn-icon`, `button:focus-visible` from Task 1.
 - Produces: a manual verification surface used by Tasks 3, 4 and 5.
 
-- [ ] **Step 1: Confirm the stylesheet path resolves**
+- [x] **Step 1: Confirm the stylesheet path resolves**
 
 The page lives at `docs/ui-style-guide.html` and the stylesheet at `crates/desktop-shell/static/style.css`, so the relative path is `../crates/desktop-shell/static/style.css`. Verify before writing the page:
 
@@ -375,7 +375,7 @@ ls -l docs/../crates/desktop-shell/static/style.css
 
 Expected: the file listing. If this fails, the layout has changed — stop and re-derive the path.
 
-- [ ] **Step 2: Write the page**
+- [x] **Step 2: Write the page**
 
 Create `docs/ui-style-guide.html`:
 
@@ -637,7 +637,7 @@ Create `docs/ui-style-guide.html`:
 
 Note: `.command-approval-risk`, `.command-approval-disclosure`, `.disclosure-caret` and the revised `.patch-actions` do not exist yet — Tasks 3, 4 and 5 create them. Until then those specimens render unstyled. That is expected and is corrected by Step 3 of Tasks 3 and 5.
 
-- [ ] **Step 3: Open it and verify it is not a copy**
+- [x] **Step 3: Open it and verify it is not a copy**
 
 ```bash
 open docs/ui-style-guide.html
@@ -647,7 +647,7 @@ Check: the button rows render with Task 1's scale, hovering changes them, Tab sh
 
 Then prove it is loading the real stylesheet. Temporarily change `--accent` in `style.css` to `#b3261e`, reload the page, and confirm the primary buttons and focus rings turn red. **Revert the token immediately** and reload to confirm they return to green.
 
-- [ ] **Step 4: Confirm it is outside the lint surface**
+- [x] **Step 4: Confirm it is outside the lint surface**
 
 ```bash
 npm run lint:web
@@ -655,7 +655,7 @@ npm run lint:web
 
 Expected: clean, and the output does not mention `docs/ui-style-guide.html`. `biome.json` scopes `files.includes` to `crates/desktop-shell/static/**/*.{js,css}` and `scripts/**/*.mjs`. Do not add the page to that list.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/ui-style-guide.html
@@ -686,7 +686,7 @@ follows."
 
 **Do not touch** `resolveCommandProposal`, `restoreActions`, or any `addEventListener` body in this task. Their behaviour is settled by specs 10 and 12. Task 4 changes which elements `restoreActions` re-enables and nothing else.
 
-- [ ] **Step 1: Measure the baseline**
+- [x] **Step 1: Measure the baseline**
 
 With a command approval card on screen:
 
@@ -706,7 +706,7 @@ With a command approval card on screen:
 
 Expected — the bad baseline: `commandFont` is `"12px"`, `commandWrap` is `"pre"`, `commandOverflowX` is `"auto"`, `detailsVisible` is `true` (the rationale is always rendered), and `cardHeight` reflects that.
 
-- [ ] **Step 2: Restructure the card in `app.js`**
+- [x] **Step 2: Restructure the card in `app.js`**
 
 In `createCommandApprovalPreview`, replace the block from `const header = document.createElement("div");` through `actions.append(rejectButton);` with:
 
@@ -770,7 +770,7 @@ Notes on what changed and why:
 - `alwaysButton` and `browserSessionButton` are **deleted here** and rebuilt as menu items in Task 4. Between this task and that one the two grants are unreachable — that is expected, and Task 4 restores them. Do not ship Task 3 alone.
 - `details.hidden = true` uses the `hidden` property, matching the pattern elsewhere in the file.
 
-- [ ] **Step 3: Temporarily neutralise the dead references**
+- [x] **Step 3: Temporarily neutralise the dead references**
 
 `restoreActions` and `resolveCommandProposal` still reference `alwaysButton` and `browserSessionButton`, which no longer exist. Task 4 removes those references properly. To keep this task independently runnable, add immediately after the `actions.append(runButton, rejectButton);` line:
 
@@ -782,7 +782,7 @@ Notes on what changed and why:
   const browserSessionButton = document.createElement("button");
 ```
 
-- [ ] **Step 4: Update the append call**
+- [x] **Step 4: Update the append call**
 
 At the end of the function, `wrapper.append(header, command, details, actions, output);` becomes:
 
@@ -790,7 +790,7 @@ At the end of the function, `wrapper.append(header, command, details, actions, o
   wrapper.append(header, command, disclosure, details, actions, output);
 ```
 
-- [ ] **Step 5: Rewrite the card CSS**
+- [x] **Step 5: Rewrite the card CSS**
 
 Replace the `.command-approval-header span` rule with a `.command-approval-risk` rule, and update the command and actions rules. The full replacement for the block from `.command-approval-header span` through `.command-approval-actions button`:
 
@@ -875,13 +875,13 @@ Two things to be careful about. `.command-approval` is `display: grid`, so `just
 
 Also delete `min-width: 0` from the now-removed `.command-approval-actions button` rule; the buttons size to content and no longer need it.
 
-- [ ] **Step 6: Rebuild and re-measure**
+- [x] **Step 6: Rebuild and re-measure**
 
 Restart the app, get an approval on screen, and run the Step 1 expression.
 
 Expected: `commandFont` is `"11px"`, `commandWrap` is `"pre-wrap"`, `commandOverflowX` is `"visible"`, and `cardHeight` is at or under 120 for a short command with the rationale collapsed — down from the measured 161 baseline. Record the exact `cardHeight` — acceptance criterion 1 needs it, and if it exceeds 120 report the number rather than adjusting padding to hit the target.
 
-- [ ] **Step 7: Verify the disclosure and the long-command case**
+- [x] **Step 7: Verify the disclosure and the long-command case**
 
 Click "Why this command": the rationale appears, the caret rotates, `aria-expanded` flips to `"true"`. Click again: it collapses. Reject the proposal, trigger another, and confirm the new card renders collapsed.
 
@@ -900,11 +900,11 @@ Then ask the assistant to run something long, for example a `docker run` with se
 
 Expected: both scroll checks are `false`. The whole command is visible. This is acceptance criterion 3.
 
-- [ ] **Step 8: Check the specimen page caught up**
+- [x] **Step 8: Check the specimen page caught up**
 
 Reload `docs/ui-style-guide.html`. The two approval cards now render with the risk pill, the 11px wrapped command, and the disclosure row styled. The long command in the right-hand specimen wraps rather than scrolling.
 
-- [ ] **Step 9: Lint and commit**
+- [x] **Step 9: Lint and commit**
 
 ```bash
 npm run lint:web
@@ -942,7 +942,7 @@ overflow menu items in the next commit."
 
 The pattern to copy is `ensureProjectMenu` / `positionProjectMenu` / `closeProjectMenu` at `app.js:594-658`. Read those first. The reason for a `position: fixed` popover on `document.body` rather than one nested in the card is the same reason given there: approval cards live inside the scrolling `#chat-log`, and a CSS-anchored popover would detach on scroll.
 
-- [ ] **Step 1: Confirm the grants are currently unreachable**
+- [x] **Step 1: Confirm the grants are currently unreachable**
 
 With an approval card on screen that offers "always" (a repeatable project command such as a test run):
 
@@ -952,7 +952,7 @@ With an approval card on screen that offers "always" (a repeatable project comma
 
 Expected after Task 3: `["Approve", "Reject"]`. The two grants are gone. That is the gap this task closes.
 
-- [ ] **Step 2: Add the shared menu**
+- [x] **Step 2: Add the shared menu**
 
 Add after `closeProjectMenu` (around line 658):
 
@@ -1029,7 +1029,7 @@ function closeApprovalMenu() {
 }
 ```
 
-- [ ] **Step 3: Register with the existing dismissal**
+- [x] **Step 3: Register with the existing dismissal**
 
 The document click and Escape handlers at `app.js:706-708` currently read:
 
@@ -1057,7 +1057,7 @@ document.addEventListener("keydown", (event) => {
 
 If the surrounding lines differ from the above, adapt rather than overwrite — the requirement is that both close, not the exact shape.
 
-- [ ] **Step 4: Build the trigger**
+- [x] **Step 4: Build the trigger**
 
 In `createCommandApprovalPreview`, delete the two no-op stand-ins added in Task 3 Step 3, then add after `actions.append(runButton, rejectButton);`:
 
@@ -1107,7 +1107,7 @@ In `createCommandApprovalPreview`, delete the two no-op stand-ins added in Task 
 
 A blocked proposal gets no trigger at all, which is acceptance criterion 5: it cannot be approved through the menu because the menu does not exist.
 
-- [ ] **Step 5: Add the shared grant handler**
+- [x] **Step 5: Add the shared grant handler**
 
 Add immediately before `runButton.addEventListener(...)`. This replaces the two deleted listeners; their bodies were identical apart from the options and the toast.
 
@@ -1126,7 +1126,7 @@ Add immediately before `runButton.addEventListener(...)`. This replaces the two 
 
 Then delete the `alwaysButton.addEventListener(...)` and `browserSessionButton.addEventListener(...)` blocks entirely.
 
-- [ ] **Step 6: Fix `restoreActions` and the disable sweep**
+- [x] **Step 6: Fix `restoreActions` and the disable sweep**
 
 `restoreActions` currently re-enables four buttons, two of which no longer exist. Replace it with:
 
@@ -1151,7 +1151,7 @@ Everything else in `resolveCommandProposal` — the streaming, the resume parame
 
 Note the ordering hazard: `overflowButton` is declared with `let` at Step 4, which runs before these functions are *called* but after they are *defined*. That is fine because both are function declarations reading the binding at call time. Do not convert them to arrow functions assigned before Step 4's block.
 
-- [ ] **Step 7: Style the menu rows**
+- [x] **Step 7: Style the menu rows**
 
 The `.context-menu-popover` and `.context-menu-row` rules already carry the popover chrome. Add only the two-line row treatment, after the existing `.context-menu-row-danger` rule:
 
@@ -1173,7 +1173,7 @@ The `.context-menu-popover` and `.context-menu-row` rules already carry the popo
 }
 ```
 
-- [ ] **Step 8: Rebuild and verify both grants**
+- [x] **Step 8: Rebuild and verify both grants**
 
 Restart. Get an approval offering "always" and check:
 
@@ -1190,7 +1190,7 @@ Then exercise each grant for real:
 - Choose "Always allow in this project". Expected: the command runs, the toast reads `Command allowed for this project`, and the same command in a later turn no longer prompts. This is spec 10's behaviour, unchanged.
 - For a browser diagnostic proposal, choose "Allow for this session". Expected: the toast reads `Browser diagnostics allowed for this session` and later diagnostics in that session do not prompt. This is spec 12's behaviour, unchanged.
 
-- [ ] **Step 9: Verify the blocked path**
+- [x] **Step 9: Verify the blocked path**
 
 Get a blocked proposal on screen — a command the policy refuses, such as one using shell control syntax. Check:
 
@@ -1207,11 +1207,11 @@ Get a blocked proposal on screen — a command the policy refuses, such as one u
 
 Expected: `approveDisabled` is `true`, `hasOverflow` is `false`, and the risk pill reads `blocked` in the danger colour. Acceptance criterion 5.
 
-- [ ] **Step 10: Verify keyboard access**
+- [x] **Step 10: Verify keyboard access**
 
 Tab from the command into the card. Expected order: disclosure → Approve → Reject → `⋯`. Every stop shows the focus ring from Task 1. Focus must not be on Approve when the card first renders — click into the chat log and Tab in to confirm. Acceptance criterion 7, and requirement 8.
 
-- [ ] **Step 11: Lint and commit**
+- [x] **Step 11: Lint and commit**
 
 ```bash
 npm run lint:web
@@ -1250,7 +1250,7 @@ unchanged."
 
 **Read the comment at `style.css:773-780` before you start.** It explains that `min-width: 0` on `.patch-preview-header` is load-bearing: both children are `white-space: nowrap`, so without it the flex row's automatic minimum is the untruncated text width, which propagates up and forces the whole conversation column to overflow. Adding buttons to this row means the *text* group must keep `min-width: 0` and the *button* group must be `flex: 0 0 auto`. Getting this wrong reintroduces a horizontal scrollbar on the chat log.
 
-- [ ] **Step 1: Measure the baseline**
+- [x] **Step 1: Measure the baseline**
 
 Get a patch proposal on screen — ask the assistant to make a small edit to a file. Then:
 
@@ -1270,7 +1270,7 @@ Get a patch proposal on screen — ask the assistant to make a small edit to a f
 
 Expected — the bad baseline: `actionsDisplay` is `"grid"` and each button is hundreds of pixels wide, roughly half the conversation column. Note `logOverflows`; it should be `false` now and must still be `false` at the end.
 
-- [ ] **Step 2: Rebuild the header**
+- [x] **Step 2: Rebuild the header**
 
 In `createPatchPreview`, replace the block from `const header = document.createElement("div");` through `wrapper.append(header, actions, secretNotice, list);` with:
 
@@ -1324,7 +1324,7 @@ In `createPatchPreview`, replace the block from `const header = document.createE
 
 The patch id previously shown in `meta` is replaced by the file and line counts, which are more useful at a glance. It remains available in `state.patchId`.
 
-- [ ] **Step 3: Keep the count live**
+- [x] **Step 3: Keep the count live**
 
 `createPatchPreview` has a local `render()` at `app.js:3899` that redraws the diff list whenever a file or hunk checkbox changes — it is called from eight sites within the function. It currently opens:
 
@@ -1345,7 +1345,7 @@ Add the counts refresh as its first statement:
 
 One line, and every existing call site picks it up. `render()` is defined after `updateHeaderCounts` in source order but that is irrelevant — both are function declarations, so both are hoisted.
 
-- [ ] **Step 4: Update the header CSS**
+- [x] **Step 4: Update the header CSS**
 
 Replace the `.patch-preview-header strong, .patch-preview-header span` and `.patch-preview-header span` and `.patch-actions` rules with:
 
@@ -1385,19 +1385,19 @@ Replace the `.patch-preview-header strong, .patch-preview-header span` and `.pat
 
 Keep the existing `.patch-preview-header` rule and its explanatory comment exactly as they are.
 
-- [ ] **Step 5: Rebuild and re-measure**
+- [x] **Step 5: Rebuild and re-measure**
 
 Restart, get a patch proposal on screen, and run the Step 1 expression.
 
 Expected: `actionsDisplay` is `"flex"`, each button width is roughly 60-90px rather than hundreds, and `logOverflows` is still `false`.
 
-- [ ] **Step 6: Verify the count tracks selection**
+- [x] **Step 6: Verify the count tracks selection**
 
 Deselect one file's checkbox. Expected: the apply label decrements, and the `+N −N` counts drop by that file's contribution. Deselect all. Expected: the label reads `Apply 0` and the button is disabled.
 
 Re-select and apply. Expected: the patch applies exactly as before — this task changed no apply logic.
 
-- [ ] **Step 7: Verify the narrow-column case**
+- [x] **Step 7: Verify the narrow-column case**
 
 This is acceptance criterion 6. Narrow the window until the conversation column is at its 420px minimum (`.app` is `grid-template-columns: 300px minmax(420px, 1fr)`), with a patch whose summary is long. Then:
 
@@ -1418,17 +1418,17 @@ This is acceptance criterion 6. Narrow the window until the conversation column 
 
 Expected: `logOverflows` is `false`, `actionsVisible` is `true`, and `summaryEllipsised` is `true` — the summary truncates and the buttons keep their full width, which is the correct priority.
 
-- [ ] **Step 8: Check the specimen page**
+- [x] **Step 8: Check the specimen page**
 
 Reload `docs/ui-style-guide.html`. The patch header specimen renders with the actions on the right at their natural width.
 
 Note the specimen markup from Task 2 puts `<strong>` and `<span>` directly in `.patch-preview-header`. Update it to match the new structure — wrap them in `<div class="patch-preview-heading">` — so the specimen reflects what the app builds.
 
-- [ ] **Step 9: Full manual pass**
+- [x] **Step 9: Full manual pass**
 
 Acceptance criterion 9. Drive the whole surface once: approve a command, reject a command, use both overflow grants, get a blocked proposal, apply a patch, reject a patch, and toggle hunk selection. Confirm no console errors throughout.
 
-- [ ] **Step 10: Lint and commit**
+- [x] **Step 10: Lint and commit**
 
 ```bash
 npm run lint:web
@@ -1458,17 +1458,17 @@ nowrap children are what would otherwise overflow the column."
 - Modify: `proposal.md` (status line)
 - Modify: `docs/specs/README.md` (row 41)
 
-- [ ] **Step 1: Update the spec status**
+- [x] **Step 1: Update the spec status**
 
 In `proposal.md`, change the `Status:` line to `Status: Done`, followed by the measured collapsed-card height recorded in Task 3 Step 6 and any deviation from the design. Follow the style of spec 16's status line, which states what was verified and points at deviations.
 
 If the measured height exceeded the 120px in acceptance criterion 1, say so plainly with the real number and why. Do not adjust padding after the fact to hit the target — the criterion documents an expectation, and a miss is information.
 
-- [ ] **Step 2: Update the README row**
+- [x] **Step 2: Update the README row**
 
 Change row 41's `**Not started.**` to `**Done.**` and add the measured before/after height.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/specs/41_ui_density_and_action_hierarchy/proposal.md docs/specs/README.md

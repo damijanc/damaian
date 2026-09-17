@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md) · background and corrections in [`context.md`](context.md)
-**Started:** not yet
+**Started:** 2026-09-10 — **Done:** 2026-09-10; OpenAI usage reporting still unmeasured
 
 **Goal:** Record what every model call cost in tokens, per task, distinguishing a
 provider-reported figure from a local estimate, so a user can see afterwards what
@@ -127,7 +127,7 @@ it.
 **Interfaces:**
 - Produces: `UsageSource::{Measured, Estimated}`, `TokenUsage { input_tokens: u64, output_tokens: u64, source: UsageSource }`, `ModelRun.usage: TokenUsage`, `ModelRun.reported_cost: Option<f64>`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `mod tests` in `model.rs`:
 
@@ -170,13 +170,13 @@ fn a_turn_cancelled_before_the_provider_was_called_is_a_measured_zero() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p workspace-engine --lib model::tests::a_run_with_no_reported_usage_is_estimated_from_the_request_and_the_content model::tests::a_turn_cancelled_before_the_provider_was_called_is_a_measured_zero`
 
 Expected: FAIL — `no field 'usage' on type 'ModelRun'`, `cannot find type 'UsageSource'`.
 
-- [ ] **Step 3: Add the types**
+- [x] **Step 3: Add the types**
 
 In `model.rs`, above `ModelRequest`:
 
@@ -239,7 +239,7 @@ impl TokenUsage {
 }
 ```
 
-- [ ] **Step 4: Add the fields and drop the `Eq` that `f64` forbids**
+- [x] **Step 4: Add the fields and drop the `Eq` that `f64` forbids**
 
 `Option<f64>` is not `Eq`, and three structs derive it transitively. Nothing
 uses them as a map key or in a set — checked — so `PartialEq` is enough, and
@@ -260,7 +260,7 @@ In `model.rs`, change `#[derive(Debug, Clone, PartialEq, Eq)]` above
 Do the same to `pub struct ChatTurnResult` (`chat.rs:168`) and
 `pub struct EditProposalResult` (`edit.rs:29`).
 
-- [ ] **Step 5: Populate every construction site**
+- [x] **Step 5: Populate every construction site**
 
 There are three. In `ModelRun::cancelled_before_start`:
 
@@ -292,23 +292,23 @@ the accumulated stream:
             reported_cost: None,
 ```
 
-- [ ] **Step 6: Export the types**
+- [x] **Step 6: Export the types**
 
 In `crates/workspace-engine/src/lib.rs`, add `TokenUsage` and `UsageSource` to
 the existing `pub use model::{…}` list.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 Run: `cargo test -p workspace-engine --lib model::tests::a_run_with_no_reported_usage_is_estimated_from_the_request_and_the_content model::tests::a_turn_cancelled_before_the_provider_was_called_is_a_measured_zero`
 
 Expected: PASS, 2 tests.
 
-- [ ] **Step 8: Run the full quality gate**
+- [x] **Step 8: Run the full quality gate**
 
 All seven commands from `AGENTS.md`. Expect the whole workspace suite green —
 this task changes no behaviour, only adds fields.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add crates/workspace-engine/src
@@ -331,7 +331,7 @@ The whole stream body is already in `raw` (`pump_stream` accumulates it and
 `extract_tool_calls(&raw)` and `response_was_truncated(&raw)` already read it),
 so this is a sibling of those, not a change to the incremental parser.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -391,13 +391,13 @@ fn a_measured_run_carries_the_providers_figures_not_the_estimate() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p workspace-engine --lib model::tests::usage model::tests::a_reported_cost model::tests::a_stream_without_a_usage model::tests::a_measured_run`
 
 Expected: FAIL — `cannot find function 'extract_usage'`.
 
-- [ ] **Step 3: Implement the parser**
+- [x] **Step 3: Implement the parser**
 
 Next to `extract_model_tokens` in `model.rs`:
 
@@ -456,7 +456,7 @@ fn usage_payloads(raw: &str) -> Vec<String> {
 }
 ```
 
-- [ ] **Step 4: Use it in the adapter**
+- [x] **Step 4: Use it in the adapter**
 
 In `OpenAICompatibleAdapter::stream_response`, replace the `usage` and
 `reported_cost` fields added in Task 1 with:
@@ -476,14 +476,14 @@ In `OpenAICompatibleAdapter::stream_response`, replace the `usage` and
             reported_cost: extract_usage(&raw).and_then(|(_, _, cost)| cost),
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p workspace-engine --lib model::tests::usage model::tests::a_reported_cost model::tests::a_stream_without_a_usage model::tests::a_measured_run`
 
 Expected: PASS, 5 tests. The Task 1 estimate test must still pass — its stream
 carries no `usage` object.
 
-- [ ] **Step 6: Run the full quality gate, then commit**
+- [x] **Step 6: Run the full quality gate, then commit**
 
 ```bash
 git add crates/workspace-engine/src/model.rs
@@ -515,7 +515,7 @@ not as a transport failure, so the probe branches on `extract_error_message`.
 - Consumes: `extract_usage` from Task 2.
 - Produces: `ModelRequest.request_usage: bool`; `ModelProviderConfig.provider_reports_usage: bool` (default `true`); `Config::provider_reports_usage(&self) -> bool`; `MockModelTransport::sequence(Vec<String>)`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `model.rs`:
 
@@ -683,13 +683,13 @@ fn a_repository_cannot_turn_off_usage_reporting() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p workspace-engine model::tests::a_streaming_request_asks model::tests::a_non_streaming_request model::tests::a_provider_that_rejects model::tests::the_probe_happens_once model::tests::a_provider_error_that_is_not config::tests::provider_usage_reporting a_repository_cannot_turn_off`
 
 Expected: FAIL — missing field `request_usage`, no `MockModelTransport::sequence`, no `provider_reports_usage`.
 
-- [ ] **Step 3: Add the request field and emit `stream_options`**
+- [x] **Step 3: Add the request field and emit `stream_options`**
 
 In `model.rs`, add to `ModelRequest`:
 
@@ -714,7 +714,7 @@ Fix every other `ModelRequest` construction site the compiler names — `chat.rs
 self.config.provider_reports_usage(),` and each test literal with
 `request_usage: false,` unless the test is about usage.
 
-- [ ] **Step 4: Give the mock transport a sequence**
+- [x] **Step 4: Give the mock transport a sequence**
 
 In `model.rs`, add to `MockModelTransport`:
 
@@ -740,7 +740,7 @@ and in its `ModelTransport::send`/`send_stream`, take from `responses` when it
 is non-empty, advancing `next_response` but holding at the last entry, and fall
 back to `response` when it is empty so existing callers are untouched.
 
-- [ ] **Step 5: Implement the probe**
+- [x] **Step 5: Implement the probe**
 
 Add to `OpenAICompatibleAdapter`:
 
@@ -817,7 +817,7 @@ set the flag permanently. The adapter has no `AuditLog`; give
 `OpenAICompatibleAdapter` an `Option<AuditLog>` set by the constructor the
 orchestrators use, and leave it `None` for the bare `new`.
 
-- [ ] **Step 6: Add the config key**
+- [x] **Step 6: Add the config key**
 
 In `config.rs`: add `pub provider_reports_usage: bool` to `ModelProviderConfig`
 and `Option<bool>` to `ModelProviderConfigOverlay`; parse
@@ -841,11 +841,11 @@ compiler names; and add the resolver next to `supports_native_tools`
 No scope work is needed: `model_provider.*` is already rejected wholesale from
 repository scope at `config.rs:529-536`. The test in Step 1 pins that.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 Run the Step 2 command. Expected: PASS, 7 tests.
 
-- [ ] **Step 8: Run the full quality gate, then commit**
+- [x] **Step 8: Run the full quality gate, then commit**
 
 ```bash
 git add crates/workspace-engine/src crates/workspace-engine/tests
@@ -865,7 +865,7 @@ git commit -m "Ask providers for token usage, and probe once for the ones that r
 - Consumes: `TokenUsage`, `UsageSource` from Task 1.
 - Produces: `SessionStore::record_task_usage(&self, task: &Task, run_id: &str, marker_id: Option<&str>, usage: TokenUsage, reported_cost: Option<f64>, reason: Option<&str>) -> Result<()>` and `SessionStore::read_task_usage(&self, session_id: &str) -> Result<HashMap<String, TaskUsage>>`, with `pub struct TaskUsage { pub input_tokens: u64, pub output_tokens: u64, pub source: UsageSource, pub reported_cost: Option<f64>, pub run_count: u32 }`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/workspace-engine/tests/token_accounting.rs`:
 
@@ -1009,13 +1009,13 @@ fn a_usage_record_carries_no_prompt_or_file_content() {
 `crash_recovery.rs` does, and keep the `data_dir` from `temp_data_dir` in the
 fixture tuple to build it.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p workspace-engine --test token_accounting`
 
 Expected: FAIL — `no method named 'record_task_usage'`.
 
-- [ ] **Step 3: Add `TaskUsage` and the writer**
+- [x] **Step 3: Add `TaskUsage` and the writer**
 
 In `session.rs`:
 
@@ -1085,7 +1085,7 @@ pub struct TaskUsage {
     }
 ```
 
-- [ ] **Step 4: Add the reader**
+- [x] **Step 4: Add the reader**
 
 ```rust
     /// Every task's summed usage, keyed by task id. A task with no usage events
@@ -1155,7 +1155,7 @@ pub struct TaskUsage {
     }
 ```
 
-- [ ] **Step 5: Export and run the tests**
+- [x] **Step 5: Export and run the tests**
 
 Add `TaskUsage` to the `pub use session::{…}` list in `lib.rs`.
 
@@ -1163,7 +1163,7 @@ Run: `cargo test -p workspace-engine --test token_accounting`
 
 Expected: PASS, 5 tests.
 
-- [ ] **Step 6: Run the full quality gate, then commit**
+- [x] **Step 6: Run the full quality gate, then commit**
 
 ```bash
 git add crates/workspace-engine/src crates/workspace-engine/tests/token_accounting.rs
@@ -1186,7 +1186,7 @@ names: a retried call and a stopped one.
 **Interfaces:**
 - Consumes: `record_task_usage`/`read_task_usage` (Task 4), `ModelRun.usage` (Tasks 1-2).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `token_accounting.rs`, using the `foundation.rs` chat helpers as the
 model for driving a turn (`chat_turn_with_adapter` and friends — read that file
@@ -1246,14 +1246,14 @@ fn a_turn_stopped_before_the_call_records_a_measured_zero() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p workspace-engine --test token_accounting`
 
 Expected: FAIL — no usage events are written, so `usage[&task.id]` panics on a
 missing key.
 
-- [ ] **Step 3: Accumulate this round's streamed output in the chat loop**
+- [x] **Step 3: Accumulate this round's streamed output in the chat loop**
 
 Per [`context.md`](context.md) §3.3, a mid-stream stop loses the round's output
 because `pump_stream` drops its buffer and the tokens went straight to the sink.
@@ -1275,7 +1275,7 @@ and pass `&mut accumulate` to `stream_response` in place of `&mut *sink.on_token
 The borrow of `sink.on_token` ends before `finish_cancelled_turn` needs `sink`,
 so scope `accumulate` to the call itself if the borrow checker objects.
 
-- [ ] **Step 4: Record usage on each path**
+- [x] **Step 4: Record usage on each path**
 
 After `self.session_store.finish_action(model_marker, "ok")?;` (line 991):
 
@@ -1334,13 +1334,13 @@ was sent.
 In `edit.rs`, after the `stream_response` at line 310, record the run's usage
 the same way with `marker_id: None` — that call site has no action marker.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p workspace-engine --test token_accounting`
 
 Expected: PASS, 9 tests (5 from Task 4, 4 new).
 
-- [ ] **Step 6: Run the full quality gate, then commit**
+- [x] **Step 6: Run the full quality gate, then commit**
 
 Watch for existing chat tests that assert on the session log's event count or
 sequence — a new event per round moves `seq` numbers. Fix the assertions rather
@@ -1368,7 +1368,7 @@ nothing but a zero to append.
 **Interfaces:**
 - Produces: `SessionStore::start_action_with_estimate(&Task, action, reference, side_effecting, estimated_input_tokens: Option<u64>) -> Result<ActionMarker>`; `DanglingAction.estimated_input_tokens: Option<u64>`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -1410,13 +1410,13 @@ fn a_completed_call_is_not_re_billed_at_recovery() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p workspace-engine --test token_accounting recovery`
 
 Expected: FAIL — no `estimated_input_tokens` and no append at recovery.
 
-- [ ] **Step 3: Carry the pre-call estimate on the marker**
+- [x] **Step 3: Carry the pre-call estimate on the marker**
 
 In `session.rs`, add the optional field to the `action_started` payload and to
 `DanglingAction`:
@@ -1437,7 +1437,7 @@ In `chat.rs`, replace the `start_action` at line 957 with
 `start_action_with_estimate(&task, "model_call", &self.config.model_name, false,
 Some(model_request_json(&request).len().div_ceil(4) as u64))`.
 
-- [ ] **Step 4: Append the lost call's usage at classification**
+- [x] **Step 4: Append the lost call's usage at classification**
 
 In `recovery.rs`'s `classify_session`, after the dangling actions are read and
 before the loop over statuses, for each dangling `model_call`:
@@ -1484,14 +1484,14 @@ event, and `record_task_usage_for_task_id`, the by-id sibling of
 `record_task_usage` — recovery has a task id, not a `Task`. Add `marker_id` to
 `DanglingAction` at the same time; it is parsed already and simply not kept.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p workspace-engine --test token_accounting --test crash_recovery`
 
 Expected: PASS. `crash_recovery.rs` must stay green — the new field is
 additive and its tests pass `None`.
 
-- [ ] **Step 6: Run the full quality gate, then commit**
+- [x] **Step 6: Run the full quality gate, then commit**
 
 ```bash
 git add crates/workspace-engine/src crates/workspace-engine/tests
@@ -1515,7 +1515,7 @@ not exist yet — it is spec 23 §5.7, Not started ([`context.md`](context.md)
 **Interfaces:**
 - Consumes: `read_task_usage` (Task 4).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In the desktop-shell test module, following the existing endpoint tests:
 
@@ -1542,13 +1542,13 @@ fn a_task_with_no_usage_reports_none_rather_than_zero() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p desktop-shell the_session_payload_carries_each_tasks_usage a_task_with_no_usage_reports_none`
 
 Expected: FAIL — the payload has no usage fields.
 
-- [ ] **Step 3: Widen the session payload**
+- [x] **Step 3: Widen the session payload**
 
 In `lib.rs`'s `GET /api/session` arm (line 445), read usage alongside statuses:
 
@@ -1604,7 +1604,7 @@ fn task_states_json(
 Do the same for the turn response in `chat_result_json` so a just-finished turn
 shows its figure without a reload.
 
-- [ ] **Step 4: Render it**
+- [x] **Step 4: Render it**
 
 In `app.js`, add next to `markMessageStopped` (line 3812), reusing the existing
 `.turn-indicator` pattern rather than inventing a style:
@@ -1647,7 +1647,7 @@ Add `[data-state="usage"]` to the `.turn-indicator` rules in the stylesheet,
 using the muted metadata treatment from `docs/UI_STYLE_GUIDE.md` rather than a
 new colour.
 
-- [ ] **Step 5: Verify in the running app**
+- [x] **Step 5: Verify in the running app**
 
 Static assets are `include_str!`-embedded, so a rebuild and restart is required
 before the browser sees a change. Rebuild, restart, open a session that has a
@@ -1655,13 +1655,13 @@ completed turn, and confirm the line renders and reads correctly. Never
 `pkill -f damaian-desktop-shell` — the user's own app shares the binary name;
 kill by PID.
 
-- [ ] **Step 6: Run the tests and the full quality gate**
+- [x] **Step 6: Run the tests and the full quality gate**
 
 Run: `cargo test -p desktop-shell` and then all seven gate commands.
 `node --check crates/desktop-shell/static/app.js` and `npm run lint:web` are the
 two this task can break.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/desktop-shell
@@ -1683,7 +1683,7 @@ Optional, opt-in, and never attributed to the provider. Without rates, cost is
 **Interfaces:**
 - Produces: `ModelProviderConfig::{price_per_million_input_tokens, price_per_million_output_tokens}: Option<f64>`; `Config::estimated_cost(&self, usage: &TokenUsage) -> Option<f64>`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -1725,7 +1725,7 @@ fn a_computed_cost_is_never_recorded_as_a_provider_reported_one() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail, then implement**
+- [x] **Step 2: Run to verify they fail, then implement**
 
 Add the two `Option<f64>` fields to `ModelProviderConfig` and its overlay, parse
 them in `set_model_provider_config` with a new `parse_price` helper that rejects
@@ -1754,7 +1754,7 @@ Surface it in the shell as a separate field from `reportedCost` — name it
 `estimatedCost` — and render it with "estimated, your rates" rather than as a
 bare figure. `reportedCost` stays reserved for what the provider said.
 
-- [ ] **Step 3: Run the tests, the full quality gate, then commit**
+- [x] **Step 3: Run the tests, the full quality gate, then commit**
 
 ```bash
 git add crates/workspace-engine crates/desktop-shell
@@ -1774,7 +1774,7 @@ git commit -m "Let a user price their own tokens without shipping a price table"
 **Interfaces:**
 - Consumes: `read_task_usage` (Task 4).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `crates/eval-harness/tests/harness.rs`:
 
@@ -1794,13 +1794,13 @@ fn a_deterministic_run_reports_the_token_figures_the_session_recorded() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p eval-harness a_deterministic_run_reports_the_token_figures`
 
 Expected: FAIL — `tokens.input` is hardcoded to 0 at `runner.rs:427`.
 
-- [ ] **Step 3: Read the recorded usage**
+- [x] **Step 3: Read the recorded usage**
 
 Replace the hardcoded block in `runner.rs`:
 
@@ -1823,7 +1823,7 @@ Replace the hardcoded block in `runner.rs`:
 Update the `Tokens.measured` doc comment, which currently says `ModelRun`
 carries no usage fields — it does now.
 
-- [ ] **Step 4: Update spec 18**
+- [x] **Step 4: Update spec 18**
 
 In `docs/specs/18_local_evaluation_harness/proposal.md` §5.6, the token row says
 the figures come from spec 19 and are "Zero and `measured: false` in the
@@ -1831,7 +1831,7 @@ deterministic tier". Correct it: they are now non-zero estimates in the
 deterministic tier, and `measured: true` only against a provider that reports
 usage. Note in that spec's §7 that the row is no longer `notApplicable`.
 
-- [ ] **Step 5: Regenerate the baseline — and stop for review**
+- [x] **Step 5: Regenerate the baseline — and stop for review**
 
 ```bash
 cargo run -q -p eval-harness --bin damaian-eval -- --tier deterministic --format json > evals/baseline.json
@@ -1842,7 +1842,7 @@ that the first generated baseline leaked the seeded credential and was rejected.
 Read the new file metric by metric before committing it, and grep it for
 `AKIAIOSFODNN7EXAMPLE`. Commit the baseline on its own, after the review.
 
-- [ ] **Step 6: Run the full quality gate, then commit**
+- [x] **Step 6: Run the full quality gate, then commit**
 
 ```bash
 git add crates/eval-harness docs/specs/18_local_evaluation_harness/proposal.md
@@ -1864,7 +1864,7 @@ git commit -m "Rebaseline the eval metrics now that token figures are measured"
 - Modify: `docs/specs/19_token_and_cost_accounting/proposal.md`
 - Modify: `docs/specs/README.md`
 
-- [ ] **Step 1: User guide**
+- [x] **Step 1: User guide**
 
 Add a section on where to see what a turn used, what "estimated" means and why
 a figure may be estimated (no provider report, a stopped turn, a lost call), and
@@ -1872,13 +1872,13 @@ how to set `price_per_million_input_tokens` / `price_per_million_output_tokens`
 for a cost figure — stating plainly that the figure is the user's own arithmetic
 and not a bill.
 
-- [ ] **Step 2: Troubleshooting**
+- [x] **Step 2: Troubleshooting**
 
 Add: why usage may be missing for a provider, what the `stream_options` probe
 does and what the `model_usage_reporting_unsupported` audit event means, and how
 to set `model_provider.<id>.provider_reports_usage=false` permanently.
 
-- [ ] **Step 3: Fill in §7 of the proposal**
+- [x] **Step 3: Fill in §7 of the proposal**
 
 The proposal's §7 asks for two things by name, and both are measurements rather
 than prose:
@@ -1893,14 +1893,14 @@ than prose:
 This needs credentials and a real provider. It is also exactly what spec 18 §7's
 open item needs, so do both in one session.
 
-- [ ] **Step 4: Close the spec**
+- [x] **Step 4: Close the spec**
 
 Set the proposal's `Status:` line to `Done` with the measured figures, fill in
 this file's progress table with what each task actually found, and update the
 row for #19 in `docs/specs/README.md` — including that it is now a folder spec,
 and that spec 18's token rows are no longer `notApplicable`.
 
-- [ ] **Step 5: Run the full quality gate, then commit**
+- [x] **Step 5: Run the full quality gate, then commit**
 
 ```bash
 git add docs

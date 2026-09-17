@@ -37,11 +37,12 @@ spec carries a `Status:` line. Read the relevant spec before changing behaviour
 it covers, and update the spec when you change the design — not just the code.
 `docs/specs/README.md` lists them in implementation order.
 
-**A spec is summarised in three places, and they move together.** Its own
+**A spec is summarised in four places, and they move together.** Its own
 `Status:` line, its row in `docs/specs/README.md`, and — for a folder spec — the
-progress table in its `tasks.md`. When you change what a spec says or what is
-true of it, update all three in the same change. Leaving one behind is the
-easiest way to make this directory lie.
+progress table in its `tasks.md` and that file's `**Started:** … — **Done:** …`
+header. When you change what a spec says or what is true of it, update all four
+in the same change. Leaving one behind is the easiest way to make this directory
+lie.
 
 The reason is measured, not theoretical. On 2026-09-15 three such summaries were
 found asserting the **opposite** of what their own specs recorded: the index
@@ -51,6 +52,30 @@ after both had been done and written up in those specs' §7. The proposals were
 correct the whole time; only the summaries around them were not. The index is
 where a reader starts, so a stale row is not a cosmetic problem — it is work
 someone repeats.
+
+### Closing out a task in a folder spec
+
+A folder spec's `tasks.md` tracks each task as a list of `- [ ]` steps. **Tick
+the box the moment the step lands, not at the end of the task**, and when the
+task is finished do all three of these before moving to the next one:
+
+1. **Tick every remaining box in that task.** An unticked box is a claim that the
+   step was never done, and the next person will redo it or, worse, trust it.
+2. **Fill in the task's row in the Progress table** — what actually landed, the
+   test count, and any deviation from the plan. That row is the record; the
+   checkboxes only say how far the work got.
+3. **Set the header.** `**Started:** YYYY-MM-DD` when you begin the first task,
+   and `— **Done:** YYYY-MM-DD` when the last one lands. Never leave it as
+   `not yet` or `yes` once work has started: a date is checkable and a word is
+   not.
+
+This one is measured too. On 2026-09-17 a survey of all 56 specs found **446
+unticked boxes across nine plans that were fully Done** — spec 46 had all 73
+unticked on the day it shipped — and four headers still reading `not yet` or
+`yes`, one of them for work finished ten days earlier. Every Progress table
+was accurate, so the checkboxes were a second tracker saying the opposite of
+the first. They were ticked retroactively from the Progress tables, which is
+reconstruction, not a record: do it as you go instead.
 
 The two root documents `ai_coding_assistant_specification.md` and
 `ai_coding_assistant_must_have.md` are the original product spec. Treat them as

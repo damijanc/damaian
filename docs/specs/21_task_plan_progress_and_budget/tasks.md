@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md) · background and corrections in [`context.md`](context.md)
-**Started:** not yet
+**Started:** 2026-09-11 — **Done:** 2026-09-14
 
 **Goal:** Give a turn an ordered plan whose steps are marked complete by
 evidence the engine observed rather than by the model's say-so, persist it in
@@ -118,7 +118,7 @@ fixes spec 18's `tool_and_model_error_rate`, which reads 0.000 by construction.
   `conflict`, `awaiting_approval`, `awaiting_review`, and, for a command, an
   `exitCode` field on the event. Tasks 4 and 5 read both.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `crates/workspace-engine/tests/crash_recovery.rs`:
 
@@ -167,12 +167,12 @@ Write `read_action_outcomes` as a test helper in the same file that reads the
 session log and returns `(outcome, exitCode)` per `action_finished` event, in
 log order.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p workspace-engine --test crash_recovery a_command_ -- --nocapture`
 Expected: FAIL, `no method named finish_command_action`.
 
-- [ ] **Step 3: Add `finish_command_action` to `SessionStore`**
+- [x] **Step 3: Add `finish_command_action` to `SessionStore`**
 
 In `crates/workspace-engine/src/session.rs`, beside `finish_action`:
 
@@ -218,18 +218,18 @@ pub fn finish_command_action(
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p workspace-engine --test crash_recovery a_command_`
 Expected: PASS.
 
-- [ ] **Step 5: Mutation-test the `None` arm**
+- [x] **Step 5: Mutation-test the `None` arm**
 
 Change `None => "unknown"` to `None => "ok"`. Run the tests. The second test
 must fail. Restore the line. A test that does not fail here is not testing the
 failure mode the spec names.
 
-- [ ] **Step 6: Route the command arm through it**
+- [x] **Step 6: Route the command arm through it**
 
 In `crates/workspace-engine/src/chat.rs`, the `ToolAction::Command` arm holds
 `record.execution` one statement before the shared `finish_action`. Carry the
@@ -258,7 +258,7 @@ and finish the marker once, after the block, on that value. Set
 `ActionOutcome::Failed` in the MCP arm when `result.is_error` or the call
 returned `Err`, and in the web-diagnostic arm when `browser_tool_result_failed`.
 
-- [ ] **Step 7: Assert the eval harness now sees a non-zero error rate**
+- [x] **Step 7: Assert the eval harness now sees a non-zero error rate**
 
 In `crates/eval-harness/tests/harness.rs`, extend
 `the_error_rate_counts_failures_and_not_outcomes_awaiting_a_human` with a case
@@ -266,7 +266,7 @@ whose scenario runs a failing command and assert the rate is above zero. Before
 this task the metric could not move; the test that proves it now can is the
 point.
 
-- [ ] **Step 8: Run the full gate, then ask before committing**
+- [x] **Step 8: Run the full gate, then ask before committing**
 
 Run all seven commands from `AGENTS.md`. Proposed message:
 `Record what a tool reported, not just that it was dispatched`
@@ -312,7 +312,7 @@ coincidence, and it is worth not "simplifying" away.
 - Produces: `StepStatus`, `PlanStep`, `TaskPlan`, `Evidence` — every later task
   depends on these names and shapes.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 use workspace_engine::plan::{Evidence, PlanStep, StepStatus, TaskPlan};
@@ -355,12 +355,12 @@ fn only_one_step_may_be_in_progress() {
 Write `step(id, status)` as a test helper building a `PlanStep` with empty
 everything else.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo test -p workspace-engine --test plan`
 Expected: FAIL, `unresolved import workspace_engine::plan`.
 
-- [ ] **Step 3: Write `plan.rs`**
+- [x] **Step 3: Write `plan.rs`**
 
 ```rust
 //! The plan a turn works through, and the evidence that says a step is done.
@@ -474,12 +474,12 @@ Add `pub mod plan;` to `crates/workspace-engine/src/lib.rs` and re-export
 `Evidence`, `PlanStep`, `StepStatus`, `TaskPlan` beside the other `pub use`
 lines.
 
-- [ ] **Step 4: Run it to verify it passes**
+- [x] **Step 4: Run it to verify it passes**
 
 Run: `cargo test -p workspace-engine --test plan`
 Expected: PASS.
 
-- [ ] **Step 5: Run the full gate, then ask before committing**
+- [x] **Step 5: Run the full gate, then ask before committing**
 
 Proposed message: `Add the plan and evidence types a turn works through`
 
@@ -524,7 +524,7 @@ sees.
   `SessionStore::update_plan_step(&Task, &PlanStep)`,
   `SessionStore::read_task_plan(session_id, task_id) -> Result<Option<TaskPlan>>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -593,12 +593,12 @@ fn a_torn_final_line_does_not_discard_the_plan_before_it() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p workspace-engine --test plan`
 Expected: FAIL, `no method named create_plan`.
 
-- [ ] **Step 3: Implement the three methods**
+- [x] **Step 3: Implement the three methods**
 
 In `session.rs`, following `read_task_statuses`'s shape:
 
@@ -686,17 +686,17 @@ A step id the plan does not contain is ignored rather than appended: a plan's
 step list is set by `plan_created` and `plan_revised`, and letting an update
 introduce a step would let the log grow a plan nobody wrote.
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p workspace-engine --test plan`
 Expected: PASS.
 
-- [ ] **Step 5: Mutation-test the task filter**
+- [x] **Step 5: Mutation-test the task filter**
 
 Delete the `created.task_id == task_id` guard. The second test must fail.
 Restore it.
 
-- [ ] **Step 6: Run the full gate, then ask before committing**
+- [x] **Step 6: Run the full gate, then ask before committing**
 
 Proposed message: `Persist a turn's plan in the session log and replay it back`
 
@@ -749,7 +749,7 @@ back to the task it came from, and the carry-over would silently do nothing.
   in `chat.rs`, and evidence attached to the in-progress step when an arm
   completes.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -801,12 +801,12 @@ fn a_command_with_no_exit_code_still_produces_evidence() {
 inside `chat.rs`. Prefer the latter — it is a unit of `chat.rs`, not of the
 public API.
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p workspace-engine evidence`
 Expected: FAIL, `cannot find function evidence_for`.
 
-- [ ] **Step 3: Implement `evidence_for` and wire the arms**
+- [x] **Step 3: Implement `evidence_for` and wire the arms**
 
 ```rust
 /// The evidence an arm's outcome supports, or `None` where the engine observed
@@ -839,12 +839,12 @@ In `edit.rs`, the apply path already computes `applied_hash` per file; attach an
 written. `applied_hash`, not `new_hash` — a partial-hunk accept writes content
 that differs from the proposal.
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p workspace-engine evidence`
 Expected: PASS.
 
-- [ ] **Step 5: Run the full gate, then ask before committing**
+- [x] **Step 5: Run the full gate, then ask before committing**
 
 Proposed message: `Attach evidence to a step from what the tool arm observed`
 
@@ -906,7 +906,7 @@ exist during a turn, and every later task that reads one depends on it.
 - Produces: a plan created during a non-trivial turn, with exactly one step
   `InProgress` at a time and evidence attached as each completes.
 
-- [ ] **Step 1: Decide the triviality rule, and write its test first**
+- [x] **Step 1: Decide the triviality rule, and write its test first**
 
 §5.1 defines non-trivial as "will propose a patch, run a mutating command, or
 has more than one step in the model's own proposal". The first two are only
@@ -918,7 +918,7 @@ without guessing. Assert both directions: a single-question turn produces
 Record the rule actually used in proposal §7, which asks for it by name along
 with how often it produced a plan for a turn that did not need one.
 
-- [ ] **Step 2: Assert the single-in-progress invariant against a real turn**
+- [x] **Step 2: Assert the single-in-progress invariant against a real turn**
 
 `TaskPlan::violates_single_in_progress` exists and is unit-tested against
 hand-built plans. Requirement 2 is about *runs*, so drive a multi-step turn and
@@ -926,20 +926,20 @@ assert the replayed plan never violates it — checking after each
 `update_plan_step`, not only at the end, since a transient double would be
 exactly the bug and invisible at the terminus.
 
-- [ ] **Step 3: Attach evidence as each step completes**
+- [x] **Step 3: Attach evidence as each step completes**
 
 Push `evidence_for(&action_outcome, marker_id)` onto the in-progress step and
 persist with `update_plan_step`. In `edit.rs`, attach the
 `Evidence::PatchApplied` built from `result.applied` — the construction Task 4
 deliberately did not leave behind as dead code.
 
-- [ ] **Step 4: Set the step's status with `status_from_evidence`, never directly**
+- [x] **Step 4: Set the step's status with `status_from_evidence`, never directly**
 
 The model never writes a step status (§5.3). Assert it: a turn whose model
 output claims completion while its command exited non-zero must leave the step
 `Blocked`.
 
-- [ ] **Step 5: Run the full gate, then ask before committing**
+- [x] **Step 5: Run the full gate, then ask before committing**
 
 Proposed message: `Give a non-trivial turn a plan and advance it as work lands`
 
@@ -1026,7 +1026,7 @@ hold an open step, and Task 6's phase derivation must not read that as
 - Produces: `fn status_from_evidence(evidence: &[Evidence]) -> StepStatus`, and
   `PlanStep::is_unverified()`.
 
-- [ ] **Step 1: Write the failing test, one case per table row**
+- [x] **Step 1: Write the failing test, one case per table row**
 
 ```rust
 #[test]
@@ -1079,12 +1079,12 @@ fn a_step_with_evidence_is_not_unverified() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p workspace-engine --test plan status_from_evidence`
 Expected: FAIL, `cannot find function status_from_evidence`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 /// Requirement 6's rule, mechanically. The model does not appear in this
@@ -1125,18 +1125,18 @@ impl PlanStep {
 }
 ```
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p workspace-engine --test plan`
 Expected: PASS.
 
-- [ ] **Step 5: Mutation-test the `None` arm**
+- [x] **Step 5: Mutation-test the `None` arm**
 
 Change `*exit_code != Some(0)` to `matches!(exit_code, Some(code) if *code != 0)`
 — which is the plausible wrong version, treating `None` as fine.
 `an_absent_exit_code_blocks_the_step` must fail. Restore.
 
-- [ ] **Step 6: Run the full gate, then ask before committing**
+- [x] **Step 6: Run the full gate, then ask before committing**
 
 Proposed message: `Decide a step's status from its evidence rather than a claim`
 
@@ -1175,7 +1175,7 @@ deciding here whether it blocks a step. That is the deferral from
 **Interfaces:**
 - Produces: `TaskPhase` and `TaskPlan::phase() -> TaskPhase`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -1202,11 +1202,11 @@ fn a_blocked_step_keeps_the_plan_out_of_complete() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Expected: FAIL, `cannot find type TaskPhase`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 /// What the work is about, distinct from `PhaseKind`, which says which stage
@@ -1229,7 +1229,7 @@ Derive it from the steps: `Complete` only when every step is `Completed` or
 phase from its evidence kinds and its position — record the exact rule chosen in
 proposal §7, since §7 asks for it.
 
-- [ ] **Step 4: Run to verify it passes, then run the full gate and ask**
+- [x] **Step 4: Run to verify it passes, then run the full gate and ask**
 
 Proposed message: `Derive the task phase from step state so it cannot contradict it`
 
@@ -1289,7 +1289,7 @@ and the phase must not round that up to `Complete`.
 - Produces: `TaskStatus::TokenBudgetExhausted`, terminal, no side effect in
   flight.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -1326,11 +1326,11 @@ fn every_terminal_status_records_a_completion_time() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Expected: FAIL, `no variant named TokenBudgetExhausted`.
 
-- [ ] **Step 3: Add the variant**
+- [x] **Step 3: Add the variant**
 
 Add to the enum, `all()`, `as_str()` (`"token_budget_exhausted"`), and
 `is_terminal()`. Leave it out of `may_have_side_effect_in_flight` — the stop
@@ -1339,13 +1339,13 @@ happens before a call, so nothing is in flight.
 Then replace `update_task_status`'s hand-written `matches!` with
 `updated.status.is_terminal()`, so the two can never disagree again.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p workspace-engine`
 Expected: PASS. The spec-17 state tests that enumerate `all()` will also need
 the new variant classified; that is the mechanism working as designed.
 
-- [ ] **Step 5: Run the full gate, then ask before committing**
+- [x] **Step 5: Run the full gate, then ask before committing**
 
 Proposed message: `Tell a turn stopped for tokens from one stopped for rounds`
 
@@ -1397,7 +1397,7 @@ task exists to create stops at the engine boundary.
 **Interfaces:**
 - Produces: `Config::agent_max_task_tokens: Option<u64>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -1444,7 +1444,7 @@ fn an_unset_ceiling_survives_a_round_trip_through_config_show() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail, then implement**
+- [x] **Step 2: Run to verify they fail, then implement**
 
 Eight touch points (§3.8): the `Config` field, the `ConfigOverlay` field, the
 exhaustive destructure in `apply_overlay_scoped`, the apply site, the key parser
@@ -1496,7 +1496,7 @@ fn restrict_only_ceiling(
 Parse with a minimum: a ceiling of zero stops every turn before its first call,
 which is indistinguishable from Damaian being broken. Reject below 1000.
 
-- [ ] **Step 3: Run to verify they pass, run the full gate, then ask**
+- [x] **Step 3: Run to verify they pass, run the full gate, then ask**
 
 Proposed message: `Add a per-task token ceiling a repository may lower but not raise`
 
@@ -1559,7 +1559,7 @@ nothing.
 - Consumes: `Config::agent_max_task_tokens`, `SessionStore::read_task_usage`,
   `TaskStatus::TokenBudgetExhausted`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -1604,7 +1604,7 @@ fn the_stop_reports_the_remaining_steps_and_the_usage_consumed() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail, then implement**
+- [x] **Step 2: Run to verify they fail, then implement**
 
 At the **top of the loop**, beside the existing cancellation check and before
 the `ModelRequest` is built:
@@ -1646,16 +1646,16 @@ the audit status string would then have to pick between arbitrarily.
 Write `token_budget_exhausted_response` beside `tool_budget_exhausted_response`,
 naming the ceiling, the spend, and the steps still `Pending`.
 
-- [ ] **Step 3: Run to verify they pass**
+- [x] **Step 3: Run to verify they pass**
 
-- [ ] **Step 4: Mutation-test the stop position**
+- [x] **Step 4: Mutation-test the stop position**
 
 Move the check to the bottom of the loop. `a_turn_stops_before_the_call_that_would_cross_the_ceiling`
 must fail on the call count while the status assertion still passes — which is
 the whole reason that test counts calls rather than only reading the status.
 Restore.
 
-- [ ] **Step 5: Run the full gate, then ask before committing**
+- [x] **Step 5: Run the full gate, then ask before committing**
 
 Proposed message: `Stop a turn before the call that would cross its token ceiling`
 
@@ -1722,7 +1722,7 @@ turn that genuinely ran away — opposite problems with opposite fixes.
 **Interfaces:**
 - Produces: `plan_resumed` event; `SessionStore::resume_plan(&Task, from_task_id)`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -1754,13 +1754,13 @@ fn a_resumed_turn_recovers_the_plan_of_the_task_it_resumes() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails, then implement**
+- [x] **Step 2: Run to verify it fails, then implement**
 
 `resume_plan` reads the source task's plan, rewrites `task_id` to the new task,
 and appends it as `plan_created` with a `resumedFrom` field naming the source.
 Both plans stay in the log; neither is rewritten.
 
-- [ ] **Step 3: Run to verify it passes, run the full gate, then ask**
+- [x] **Step 3: Run to verify it passes, run the full gate, then ask**
 
 Proposed message: `Carry a plan forward when a stopped turn is resumed`
 
@@ -1824,7 +1824,7 @@ command behind it would have come out `Completed`.
   command approval.
 - Produces: `plan_revised` event; a plan proposal in `ChatTurnResult`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -1865,7 +1865,7 @@ fn a_revision_keeps_the_original_plan_in_the_log() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail, then implement**
+- [x] **Step 2: Run to verify they fail, then implement**
 
 Reuse the `PendingChatTurn` shape: the plan gate is the same pause — persist the
 turn state keyed by a proposal id, hand the user a proposal, resume on the
@@ -1875,7 +1875,7 @@ Gate only on the **first mutating** step, per §5.5: a plan whose steps are all
 read-only needs no approval, and asking for one would make the gate noise the
 user learns to click through.
 
-- [ ] **Step 3: Run to verify they pass, run the full gate, then ask**
+- [x] **Step 3: Run to verify they pass, run the full gate, then ask**
 
 Proposed message: `Show a plan for approval before the first mutating step`
 
@@ -1961,13 +1961,13 @@ wiring, so it waits for the task that renders the panel.
 - Consumes: `TaskPlan` over a new `plan` SSE event, alongside the existing
   `phase` event.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 A shell test asserting the `plan` SSE event carries steps with status and
 evidence, and that a plan with two `in_progress` steps renders the violation
 visibly rather than silently picking one.
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 Extend `TurnProgress` with `Plan(TaskPlan)`, map it in `turn_progress_event`,
 add the `plan` case to `write_sse_event`, and add a `plan(payload)` handler in
@@ -1986,12 +1986,12 @@ The completion report distinguishes four outcomes per step — verified complete
 completed unverified, blocked, skipped — and the summary line never says
 "complete" for a plan with a blocked step.
 
-- [ ] **Step 3: Verify in the running app**
+- [x] **Step 3: Verify in the running app**
 
 Static assets are `include_str!`-embedded: rebuild and restart before checking,
 or you will be looking at the previous build. Kill by PID, never by name.
 
-- [ ] **Step 4: Run the full gate, then ask before committing**
+- [x] **Step 4: Run the full gate, then ask before committing**
 
 `node --check crates/desktop-shell/static/app.js` is in the gate and is the one
 that gets missed after an `app.js` edit.
@@ -2081,7 +2081,7 @@ settled rows, the token-stop row, and the reload join.
 - Modify: `docs/USER_GUIDE.md`, `docs/TROUBLESHOOTING.md`
 - Modify: `docs/specs/21_task_plan_progress_and_budget/proposal.md` (§7)
 
-- [ ] **Step 1: Add plan metrics to the harness**
+- [x] **Step 1: Add plan metrics to the harness**
 
 Steps planned, steps completed, steps completed unverified, steps blocked.
 Follow spec 18 requirement 5: every metric carries a value or an explicit
@@ -2093,7 +2093,7 @@ This is the acceptance criterion restated from spec 23 (§3.6): a plan runs end
 to end through to a completion report inside the harness, which is Done and
 runs in CI.
 
-- [ ] **Step 2: Write the user guide section**
+- [x] **Step 2: Write the user guide section**
 
 What a plan is, when one appears, how to adjust it, what "completed unverified"
 means and why Damaian says it rather than hiding it, and how to set a ceiling.
@@ -2102,13 +2102,13 @@ Say plainly that the ceiling is **per turn**, not per session or per task in the
 colloquial sense (§3.1) — a reader who assumes otherwise will set a ceiling that
 does not do what they meant, and finding that out from a bill is the wrong way.
 
-- [ ] **Step 3: Write the troubleshooting section**
+- [x] **Step 3: Write the troubleshooting section**
 
 Where plan events are in the session log, how to read step evidence, and the
 difference between `tool_budget_exhausted` and `token_budget_exhausted` — one
 means the work needed more rounds, the other that it needed more money.
 
-- [ ] **Step 4: Fill in proposal §7**
+- [x] **Step 4: Fill in proposal §7**
 
 It asks for three things by name: the mechanical rule actually used to decide a
 turn is non-trivial and how often it produced an unnecessary plan; the default
@@ -2118,12 +2118,12 @@ evidence model is missing a source, not that the work is unobservable.
 
 Record the phase-derivation rule from Task 6 here too.
 
-- [ ] **Step 5: Update the status line and the specs README**
+- [x] **Step 5: Update the status line and the specs README**
 
 Set the proposal's `Status:` to what is actually true, and update
 `docs/specs/README.md` row 21.
 
-- [ ] **Step 6: Run the full gate, then ask before committing**
+- [x] **Step 6: Run the full gate, then ask before committing**
 
 Proposed message: `Measure plans in the harness and document what a plan means`
 

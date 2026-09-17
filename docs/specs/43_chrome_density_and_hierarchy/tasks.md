@@ -2,7 +2,7 @@
 
 **Implements:** [`proposal.md`](proposal.md) · background in [`context.md`](context.md)
 **Style reference:** [`../../UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md) · rendered at `docs/ui-style-guide.html`
-**Started:** 2026-09-04
+**Started:** 2026-09-04 — **Done:** 2026-09-06
 
 ## Progress
 
@@ -50,15 +50,15 @@ Shell on port 4899, killed by PID, never by name. Static assets are
 
 **Files:** `style.css`, `index.html`
 
-- [ ] Replace `.inline-actions`' grid with the flex row from `proposal.md` §3.1.
-- [ ] Delete `.compact-actions` from `style.css` and its use at `index.html:296`.
-- [ ] Add `.btn-danger` and its hover from §3.3, after `.btn-quiet`.
-- [ ] Apply the §3.2 table: `.btn-primary` on `#config-save-btn`,
+- [x] Replace `.inline-actions`' grid with the flex row from `proposal.md` §3.1.
+- [x] Delete `.compact-actions` from `style.css` and its use at `index.html:296`.
+- [x] Add `.btn-danger` and its hover from §3.3, after `.btn-quiet`.
+- [x] Apply the §3.2 table: `.btn-primary` on `#config-save-btn`,
       `#mcp-save-btn`, `#provider-save-btn`, `#model-key-save-btn`;
       `.btn-danger` on `#mcp-remove-btn`, `#provider-remove-btn`,
       `#model-key-delete-btn`; `.btn-quiet` on `#config-load-btn` and
       `#mcp-test-btn`.
-- [ ] Verify: no settings action button over 200px; the MCP row on one line;
+- [x] Verify: no settings action button over 200px; the MCP row on one line;
       one primary per group; each Remove still opens its confirm dialog. Lint.
       Commit.
 
@@ -66,30 +66,30 @@ Shell on port 4899, killed by PID, never by name. Static assets are
 
 **Files:** `style.css`
 
-- [ ] `.settings-nav-item` → `font-size: 13px; font-weight: 600`.
-- [ ] `.settings-section h3` → `font-size: 15px` (keep 750).
-- [ ] `.projects-title` → `font-size: 13px; font-weight: 600`.
-- [ ] `.terminal-tab span:last-child` → `font-size: 12px; font-weight: 600`.
-- [ ] Sweep every `font-size` in `style.css` and list any value outside
+- [x] `.settings-nav-item` → `font-size: 13px; font-weight: 600`.
+- [x] `.settings-section h3` → `font-size: 15px` (keep 750).
+- [x] `.projects-title` → `font-size: 13px; font-weight: 600`.
+- [x] `.terminal-tab span:last-child` → `font-size: 12px; font-weight: 600`.
+- [x] Sweep every `font-size` in `style.css` and list any value outside
       {18, 15, 14, 13, 12, 11, 10}. Fix what is a stray; if a value is load
       bearing — an icon glyph sized in px, for instance — leave it and record
       why in the progress table rather than forcing it.
-- [ ] Verify the sidebar and settings still read with a clear hierarchy rather
+- [x] Verify the sidebar and settings still read with a clear hierarchy rather
       than flat. Lint. Commit.
 
 ## Task 3 · Terminal chrome
 
 **Files:** `index.html`, `style.css`
 
-- [ ] Move `#terminal-cwd` inside `.terminal-tabbar`, after the tab and before
+- [x] Move `#terminal-cwd` inside `.terminal-tabbar`, after the tab and before
       `.terminal-spacer`, keeping its id so `app.js` needs no change.
-- [ ] `.terminal-tabbar` → `min-height: 36px`, padding `4px 10px`, gap `8px`.
-- [ ] `.terminal-tab` → `min-height: 26px`, `border-radius: 999px`, padding
+- [x] `.terminal-tabbar` → `min-height: 36px`, padding `4px 10px`, gap `8px`.
+- [x] `.terminal-tab` → `min-height: 26px`, `border-radius: 999px`, padding
       `0 10px`.
-- [ ] Restyle `#terminal-cwd` as inline muted 11px text: no border, no
+- [x] Restyle `#terminal-cwd` as inline muted 11px text: no border, no
       background, `min-width: 0`, `direction: rtl` with ellipsis so the leaf
       directory survives truncation.
-- [ ] Verify: tab bar ≤ 36px, no separate cwd strip, cwd visible in the bar,
+- [x] Verify: tab bar ≤ 36px, no separate cwd strip, cwd visible in the bar,
       terminal body ≥ 177px at the 220px minimum, and xterm still fits its
       container without clipping. Lint. Commit.
 
@@ -97,14 +97,14 @@ Shell on port 4899, killed by PID, never by name. Static assets are
 
 **Files:** `docs/ui-style-guide.html`, `docs/UI_STYLE_GUIDE.md`, spec folder, `docs/specs/README.md`
 
-- [ ] Add `.btn-danger` to the specimen page's button grid, default and
+- [x] Add `.btn-danger` to the specimen page's button grid, default and
       disabled, and add the two heading steps to its type-scale section.
-- [ ] Update the guide: `.btn-danger` in the §3 table, the §3 rule about
+- [x] Update the guide: `.btn-danger` in the §3 table, the §3 rule about
       destructive actions rewritten to name it, the §2 type table replaced with
       §3.4's, and `.inline-actions` removed from the §4 anti-pattern note since
       the rule no longer has the flaw the note describes.
-- [ ] Correct spec 41: add a note to its `context.md` §3 recording that its
+- [x] Correct spec 41: add a note to its `context.md` §3 recording that its
       §3.1 `.inline-actions` decision was superseded, and why.
-- [ ] Run the specimen page's missing-class check.
-- [ ] Record measurements in `proposal.md`'s status line and set the
+- [x] Run the specimen page's missing-class check.
+- [x] Record measurements in `proposal.md`'s status line and set the
       `docs/specs/README.md` row to Done. Commit.

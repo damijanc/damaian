@@ -103,7 +103,7 @@ The load-bearing primitive. Everything else is bookkeeping around it.
   Debug + PartialEq + Eq`, and `ProcessIdentity::of(pid: u32) ->
   Option<ProcessIdentity>`.
 
-- [ ] **Step 1: Add the dependency**
+- [x] **Step 1: Add the dependency**
 
 In `crates/workspace-engine/Cargo.toml`, under `[dependencies]`, keeping the
 list alphabetical:
@@ -112,7 +112,7 @@ list alphabetical:
 libc = "0.2.186"
 ```
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Create `crates/workspace-engine/src/process_registry.rs` containing only this
 test module for now:
@@ -155,7 +155,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 ```bash
 cargo test -p workspace-engine --lib process_registry
@@ -163,7 +163,7 @@ cargo test -p workspace-engine --lib process_registry
 
 Expected: FAIL to compile, `cannot find type ProcessIdentity in this scope`.
 
-- [ ] **Step 4: Write the implementation**
+- [x] **Step 4: Write the implementation**
 
 Put this above the test module in the same file:
 
@@ -227,7 +227,7 @@ others:
 pub use process_registry::ProcessIdentity;
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 ```bash
 cargo test -p workspace-engine --lib process_registry
@@ -235,12 +235,12 @@ cargo test -p workspace-engine --lib process_registry
 
 Expected: 3 passed.
 
-- [ ] **Step 6: Run the full quality gate**
+- [x] **Step 6: Run the full quality gate**
 
 All seven commands from `AGENTS.md`. `cargo deny check` matters here — it is
 the one that confirms `libc`'s license is on the allow-list.
 
-- [ ] **Step 7: Show the change and ask before committing**
+- [x] **Step 7: Show the change and ask before committing**
 
 Suggested subject line: `Read a process start time so a recycled PID is detectable`
 
@@ -269,7 +269,7 @@ One file per live child, written before the spawning function returns.
     Option<RegisteredProcess>)>>` — `None` for a file that does not parse.
   - `RegistrationHandle`, whose `Drop` unlinks, plus `RegistrationHandle::none()`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the `tests` module in `process_registry.rs`:
 
@@ -372,7 +372,7 @@ Add to the `tests` module in `process_registry.rs`:
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 ```bash
 cargo test -p workspace-engine --lib process_registry
@@ -380,7 +380,7 @@ cargo test -p workspace-engine --lib process_registry
 
 Expected: FAIL to compile, `cannot find type ProcessRegistry in this scope`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Add these imports at the top of `process_registry.rs`:
 
@@ -576,7 +576,7 @@ pub use process_registry::{
 
 (replacing the single-item re-export from Task 1).
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 ```bash
 cargo test -p workspace-engine --lib process_registry
@@ -584,11 +584,11 @@ cargo test -p workspace-engine --lib process_registry
 
 Expected: 8 passed.
 
-- [ ] **Step 5: Run the full quality gate**
+- [x] **Step 5: Run the full quality gate**
 
 All seven commands from `AGENTS.md`.
 
-- [ ] **Step 6: Show the change and ask before committing**
+- [x] **Step 6: Show the change and ask before committing**
 
 Suggested subject line: `Record every spawned child in a file written before it runs`
 
@@ -617,7 +617,7 @@ test.
     identity_of: &dyn Fn(u32) -> Option<ProcessIdentity>, kill: &mut dyn
     FnMut(&RegisteredProcess)) -> Result<SweepReport>`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the `tests` module. These are the five rows of §5.4 plus the
 concurrent-instance case:
@@ -802,7 +802,7 @@ concurrent-instance case:
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 ```bash
 cargo test -p workspace-engine --lib process_registry
@@ -810,7 +810,7 @@ cargo test -p workspace-engine --lib process_registry
 
 Expected: FAIL to compile, `cannot find type SweepScope in this scope`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Add `use crate::audit::AuditLog;` to the imports, then:
 
@@ -967,7 +967,7 @@ impl ProcessRegistry {
 
 Add `SweepDecision`, `SweepReport`, `SweepScope` to the `lib.rs` re-export list.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 ```bash
 cargo test -p workspace-engine --lib process_registry
@@ -975,11 +975,11 @@ cargo test -p workspace-engine --lib process_registry
 
 Expected: 14 passed.
 
-- [ ] **Step 5: Run the full quality gate**
+- [x] **Step 5: Run the full quality gate**
 
 All seven commands from `AGENTS.md`.
 
-- [ ] **Step 6: Show the change and ask before committing**
+- [x] **Step 6: Show the change and ask before committing**
 
 Suggested subject line: `Refuse to kill a recorded PID whose start time no longer matches`
 
@@ -996,7 +996,7 @@ Suggested subject line: `Refuse to kill a recorded PID whose start time no longe
   Result<SweepReport>` and `ProcessRegistry::sweep_own(&self, audit: &AuditLog)
   -> Result<SweepReport>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 This one spawns a real process, so it is `#[ignore]`d per `AGENTS.md`. Add it to
 the `tests` module:
@@ -1053,7 +1053,7 @@ the `tests` module:
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 ```bash
 cargo test -p workspace-engine --lib -- --ignored --exact \
@@ -1062,7 +1062,7 @@ cargo test -p workspace-engine --lib -- --ignored --exact \
 
 Expected: FAIL to compile, `no method named sweep_own`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```rust
 /// How long a swept process is given to act on `SIGTERM` before `SIGKILL`.
@@ -1126,7 +1126,7 @@ impl ProcessRegistry {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 ```bash
 cargo test -p workspace-engine --lib -- --ignored --exact \
@@ -1136,12 +1136,12 @@ cargo test -p workspace-engine --lib -- --ignored --exact \
 Expected: PASS. Then confirm no stragglers with `pgrep -fl "sleep 120"` — it
 should print nothing.
 
-- [ ] **Step 5: Run the full quality gate**
+- [x] **Step 5: Run the full quality gate**
 
 All seven commands from `AGENTS.md`. The new test is `#[ignore]`d, so
 `cargo test --workspace --locked` must not run it.
 
-- [ ] **Step 6: Show the change and ask before committing**
+- [x] **Step 6: Show the change and ask before committing**
 
 Suggested subject line: `Kill a swept process group with SIGTERM before SIGKILL`
 
@@ -1163,7 +1163,7 @@ Suggested subject line: `Kill a swept process group with SIGTERM before SIGKILL`
   Option<String>, registry: &ProcessRegistry, session_id: &str) ->
   Result<McpClient>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `crates/workspace-engine/tests/foundation.rs`, next to the existing MCP
 tests:
@@ -1198,7 +1198,7 @@ fn an_mcp_stdio_server_is_registered_while_it_runs_and_not_after() {
 Reuse whatever helper the existing MCP test at `foundation.rs:4568` uses to
 build a stdio server config and a temp directory; do not invent a second one.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 ```bash
 cargo test -p workspace-engine --test foundation an_mcp_stdio_server_is_registered
@@ -1206,7 +1206,7 @@ cargo test -p workspace-engine --test foundation an_mcp_stdio_server_is_register
 
 Expected: FAIL to compile — `connect` takes 2 arguments.
 
-- [ ] **Step 3: Change `StdioTransport`**
+- [x] **Step 3: Change `StdioTransport`**
 
 In `mcp.rs`, add `use crate::process_registry::{ProcessKind, ProcessRegistry,
 RegistrationHandle};` and `use std::os::unix::process::CommandExt;`, then give
@@ -1244,7 +1244,7 @@ Change the signature to
 `fn spawn(config: &McpServerConfig, registry: &ProcessRegistry, session_id: &str) -> Result<Self>`
 and add `_registration: registration` to the returned struct literal.
 
-- [ ] **Step 4: Thread it through `McpClient::connect`**
+- [x] **Step 4: Thread it through `McpClient::connect`**
 
 ```rust
     pub fn connect(
@@ -1259,7 +1259,7 @@ and add `_registration: registration` to the returned struct literal.
         };
 ```
 
-- [ ] **Step 5: Update the four call sites**
+- [x] **Step 5: Update the four call sites**
 
 Each already has an engine or config in scope, so the registry is one line:
 
@@ -1272,7 +1272,7 @@ Each already has an engine or config in scope, so the registry is one line:
 - `crates/workspace-engine/tests/foundation.rs:4568` — build a registry over the
   test's temp directory.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 ```bash
 cargo test -p workspace-engine --test foundation
@@ -1280,11 +1280,11 @@ cargo test -p workspace-engine --test foundation
 
 Expected: PASS, including the new test.
 
-- [ ] **Step 7: Run the full quality gate**
+- [x] **Step 7: Run the full quality gate**
 
 All seven commands from `AGENTS.md`.
 
-- [ ] **Step 8: Show the change and ask before committing**
+- [x] **Step 8: Show the change and ask before committing**
 
 Suggested subject line: `Register MCP stdio servers so a crash cannot leak them`
 
@@ -1305,7 +1305,7 @@ Suggested subject line: `Register MCP stdio servers so a crash cannot leak them`
 - Produces: `CurlModelTransport::new(base_url: impl Into<String>, api_key: impl
   Into<String>, registry: ProcessRegistry) -> CurlModelTransport`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the existing `#[cfg(test)] mod tests` in `model.rs`:
 
@@ -1327,7 +1327,7 @@ Add to the existing `#[cfg(test)] mod tests` in `model.rs`:
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 ```bash
 cargo test -p workspace-engine --lib a_model_call_transport_carries_a_registry
@@ -1335,7 +1335,7 @@ cargo test -p workspace-engine --lib a_model_call_transport_carries_a_registry
 
 Expected: FAIL to compile — `new` takes 2 arguments.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```rust
 pub struct CurlModelTransport {
@@ -1390,7 +1390,7 @@ struct KillOnDrop(Child, RegistrationHandle);
 
 `KillOnDrop::child` and the `Drop` body still use `self.0`, unchanged.
 
-- [ ] **Step 4: Update the call sites**
+- [x] **Step 4: Update the call sites**
 
 Every real call site already has `engine.config.data_dir` or `config.data_dir`
 in scope:
@@ -1406,7 +1406,7 @@ let transport = CurlModelTransport::new(
 For the two tests inside `model.rs`, use a scratch directory the same way the
 new test above does.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 ```bash
 cargo test -p workspace-engine --lib model
@@ -1415,11 +1415,11 @@ cargo test -p workspace-engine --lib model
 Expected: PASS, including `curl_transport_does_not_put_api_key_in_argv` and the
 other existing transport tests.
 
-- [ ] **Step 6: Run the full quality gate**
+- [x] **Step 6: Run the full quality gate**
 
 All seven commands from `AGENTS.md`.
 
-- [ ] **Step 7: Show the change and ask before committing**
+- [x] **Step 7: Show the change and ask before committing**
 
 Suggested subject line: `Register curl model calls so a killed turn stops billing`
 
@@ -1438,7 +1438,7 @@ The source the original spec 17 analysis wrongly dismissed. See
 - Produces: no signature change. `CommandRunner::new` keeps its four parameters
   and builds the registry from `config.data_dir` internally.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `#[cfg(test)] mod tests` in `command_runner.rs`:
 
@@ -1477,7 +1477,7 @@ than trusting the call above — and write `runner_with_scratch_data_dir` to bui
 a `Config` whose `data_dir` is a fresh temp directory, following whatever
 fixture pattern the surrounding tests already use.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 ```bash
 cargo test -p workspace-engine --lib -- --ignored --exact \
@@ -1487,7 +1487,7 @@ cargo test -p workspace-engine --lib -- --ignored --exact \
 Expected: FAIL — the registry directory does not exist, or the assertion on
 `entries()` cannot compile because nothing registers.
 
-- [ ] **Step 3: Replace `output()` with `spawn()`**
+- [x] **Step 3: Replace `output()` with `spawn()`**
 
 At `command_runner.rs:89-93`, replace:
 
@@ -1565,7 +1565,7 @@ impl Drop for CommandGuard {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 ```bash
 cargo test -p workspace-engine --lib command_runner
@@ -1578,7 +1578,7 @@ passes — output truncation, the docker diagnostic, and the redaction tests all
 read `output.stdout`/`output.stderr`, which `wait_with_output` fills exactly as
 `output` did.
 
-- [ ] **Step 5: Run the eval harness**
+- [x] **Step 5: Run the eval harness**
 
 `AGENTS.md` requires this after touching tool-dispatch code:
 
@@ -1588,11 +1588,11 @@ cargo run -p eval-harness -- run --tier deterministic
 
 Expected: the approval-denial and restricted-path scenarios still pass.
 
-- [ ] **Step 6: Run the full quality gate**
+- [x] **Step 6: Run the full quality gate**
 
 All seven commands from `AGENTS.md`.
 
-- [ ] **Step 7: Show the change and ask before committing**
+- [x] **Step 7: Show the change and ask before committing**
 
 Suggested subject line: `Spawn shell commands in their own group and register them`
 
@@ -1611,7 +1611,7 @@ Suggested subject line: `Spawn shell commands in their own group and register th
 - Produces: `terminal::open(cwd: &Path, cols: u16, rows: u16, data_dir: &Path)
   -> Result<String, String>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `#[cfg(test)] mod tests` in `crates/desktop-shell/src/lib.rs`, beside
 the existing pty test at `:4711`:
@@ -1652,7 +1652,7 @@ the existing pty test at `:4711`:
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 ```bash
 cargo test -p desktop-shell --lib -- --ignored --exact \
@@ -1661,7 +1661,7 @@ cargo test -p desktop-shell --lib -- --ignored --exact \
 
 Expected: FAIL to compile — `open` takes 3 arguments.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Give `PtySession` a handle field, declared after `child` so it drops last:
 
@@ -1705,13 +1705,13 @@ the imports.
 `close` needs no change: it removes the session from the map, and dropping the
 `PtySession` drops the handle.
 
-- [ ] **Step 4: Update the two call sites**
+- [x] **Step 4: Update the two call sites**
 
 `crates/desktop-shell/src/lib.rs:4711` and `crates/desktop-app/src/main.rs:155`
 both need a data directory. In the shell it is `engine.config.data_dir`; in the
 Tauri app, resolve it the same way that file already resolves config.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 ```bash
 cargo test -p desktop-shell --lib
@@ -1721,11 +1721,11 @@ cargo test -p desktop-shell --lib -- --ignored --exact \
 
 Expected: PASS.
 
-- [ ] **Step 6: Run the full quality gate**
+- [x] **Step 6: Run the full quality gate**
 
 All seven commands from `AGENTS.md`.
 
-- [ ] **Step 7: Show the change and ask before committing**
+- [x] **Step 7: Show the change and ask before committing**
 
 Suggested subject line: `Register PTY sessions so a crash does not leak a shell`
 
@@ -1742,7 +1742,7 @@ Suggested subject line: `Register PTY sessions so a crash does not leak a shell`
 - Produces: `ProcessRegistry::install_shutdown_handler(self, audit: AuditLog)
   -> Result<()>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `crates/workspace-engine/tests/process_registry.rs`. The child is this
 same test binary re-executed into a helper, following the pattern at
@@ -1873,7 +1873,7 @@ fn sigint_helper_registers_a_silent_child_and_waits() {
 Add `libc` to `crates/workspace-engine/Cargo.toml` under `[dev-dependencies]`
 if it is not already reachable from tests.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 ```bash
 cargo test -p workspace-engine --test process_registry -- --ignored --exact \
@@ -1882,7 +1882,7 @@ cargo test -p workspace-engine --test process_registry -- --ignored --exact \
 
 Expected: FAIL to compile — `no method named install_shutdown_handler`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Add to `process_registry.rs`:
 
@@ -1962,7 +1962,7 @@ impl ProcessRegistry {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 ```bash
 cargo test -p workspace-engine --test process_registry -- --ignored --exact \
@@ -1971,12 +1971,12 @@ cargo test -p workspace-engine --test process_registry -- --ignored --exact \
 
 Expected: PASS. Then confirm with `pgrep -fl "sleep 300"` that nothing is left.
 
-- [ ] **Step 5: Run the full quality gate**
+- [x] **Step 5: Run the full quality gate**
 
 All seven commands from `AGENTS.md`. Both tests in the new file are
 `#[ignore]`d, so `cargo test --workspace --locked` must not run either.
 
-- [ ] **Step 6: Show the change and ask before committing**
+- [x] **Step 6: Show the change and ask before committing**
 
 Suggested subject line: `Kill registered processes on Ctrl-C through a self-pipe handler`
 
@@ -1994,7 +1994,7 @@ The wiring that makes the previous nine tasks do anything.
 - Consumes: `ProcessRegistry::open`, `sweep`, `install_shutdown_handler`.
 - Produces: nothing new.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `#[cfg(test)] mod tests` in `crates/desktop-shell/src/lib.rs`:
 
@@ -2029,7 +2029,7 @@ Add to the `#[cfg(test)] mod tests` in `crates/desktop-shell/src/lib.rs`:
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 ```bash
 cargo test -p desktop-shell --lib startup_sweeps_an_entry
@@ -2037,7 +2037,7 @@ cargo test -p desktop-shell --lib startup_sweeps_an_entry
 
 Expected: FAIL to compile — `cannot find function sweep_orphaned_processes`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 In `crates/desktop-shell/src/lib.rs`, beside `verify_data_dir_schema_at`:
 
@@ -2097,7 +2097,7 @@ In both `crates/desktop-shell/src/main.rs` and
 and in the CLI only, run the launch sweep too — the CLI spawns `curl` and MCP
 servers and may be the only front end a user runs.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 ```bash
 cargo test -p desktop-shell --lib startup_sweeps_an_entry
@@ -2105,7 +2105,7 @@ cargo test -p desktop-shell --lib startup_sweeps_an_entry
 
 Expected: PASS.
 
-- [ ] **Step 5: Verify it by hand against the real app**
+- [x] **Step 5: Verify it by hand against the real app**
 
 Per `AGENTS.md`, use a port and data directory of your own — never take 4765 and
 never `pkill` by name:
@@ -2119,7 +2119,7 @@ Start it, open a terminal in the UI, note the pid from
 PID), restart it, and confirm the pty shell is gone and the audit log has an
 `orphan_process_killed` event.
 
-- [ ] **Step 6: Run the eval harness and the full quality gate**
+- [x] **Step 6: Run the eval harness and the full quality gate**
 
 ```bash
 cargo run -p eval-harness -- run --tier deterministic
@@ -2127,7 +2127,7 @@ cargo run -p eval-harness -- run --tier deterministic
 
 then all seven commands from `AGENTS.md`.
 
-- [ ] **Step 7: Show the change and ask before committing**
+- [x] **Step 7: Show the change and ask before committing**
 
 Suggested subject line: `Sweep orphaned processes at launch and on shutdown`
 
@@ -2140,36 +2140,36 @@ Suggested subject line: `Sweep orphaned processes at launch and on shutdown`
   `docs/specs/46_process_registry_and_orphan_sweep/tasks.md`,
   `docs/specs/README.md`, `docs/TROUBLESHOOTING.md`
 
-- [ ] **Step 1: Fill in §7 of the proposal**
+- [x] **Step 1: Fill in §7 of the proposal**
 
 Record what the implementation found that the design did not predict — the
 convention in this repo is that §7 is written from experience, not restated from
 §5. If nothing surprised you, say that in one line rather than padding it.
 
-- [ ] **Step 2: Set the status**
+- [x] **Step 2: Set the status**
 
 `Status: Done` in `proposal.md`, and `**Started:** not yet` in this file becomes
 the date the work began.
 
-- [ ] **Step 3: Update the specs README**
+- [x] **Step 3: Update the specs README**
 
 Row 46 still describes three sources and a session-scoped registry. Rewrite it
 for what shipped: four sources, an owner-scoped registry, and the launch sweep
 plus the signal handler. Mark it Done.
 
-- [ ] **Step 4: Add the diagnostic to TROUBLESHOOTING.md**
+- [x] **Step 4: Add the diagnostic to TROUBLESHOOTING.md**
 
 Readers need to know `<data_dir>/processes/` exists, what a file in it means, and
 that `orphan_process_killed`, `orphan_process_kill_refused`,
 `orphan_process_already_exited` and `process_registry_entry_unreadable` are the
 audit events to grep for. Follow the structure of the sections already there.
 
-- [ ] **Step 5: Run the full quality gate**
+- [x] **Step 5: Run the full quality gate**
 
 All seven commands from `AGENTS.md`. `typos` is the one that catches
 documentation changes.
 
-- [ ] **Step 6: Show the change and ask before committing**
+- [x] **Step 6: Show the change and ask before committing**
 
 Suggested subject line: `Document the process registry and the orphan sweep`
 

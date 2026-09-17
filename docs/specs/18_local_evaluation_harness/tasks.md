@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md) · background in [`context.md`](context.md)
-**Started:** not yet
+**Started:** 2026-09-07 — **Done:** 2026-09-07; live-tier defects closed 2026-09-11
 
 **Goal:** Build `crates/eval-harness`, a reproducible evaluation runner with fixture
 repositories and deterministic assertions, so a change that makes Damaian worse at its job
@@ -318,7 +318,7 @@ user's real data directory is the one failure mode that damages something outsid
   `guard::eval_data_dir() -> workspace_engine::Result<PathBuf>` which creates a fresh temp
   directory and returns it after checking it.
 
-- [ ] **Step 1: Add the crate to the workspace**
+- [x] **Step 1: Add the crate to the workspace**
 
 In the root `Cargo.toml`, extend `members`:
 
@@ -332,7 +332,7 @@ members = [
 ]
 ```
 
-- [ ] **Step 2: Write the crate manifest**
+- [x] **Step 2: Write the crate manifest**
 
 `crates/eval-harness/Cargo.toml`. `toml` is the one new direct dependency: it is already in
 `Cargo.lock` transitively, and it is `MIT OR Apache-2.0`, both of which `deny.toml`'s
@@ -358,7 +358,7 @@ toml = "0.9.12"
 If `version.workspace`/`edition.workspace` are not what the other crates use, copy the exact
 form from `crates/workspace-engine/Cargo.toml` instead of guessing.
 
-- [ ] **Step 3: Write the failing test**
+- [x] **Step 3: Write the failing test**
 
 `crates/eval-harness/tests/harness.rs`:
 
@@ -388,13 +388,13 @@ fn accepts_a_temporary_data_dir() {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it fails**
+- [x] **Step 4: Run the test to verify it fails**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: FAIL — the crate has no `guard` module yet, so this is a compile error naming
 `eval_harness::guard`.
 
-- [ ] **Step 5: Implement the guard**
+- [x] **Step 5: Implement the guard**
 
 `crates/eval-harness/src/guard.rs`:
 
@@ -470,18 +470,18 @@ fn main() {
 }
 ```
 
-- [ ] **Step 6: Run the test to verify it passes**
+- [x] **Step 6: Run the test to verify it passes**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: PASS, 2 tests.
 
-- [ ] **Step 7: Run the full quality gate**
+- [x] **Step 7: Run the full quality gate**
 
 Run every command in the `## Quality gate` section of `AGENTS.md`. `cargo deny check` matters
 here specifically, because this task adds a dependency.
 Expected: all pass. Total workspace test count rises from 333 to 335.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock crates/eval-harness
@@ -512,7 +512,7 @@ Damaian data."
   - `fixture::materialize(name: &str) -> Result<Materialized>`
   - `fixture::fixtures_dir() -> PathBuf`
 
-- [ ] **Step 1: Write the fixture tree**
+- [x] **Step 1: Write the fixture tree**
 
 `crates/eval-harness/fixtures/rust-workspace/fixture.toml`:
 
@@ -551,7 +551,7 @@ pub fn upload(payload: &str) -> Result<(), String> {
 This fixture is deliberately tiny — proposal §4 lists "fixture repositories large enough to be
 realistic" as a non-goal.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Append to `crates/eval-harness/tests/harness.rs`:
 
@@ -591,12 +591,12 @@ fn two_materializations_are_independent() {
 }
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [x] **Step 3: Run the test to verify it fails**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: FAIL — compile error naming `eval_harness::fixture`.
 
-- [ ] **Step 4: Implement fixture materialization**
+- [x] **Step 4: Implement fixture materialization**
 
 `crates/eval-harness/src/fixture.rs`:
 
@@ -710,17 +710,17 @@ Add to `crates/eval-harness/src/lib.rs`:
 pub mod fixture;
 ```
 
-- [ ] **Step 5: Run the test to verify it passes**
+- [x] **Step 5: Run the test to verify it passes**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: PASS, 4 tests.
 
-- [ ] **Step 6: Run the full quality gate**
+- [x] **Step 6: Run the full quality gate**
 
 Run every command from `AGENTS.md`'s `## Quality gate`.
 Expected: all pass, 337 workspace tests.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/eval-harness
@@ -774,7 +774,7 @@ pub fn load_all() -> Result<Vec<Scenario>>   // every scenarios/*.toml, sorted b
 pub fn scenarios_dir() -> PathBuf
 ```
 
-- [ ] **Step 1: Write the first scenario file**
+- [x] **Step 1: Write the first scenario file**
 
 `crates/eval-harness/scenarios/one_file_patch.toml`:
 
@@ -826,7 +826,7 @@ files_changed_outside_patch = 0
 `patch_applied = false` is the point of the scenario, not an omission: a proposed patch must
 wait for a human. Task 8 asserts the same thing for the multi-file case.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Append to `crates/eval-harness/tests/harness.rs`:
 
@@ -888,12 +888,12 @@ fn every_committed_scenario_loads() {
 }
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [x] **Step 3: Run the test to verify it fails**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: FAIL — compile error naming `eval_harness::scenario`.
 
-- [ ] **Step 4: Implement the loader**
+- [x] **Step 4: Implement the loader**
 
 `crates/eval-harness/src/scenario.rs`:
 
@@ -1089,16 +1089,16 @@ Add to `crates/eval-harness/src/lib.rs`:
 pub mod scenario;
 ```
 
-- [ ] **Step 5: Run the test to verify it passes**
+- [x] **Step 5: Run the test to verify it passes**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: PASS, 7 tests.
 
-- [ ] **Step 6: Run the full quality gate**
+- [x] **Step 6: Run the full quality gate**
 
 Expected: all pass, 340 workspace tests.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/eval-harness
@@ -1152,7 +1152,7 @@ impl RunRecord { pub fn sanitize(&mut self, scanner: &SecretScanner); }
 `RunRecord` derives `Serialize` with `#[serde(rename_all = "camelCase")]` so the JSON matches
 proposal §5.5 exactly (`fixtureVersion`, `startedAtMs`, `durationMs`, `notApplicable`).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `crates/eval-harness/tests/harness.rs`:
 
@@ -1198,12 +1198,12 @@ fn a_record_serializes_with_the_field_names_the_spec_defines() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: FAIL — compile error naming `eval_harness::record`.
 
-- [ ] **Step 3: Implement the record**
+- [x] **Step 3: Implement the record**
 
 `crates/eval-harness/src/record.rs`:
 
@@ -1340,18 +1340,18 @@ Add to `crates/eval-harness/src/lib.rs`:
 pub mod record;
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: PASS, 9 tests. If `SecretScanner::redact` returns a type whose text field is not
 `.text`, check `crates/workspace-engine/src/secret_scanner.rs` and adjust — `foundation.rs:64`
 uses `result.text`.
 
-- [ ] **Step 5: Run the full quality gate**
+- [x] **Step 5: Run the full quality gate**
 
 Expected: all pass, 342 workspace tests.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/eval-harness
@@ -1387,7 +1387,7 @@ impl Trace {
 }
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `crates/eval-harness/tests/harness.rs`:
 
@@ -1427,12 +1427,12 @@ fn a_missing_audit_log_is_an_empty_trace_not_an_error() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: FAIL — compile error naming `eval_harness::trace`.
 
-- [ ] **Step 3: Implement the trace reader**
+- [x] **Step 3: Implement the trace reader**
 
 `crates/eval-harness/src/trace.rs`:
 
@@ -1526,16 +1526,16 @@ Add to `crates/eval-harness/src/lib.rs`:
 pub mod trace;
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: PASS, 11 tests.
 
-- [ ] **Step 5: Run the full quality gate**
+- [x] **Step 5: Run the full quality gate**
 
 Expected: all pass, 344 workspace tests.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/eval-harness
@@ -1574,7 +1574,7 @@ pub fn mock_provider() -> ModelProviderConfig
 `context_files` and `response`, which are not in the record — §5.5 keeps records free of
 content.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `crates/eval-harness/tests/harness.rs`:
 
@@ -1616,12 +1616,12 @@ fn a_run_never_touches_the_real_data_directory() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: FAIL — compile error naming `eval_harness::runner`.
 
-- [ ] **Step 3: Implement the runner**
+- [x] **Step 3: Implement the runner**
 
 `crates/eval-harness/src/runner.rs`:
 
@@ -1849,7 +1849,7 @@ Add to `crates/eval-harness/src/lib.rs`:
 pub mod runner;
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: PASS, 13 tests.
@@ -1858,11 +1858,11 @@ If `Config` has no `secret_patterns` field, or `AgentPatchProposal` is not expor
 `workspace_engine`, check `crates/workspace-engine/src/lib.rs:34-80` for the real export list
 and adjust the imports — do not add new `pub use` lines to the engine for this.
 
-- [ ] **Step 5: Run the full quality gate**
+- [x] **Step 5: Run the full quality gate**
 
 Expected: all pass, 346 workspace tests.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/eval-harness
@@ -1890,7 +1890,7 @@ than a harness failure."
 `patch_paths` is passed in rather than read from the proposal inside `evaluate`, so the
 function is pure with respect to the engine and testable from a hand-built `Run`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 use eval_harness::assertions;
@@ -1955,12 +1955,12 @@ fn deterministic_only_assertions_are_skipped_in_the_live_tier() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: FAIL — compile error naming `eval_harness::assertions`.
 
-- [ ] **Step 3: Implement the evaluator**
+- [x] **Step 3: Implement the evaluator**
 
 `crates/eval-harness/src/assertions.rs`:
 
@@ -2174,16 +2174,16 @@ Add to `crates/eval-harness/src/lib.rs`:
 pub mod assertions;
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: PASS, 16 tests.
 
-- [ ] **Step 5: Run the full quality gate**
+- [x] **Step 5: Run the full quality gate**
 
 Expected: all pass, 349 workspace tests.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/eval-harness
@@ -2227,7 +2227,7 @@ than glossed.
 - Produces: no new Rust API. Later tasks rely on fixture version `2` and on
   `src/checkout.rs` existing in the `rust-workspace` fixture.
 
-- [ ] **Step 1: Extend the fixture and bump its version**
+- [x] **Step 1: Extend the fixture and bump its version**
 
 A retrieval scenario needs something to *not* retrieve, or ranking is meaningless with one
 file. Add a second module.
@@ -2265,7 +2265,7 @@ because a result is only comparable against a baseline produced from the same fi
 run record from now on reports `fixtureVersion: "2"`, and Task 6's test asserting `"1"` must be
 updated to `"2"` in this step.
 
-- [ ] **Step 2: Write the three scenario files**
+- [x] **Step 2: Write the three scenario files**
 
 `crates/eval-harness/scenarios/file_references.toml` — the model answers in prose naming real
 paths, and every path it names must exist:
@@ -2337,7 +2337,7 @@ context_ranks_within = ["src/checkout.rs", 3]
 
 If `search_codebase`'s argument key is not `query`, read `chat.rs:1803` and use the real one.
 
-- [ ] **Step 3: Write the failing test**
+- [x] **Step 3: Write the failing test**
 
 ```rust
 fn run_and_evaluate(name: &str) -> (eval_harness::runner::Run, Vec<AssertionOutcome>) {
@@ -2390,13 +2390,13 @@ fn the_deterministic_tier_does_not_enable_semantic_search() {
 doc comment (`patch_id` + `summary` + `files`). Verify against the struct and adjust the helper
 if they differ.
 
-- [ ] **Step 4: Run the test to verify it fails**
+- [x] **Step 4: Run the test to verify it fails**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: FAIL — the three scenario files do not exist yet if Step 2 was skipped, otherwise a
 genuine assertion failure showing which retrieval assertion is not yet satisfied.
 
-- [ ] **Step 5: Make the scenarios pass**
+- [x] **Step 5: Make the scenarios pass**
 
 No new harness code should be needed. If `context_contains` fails, the likely cause is that
 `ChatTurnResult::context_files` holds paths relative to the repository root while the
@@ -2408,16 +2408,16 @@ fixture's wording carry the concept (rename the doc comment to mention "promotio
 "basket") rather than weakening the assertion to top-10. A scenario that passes because the
 threshold was loosened measures nothing.
 
-- [ ] **Step 6: Run the test to verify it passes**
+- [x] **Step 6: Run the test to verify it passes**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: PASS, 18 tests.
 
-- [ ] **Step 7: Run the full quality gate**
+- [x] **Step 7: Run the full quality gate**
 
 Expected: all pass, 351 workspace tests.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/eval-harness
@@ -2447,7 +2447,7 @@ pass is not mistaken for embedding coverage."
   it is applied, which is the only way to create the `base_hash` conflict §5.4 asserts.
   `runner::Run` gains `pub apply_error: Option<String>`.
 
-- [ ] **Step 1: Write the multi-file scenario**
+- [x] **Step 1: Write the multi-file scenario**
 
 `crates/eval-harness/scenarios/multi_file_patch.toml`:
 
@@ -2503,7 +2503,7 @@ patch_applied = false
 files_changed_outside_patch = 0
 ```
 
-- [ ] **Step 2: Add the scenario field the conflict scenario needs**
+- [x] **Step 2: Add the scenario field the conflict scenario needs**
 
 In `crates/eval-harness/src/scenario.rs`, add to `RawScenario`:
 
@@ -2532,7 +2532,7 @@ In `Scenario`, add `pub modify_after_proposal: Option<(String, String)>,` and po
             .map(|change| (change.path, change.content)),
 ```
 
-- [ ] **Step 3: Write the conflict scenario**
+- [x] **Step 3: Write the conflict scenario**
 
 `crates/eval-harness/scenarios/preserve_user_modified.toml`:
 
@@ -2570,7 +2570,7 @@ patch_applied = false
 approval_required = true
 ```
 
-- [ ] **Step 4: Write the failing test**
+- [x] **Step 4: Write the failing test**
 
 ```rust
 #[test]
@@ -2610,12 +2610,12 @@ fn a_patch_is_refused_when_the_user_changed_the_file_after_the_preview() {
 }
 ```
 
-- [ ] **Step 5: Run the test to verify it fails**
+- [x] **Step 5: Run the test to verify it fails**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: FAIL — `Run` has no `apply_error` field yet.
 
-- [ ] **Step 6: Implement the apply attempt in the runner**
+- [x] **Step 6: Implement the apply attempt in the runner**
 
 Add `pub apply_error: Option<String>` to `runner::Run`, initialise it to `None` in the existing
 `Ok(Run { .. })`, and insert this after the trace is read and before the record is finalised:
@@ -2652,16 +2652,16 @@ the shape the desktop route uses, and the parameter order or the hunk-selection 
 differ. Adjust the call, not the intent: apply the whole stored proposal by id and capture the
 error.
 
-- [ ] **Step 7: Run the test to verify it passes**
+- [x] **Step 7: Run the test to verify it passes**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: PASS, 20 tests.
 
-- [ ] **Step 8: Run the full quality gate**
+- [x] **Step 8: Run the full quality gate**
 
 Expected: all pass, 353 workspace tests.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add crates/eval-harness
@@ -2695,7 +2695,7 @@ regression, it is a security defect.
 - Produces: `Scenario` gains `pub restricted_patterns: Vec<String>`, applied to the run's
   `Config` so a scenario can declare what must be refused.
 
-- [ ] **Step1: Extend the fixture**
+- [x] **Step1: Extend the fixture**
 
 `crates/eval-harness/fixtures/rust-workspace/.env` — the seeded secret. The value is AWS's own
 documentation example key, which is well-known-invalid, and is already used for this purpose at
@@ -2729,7 +2729,7 @@ scanner both need to tolerate it. If `cargo test` for the workspace starts faili
 some other test walks the repository and finds this file, that is a real finding — record it in
 the Progress table and in proposal §7 rather than deleting the fixture.
 
-- [ ] **Step 2: Add the restricted-patterns scenario field**
+- [x] **Step 2: Add the restricted-patterns scenario field**
 
 In `scenario.rs`, add to `RawScenario` and `Scenario`:
 
@@ -2746,7 +2746,7 @@ and in `runner::run`, before `WorkspaceEngine::new(config)`:
     }
 ```
 
-- [ ] **Step 3: Write the three scenario files**
+- [x] **Step 3: Write the three scenario files**
 
 `crates/eval-harness/scenarios/restricted_path.toml`:
 
@@ -2820,7 +2820,7 @@ content = "Within src/ prefer expect with a message over unwrap."
 context_contains = ["src/AGENTS.md"]
 ```
 
-- [ ] **Step 4: Write the failing test**
+- [x] **Step 4: Write the failing test**
 
 ```rust
 #[test]
@@ -2870,30 +2870,30 @@ fn a_nested_agents_md_is_not_overridden_by_the_root_one() {
 }
 ```
 
-- [ ] **Step 5: Run the test to verify it fails**
+- [x] **Step 5: Run the test to verify it fails**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: FAIL — `restricted_patterns` is not yet a scenario field, so the loader rejects the
 unknown key (`deny_unknown_fields` makes this a clear error rather than a silent ignore).
 
-- [ ] **Step 6: Make them pass**
+- [x] **Step 6: Make them pass**
 
 Implement Step 2 if not already done. If `agents_md_scoping` fails because `context_files` does
 not include instruction files at all, that is a finding about how `ContextManager` reports
 `AGENTS.md` content — check whether the instruction reaches the assembled prompt under a
 different label before changing the assertion, and record what you found in proposal §7.
 
-- [ ] **Step 7: Run the test to verify it passes**
+- [x] **Step 7: Run the test to verify it passes**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: PASS, 23 tests.
 
-- [ ] **Step 8: Run the full quality gate**
+- [x] **Step 8: Run the full quality gate**
 
 Expected: all pass, 356 workspace tests. `typos` matters here: a fixture with a `.env` and new
 Markdown files is new prose in the repository.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add crates/eval-harness
@@ -2920,7 +2920,7 @@ run produced, including the harness's own record and the audit log."
 - Produces: `Scenario` gains `pub approval_decision: Option<bool>` — when set, the runner calls
   `resume_after_command_decision` with it after the turn stops for approval.
 
-- [ ] **Step 1: Add the approval-decision field and resume step**
+- [x] **Step 1: Add the approval-decision field and resume step**
 
 In `scenario.rs`, add `#[serde(default)] approval_decision: Option<bool>` to `RawScenario` and
 `pub approval_decision: Option<bool>` to `Scenario`, populated straight through.
@@ -2958,7 +2958,7 @@ Then, when folding the outcome into the record, prefer `resumed` over `outcome` 
 `Some`, since the resumed turn is the one that finished. Keep the original `outcome`'s
 `command_proposal` for the `approval_required` assertion.
 
-- [ ] **Step 2: Write the three scenario files**
+- [x] **Step 2: Write the three scenario files**
 
 `crates/eval-harness/scenarios/denied_approval.toml`:
 
@@ -3039,7 +3039,7 @@ tool_rounds_at_most = 8
 The assertion therefore measures the engine's own bound rather than a number invented here. If
 either default changes, this scenario is supposed to fail — update it deliberately.
 
-- [ ] **Step 3: Write the failing test**
+- [x] **Step 3: Write the failing test**
 
 ```rust
 #[test]
@@ -3083,28 +3083,28 @@ fn a_truncated_tool_call_is_reported_and_not_applied() {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it fails**
+- [x] **Step 4: Run the test to verify it fails**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: FAIL — `approval_decision` is an unknown scenario key until Step 1 lands.
 
-- [ ] **Step 5: Make them pass**
+- [x] **Step 5: Make them pass**
 
 Implement Step 1. The likely rough edge is that `resume_after_command_decision` needs the same
 `adapter` the first turn used, and the adapter has already consumed its first response — that
 is correct and intended, since the second scripted turn is the model's reply after the
 decision.
 
-- [ ] **Step 6: Run the test to verify it passes**
+- [x] **Step 6: Run the test to verify it passes**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: PASS, 26 tests.
 
-- [ ] **Step 7: Run the full quality gate**
+- [x] **Step 7: Run the full quality gate**
 
 Expected: all pass, 359 workspace tests.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/eval-harness
@@ -3133,7 +3133,7 @@ whole of the resume work in this plan — see proposal §5.4.
   and whose `record.final_status` is `"not_applicable"` for a blocked scenario, without
   materializing a fixture or calling the engine.
 
-- [ ] **Step 1: Write the blocked scenario file**
+- [x] **Step 1: Write the blocked scenario file**
 
 `crates/eval-harness/scenarios/resume_interrupted_session.toml`:
 
@@ -3166,7 +3166,7 @@ command_executed = false
 files_changed_outside_patch = 0
 ```
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 ```rust
 /// A deferral has to be visible in the output, not remembered. Proposal §5.4
@@ -3203,13 +3203,13 @@ fn twelve_scenarios_run_and_exactly_one_is_blocked() {
 }
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [x] **Step 3: Run the test to verify it fails**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: FAIL — `runner::run` currently materializes a fixture and calls the engine for every
 scenario, so `not_applicable` is `None`.
 
-- [ ] **Step 4: Implement the skip**
+- [x] **Step 4: Implement the skip**
 
 At the very top of `runner::run`, after the tier check:
 
@@ -3235,16 +3235,16 @@ At the very top of `runner::run`, after the tier check:
     }
 ```
 
-- [ ] **Step 5: Run the test to verify it passes**
+- [x] **Step 5: Run the test to verify it passes**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: PASS, 28 tests.
 
-- [ ] **Step 6: Run the full quality gate**
+- [x] **Step 6: Run the full quality gate**
 
 Expected: all pass, 361 workspace tests.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/eval-harness
@@ -3291,7 +3291,7 @@ impl MetricSet {
 `MetricValue` serializes as a tagged object so `notApplicable` and `source: "human"` are
 representable exactly as §5.6 requires — never as a bare zero.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 use eval_harness::metrics::{MetricSet, MetricValue};
@@ -3369,12 +3369,12 @@ fn a_not_applicable_run_is_excluded_from_the_completion_rate() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: FAIL — compile error naming `eval_harness::metrics`.
 
-- [ ] **Step 3: Implement the metric set**
+- [x] **Step 3: Implement the metric set**
 
 `crates/eval-harness/src/metrics.rs`:
 
@@ -3662,16 +3662,16 @@ when you write it; the struct form is the intended interface and later tasks dep
 That is a deliberate merge of two rows carrying the identical marker; if a reviewer wants them
 separate, split the key and bump `KEYS` to 16.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: PASS, 33 tests.
 
-- [ ] **Step 5: Run the full quality gate**
+- [x] **Step 5: Run the full quality gate**
 
 Expected: all pass, 366 workspace tests.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/eval-harness
@@ -3708,7 +3708,7 @@ pub fn failed_assertions(report: &Report) -> Vec<(String, AssertionOutcome)>
 pub fn run_tier(tier: Tier) -> Result<Report>
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 use eval_harness::report;
@@ -3774,12 +3774,12 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: FAIL — compile error naming `eval_harness::report` and `eval_harness::run_tier`.
 
-- [ ] **Step 3: Implement the report**
+- [x] **Step 3: Implement the report**
 
 `crates/eval-harness/src/report.rs`:
 
@@ -3916,7 +3916,7 @@ pub fn run_tier(tier: Tier) -> Result<report::Report> {
 }
 ```
 
-- [ ] **Step 4: Implement the binary**
+- [x] **Step 4: Implement the binary**
 
 `crates/eval-harness/src/main.rs`:
 
@@ -3975,7 +3975,7 @@ The spec's §5.1 invocation is `cargo run -p eval-harness -- run --tier determin
 parser ignores a leading positional `run`, which keeps that exact command working while also
 accepting it without the subcommand.
 
-- [ ] **Step 5: Run the test to verify it passes**
+- [x] **Step 5: Run the test to verify it passes**
 
 Run: `cargo test -p eval-harness --locked`
 Expected: PASS, 36 tests. Then run the binary both ways and read the output yourself:
@@ -3988,11 +3988,11 @@ cargo run -p eval-harness -- run --tier deterministic
 cargo run -p eval-harness -- run --tier deterministic --format json
 ```
 
-- [ ] **Step 6: Run the full quality gate**
+- [x] **Step 6: Run the full quality gate**
 
 Expected: all pass, 369 workspace tests.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/eval-harness
@@ -4024,7 +4024,7 @@ The last task, and the one with a human gate in the middle of it.
 **Interfaces:**
 - Produces: `runner::run_live(scenario: &Scenario) -> Result<Run>`, credential-gated.
 
-- [ ] **Step 1: Confirm CI already covers the deterministic tier**
+- [x] **Step 1: Confirm CI already covers the deterministic tier**
 
 No workflow edit is needed, and adding one would violate §5.8. Task 14's
 `the_deterministic_tier_runs_every_scenario_and_passes` lives in
@@ -4038,7 +4038,7 @@ cargo test --workspace --locked 2>&1 | grep -c "the_deterministic_tier_runs_ever
 Expected: `1`. Record the deterministic tier's wall-clock runtime — proposal §7 asks for it,
 because a slow harness inside every `cargo test` is the first thing someone disables.
 
-- [ ] **Step 2: Add the live tier**
+- [x] **Step 2: Add the live tier**
 
 In `runner.rs`:
 
@@ -4103,7 +4103,7 @@ fn live_tier_runs_one_scenario_against_a_real_provider() {
 }
 ```
 
-- [ ] **Step 3: Document it**
+- [x] **Step 3: Document it**
 
 Add to `docs/DEVELOPMENT.md` a section covering: running each tier, adding a scenario, adding a
 fixture and bumping its version, and regenerating and reviewing the baseline. Add one line to
@@ -4115,13 +4115,13 @@ fixture and bumping its version, and regenerating and reviewing the baseline. Ad
   its deterministic tier is already part of `cargo test --workspace --locked`.
 ```
 
-- [ ] **Step 4: Generate the baseline**
+- [x] **Step 4: Generate the baseline**
 
 ```bash
 cargo run -p eval-harness -- run --tier deterministic --format json > evals/baseline.json
 ```
 
-- [ ] **Step 5: STOP — human review gate**
+- [x] **Step 5: STOP — human review gate**
 
 Do not commit `evals/baseline.json` yet. Proposal §5.7: the baseline is committed in its own
 commit, by a person who has read every number and can say what each one means. An unread
@@ -4134,7 +4134,7 @@ metrics, ask for a value and a sample size, or record `null` with the reason. Wa
 answer. If any number surprises them, that is a finding to investigate before committing, not a
 number to write down.
 
-- [ ] **Step 6: Commit the code and docs, then the reviewed baseline separately**
+- [x] **Step 6: Commit the code and docs, then the reviewed baseline separately**
 
 ```bash
 git add crates/eval-harness docs/DEVELOPMENT.md AGENTS.md docs/specs/18_local_evaluation_harness
@@ -4156,7 +4156,7 @@ review gate. The two human-sourced metrics carry a stated sample size
 or an explicit null with a reason."
 ```
 
-- [ ] **Step 7: Close the spec**
+- [x] **Step 7: Close the spec**
 
 Update `proposal.md`'s `Status:` line from `Not started` to `Done`, with the measured
 deterministic-tier runtime and the scenario counts. Fill in §7 Implementation Notes: who
@@ -4165,7 +4165,7 @@ tier's runtime, and the sample size or null reason behind each human-sourced met
 this file's Progress table, and the spec 18 row in `docs/specs/README.md` from
 `**Not started.**` to `**Done.**` with a one-line summary.
 
-- [ ] **Step 8: Run the full quality gate one last time**
+- [x] **Step 8: Run the full quality gate one last time**
 
 Every command from `AGENTS.md`'s `## Quality gate`. Report the real numbers, including the new
 workspace test total.
