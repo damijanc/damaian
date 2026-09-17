@@ -420,3 +420,50 @@ jobs:
               --title "${TAG_NAME}" \
               --notes-file release-notes.md
           fi
+
+  # The changelog row is generated from the tag, so it cannot exist until the
+  # tag does — which is why this ran by hand until now. It runs after
+  # publish-release rather than before it so a bookkeeping commit can never
+  # withhold a built DMG from users. See docs/specs/09_release_quality_gate.md
+  # §4.5. `needs:` carries publish-release's tag condition transitively, so a
+  # workflow_dispatch build never reaches here.
+  update-changelog:
+    name: Update changelog
+    needs: publish-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # main, not the tag: a tag checkout is detached and cannot be pushed to.
+      # Full history because the script counts reachable commits per tag to
+      # order them — a shallow clone would order them wrongly rather than fail.
+      - name: Check out main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      # No npm ci: update-changelog.mjs imports only node: built-ins.
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Add the release row
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          npm run changelog:update
+          if git diff --quiet -- CHANGELOG.md; then
+            echo "CHANGELOG.md already documents ${TAG_NAME}; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git commit -m "Add ${TAG_NAME} to the changelog"
+          # Another tag's run may have landed on main since checkout.
+          git pull --rebase origin main
+          git push origin HEAD:main

@@ -69,15 +69,20 @@ easy mistake:
   2026-09-15, because the changelog says what actually happened and what is
   written down — the same information without the guesswork.
 
-  **After tagging, run `npm run changelog:update`.** It adds a row to the
-  releases table for every tag the file does not yet document, from the commit
-  subjects in that tag's range, and it never rewrites an existing row — so edit
-  a generated row freely, and re-running leaves it alone. Rows are inserted
-  under the `<!-- releases -->` marker's separator line; do not remove that
-  marker. A tag with no commits in its range is omitted, and
-  `npm run changelog:check` exits non-zero when a tag is undocumented. Moving an
-  entry out of `Unreleased` when it ships is still a judgement call, so the
-  script only reminds you.
+  **The release pipeline writes the release row.** `macos-dmg.yml`'s
+  `update-changelog` job runs `npm run changelog:update` once a tagged release
+  has published, and commits the result to `main`. Run the command yourself only
+  to catch up a tag pushed before that job existed, or with `--dry-run` to see
+  what it would add; `npm run changelog:check` exits non-zero when a tag is
+  undocumented and is a local command, called by no workflow. It adds a row for
+  every tag the file does not yet document, from the commit subjects in that
+  tag's range, and it never rewrites an existing row — so edit a generated row
+  freely, and re-running leaves it alone. Rows are inserted under the
+  `<!-- releases -->` marker's separator line; do not remove that marker. A tag
+  with no commits in its range is omitted. **Moving an entry out of
+  `Unreleased` when it ships is still yours** — nothing automates that
+  judgement, so a release can leave `Unreleased` naming work that already
+  shipped.
 - `docs/PLAN/` — **local-only and not committed**, so never link to it from a
   committed file; name it instead. Phases, work packages, the execution
   dashboard, and `OBSERVATIONS.md`, the inbox for things noticed but not yet
