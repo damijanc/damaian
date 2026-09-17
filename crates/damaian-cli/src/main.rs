@@ -46,6 +46,10 @@ fn main() {
         eprintln!("{error}");
         std::process::exit(1);
     }
+    if let Err(error) = start_process_cleanup() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
     if let Err(error) = run() {
         eprintln!("{error}");
         std::process::exit(1);
@@ -66,6 +70,30 @@ fn verify_data_dir_schema() -> std::result::Result<(), String> {
         DataSchemaOutcome::Initialized | DataSchemaOutcome::Current => {}
     }
     Ok(())
+}
+
+/// Sweeps what a crashed instance left running and arms the shutdown handler,
+/// per `docs/specs/46_process_registry_and_orphan_sweep/proposal.md` §5.6–§5.7.
+///
+/// The CLI spawns `curl` and MCP stdio servers of its own and may be the only
+/// front end a user ever runs, so it cannot rely on the desktop shell having
+/// swept. Running both is harmless: an entry whose owner is still alive is
+/// skipped, so the second sweep of a launch is a no-op.
+fn start_process_cleanup() -> std::result::Result<(), String> {
+    let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
+    let (registry, audit) =
+        ProcessRegistry::open_with_audit(&config).map_err(|error| error.to_string())?;
+    let report = registry.sweep(&audit).map_err(|error| error.to_string())?;
+    if report.killed() > 0 || report.refused() > 0 {
+        eprintln!(
+            "Orphan sweep: killed {}, refused {} on a start-time mismatch",
+            report.killed(),
+            report.refused()
+        );
+    }
+    registry
+        .install_shutdown_handler(audit)
+        .map_err(|error| error.to_string())
 }
 
 fn run() -> workspace_engine::Result<()> {

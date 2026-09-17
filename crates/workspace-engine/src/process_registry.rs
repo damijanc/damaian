@@ -8,8 +8,10 @@
 //! `ProcessIdentity` is the evidence, and nothing here kills without it.
 
 use crate::audit::AuditLog;
+use crate::config::Config;
 use crate::error::{ClientError, Result};
 use crate::hash::now_millis;
+use crate::secret_scanner::SecretScanner;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -133,6 +135,24 @@ impl ProcessRegistry {
             ClientError::Io("cannot read this process's own start time".to_string())
         })?;
         Ok(Self { dir, owner })
+    }
+
+    /// The registry for `config.data_dir` together with the audit log its sweep
+    /// records through, built from the same fields `WorkspaceEngine` uses so a
+    /// sweep's events land beside every other event.
+    ///
+    /// This pair lives here rather than beside either front end's startup code
+    /// because `damaian-cli` does not depend on `desktop-shell`, and both
+    /// binaries have to build it identically — a second copy is where the two
+    /// would drift.
+    pub fn open_with_audit(config: &Config) -> Result<(Self, AuditLog)> {
+        let audit = AuditLog::with_retention(
+            &config.data_dir,
+            config.audit_enabled,
+            config.audit_retention_days,
+            SecretScanner::new(config.secret_patterns.clone()),
+        );
+        Ok((Self::open(&config.data_dir)?, audit))
     }
 
     /// Records `pid` and returns a handle that removes the record when dropped.

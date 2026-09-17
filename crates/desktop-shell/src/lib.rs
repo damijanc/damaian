@@ -67,11 +67,35 @@ fn verify_data_dir_schema_at(data_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Kills what a crashed instance left running, per
+/// `docs/specs/46_process_registry_and_orphan_sweep/proposal.md` §5.7.
+///
+/// Eagerly at startup rather than inside `recovery::sweep_once`, which is
+/// memoized on the first HTTP request: an orphan must not outlive the crash
+/// just because nobody opened the UI. An entry whose owner is still alive is
+/// skipped, so running this from both front ends is a no-op the second time.
+pub fn sweep_orphaned_processes(config: &Config) -> Result<(), String> {
+    let (registry, audit) =
+        ProcessRegistry::open_with_audit(config).map_err(|error| error.to_string())?;
+    let report = registry.sweep(&audit).map_err(|error| error.to_string())?;
+    if report.killed() > 0 || report.refused() > 0 {
+        println!(
+            "Orphan sweep: killed {}, refused {} on a start-time mismatch",
+            report.killed(),
+            report.refused()
+        );
+    }
+    Ok(())
+}
+
 pub fn run_server_with_ready<F>(options: ShellOptions, ready: F) -> Result<(), String>
 where
     F: FnOnce(u16),
 {
     verify_data_dir_schema()?;
+    // Before the port is bound, so an orphan never overlaps a new session.
+    let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
+    sweep_orphaned_processes(&config)?;
     let bind = format!("127.0.0.1:{}", options.port);
     let listener = TcpListener::bind(&bind).map_err(|error| format!("bind {bind}: {error}"))?;
     let actual_port = listener
@@ -3261,8 +3285,8 @@ mod tests {
         json_optional_string, keychain, mcp_browser_arguments, parse_form, parse_path_list,
         percent_decode, plan_json, plan_proposal_json, relay_turn_events, remember_model_api_key,
         render_markdown_with_optional_file_links, repository_config_review_json, require_api_token,
-        run_server, run_terminal_command, save_config_file, task_states_json,
-        terminal_cwd_for_repo, validate_context_files, validate_working_folder,
+        run_server, run_terminal_command, save_config_file, sweep_orphaned_processes,
+        task_states_json, terminal_cwd_for_repo, validate_context_files, validate_working_folder,
         validate_workspace_path, verify_data_dir_schema_at,
     };
     use std::collections::HashMap;
@@ -4746,6 +4770,44 @@ mod tests {
         assert_eq!(
             fs::read_to_string(data_dir.join("schema.conf")).expect("marker should be written"),
             "schema_version=1\n"
+        );
+    }
+
+    // The launch sweep has to *decide* and record, not merely tidy the
+    // directory. An entry naming a pid that cannot exist, owned by an instance
+    // that cannot exist, is the shape a crashed instance leaves behind.
+    #[test]
+    fn startup_sweeps_an_entry_left_by_a_crashed_instance() {
+        let data_dir = temp_path("startup-sweep");
+        fs::create_dir_all(data_dir.join("processes")).unwrap();
+        fs::write(
+            data_dir.join("processes").join("4000002-111.json"),
+            "{\"pid\":4000002,\"startTimeUs\":111,\"pgid\":4000002,\"kind\":\"command\",\
+             \"sessionId\":\"ses_1\",\"registeredAtMs\":0,\"ownerPid\":4000001,\
+             \"ownerStartTimeUs\":222}",
+        )
+        .unwrap();
+        // Its own config rather than the machine's: whether this passes must
+        // not depend on whether auditing happens to be enabled here.
+        let config = workspace_engine::Config {
+            data_dir: data_dir.clone(),
+            ..workspace_engine::Config::default()
+        };
+
+        sweep_orphaned_processes(&config).expect("the sweep should run");
+
+        assert!(
+            fs::read_dir(data_dir.join("processes"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "a spent entry is removed so it is not re-decided at every launch"
+        );
+        let log = fs::read_to_string(data_dir.join("audit").join("events.jsonl"))
+            .expect("the sweep records what it decided");
+        assert!(
+            log.contains("orphan_process_already_exited"),
+            "the sweep must record its decision, not just empty the directory: {log}"
         );
     }
 

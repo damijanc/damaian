@@ -114,31 +114,134 @@ fn signalling_the_owner_cleans_up_and_re_raises(signal: libc::c_int, name: &str)
     }
 }
 
-/// Re-executed by the test above, never run on its own. Registers a silent
+/// The crash half of `proposal.md` §5.9, and the one acceptance criterion 2
+/// rests on: a child registered by an instance that is then `SIGKILL`ed — so
+/// no handler of its own can possibly run — is killed by the **next launch's**
+/// sweep, performed from a fresh process that is not the recorded owner.
+///
+/// The helper it re-executes installs no shutdown handler, so the sweep is the
+/// only thing that can account for the child being gone.
+///
+/// `#[ignore]`d per `AGENTS.md` because it spawns and kills real processes.
+/// Run it by hand:
+///
+/// ```sh
+/// cargo test -p workspace-engine --test process_registry -- --ignored --exact \
+///   a_sigkilled_owners_child_is_killed_by_the_next_launch_sweep
+/// ```
+#[test]
+#[ignore]
+fn a_sigkilled_owners_child_is_killed_by_the_next_launch_sweep() {
+    use std::process::Command;
+    use workspace_engine::{Config, ProcessIdentity, ProcessRegistry};
+
+    let data_dir = scratch("crash");
+    let mut owner = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "crash_helper_registers_a_silent_child_without_a_handler",
+        ])
+        .env("DAMAIAN_SWEEP_DIR", &data_dir)
+        .spawn()
+        .expect("owner should spawn");
+
+    let processes = data_dir.join("processes");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let child_pid = loop {
+        if let Some(pid) = registered_pid(&processes) {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the helper never registered");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    // `SIGKILL` is uncatchable, so nothing in the owner runs on the way out.
+    // That is precisely the case the on-disk entry exists for.
+    // SAFETY: `kill` takes two integers by value and touches no memory.
+    unsafe { libc::kill(owner.id() as libc::pid_t, libc::SIGKILL) };
+    owner.wait().expect("owner should be reaped");
+    assert!(
+        ProcessIdentity::of(child_pid).is_some(),
+        "the child must outlive its killed owner, or the sweep is not what this \
+         test goes on to measure"
+    );
+
+    // A fresh registry, as the next launch builds: this process is not the
+    // recorded owner, and the recorded owner is provably gone.
+    let config = Config {
+        data_dir: data_dir.clone(),
+        ..Config::default()
+    };
+    let (registry, audit) = ProcessRegistry::open_with_audit(&config).unwrap();
+    let report = registry.sweep(&audit).unwrap();
+    assert_eq!(
+        report.killed(),
+        1,
+        "the orphan should be killed: {report:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ProcessIdentity::of(child_pid).is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "the orphan survived the launch sweep"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let log = std::fs::read_to_string(data_dir.join("audit").join("events.jsonl"))
+        .expect("the sweep records what it decided");
+    assert!(
+        log.contains("orphan_process_killed"),
+        "requirement 5: the kill must be audited: {log}"
+    );
+}
+
+/// Re-executed by the signal test, never run on its own. Registers a silent
 /// child, installs the handler, and waits to be signalled.
 #[test]
 #[ignore]
 fn sigint_helper_registers_a_silent_child_and_waits() {
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-    use workspace_engine::{AuditLog, ProcessKind, ProcessRegistry, SecretScanner};
-
     let Ok(data_dir) = std::env::var("DAMAIAN_SWEEP_DIR") else {
         // Run directly rather than re-executed: there is nothing to do, and
         // doing anything would spawn a process no one is waiting for.
         return;
     };
-    let registry = ProcessRegistry::open(&data_dir).unwrap();
-    let audit = AuditLog::new(&data_dir, true, SecretScanner::new(Vec::new()));
-    registry
-        .clone()
-        .install_shutdown_handler(audit)
-        .expect("handler should install");
+    register_silent_child(&data_dir, true);
+}
 
-    // Never `wait`ed on deliberately: this helper is killed by the signal the
-    // test sends, and the child has to outlive it exactly as a crash would
-    // leave it. Reaping the child here would remove the very thing the sweep
-    // is meant to find.
+/// Re-executed by the crash test, never run on its own. Deliberately installs
+/// **no** handler: under `SIGKILL` one could not run anyway, and leaving it out
+/// means nothing in this process can be confused for the sweep.
+#[test]
+#[ignore]
+fn crash_helper_registers_a_silent_child_without_a_handler() {
+    let Ok(data_dir) = std::env::var("DAMAIAN_SWEEP_DIR") else {
+        return;
+    };
+    register_silent_child(&data_dir, false);
+}
+
+/// Registers a silent child whose entry outlives this process, exactly as a
+/// crash would leave it, then waits to be killed.
+fn register_silent_child(data_dir: &str, install_handler: bool) {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use workspace_engine::{AuditLog, ProcessKind, ProcessRegistry, SecretScanner};
+
+    let registry = ProcessRegistry::open(data_dir).unwrap();
+    if install_handler {
+        let audit = AuditLog::new(data_dir, true, SecretScanner::new(Vec::new()));
+        registry
+            .clone()
+            .install_shutdown_handler(audit)
+            .expect("handler should install");
+    }
+
+    // Never `wait`ed on deliberately: this helper is killed where it stands,
+    // and the child has to outlive it exactly as a crash would leave it.
+    // Reaping the child here would remove the very thing the sweep must find.
     #[allow(clippy::zombie_processes)]
     let child = Command::new("/bin/sh")
         .arg("-lc")
