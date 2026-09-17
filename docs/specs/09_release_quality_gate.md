@@ -91,6 +91,8 @@ resulting chain is:
 quality → build → publish-release
 ```
 
+(A fourth job was appended to this chain on 2026-09-17; see §4.5 and §7.)
+
 A failure anywhere in `quality` fails the job, which blocks `build` on its
 `needs`, which blocks `publish-release` on its. The pipeline fails closed: no
 DMG is produced and no GitHub Release is created or edited. Because the
@@ -126,6 +128,98 @@ release build starts.
 This serialization is the gate. Overlapping the two would mean starting a build
 before knowing whether it should exist, which is the defect being fixed. The
 added wall-clock time is accepted deliberately.
+
+### 4.5 The changelog row is written after publishing
+
+Added 2026-09-17. `CHANGELOG.md` is generated from tags by
+`scripts/update-changelog.mjs`, which can only run once the tag exists. That
+made it a manual step after tagging, recorded in `AGENTS.md`, and a forgotten
+run left the file behind the releases it documents while the GitHub Release
+itself stayed correct. The same pipeline that creates the tag's release can
+write the row.
+
+`macos-dmg.yml` gains a fourth job:
+
+```yaml
+update-changelog:
+  name: Update changelog
+  needs: publish-release
+  runs-on: ubuntu-latest
+  permissions:
+    contents: write
+```
+
+The chain becomes:
+
+```
+quality → build → publish-release → update-changelog
+```
+
+`needs: publish-release` carries that job's
+`if: startsWith(github.ref, 'refs/tags/')` transitively, so a
+`workflow_dispatch` build never writes a row — there is no tag for it to
+document.
+
+**The job runs after publishing, not before.** A bookkeeping commit stays off
+the critical path: the DMG and the release notes are already out before the job
+starts, so a push that fails cannot withhold a build from users. The job still
+fails the run, so a rejected push is visible rather than silent.
+
+The job checks out `main` rather than the tag, which is detached and cannot be
+pushed to, with `fetch-depth: 0` — the script reads every tag and counts
+reachable commits to order them, so a shallow clone would produce a wrong
+ordering rather than an error. Node is set up without `npm ci`, because
+`update-changelog.mjs` imports only `node:fs/promises` and
+`node:child_process`. The job runs `npm run changelog:update`, exits quietly
+when `CHANGELOG.md` is unchanged, and otherwise commits as `github-actions[bot]`
+with a single-line subject naming the tag being released, rebasing onto `main`
+before pushing so a concurrent push does not lose the race. The subject names
+the tag rather than the rows written, which differ only when the job is catching
+up more than one undocumented tag; deriving the real list would mean parsing the
+script's stdout, and that coupling is not worth the accuracy.
+
+**Existing rows are never touched, and that guarantee is the script's rather
+than the workflow's.** `update-changelog.mjs` splices new rows under the
+`<!-- releases -->` separator, carries the remainder of the file through byte
+for byte, and refuses to write if that remainder would have changed. A version
+already present in the table is skipped entirely. CI running the same script
+inherits all of it, so a row edited by hand after an earlier release survives
+every later run, and a re-run is a no-op.
+
+The bot's own commit touches only `CHANGELOG.md`, which the script files under
+the `Docs` component, and `Docs` commits produce no bullets. The automation does
+not appear in the next release's row.
+
+**What stays manual.** Moving an entry out of the `Unreleased` table when it
+ships. That is a judgement about whether a shipped change matches what was
+specified, the script has never made it, and this does not change that. After a
+release, `Unreleased` can still name work that just shipped until someone edits
+it.
+
+**`AGENTS.md` becomes wrong and is corrected.** Its planning section currently
+carries the instruction **"After tagging, run `npm run changelog:update`"** as
+the reader's responsibility. That sentence is replaced by one stating that the
+release pipeline runs it, that the command remains available for a local run
+against tags already pushed, and that `Unreleased` is still edited by hand.
+Everything the existing passage says about the script's behaviour — rows
+inserted under the `<!-- releases -->` marker, the marker not to be removed,
+existing rows never rewritten, a tag with no commits omitted — is still true and
+stays.
+
+Two things are deliberately not done. The GitHub Release notes still come from
+`git log` over the tag range rather than from the changelog row: the two texts
+have different audiences and different lifetimes — notes are frozen at
+publication, a row is edited afterwards — and merging them is a separate
+decision. And `npm run changelog:check` remains uncalled by any workflow; with
+the row written automatically there is nothing left for it to catch, and it
+stays a local command.
+
+Accepted cost: pushing to `main` triggers `quality.yml` on `push`, so every
+release spends a full Quality run on a one-file commit. Suppressing it would
+mean either a `[skip ci]` marker in a subject line that appears in GitHub's
+release feed, or a `paths-ignore` on `quality.yml` that would also stop Quality
+running on genuine documentation-only commits. Neither trade is worth a few
+minutes per release.
 
 ## 5. Typo fixes
 
@@ -168,6 +262,21 @@ Criterion 7 cannot be observed without pushing a tag against a failing tree.
 Criteria 3–6 establish the wiring statically; criterion 7 is what that wiring
 is for.
 
+Criteria 8–11 cover §4.5 and were added on 2026-09-17:
+
+8. `macos-dmg.yml` contains an `update-changelog` job declaring
+   `needs: publish-release` and `permissions: contents: write`, and the file
+   still parses as a valid workflow.
+9. Running `npm run changelog:update` against a tree whose `CHANGELOG.md`
+   already documents every tag makes no change to the file and no commit.
+10. On a tag push, `CHANGELOG.md` on `main` gains one row for that tag, and the
+    text of every row already present is byte-identical afterwards.
+11. `AGENTS.md` no longer instructs the reader to run the command after tagging.
+
+Criterion 10 is the append-only requirement, and it is enforced by the script's
+own refusal to write a changed tail rather than by the workflow. Criterion 9 is
+the part of it that can be checked locally without pushing a tag.
+
 ## 7. Implementation notes
 
 **2026-09-16 — the test step became `cargo nextest run`.** `quality.rust` now
@@ -197,3 +306,16 @@ in the swap: nextest does not run doctests and this workspace has none, and the
 14 skipped tests are the pre-existing `#[ignore]`d ones, so the 665 total is
 unchanged. `--final-status-level slow` prints the slowest tests, so the same
 drift shows up in the log next time rather than only in the job duration.
+
+**2026-09-17 — the pipeline writes the changelog row.** The release pipeline
+gained a fourth job, specified in §4.5, and §4.2's chain diagram was corrected
+to match. Criteria 8–11 were added for it; criteria 1–7 record what was verified
+when this spec was first executed and are left as written.
+
+It is recorded here rather than as a new numbered spec because it extends the
+pipeline this document already defines, and splitting one pipeline across two
+specs would leave neither describing it completely. There is no `docs/PLAN/`
+work package behind it: it came from reading the release path and noticing that
+the one step in it still performed by hand had no reason to be.
+`OBSERVATIONS.md` held no open entry touching the release path when this was
+written.
