@@ -160,15 +160,31 @@ Notes:
   Add tests next to the code you change. (No count here on purpose — a number in
   this file goes stale on the next commit that adds a test, and a stale one is
   worse than none: it invites "close enough" when the real total differs.)
+- **A test that builds a throwaway repository must set
+  `enable_index_watcher: false` on its `Config`.** Registering the filesystem
+  watcher is a synchronous handshake with macOS `fseventsd` that costs ten to
+  fifteen seconds per repository — not work this project controls — and a test
+  that indexes a fixture once and discards it buys nothing with it. Copy
+  `foundation`'s `test_config` or the eval harness's `base_config`. Omitting it
+  is what made this suite take forty-five minutes on 2026-09-16: `foundation`
+  and the eval harness held 29 of those minutes between them, at 92% idle.
+  `index_cache_picks_up_file_changes_via_watcher_without_full_rescan` is the
+  one test that needs a watcher, and turns it back on deliberately.
+- **If the suite feels slow, measure wall time against CPU time before reaching
+  for build tooling.** `/usr/bin/time -p cargo nextest run --workspace --locked`
+  settles it: when `user + sys` is a small fraction of `real`, the suite is
+  waiting on something, and no amount of `sccache`, `mold` or cache tuning will
+  move it. `sample <pid>` on a stalled test names the blocking syscall. That is
+  how the `fseventsd` cost above was found, after a build-caching guide had sent
+  the search in the wrong direction.
 - `cargo run -p eval-harness -- run --tier deterministic` evaluates Damaian end
   to end against fixture repositories — scenarios covering retrieval, patch
   proposal, restricted paths, secret redaction, approval denial, the retry bound
   and crash recovery. Run it after changing prompt, context-assembly,
   tool-dispatch, path-policy or recovery code: a regression there passes the
-  unit tests and fails here. Its
-  deterministic tier is already part of `cargo nextest run --workspace
-  --locked`, so it
-  adds no quality-gate command. See
+  unit tests and fails here. Its deterministic tier is already part of
+  `cargo nextest run --workspace --locked`, so it adds no quality-gate
+  command. See
   [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md#evaluation-harness).
 - Some tests are `#[ignore]`d because they have real side effects: one opens
   Finder, one spawns a real login shell, one reads your own checkout to measure
