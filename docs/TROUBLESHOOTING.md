@@ -44,6 +44,12 @@ to a local HTTP server, so browser-side debugging applies (see
 > name. The user's own running app shares those names. Track the PID you
 > spawned and kill that one.
 
+Each of the three spawns children of its own — MCP stdio servers, `curl` model
+calls, PTY shells and shell commands — and records them under `processes/` so a
+crash cannot leak them. That registry is the mechanical form of the rule above:
+it kills by PID and start time, never by name. See
+[After a crash: what was still running](#after-a-crash-what-was-still-running).
+
 ## Where state lives
 
 ### Global data directory
@@ -74,6 +80,7 @@ isolated tree — that is the intended way to test without touching real data.
 | `commands/output/<exec-id>/` | `stdout.log`, `stderr.log`, `summary.dcmd` per execution | [validation.rs:67](../crates/workspace-engine/src/validation.rs:67) |
 | `commands/rejected/<id>.dcmd` | Rejected command proposals | [validation.rs:93](../crates/workspace-engine/src/validation.rs:93) |
 | `chat/pending/<proposal-id>.json` | Suspended chat turn awaiting a command decision | [chat.rs:859](../crates/workspace-engine/src/chat.rs:859) |
+| `processes/<pid>-<start-time-us>.json` | One live child process this instance spawned, written **before** the child is returned to its caller and unlinked on clean exit | [process_registry.rs:164](../crates/workspace-engine/src/process_registry.rs:164) |
 | `vector-index/<repo-id>.bin` | Semantic-search embeddings cache | [vector_index.rs:149](../crates/workspace-engine/src/vector_index.rs:149) |
 | `models/all-MiniLM-L6-v2/` | Downloaded embedding model (semantic search only) | [embeddings.rs:27](../crates/workspace-engine/src/embeddings.rs:27) |
 
@@ -332,6 +339,7 @@ Event types grouped by what they tell you:
 | Commands | `command_proposed`, `command_proposal_stored`, `command_executed`, `stored_command_executed`, `stored_command_rejected` |
 | Files & repo | `file_read`, `file_modified`, `file_restored`, `repository_indexed`, `git_status_read`, `git_diff_read` |
 | MCP | `mcp_tools_listed`, `mcp_tool_called`, `mcp_tool_call_failed`, `mcp_discovery_failed` |
+| Orphan sweep | `orphan_process_killed`, `orphan_process_kill_refused`, `orphan_process_already_exited`, `process_registry_entry_unreadable` |
 
 Useful reads:
 
@@ -587,6 +595,66 @@ proposal it was waiting on. There is nothing to reattach and nothing safe to
 guess, so it is failed with that stated reason rather than shown as an approval
 card rebuilt from partial data. **No stored proposal is deleted** — the patches
 and commands themselves remain on disk and stay usable.
+
+### After a crash: what was still running
+
+A separate question from the one above, and a separate sweep. That one asks what
+a *task* was doing; this one asks which **child processes** outlived the crash —
+MCP stdio servers, `curl` model calls, PTY shells and shell commands. Damaian
+records each one at spawn under `processes/`, and kills the leftovers at the
+next launch ([spec 46](specs/46_process_registry_and_orphan_sweep/proposal.md)).
+
+Each file is named `<pid>-<start-time-us>.json`, and **both halves matter**. A
+PID is reused, so the start time is the evidence that the number still names the
+process that was recorded. What is currently registered:
+
+```bash
+for f in "$DATA_DIR"/processes/*.json; do jq -r '"\(.kind) pid=\(.pid) pgid=\(.pgid) session=\(.sessionId) owner=\(.ownerPid)"' "$f"; done
+```
+
+A file here does **not** mean something is leaking. The normal state during a
+session is one file per live child; they are unlinked when the child exits
+cleanly. A file left behind after Damaian is closed means the process died
+without unlinking — which is exactly the case the next launch's sweep is for.
+
+`ownerPid` is the Damaian instance that spawned the child, and it is why a
+second running instance is safe: an entry whose owner is still alive is skipped,
+not killed. Two Damaian instances can run at once, so "recorded but not mine" is
+not evidence of a crash.
+
+Sweep decisions are in the **audit log**, one event per entry:
+
+```bash
+jq -r 'select((.eventType|startswith("orphan_process_")) or .eventType=="process_registry_entry_unreadable") | "\(.eventType) pid=\(.pid // "-") kind=\(.kind // "-") \(.recordedStartTimeUs // "") \(.actualStartTimeUs // "")"' "$DATA_DIR/audit/events.jsonl"
+```
+
+The parentheses around `startswith` are not cosmetic. Written as
+`select(.eventType|startswith(…) or .eventType==…)`, the `or` binds *inside* the
+pipe, where `.` is already the event-type string — so `.eventType` indexes a
+string and `jq` aborts on the first line that is not an orphan event. It appears
+to work on a log that contains nothing else, because `or` short-circuits before
+evaluating the broken half.
+
+Audit fields sit at the top level of each event, not under a `payload` object —
+unlike the session log, where they are nested.
+
+| Event | What happened |
+|---|---|
+| `orphan_process_killed` | The PID was alive and its start time matched. Killed, entry removed |
+| `orphan_process_kill_refused` | The PID was alive and its start time **differed** — it is a different process now, so it was left alone. Both start times are recorded so the refusal is checkable after the fact |
+| `orphan_process_already_exited` | Nothing to kill; the entry was removed |
+| `process_registry_entry_unreadable` | A half-written entry, meaning the crash landed between creating the file and writing it. Audited rather than ignored, because it is evidence about the crash |
+
+**A refusal is the system working, not a failure.** It means a recorded PID had
+already been recycled by the operating system and now belongs to something else.
+Killing it would have taken out an unrelated process — a worse outcome than the
+leftover this sweep exists to clean up.
+
+If you expected a cleanup and got nothing, check in this order: the entry's
+`ownerPid` is still alive (so the entry is deliberately skipped); the sweep runs
+at launch and on `SIGINT`/`SIGTERM`/`SIGHUP`, so a `SIGKILL`ed Damaian cleans up
+on its *next* start rather than immediately; and a process started outside
+Damaian was never registered, so it is not the sweep's to kill.
 
 ### Checkpoints and rewind
 

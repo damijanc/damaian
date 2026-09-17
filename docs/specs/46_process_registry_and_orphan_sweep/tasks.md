@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md)
-**Started:** not yet
+**Started:** 2026-09-15 — **Done:** 2026-09-17
 
 **Goal:** Record every child process Damaian spawns in a file written at spawn
 time, and at the next launch kill the ones left behind by a crashed instance —

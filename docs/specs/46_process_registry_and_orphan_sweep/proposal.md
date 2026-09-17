@@ -1,6 +1,6 @@
 # Feature Spec: Process Registry and Orphan Sweep
 
-Status: Not started
+Status: Done
 Order: 46 of 46
 Plan: `docs/PLAN/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 2 (Must) — the process-cleanup half. That directory is local-only and
@@ -326,4 +326,73 @@ the same identity-gated kill as the sweep, so §5.4's table covers both.
 
 ## 7. Implementation Notes
 
-To be completed during implementation.
+Written after implementation. The design held where it mattered: §5.8's
+call-site counts were exact (11 `curl`, 4 MCP, 2 PTY), the §5.4 decision table
+needed no new rows, and `proc_pidinfo`'s fail-closed behaviour never had to be
+worked around. What follows is only what the design did not predict.
+
+### The handler had to carry *which* signal arrived
+
+§5.6 says the watchdog restores `SIG_DFL` and re-raises "so the process reports
+the correct `WIFSIGNALED` status". Re-raising a *fixed* `SIGINT` satisfies every
+other sentence in that section — the child is still cleaned up, the process
+still exits signalled — while reporting the wrong signal to whatever ran it. A
+`SIGTERM`ed instance is the ordinary case under a supervisor, not an exotic one.
+
+The fix keeps the handler to a single `write`: the byte written **is** the
+signal number. `SIGHUP`, `SIGINT` and `SIGTERM` are 1, 2 and 15, so the
+self-pipe that already existed carries it at no cost, and the watchdog re-raises
+what it reads.
+
+Worth recording because the defect is invisible to the obvious test. A `SIGINT`
+test passes against both versions; only comparing the exit status against the
+signal actually *sent* separates them, which is what
+`sigterm_cleans_up_a_silent_child_and_re_raises_sigterm_not_sigint` does.
+
+### The two front ends could not share one sweep function
+
+§5.7 has the sweep running from both front ends. `damaian-cli` does not depend
+on `desktop-shell`, so the obvious placement — beside the shell's startup code —
+is unreachable from the CLI, and the alternative is the same audit-construction
+lines copied into two binaries.
+
+`ProcessRegistry::open_with_audit(&Config)` became the seam: it returns the
+registry together with the audit log its sweep records through, built from the
+same config fields `WorkspaceEngine` uses. Each front end composes it. The shell
+sweeps inside `run_server_with_ready`, so the Tauri host gets the sweep too, and
+installs the handler in `main` only, per §5.6.
+
+Taking a `&Config` rather than loading one internally also decides a test
+question: a sweep that calls `Config::load_for_repository` itself reads *the
+developer's* configuration, so whether its test passes depends on whether
+auditing happens to be enabled on that machine.
+
+### Surface that was specified and is not used
+
+- `ProcessKind::parse` was in the implementation plan's interface list and was
+  never needed. Nothing reads `kind` back out of an entry; the sweep only copies
+  it into an audit field.
+- `RegisteredProcess::identity()` is never called — the sweep compares
+  `start_time_us` directly.
+- `CurlModelTransport::for_session` exists with no call site, so **every
+  model-call entry records an empty session id**, exactly as §5.8's note
+  anticipated. The affordance is there for a later spec that wants per-session
+  attribution for model calls; today it is a half-open door rather than a
+  feature.
+
+None of the three produces a warning, because all are `pub` and `dead_code` does
+not fire on public items. Worth knowing before reading a green clippy run as
+"nothing here is unused".
+
+### Test mechanics
+
+- `libc` had to be added under **`[dev-dependencies]`** as well as
+  `[dependencies]`. Integration tests under `tests/` are separate crates and do
+  not inherit the library's dependencies; the failure reads as a missing crate
+  rather than a missing section.
+- `clippy::zombie_processes` fires on the re-exec helpers' children, which are
+  deliberately never reaped — reaping one would remove the very thing the sweep
+  exists to find. Each carries an `#[allow]` saying so.
+- §5.9's two end-to-end cases both exist. The crash one re-executes a helper
+  that installs **no** shutdown handler, so nothing inside the killed process
+  can be mistaken for the launch sweep that follows it.
