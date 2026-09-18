@@ -435,8 +435,12 @@ identically — 18 — in all six runs, because it was counted from
 `scenario.turns`, and the live tier ignores the scripts. It described the
 scenario directory, not a model. Fixed to read the session log
 (`trace::tool_rounds`), delimited by the `model_call` marker that opens each
-round, so a provider emitting several tool calls in one message adds calls and
-not rounds — the distinction this A/B needed and could not make. Pinned by
+round, so a provider emitting several tool calls in one message would add calls
+and not rounds — the distinction this A/B needed and could not make. That case
+cannot arise yet: `first_decodable_tool_action` executes the first decodable
+call of a round and drops the rest (§5.6), so calls and rounds track one to one
+today, and the measured 55 calls are 55 rounds rather than a batched surface.
+The semantics matter once requirement 8's batching lands. Pinned by
 `tool_rounds_come_from_the_run_and_not_from_the_scenario_script`, which uses
 `failed_validation_retry`: one scripted turn, several real rounds, so the two
 sources disagree without needing a provider. Read the numbers above as tool
