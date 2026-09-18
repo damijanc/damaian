@@ -165,6 +165,31 @@ Notes:
   lint is genuinely wrong for the code, `#[allow(...)]` with a comment
   explaining why is acceptable — see the `too_many_arguments` allowances on the
   dependency-injection constructors.
+- **Working through a plan task-by-task? Scope the per-task checks and run this
+  gate once, at the end.** Measured on a developer Mac on 2026-09-18, these are
+  what the two slow commands actually cost locally:
+
+  | Command | Cost |
+  |---|---|
+  | `cargo clippy --workspace --all-targets` (cold) | **18m 20s** |
+  | `cargo clippy -p workspace-engine --all-targets` (warm) | **75s** |
+  | `cargo nextest run --workspace --locked` | **~5 min** |
+
+  So per task run `cargo nextest run -p <crate> --test <file>` and clippy scoped
+  with `-p`, and leave the full gate for the end. A seven-task plan that runs the
+  unscoped pair every time spends over two hours waiting, almost all of it idle.
+  This changes *when* the gate runs, never *whether*: nothing is finished until
+  all seven commands have passed on the finished state.
+
+  Do not read the local test figure as a regression against the 28s in
+  [`docs/specs/09_release_quality_gate.md`](docs/specs/09_release_quality_gate.md)
+  §7 — that number was measured on the CI runner and has never described a
+  developer machine. The local suite is 92% idle, blocked in `poll` on the `git`
+  subprocesses the checkpoint object store spawns (a checkpoint costs about five
+  round-trips, and the index grows every turn), not on the `fseventsd` watcher
+  that caused the forty-five-minute suite. That was diagnosed on 2026-09-18 with
+  the wall-versus-CPU method below; the evidence and the one question it left
+  open are in `docs/PLAN/OBSERVATIONS.md`. Re-deriving it costs an hour.
 - `npm run lint:web:fix` auto-fixes most web-asset findings.
 - `cargo nextest` needs `cargo install cargo-nextest --locked`; CI installs it
   with `taiki-e/install-action`. It replaced `cargo test` because it runs test
