@@ -186,7 +186,7 @@ waiting for your answer", not "An approval was pending".
 
 At most **two** questions per turn, and each consumes a tool round from the
 same budget every other tool call draws on ([spec 21](21_task_plan_progress_and_budget/proposal.md),
-and the continuation budget in [spec 47](47_agent_working_capability.md)). A
+and the continuation budget in [spec 47](47_agent_working_capability/proposal.md)). A
 third call in a turn is refused with a tool error saying so, which the model can
 read and work around by proceeding.
 

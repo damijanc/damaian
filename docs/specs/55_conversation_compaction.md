@@ -145,7 +145,7 @@ central loop.
   against actions whose outcomes
   [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) may classify as
   unknown, and it interacts with the continuation budget in
-  [spec 47](47_agent_working_capability.md). Doing both here would hide a hard
+  [spec 47](47_agent_working_capability/proposal.md). Doing both here would hide a hard
   problem inside an easier one.
 - **Cross-session memory.** A summary serves the session that produced it.
   Carrying knowledge between sessions is [spec 28](28_memory_model_and_storage.md)

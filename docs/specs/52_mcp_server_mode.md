@@ -18,7 +18,7 @@ and types this reuses),
 process narrows and can never widen),
 [`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)
 (the scope rules that decide who chooses the repository),
-[`47_agent_working_capability.md`](47_agent_working_capability.md) (the read
+[`47_agent_working_capability/proposal.md`](47_agent_working_capability/proposal.md) (the read
 tools this exposes).
 
 ## 1. Motivation
@@ -116,8 +116,8 @@ agent may do.
 | Tool | Why it is safe to expose |
 |---|---|
 | `search_codebase` | Read-only, path-policed, redacted |
-| `read_file` (ranged, per [spec 47](47_agent_working_capability.md)) | Read-only, path-policed, redacted |
-| `list_directory` ([spec 47](47_agent_working_capability.md)) | Read-only, path-policed |
+| `read_file` (ranged, per [spec 47](47_agent_working_capability/proposal.md)) | Read-only, path-policed, redacted |
+| `list_directory` ([spec 47](47_agent_working_capability/proposal.md)) | Read-only, path-policed |
 | `read_git_status`, `read_git_diff` | Read-only; the diff redacts, and [spec 35](35_commit_preparation.md)'s warning about redacted diffs concerns *committing* from one, which this cannot do |
 | Repository map (Phase 3 WP2), symbol lookup (Phase 3 WP3) | Read-only, derived, when they exist |
 
