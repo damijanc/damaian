@@ -17,6 +17,11 @@ pub struct Session {
     pub created_at_ms: u128,
     pub updated_at_ms: u128,
     pub summary: String,
+    /// Who opened the session: `"user"`, or the server-mode origin spec 52 will
+    /// introduce. Stubbed now (always `"user"`) so search and the session list
+    /// can filter on it without a second migration when 52 lands. See spec 53
+    /// §5.6.
+    pub origin: String,
 }
 
 /// What a task is doing, precisely enough that a crash in it is classifiable.
@@ -282,6 +287,7 @@ impl SessionStore {
             created_at_ms: now,
             updated_at_ms: now,
             summary: String::new(),
+            origin: "user".to_string(),
         };
         self.append_session_event(&session.id, "session_created", &session_json(&session))?;
         Ok(session)
@@ -1447,13 +1453,14 @@ impl SessionStore {
 
 fn session_json(session: &Session) -> String {
     format!(
-        "{{\"id\":\"{}\",\"repositoryId\":\"{}\",\"title\":\"{}\",\"createdAtMs\":{},\"updatedAtMs\":{},\"summary\":\"{}\"}}",
+        "{{\"id\":\"{}\",\"repositoryId\":\"{}\",\"title\":\"{}\",\"createdAtMs\":{},\"updatedAtMs\":{},\"summary\":\"{}\",\"origin\":\"{}\"}}",
         escape_json(&session.id),
         escape_json(&session.repository_id),
         escape_json(&session.title),
         session.created_at_ms,
         session.updated_at_ms,
-        escape_json(&session.summary)
+        escape_json(&session.summary),
+        escape_json(&session.origin)
     )
 }
 
@@ -1608,6 +1615,7 @@ fn parse_session_event(event: &SessionEvent) -> Option<Session> {
         created_at_ms: event.number("createdAtMs")?,
         updated_at_ms: event.number("updatedAtMs")?,
         summary: event.text("summary").unwrap_or_default(),
+        origin: event.text("origin").unwrap_or_else(|| "user".to_string()),
     })
 }
 
