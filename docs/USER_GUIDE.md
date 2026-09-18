@@ -131,6 +131,16 @@ A rewind never rewrites history you can audit. The conversation moves back by ap
 
 **Checkpoints are session recovery, not version control.** They cover Damaian's own changes to one repository, they expire (`checkpoint_retention_days`, 90 days by default), and they are no substitute for a commit. Commit anything you would be unhappy to lose.
 
+## Search and Export
+
+The search box at the top of the conversation finds text across the sessions of the current working folder. Type and matches appear live, each with the session title and a short snippet. Choosing one opens that session and scrolls to the matching message. Search is a plain text search — it is not code search and it is not semantic — and it defaults to the current folder, because a session from another folder can contain that folder's file contents. Search only ever reads the session log; it never changes a session.
+
+Each session in the folder list has an export button (↓) that saves the conversation as Markdown. Exports contain the title, the time range, the conversation in order, what each task came to, the plan steps and their evidence, and token and cost totals.
+
+**Exports are redacted.** A session stores exactly what was said, so that a rewind can restore it faithfully; that same fidelity is why the stored log is not safe to copy out as-is. Every export runs the secret scanner over the conversation and states at the top how many secrets it removed. The number is not silently applied: if a transcript says it removed three secrets, three secrets were replaced with `[REDACTED_…]` and are not in the file. Searching finds a secret-shaped string without showing it — the snippet is redacted too.
+
+An export is a one-way record. It cannot be imported back, and it never leaves your machine on its own: the file is saved wherever your browser's save dialog puts it, and no request is made to anywhere but Damaian itself.
+
 ## After a Crash
 
 If Damaian stops while a turn is in flight — a crash, a force quit, a machine that lost power — the turn is not lost silently. When you reopen the session, a card at the top of the conversation says what was actually happening: "A patch application was in progress and its outcome is unknown", "Reading a file was interrupted before it finished". It never just says the session was interrupted, because what was in flight is what decides what can safely be done about it.

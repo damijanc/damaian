@@ -74,6 +74,17 @@
           <div class="thread-actions">
             <span id="chat-status" class="status-badge">Idle</span>
             <button
+              id="session-search-btn"
+              class="topbar-button search-button"
+              type="button"
+              aria-label="Search sessions"
+              aria-haspopup="menu"
+              aria-expanded="false"
+              title="Search sessions"
+            >
+              <span class="search-icon" aria-hidden="true"></span>
+            </button>
+            <button
               id="open-vscode-btn"
               class="topbar-button vscode-button"
               type="button"
@@ -113,6 +124,16 @@
             </button>
           </div>
         </header>
+
+        <div id="session-search-panel" class="session-search-panel" hidden>
+          <input
+            id="session-search-input"
+            type="search"
+            placeholder="Search sessions"
+            aria-label="Search sessions"
+          />
+          <div id="session-search-results" class="session-search-results"></div>
+        </div>
 
         <section id="chat-log" class="chat-log" aria-live="polite"></section>
 

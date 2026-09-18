@@ -1,6 +1,9 @@
 # Feature Spec: Session Search and Export
 
-Status: Not started
+Status: Done. Search, export, and redaction ship per
+[`tasks.md`](tasks.md); requirement 7's server-mode exclusion is live as a
+forward-looking `origin` field (always `"user"` until spec 52 writes a
+non-user origin), so the filter exists and excludes nothing yet.
 Order: 53 of 53
 Plan: `docs/PLAN/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 9 (Should). That directory is local-only and not committed, so the
