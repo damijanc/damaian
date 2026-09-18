@@ -79,6 +79,11 @@ pub fn upload_with_retry(payload: &str, attempts: u32) -> Result<(), String> {
 patch_touches = ["src/upload.rs"]
 approval_required = true
 patch_applied = false
+# Both of the above depend on the model choosing to propose an edit at all,
+# which the script decides here and the model decides in the live tier — where
+# it read the file and answered in prose instead, failing two assertions that
+# were never about the live tier. §5.3's mechanism, used as intended.
+deterministic_only = ["patch_touches", "approval_required"]
 # Navigating reads only. A changed file here would mean one of the three read
 # tools wrote something.
 files_changed_outside_patch = 0

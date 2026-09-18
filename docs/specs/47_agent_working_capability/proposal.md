@@ -379,24 +379,73 @@ Its assertions were falsified before being trusted: replacing the anchor with a
 string that occurs more than once refuses the edit and fails `patch_touches`
 and `approval_required`, and the harness exits non-zero.
 
-**What it does not measure, and what would.** Two things, both by construction,
-and neither is closed by adding more deterministic scenarios:
+**What it does not measure.** `absent_everywhere` reads the response, the
+context files, the run record and the audit trace; a tool result reaches none of
+them, so an assertion that a `search_content` over `secrets/` returned nothing
+would pass whatever the tool returned. The engine's own tests cover the
+behaviour (the redaction one mutation-tested); making the harness see tool
+results is its own change. Fewer rounds it cannot measure either, because the
+deterministic tier scripts every call — which is what §7.2 went to the live tier
+for.
 
-- **Fewer rounds.** The deterministic tier scripts every call, so the round
-  count is the script's and not the model's. The premise this spec was written
-  from — a session that ran out of tool rounds — is only measurable in the live
-  tier, and only as an A/B: the same scenarios run with the four tools offered
-  and with them suppressed, comparing `toolRounds` and `modelCalls`. A single
-  run against an older baseline cannot attribute a difference to this slice,
-  because #21, #48 and #53 moved the engine over the same period.
-- **Redaction and path policy inside a tool result.** `absent_everywhere` reads
-  the response, the context files, the run record and the audit trace; a tool
-  result reaches none of them, so the obvious assertion would pass whatever the
-  tool returned. The engine's own tests cover the behaviour (the redaction one
-  mutation-tested); making the harness see tool results is its own change.
+### 7.2 The live-tier A/B, measured 2026-09-18
 
-The A/B belongs **before** requirement 6 is built rather than after. Requirement
-6 is the continuation past the round cap, and how much it is needed depends on
-how often rounds still run out now that this slice has landed — measured
-afterwards, the two effects cannot be separated. §6 carries no measurement
-criterion today; adding one is the open decision.
+Run as an A/B rather than against an older baseline, because #21, #48 and #53
+moved the engine over the same period and a single after-number could not be
+attributed to this slice. The before arm is a worktree at the slice's parent
+commit and the after arm is `main`, so **no product code differs between the
+arms except the slice itself**; three runs each against `deepseek-v4-flash`,
+medians over the 14 scenarios both arms can run (`navigated_edit` exists only on
+the after side and is excluded).
+
+| | before | after | |
+|---|---|---|---|
+| tool calls | 29 | 55 | +90% |
+| model calls | 34 | 63 | +85% |
+| tokens | 92,876 | 191,729 | +106% |
+| tokens per model call | 2,850 | 3,043 | +7% |
+| scenarios completed | 14/14 | 13/14 | |
+| failed assertions | 4 | 4 | |
+
+**The premise as written is not supported.** This spec opens on a session that
+ran out of tool rounds and concludes the tool surface is the reason. On this
+scenario set the slice makes the model do *more*, and the token increase is
+almost entirely more calls rather than heavier ones — the +7% per call is the
+four extra tool definitions riding in every payload, which is a permanent
+structural cost paid by every turn whether or not it navigates.
+
+**What the slice does buy is visible in the tool mix**, summed over three runs
+each:
+
+| | before | after |
+|---|---|---|
+| `run_command` | 28 | 10 |
+| `search_codebase` | 31 | 1 |
+| `read_file` | 26 | 70 |
+| `list_directory` / `search_content` / `edit_file` | — | 34 / 31 / 8 |
+| outcomes `awaiting_approval` | **17** | **4** |
+
+The model stopped shelling out to navigate, and approval stops fell from 17 to
+4. That is requirement 2's actual claim — navigating the repository needs no
+`command_allowlist` entry — measured rather than argued. The slice trades tokens
+for human interruptions.
+
+**The measurement found a defect in the measurement.** `toolRounds` read
+identically — 18 — in all six runs, because it was counted from
+`scenario.turns`, and the live tier ignores the scripts. It described the
+scenario directory, not a model. Fixed to read the session log
+(`trace::tool_rounds`), delimited by the `model_call` marker that opens each
+round, so a provider emitting several tool calls in one message adds calls and
+not rounds — the distinction this A/B needed and could not make. Pinned by
+`tool_rounds_come_from_the_run_and_not_from_the_scenario_script`, which uses
+`failed_validation_retry`: one scripted turn, several real rounds, so the two
+sources disagree without needing a provider. Read the numbers above as tool
+calls and model calls; the rounds column of the original runs is not evidence.
+
+**What this does not settle.** All 14 scenarios are short — 1 to 8 calls — and
+the premise is about a long task that exhausts the round cap, which a short task
+cannot exhibit. So the result is "no benefit on short tasks, at a real cost",
+not "no benefit". Testing the premise needs one long-task scenario, deferred
+until Damaian is closer to production. Requirement 6's justification is weaker
+than when this spec was written, and should be re-argued from a long-task
+measurement rather than from the opening paragraph.

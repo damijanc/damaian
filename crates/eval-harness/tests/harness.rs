@@ -1451,6 +1451,48 @@ fn tool_calls_come_from_the_run_and_not_from_the_scenario_script() {
     );
 }
 
+/// A run record's tool *rounds* must describe the run, not the script — the
+/// same rule the test above enforces for tool calls, which `tool_rounds` was
+/// left out of.
+///
+/// It was `scenario.turns.iter().filter(|t| !t.tool_calls.is_empty()).count()`:
+/// a count of lines in a TOML file. In the live tier, which ignores the scripts,
+/// that made it a constant — the spec 47 A/B measured 18 rounds in all six runs,
+/// before and after, because 18 is a property of the scenario directory and not
+/// of anything a model did.
+///
+/// `failed_validation_retry` is where the two sources disagree without needing a
+/// provider: its script has one turn carrying tool calls, and the run dispatches
+/// a command that keeps failing until the retry bound stops it, each attempt in
+/// its own round.
+#[test]
+fn tool_rounds_come_from_the_run_and_not_from_the_scenario_script() {
+    let path = scenario::scenarios_dir().join("failed_validation_retry.toml");
+    let loaded = scenario::load(&path).expect("scenario");
+    let scripted = loaded
+        .turns
+        .iter()
+        .filter(|turn| !turn.tool_calls.is_empty())
+        .count() as u64;
+    let run = eval_harness::runner::run(&loaded).expect("deterministic run");
+
+    assert_eq!(scripted, 1, "the script carries one turn with tool calls");
+    assert_eq!(
+        run.record.tool_rounds,
+        run.record.tool_calls.len() as u64,
+        "every dispatched call in this scenario is its own round, so the two \
+         counts agree here; got {} rounds for {} calls",
+        run.record.tool_rounds,
+        run.record.tool_calls.len()
+    );
+    assert!(
+        run.record.tool_rounds > scripted,
+        "the run retried across several rounds, so the record must exceed the \
+         script's {scripted}, got {}",
+        run.record.tool_rounds
+    );
+}
+
 /// The error rate must count errors, not every outcome that is not `ok`.
 ///
 /// A tool failure is fed back to the model as a tool result and the marker

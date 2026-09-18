@@ -365,11 +365,10 @@ fn drive(
     // `model_response_completed` is NOT a substitute: it fires once per turn,
     // not once per call.
     run_record.model_calls = trace.count("model_request_prepared");
-    run_record.tool_rounds = scenario
-        .turns
-        .iter()
-        .filter(|turn| !turn.tool_calls.is_empty())
-        .count() as u64;
+    // From the session log for the same reason `tool_calls` is: counting the
+    // script's turns described the TOML file, which in the live tier is not
+    // even a description of the run. See `trace::tool_rounds`.
+    run_record.tool_rounds = trace::tool_rounds(&materialized.data_dir)?;
 
     // filesChanged is the union of what the engine says it wrote — never a walk
     // of the working tree, which would also catch git's own bookkeeping.

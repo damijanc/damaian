@@ -132,30 +132,10 @@ impl Trace {
 /// omitting it would hide a call that may well have been billed.
 ///
 /// `model_call` markers are excluded: they are not tool calls, and
-/// `model_calls` counts them separately.
+/// `model_calls` counts them separately — but see [`tool_rounds`], which needs
+/// them to know where one round ends and the next begins.
 pub fn tool_actions(data_dir: &Path) -> Result<Vec<RecordedToolCall>> {
-    let sessions = data_dir.join("sessions");
-    let Ok(entries) = std::fs::read_dir(&sessions) else {
-        // No session log means no turn ran — a refusal scenario is exactly
-        // that, so this is not an error.
-        return Ok(Vec::new());
-    };
-
-    let mut paths = Vec::new();
-    for entry in entries {
-        let path = entry
-            .map_err(|error| ClientError::Io(format!("{}: {error}", sessions.display())))?
-            .path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "jsonl")
-        {
-            paths.push(path);
-        }
-    }
-    // Sorted so a run with more than one session log produces a stable record
-    // rather than one that depends on directory order.
-    paths.sort();
+    let paths = session_log_paths(data_dir)?;
 
     let mut started = Vec::new();
     let mut outcomes: Vec<(String, String)> = Vec::new();
@@ -211,4 +191,83 @@ pub fn tool_actions(data_dir: &Path) -> Result<Vec<RecordedToolCall>> {
                 .unwrap_or_else(|| "unknown".to_string()),
         })
         .collect())
+}
+
+/// Rounds in which the run dispatched at least one tool, read from the session
+/// log for the same reason [`tool_actions`] is: the scenario script is not
+/// evidence of what happened.
+///
+/// This was counted from `scenario.turns` until spec 47's A/B, where it read
+/// identically in every live run — before and after the tool surface changed —
+/// because the live tier ignores the script entirely, so the number described
+/// the scenario directory rather than a model. In the deterministic tier it was
+/// merely redundant, except where the engine dispatches more rounds than the
+/// script has turns: a retried command is one scripted turn and several rounds.
+///
+/// A round is delimited by the `model_call` marker that opens it, and counts
+/// once however many tools it dispatched — so a provider that emits several
+/// tool calls in one message adds calls, not rounds, which is exactly the
+/// distinction the A/B needed and could not make. Tools dispatched before any
+/// `model_call` marker still open a round, so a count is never lost to an
+/// ordering this function did not expect.
+pub fn tool_rounds(data_dir: &Path) -> Result<u64> {
+    let paths = session_log_paths(data_dir)?;
+
+    let mut rounds = 0;
+    let mut counted_this_round = false;
+    for path in &paths {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
+        for line in text.lines() {
+            let Ok(serde_json::Value::Object(event)) = serde_json::from_str(line.trim()) else {
+                continue;
+            };
+            if event.get("eventType").and_then(|value| value.as_str()) != Some("action_started") {
+                continue;
+            }
+            let Some(payload) = event.get("payload").and_then(|value| value.as_object()) else {
+                continue;
+            };
+            let action = payload
+                .get("action")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if action == "model_call" {
+                counted_this_round = false;
+            } else if !counted_this_round {
+                rounds += 1;
+                counted_this_round = true;
+            }
+        }
+    }
+
+    Ok(rounds)
+}
+
+/// Every session log a run wrote, in a stable order.
+///
+/// Sorted so a run with more than one session log produces a stable record
+/// rather than one that depends on directory order.
+fn session_log_paths(data_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let sessions = data_dir.join("sessions");
+    let Ok(entries) = std::fs::read_dir(&sessions) else {
+        // No session log means no turn ran — a refusal scenario is exactly
+        // that, so this is not an error.
+        return Ok(Vec::new());
+    };
+
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| ClientError::Io(format!("{}: {error}", sessions.display())))?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }
