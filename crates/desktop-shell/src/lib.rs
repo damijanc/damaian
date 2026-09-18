@@ -9,14 +9,15 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use workspace_engine::{
     AgentPlanProposal, CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions,
-    ChatTurnResult, Config, CurlModelTransport, DataSchemaOutcome, GeneratedSecretWarning,
-    McpClient, McpServerConfig, McpTokenResolver, McpTransport, OpenAICompatibleAdapter,
-    PlanRevisionStep, ProcessRegistry, ProposedFilePatch, ResumeDecisionOptions, Session,
-    StepStatus, TaskPlan, TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink,
-    WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticReport, WebDiagnosticsRunner,
-    WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible, command_approval_prompt,
-    ensure_data_dir_schema, normalize_mcp_server_id, normalize_model_provider,
-    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    ChatTurnResult, Config, CurlModelTransport, DataSchemaOutcome, ExportFormat,
+    GeneratedSecretWarning, McpClient, McpServerConfig, McpTokenResolver, McpTransport,
+    OpenAICompatibleAdapter, PlanRevisionStep, ProcessRegistry, ProposedFilePatch,
+    ResumeDecisionOptions, SearchOptions, Session, StepStatus, TaskPlan, TaskUsage, TokenUsage,
+    TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticReport,
+    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible,
+    command_approval_prompt, ensure_data_dir_schema, normalize_mcp_server_id,
+    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
+    parse_mcp_transport, patch_diff_text,
 };
 
 mod keychain;
@@ -377,6 +378,78 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 &format!("{{\"sessions\":[{}]}}", sessions_json(&sessions)),
             )
         }
+        ("GET", "/api/session-search") => {
+            let query = required_param(&request, "query")?;
+            let whole_word = request.param("whole_word").as_deref() == Some("true");
+            let literal_phrase = request.param("literal").as_deref() != Some("false");
+            let max_results = request
+                .param("max")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(50);
+            let (engine, repository_id) = if request.param("scope").as_deref() == Some("all") {
+                (default_engine()?, None)
+            } else {
+                let repo = required_param(&request, "repo")?;
+                let engine = engine_for_repo(&repo)?;
+                let repository_id = engine
+                    .indexer
+                    .repository_id_for_path(&repo)
+                    .map_err(|error| error.to_string())?;
+                (engine, Some(repository_id))
+            };
+            let result = engine
+                .session_store
+                .search_sessions(
+                    repository_id.as_deref(),
+                    &query,
+                    SearchOptions {
+                        whole_word,
+                        literal_phrase,
+                        max_results,
+                    },
+                    &engine.scanner,
+                )
+                .map_err(|error| error.to_string())?;
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &serde_json::to_string(&result).map_err(|error| error.to_string())?,
+            )
+        }
+        ("GET", "/api/session-export") => {
+            let session_id = required_param(&request, "session_id")?;
+            let format =
+                request
+                    .param("format")
+                    .as_deref()
+                    .map_or(ExportFormat::Markdown, |value| match value {
+                        "json" => ExportFormat::Json,
+                        _ => ExportFormat::Markdown,
+                    });
+            let engine = default_engine()?;
+            let content = engine
+                .session_store
+                .export_session(&session_id, format, &engine.scanner)
+                .map_err(|error| error.to_string())?;
+            let (content_type, extension) = match format {
+                ExportFormat::Markdown => ("text/markdown; charset=utf-8", "md"),
+                ExportFormat::Json => ("application/json", "json"),
+            };
+            // The browser's save dialog is the path the user chose: the export
+            // writes nowhere itself and makes no network request.
+            let filename = export_filename(&engine, &session_id, extension)?;
+            let disposition = format!("content-disposition: attachment; filename=\"{filename}\"");
+            write_response_with_extra_headers(
+                stream,
+                &request,
+                200,
+                content_type,
+                &content,
+                &disposition,
+            )
+        }
         // The launch sweep behind `docs/specs/45_crash_recovery_prompt.md`. It
         // runs once per process; every call after the first serves the same
         // snapshot, minus tasks the user has since dealt with.
@@ -479,7 +552,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             };
             let messages = engine
                 .session_store
-                .read_messages(&session_id)
+                .read_messages_with_seq(&session_id)
                 .map_err(|error| error.to_string())?;
             // Message roles alone cannot say whether a turn was stopped, so the
             // task statuses ride along and the UI joins them by `taskId`.
@@ -3024,15 +3097,48 @@ fn sessions_json(sessions: &[Session]) -> String {
         .join(",")
 }
 
+fn export_filename(
+    engine: &WorkspaceEngine,
+    session_id: &str,
+    extension: &str,
+) -> Result<String, String> {
+    let title = engine
+        .session_store
+        .read_session(session_id)
+        .map_err(|error| error.to_string())?
+        .map(|session| session.title)
+        .unwrap_or_else(|| session_id.to_string());
+    let sanitized: String = title
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('_');
+    Ok(format!(
+        "{}.{extension}",
+        if sanitized.is_empty() {
+            session_id.to_string()
+        } else {
+            sanitized.to_string()
+        }
+    ))
+}
+
 fn session_json(session: &Session) -> String {
     format!(
-        "{{\"id\":\"{}\",\"repositoryId\":\"{}\",\"title\":\"{}\",\"createdAtMs\":{},\"updatedAtMs\":{},\"summary\":\"{}\"}}",
+        "{{\"id\":\"{}\",\"repositoryId\":\"{}\",\"title\":\"{}\",\"createdAtMs\":{},\"updatedAtMs\":{},\"summary\":\"{}\",\"origin\":\"{}\"}}",
         escape_json(&session.id),
         escape_json(&session.repository_id),
         escape_json(&session.title),
         session.created_at_ms,
         session.updated_at_ms,
-        escape_json(&session.summary)
+        escape_json(&session.summary),
+        escape_json(&session.origin)
     )
 }
 
@@ -3097,17 +3203,17 @@ fn task_states_json(
         .join(",")
 }
 
-fn messages_json(messages: &[ChatMessage]) -> String {
+fn messages_json(messages: &[(u64, ChatMessage)]) -> String {
     messages
         .iter()
-        .map(message_json)
+        .map(|(seq, message)| message_json(*seq, message))
         .collect::<Vec<_>>()
         .join(",")
 }
 
-fn message_json(message: &ChatMessage) -> String {
+fn message_json(seq: u64, message: &ChatMessage) -> String {
     format!(
-        "{{\"id\":\"{}\",\"sessionId\":\"{}\",\"taskId\":{},\"role\":\"{}\",\"content\":\"{}\",\"createdAtMs\":{}}}",
+        "{{\"id\":\"{}\",\"sessionId\":\"{}\",\"taskId\":{},\"role\":\"{}\",\"content\":\"{}\",\"createdAtMs\":{},\"seq\":{}}}",
         escape_json(&message.id),
         escape_json(&message.session_id),
         message
@@ -3117,7 +3223,8 @@ fn message_json(message: &ChatMessage) -> String {
             .unwrap_or_else(|| "null".to_string()),
         escape_json(&message.role),
         escape_json(&message.content),
-        message.created_at_ms
+        message.created_at_ms,
+        seq
     )
 }
 

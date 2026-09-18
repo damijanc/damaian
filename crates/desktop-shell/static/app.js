@@ -3214,6 +3214,7 @@ function renderMessages(messages, tasks = []) {
   );
   messages.forEach((message) => {
     const bubble = appendChatMessage(message.role, message.content);
+    if (message.seq) bubble.message.dataset.seq = message.seq;
     if (message.role === "user") {
       const checkpoint = sessionCheckpoints.find((entry) => entry.userMessageId === message.id);
       if (checkpoint) markMessageRewindable(bubble, checkpoint);
@@ -4357,7 +4358,22 @@ function renderProjectSession(projectPath, session) {
     }
   });
 
-  row.append(button, deleteButton);
+  const exportButton = document.createElement("button");
+  exportButton.type = "button";
+  exportButton.className = "project-session-export";
+  exportButton.textContent = "↓";
+  exportButton.title = `Export ${session.title}`;
+  exportButton.setAttribute("aria-label", `Export ${session.title}`);
+  exportButton.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    try {
+      await exportSessionDownload(session);
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+
+  row.append(button, deleteButton, exportButton);
   return row;
 }
 
@@ -4450,6 +4466,116 @@ function syncSessionListActive() {
       button.dataset.projectPath === repo() && button.dataset.sessionId === currentSessionId,
     );
   });
+}
+
+// Downloads a session's Markdown export through the browser's save dialog, which
+// is the "path the user chose" the export spec means: the shell writes nowhere
+// and makes no network request.
+async function exportSessionDownload(session) {
+  const path = `/api/session-export?session_id=${encodeURIComponent(session.id)}&format=markdown`;
+  await ensureDesktopApiReady();
+  const response = await fetch(apiUrl(path), withApiToken(path, {}));
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || response.statusText);
+  }
+  const filename =
+    exportFilenameFromDisposition(response.headers.get("content-disposition")) ||
+    `${session.title || session.id}.md`;
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+function exportFilenameFromDisposition(disposition) {
+  if (!disposition) return null;
+  const match = /filename="?([^";]+)"?/.exec(disposition);
+  return match ? match[1] : null;
+}
+
+function toggleSessionSearch() {
+  const panel = $("session-search-panel");
+  const button = $("session-search-btn");
+  const open = panel.hidden;
+  panel.hidden = !open;
+  button.setAttribute("aria-expanded", String(open));
+  if (open) {
+    $("session-search-input").value = "";
+    $("session-search-results").innerHTML = "";
+    $("session-search-input").focus();
+  }
+}
+
+async function runSessionSearch(query) {
+  const results = $("session-search-results");
+  if (!query.trim()) {
+    results.innerHTML = "";
+    return;
+  }
+  const repoPath = repo();
+  if (!repoPath) {
+    results.innerHTML = '<p class="project-session-empty">Select a repository first</p>';
+    return;
+  }
+  try {
+    const payload = await api(
+      `/api/session-search?repo=${encodeURIComponent(repoPath)}&query=${encodeURIComponent(query.trim())}`,
+    );
+    renderSessionSearchResults(payload);
+  } catch (error) {
+    results.innerHTML = "";
+    toast(error.message);
+  }
+}
+
+function renderSessionSearchResults(payload) {
+  const results = $("session-search-results");
+  results.innerHTML = "";
+  const hits = payload.hits || [];
+  if (!hits.length) {
+    const empty = document.createElement("p");
+    empty.className = "project-session-empty";
+    empty.textContent = "No matches";
+    results.append(empty);
+    return;
+  }
+  hits.forEach((hit) => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "session-search-hit";
+    const title = document.createElement("span");
+    title.className = "session-search-hit-title";
+    title.textContent = hit.sessionTitle;
+    const snippet = document.createElement("span");
+    snippet.className = "session-search-hit-snippet";
+    snippet.textContent = hit.snippet;
+    row.append(title, snippet);
+    row.addEventListener("click", () => {
+      void openSearchHit(hit);
+    });
+    results.append(row);
+  });
+  if (payload.capped) {
+    const note = document.createElement("p");
+    note.className = "project-session-empty";
+    note.textContent = "More results were cut off — narrow the search";
+    results.append(note);
+  }
+}
+
+async function openSearchHit(hit) {
+  $("session-search-panel").hidden = true;
+  $("session-search-btn").setAttribute("aria-expanded", "false");
+  await switchProject(repo(), { preferredSessionId: hit.sessionId, reloadSelected: false });
+  await loadSession(hit.sessionId);
+  const target = document.querySelector(`.message[data-seq="${hit.seq}"]`);
+  if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function diffStats(diff) {
@@ -5577,6 +5703,21 @@ $("open-vscode-btn").addEventListener("click", async () => {
 
 $("terminal-toggle-btn").addEventListener("click", () => {
   setTerminalOpen(!terminalOpen);
+});
+
+$("session-search-btn").addEventListener("click", () => {
+  toggleSessionSearch();
+});
+
+$("session-search-input").addEventListener("input", (event) => {
+  void runSessionSearch(event.target.value);
+});
+
+$("session-search-input").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    $("session-search-panel").hidden = true;
+    $("session-search-btn").setAttribute("aria-expanded", "false");
+  }
 });
 
 $("terminal-close-btn").addEventListener("click", () => {
