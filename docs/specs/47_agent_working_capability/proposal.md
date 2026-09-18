@@ -214,7 +214,7 @@ navigation tools are two more visitors. The existing index tests are the guard
 that the extraction changed no behaviour.
 
 `regex` becomes a direct dependency of `workspace-engine`. It is already in
-`Cargo.lock` transitively through `syntect` and `tokenizers`, under the same
+`Cargo.lock` transitively at 1.12.4 through `tokenizers`, under the same
 MIT/Apache-2.0 already on `deny.toml`'s allow-list, so this is the precedent
 [#46](../46_process_registry_and_orphan_sweep/proposal.md) set with `libc` and
 not a new supply-chain decision. The reason to take it rather than hand-roll a

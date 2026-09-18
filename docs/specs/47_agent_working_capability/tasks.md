@@ -31,7 +31,7 @@ MIT/Apache-2.0, both on `deny.toml`'s allow-list.
 | 1 · Extract the walk | Done | `tree_walk.rs` with a `WalkEvent` visitor; `ProjectIndexer::walk` deleted and `index_repository` now drives it through `add_file`, which was already factored out so nothing had to move. 1 new test. **Plan correction:** the plan named the skip reason `not_a_regular_file`; the index has always spelled it `not_regular_file` and its tests assert on it. Guarded by the 11 existing index tests, all green. |
 | 2 · Ranged reads | Done | `LineRange`, `ReadWindow`, and `FileRead.{line_range,total_lines,truncated_by}`; `max_read_lines` (400) added restrict-only with a new `restrict_only_limit` helper and a `parse_read_lines` that refuses 0. 4 new tests; byte cap mutation-tested (disabling it fails `a_few_enormous_lines_…`). **Plan deviation:** the plan's `range: Option<LineRange>` was wrong — `None` would have meant "capped" for `context_manager` too, silently shrinking what every task sees, and its own comment contradicted the code. Replaced with a three-variant `ReadWindow` so each call site states its intent: `Whole` (context assembly, keeps the original `max_file_bytes` refusal), `Default` (the tool, capped), `Range` (also capped, so a large range cannot step around the cap). Also needed `#[allow(clippy::too_many_arguments)]` with a reason. |
 | 3 · `list_directory` | Done | `navigation.rs` with `NavigationController` and `DirectoryListing`; a `tree_walk` visitor, `max_list_entries` (200) restrict-only. 3 new tests (8 in file). Restricted paths are checked **per entry**, not just on the starting directory, because a path can name a secret (`deploy/prod-key.pem`). **Beyond the plan:** added `repository_config_may_lower_the_navigation_caps_but_not_raise_them` to `repository_config_trust.rs` — no restrict-only key had a trust test at all, so an unclassed key would have been a silent hole. The `.env` fixture tests the restriction rather than the ignore rules: `.env` is in `DEFAULT_RESTRICTED_PATTERNS` and deliberately not in `DEFAULT_IGNORE_PATTERNS`. |
-| 4 · `search_content` | Not started | |
+| 4 · `search_content` | Done | `ContentMatch`/`ContentSearch` on `NavigationController`; `regex` promoted to a direct dependency (lockfile diff is **one line** — the edge only, no version change, no new packages); `max_search_matches` (50) and `max_match_line_chars` (500) restrict-only. 6 new tests, not the planned 5 — added `a_max_matches_argument_cannot_raise_the_configured_cap`, because asserting only that the argument is honoured would pass if it could also raise the cap. Redaction mutation-tested: replacing `redact(line)` with the raw line fails the secret test with the key visible. `cargo deny check` green. **Doc correction:** the proposal and context said `regex` arrives via `syntect` and `tokenizers`; `cargo tree -i regex` shows `tokenizers` only — `syntect` is built with `regex-fancy` and pulls `fancy-regex`. Both files corrected. |
 | 5 · `edit_file` splice | Not started | |
 | 6 · Wire the four tools | Not started | |
 | 7 · Acceptance criteria, docs, close the slice | Not started | |
@@ -730,7 +730,7 @@ Suggested subject: `List repository paths as a tool rather than a shell command`
 - Consumes: `NavigationController` from Task 3.
 - Produces: `search_content(root, pattern: &str, path_glob: Option<&str>, max_matches: Option<usize>, task_id, repository_id) -> Result<ContentSearch>`; `ContentSearch { matches: Vec<ContentMatch>, total_found: usize, files_searched: usize, truncated: bool }`; `ContentMatch { path: String, line: usize, text: String }`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -828,12 +828,12 @@ fn an_invalid_pattern_is_refused_with_the_compile_error() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools`
 Expected: FAIL to compile — no `search_content`.
 
-- [ ] **Step 3: Add the dependency and the config keys**
+- [x] **Step 3: Add the dependency and the config keys**
 
 `crates/workspace-engine/Cargo.toml`, in alphabetical position:
 
@@ -848,7 +848,7 @@ occur; if `cargo` wants to update the lockfile, stop and raise it.
 `max_search_matches: usize` (default `50`) and `max_match_line_chars: usize`
 (default `500`), both restrict-only, same six places as Task 2 Step 3.
 
-- [ ] **Step 4: Implement `search_content`**
+- [x] **Step 4: Implement `search_content`**
 
 1. `Regex::new(pattern)` — on `Err`, return `ClientError::InvalidInput(format!("Invalid search pattern: {error}"))`. Do this **before** walking, so a bad pattern costs no I/O.
 2. Resolve and check the root exactly as `list_directory` does.
@@ -870,17 +870,17 @@ occur; if `cargo` wants to update the lockfile, stop and raise it.
 Redact before trimming, never after: trimming first can cut a secret in half and
 leave a fragment the scanner no longer recognises.
 
-- [ ] **Step 5: Run the new tests**
+- [x] **Step 5: Run the new tests**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools`
 Expected: PASS, 13 tests in this file.
 
-- [ ] **Step 6: Mutation-test the redaction**
+- [x] **Step 6: Mutation-test the redaction**
 
 Replace `self.scanner.redact(line).text` with `line.to_string()` and re-run.
 `search_redacts_a_secret_it_would_otherwise_return` must fail. Restore it.
 
-- [ ] **Step 7: Targeted tests, fmt and clippy**
+- [x] **Step 7: Targeted tests, fmt and clippy**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools` — 13 tests, all
 passing. Then `cargo fmt --all -- --check`,
@@ -889,7 +889,7 @@ passing. Then `cargo fmt --all -- --check`,
 is the task that adds a dependency and it is the check that confirms `regex`'s
 license is already on the allow-list.
 
-- [ ] **Step 8: Show the change and the gate result, and ask before committing**
+- [x] **Step 8: Show the change and the gate result, and ask before committing**
 
 Suggested subject: `Search file contents as a tool, capped and redacted`
 

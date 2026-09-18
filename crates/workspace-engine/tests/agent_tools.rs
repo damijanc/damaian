@@ -318,3 +318,158 @@ fn listing_outside_the_repository_is_denied() {
         "got {error:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 4 · search_content (requirements 2 and 3)
+// ---------------------------------------------------------------------------
+
+/// The gap this closes: `search_codebase` finds *files* about a topic, so
+/// "where is `apply_overlay` wired" had no cheap answer. This finds call sites.
+#[test]
+fn search_finds_call_sites_with_line_numbers() {
+    let repo = temp_dir("search-basic");
+    write_fixture(&repo, "src/a.rs", "fn one() {}\nfn apply_overlay() {}\n");
+    write_fixture(&repo, "src/b.rs", "fn two() {\n    apply_overlay();\n}\n");
+    let config = test_config(&repo);
+    let nav = navigation_for(&repo, &config);
+
+    let found = nav
+        .search_content(&repo, "apply_overlay", None, None, None, None)
+        .unwrap();
+
+    assert_eq!(found.total_found, 2);
+    assert_eq!(found.matches[0].path, "src/a.rs");
+    assert_eq!(found.matches[0].line, 2);
+    assert_eq!(found.matches[1].path, "src/b.rs");
+    assert_eq!(found.matches[1].line, 2);
+    assert!(!found.truncated);
+}
+
+/// Requirement 2: redacted through `SecretScanner` on the same path as a read.
+///
+/// The fixture is deliberately a readable file, not `.env`:
+/// `DEFAULT_RESTRICTED_PATTERNS` covers `.env`, so a test using one would assert
+/// *refusal* while claiming to test *redaction*. Spec 18 Task 10 found that trap
+/// the hard way.
+#[test]
+fn search_redacts_a_secret_it_would_otherwise_return() {
+    let repo = temp_dir("search-secret");
+    write_fixture(
+        &repo,
+        "src/telemetry_config.rs",
+        "pub const TOKEN: &str = \"AKIAIOSFODNN7EXAMPLE\";\n",
+    );
+    let config = test_config(&repo);
+    let nav = navigation_for(&repo, &config);
+
+    let found = nav
+        .search_content(&repo, "TOKEN", None, None, None, None)
+        .unwrap();
+
+    assert_eq!(found.total_found, 1);
+    assert!(
+        !found.matches[0].text.contains("AKIAIOSFODNN7EXAMPLE"),
+        "a match line must be redacted before it leaves the engine: {:?}",
+        found.matches[0].text
+    );
+    assert!(found.matches[0].text.contains("[REDACTED_"));
+}
+
+#[test]
+fn search_caps_matches_and_says_what_it_cut() {
+    let repo = temp_dir("search-cap");
+    for n in 1..=100 {
+        write_fixture(&repo, &format!("src/m{n}.rs"), "let needle = 1;\n");
+    }
+    let config = Config {
+        max_search_matches: 50,
+        ..test_config(&repo)
+    };
+    let nav = navigation_for(&repo, &config);
+
+    let found = nav
+        .search_content(&repo, "needle", None, None, None, None)
+        .unwrap();
+
+    assert_eq!(found.matches.len(), 50);
+    assert_eq!(found.total_found, 100);
+    assert_eq!(found.files_searched, 100);
+    assert!(found.truncated);
+}
+
+/// A `max_matches` argument may ask for fewer than the configured cap, never
+/// more, or the cap would be advisory rather than a cap.
+#[test]
+fn a_max_matches_argument_cannot_raise_the_configured_cap() {
+    let repo = temp_dir("search-arg-cap");
+    for n in 1..=100 {
+        write_fixture(&repo, &format!("src/m{n}.rs"), "let needle = 1;\n");
+    }
+    let config = Config {
+        max_search_matches: 10,
+        ..test_config(&repo)
+    };
+    let nav = navigation_for(&repo, &config);
+
+    let raised = nav
+        .search_content(&repo, "needle", None, Some(90), None, None)
+        .unwrap();
+    let lowered = nav
+        .search_content(&repo, "needle", None, Some(3), None, None)
+        .unwrap();
+
+    assert_eq!(
+        raised.matches.len(),
+        10,
+        "an argument must not raise the cap"
+    );
+    assert_eq!(lowered.matches.len(), 3, "but it may ask for fewer");
+}
+
+#[test]
+fn an_overlong_match_line_is_trimmed() {
+    let repo = temp_dir("search-longline");
+    write_fixture(
+        &repo,
+        "src/min.js",
+        &format!("var needle={};\n", "x".repeat(4000)),
+    );
+    let config = Config {
+        max_match_line_chars: 500,
+        ..test_config(&repo)
+    };
+    let nav = navigation_for(&repo, &config);
+
+    let found = nav
+        .search_content(&repo, "needle", None, None, None, None)
+        .unwrap();
+
+    assert!(
+        found.matches[0].text.chars().count() <= 500,
+        "line was {} chars",
+        found.matches[0].text.chars().count()
+    );
+}
+
+/// The compile error reaches the model so it can correct the pattern in the
+/// same round, rather than being told only that something went wrong.
+#[test]
+fn an_invalid_pattern_is_refused_with_the_compile_error() {
+    let repo = temp_dir("search-badpattern");
+    write_fixture(&repo, "src/a.rs", "fn one() {}\n");
+    let config = test_config(&repo);
+    let nav = navigation_for(&repo, &config);
+
+    let error = nav
+        .search_content(&repo, "fn (one", None, None, None, None)
+        .unwrap_err();
+
+    assert!(
+        matches!(error, ClientError::InvalidInput(_)),
+        "got {error:?}"
+    );
+    assert!(
+        format!("{error}").contains("unclosed"),
+        "the compile error must reach the model: {error}"
+    );
+}

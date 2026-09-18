@@ -93,7 +93,9 @@ Checked because three of §5's questions assumed one of these existed:
   rejecting symlinks that canonicalize outside the root. Reusing it is not a
   preference, it is the only way the symlink check is not duplicated.
 - **No `regex` crate as a direct dependency** — but it *is* in `Cargo.lock`
-  transitively, through `syntect` and `tokenizers`. Promoting it is the same
+  transitively at 1.12.4, through `tokenizers`. (Not `syntect`: it is built with
+  the `regex-fancy` feature and pulls `fancy-regex` instead. Checked with
+  `cargo tree -i regex` while implementing.) Promoting it is the same
   move [#46](../46_process_registry_and_orphan_sweep/proposal.md) made with
   `libc`: already in the tree, already on `deny.toml`'s allow-list, no new
   license and no new download.

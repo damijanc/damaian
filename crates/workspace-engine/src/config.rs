@@ -152,6 +152,11 @@ pub struct Config {
     /// Paths `list_directory` returns before it truncates and says so.
     /// Restrict-only, same reasoning as `max_read_lines`.
     pub max_list_entries: usize,
+    /// Matches `search_content` returns before it truncates and says so.
+    pub max_search_matches: usize,
+    /// Characters of a matching line returned before it is trimmed, so one
+    /// minified line cannot fill the model's context on its own.
+    pub max_match_line_chars: usize,
     pub max_command_output_bytes: usize,
     pub allowed_roots: Vec<PathBuf>,
     pub ignore_patterns: Vec<String>,
@@ -519,6 +524,8 @@ impl Config {
             max_file_bytes,
             max_read_lines,
             max_list_entries,
+            max_search_matches,
+            max_match_line_chars,
             max_command_output_bytes,
             allowed_roots,
             ignore_patterns,
@@ -770,6 +777,24 @@ impl Config {
                 &mut self.max_list_entries,
                 value,
                 "max_list_entries",
+                trusted,
+                &mut rejected,
+            );
+        }
+        if let Some(value) = max_search_matches {
+            restrict_only_limit(
+                &mut self.max_search_matches,
+                value,
+                "max_search_matches",
+                trusted,
+                &mut rejected,
+            );
+        }
+        if let Some(value) = max_match_line_chars {
+            restrict_only_limit(
+                &mut self.max_match_line_chars,
+                value,
+                "max_match_line_chars",
                 trusted,
                 &mut rejected,
             );
@@ -1219,6 +1244,16 @@ impl Config {
         );
         push_line(
             &mut output,
+            "max_search_matches",
+            &self.max_search_matches.to_string(),
+        );
+        push_line(
+            &mut output,
+            "max_match_line_chars",
+            &self.max_match_line_chars.to_string(),
+        );
+        push_line(
+            &mut output,
             "max_command_output_bytes",
             &self.max_command_output_bytes.to_string(),
         );
@@ -1365,6 +1400,8 @@ impl Default for Config {
             // context budget; a bigger file is read by range instead.
             max_read_lines: 400,
             max_list_entries: 200,
+            max_search_matches: 50,
+            max_match_line_chars: 500,
             max_command_output_bytes: 1024 * 1024,
             allowed_roots: Vec::new(),
             ignore_patterns: DEFAULT_IGNORE_PATTERNS
@@ -1418,6 +1455,8 @@ pub struct ConfigOverlay {
     pub max_file_bytes: Option<u64>,
     pub max_read_lines: Option<usize>,
     pub max_list_entries: Option<usize>,
+    pub max_search_matches: Option<usize>,
+    pub max_match_line_chars: Option<usize>,
     pub max_command_output_bytes: Option<usize>,
     pub allowed_roots: Option<Vec<PathBuf>>,
     pub ignore_patterns: Option<Vec<String>>,
@@ -1556,6 +1595,10 @@ impl ConfigOverlay {
             "max_file_bytes" => self.max_file_bytes = Some(parse_u64(key, value)?),
             "max_read_lines" => self.max_read_lines = Some(parse_read_lines(key, value)?),
             "max_list_entries" => self.max_list_entries = Some(parse_read_lines(key, value)?),
+            "max_search_matches" => self.max_search_matches = Some(parse_read_lines(key, value)?),
+            "max_match_line_chars" => {
+                self.max_match_line_chars = Some(parse_read_lines(key, value)?)
+            }
             "max_command_output_bytes" => {
                 self.max_command_output_bytes = Some(parse_u64(key, value)? as usize)
             }
@@ -1745,6 +1788,12 @@ impl ConfigOverlay {
         }
         if let Some(value) = self.max_list_entries {
             push_line(&mut output, "max_list_entries", &value.to_string());
+        }
+        if let Some(value) = self.max_search_matches {
+            push_line(&mut output, "max_search_matches", &value.to_string());
+        }
+        if let Some(value) = self.max_match_line_chars {
+            push_line(&mut output, "max_match_line_chars", &value.to_string());
         }
         if let Some(value) = self.max_file_bytes {
             push_line(&mut output, "max_file_bytes", &value.to_string());
