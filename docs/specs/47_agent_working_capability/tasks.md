@@ -4,7 +4,7 @@
 
 **Implements:** [`proposal.md`](proposal.md) §5, requirements 1–4 · background and
 corrections in [`context.md`](context.md)
-**Started:** not yet
+**Started:** 2026-09-18
 
 **Goal:** Give the agent a working floor — reads that return a range instead of
 a whole file, listing and content search as tools, and edits whose payload is
@@ -28,7 +28,7 @@ MIT/Apache-2.0, both on `deny.toml`'s allow-list.
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · Extract the walk | Not started | |
+| 1 · Extract the walk | Done | `tree_walk.rs` with a `WalkEvent` visitor; `ProjectIndexer::walk` deleted and `index_repository` now drives it through `add_file`, which was already factored out so nothing had to move. 1 new test. **Plan correction:** the plan named the skip reason `not_a_regular_file`; the index has always spelled it `not_regular_file` and its tests assert on it. Guarded by the 11 existing index tests, all green. |
 | 2 · Ranged reads | Not started | |
 | 3 · `list_directory` | Not started | |
 | 4 · `search_content` | Not started | |
@@ -37,8 +37,14 @@ MIT/Apache-2.0, both on `deny.toml`'s allow-list.
 | 7 · Acceptance criteria, docs, close the slice | Not started | |
 
 **Baseline measured 2026-09-17:** `cargo nextest run --workspace --locked` is
-**652 passed, 16 skipped**. Expected count as tasks land, so a missing test is
-visible: 652 → 653 → 657 → 660 → 665 → 670 → 672 → 675.
+**652 passed, 16 skipped**, and takes about five minutes locally — see
+`OBSERVATIONS.md` entry 8 for why, and the Global Constraints for what that means
+for this plan.
+
+The running check per task is the count in `tests/agent_tools.rs` — 1, 5, 8, 13,
+18, 20, 23 as Tasks 1–7 land. Task 7 verifies the whole workspace once, at
+**675**. A task whose file count comes out wrong has a missing or duplicated
+test; find it then rather than at the end.
 
 ## Global Constraints
 
@@ -66,10 +72,18 @@ Every task's requirements implicitly include this section.
   seconds of waiting on `fseventsd` that no test here needs.
 - **Clippy warnings are errors.** Fix rather than suppress; an `#[allow(...)]`
   needs a comment saying why.
-- **Every quality-gate command from `AGENTS.md` must pass** at the end of every
-  task. That is seven commands and the list in `AGENTS.md` is authoritative —
-  read it, do not rely on a remembered list. `typos` and
-  `node --check crates/desktop-shell/static/app.js` are the two that get missed.
+- **Per task, run only the targeted tests; the full suite and the full gate run
+  once, in Task 7.** A local `cargo nextest run --workspace --locked` takes about
+  five minutes — it is 92% idle, blocked on `git` subprocesses in the checkpoint
+  object store (`OBSERVATIONS.md` entry 8), not something a faster machine or a
+  build cache fixes. Seven of them would be 35 minutes of waiting for a slice
+  that touches none of the slow suites. Each task below names the narrow command
+  to run instead.
+- **The gate still gates.** Nothing is called finished until every quality-gate
+  command from `AGENTS.md` has passed — that is seven commands, the list there is
+  authoritative, and `typos` and `node --check crates/desktop-shell/static/app.js`
+  are the two that get missed. Deferring them changes when they run, not whether.
+  If a task's narrow run goes red, stop there rather than carrying it forward.
 - **Commit messages:** one subject line, no body, no `Co-Authored-By`. Rationale
   belongs in this plan and the proposal. Never cite commit SHAs in
   documentation.
@@ -106,7 +120,7 @@ test of its own.
 **Interfaces:**
 - Produces: `tree_walk::walk(root: &Path, directory: &Path, relative_directory: &str, inherited_rules: &[IgnoreRule], visitor: &mut dyn FnMut(&WalkEvent) -> Result<()>) -> Result<()>`; `enum WalkEvent { File(WalkFile), Skipped(WalkSkip) }`; `WalkFile { relative_path: String, absolute_path: PathBuf }`; `WalkSkip { path: String, reason: String }`. Directories are recursed into, not reported — no caller in this slice needs them.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In a new `crates/workspace-engine/tests/agent_tools.rs`, with the same
 `temp_dir` / `write_fixture` / `test_config` helpers `foundation.rs` uses
@@ -148,12 +162,12 @@ fn the_walk_rejects_a_symlink_that_escapes_the_root() {
 }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools`
 Expected: FAIL to compile — `tree_walk` does not exist.
 
-- [ ] **Step 3: Write `tree_walk.rs`**
+- [x] **Step 3: Write `tree_walk.rs`**
 
 Move the body of `ProjectIndexer::walk` (`indexer.rs:250-330`) verbatim, replacing
 the two accumulators with one visitor. Do not change the order of the checks:
@@ -268,7 +282,7 @@ Add `pub mod tree_walk;` to `lib.rs` in alphabetical position (after
 `pub mod session;`... check: it sorts after `secret_scanner`, before any later
 module — place it to keep the list sorted).
 
-- [ ] **Step 4: Rewrite `ProjectIndexer::walk` as a caller**
+- [x] **Step 4: Rewrite `ProjectIndexer::walk` as a caller**
 
 The per-file work is already factored out as `ProjectIndexer::add_file`
 (`indexer.rs:332`), so nothing has to move: the visitor just calls it. Delete
@@ -305,10 +319,13 @@ closure while `self.add_file` also takes them, pass them in as the closure's
 captured `&mut` and call `add_file` on `self` — `add_file` takes `&self`, so
 there is no conflict. Do not restructure `add_file` to work around it.
 
-- [ ] **Step 5: Run the full suite to verify nothing moved**
+- [x] **Step 5: Run the index tests to verify nothing moved**
 
-Run: `cargo nextest run --workspace --locked`
-Expected: PASS, **653 tests** — the 652 baseline plus the one written in Step 1.
+Run: `cargo nextest run -p workspace-engine -E 'test(index) or test(walk)'`
+Expected: PASS, every index test plus the one written in Step 1.
+
+These are the tests that pin what the walk produces, so they are the ones that
+can detect a bad extraction. The full workspace run is deferred to Task 7.
 
 This task adds exactly one test because the existing index tests are the real
 assertion: they already pin what the walk produces, so an extraction that
@@ -319,11 +336,13 @@ If your count differs from 653, record the real number in the Progress table
 rather than adjusting the plan silently. A count that drifts without explanation
 is how a missing test hides.
 
-- [ ] **Step 6: Run the full quality gate**
+- [x] **Step 6: Run clippy and fmt on what you touched**
 
-All seven commands from `AGENTS.md`.
+`cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings`.
+These are fast and catch what the narrow test run cannot. The remaining five gate
+commands run once in Task 7.
 
-- [ ] **Step 7: Show the change and the gate result, and ask before committing**
+- [x] **Step 7: Show the change and the gate result, and ask before committing**
 
 Suggested subject: `Lift the tree walk out of the indexer so one walker serves both`
 
@@ -533,10 +552,11 @@ Delete the byte-trim loop from Step 4 and re-run. `a_few_enormous_lines_are_cut_
 must fail. Restore it and confirm it passes. A cap that no test can distinguish
 from its absence is not a cap.
 
-- [ ] **Step 7: Full suite and quality gate**
+- [ ] **Step 7: Targeted tests, fmt and clippy**
 
-Run: `cargo nextest run --workspace --locked` — expected **657**.
-Then all seven gate commands.
+Run: `cargo nextest run -p workspace-engine --test agent_tools` — 5 tests, all
+passing. Then `cargo fmt --all -- --check` and
+`cargo clippy --workspace --all-targets --locked -- -D warnings`.
 
 - [ ] **Step 8: Show the change and the gate result, and ask before committing**
 
@@ -688,10 +708,11 @@ restricted check still matters because a *path* can name a secret
 Run: `cargo nextest run -p workspace-engine --test agent_tools`
 Expected: PASS, 8 tests in this file.
 
-- [ ] **Step 6: Full suite and quality gate**
+- [ ] **Step 6: Targeted tests, fmt and clippy**
 
-Run: `cargo nextest run --workspace --locked` — expected **660**.
-Then all seven gate commands.
+Run: `cargo nextest run -p workspace-engine --test agent_tools` — 8 tests, all
+passing. Then `cargo fmt --all -- --check` and
+`cargo clippy --workspace --all-targets --locked -- -D warnings`.
 
 - [ ] **Step 7: Show the change and the gate result, and ask before committing**
 
@@ -859,11 +880,14 @@ Expected: PASS, 13 tests in this file.
 Replace `self.scanner.redact(line).text` with `line.to_string()` and re-run.
 `search_redacts_a_secret_it_would_otherwise_return` must fail. Restore it.
 
-- [ ] **Step 7: Full suite and quality gate**
+- [ ] **Step 7: Targeted tests, fmt and clippy**
 
-Run: `cargo nextest run --workspace --locked` — expected **665**.
-Then all seven gate commands, including `cargo deny check`, which is what
-confirms `regex`'s license is already on the allow-list.
+Run: `cargo nextest run -p workspace-engine --test agent_tools` — 13 tests, all
+passing. Then `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings`, and
+**`cargo deny check`** — run that one here rather than deferring it, because this
+is the task that adds a dependency and it is the check that confirms `regex`'s
+license is already on the allow-list.
 
 - [ ] **Step 8: Show the change and the gate result, and ask before committing**
 
@@ -1094,10 +1118,11 @@ Change `if count > 1` to `if count > 2` and re-run.
 This is the assertion the whole design rests on; a test that passes either way
 is worse than none.
 
-- [ ] **Step 6: Full suite and quality gate**
+- [ ] **Step 6: Targeted tests, fmt and clippy**
 
-Run: `cargo nextest run --workspace --locked` — expected **670**.
-Then all seven gate commands.
+Run: `cargo nextest run -p workspace-engine --test agent_tools` — 18 tests, all
+passing. Then `cargo fmt --all -- --check` and
+`cargo clippy --workspace --all-targets --locked -- -D warnings`.
 
 - [ ] **Step 7: Show the change and the gate result, and ask before committing**
 
@@ -1298,10 +1323,11 @@ reads, so they carry the notices:
 Run: `cargo nextest run -p workspace-engine --test agent_tools`
 Expected: PASS, 20 tests in this file.
 
-- [ ] **Step 7: Full suite and quality gate**
+- [ ] **Step 7: Targeted tests, fmt and clippy**
 
-Run: `cargo nextest run --workspace --locked` — expected **672**.
-Then all seven gate commands.
+Run: `cargo nextest run -p workspace-engine --test agent_tools` — 20 tests, all
+passing. Then `cargo fmt --all -- --check` and
+`cargo clippy --workspace --all-targets --locked -- -D warnings`.
 
 - [ ] **Step 8: Show the change and the gate result, and ask before committing**
 
@@ -1436,7 +1462,9 @@ rather than adjusting the expectation to whatever the test happens to find.
 
 - [ ] **Step 4: Run the full suite**
 
-Run: `cargo nextest run --workspace --locked` — expected **675**.
+Run: `cargo nextest run --workspace --locked` — expected **675**. This is the
+**one** full-suite run of the slice, so allow about five minutes for it and use a
+`timeout` of at least 600000. Every earlier task deferred to here.
 
 - [ ] **Step 5: Documentation**
 

@@ -29,6 +29,7 @@ mod render;
 pub mod repository_trust;
 pub mod secret_scanner;
 pub mod session;
+pub mod tree_walk;
 pub mod validation;
 pub mod vector_index;
 pub mod web_diagnostics;

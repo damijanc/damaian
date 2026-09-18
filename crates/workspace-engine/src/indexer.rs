@@ -2,7 +2,7 @@ use crate::audit::AuditLog;
 use crate::config::{Config, DEFAULT_IGNORE_PATTERNS};
 use crate::error::Result;
 use crate::hash::{now_millis, repository_id_for_root, sha256};
-use crate::ignore::{IgnoreRule, is_ignored_by_rules, parse_ignore_patterns};
+use crate::ignore::{is_ignored_by_rules, parse_ignore_patterns};
 use crate::language::{detect_language, extract_imports, extract_symbols};
 use crate::secret_scanner::SecretScanner;
 use std::collections::HashSet;
@@ -163,15 +163,26 @@ impl ProjectIndexer {
             self.config.ignore_patterns.clone()
         };
         let rules = parse_ignore_patterns(&default_patterns, "");
-        self.walk(
-            &root,
-            &root,
-            "",
-            &rules,
-            &repository_id,
-            &mut files,
-            &mut skipped,
-        )?;
+        // The traversal itself lives in `tree_walk` so the navigation tools of
+        // spec 47 share it rather than reimplementing the ignore and
+        // symlink-escape rules. This visitor is the index-building half that
+        // stayed behind.
+        crate::tree_walk::walk(&root, &root, "", &rules, &mut |event| match event {
+            crate::tree_walk::WalkEvent::Skipped(skip) => {
+                skipped.push(SkippedFile {
+                    path: skip.path.clone(),
+                    reason: skip.reason.clone(),
+                });
+                Ok(())
+            }
+            crate::tree_walk::WalkEvent::File(file) => self.add_file(
+                &repository_id,
+                &file.absolute_path,
+                &file.relative_path,
+                &mut files,
+                &mut skipped,
+            ),
+        })?;
 
         let index = RepositoryIndex {
             repository_id,
@@ -241,92 +252,6 @@ impl ProjectIndexer {
             &mut skipped,
         )?;
         Ok(files.into_iter().next())
-    }
-
-    // Recursive directory walk: carries both the position in the tree
-    // (root/directory/relative_directory), inherited ignore rules, and the two
-    // output accumulators down each level.
-    #[allow(clippy::too_many_arguments)]
-    fn walk(
-        &self,
-        root: &Path,
-        directory: &Path,
-        relative_directory: &str,
-        inherited_rules: &[IgnoreRule],
-        repository_id: &str,
-        files: &mut Vec<FileRecord>,
-        skipped: &mut Vec<SkippedFile>,
-    ) -> Result<()> {
-        let mut rules = inherited_rules.to_vec();
-        let gitignore_path = directory.join(".gitignore");
-        if let Ok(content) = fs::read_to_string(gitignore_path) {
-            let patterns = content
-                .lines()
-                .map(|line| line.to_string())
-                .collect::<Vec<_>>();
-            rules.extend(parse_ignore_patterns(&patterns, relative_directory));
-        }
-
-        let mut entries = fs::read_dir(directory)?.collect::<std::result::Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-
-        for entry in entries {
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            let relative_path = if relative_directory.is_empty() {
-                file_name
-            } else {
-                format!(
-                    "{relative_directory}/{}",
-                    entry.file_name().to_string_lossy()
-                )
-            };
-            let file_type = entry.file_type()?;
-            let is_directory = file_type.is_dir();
-
-            if is_ignored_by_rules(&rules, &relative_path, is_directory) {
-                skipped.push(SkippedFile {
-                    path: relative_path,
-                    reason: "ignored".to_string(),
-                });
-                continue;
-            }
-
-            if file_type.is_symlink() {
-                let resolved = fs::canonicalize(entry.path())?;
-                if !resolved.starts_with(root) {
-                    skipped.push(SkippedFile {
-                        path: relative_path,
-                        reason: "symlink_outside_root".to_string(),
-                    });
-                    continue;
-                }
-            }
-
-            if is_directory {
-                self.walk(
-                    root,
-                    &entry.path(),
-                    &relative_path,
-                    &rules,
-                    repository_id,
-                    files,
-                    skipped,
-                )?;
-                continue;
-            }
-
-            if !file_type.is_file() {
-                skipped.push(SkippedFile {
-                    path: relative_path,
-                    reason: "not_regular_file".to_string(),
-                });
-                continue;
-            }
-
-            self.add_file(repository_id, &entry.path(), &relative_path, files, skipped)?;
-        }
-
-        Ok(())
     }
 
     fn add_file(
