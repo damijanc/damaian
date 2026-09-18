@@ -106,8 +106,8 @@ pub use repository_trust::{
 };
 pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{
-    ActionMarker, ChatMessage, DanglingAction, PendingApprovalRef, Session, SessionStore, Task,
-    TaskStatus, TaskUsage,
+    ActionMarker, ChatMessage, DanglingAction, ExportFormat, PendingApprovalRef, SearchOptions,
+    Session, SessionSearchHit, SessionSearchResult, SessionStore, Task, TaskStatus, TaskUsage,
 };
 pub use validation::{
     CommandProposal, CommandRunRecord, CommandStore, ValidationOrchestrator,

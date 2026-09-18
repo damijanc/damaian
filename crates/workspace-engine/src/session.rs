@@ -2,6 +2,7 @@ use crate::audit::escape_json;
 use crate::error::Result;
 use crate::hash::{create_id, now_millis};
 use crate::model::{TokenUsage, UsageSource};
+use crate::secret_scanner::SecretScanner;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -163,6 +164,50 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
     pub created_at_ms: u128,
+}
+
+/// One match from [`SessionStore::search_sessions`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSearchHit {
+    pub session_id: String,
+    pub session_title: String,
+    /// The matching event's `seq`, the stable anchor to scroll to (§5.3).
+    pub seq: u64,
+    /// Surrounding text, redacted, with ellipses marking a cut.
+    pub snippet: String,
+    pub role: String,
+    pub created_at_ms: u128,
+    /// How many events in this session matched, so the ranking's second key is
+    /// visible to the caller rather than hidden inside the sort.
+    pub match_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSearchResult {
+    pub hits: Vec<SessionSearchHit>,
+    /// `true` when the result cap cut the list — stated, never silently applied.
+    pub capped: bool,
+    /// Torn lines skipped across every session searched (§5.2).
+    pub unreadable_lines: usize,
+}
+
+/// How [`SessionStore::search_sessions`] matches and caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// Match only on word boundaries rather than anywhere in the text.
+    pub whole_word: bool,
+    /// `true`: the query is one literal substring. `false`: the query is split
+    /// on whitespace and every term must appear (an AND of substrings).
+    pub literal_phrase: bool,
+    pub max_results: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Markdown,
+    Json,
 }
 
 /// Which stored proposal a task is waiting on, recorded alongside the
@@ -487,6 +532,17 @@ impl SessionStore {
             .filter(|event| event.event_type == "message_appended")
             .filter_map(parse_message_event)
             .collect())
+    }
+
+    /// [`Self::read_messages`] with each message's event `seq`, the stable anchor
+    /// a search hit scrolls to (§5.3). `seq` survives rewinds, where a rendered
+    /// list index does not.
+    pub fn read_messages_with_seq(&self, session_id: &str) -> Result<Vec<(u64, ChatMessage)>> {
+        let path = self.session_log_path(session_id);
+        let Ok(content) = fs::read_to_string(path) else {
+            return Ok(Vec::new());
+        };
+        Ok(messages_with_seq(&content))
     }
 
     /// The latest recorded status of every task in the session, keyed by task id.
@@ -1383,6 +1439,250 @@ impl SessionStore {
         Ok(latest_seq(&content))
     }
 
+    /// A bounded scan over the sessions of `repository_id` (or every session
+    /// when `None`), matching `message_appended` content and task titles through
+    /// spec 17's parse-first reader. Snippets are redacted by `scanner` before
+    /// they are returned, because storage is deliberately unredacted (§5.4).
+    pub fn search_sessions(
+        &self,
+        repository_id: Option<&str>,
+        query: &str,
+        options: SearchOptions,
+        scanner: &SecretScanner,
+    ) -> Result<SessionSearchResult> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(SessionSearchResult {
+                hits: Vec::new(),
+                capped: false,
+                unreadable_lines: 0,
+            });
+        }
+        let needles = search_needles(query, options.literal_phrase);
+        let mut grouped: Vec<(Session, Vec<SessionSearchHit>)> = Vec::new();
+        let mut unreadable_lines = 0;
+        // `list_sessions` is already recency-descending, so the scan reads the
+        // sessions a user most likely wants first — but the sort below re-ranks
+        // on match count, so the order here is only a hint.
+        for session in self.list_sessions(repository_id)? {
+            if session.origin != "user" {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(self.session_log_path(&session.id)) else {
+                continue;
+            };
+            let (events, discarded) = parsed_events(&content);
+            unreadable_lines += discarded;
+            let mut session_hits = Vec::new();
+            for event in &events {
+                let (haystack, role) = match event.event_type.as_str() {
+                    "message_appended" => (event.text("content"), event.text("role")),
+                    "task_created" => (event.text("userPrompt"), Some("task".to_string())),
+                    _ => continue,
+                };
+                let Some(haystack) = haystack else { continue };
+                let Some(match_start) = first_match(&haystack, &needles, options.whole_word) else {
+                    continue;
+                };
+                session_hits.push(SessionSearchHit {
+                    session_id: session.id.clone(),
+                    session_title: session.title.clone(),
+                    seq: event.seq,
+                    snippet: snippet_around(&haystack, match_start, scanner),
+                    role: role.unwrap_or_default(),
+                    created_at_ms: event.number("createdAtMs").unwrap_or(0),
+                    match_count: 0,
+                });
+            }
+            if !session_hits.is_empty() {
+                grouped.push((session, session_hits));
+            }
+        }
+        // Ranking is recency first, then match count, then title, so two
+        // identical searches over an unchanged corpus return the same order.
+        grouped.sort_by(|left, right| {
+            right
+                .0
+                .updated_at_ms
+                .cmp(&left.0.updated_at_ms)
+                .then(right.1.len().cmp(&left.1.len()))
+                .then(left.0.title.cmp(&right.0.title))
+        });
+        let total = grouped.iter().map(|(_, hits)| hits.len()).sum::<usize>();
+        let mut hits = Vec::with_capacity(total.min(options.max_results));
+        for (_session, mut session_hits) in grouped {
+            session_hits.sort_by_key(|hit| hit.seq);
+            let count = session_hits.len();
+            for mut hit in session_hits {
+                hit.match_count = count;
+                hits.push(hit);
+            }
+        }
+        let capped = hits.len() > options.max_results;
+        hits.truncate(options.max_results);
+        Ok(SessionSearchResult {
+            hits,
+            capped,
+            unreadable_lines,
+        })
+    }
+
+    /// Renders a session to Markdown or JSON, redacted on the way out with the
+    /// redaction count stated rather than silently applied (§5.4, §5.5).
+    pub fn export_session(
+        &self,
+        session_id: &str,
+        format: ExportFormat,
+        scanner: &SecretScanner,
+    ) -> Result<String> {
+        let Some(session) = self.read_session(session_id)? else {
+            return Err(crate::error::ClientError::InvalidInput(format!(
+                "Unknown session: {session_id}"
+            )));
+        };
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Err(crate::error::ClientError::InvalidInput(format!(
+                "Unknown session: {session_id}"
+            )));
+        };
+        let messages = messages_with_seq(&content);
+        let tasks = self.read_tasks(session_id)?;
+        let usage = self.read_task_usage(session_id)?;
+        let plans = self.read_session_plans(session_id)?;
+
+        let mut redaction_count = 0usize;
+        let mut redact = |text: &str| -> String {
+            let redaction = scanner.redact(text);
+            redaction_count += redaction.findings.len();
+            redaction.text
+        };
+
+        let rendered = match format {
+            ExportFormat::Markdown => {
+                let mut out = String::new();
+                out.push_str(&format!("# {}\n\n", redact(&session.title)));
+                out.push_str(&format!("- Repository: `{}`\n", session.repository_id));
+                out.push_str(&format!(
+                    "- Time range: {} ms → {} ms (epoch)\n",
+                    session.created_at_ms, session.updated_at_ms
+                ));
+                out.push_str("- Origin: user\n\n");
+                out.push_str("## Conversation\n\n");
+                for (_, message) in &messages {
+                    out.push_str(&format!(
+                        "### {}\n\n{}\n\n",
+                        message.role,
+                        redact(&message.content)
+                    ));
+                }
+                out.push_str("## Tasks\n\n");
+                for task in &tasks {
+                    out.push_str(&format!(
+                        "- {} — {}",
+                        task.status.as_str(),
+                        redact(&task.user_prompt)
+                    ));
+                    if let Some(total) = usage.get(&task.id) {
+                        out.push_str(&format!(
+                            " ({} in / {} out tokens{})",
+                            total.input_tokens,
+                            total.output_tokens,
+                            total
+                                .reported_cost
+                                .map(|cost| format!(", reported cost {cost}"))
+                                .unwrap_or_default()
+                        ));
+                    }
+                    out.push('\n');
+                    if let Some(plan) = plans.get(&task.id) {
+                        for step in &plan.steps {
+                            out.push_str(&format!(
+                                "  - [{}] {}\n",
+                                format!("{:?}", step.status).to_lowercase(),
+                                redact(&step.title)
+                            ));
+                            for evidence in &step.evidence {
+                                out.push_str(&format!(
+                                    "    - {}\n",
+                                    serde_json::to_string(evidence).unwrap_or_default()
+                                ));
+                            }
+                        }
+                    }
+                }
+                out
+            }
+            ExportFormat::Json => {
+                let messages: Vec<serde_json::Value> = messages
+                    .iter()
+                    .map(|(seq, message)| {
+                        serde_json::json!({
+                            "seq": seq,
+                            "role": message.role,
+                            "content": redact(&message.content),
+                            "taskId": message.task_id,
+                            "createdAtMs": message.created_at_ms,
+                        })
+                    })
+                    .collect();
+                let tasks: Vec<serde_json::Value> = tasks
+                    .iter()
+                    .map(|task| {
+                        serde_json::json!({
+                            "id": task.id,
+                            "status": task.status.as_str(),
+                            "userPrompt": redact(&task.user_prompt),
+                            "modelProvider": task.model_provider,
+                            "modelName": task.model_name,
+                            "usage": usage.get(&task.id).map(|total| serde_json::json!({
+                                "inputTokens": total.input_tokens,
+                                "outputTokens": total.output_tokens,
+                                "source": total.source,
+                                "reportedCost": total.reported_cost,
+                                "runCount": total.run_count,
+                            })),
+                            "plan": plans.get(&task.id).map(|plan| serde_json::json!({
+                                "createdAtMs": plan.created_at_ms,
+                                "steps": plan.steps.iter().map(|step| serde_json::json!({
+                                    "id": step.id,
+                                    "title": redact(&step.title),
+                                    "detail": step.detail.as_ref().map(|d| redact(d)),
+                                    "status": step.status,
+                                    "evidence": step.evidence,
+                                })).collect::<Vec<_>>(),
+                            })),
+                        })
+                    })
+                    .collect();
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "redacted": true,
+                    "redactionCount": redaction_count,
+                    "session": {
+                        "id": session.id,
+                        "repositoryId": session.repository_id,
+                        "title": session.title,
+                        "createdAtMs": session.created_at_ms,
+                        "updatedAtMs": session.updated_at_ms,
+                        "origin": session.origin,
+                    },
+                    "messages": messages,
+                    "tasks": tasks,
+                }))
+                .unwrap_or_default()
+            }
+        };
+
+        // The notice goes last in Markdown (header carries no count) and is a
+        // field in JSON, so both state the count. Reuse `redact` is done; read
+        // the tally once.
+        match format {
+            ExportFormat::Markdown => Ok(format!(
+                "{rendered}\n---\nThis export was redacted: {redaction_count} secret(s) removed.\n"
+            )),
+            ExportFormat::Json => Ok(rendered),
+        }
+    }
+
     /// Moves the active conversation back to `through_event_seq` by appending a
     /// marker, never by rewriting the log: tasks are replayed from these events
     /// and the log is the audit trail. Events after the marker stay on disk,
@@ -1662,4 +1962,90 @@ fn parse_message_event(event: &SessionEvent) -> Option<ChatMessage> {
         content: event.text("content")?,
         created_at_ms: event.number("createdAtMs")?,
     })
+}
+
+/// The active conversation's messages with their event `seq`, for export's JSON
+/// and for a search hit's anchor. Mirrors [`SessionStore::read_messages`] but
+/// keeps the `seq` that method drops.
+fn messages_with_seq(content: &str) -> Vec<(u64, ChatMessage)> {
+    active_events(content)
+        .iter()
+        .filter(|event| event.event_type == "message_appended")
+        .filter_map(|event| parse_message_event(event).map(|message| (event.seq, message)))
+        .collect()
+}
+
+/// The case-insensitive substrings a query is split into: one literal phrase, or
+/// every whitespace-separated term (an AND of substrings).
+fn search_needles(query: &str, literal_phrase: bool) -> Vec<String> {
+    if literal_phrase {
+        vec![query.to_ascii_lowercase()]
+    } else {
+        query
+            .split_whitespace()
+            .map(|term| term.to_ascii_lowercase())
+            .collect()
+    }
+}
+
+/// The byte offset of the earliest match, or `None` when any needle is absent.
+///
+/// ASCII case-folding keeps byte offsets identical between `text` and its
+/// lowercase copy, so the returned offset indexes `text` directly.
+fn first_match(text: &str, needles: &[String], whole_word: bool) -> Option<usize> {
+    if needles.is_empty() {
+        return None;
+    }
+    let lower = text.to_ascii_lowercase();
+    let mut earliest: Option<usize> = None;
+    for needle in needles {
+        let mut from = 0;
+        let mut found = false;
+        while let Some(relative) = lower[from..].find(needle.as_str()) {
+            let start = from + relative;
+            if whole_word && !on_word_boundaries(&lower, start, needle.len()) {
+                from = start + 1;
+                continue;
+            }
+            earliest = Some(earliest.map_or(start, |current| current.min(start)));
+            found = true;
+            break;
+        }
+        if !found {
+            return None;
+        }
+    }
+    earliest
+}
+
+fn on_word_boundaries(text: &str, start: usize, len: usize) -> bool {
+    let before = start == 0 || {
+        text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_alphanumeric() && character != '_')
+    };
+    let after = start + len >= text.len() || {
+        text[start + len..]
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_alphanumeric() && character != '_')
+    };
+    before && after
+}
+
+/// A redacted window of text around `match_start`, with ellipses marking a cut.
+fn snippet_around(text: &str, match_start: usize, scanner: &SecretScanner) -> String {
+    const WINDOW_CHARS: usize = 60;
+    let char_index = text[..match_start].chars().count();
+    let start = char_index.saturating_sub(WINDOW_CHARS);
+    let end = (char_index + WINDOW_CHARS).min(text.chars().count());
+    let mut snippet: String = text.chars().skip(start).take(end - start).collect();
+    if start > 0 {
+        snippet.insert(0, '…');
+    }
+    if end < text.chars().count() {
+        snippet.push('…');
+    }
+    scanner.redact(&snippet).text
 }
