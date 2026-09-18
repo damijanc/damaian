@@ -362,3 +362,41 @@ order of consequence.
    `edits` array, so one call can propose several anchored edits and they compose
    against each other rather than each being spliced against the on-disk file
    independently — which would silently drop all but the last edit to one file.
+
+### 7.1 Eval coverage, added after the slice closed
+
+The slice shipped with no [#18](../18_local_evaluation_harness/proposal.md)
+scenario, which meant the four tools could stop being offered and every eval
+would still pass. `navigated_edit` closes that: the same task as
+`one_file_patch` — give the upload client a retry — reached by listing,
+searching and a ranged read instead of being handed the path, and answered with
+an anchored region instead of whole-file content. It asserts the same four
+things `one_file_patch` does, which is requirement 4's claim that a region edit
+is indistinguishable downstream, not duplication. Fifteen scenarios now; two
+count guards in `tests/harness.rs` assert it.
+
+Its assertions were falsified before being trusted: replacing the anchor with a
+string that occurs more than once refuses the edit and fails `patch_touches`
+and `approval_required`, and the harness exits non-zero.
+
+**What it does not measure, and what would.** Two things, both by construction,
+and neither is closed by adding more deterministic scenarios:
+
+- **Fewer rounds.** The deterministic tier scripts every call, so the round
+  count is the script's and not the model's. The premise this spec was written
+  from — a session that ran out of tool rounds — is only measurable in the live
+  tier, and only as an A/B: the same scenarios run with the four tools offered
+  and with them suppressed, comparing `toolRounds` and `modelCalls`. A single
+  run against an older baseline cannot attribute a difference to this slice,
+  because #21, #48 and #53 moved the engine over the same period.
+- **Redaction and path policy inside a tool result.** `absent_everywhere` reads
+  the response, the context files, the run record and the audit trace; a tool
+  result reaches none of them, so the obvious assertion would pass whatever the
+  tool returned. The engine's own tests cover the behaviour (the redaction one
+  mutation-tested); making the harness see tool results is its own change.
+
+The A/B belongs **before** requirement 6 is built rather than after. Requirement
+6 is the continuation past the round cap, and how much it is needed depends on
+how often rounds still run out now that this slice has landed — measured
+afterwards, the two effects cannot be separated. §6 carries no measurement
+criterion today; adding one is the open decision.

@@ -41,6 +41,11 @@ API keys under your control.
 - **Organize work by project.** A Projects sidebar groups chat sessions by
   folder, and your project list and last-used folder are remembered between
   launches.
+- **Find an old session, and take one with you.** Search the text of every
+  session in the current folder, jump straight to the matching message, and
+  export a whole conversation as Markdown. Exports are secret-redacted and say
+  at the top how many secrets were removed, so what you share is not what the
+  session stored.
 - **Hand off to your editor.** Open the current folder in Visual Studio Code, or
   use the built-in bottom terminal panel, in one click.
 - **Keep secrets safe.** Detected credentials are redacted from context, command

@@ -210,6 +210,7 @@ Because that file arrives with a clone, a repository can only make Damaian *more
 - The `require_approval_for_*` flags can be turned on by a repository, not off. MCP and individual MCP servers can be turned off, not on.
 - `command_allowlist` is never taken from repository config; `Allow Always` writes to your own config instead. See [Chat](#chat).
 - Budgets and preferences — `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, and the `agent_*` round limits — apply as written.
+- The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — can be lowered by a repository but never raised. They bound how much of your repository a single tool call puts into a model request, so raising one would widen what leaves your machine. A repository that tries is told to you like any other rejected key.
 
 ## Model Providers and API Keys
 

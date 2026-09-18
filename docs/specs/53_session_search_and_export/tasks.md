@@ -96,7 +96,7 @@ origin.
   `cargo nextest run -p workspace-engine --test foundation` and
   `cargo clippy -p workspace-engine --all-targets`.
 
-- [ ] **Step 6: Show the change and ask before committing**
+- [x] **Step 6: Show the change and ask before committing**
 
   Suggested subject line: `Record a session's origin so server-mode sessions can be filtered`
 
@@ -140,7 +140,7 @@ silently applying.
 
   `cargo nextest run -p workspace-engine --test session_search_export` and clippy.
 
-- [ ] **Step 4: Show the change and ask before committing**
+- [x] **Step 4: Show the change and ask before committing**
 
   Suggested subject line: `Search sessions by text through the append-only log`
 
@@ -176,7 +176,7 @@ Markdown and JSON, both redacted, both carrying the redaction notice and count.
 
   `cargo nextest run -p workspace-engine --test session_search_export` and clippy.
 
-- [ ] **Step 4: Show the change and ask before committing**
+- [x] **Step 4: Show the change and ask before committing**
 
   Suggested subject line: `Export a session to Markdown and JSON, redacted with a count`
 
@@ -204,7 +204,7 @@ Markdown and JSON, both redacted, both carrying the redaction notice and count.
   `cargo clippy -p desktop-shell --all-targets` and a manual curl against a
   `DAMAIAN_DATA_DIR=.damaian` instance.
 
-- [ ] **Step 3: Show the change and ask before committing**
+- [x] **Step 3: Show the change and ask before committing**
 
   Suggested subject line: `Serve session search and export over the shell`
 
@@ -230,7 +230,7 @@ Markdown and JSON, both redacted, both carrying the redaction notice and count.
 
   `node --check crates/desktop-shell/static/app.js` and `npm run lint:web`.
 
-- [ ] **Step 4: Show the change and ask before committing**
+- [x] **Step 4: Show the change and ask before committing**
 
   Suggested subject line: `Add session search and export to the web UI`
 
