@@ -66,6 +66,10 @@ enum ActionOutcome {
     /// error, a browser diagnostic that could not run. Not a command, so there
     /// is no exit code to carry.
     Failed,
+    /// A stop reached a concurrent batch before this call started, so it did
+    /// nothing. Distinct from `Failed`: nothing was attempted, and the turn is
+    /// about to end cancelled rather than treat the tool as having errored.
+    Cancelled,
 }
 
 /// The evidence an arm's outcome supports, or `None` where the engine observed
@@ -97,7 +101,7 @@ fn evidence_for(outcome: &ActionOutcome, marker_id: &str) -> Option<crate::plan:
             path: path.clone(),
             hash: hash.clone(),
         }),
-        ActionOutcome::Ok | ActionOutcome::Failed => None,
+        ActionOutcome::Ok | ActionOutcome::Failed | ActionOutcome::Cancelled => None,
     }
 }
 
@@ -1772,7 +1776,13 @@ impl ChatOrchestrator {
                     .iter()
                     .all(|(_, action)| action_is_batchable_read_only(action))
             {
-                Some(self.run_read_only_batch(repository_root, &session, &task, &calls_this_round))
+                Some(self.run_read_only_batch(
+                    repository_root,
+                    &session,
+                    &task,
+                    &calls_this_round,
+                    sink.cancel,
+                ))
             } else {
                 None
             };
@@ -2411,6 +2421,16 @@ impl ChatOrchestrator {
                         ),
                     }
                     };
+                // Defensive: the top-of-loop check normally catches a stop
+                // before the marker is even started, so a cancelled batch result
+                // is rare. If one arrives, close the marker cleanly and let the
+                // turn end cancelled rather than record a result for a call that
+                // did nothing.
+                if action_outcome == ActionOutcome::Cancelled {
+                    self.session_store
+                        .finish_action(action_marker, "cancelled")?;
+                    break;
+                }
                 // Accrued before the marker is consumed, since the marker id is
                 // what ties this evidence back to the action in the log. Evidence
                 // belongs to whichever step is open; with no plan there is nothing
@@ -2437,6 +2457,11 @@ impl ChatOrchestrator {
                     ActionOutcome::Failed => {
                         self.session_store.finish_action(action_marker, "failed")?
                     }
+                    // Unreachable after the early break above, kept so the
+                    // match stays exhaustive if that guard ever changes.
+                    ActionOutcome::Cancelled => self
+                        .session_store
+                        .finish_action(action_marker, "cancelled")?,
                 }
 
                 // Persist the tool call and its result so later turns in this
@@ -2914,12 +2939,20 @@ impl ChatOrchestrator {
         session: &Session,
         task: &Task,
         actions: &[DecodedCall],
+        cancel: &CancelToken,
     ) -> Vec<(String, String, ActionOutcome)> {
         std::thread::scope(|scope| {
             let handles: Vec<_> = actions
                 .iter()
                 .map(|(_, action)| {
                     scope.spawn(move || {
+                        // Requirement 8: a stop cancels every call that has not
+                        // started. A read already in flight is not interrupted
+                        // — it is a bounded local read and takes no cancel token
+                        // — but no call begins after this check.
+                        if cancel.is_cancelled() {
+                            return (String::new(), String::new(), ActionOutcome::Cancelled);
+                        }
                         self.dispatch_read_only_action(repository_root, session, task, action)
                     })
                 })
@@ -4413,6 +4446,191 @@ mod evidence_tests {
             !bounded
                 .iter()
                 .any(|message| message.content.contains("elided"))
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Requirement 8's concurrent batch, at the level the turn calls it
+    // -----------------------------------------------------------------
+
+    fn batch_repo(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("damaian-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
+        fs::write(dir.join("src/b.rs"), "pub fn beta() {}\n").unwrap();
+        dir
+    }
+
+    fn batch_engine(repo: &Path) -> crate::workspace_engine::WorkspaceEngine {
+        crate::workspace_engine::WorkspaceEngine::new(Config {
+            data_dir: repo.join(".damaian"),
+            enable_index_watcher: false,
+            ..Config::default()
+        })
+    }
+
+    fn batch_session() -> Session {
+        Session {
+            id: "session-1".to_string(),
+            repository_id: "repo-1".to_string(),
+            title: "batch".to_string(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            summary: String::new(),
+            origin: "user".to_string(),
+        }
+    }
+
+    fn batch_task() -> Task {
+        Task {
+            id: "task-1".to_string(),
+            session_id: "session-1".to_string(),
+            status: TaskStatus::PreparingContext,
+            user_prompt: "batch".to_string(),
+            model_provider: "mock".to_string(),
+            model_name: "mock".to_string(),
+            created_at_ms: 0,
+            completed_at_ms: None,
+        }
+    }
+
+    fn two_reads() -> Vec<DecodedCall> {
+        vec![
+            (
+                None,
+                ToolAction::ReadFile {
+                    path: "src/a.rs".to_string(),
+                    range: None,
+                },
+            ),
+            (
+                None,
+                ToolAction::ReadFile {
+                    path: "src/b.rs".to_string(),
+                    range: None,
+                },
+            ),
+        ]
+    }
+
+    /// Requirement 8: the concurrent batch must be byte-identical to the same
+    /// calls dispatched one after another, in the model's order. This is the
+    /// "comparing a concurrent run against a sequential one" half of the
+    /// acceptance criterion, and it is exact rather than timing-based.
+    #[test]
+    fn a_read_only_batch_matches_a_sequential_dispatch() {
+        let repo = batch_repo("batch-equivalence");
+        let engine = batch_engine(&repo);
+        let orchestrator = &engine.chat_orchestrator;
+        let session = batch_session();
+        let task = batch_task();
+        let actions = two_reads();
+
+        let sequential: Vec<_> = actions
+            .iter()
+            .map(|(_, action)| {
+                orchestrator.dispatch_read_only_action(&repo, &session, &task, action)
+            })
+            .collect();
+        let concurrent =
+            orchestrator.run_read_only_batch(&repo, &session, &task, &actions, &CancelToken::new());
+
+        assert_eq!(
+            sequential, concurrent,
+            "concurrent results must equal sequential ones, in the same order"
+        );
+    }
+
+    /// Requirement 8: a stop cancels every call in the batch that has not
+    /// started. Deterministic here because the token is set before the batch
+    /// runs, so every thread checks it first; no `file_read` audit entry may be
+    /// written. An already in-flight read is still not interruptible, which the
+    /// method's comment states rather than hides.
+    #[test]
+    fn a_cancelled_batch_dispatches_nothing() {
+        let repo = batch_repo("batch-cancelled");
+        let engine = batch_engine(&repo);
+        let orchestrator = &engine.chat_orchestrator;
+        let session = batch_session();
+        let task = batch_task();
+        let actions = two_reads();
+
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let results = orchestrator.run_read_only_batch(&repo, &session, &task, &actions, &cancel);
+
+        assert_eq!(
+            results.len(),
+            2,
+            "one result slot per call, so the turn can abandon them"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|(_, _, outcome)| *outcome == ActionOutcome::Cancelled),
+            "every call must report cancelled: {results:?}"
+        );
+        let audit =
+            fs::read_to_string(repo.join(".damaian/audit/events.jsonl")).unwrap_or_default();
+        assert!(
+            !audit.contains("file_read"),
+            "nothing may be read once the batch is cancelled: {audit}"
+        );
+    }
+
+    /// The timing half of requirement 8's first clause. It is `#[ignore]`d
+    /// because a wall-clock comparison is exactly the kind of assertion that
+    /// flakes under load, and the exact sequential-equals-concurrent test above
+    /// is the real gate. Run it by hand:
+    ///
+    /// ```sh
+    /// cargo test -p workspace-engine --lib -- --ignored --exact \
+    ///   chat::evidence_tests::a_concurrent_batch_is_faster_than_a_sequential_search
+    /// ```
+    #[test]
+    #[ignore]
+    fn a_concurrent_batch_is_faster_than_a_sequential_search() {
+        let repo = batch_repo("batch-timing");
+        for index in 0..2000 {
+            fs::write(
+                repo.join("src").join(format!("f{index}.rs")),
+                "let needle = 1;\n",
+            )
+            .unwrap();
+        }
+        let engine = batch_engine(&repo);
+        let orchestrator = &engine.chat_orchestrator;
+        let session = batch_session();
+        let task = batch_task();
+        let actions: Vec<DecodedCall> = (0..4)
+            .map(|_| {
+                (
+                    None,
+                    ToolAction::SearchContent {
+                        pattern: "needle".to_string(),
+                        path_glob: None,
+                        max_matches: None,
+                    },
+                )
+            })
+            .collect();
+
+        let sequential_start = std::time::Instant::now();
+        for (_, action) in &actions {
+            orchestrator.dispatch_read_only_action(&repo, &session, &task, action);
+        }
+        let sequential = sequential_start.elapsed();
+
+        let concurrent_start = std::time::Instant::now();
+        orchestrator.run_read_only_batch(&repo, &session, &task, &actions, &CancelToken::new());
+        let concurrent = concurrent_start.elapsed();
+
+        eprintln!("sequential {sequential:?}, concurrent {concurrent:?}");
+        assert!(
+            concurrent < sequential,
+            "four concurrent searches should beat four sequential ones: \
+             concurrent {concurrent:?} vs sequential {sequential:?}"
         );
     }
 }
