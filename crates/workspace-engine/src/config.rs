@@ -149,6 +149,9 @@ pub struct Config {
     /// because raising it pulls more of the user's files into a model request
     /// than the user chose to allow.
     pub max_read_lines: usize,
+    /// Paths `list_directory` returns before it truncates and says so.
+    /// Restrict-only, same reasoning as `max_read_lines`.
+    pub max_list_entries: usize,
     pub max_command_output_bytes: usize,
     pub allowed_roots: Vec<PathBuf>,
     pub ignore_patterns: Vec<String>,
@@ -515,6 +518,7 @@ impl Config {
             data_dir,
             max_file_bytes,
             max_read_lines,
+            max_list_entries,
             max_command_output_bytes,
             allowed_roots,
             ignore_patterns,
@@ -757,6 +761,15 @@ impl Config {
                 &mut self.max_read_lines,
                 value,
                 "max_read_lines",
+                trusted,
+                &mut rejected,
+            );
+        }
+        if let Some(value) = max_list_entries {
+            restrict_only_limit(
+                &mut self.max_list_entries,
+                value,
+                "max_list_entries",
                 trusted,
                 &mut rejected,
             );
@@ -1201,6 +1214,11 @@ impl Config {
         );
         push_line(
             &mut output,
+            "max_list_entries",
+            &self.max_list_entries.to_string(),
+        );
+        push_line(
+            &mut output,
             "max_command_output_bytes",
             &self.max_command_output_bytes.to_string(),
         );
@@ -1346,6 +1364,7 @@ impl Default for Config {
             // 400 lines keeps an unranged read well inside the 16k default
             // context budget; a bigger file is read by range instead.
             max_read_lines: 400,
+            max_list_entries: 200,
             max_command_output_bytes: 1024 * 1024,
             allowed_roots: Vec::new(),
             ignore_patterns: DEFAULT_IGNORE_PATTERNS
@@ -1398,6 +1417,7 @@ pub struct ConfigOverlay {
     pub data_dir: Option<PathBuf>,
     pub max_file_bytes: Option<u64>,
     pub max_read_lines: Option<usize>,
+    pub max_list_entries: Option<usize>,
     pub max_command_output_bytes: Option<usize>,
     pub allowed_roots: Option<Vec<PathBuf>>,
     pub ignore_patterns: Option<Vec<String>>,
@@ -1535,6 +1555,7 @@ impl ConfigOverlay {
             "data_dir" => self.data_dir = Some(PathBuf::from(value)),
             "max_file_bytes" => self.max_file_bytes = Some(parse_u64(key, value)?),
             "max_read_lines" => self.max_read_lines = Some(parse_read_lines(key, value)?),
+            "max_list_entries" => self.max_list_entries = Some(parse_read_lines(key, value)?),
             "max_command_output_bytes" => {
                 self.max_command_output_bytes = Some(parse_u64(key, value)? as usize)
             }
@@ -1721,6 +1742,9 @@ impl ConfigOverlay {
         }
         if let Some(value) = self.max_read_lines {
             push_line(&mut output, "max_read_lines", &value.to_string());
+        }
+        if let Some(value) = self.max_list_entries {
+            push_line(&mut output, "max_list_entries", &value.to_string());
         }
         if let Some(value) = self.max_file_bytes {
             push_line(&mut output, "max_file_bytes", &value.to_string());

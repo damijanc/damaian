@@ -1264,3 +1264,27 @@ fn repository_scope_is_recognised_from_the_damaian_layout() {
     assert!(path.ends_with(Path::new(".damaian/config.conf")));
     let _ = fs::remove_dir_all(root);
 }
+
+/// Spec 47 §5.5. The two navigation caps are restrict-only: a cloned repository
+/// may lower them, because a restriction is always safe, but raising one would
+/// let the repository pull more of the user's files into a model request than
+/// the user chose to allow. Nothing tested this class of key before.
+#[test]
+fn repository_config_may_lower_the_navigation_caps_but_not_raise_them() {
+    let fixture = fixture(
+        "navigation-caps",
+        "max_read_lines=400\nmax_list_entries=200\n",
+        "max_read_lines=50\nmax_list_entries=500\n",
+    );
+
+    let config = fixture.load();
+
+    assert_eq!(
+        config.max_read_lines, 50,
+        "a repository lowering a cap is a restriction and must be honoured"
+    );
+    assert_eq!(
+        config.max_list_entries, 200,
+        "a repository raising a cap must be refused and the user's value kept"
+    );
+}

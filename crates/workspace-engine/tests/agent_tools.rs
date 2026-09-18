@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::file_access::{FileAccessController, LineRange, ReadWindow};
+use workspace_engine::navigation::NavigationController;
 use workspace_engine::tree_walk::{self, WalkEvent};
-use workspace_engine::{AuditLog, Config, PathPolicy, SecretScanner};
+use workspace_engine::{AuditLog, ClientError, Config, PathPolicy, SecretScanner};
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -50,6 +51,16 @@ fn test_audit(repo: &Path, scanner: SecretScanner) -> AuditLog {
 fn file_access_for(repo: &Path, config: &Config) -> FileAccessController {
     let scanner = SecretScanner::new(config.secret_patterns.clone());
     FileAccessController::new(
+        config.clone(),
+        test_audit(repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(config),
+    )
+}
+
+fn navigation_for(repo: &Path, config: &Config) -> NavigationController {
+    let scanner = SecretScanner::new(config.secret_patterns.clone());
+    NavigationController::new(
         config.clone(),
         test_audit(repo, scanner.clone()),
         scanner,
@@ -230,4 +241,80 @@ fn a_few_enormous_lines_are_cut_by_bytes_and_say_so() {
         read.content.len()
     );
     assert_eq!(read.total_lines, 10);
+}
+
+// ---------------------------------------------------------------------------
+// Task 3 · list_directory (requirements 2 and 3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn listing_respects_gitignore_and_caps_with_a_notice() {
+    let repo = temp_dir("list-basic");
+    for n in 1..=250 {
+        write_fixture(&repo, &format!("src/m{n}.rs"), "pub fn a() {}\n");
+    }
+    // A per-directory `.gitignore`, not a default pattern: this is what proves
+    // the listing inherits the walk's ignore handling rather than its own.
+    write_fixture(&repo, ".gitignore", "generated/\n");
+    write_fixture(&repo, "generated/derived.rs", "pub fn generated() {}\n");
+    let config = Config {
+        max_list_entries: 200,
+        ..test_config(&repo)
+    };
+    let nav = navigation_for(&repo, &config);
+
+    let listing = nav.list_directory(&repo, None, None, None, None).unwrap();
+
+    assert_eq!(listing.paths.len(), 200);
+    assert_eq!(listing.total_found, 250);
+    assert!(listing.truncated);
+    assert!(
+        !listing.paths.iter().any(|p| p.starts_with("generated/")),
+        "a .gitignore'd directory must not be listed: {:?}",
+        listing.paths
+    );
+}
+
+/// Requirement 2: resolved through `PathPolicy` on the same path
+/// `FileAccessController::read_file` uses. `.env` is in
+/// `DEFAULT_RESTRICTED_PATTERNS` and deliberately *not* in
+/// `DEFAULT_IGNORE_PATTERNS`, so this tests the restriction rather than the
+/// ignore rules — the trap spec 18 Task 10 recorded.
+#[test]
+fn listing_cannot_reach_a_restricted_path() {
+    let repo = temp_dir("list-restricted");
+    write_fixture(&repo, "src/lib.rs", "pub fn a() {}\n");
+    write_fixture(&repo, ".env", "API_KEY=sk_live_0123456789abcdef\n");
+    let config = test_config(&repo);
+    let nav = navigation_for(&repo, &config);
+
+    let listing = nav.list_directory(&repo, None, None, None, None).unwrap();
+
+    assert!(
+        listing.paths.iter().any(|p| p == "src/lib.rs"),
+        "the readable file should still be listed: {:?}",
+        listing.paths
+    );
+    assert!(
+        !listing.paths.iter().any(|p| p == ".env"),
+        "a restricted path must not be revealed by a listing: {:?}",
+        listing.paths
+    );
+}
+
+#[test]
+fn listing_outside_the_repository_is_denied() {
+    let repo = temp_dir("list-escape");
+    write_fixture(&repo, "src/lib.rs", "pub fn a() {}\n");
+    let config = test_config(&repo);
+    let nav = navigation_for(&repo, &config);
+
+    let error = nav
+        .list_directory(&repo, Some("../.."), None, None, None)
+        .unwrap_err();
+
+    assert!(
+        matches!(error, ClientError::AccessDenied(_)),
+        "got {error:?}"
+    );
 }

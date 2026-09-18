@@ -20,6 +20,7 @@ pub mod indexer;
 pub mod language;
 pub mod mcp;
 pub mod model;
+pub mod navigation;
 pub mod patch_engine;
 pub mod path_policy;
 pub mod plan;
@@ -67,7 +68,7 @@ pub use edit::{
     patch_diff_text, patch_hunk_summary,
 };
 pub use error::{ClientError, ProviderRefusal, Result};
-pub use file_access::{FileAccessController, FileRead};
+pub use file_access::{FileAccessController, FileRead, LineRange, ReadWindow};
 pub use git_service::{GitFileStatus, GitService, GitStatus};
 pub use hash::repository_id_for_root;
 pub use index_cache::IndexCache;
@@ -81,6 +82,7 @@ pub use model::{
     ModelRequest, ModelRun, ModelTransport, OpenAICompatibleAdapter, ResponseMeta, TokenUsage,
     ToolCall, ToolDefinition, UsageSource, extract_model_tokens, model_request_json,
 };
+pub use navigation::{DirectoryListing, NavigationController};
 pub use patch_engine::{
     GeneratedSecretWarning, PatchApplyResult, PatchEngine, PatchRollbackResult, ProposedChange,
     ProposedFilePatch, ProposedPatch, parse_hunk_selection,
@@ -109,6 +111,7 @@ pub use session::{
     ActionMarker, ChatMessage, DanglingAction, PendingApprovalRef, Session, SessionStore, Task,
     TaskStatus, TaskUsage,
 };
+pub use tree_walk::{WalkEvent, WalkFile, WalkSkip};
 pub use validation::{
     CommandProposal, CommandRunRecord, CommandStore, ValidationOrchestrator,
     command_approval_prompt,

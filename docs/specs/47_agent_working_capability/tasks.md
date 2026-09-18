@@ -30,7 +30,7 @@ MIT/Apache-2.0, both on `deny.toml`'s allow-list.
 |---|---|---|
 | 1 · Extract the walk | Done | `tree_walk.rs` with a `WalkEvent` visitor; `ProjectIndexer::walk` deleted and `index_repository` now drives it through `add_file`, which was already factored out so nothing had to move. 1 new test. **Plan correction:** the plan named the skip reason `not_a_regular_file`; the index has always spelled it `not_regular_file` and its tests assert on it. Guarded by the 11 existing index tests, all green. |
 | 2 · Ranged reads | Done | `LineRange`, `ReadWindow`, and `FileRead.{line_range,total_lines,truncated_by}`; `max_read_lines` (400) added restrict-only with a new `restrict_only_limit` helper and a `parse_read_lines` that refuses 0. 4 new tests; byte cap mutation-tested (disabling it fails `a_few_enormous_lines_…`). **Plan deviation:** the plan's `range: Option<LineRange>` was wrong — `None` would have meant "capped" for `context_manager` too, silently shrinking what every task sees, and its own comment contradicted the code. Replaced with a three-variant `ReadWindow` so each call site states its intent: `Whole` (context assembly, keeps the original `max_file_bytes` refusal), `Default` (the tool, capped), `Range` (also capped, so a large range cannot step around the cap). Also needed `#[allow(clippy::too_many_arguments)]` with a reason. |
-| 3 · `list_directory` | Not started | |
+| 3 · `list_directory` | Done | `navigation.rs` with `NavigationController` and `DirectoryListing`; a `tree_walk` visitor, `max_list_entries` (200) restrict-only. 3 new tests (8 in file). Restricted paths are checked **per entry**, not just on the starting directory, because a path can name a secret (`deploy/prod-key.pem`). **Beyond the plan:** added `repository_config_may_lower_the_navigation_caps_but_not_raise_them` to `repository_config_trust.rs` — no restrict-only key had a trust test at all, so an unclassed key would have been a silent hole. The `.env` fixture tests the restriction rather than the ignore rules: `.env` is in `DEFAULT_RESTRICTED_PATTERNS` and deliberately not in `DEFAULT_IGNORE_PATTERNS`. |
 | 4 · `search_content` | Not started | |
 | 5 · `edit_file` splice | Not started | |
 | 6 · Wire the four tools | Not started | |
@@ -575,7 +575,7 @@ Suggested subject: `Read a file by line range and bound what a read returns`
 - Consumes: `tree_walk::walk` and `WalkEvent` from Task 1.
 - Produces: `NavigationController::new(config, audit_log, scanner, path_policy)`; `list_directory(root, dir: Option<&str>, depth: Option<usize>, task_id, repository_id) -> Result<DirectoryListing>`; `DirectoryListing { paths: Vec<String>, total_found: usize, truncated: bool }`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -645,17 +645,17 @@ fn navigation_for(repo: &Path, config: &Config) -> NavigationController {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools`
 Expected: FAIL to compile — `NavigationController` does not exist.
 
-- [ ] **Step 3: Add the config key**
+- [x] **Step 3: Add the config key**
 
 `max_list_entries: usize`, default `200`, restrict-only, same six places as
 Task 2 Step 3.
 
-- [ ] **Step 4: Write `navigation.rs`**
+- [x] **Step 4: Write `navigation.rs`**
 
 ```rust
 /// The listing and content-search tools.
@@ -703,18 +703,18 @@ Paths only; no file contents are read, so there is nothing to redact here. The
 restricted check still matters because a *path* can name a secret
 (`deploy/prod-key.pem`).
 
-- [ ] **Step 5: Run the new tests**
+- [x] **Step 5: Run the new tests**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools`
 Expected: PASS, 8 tests in this file.
 
-- [ ] **Step 6: Targeted tests, fmt and clippy**
+- [x] **Step 6: Targeted tests, fmt and clippy**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools` — 8 tests, all
 passing. Then `cargo fmt --all -- --check` and
 `cargo clippy --workspace --all-targets --locked -- -D warnings`.
 
-- [ ] **Step 7: Show the change and the gate result, and ask before committing**
+- [x] **Step 7: Show the change and the gate result, and ask before committing**
 
 Suggested subject: `List repository paths as a tool rather than a shell command`
 
