@@ -2,8 +2,8 @@ use std::env;
 use std::io::IsTerminal;
 use std::path::Path;
 use workspace_engine::{
-    CURRENT_DATA_SCHEMA_VERSION, CommandProposal, CommandRisk, Config, ConfigOverlay, ConfigScope,
-    CurlModelTransport, DataSchemaOutcome, MockModelAdapter, OpenAICompatibleAdapter,
+    CURRENT_DATA_SCHEMA_VERSION, CancelToken, CommandProposal, CommandRisk, Config, ConfigOverlay,
+    ConfigScope, CurlModelTransport, DataSchemaOutcome, MockModelAdapter, OpenAICompatibleAdapter,
     ProcessRegistry, ReadWindow, SearchResult, WorkspaceEngine, command_approval_prompt,
     ensure_data_dir_schema, parse_hunk_selection, patch_diff_text, patch_hunk_summary,
     render_markdown_to_ansi,
@@ -293,10 +293,20 @@ fn run() -> workspace_engine::Result<()> {
             } else {
                 None
             };
-            let record =
-                engine
-                    .validation_orchestrator
-                    .run_proposal(proposal_id, approved, "local_user")?;
+            let record = {
+                // The CLI's command path is not a turn: nothing can stop it and
+                // there is no progress stream to feed.
+                let cancel = CancelToken::new();
+                let mut on_output = |_line: &str| {};
+                engine.validation_orchestrator.run_proposal(
+                    proposal_id,
+                    approved,
+                    "local_user",
+                    None,
+                    &cancel,
+                    &mut on_output,
+                )?
+            };
             println!(
                 "{{\"proposalId\":\"{}\",\"commandId\":\"{}\",\"exitCode\":{},\"stdoutRef\":\"{}\",\"stderrRef\":\"{}\",\"allowlistPath\":{}}}",
                 escape(&record.proposal_id),

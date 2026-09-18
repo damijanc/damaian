@@ -999,10 +999,21 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                     &chat_result_json(&result),
                 )
             } else {
-                let record = engine
-                    .validation_orchestrator
-                    .run_proposal(&proposal_id, true, "desktop_user")
-                    .map_err(|error| error.to_string())?;
+                let record = {
+                    // A command run from this endpoint has no turn behind it,
+                    // so it has no stop to honour and no progress to stream.
+                    let cancel = CancelToken::new();
+                    let mut on_output = |_line: &str| {};
+                    engine.validation_orchestrator.run_proposal(
+                        &proposal_id,
+                        true,
+                        "desktop_user",
+                        None,
+                        &cancel,
+                        &mut on_output,
+                    )
+                }
+                .map_err(|error| error.to_string())?;
                 write_response(
                     stream,
                     &request,

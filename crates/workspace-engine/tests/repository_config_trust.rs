@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    CommandPolicy, CommandRisk, Config, ConfigOverlay, RepositoryKeyClass, WorkspaceEngine,
-    repository_id_for_root,
+    CancelToken, CommandPolicy, CommandRisk, Config, ConfigOverlay, RepositoryKeyClass,
+    WorkspaceEngine, repository_id_for_root,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -762,7 +762,14 @@ fn an_approved_command_runs_the_users_shell_not_the_repository_shell() {
         .unwrap();
     let record = engine
         .validation_orchestrator
-        .run_proposal(&proposal.id, true, "tester")
+        .run_proposal(
+            &proposal.id,
+            true,
+            "tester",
+            None,
+            &CancelToken::new(),
+            &mut |_line: &str| {},
+        )
         .unwrap();
 
     let stdout = fs::read_to_string(&record.stdout_ref).unwrap();
@@ -1286,5 +1293,60 @@ fn repository_config_may_lower_the_navigation_caps_but_not_raise_them() {
     assert_eq!(
         config.max_list_entries, 200,
         "a repository raising a cap must be refused and the user's value kept"
+    );
+}
+
+/// Spec 47 requirement 5. The command deadline is the same lower-wins shape: a
+/// repository may shorten how long its own commands run, but lengthening a
+/// deadline the user set would let a clone run past the user's bound.
+#[test]
+fn repository_config_may_shorten_a_command_timeout_but_not_lengthen_it() {
+    let shortened = fixture(
+        "command-timeout-shorten",
+        "command_timeout_secs=300\n",
+        "command_timeout_secs=60\n",
+    );
+    assert_eq!(
+        shortened.load().command_timeout_secs,
+        60,
+        "a repository shortening the deadline is a restriction and must be honoured"
+    );
+
+    let lengthened = fixture(
+        "command-timeout-lengthen",
+        "command_timeout_secs=300\n",
+        "command_timeout_secs=900\n",
+    );
+    assert_eq!(
+        lengthened.load().command_timeout_secs,
+        300,
+        "a repository lengthening the deadline must be refused and the user's value kept"
+    );
+}
+
+/// Spec 47 requirement 6. The in-turn message window is the same lower-wins
+/// shape: a repository may shrink the request, never widen it.
+#[test]
+fn repository_config_may_shrink_the_turn_message_window_but_not_widen_it() {
+    let shrunk = fixture(
+        "turn-window-shrink",
+        "agent_max_turn_messages=24\n",
+        "agent_max_turn_messages=8\n",
+    );
+    assert_eq!(
+        shrunk.load().agent_max_turn_messages,
+        8,
+        "a repository shrinking the window must be honoured"
+    );
+
+    let widened = fixture(
+        "turn-window-widen",
+        "agent_max_turn_messages=24\n",
+        "agent_max_turn_messages=100\n",
+    );
+    assert_eq!(
+        widened.load().agent_max_turn_messages,
+        24,
+        "a repository widening the window must be refused and the user's value kept"
     );
 }

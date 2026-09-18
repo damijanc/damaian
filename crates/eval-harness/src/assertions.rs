@@ -230,6 +230,26 @@ pub fn evaluate(
                 rounds.to_string(),
             );
         }
+
+        if let Some(limit) = asserts.tool_calls_at_least {
+            let count = run.record.tool_calls.len() as u64;
+            push(
+                "tool_calls_at_least",
+                count >= limit,
+                format!("at least {limit} tool calls"),
+                count.to_string(),
+            );
+        }
+
+        if let Some(limit) = asserts.tool_rounds_at_most {
+            let rounds = run.record.tool_rounds;
+            push(
+                "tool_rounds_at_most",
+                rounds <= limit,
+                format!("at most {limit} tool rounds"),
+                rounds.to_string(),
+            );
+        }
     }
 
     results

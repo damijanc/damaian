@@ -1,10 +1,14 @@
 # Feature Spec: Agent Working Capability
 
-Status: In progress. The first slice is built and done: requirements 1–4 —
-ranged reads, `list_directory` and `search_content`, and anchor-based region
-edits — are implemented, tested, and closed out (see
-[`tasks.md`](tasks.md)). Requirements 5, 6 and 8 are designed only to the extent
-of the decisions recorded in §5.6, and follow as their own slices.
+Status: Done. All eight requirements are implemented, tested and closed out (see
+[`tasks.md`](tasks.md)): requirements 1–4 — ranged reads, `list_directory` and
+`search_content`, and anchor-based region edits — landed 2026-09-18, and
+requirements 5, 6 and 8 — a command that can be stopped, timed out and watched;
+a bounded, recorded continuation past the round cap; and within-round concurrent
+dispatch of read-only calls — followed the same day. Requirement 6 is justified
+by the round-cap cliff and the unbounded in-turn message array, **not** by this
+spec's opening premise: §7.2's live-tier A/B did not support that premise, and
+§7.3 says so.
 Order: 47 of 47
 Plan: none. Like [`07`](../07_generated_secret_override.md),
 [`08`](../08_stop_and_progress.md), [`13`](../13_docker_command_support.md) and
@@ -453,3 +457,71 @@ not "no benefit". Testing the premise needs one long-task scenario, deferred
 until Damaian is closer to production. Requirement 6's justification is weaker
 than when this spec was written, and should be re-argued from a long-task
 measurement rather than from the opening paragraph.
+
+### 7.3 The later slices (requirements 5, 6 and 8)
+
+What implementing them found, in the order that mattered.
+
+1. **Requirement 5 started from a spawned child, not a hidden one.** Spec 46 had
+   already replaced `Command::output()` with `spawn()` + `process_group(0)` + a
+   registry handle, so the work was the wait loop rather than the spawn: reader
+   threads drain both pipes, a pure `classify_wait(cancelled, deadline, now)`
+   decides between a stop and a timeout, and the existing `CommandGuard` kills
+   the group. The decision is a free function because `AGENTS.md` requires
+   shell-spawning tests to be `#[ignore]`d — the part that must not be a guess
+   keeps default-suite coverage, and only the real termination is manual. Live
+   output is redacted per line; the persisted output is redacted whole and stays
+   authoritative, so a secret split across a chunk cannot escape through the
+   stream.
+2. **`command_timeout_secs` is `usize`, not the plan's `u64`.** That reuses
+   `restrict_only_limit` and the existing "at least 1" parse shape instead of
+   adding a parallel one. It is Restrict-only: a repository may shorten how long
+   its own commands run, never lengthen one past the user's deadline.
+3. **Requirement 8 was two changes, as §5.6 said.** Batching first:
+   `first_decodable_tool_action` became `decodable_tool_actions`, and each call's
+   result is fed back before the next dispatch, so a terminal call still carries
+   what already ran in the same round. `PendingChatTurn.matched_tool_call` stayed
+   singular rather than widening to a `Vec`: a terminal call ends the round, so
+   the resumed turn only ever needs that one call, and the earlier ones are
+   already in the messages it stored.
+4. **Concurrency safety is derived, not declared.** `ActionEffect { ReadOnly,
+   WritesRepository, ShapesTurn }` is one exhaustive match; `tool_action_marker`'s
+   recovery bool and the new `action_is_batchable_read_only` both come off it.
+   That changes `tool_action_marker`'s *body*, which is the one place this slice
+   departs from "leave the recovery answer alone" — its *value* is unchanged, and
+   spec 17's tests are the guard. `std::thread::scope` with results joined in
+   call order is the whole ordering guarantee; `ChatOrchestrator` proved `Sync`,
+   so no clone-per-thread was needed. A limitation is stated rather than tested
+   flakily: a stop before a round skips the batch and a stop between calls ends
+   it, but an in-flight read is not interrupted, because the read tools take no
+   cancel token — they are bounded local reads.
+5. **Requirement 6 is built on today's evidence, and §7.2 is why.** The A/B did
+   not support "the tool surface is why sessions run out of rounds", so R6 is not
+   justified by that. It is justified by two facts that are true now: the round
+   cap is a cliff whose only continuation is a manual re-ask that starts a new
+   task and loses in-turn state, and the within-turn message array grows without
+   bound (`OBSERVATIONS.md` entry 6).
+6. **The array half is one restrict-only key.** `agent_max_turn_messages`
+   (default 24) drives `bounded_messages`, which keeps the system+user seed,
+   drops the oldest call/result pairs in whole pairs, and states the elision in a
+   notice. The session log still holds every round; only the request is bounded.
+   That resolves `OBSERVATIONS.md` entry 6 — the entry's disposition is written
+   here because `docs/PLAN/` is uncommitted and absent from the branch this slice
+   was built on.
+7. **The continuation half is bounded twice.** At the round cap, a turn with a
+   token ceiling records `turn_continued` and takes another segment; the existing
+   pre-call token check is the money bound, and `ABSOLUTE_TOOL_ROUND_CAP` is the
+   safety net for a provider whose usage never reaches the ceiling. With no
+   ceiling set there is no continuation, so the default is unchanged. Building it
+   required changing one spec-21 test: `a_ceiling_the_turn_never_approaches_changes_nothing`
+   is now `…_does_not_stop_it` and asserts the turn runs past its configured
+   segment, because a roomy ceiling no longer "changes nothing". Its old
+   `calls > 2` could not distinguish a continuation from the old single
+   forced-final round.
+8. **The live-tier consequence is recorded, not re-measured.** Whether the
+   continuation helps a long task is a live-tier question, the long-task scenario
+   remains deferred, and this slice claims no measured improvement.
+9. **Spec 18 gained the measurement.** `batched_reads` plus
+   `tool_calls_at_least` and `tool_rounds_at_most`; its long-stale "thirteen
+   scenarios" was corrected to sixteen. `evals/baseline.json` is regenerated only
+   alongside that scenario and read before it is committed.

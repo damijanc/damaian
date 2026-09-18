@@ -56,6 +56,14 @@ pub struct Asserts {
     pub command_executed: Option<bool>,
     pub patch_applied: Option<bool>,
     pub model_calls_at_most: Option<u64>,
+    /// That the run dispatched at least this many tool calls, which proves a
+    /// batch ran every call the model made in one message. Script-derived, so a
+    /// scenario using it lists it in `deterministic_only`.
+    pub tool_calls_at_least: Option<u64>,
+    /// That the run used at most this many tool rounds. A batch of N calls in
+    /// one message is one round, not N, so this is the other half of the
+    /// batching claim. Script-derived, like `tool_calls_at_least`.
+    pub tool_rounds_at_most: Option<u64>,
     /// What the classifier must conclude about the task left mid-action by
     /// `crash_mid_action`, as its `TaskStatus` string.
     pub recovered_classification: Option<String>,

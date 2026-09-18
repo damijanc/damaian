@@ -81,6 +81,16 @@ the same terms as a whole-file `propose_patch`. A large file read is reported as
 a range with the file's real line count ("lines 1–400 of 4420"), so a truncated
 result says so rather than reading as the whole file.
 
+A command Damaian runs is stoppable and has a deadline: its output is streamed
+to the turn while it runs, Stop ends it, and `command_timeout_secs` (600 by
+default) kills it if it runs too long. A repository may shorten that deadline,
+never lengthen it. When one model message asks for several read-only tools, they
+run together and their results are reported in the order the model asked for
+them. A turn that reaches its tool-round limit can continue under a token
+ceiling (`agent_max_task_tokens`) rather than stopping, and the messages it
+sends are bounded by `agent_max_turn_messages` so a long turn does not grow
+without limit.
+
 ## Provider Limits and Retries
 
 A model provider can refuse a call — rate limiting ("you are going too fast"), a

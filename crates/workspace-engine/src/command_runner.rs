@@ -1,4 +1,5 @@
 use crate::audit::AuditLog;
+use crate::cancel::CancelToken;
 use crate::command_policy::{CommandPolicy, CommandRisk};
 use crate::config::Config;
 use crate::error::{ClientError, Result};
@@ -7,7 +8,10 @@ use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
 use crate::secret_scanner::SecretScanner;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandExecution {
@@ -19,8 +23,142 @@ pub struct CommandExecution {
     pub started_at_ms: u128,
     pub completed_at_ms: u128,
     pub exit_code: Option<i32>,
+    /// Why the child stopped being waited on. Not derivable from `exit_code`:
+    /// a timed-out or cancelled command and one that died from a signal both
+    /// report `None`, and a timeout must be distinguishable from an exit for
+    /// the report and the repair the user is offered.
+    pub termination: CommandTermination,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// Why a running child stopped being waited on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandTermination {
+    /// The process exited on its own; `exit_code` says how.
+    Exited,
+    /// The configured deadline passed and the process group was killed.
+    TimedOut,
+    /// The user stopped the turn and the process group was killed.
+    Cancelled,
+}
+
+impl CommandTermination {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Exited => "exited",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// What the poll loop decided about a child that is still running.
+///
+/// `None` means keep waiting. A free function over plain values so the
+/// decision — the part that must not be a guess — is covered by the default
+/// suite; `AGENTS.md` requires tests that spawn a shell to be `#[ignore]`d.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitDecision {
+    TimedOut,
+    Cancelled,
+}
+
+fn classify_wait(cancelled: bool, deadline: Instant, now: Instant) -> Option<WaitDecision> {
+    // Cancel first: a stop is more specific than a deadline, and naming a stop
+    // a timeout would tell the user Damaian gave up when they told it to.
+    if cancelled {
+        return Some(WaitDecision::Cancelled);
+    }
+    if now >= deadline {
+        return Some(WaitDecision::TimedOut);
+    }
+    None
+}
+
+/// The per-run side channel. Grouped rather than passed as four more
+/// parameters because `run` already took six, and because approval, identity,
+/// the stop and the live output all belong to one "how this run was invoked"
+/// question.
+pub struct CommandRunOptions<'a> {
+    pub approved: bool,
+    pub approved_by: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+    pub cancel: &'a CancelToken,
+    pub on_output: &'a mut dyn FnMut(&str),
+}
+
+/// How long the poll loop sleeps between `try_wait` calls. Short enough that a
+/// stop is felt promptly, long enough not to spin a core.
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, Copy)]
+enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+struct OutputChunk {
+    stream: OutputStream,
+    bytes: Vec<u8>,
+}
+
+fn spawn_reader<R: std::io::Read + Send + 'static>(
+    reader: R,
+    stream: OutputStream,
+    sender: mpsc::Sender<OutputChunk>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(reader);
+        let mut buffer = Vec::new();
+        loop {
+            buffer.clear();
+            match std::io::BufRead::read_until(&mut reader, b'\n', &mut buffer) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if sender
+                        .send(OutputChunk {
+                            stream,
+                            bytes: buffer.clone(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn drain_output(
+    receiver: &mpsc::Receiver<OutputChunk>,
+    scanner: &SecretScanner,
+    on_output: &mut dyn FnMut(&str),
+    raw_stdout: &mut String,
+    raw_stderr: &mut String,
+) {
+    while let Ok(chunk) = receiver.try_recv() {
+        let text = String::from_utf8_lossy(&chunk.bytes);
+        match chunk.stream {
+            OutputStream::Stdout => raw_stdout.push_str(&text),
+            OutputStream::Stderr => raw_stderr.push_str(&text),
+        }
+        // Redact line by line for the live stream; the final whole-output
+        // redaction below is still authoritative, so a secret split across a
+        // chunk boundary cannot survive in the persisted copy. The alternative
+        // — streaming the raw text — would make the live view the one path
+        // around the scanner.
+        on_output(&scanner.redact(&text).text);
+    }
+}
+
+fn kill_process_group(pid: u32) {
+    // SAFETY: `kill` takes two integers by value and touches no memory. The
+    // group id is the child's own pid, because it was spawned with
+    // `process_group(0)`.
+    unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
 }
 
 #[derive(Debug, Clone)]
@@ -51,16 +189,14 @@ impl CommandRunner {
         command: &str,
         cwd: impl AsRef<Path>,
         reason: &str,
-        approved: bool,
-        approved_by: Option<&str>,
-        task_id: Option<&str>,
+        options: CommandRunOptions<'_>,
     ) -> Result<CommandExecution> {
         let classification = self.command_policy.classify(command, cwd.as_ref());
         self.audit_log.record(
             "command_proposed",
             &[
                 ("actor", "assistant".to_string()),
-                ("taskId", task_id.unwrap_or_default().to_string()),
+                ("taskId", options.task_id.unwrap_or_default().to_string()),
                 ("command", classification.command.clone()),
                 (
                     "workingDirectory",
@@ -81,7 +217,7 @@ impl CommandRunner {
                 "Command is blocked by policy".to_string(),
             ));
         }
-        if classification.requires_approval && !approved {
+        if classification.requires_approval && !options.approved {
             return Err(ClientError::ApprovalRequired(
                 "Command requires user approval before execution".to_string(),
             ));
@@ -92,7 +228,7 @@ impl CommandRunner {
         // hides it, which is the only reason spec 17 concluded a command could
         // not be cleaned up — it orphans under `SIGKILL` like anything else.
         // Its own group so a pipeline's members are reachable too.
-        let child = Command::new(&self.config.shell)
+        let mut child = Command::new(&self.config.shell)
             .arg("-lc")
             .arg(command)
             .current_dir(cwd.as_ref())
@@ -105,25 +241,76 @@ impl CommandRunner {
             armed: true,
             _registration: ProcessRegistry::open(&self.config.data_dir)?.register(
                 ProcessKind::Command,
-                task_id.unwrap_or_default(),
+                options.task_id.unwrap_or_default(),
                 child.id(),
             )?,
         };
-        let output = child.wait_with_output()?;
+
+        // Drain both pipes on their own threads: a child that fills a pipe
+        // buffer and blocks waiting for the reader is a hung command, and
+        // `wait_with_output` was the only thing draining them before.
+        let stdout_pipe = child.stdout.take().expect("stdout was piped");
+        let stderr_pipe = child.stderr.take().expect("stderr was piped");
+        let (sender, receiver) = mpsc::channel::<OutputChunk>();
+        let stdout_reader = spawn_reader(stdout_pipe, OutputStream::Stdout, sender.clone());
+        let stderr_reader = spawn_reader(stderr_pipe, OutputStream::Stderr, sender.clone());
+        drop(sender);
+
+        let deadline =
+            Instant::now() + Duration::from_secs(self.config.command_timeout_secs as u64);
+        let mut termination = CommandTermination::Exited;
+        // Assigned on both break paths, and the loop has no other exit, so it
+        // is definitely initialised by the time it is read.
+        let status: Option<ExitStatus>;
+        let mut raw_stdout = String::new();
+        let mut raw_stderr = String::new();
+        loop {
+            drain_output(
+                &receiver,
+                &self.scanner,
+                options.on_output,
+                &mut raw_stdout,
+                &mut raw_stderr,
+            );
+            if let Some(exit) = child.try_wait()? {
+                status = Some(exit);
+                break;
+            }
+            if let Some(decision) =
+                classify_wait(options.cancel.is_cancelled(), deadline, Instant::now())
+            {
+                termination = match decision {
+                    WaitDecision::TimedOut => CommandTermination::TimedOut,
+                    WaitDecision::Cancelled => CommandTermination::Cancelled,
+                };
+                kill_process_group(child.id());
+                // Reap so the guard does not kill a pid that could have been
+                // reused, and so the readers see EOF and return.
+                status = child.wait().ok();
+                break;
+            }
+            std::thread::sleep(COMMAND_POLL_INTERVAL);
+        }
+
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        drain_output(
+            &receiver,
+            &self.scanner,
+            options.on_output,
+            &mut raw_stdout,
+            &mut raw_stderr,
+        );
+
         // Reaped, so the pid is free and its group may already be someone
         // else's. Disarm the kill — but let the guard drop normally, because
         // its handle is what removes the registry entry.
         guard.armed = false;
         drop(guard);
         let completed_at_ms = now_millis();
-        let stdout = truncate_output(
-            String::from_utf8_lossy(&output.stdout).as_ref(),
-            self.config.max_command_output_bytes,
-        );
-        let stderr = truncate_output(
-            String::from_utf8_lossy(&output.stderr).as_ref(),
-            self.config.max_command_output_bytes,
-        );
+
+        let stdout = truncate_output(&raw_stdout, self.config.max_command_output_bytes);
+        let stderr = truncate_output(&raw_stderr, self.config.max_command_output_bytes);
         let redacted_stdout = self.scanner.redact(&stdout).text;
         let redacted_stderr =
             append_docker_diagnostic(&classification.command, &self.scanner.redact(&stderr).text);
@@ -134,10 +321,11 @@ impl CommandRunner {
             risk: classification.risk,
             approved_by: classification
                 .requires_approval
-                .then(|| approved_by.unwrap_or("local_user").to_string()),
+                .then(|| options.approved_by.unwrap_or("local_user").to_string()),
             started_at_ms,
             completed_at_ms,
-            exit_code: output.status.code(),
+            exit_code: status.and_then(|status| status.code()),
+            termination,
             stdout: redacted_stdout,
             stderr: redacted_stderr,
         };
@@ -146,7 +334,7 @@ impl CommandRunner {
             "command_executed",
             &[
                 ("actor", "command".to_string()),
-                ("taskId", task_id.unwrap_or_default().to_string()),
+                ("taskId", options.task_id.unwrap_or_default().to_string()),
                 ("command", execution.command.clone()),
                 ("workingDirectory", execution.working_directory.clone()),
                 ("risk", execution.risk.as_str().to_string()),
@@ -155,6 +343,7 @@ impl CommandRunner {
                     execution.approved_by.clone().unwrap_or_default(),
                 ),
                 ("exitCode", execution.exit_code.unwrap_or(-1).to_string()),
+                ("termination", execution.termination.as_str().to_string()),
                 (
                     "stdoutSummary",
                     execution.stdout.chars().take(2000).collect(),
@@ -191,10 +380,9 @@ impl Drop for CommandGuard {
         if !self.armed {
             return;
         }
-        // SAFETY: `kill` takes two integers by value and touches no memory.
-        // The group id is this child's own pid, because it was spawned with
-        // `process_group(0)`, and the child is known not to have been reaped.
-        unsafe { libc::kill(-(self.pid as libc::pid_t), libc::SIGKILL) };
+        // The child is known not to have been reaped on this path, so the pid
+        // cannot have been reused.
+        kill_process_group(self.pid);
     }
 }
 
@@ -297,13 +485,32 @@ fn is_docker_compose_invocation(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandRunner, append_docker_diagnostic};
+    use super::{
+        CommandRunOptions, CommandRunner, WaitDecision, append_docker_diagnostic, classify_wait,
+    };
     use crate::audit::AuditLog;
+    use crate::cancel::CancelToken;
     use crate::command_policy::CommandPolicy;
     use crate::config::Config;
     use crate::process_registry::ProcessRegistry;
     use crate::secret_scanner::SecretScanner;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    /// Approval as a shell-invoking test wants it: granted, by the local user,
+    /// with a token that is never cancelled and output that goes nowhere.
+    fn granted_options<'a>(
+        cancel: &'a CancelToken,
+        on_output: &'a mut dyn FnMut(&str),
+    ) -> CommandRunOptions<'a> {
+        CommandRunOptions {
+            approved: true,
+            approved_by: Some("local_user"),
+            task_id: None,
+            cancel,
+            on_output,
+        }
+    }
 
     /// A runner whose data directory is a scratch path, so a test never writes
     /// to the user's real `~/Library/Application Support/DamaianClient`.
@@ -341,14 +548,14 @@ mod tests {
         let (runner, data_dir) = runner_with_scratch_data_dir();
         let registry = ProcessRegistry::open(&data_dir).unwrap();
 
+        let cancel = CancelToken::new();
+        let mut on_output = |_line: &str| {};
         let execution = runner
             .run(
                 "echo hello",
                 &data_dir,
                 "test",
-                true,
-                Some("local_user"),
-                None,
+                granted_options(&cancel, &mut on_output),
             )
             .expect("the command should run");
 
@@ -376,14 +583,14 @@ mod tests {
         let (runner, data_dir) = runner_with_scratch_data_dir();
 
         // `$$` is the shell's own pid; `ps` reports the group it belongs to.
+        let cancel = CancelToken::new();
+        let mut on_output = |_line: &str| {};
         let execution = runner
             .run(
                 "ps -o pgid= -p $$",
                 &data_dir,
                 "test",
-                true,
-                Some("local_user"),
-                None,
+                granted_options(&cancel, &mut on_output),
             )
             .expect("the command should run");
         let pgid: u32 = execution
@@ -425,5 +632,53 @@ mod tests {
         let stderr = append_docker_diagnostic("git status", "command not found: git");
 
         assert_eq!(stderr, "command not found: git");
+    }
+
+    /// The wait/terminate decision is the part a shell-spawning test cannot
+    /// cheaply cover, so it is a pure function and tested here on the default
+    /// suite. A command that ran past its deadline must be classified as timed
+    /// out rather than exited: `exit_code` is `None` either way, and treating a
+    /// kill as a clean exit is how a hung command would read as a finished one.
+    #[test]
+    fn a_command_past_its_deadline_is_timed_out() {
+        let now = Instant::now();
+        let deadline = now - Duration::from_secs(1);
+
+        assert_eq!(
+            classify_wait(false, deadline, now),
+            Some(WaitDecision::TimedOut)
+        );
+    }
+
+    /// Cancellation is checked before the deadline, so a user's stop is named
+    /// as a stop even when the clock had also run out.
+    #[test]
+    fn a_cancel_outranks_a_deadline_that_also_passed() {
+        let now = Instant::now();
+        let deadline = now - Duration::from_secs(1);
+
+        assert_eq!(
+            classify_wait(true, deadline, now),
+            Some(WaitDecision::Cancelled)
+        );
+    }
+
+    #[test]
+    fn a_cancelled_command_with_time_left_is_cancelled() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(600);
+
+        assert_eq!(
+            classify_wait(true, deadline, now),
+            Some(WaitDecision::Cancelled)
+        );
+    }
+
+    #[test]
+    fn a_running_command_inside_its_deadline_keeps_waiting() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(600);
+
+        assert_eq!(classify_wait(false, deadline, now), None);
     }
 }

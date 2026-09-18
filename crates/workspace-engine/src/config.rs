@@ -158,6 +158,13 @@ pub struct Config {
     /// minified line cannot fill the model's context on its own.
     pub max_match_line_chars: usize,
     pub max_command_output_bytes: usize,
+    /// Seconds a running command may run before its process group is killed
+    /// and it is reported as timed out.
+    ///
+    /// Restrict-only, on the same reasoning as the token ceiling: a repository
+    /// may shorten how long its own commands run, but may not lengthen one past
+    /// what the user chose. Spec 47 requirement 5.
+    pub command_timeout_secs: usize,
     pub allowed_roots: Vec<PathBuf>,
     pub ignore_patterns: Vec<String>,
     pub restricted_patterns: Vec<String>,
@@ -227,6 +234,16 @@ pub struct Config {
     /// per-session budgets deliberately; the user guide has to say so plainly
     /// rather than let a reader assume otherwise.
     pub agent_max_task_tokens: Option<u64>,
+    /// Most messages a model request may carry inside one turn. The within-turn
+    /// array grows by an assistant message and a tool result per round, and a
+    /// tool result can be most of a file, so a long turn would otherwise send a
+    /// request that grows without bound — the half of compaction spec 47
+    /// requirement 6 owns (`OBSERVATIONS.md` entry 6).
+    ///
+    /// Restrict-only: a repository may lower the window, never raise it, for
+    /// the same reason as the read caps. The session log still holds every
+    /// round; only the request is bounded.
+    pub agent_max_turn_messages: usize,
     pub shell: String,
     pub model_provider: String,
     pub model_name: String,
@@ -527,6 +544,7 @@ impl Config {
             max_search_matches,
             max_match_line_chars,
             max_command_output_bytes,
+            command_timeout_secs,
             allowed_roots,
             ignore_patterns,
             restricted_patterns,
@@ -548,6 +566,7 @@ impl Config {
             agent_web_debug_max_tool_rounds,
             agent_tool_retry_limit,
             agent_max_task_tokens,
+            agent_max_turn_messages,
             shell,
             model_provider,
             model_name,
@@ -760,6 +779,18 @@ impl Config {
             );
         }
 
+        // Restrict-only like the token ceiling: a repository may shrink the
+        // window, never widen what one request carries.
+        if let Some(value) = agent_max_turn_messages {
+            restrict_only_limit(
+                &mut self.agent_max_turn_messages,
+                value,
+                "agent_max_turn_messages",
+                trusted,
+                &mut rejected,
+            );
+        }
+
         // Restrict-only for the same reason: a lower cap is a restriction and
         // always allowed, a higher one widens what a repository can pull into
         // the user's context. Spec 47 §5.5.
@@ -795,6 +826,19 @@ impl Config {
                 &mut self.max_match_line_chars,
                 value,
                 "max_match_line_chars",
+                trusted,
+                &mut rejected,
+            );
+        }
+
+        // Restrict-only: shortening a command's deadline is a restriction a
+        // repository may apply; lengthening one the user chose would let a
+        // clone run its commands past the user's bound. Spec 47 requirement 5.
+        if let Some(value) = command_timeout_secs {
+            restrict_only_limit(
+                &mut self.command_timeout_secs,
+                value,
+                "command_timeout_secs",
                 trusted,
                 &mut rejected,
             );
@@ -1259,6 +1303,11 @@ impl Config {
         );
         push_line(
             &mut output,
+            "command_timeout_secs",
+            &self.command_timeout_secs.to_string(),
+        );
+        push_line(
+            &mut output,
             "allowed_roots",
             &join_paths(&self.allowed_roots),
         );
@@ -1363,6 +1412,11 @@ impl Config {
         if let Some(value) = self.agent_max_task_tokens {
             push_line(&mut output, "agent_max_task_tokens", &value.to_string());
         }
+        push_line(
+            &mut output,
+            "agent_max_turn_messages",
+            &self.agent_max_turn_messages.to_string(),
+        );
         push_line(&mut output, "shell", &self.shell);
         push_line(&mut output, "model_provider", &self.model_provider);
         push_line(&mut output, "model_name", &self.model_name);
@@ -1403,6 +1457,7 @@ impl Default for Config {
             max_search_matches: 50,
             max_match_line_chars: 500,
             max_command_output_bytes: 1024 * 1024,
+            command_timeout_secs: 600,
             allowed_roots: Vec::new(),
             ignore_patterns: DEFAULT_IGNORE_PATTERNS
                 .iter()
@@ -1433,6 +1488,7 @@ impl Default for Config {
             // No ceiling by default: this must not change what an existing
             // configuration does on upgrade (§5.4).
             agent_max_task_tokens: None,
+            agent_max_turn_messages: 24,
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()),
             model_provider: "openai".to_string(),
             model_name: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1".to_string()),
@@ -1458,6 +1514,7 @@ pub struct ConfigOverlay {
     pub max_search_matches: Option<usize>,
     pub max_match_line_chars: Option<usize>,
     pub max_command_output_bytes: Option<usize>,
+    pub command_timeout_secs: Option<usize>,
     pub allowed_roots: Option<Vec<PathBuf>>,
     pub ignore_patterns: Option<Vec<String>>,
     pub restricted_patterns: Option<Vec<String>>,
@@ -1480,6 +1537,7 @@ pub struct ConfigOverlay {
     pub agent_web_debug_max_tool_rounds: Option<u32>,
     pub agent_tool_retry_limit: Option<u32>,
     pub agent_max_task_tokens: Option<u64>,
+    pub agent_max_turn_messages: Option<usize>,
     pub shell: Option<String>,
     pub model_provider: Option<String>,
     pub model_name: Option<String>,
@@ -1602,6 +1660,9 @@ impl ConfigOverlay {
             "max_command_output_bytes" => {
                 self.max_command_output_bytes = Some(parse_u64(key, value)? as usize)
             }
+            "command_timeout_secs" => {
+                self.command_timeout_secs = Some(parse_timeout_seconds(key, value)?)
+            }
             "allowed_roots" => self.allowed_roots = Some(split_paths(value)),
             "ignore_patterns" => self.ignore_patterns = Some(split_list(value)),
             "restricted_patterns" => self.restricted_patterns = Some(split_list(value)),
@@ -1643,6 +1704,9 @@ impl ConfigOverlay {
             }
             "agent_max_task_tokens" => {
                 self.agent_max_task_tokens = Some(parse_task_token_ceiling(key, value)?)
+            }
+            "agent_max_turn_messages" => {
+                self.agent_max_turn_messages = Some(parse_read_lines(key, value)?)
             }
             "shell" => self.shell = Some(value.to_string()),
             "model_provider" => self.model_provider = Some(normalize_model_provider(value)?),
@@ -2561,6 +2625,20 @@ fn parse_round_count(key: &str, value: &str) -> Result<u32> {
 /// Refuse it at parse time rather than letting it surface later as a file the
 /// model insists is empty — the same reasoning as `parse_task_token_ceiling`.
 fn parse_read_lines(key: &str, value: &str) -> Result<usize> {
+    let parsed = parse_u64(key, value)? as usize;
+    if parsed >= 1 {
+        Ok(parsed)
+    } else {
+        Err(ClientError::InvalidInput(format!(
+            "{key} must be at least 1"
+        )))
+    }
+}
+
+/// A deadline of zero would kill every command at spawn, which reads as
+/// Damaian being unable to run anything rather than as a timeout. Refuse it at
+/// parse time, the same reasoning as `parse_task_token_ceiling`.
+fn parse_timeout_seconds(key: &str, value: &str) -> Result<usize> {
     let parsed = parse_u64(key, value)? as usize;
     if parsed >= 1 {
         Ok(parsed)

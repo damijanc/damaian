@@ -708,6 +708,15 @@ Both streams are secret-redacted and truncated to `max_command_output_bytes`
 before being stored, so a suspiciously short log may be a truncation, not an
 early exit. Check `exitCode` on the matching `command_executed` audit event.
 
+A command that was killed rather than exited reports `exitCode: -1` on that
+audit event and a `TERMINATION` of `timed_out` or `cancelled` on its
+`summary.dcmd`. It is killed when it passes `command_timeout_secs` (default
+600) or when the turn is stopped; `command_timeout_secs` is restrict-only, so a
+repository may lower that deadline but not raise it. While it runs, its output
+is streamed to the interface as it arrives and redacted a line at a time; the
+stored log above is still the authoritative whole-output redaction, so treat a
+missing secret in the live view as expected rather than as proof.
+
 ## Inspecting configuration
 
 Effective config for a repository, with all three overlays applied:

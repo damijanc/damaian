@@ -4,7 +4,7 @@ use crate::checkpoint::{
     CheckpointConversation, CheckpointRequest, CheckpointStore, CommandCensus, PendingApproval,
 };
 use crate::command_policy::allow_always_eligible;
-use crate::command_runner::CommandExecution;
+use crate::command_runner::{CommandExecution, CommandTermination};
 use crate::config::{Config, McpTransport};
 use crate::context_manager::ContextManager;
 use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes};
@@ -126,6 +126,10 @@ pub enum PhaseKind {
     Model,
     Tool,
     Finalizing,
+    /// A line of a running command's output, streamed before it exits
+    /// (requirement 5). Distinct from the other kinds so a client can render it
+    /// as a log line rather than replacing the status badge it is not.
+    Output,
 }
 
 impl PhaseKind {
@@ -135,6 +139,7 @@ impl PhaseKind {
             Self::Model => "model",
             Self::Tool => "tool",
             Self::Finalizing => "finalizing",
+            Self::Output => "output",
         }
     }
 }
@@ -836,9 +841,27 @@ impl ChatOrchestrator {
                     .checkpoint_store
                     .begin_command_census(&repository_root)
                     .unwrap_or_else(|_| CommandCensus::unavailable());
-                let record =
-                    self.validation_orchestrator
-                        .run_proposal(proposal_id, true, approved_by)?;
+                let max_rounds = self.tool_round_limit(false, pending.turn_options);
+                let cancel = sink.cancel;
+                // Borrow only the progress field, so `cancel` can be read for
+                // the same call without two conflicting borrows of the sink.
+                let on_progress = &mut *sink.on_progress;
+                let mut on_output = |line: &str| {
+                    on_progress(TurnProgress::Phase(TurnPhase::new(
+                        PhaseKind::Output,
+                        line,
+                        pending.round,
+                        max_rounds,
+                    )));
+                };
+                let record = self.validation_orchestrator.run_proposal(
+                    proposal_id,
+                    true,
+                    approved_by,
+                    Some(&pending.task.id),
+                    cancel,
+                    &mut on_output,
+                )?;
                 self.record_command_effects(
                     &repository_root,
                     &pending.session,
@@ -1305,6 +1328,10 @@ impl ChatOrchestrator {
             .read_plan_approved(&session.id, &task.id)
             .unwrap_or(false);
 
+        // Extra rounds a turn may take past its configured segment because a
+        // token ceiling is set (requirement 6). Bounded by the absolute round
+        // cap so a provider that reports no usage cannot loop forever.
+        let mut round_budget_extension: u32 = 0;
         let (final_run, response, proposals, stop_reason) = loop {
             // Checked before each round rather than only mid-stream: stopping
             // here is what saves a whole model call, and it is the only point
@@ -1377,7 +1404,9 @@ impl ChatOrchestrator {
                 }
             }
 
-            let max_rounds = self.tool_round_limit(web_debug_mode, turn_options);
+            let max_rounds = (self.tool_round_limit(web_debug_mode, turn_options)
+                + round_budget_extension)
+                .min(ABSOLUTE_TOOL_ROUND_CAP);
             let force_final = round >= max_rounds;
             let tools = if force_final {
                 None
@@ -1387,7 +1416,9 @@ impl ChatOrchestrator {
             let request = ModelRequest {
                 provider: self.config.model_provider.clone(),
                 model: self.config.model_name.clone(),
-                messages: messages.clone(),
+                // Bounded, not the raw array: a long turn's tool results would
+                // otherwise grow the request without limit (requirement 6).
+                messages: bounded_messages(&messages, self.config.agent_max_turn_messages),
                 temperature: Some("0".to_string()),
                 reasoning_level: Some(self.config.model_reasoning_level.clone()),
                 stream: true,
@@ -1396,7 +1427,8 @@ impl ChatOrchestrator {
                 request_usage: self.config.provider_reports_usage(),
             };
 
-            let token_estimate: usize = messages
+            let token_estimate: usize = request
+                .messages
                 .iter()
                 .map(|message| message.content.len())
                 .sum::<usize>()
@@ -1615,6 +1647,38 @@ impl ChatOrchestrator {
 
             if force_final {
                 if model_output_requests_tool(&model_run, &redacted) {
+                    // Requirement 6: with a token ceiling set, the round cap is
+                    // not the end. The ceiling is the explicit, bounded budget,
+                    // so the turn takes another round segment and records that
+                    // it did rather than stopping dead. With no ceiling there is
+                    // no bound to continue under, so today's `ToolBudget` stop
+                    // stands. `round < ABSOLUTE_TOOL_ROUND_CAP` is the safety
+                    // net for a provider whose usage never reaches the ceiling.
+                    if self.config.agent_max_task_tokens.is_some()
+                        && round < ABSOLUTE_TOOL_ROUND_CAP
+                    {
+                        self.audit_log.record(
+                            "turn_continued",
+                            &[
+                                ("actor", "system".to_string()),
+                                ("sessionId", session.id.clone()),
+                                ("taskId", task.id.clone()),
+                                ("round", round.to_string()),
+                                ("roundLimit", max_rounds.to_string()),
+                            ],
+                        )?;
+                        messages.push(
+                            ModelMessage::assistant(redacted.clone())
+                                .with_reasoning_content(model_run.reasoning_content.clone()),
+                        );
+                        messages.push(ModelMessage::user(
+                            "Your tool-round segment ended and the turn continued under its token ceiling. Continue the task; the ceiling will stop it when it is reached."
+                                .to_string(),
+                        ));
+                        round_budget_extension += self.default_tool_round_limit();
+                        round += 1;
+                        continue;
+                    }
                     let response = tool_budget_exhausted_response(max_rounds);
                     let mut exhausted_run = model_run;
                     exhausted_run.content = response.clone();
@@ -1633,12 +1697,18 @@ impl ChatOrchestrator {
                 );
             }
 
-            let (matched_tool_call, decoded_tool_action, tool_decode_error) =
-                first_decodable_tool_action(&model_run.tool_calls);
-            let tool_action = decoded_tool_action
-                .or_else(|| parse_command_request(&redacted).map(ToolAction::Command));
+            let (mut calls_this_round, undecodable_calls) =
+                decodable_tool_actions(&model_run.tool_calls, model_run.truncated);
+            // The text envelope is the fallback only when no native call
+            // decoded, exactly as before: one native call and the envelope is
+            // ignored.
+            if calls_this_round.is_empty()
+                && let Some(command) = parse_command_request(&redacted)
+            {
+                calls_this_round.push((None, ToolAction::Command(command)));
+            }
 
-            let Some(tool_action) = tool_action else {
+            if calls_this_round.is_empty() {
                 // The model asked for a tool but the request couldn't be
                 // decoded. The usual cause is the provider stopping at its
                 // output-token ceiling and cutting the `arguments` JSON off
@@ -1647,7 +1717,7 @@ impl ChatOrchestrator {
                 // patch, and a task marked complete. Feed the failure back
                 // instead so the model can retry within the remaining rounds —
                 // the same recovery the restricted-path patch arm uses.
-                let Some(undecodable) = model_run.tool_calls.first().cloned() else {
+                let Some((undecodable, note)) = undecodable_calls.first() else {
                     break (
                         model_run,
                         redacted,
@@ -1655,9 +1725,6 @@ impl ChatOrchestrator {
                         StopReason::Answered,
                     );
                 };
-                let note = tool_decode_error.unwrap_or_else(|| {
-                    undecodable_tool_call_note(&undecodable, model_run.truncated)
-                });
                 let summary = format!(
                     "Attempted to call `{}`, but the request could not be decoded.",
                     undecodable.name
@@ -1669,7 +1736,7 @@ impl ChatOrchestrator {
                     &summary,
                 )?;
                 self.session_store
-                    .append_message(&session.id, Some(&task.id), "tool", &note)?;
+                    .append_message(&session.id, Some(&task.id), "tool", note)?;
                 // Deliberately not echoed back as an `assistant` tool_calls /
                 // `tool` pair: the malformed arguments would have to be
                 // replayed verbatim, and providers reject a tool result whose
@@ -1682,831 +1749,775 @@ impl ChatOrchestrator {
                     })
                     .with_reasoning_content(model_run.reasoning_content.clone()),
                 );
-                messages.push(ModelMessage::user(note));
+                messages.push(ModelMessage::user(note.clone()));
                 round += 1;
                 continue;
-            };
+            }
 
-            // The review gate (§5.5). Checked before the action is bracketed,
-            // let alone dispatched: there is no marker to finish and nothing
-            // to undo, because nothing has happened yet. That is the whole
-            // point of putting it here rather than beside the approval card
-            // the action would have raised on its own — the user is being
-            // asked about the plan, not about this one step, and asking after
-            // the first edit had already been prepared would be asking too
-            // late to redirect.
-            //
-            // A turn with no plan is not gated. The gate exists to review a
-            // plan, and inventing one to have something to approve would put a
-            // panel in front of every trivial question (§5.1).
-            if let Some(current) = plan.as_ref()
-                && !plan_approved
-                && action_awaits_plan_review(&tool_action, |command| {
-                    self.validation_orchestrator
-                        .command_needs_approval(repository_root, command)
-                })
+            // Every decoded call runs, in the order the model made them. A
+            // terminal arm (a command needing approval, a patch ready for
+            // review) ends the turn from inside the loop; a non-terminal one
+            // records its result and the loop continues. The break value is
+            // carried out in `terminal` because a `break` inside the `for`
+            // would only leave the loop, not the turn.
+            // An all-read-only round is dispatched concurrently; any other round
+            // falls back to sequential, in-order dispatch — which is also what
+            // runs the mutating calls one at a time (requirement 8). A single
+            // call is never batched: there is nothing to overlap.
+            // A stop that arrived before the round starts must not begin a
+            // batch of reads; the top-of-loop check finishes the turn.
+            let precomputed = if !sink.cancel.is_cancelled()
+                && calls_this_round.len() > 1
+                && calls_this_round
+                    .iter()
+                    .all(|(_, action)| action_is_batchable_read_only(action))
             {
-                let deferred_action = tool_action_label(&tool_action);
-                let response = plan_review_response(current, &deferred_action);
-                let proposal_id = create_id("planreview");
-                self.pending_commands.save(&PendingChatTurn {
-                    proposal_id: proposal_id.clone(),
-                    session: session.clone(),
-                    task: task.clone(),
-                    repository_root: repository_root.to_string_lossy().to_string(),
-                    context_files: context_files.clone(),
-                    round,
-                    messages: messages.clone(),
-                    // The deferred call is deliberately dropped rather than
-                    // stored: it was never dispatched, and the resumed turn
-                    // asks the model again rather than replaying a request the
-                    // user may have just revised out of the plan.
-                    matched_tool_call: None,
-                    last_content: redacted.clone(),
-                    turn_options,
-                    reasoning_content: model_run.reasoning_content.clone(),
-                    mcp_call: None,
-                    web_diagnostic_call: None,
-                    plan_review: Some(PendingPlanReview {
-                        deferred_action: deferred_action.clone(),
-                    }),
-                })?;
-                self.note_pending_approvals(
-                    &session,
-                    &task,
-                    vec![PendingApproval {
-                        kind: "plan".to_string(),
-                        proposal_id: proposal_id.clone(),
-                    }],
-                );
-                let mut proposal_run = model_run;
-                proposal_run.content = response.clone();
-                break (
-                    proposal_run,
-                    response,
-                    TurnProposals {
-                        plan: Some(AgentPlanProposal {
-                            id: proposal_id,
-                            plan: current.clone(),
-                            deferred_action,
-                        }),
-                        ..Default::default()
-                    },
-                    StopReason::Answered,
-                );
-            }
-
-            if matches!(tool_action, ToolAction::WebDiagnostic(_)) {
-                web_debug_mode = true;
-            }
-            let max_rounds = self.tool_round_limit(web_debug_mode, turn_options);
-            sink.phase(
-                PhaseKind::Tool,
-                tool_action_label(&tool_action),
-                round,
-                max_rounds,
-            );
-
-            // Bracket the dispatch, not the leaf call: `ValidationOrchestrator`
-            // and `McpClient` hold no `SessionStore` and receive no `Task`, so
-            // marking inside them would mean threading session state through
-            // two modules that have nothing to do with it. The window is
-            // slightly wider than the leaf action — it includes proposal and
-            // setup — which errs toward reporting an unknown outcome rather
-            // than missing one, the safe direction for requirement 5.
-            let (marker_action, marker_ref, marker_side_effecting) =
-                tool_action_marker(&tool_action);
-            let action_marker = self.session_store.start_action(
-                &task,
-                marker_action,
-                &marker_ref,
-                marker_side_effecting,
-            )?;
-
-            // Each non-terminal arm below produces the (assistant summary,
-            // tool result, outcome) triple to persist and feed back to the
-            // model. Terminal outcomes (a command needing approval, or a patch
-            // ready for review) `break` the loop directly instead, since
-            // both always require the human before anything continues.
-            //
-            // The third element is what the tool *reported*, which is not the
-            // same as whether dispatching it worked. Every arm used to converge
-            // on `finish_action(marker, "ok")`, so a command that exited
-            // non-zero was indistinguishable in the log from one that passed —
-            // and spec 18's `tool_and_model_error_rate` consequently read 0.000
-            // by construction. Spec 21 requirement 6 reads a step's status from
-            // this value, so it has to be the tool's answer, not the
-            // dispatcher's.
-            let (assistant_summary, tool_result_text, action_outcome) = match tool_action {
-                ToolAction::Command(command_request) => {
-                    let proposal = self.validation_orchestrator.propose_command(
-                        repository_root,
-                        &command_request.command,
-                        &command_request.reason,
-                    )?;
-
-                    if proposal.requires_approval || proposal.blocked {
-                        let response = command_proposal_response(&proposal);
-                        self.pending_commands.save(&PendingChatTurn {
-                            proposal_id: proposal.id.clone(),
-                            session: session.clone(),
-                            task: task.clone(),
-                            repository_root: repository_root.to_string_lossy().to_string(),
-                            context_files: context_files.clone(),
-                            round,
-                            messages: messages.clone(),
-                            matched_tool_call: matched_tool_call.clone(),
-                            last_content: redacted.clone(),
-                            turn_options,
-                            reasoning_content: model_run.reasoning_content.clone(),
-                            mcp_call: None,
-                            web_diagnostic_call: None,
-                            plan_review: None,
-                        })?;
-                        self.note_pending_approvals(
-                            &session,
-                            &task,
-                            vec![PendingApproval {
-                                kind: "command".to_string(),
-                                proposal_id: proposal.id.clone(),
-                            }],
-                        );
-                        // A clean stop for a human decision, not a crash: the
-                        // action is finished so the classifier does not read a
-                        // dangling marker as an unknown outcome.
-                        self.session_store
-                            .finish_action(action_marker, "awaiting_approval")?;
-                        let mut proposal_run = model_run;
-                        proposal_run.content = response.clone();
-                        break (
-                            proposal_run,
-                            response,
-                            TurnProposals {
-                                command: Some(agent_command_proposal(&self.config, &proposal)),
-                                ..Default::default()
-                            },
-                            StopReason::Answered,
-                        );
-                    }
-
-                    let record = self.validation_orchestrator.run_proposal(
-                        &proposal.id,
-                        false,
-                        "sandbox",
-                    )?;
-                    let command_context = sandbox_command_context(&record.execution);
-                    // The exit code is in hand right here, one statement before
-                    // the marker is finished. Nothing downstream can recover it
-                    // — `CommandExecution` is never persisted to the session log
-                    // — so it is carried out of the arm rather than looked up.
-                    let exit_code = record.execution.exit_code;
-                    (
-                        tool_call_summary(&command_request),
-                        command_context,
-                        ActionOutcome::CommandExit(exit_code),
-                    )
+                Some(self.run_read_only_batch(repository_root, &session, &task, &calls_this_round))
+            } else {
+                None
+            };
+            let mut terminal: Option<(ModelRun, String, TurnProposals, StopReason)> = None;
+            let mut first_in_round = true;
+            for (index, (matched_tool_call, tool_action)) in
+                calls_this_round.into_iter().enumerate()
+            {
+                // A stop between calls of a round ends the batch: no further
+                // call starts, and the top of the loop finishes the turn. A
+                // read already in flight is not interrupted — it is a bounded
+                // local read, and the tools take no cancel token — but none
+                // begins after this point.
+                if sink.cancel.is_cancelled() {
+                    break;
                 }
-                ToolAction::ProposePatch(generated_edit) => {
-                    match self.patch_engine.create_patch(
-                        repository_root,
-                        &generated_edit.changes,
-                        Some(&task.id),
-                        &generated_edit.summary,
-                    ) {
-                        Ok(patch) => {
-                            // See `ProposedPatch::session_id`: the engine does
-                            // not know the session, this orchestrator does.
-                            let mut patch = patch;
-                            patch.session_id = session.id.clone();
-                            self.patch_store.save(&patch)?;
-                            let response = patch_proposal_response(&patch);
-                            // A patch waiting for review is a clean stop, not
-                            // a crash — finish the marker before breaking.
+                // The review gate (§5.5). Checked before the action is bracketed,
+                // let alone dispatched: there is no marker to finish and nothing
+                // to undo, because nothing has happened yet. That is the whole
+                // point of putting it here rather than beside the approval card
+                // the action would have raised on its own — the user is being
+                // asked about the plan, not about this one step, and asking after
+                // the first edit had already been prepared would be asking too
+                // late to redirect.
+                //
+                // A turn with no plan is not gated. The gate exists to review a
+                // plan, and inventing one to have something to approve would put a
+                // panel in front of every trivial question (§5.1).
+                if let Some(current) = plan.as_ref()
+                    && !plan_approved
+                    && action_awaits_plan_review(&tool_action, |command| {
+                        self.validation_orchestrator
+                            .command_needs_approval(repository_root, command)
+                    })
+                {
+                    let deferred_action = tool_action_label(&tool_action);
+                    let response = plan_review_response(current, &deferred_action);
+                    let proposal_id = create_id("planreview");
+                    self.pending_commands.save(&PendingChatTurn {
+                        proposal_id: proposal_id.clone(),
+                        session: session.clone(),
+                        task: task.clone(),
+                        repository_root: repository_root.to_string_lossy().to_string(),
+                        context_files: context_files.clone(),
+                        round,
+                        messages: messages.clone(),
+                        // The deferred call is deliberately dropped rather than
+                        // stored: it was never dispatched, and the resumed turn
+                        // asks the model again rather than replaying a request the
+                        // user may have just revised out of the plan.
+                        matched_tool_call: None,
+                        last_content: redacted.clone(),
+                        turn_options,
+                        reasoning_content: model_run.reasoning_content.clone(),
+                        mcp_call: None,
+                        web_diagnostic_call: None,
+                        plan_review: Some(PendingPlanReview {
+                            deferred_action: deferred_action.clone(),
+                        }),
+                    })?;
+                    self.note_pending_approvals(
+                        &session,
+                        &task,
+                        vec![PendingApproval {
+                            kind: "plan".to_string(),
+                            proposal_id: proposal_id.clone(),
+                        }],
+                    );
+                    let mut proposal_run = model_run;
+                    proposal_run.content = response.clone();
+                    terminal = Some((
+                        proposal_run,
+                        response,
+                        TurnProposals {
+                            plan: Some(AgentPlanProposal {
+                                id: proposal_id,
+                                plan: current.clone(),
+                                deferred_action,
+                            }),
+                            ..Default::default()
+                        },
+                        StopReason::Answered,
+                    ));
+                    break;
+                }
+
+                if matches!(tool_action, ToolAction::WebDiagnostic(_)) {
+                    web_debug_mode = true;
+                }
+                let max_rounds = (self.tool_round_limit(web_debug_mode, turn_options)
+                    + round_budget_extension)
+                    .min(ABSOLUTE_TOOL_ROUND_CAP);
+                sink.phase(
+                    PhaseKind::Tool,
+                    tool_action_label(&tool_action),
+                    round,
+                    max_rounds,
+                );
+
+                // Bracket the dispatch, not the leaf call: `ValidationOrchestrator`
+                // and `McpClient` hold no `SessionStore` and receive no `Task`, so
+                // marking inside them would mean threading session state through
+                // two modules that have nothing to do with it. The window is
+                // slightly wider than the leaf action — it includes proposal and
+                // setup — which errs toward reporting an unknown outcome rather
+                // than missing one, the safe direction for requirement 5.
+                let (marker_action, marker_ref, marker_side_effecting) =
+                    tool_action_marker(&tool_action);
+                let action_marker = self.session_store.start_action(
+                    &task,
+                    marker_action,
+                    &marker_ref,
+                    marker_side_effecting,
+                )?;
+
+                // Each non-terminal arm below produces the (assistant summary,
+                // tool result, outcome) triple to persist and feed back to the
+                // model. Terminal outcomes (a command needing approval, or a patch
+                // ready for review) `break` the loop directly instead, since
+                // both always require the human before anything continues.
+                //
+                // The third element is what the tool *reported*, which is not the
+                // same as whether dispatching it worked. Every arm used to converge
+                // on `finish_action(marker, "ok")`, so a command that exited
+                // non-zero was indistinguishable in the log from one that passed —
+                // and spec 18's `tool_and_model_error_rate` consequently read 0.000
+                // by construction. Spec 21 requirement 6 reads a step's status from
+                // this value, so it has to be the tool's answer, not the
+                // dispatcher's.
+                let (assistant_summary, tool_result_text, action_outcome) =
+                    if action_is_batchable_read_only(&tool_action) {
+                        match precomputed.as_ref() {
+                            // Precomputed by the concurrent batch, indexed by the
+                            // model's call order.
+                            Some(results) => results[index].clone(),
+                            None => self.dispatch_read_only_action(
+                                repository_root,
+                                &session,
+                                &task,
+                                &tool_action,
+                            ),
+                        }
+                    } else {
+                        match tool_action {
+                ToolAction::Command(command_request) => {
+                        let proposal = self.validation_orchestrator.propose_command(
+                            repository_root,
+                            &command_request.command,
+                            &command_request.reason,
+                        )?;
+
+                        if proposal.requires_approval || proposal.blocked {
+                            let response = command_proposal_response(&proposal);
+                            self.pending_commands.save(&PendingChatTurn {
+                                proposal_id: proposal.id.clone(),
+                                session: session.clone(),
+                                task: task.clone(),
+                                repository_root: repository_root.to_string_lossy().to_string(),
+                                context_files: context_files.clone(),
+                                round,
+                                messages: messages.clone(),
+                                matched_tool_call: matched_tool_call.clone(),
+                                last_content: redacted.clone(),
+                                turn_options,
+                                reasoning_content: model_run.reasoning_content.clone(),
+                                mcp_call: None,
+                                web_diagnostic_call: None,
+                                plan_review: None,
+                            })?;
+                            self.note_pending_approvals(
+                                &session,
+                                &task,
+                                vec![PendingApproval {
+                                    kind: "command".to_string(),
+                                    proposal_id: proposal.id.clone(),
+                                }],
+                            );
+                            // A clean stop for a human decision, not a crash: the
+                            // action is finished so the classifier does not read a
+                            // dangling marker as an unknown outcome.
                             self.session_store
-                                .finish_action(action_marker, "awaiting_review")?;
-                            let proposal = agent_patch_proposal(&patch);
+                                .finish_action(action_marker, "awaiting_approval")?;
                             let mut proposal_run = model_run;
                             proposal_run.content = response.clone();
-                            break (
+                            terminal = Some((
                                 proposal_run,
                                 response,
                                 TurnProposals {
-                                    patch: Some(proposal),
+                                    command: Some(agent_command_proposal(&self.config, &proposal)),
                                     ..Default::default()
                                 },
                                 StopReason::Answered,
-                            );
+                            ));
+                            break;
                         }
-                        // Fed back as a tool result rather than aborting the
-                        // turn, so the model can see why (e.g. a restricted
-                        // or out-of-repo path) and correct itself within the
-                        // remaining rounds instead of the turn just failing.
-                        Err(error) => (
-                            format!("Attempted to propose a patch: {}", generated_edit.summary),
-                            format!("Cannot propose that patch: {error}"),
-                            ActionOutcome::Failed,
-                        ),
-                    }
-                }
-                ToolAction::ProposePlan(steps) => {
-                    if plan.is_some() {
-                        // Refused rather than replaced. Steps already carry
-                        // evidence tied to a state of the repository, and
-                        // rewriting the plan underneath that evidence produces
-                        // a history that no longer describes what happened —
-                        // the same reason §5.5 rules out mid-execution edits.
+
+                        let cancel = sink.cancel;
+                        // Borrow only the progress field, so `cancel` can be read
+                        // for the same call without two conflicting borrows of the
+                        // sink.
+                        let on_progress = &mut *sink.on_progress;
+                        let mut on_output = |line: &str| {
+                            on_progress(TurnProgress::Phase(TurnPhase::new(
+                                PhaseKind::Output,
+                                line,
+                                round,
+                                max_rounds,
+                            )));
+                        };
+                        let record = self.validation_orchestrator.run_proposal(
+                            &proposal.id,
+                            false,
+                            "sandbox",
+                            Some(&task.id),
+                            cancel,
+                            &mut on_output,
+                        )?;
+                        let command_context = sandbox_command_context(&record.execution);
+                        // The exit code is in hand right here, one statement before
+                        // the marker is finished. Nothing downstream can recover it
+                        // — `CommandExecution` is never persisted to the session log
+                        // — so it is carried out of the arm rather than looked up.
+                        let exit_code = record.execution.exit_code;
                         (
+                            tool_call_summary(&command_request),
+                            command_context,
+                            ActionOutcome::CommandExit(exit_code),
+                        )
+                    }
+                    ToolAction::ProposePatch(generated_edit) => {
+                        match self.patch_engine.create_patch(
+                            repository_root,
+                            &generated_edit.changes,
+                            Some(&task.id),
+                            &generated_edit.summary,
+                        ) {
+                            Ok(patch) => {
+                                // See `ProposedPatch::session_id`: the engine does
+                                // not know the session, this orchestrator does.
+                                let mut patch = patch;
+                                patch.session_id = session.id.clone();
+                                self.patch_store.save(&patch)?;
+                                let response = patch_proposal_response(&patch);
+                                // A patch waiting for review is a clean stop, not
+                                // a crash — finish the marker before breaking.
+                                self.session_store
+                                    .finish_action(action_marker, "awaiting_review")?;
+                                let proposal = agent_patch_proposal(&patch);
+                                let mut proposal_run = model_run;
+                                proposal_run.content = response.clone();
+                                terminal = Some((
+                                    proposal_run,
+                                    response,
+                                    TurnProposals {
+                                        patch: Some(proposal),
+                                        ..Default::default()
+                                    },
+                                    StopReason::Answered,
+                                ));
+                                break;
+                            }
+                            // Fed back as a tool result rather than aborting the
+                            // turn, so the model can see why (e.g. a restricted
+                            // or out-of-repo path) and correct itself within the
+                            // remaining rounds instead of the turn just failing.
+                            Err(error) => (
+                                format!("Attempted to propose a patch: {}", generated_edit.summary),
+                                format!("Cannot propose that patch: {error}"),
+                                ActionOutcome::Failed,
+                            ),
+                        }
+                    }
+                    ToolAction::ProposePlan(steps) => {
+                        if plan.is_some() {
+                            // Refused rather than replaced. Steps already carry
+                            // evidence tied to a state of the repository, and
+                            // rewriting the plan underneath that evidence produces
+                            // a history that no longer describes what happened —
+                            // the same reason §5.5 rules out mid-execution edits.
+                            (
                             "Attempted to propose a second plan.".to_string(),
                             "This turn already has a plan. Work through its remaining steps with complete_step, or stop and start a new turn if the plan is wrong.".to_string(),
                             ActionOutcome::Failed,
                         )
-                    } else {
-                        let now = now_millis();
-                        let mut proposed = crate::plan::TaskPlan::new(&task.id, now);
-                        for (index, step) in steps.iter().enumerate() {
-                            proposed.steps.push(crate::plan::PlanStep {
-                                id: format!("step_{}", index + 1),
-                                // Model-authored text, redacted like any other:
-                                // a title is rendered in the panel and written
-                                // to the log, so a secret echoed into one must
-                                // not survive there.
-                                title: self.scanner.redact(&step.title).text,
-                                detail: step
-                                    .detail
-                                    .as_ref()
-                                    .map(|detail| self.scanner.redact(detail).text),
-                                // The engine's to set, not the model's.
-                                status: if index == 0 {
-                                    crate::plan::StepStatus::InProgress
-                                } else {
-                                    crate::plan::StepStatus::Pending
-                                },
-                                depends_on: Vec::new(),
-                                started_at_ms: (index == 0).then_some(now),
-                                completed_at_ms: None,
-                                evidence: Vec::new(),
-                            });
-                        }
-                        self.session_store.create_plan(&task, &proposed)?;
-                        sink.plan(&proposed);
-                        let summary = format!("Planned {} steps.", proposed.steps.len());
-                        let first = proposed.steps[0].title.clone();
-                        plan = Some(proposed);
-                        (
-                            summary,
-                            format!(
-                                "Plan recorded. The current step is: {first}. Call complete_step when its work is done."
-                            ),
-                            ActionOutcome::Ok,
-                        )
-                    }
-                }
-                ToolAction::CompleteStep => match plan.as_mut() {
-                    None => (
-                        "Attempted to complete a step.".to_string(),
-                        "There is no plan for this turn, so there is no step to complete."
-                            .to_string(),
-                        ActionOutcome::Failed,
-                    ),
-                    Some(current) => {
-                        // The model asked to move on; it does not get to say
-                        // how the step ended. §5.3: the status is a function
-                        // of the evidence, and this is the only place a step
-                        // reaches a terminal status.
-                        let accrued = std::mem::take(&mut step_evidence);
-                        let now = now_millis();
-                        let mut finished_title = String::new();
-                        let mut status = crate::plan::StepStatus::Completed;
-                        if let Some(open) = current
-                            .steps
-                            .iter_mut()
-                            .find(|step| step.status == crate::plan::StepStatus::InProgress)
-                        {
-                            // Extends rather than replaces. A step can already
-                            // carry evidence this turn never saw: a patch
-                            // applied after the turn that proposed it appends
-                            // through the log (`edit.rs`), and a resumed plan
-                            // arrives with everything its earlier turns
-                            // recorded. Assigning here would silently drop
-                            // both, and the step would then be judged on a
-                            // fraction of what is known about it.
-                            open.evidence.extend(accrued);
-                            status = crate::plan::status_from_evidence(&open.evidence);
-                            open.status = status;
-                            open.completed_at_ms = Some(now);
-                            finished_title = open.title.clone();
-                            let closed = open.clone();
-                            self.session_store.update_plan_step(&task, &closed)?;
-                        }
-
-                        // A blocked step does not hand off: the next step's
-                        // prerequisite failed, and starting it anyway would
-                        // build on work that did not happen.
-                        let mut next_title = None;
-                        if status == crate::plan::StepStatus::Completed
-                            && let Some(next) = current
-                                .steps
-                                .iter_mut()
-                                .find(|step| step.status == crate::plan::StepStatus::Pending)
-                        {
-                            next.status = crate::plan::StepStatus::InProgress;
-                            next.started_at_ms = Some(now);
-                            next_title = Some(next.title.clone());
-                            let started = next.clone();
-                            self.session_store.update_plan_step(&task, &started)?;
-                        }
-                        // Once, after the handoff rather than after each of its
-                        // two writes: between them the closing step is already
-                        // terminal and the next has not opened, so a panel
-                        // updated mid-handoff would blink through a state with
-                        // no current step. The log keeps both writes; the panel
-                        // does not need them.
-                        sink.plan(current);
-
-                        let result = match (status, &next_title) {
-                            (crate::plan::StepStatus::Blocked, _) => format!(
-                                "Step \"{finished_title}\" is blocked: a command it ran did not succeed. Fix that before moving on; the remaining steps are still pending."
-                            ),
-                            (_, Some(next)) => format!(
-                                "Step \"{finished_title}\" is complete. The current step is now: {next}."
-                            ),
-                            (_, None) => format!(
-                                "Step \"{finished_title}\" is complete. That was the last step."
-                            ),
-                        };
-                        (
-                            format!("Finished: {finished_title}"),
-                            result,
-                            ActionOutcome::Ok,
-                        )
-                    }
-                },
-                ToolAction::ReadFile { path, range } => {
-                    let window = match range {
-                        Some(range) => ReadWindow::Range(range),
-                        None => ReadWindow::Default,
-                    };
-                    let (content, outcome) = match self.file_access.read_file(
-                        repository_root,
-                        &path,
-                        Some(&task.id),
-                        Some(&session.repository_id),
-                        false,
-                        false,
-                        window,
-                    ) {
-                        Ok(file_read) => {
-                            let mut content = format!(
-                                "Content of {}, lines {}–{} of {}:",
-                                file_read.path,
-                                file_read.line_range.start,
-                                file_read.line_range.end,
-                                file_read.total_lines,
-                            );
-                            if let Some(reason) = &file_read.truncated_by {
-                                content.push_str(&format!(
-                                    " (truncated by {reason}; ask for a narrower range)"
-                                ));
+                        } else {
+                            let now = now_millis();
+                            let mut proposed = crate::plan::TaskPlan::new(&task.id, now);
+                            for (index, step) in steps.iter().enumerate() {
+                                proposed.steps.push(crate::plan::PlanStep {
+                                    id: format!("step_{}", index + 1),
+                                    // Model-authored text, redacted like any other:
+                                    // a title is rendered in the panel and written
+                                    // to the log, so a secret echoed into one must
+                                    // not survive there.
+                                    title: self.scanner.redact(&step.title).text,
+                                    detail: step
+                                        .detail
+                                        .as_ref()
+                                        .map(|detail| self.scanner.redact(detail).text),
+                                    // The engine's to set, not the model's.
+                                    status: if index == 0 {
+                                        crate::plan::StepStatus::InProgress
+                                    } else {
+                                        crate::plan::StepStatus::Pending
+                                    },
+                                    depends_on: Vec::new(),
+                                    started_at_ms: (index == 0).then_some(now),
+                                    completed_at_ms: None,
+                                    evidence: Vec::new(),
+                                });
                             }
-                            content.push_str(&format!("\n{}", file_read.content));
+                            self.session_store.create_plan(&task, &proposed)?;
+                            sink.plan(&proposed);
+                            let summary = format!("Planned {} steps.", proposed.steps.len());
+                            let first = proposed.steps[0].title.clone();
+                            plan = Some(proposed);
                             (
-                                content,
-                                ActionOutcome::FileRead {
-                                    path: file_read.path.clone(),
-                                    hash: file_read.hash.clone(),
-                                },
-                            )
-                        }
-                        Err(error) => (
-                            format!("Cannot read {path}: {error}"),
-                            ActionOutcome::Failed,
-                        ),
-                    };
-                    (format!("Read `{path}`"), content, outcome)
-                }
-                ToolAction::ListDirectory { dir, depth } => {
-                    match self.navigation.list_directory(
-                        repository_root,
-                        dir.as_deref(),
-                        depth,
-                        Some(&task.id),
-                        Some(&session.repository_id),
-                    ) {
-                        Ok(listing) => {
-                            let dir_name = dir.as_deref().unwrap_or(".");
-                            let content = if listing.truncated {
+                                summary,
                                 format!(
-                                    "Listing of {dir_name} ({} of {} paths):\n{}",
-                                    listing.paths.len(),
-                                    listing.total_found,
-                                    listing.paths.join("\n")
-                                )
-                            } else {
-                                format!(
-                                    "Listing of {dir_name} ({} paths):\n{}",
-                                    listing.total_found,
-                                    listing.paths.join("\n")
-                                )
-                            };
-                            (format!("Listed {dir_name}"), content, ActionOutcome::Ok)
-                        }
-                        Err(error) => (
-                            "Attempted to list the directory.".to_string(),
-                            format!("Cannot list that directory: {error}"),
-                            ActionOutcome::Failed,
-                        ),
-                    }
-                }
-                ToolAction::SearchContent {
-                    pattern,
-                    path_glob,
-                    max_matches,
-                } => {
-                    match self.navigation.search_content(
-                        repository_root,
-                        &pattern,
-                        path_glob.as_deref(),
-                        max_matches,
-                        Some(&task.id),
-                        Some(&session.repository_id),
-                    ) {
-                        Ok(found) => {
-                            let mut lines = found
-                                .matches
-                                .iter()
-                                .map(|m| format!("{}:{}: {}", m.path, m.line, m.text))
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            if !lines.is_empty() {
-                                lines.push('\n');
-                            }
-                            let content = format!(
-                                "{} matches for \"{}\" across {} files (showing {}):\n{}",
-                                found.total_found,
-                                pattern,
-                                found.files_searched,
-                                found.matches.len(),
-                                lines,
-                            );
-                            (
-                                format!("Searched for \"{pattern}\""),
-                                content,
+                                    "Plan recorded. The current step is: {first}. Call complete_step when its work is done."
+                                ),
                                 ActionOutcome::Ok,
                             )
                         }
-                        Err(error) => (
-                            "Attempted to search the repository.".to_string(),
-                            format!("Cannot search: {error}"),
+                    }
+                    ToolAction::CompleteStep => match plan.as_mut() {
+                        None => (
+                            "Attempted to complete a step.".to_string(),
+                            "There is no plan for this turn, so there is no step to complete."
+                                .to_string(),
                             ActionOutcome::Failed,
                         ),
-                    }
-                }
-                ToolAction::EditFile { summary, edits } => {
-                    match region_edits_to_changes(repository_root, &self.path_policy, &edits)
-                        .and_then(|changes| {
-                            self.patch_engine.create_patch(
-                                repository_root,
-                                &changes,
-                                Some(&task.id),
-                                &summary,
+                        Some(current) => {
+                            // The model asked to move on; it does not get to say
+                            // how the step ended. §5.3: the status is a function
+                            // of the evidence, and this is the only place a step
+                            // reaches a terminal status.
+                            let accrued = std::mem::take(&mut step_evidence);
+                            let now = now_millis();
+                            let mut finished_title = String::new();
+                            let mut status = crate::plan::StepStatus::Completed;
+                            if let Some(open) = current
+                                .steps
+                                .iter_mut()
+                                .find(|step| step.status == crate::plan::StepStatus::InProgress)
+                            {
+                                // Extends rather than replaces. A step can already
+                                // carry evidence this turn never saw: a patch
+                                // applied after the turn that proposed it appends
+                                // through the log (`edit.rs`), and a resumed plan
+                                // arrives with everything its earlier turns
+                                // recorded. Assigning here would silently drop
+                                // both, and the step would then be judged on a
+                                // fraction of what is known about it.
+                                open.evidence.extend(accrued);
+                                status = crate::plan::status_from_evidence(&open.evidence);
+                                open.status = status;
+                                open.completed_at_ms = Some(now);
+                                finished_title = open.title.clone();
+                                let closed = open.clone();
+                                self.session_store.update_plan_step(&task, &closed)?;
+                            }
+
+                            // A blocked step does not hand off: the next step's
+                            // prerequisite failed, and starting it anyway would
+                            // build on work that did not happen.
+                            let mut next_title = None;
+                            if status == crate::plan::StepStatus::Completed
+                                && let Some(next) = current
+                                    .steps
+                                    .iter_mut()
+                                    .find(|step| step.status == crate::plan::StepStatus::Pending)
+                            {
+                                next.status = crate::plan::StepStatus::InProgress;
+                                next.started_at_ms = Some(now);
+                                next_title = Some(next.title.clone());
+                                let started = next.clone();
+                                self.session_store.update_plan_step(&task, &started)?;
+                            }
+                            // Once, after the handoff rather than after each of its
+                            // two writes: between them the closing step is already
+                            // terminal and the next has not opened, so a panel
+                            // updated mid-handoff would blink through a state with
+                            // no current step. The log keeps both writes; the panel
+                            // does not need them.
+                            sink.plan(current);
+
+                            let result = match (status, &next_title) {
+                                (crate::plan::StepStatus::Blocked, _) => format!(
+                                    "Step \"{finished_title}\" is blocked: a command it ran did not succeed. Fix that before moving on; the remaining steps are still pending."
+                                ),
+                                (_, Some(next)) => format!(
+                                    "Step \"{finished_title}\" is complete. The current step is now: {next}."
+                                ),
+                                (_, None) => format!(
+                                    "Step \"{finished_title}\" is complete. That was the last step."
+                                ),
+                            };
+                            (
+                                format!("Finished: {finished_title}"),
+                                result,
+                                ActionOutcome::Ok,
                             )
-                        }) {
-                        Ok(patch) => {
-                            // See `ProposedPatch::session_id`: the engine does
-                            // not know the session, this orchestrator does.
-                            let mut patch = patch;
-                            patch.session_id = session.id.clone();
-                            self.patch_store.save(&patch)?;
-                            let response = patch_proposal_response(&patch);
-                            // A patch waiting for review is a clean stop, not
-                            // a crash — finish the marker before breaking.
+                        }
+                    },
+                    ToolAction::EditFile { summary, edits } => {
+                        match region_edits_to_changes(repository_root, &self.path_policy, &edits)
+                            .and_then(|changes| {
+                                self.patch_engine.create_patch(
+                                    repository_root,
+                                    &changes,
+                                    Some(&task.id),
+                                    &summary,
+                                )
+                            }) {
+                            Ok(patch) => {
+                                // See `ProposedPatch::session_id`: the engine does
+                                // not know the session, this orchestrator does.
+                                let mut patch = patch;
+                                patch.session_id = session.id.clone();
+                                self.patch_store.save(&patch)?;
+                                let response = patch_proposal_response(&patch);
+                                // A patch waiting for review is a clean stop, not
+                                // a crash — finish the marker before breaking.
+                                self.session_store
+                                    .finish_action(action_marker, "awaiting_review")?;
+                                let proposal = agent_patch_proposal(&patch);
+                                let mut proposal_run = model_run;
+                                proposal_run.content = response.clone();
+                                terminal = Some((
+                                    proposal_run,
+                                    response,
+                                    TurnProposals {
+                                        patch: Some(proposal),
+                                        ..Default::default()
+                                    },
+                                    StopReason::Answered,
+                                ));
+                                break;
+                            }
+                            // Fed back as a tool result rather than aborting the
+                            // turn, so the model can see why (a stale anchor, a
+                            // restricted path) and correct itself within the
+                            // remaining rounds.
+                            Err(error) => (
+                                format!("Attempted to edit files: {summary}"),
+                                format!("Cannot apply that edit: {error}"),
+                                ActionOutcome::Failed,
+                            ),
+                        }
+                    }
+                    ToolAction::WebDiagnostic(call) => {
+                        let call = call.with_context(&session.id, &task.id);
+                        let session_approved = if call.is_low_risk() {
+                            false
+                        } else {
                             self.session_store
-                                .finish_action(action_marker, "awaiting_review")?;
-                            let proposal = agent_patch_proposal(&patch);
+                                .browser_diagnostics_allowed_for_session(&session.id)?
+                        };
+                        if !call.is_low_risk() && !session_approved {
+                            let proposal_id = create_id("webdiag");
+                            let proposal = web_diagnostic_approval_proposal(&proposal_id, &call);
+                            let response = proposal.prompt.clone();
+                            self.pending_commands.save(&PendingChatTurn {
+                                proposal_id,
+                                session: session.clone(),
+                                task: task.clone(),
+                                repository_root: repository_root.to_string_lossy().to_string(),
+                                context_files: context_files.clone(),
+                                round,
+                                messages: messages.clone(),
+                                matched_tool_call: matched_tool_call.clone(),
+                                last_content: redacted.clone(),
+                                turn_options,
+                                reasoning_content: model_run.reasoning_content.clone(),
+                                mcp_call: None,
+                                web_diagnostic_call: Some(PendingWebDiagnosticCall { call }),
+                                plan_review: None,
+                            })?;
+                            self.note_pending_approvals(
+                                &session,
+                                &task,
+                                vec![PendingApproval {
+                                    kind: "browser_diagnostic".to_string(),
+                                    proposal_id: proposal.id.clone(),
+                                }],
+                            );
+                            // A clean stop for a human decision, not a crash: the
+                            // action is finished so the classifier does not read a
+                            // dangling marker as an unknown outcome.
+                            self.session_store
+                                .finish_action(action_marker, "awaiting_approval")?;
                             let mut proposal_run = model_run;
                             proposal_run.content = response.clone();
-                            break (
+                            terminal = Some((
                                 proposal_run,
                                 response,
                                 TurnProposals {
-                                    patch: Some(proposal),
+                                    command: Some(proposal),
                                     ..Default::default()
                                 },
                                 StopReason::Answered,
-                            );
+                            ));
+                            break;
                         }
-                        // Fed back as a tool result rather than aborting the
-                        // turn, so the model can see why (a stale anchor, a
-                        // restricted path) and correct itself within the
-                        // remaining rounds.
-                        Err(error) => (
-                            format!("Attempted to edit files: {summary}"),
-                            format!("Cannot apply that edit: {error}"),
-                            ActionOutcome::Failed,
-                        ),
-                    }
-                }
-                ToolAction::SearchCodebase {
-                    query,
-                    semantic,
-                    limit,
-                } => {
-                    let index = crate::index_cache::IndexCache::get_or_build(
-                        &self.indexer,
-                        repository_root,
-                    )?;
-                    let results = if semantic {
-                        if self.config.enable_semantic_search {
-                            VectorIndexCache::semantic_search(
-                                &self.config.data_dir,
-                                &index,
-                                &query,
-                                limit,
-                            )
-                        } else {
-                            index.semantic_search(&query, limit)
+                        if session_approved {
+                            self.audit_log.record(
+                                "browser_diagnostic_session_approval_used",
+                                &[
+                                    ("actor", "system".to_string()),
+                                    ("sessionId", session.id.clone()),
+                                    ("taskId", task.id.clone()),
+                                    ("tool", call.name().to_string()),
+                                    ("url", call.url.clone()),
+                                ],
+                            )?;
                         }
-                    } else {
-                        index.keyword_search(&query, limit)
-                    };
-                    (
-                        format!("Searched codebase for \"{query}\""),
-                        format_search_results(&results),
-                        // A search that matched nothing still ran. "No results"
-                        // is an answer, not a failure.
-                        ActionOutcome::Ok,
-                    )
-                }
-                ToolAction::ReadGitStatus => {
-                    let (content, outcome) = match self.git.status(repository_root) {
-                        Ok(status) => (format_git_status(&status), ActionOutcome::Ok),
-                        Err(error) => (
-                            format!("Cannot read git status: {error}"),
-                            ActionOutcome::Failed,
-                        ),
-                    };
-                    ("Checked git status".to_string(), content, outcome)
-                }
-                ToolAction::ReadGitDiff { staged } => {
-                    let (content, outcome) = match self.git.diff(repository_root, staged) {
-                        Ok(diff) if diff.trim().is_empty() => {
-                            ("No differences.".to_string(), ActionOutcome::Ok)
-                        }
-                        Ok(diff) => (diff, ActionOutcome::Ok),
-                        Err(error) => (
-                            format!("Cannot read git diff: {error}"),
-                            ActionOutcome::Failed,
-                        ),
-                    };
-                    (
-                        format!("Read git diff{}", if staged { " (staged)" } else { "" }),
-                        content,
-                        outcome,
-                    )
-                }
-                ToolAction::WebDiagnostic(call) => {
-                    let call = call.with_context(&session.id, &task.id);
-                    let session_approved = if call.is_low_risk() {
-                        false
-                    } else {
-                        self.session_store
-                            .browser_diagnostics_allowed_for_session(&session.id)?
-                    };
-                    if !call.is_low_risk() && !session_approved {
-                        let proposal_id = create_id("webdiag");
-                        let proposal = web_diagnostic_approval_proposal(&proposal_id, &call);
-                        let response = proposal.prompt.clone();
-                        self.pending_commands.save(&PendingChatTurn {
-                            proposal_id,
-                            session: session.clone(),
-                            task: task.clone(),
-                            repository_root: repository_root.to_string_lossy().to_string(),
-                            context_files: context_files.clone(),
-                            round,
-                            messages: messages.clone(),
-                            matched_tool_call: matched_tool_call.clone(),
-                            last_content: redacted.clone(),
-                            turn_options,
-                            reasoning_content: model_run.reasoning_content.clone(),
-                            mcp_call: None,
-                            web_diagnostic_call: Some(PendingWebDiagnosticCall { call }),
-                            plan_review: None,
-                        })?;
-                        self.note_pending_approvals(
-                            &session,
-                            &task,
-                            vec![PendingApproval {
-                                kind: "browser_diagnostic".to_string(),
-                                proposal_id: proposal.id.clone(),
-                            }],
-                        );
-                        // A clean stop for a human decision, not a crash: the
-                        // action is finished so the classifier does not read a
-                        // dangling marker as an unknown outcome.
-                        self.session_store
-                            .finish_action(action_marker, "awaiting_approval")?;
-                        let mut proposal_run = model_run;
-                        proposal_run.content = response.clone();
-                        break (
-                            proposal_run,
-                            response,
-                            TurnProposals {
-                                command: Some(proposal),
-                                ..Default::default()
-                            },
-                            StopReason::Answered,
-                        );
-                    }
-                    if session_approved {
-                        self.audit_log.record(
-                            "browser_diagnostic_session_approval_used",
-                            &[
-                                ("actor", "system".to_string()),
-                                ("sessionId", session.id.clone()),
-                                ("taskId", task.id.clone()),
-                                ("tool", call.name().to_string()),
-                                ("url", call.url.clone()),
-                            ],
-                        )?;
-                    }
 
-                    let signature = web_diagnostic_signature(&call);
-                    let retry_limit = self.config.agent_tool_retry_limit;
-                    let (content, outcome) = if failed_browser_calls
-                        .get(&signature)
-                        .copied()
-                        .unwrap_or_default()
-                        >= retry_limit
-                    {
-                        // Refused rather than attempted, because the same call
-                        // has already failed its retry limit. Still a failure:
-                        // the tool produced no diagnostic.
-                        (browser_retry_limit_note(retry_limit), ActionOutcome::Failed)
-                    } else {
-                        let report = self.run_web_diagnostic_report(&call);
-                        let content = self.format_web_diagnostic_result(report);
-                        let failed = browser_tool_result_failed(&content);
-                        if failed {
-                            *failed_browser_calls.entry(signature).or_insert(0) += 1;
-                        }
-                        let outcome = if failed {
-                            ActionOutcome::Failed
+                        let signature = web_diagnostic_signature(&call);
+                        let retry_limit = self.config.agent_tool_retry_limit;
+                        let (content, outcome) = if failed_browser_calls
+                            .get(&signature)
+                            .copied()
+                            .unwrap_or_default()
+                            >= retry_limit
+                        {
+                            // Refused rather than attempted, because the same call
+                            // has already failed its retry limit. Still a failure:
+                            // the tool produced no diagnostic.
+                            (browser_retry_limit_note(retry_limit), ActionOutcome::Failed)
                         } else {
-                            ActionOutcome::Ok
-                        };
-                        (content, outcome)
-                    };
-                    (web_diagnostic_summary(&call), content, outcome)
-                }
-                ToolAction::McpCall {
-                    server_id,
-                    tool_name,
-                    arguments_json,
-                } => {
-                    // MCP tools reach an external service and can have side
-                    // effects, so unless the server is marked no-approval we
-                    // pause the turn exactly like a command needing approval:
-                    // persist state keyed by a fresh proposal id and hand the
-                    // user a proposal to accept or decline.
-                    if mcp.requires_approval(&server_id) {
-                        let proposal_id = create_id("mcp");
-                        let proposal = mcp_approval_proposal(
-                            &proposal_id,
-                            &server_id,
-                            &tool_name,
-                            &arguments_json,
-                        );
-                        let response = proposal.prompt.clone();
-                        self.pending_commands.save(&PendingChatTurn {
-                            proposal_id,
-                            session: session.clone(),
-                            task: task.clone(),
-                            repository_root: repository_root.to_string_lossy().to_string(),
-                            context_files: context_files.clone(),
-                            round,
-                            messages: messages.clone(),
-                            matched_tool_call: matched_tool_call.clone(),
-                            last_content: redacted.clone(),
-                            turn_options,
-                            reasoning_content: model_run.reasoning_content.clone(),
-                            mcp_call: Some(PendingMcpCall {
-                                server_id,
-                                tool_name,
-                                arguments_json,
-                            }),
-                            web_diagnostic_call: None,
-                            plan_review: None,
-                        })?;
-                        self.note_pending_approvals(
-                            &session,
-                            &task,
-                            vec![PendingApproval {
-                                kind: "mcp_tool".to_string(),
-                                proposal_id: proposal.id.clone(),
-                            }],
-                        );
-                        let mut proposal_run = model_run;
-                        proposal_run.content = response.clone();
-                        break (
-                            proposal_run,
-                            response,
-                            TurnProposals {
-                                command: Some(proposal),
-                                ..Default::default()
-                            },
-                            StopReason::Answered,
-                        );
-                    }
-
-                    // No approval required: run it now and feed the result back.
-                    let summary = mcp_call_summary(&server_id, &tool_name);
-                    let (content, outcome) =
-                        match mcp.call_tool(&server_id, &tool_name, &arguments_json) {
-                            Ok(result) => {
-                                let text = self.scanner.redact(&result.text).text;
-                                // `is_error` is the server's own verdict on its
-                                // call. Reaching the server is not the same as
-                                // the call working, and only the server knows
-                                // which happened.
-                                if result.is_error {
-                                    (
-                                        format!("MCP tool reported an error:\n{text}"),
-                                        ActionOutcome::Failed,
-                                    )
-                                } else {
-                                    (text, ActionOutcome::Ok)
-                                }
+                            let report = self.run_web_diagnostic_report(&call);
+                            let content = self.format_web_diagnostic_result(report);
+                            let failed = browser_tool_result_failed(&content);
+                            if failed {
+                                *failed_browser_calls.entry(signature).or_insert(0) += 1;
                             }
-                            Err(error) => (
-                                format!("MCP tool call failed: {error}"),
-                                ActionOutcome::Failed,
-                            ),
+                            let outcome = if failed {
+                                ActionOutcome::Failed
+                            } else {
+                                ActionOutcome::Ok
+                            };
+                            (content, outcome)
                         };
-                    (summary, content, outcome)
+                        (web_diagnostic_summary(&call), content, outcome)
+                    }
+                    ToolAction::McpCall {
+                        server_id,
+                        tool_name,
+                        arguments_json,
+                    } => {
+                        // MCP tools reach an external service and can have side
+                        // effects, so unless the server is marked no-approval we
+                        // pause the turn exactly like a command needing approval:
+                        // persist state keyed by a fresh proposal id and hand the
+                        // user a proposal to accept or decline.
+                        if mcp.requires_approval(&server_id) {
+                            let proposal_id = create_id("mcp");
+                            let proposal = mcp_approval_proposal(
+                                &proposal_id,
+                                &server_id,
+                                &tool_name,
+                                &arguments_json,
+                            );
+                            let response = proposal.prompt.clone();
+                            self.pending_commands.save(&PendingChatTurn {
+                                proposal_id,
+                                session: session.clone(),
+                                task: task.clone(),
+                                repository_root: repository_root.to_string_lossy().to_string(),
+                                context_files: context_files.clone(),
+                                round,
+                                messages: messages.clone(),
+                                matched_tool_call: matched_tool_call.clone(),
+                                last_content: redacted.clone(),
+                                turn_options,
+                                reasoning_content: model_run.reasoning_content.clone(),
+                                mcp_call: Some(PendingMcpCall {
+                                    server_id,
+                                    tool_name,
+                                    arguments_json,
+                                }),
+                                web_diagnostic_call: None,
+                                plan_review: None,
+                            })?;
+                            self.note_pending_approvals(
+                                &session,
+                                &task,
+                                vec![PendingApproval {
+                                    kind: "mcp_tool".to_string(),
+                                    proposal_id: proposal.id.clone(),
+                                }],
+                            );
+                            let mut proposal_run = model_run;
+                            proposal_run.content = response.clone();
+                            terminal = Some((
+                                proposal_run,
+                                response,
+                                TurnProposals {
+                                    command: Some(proposal),
+                                    ..Default::default()
+                                },
+                                StopReason::Answered,
+                            ));
+                            break;
+                        }
+
+                        // No approval required: run it now and feed the result back.
+                        let summary = mcp_call_summary(&server_id, &tool_name);
+                        let (content, outcome) =
+                            match mcp.call_tool(&server_id, &tool_name, &arguments_json) {
+                                Ok(result) => {
+                                    let text = self.scanner.redact(&result.text).text;
+                                    // `is_error` is the server's own verdict on its
+                                    // call. Reaching the server is not the same as
+                                    // the call working, and only the server knows
+                                    // which happened.
+                                    if result.is_error {
+                                        (
+                                            format!("MCP tool reported an error:\n{text}"),
+                                            ActionOutcome::Failed,
+                                        )
+                                    } else {
+                                        (text, ActionOutcome::Ok)
+                                    }
+                                }
+                                Err(error) => (
+                                    format!("MCP tool call failed: {error}"),
+                                    ActionOutcome::Failed,
+                                ),
+                            };
+                        (summary, content, outcome)
+                    }
+                        other => unreachable!(
+                            "read-only action reached the sequential match: {other:?}"
+                        ),
+                    }
+                    };
+                // Accrued before the marker is consumed, since the marker id is
+                // what ties this evidence back to the action in the log. Evidence
+                // belongs to whichever step is open; with no plan there is nothing
+                // to attach it to and this is a no-op.
+                if plan.is_some()
+                    && let Some(evidence) = evidence_for(&action_outcome, action_marker.id())
+                {
+                    step_evidence.push(evidence);
                 }
-            };
-            // Accrued before the marker is consumed, since the marker id is
-            // what ties this evidence back to the action in the log. Evidence
-            // belongs to whichever step is open; with no plan there is nothing
-            // to attach it to and this is a no-op.
-            if plan.is_some()
-                && let Some(evidence) = evidence_for(&action_outcome, action_marker.id())
-            {
-                step_evidence.push(evidence);
-            }
-            // One finish per dispatch, on the tool's own answer. A command goes
-            // through `finish_command_action` so the outcome is derived from
-            // the exit code rather than passed beside it — the two cannot then
-            // disagree in the log.
-            match action_outcome {
-                ActionOutcome::CommandExit(exit_code) => self
-                    .session_store
-                    .finish_command_action(action_marker, exit_code)?,
-                // A successful read is an `ok` dispatch like any other; the
-                // path and hash it carries are for the step's evidence, not
-                // for the marker.
-                ActionOutcome::Ok | ActionOutcome::FileRead { .. } => {
-                    self.session_store.finish_action(action_marker, "ok")?
+                // One finish per dispatch, on the tool's own answer. A command goes
+                // through `finish_command_action` so the outcome is derived from
+                // the exit code rather than passed beside it — the two cannot then
+                // disagree in the log.
+                match action_outcome {
+                    ActionOutcome::CommandExit(exit_code) => self
+                        .session_store
+                        .finish_command_action(action_marker, exit_code)?,
+                    // A successful read is an `ok` dispatch like any other; the
+                    // path and hash it carries are for the step's evidence, not
+                    // for the marker.
+                    ActionOutcome::Ok | ActionOutcome::FileRead { .. } => {
+                        self.session_store.finish_action(action_marker, "ok")?
+                    }
+                    ActionOutcome::Failed => {
+                        self.session_store.finish_action(action_marker, "failed")?
+                    }
                 }
-                ActionOutcome::Failed => {
-                    self.session_store.finish_action(action_marker, "failed")?
+
+                // Persist the tool call and its result so later turns in this
+                // session can still see it (previously this context was
+                // discarded once the turn finished).
+                self.session_store.append_message(
+                    &session.id,
+                    Some(&task.id),
+                    "assistant",
+                    &assistant_summary,
+                )?;
+                self.session_store.append_message(
+                    &session.id,
+                    Some(&task.id),
+                    "tool",
+                    &tool_result_text,
+                )?;
+
+                // Feed this call back before the next one in the round, so a
+                // terminal break still carries everything that already ran.
+                // Only the first assistant message of a round repeats the
+                // model's prose and reasoning; a later one would duplicate
+                // them.
+                if let Some(call) = &matched_tool_call {
+                    let content = if first_in_round {
+                        redacted.clone()
+                    } else {
+                        String::new()
+                    };
+                    let reasoning = if first_in_round {
+                        model_run.reasoning_content.clone()
+                    } else {
+                        None
+                    };
+                    messages.push(ModelMessage::assistant_with_tool_calls(
+                        content,
+                        vec![call.clone()],
+                        reasoning,
+                    ));
+                    messages.push(ModelMessage::tool(
+                        call.id.clone(),
+                        tool_result_text.clone(),
+                    ));
+                } else {
+                    // Only reachable for `ToolAction::Command` via the
+                    // `DAMAIAN_COMMAND_V1` text-envelope fallback — every other
+                    // action only exists as a native tool call.
+                    messages.push(
+                        ModelMessage::assistant(redacted.clone())
+                            .with_reasoning_content(model_run.reasoning_content.clone()),
+                    );
+                    messages.push(ModelMessage::user(format!(
+                        "Command result:\n{tool_result_text}"
+                    )));
                 }
+                first_in_round = false;
             }
 
-            // Persist the tool call and its result so later turns in this
-            // session can still see it (previously this context was
-            // discarded once the turn finished).
-            self.session_store.append_message(
-                &session.id,
-                Some(&task.id),
-                "assistant",
-                &assistant_summary,
-            )?;
-            self.session_store.append_message(
-                &session.id,
-                Some(&task.id),
-                "tool",
-                &tool_result_text,
-            )?;
+            if let Some(finished) = terminal {
+                break finished;
+            }
 
-            if let Some(call) = &matched_tool_call {
-                messages.push(ModelMessage::assistant_with_tool_calls(
-                    redacted.clone(),
-                    vec![call.clone()],
-                    model_run.reasoning_content.clone(),
-                ));
-                messages.push(ModelMessage::tool(call.id.clone(), tool_result_text));
-            } else {
-                // Only reachable for `ToolAction::Command` via the
-                // `DAMAIAN_COMMAND_V1` text-envelope fallback — every other
-                // action only exists as a native tool call.
-                messages.push(
-                    ModelMessage::assistant(redacted.clone())
-                        .with_reasoning_content(model_run.reasoning_content.clone()),
+            // A call in the same round that could not be decoded is reported
+            // after the ones that ran, as plain text: its arguments cannot be
+            // replayed and providers reject a tool result whose call never
+            // parsed.
+            if let Some((undecodable, note)) = undecodable_calls.first() {
+                let summary = format!(
+                    "Attempted to call `{}`, but the request could not be decoded.",
+                    undecodable.name
                 );
-                messages.push(ModelMessage::user(format!(
-                    "Command result:\n{tool_result_text}"
-                )));
+                self.session_store.append_message(
+                    &session.id,
+                    Some(&task.id),
+                    "assistant",
+                    &summary,
+                )?;
+                self.session_store
+                    .append_message(&session.id, Some(&task.id), "tool", note)?;
+                messages.push(ModelMessage::assistant(summary));
+                messages.push(ModelMessage::user(note.clone()));
             }
 
             round += 1;
@@ -2687,6 +2698,236 @@ impl ChatOrchestrator {
             cancelled: true,
             usage,
             estimated_cost,
+        })
+    }
+
+    /// Dispatch one of the read-only tools. Shared by the sequential path (a
+    /// lone call in a round) and [`Self::run_read_only_batch`], so the two
+    /// cannot drift. The returned triple is what the turn records.
+    fn dispatch_read_only_action(
+        &self,
+        repository_root: &Path,
+        session: &Session,
+        task: &Task,
+        action: &ToolAction,
+    ) -> (String, String, ActionOutcome) {
+        match action {
+            ToolAction::ReadFile { path, range } => {
+                let window = match range {
+                    Some(range) => ReadWindow::Range(*range),
+                    None => ReadWindow::Default,
+                };
+                let (content, outcome) = match self.file_access.read_file(
+                    repository_root,
+                    path,
+                    Some(&task.id),
+                    Some(&session.repository_id),
+                    false,
+                    false,
+                    window,
+                ) {
+                    Ok(file_read) => {
+                        let mut content = format!(
+                            "Content of {}, lines {}–{} of {}:",
+                            file_read.path,
+                            file_read.line_range.start,
+                            file_read.line_range.end,
+                            file_read.total_lines,
+                        );
+                        if let Some(reason) = &file_read.truncated_by {
+                            content.push_str(&format!(
+                                " (truncated by {reason}; ask for a narrower range)"
+                            ));
+                        }
+                        content.push_str(&format!("\n{}", file_read.content));
+                        (
+                            content,
+                            ActionOutcome::FileRead {
+                                path: file_read.path.clone(),
+                                hash: file_read.hash.clone(),
+                            },
+                        )
+                    }
+                    Err(error) => (
+                        format!("Cannot read {path}: {error}"),
+                        ActionOutcome::Failed,
+                    ),
+                };
+                (format!("Read `{path}`"), content, outcome)
+            }
+            ToolAction::ListDirectory { dir, depth } => {
+                match self.navigation.list_directory(
+                    repository_root,
+                    dir.as_deref(),
+                    *depth,
+                    Some(&task.id),
+                    Some(&session.repository_id),
+                ) {
+                    Ok(listing) => {
+                        let dir_name = dir.as_deref().unwrap_or(".");
+                        let content = if listing.truncated {
+                            format!(
+                                "Listing of {dir_name} ({} of {} paths):\n{}",
+                                listing.paths.len(),
+                                listing.total_found,
+                                listing.paths.join("\n")
+                            )
+                        } else {
+                            format!(
+                                "Listing of {dir_name} ({} paths):\n{}",
+                                listing.total_found,
+                                listing.paths.join("\n")
+                            )
+                        };
+                        (format!("Listed {dir_name}"), content, ActionOutcome::Ok)
+                    }
+                    Err(error) => (
+                        "Attempted to list the directory.".to_string(),
+                        format!("Cannot list that directory: {error}"),
+                        ActionOutcome::Failed,
+                    ),
+                }
+            }
+            ToolAction::SearchContent {
+                pattern,
+                path_glob,
+                max_matches,
+            } => {
+                match self.navigation.search_content(
+                    repository_root,
+                    pattern,
+                    path_glob.as_deref(),
+                    *max_matches,
+                    Some(&task.id),
+                    Some(&session.repository_id),
+                ) {
+                    Ok(found) => {
+                        let mut lines = found
+                            .matches
+                            .iter()
+                            .map(|m| format!("{}:{}: {}", m.path, m.line, m.text))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !lines.is_empty() {
+                            lines.push('\n');
+                        }
+                        let content = format!(
+                            "{} matches for \"{}\" across {} files (showing {}):\n{}",
+                            found.total_found,
+                            pattern,
+                            found.files_searched,
+                            found.matches.len(),
+                            lines,
+                        );
+                        (
+                            format!("Searched for \"{pattern}\""),
+                            content,
+                            ActionOutcome::Ok,
+                        )
+                    }
+                    Err(error) => (
+                        "Attempted to search the repository.".to_string(),
+                        format!("Cannot search: {error}"),
+                        ActionOutcome::Failed,
+                    ),
+                }
+            }
+            ToolAction::SearchCodebase {
+                query,
+                semantic,
+                limit,
+            } => {
+                let index = match crate::index_cache::IndexCache::get_or_build(
+                    &self.indexer,
+                    repository_root,
+                ) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        return (
+                            format!("Searched codebase for \"{query}\""),
+                            format!("Cannot search the codebase: {error}"),
+                            ActionOutcome::Failed,
+                        );
+                    }
+                };
+                let results = if *semantic {
+                    if self.config.enable_semantic_search {
+                        VectorIndexCache::semantic_search(
+                            &self.config.data_dir,
+                            &index,
+                            query,
+                            *limit,
+                        )
+                    } else {
+                        index.semantic_search(query, *limit)
+                    }
+                } else {
+                    index.keyword_search(query, *limit)
+                };
+                (
+                    format!("Searched codebase for \"{query}\""),
+                    format_search_results(&results),
+                    // A search that matched nothing still ran. "No results"
+                    // is an answer, not a failure.
+                    ActionOutcome::Ok,
+                )
+            }
+            ToolAction::ReadGitStatus => {
+                let (content, outcome) = match self.git.status(repository_root) {
+                    Ok(status) => (format_git_status(&status), ActionOutcome::Ok),
+                    Err(error) => (
+                        format!("Cannot read git status: {error}"),
+                        ActionOutcome::Failed,
+                    ),
+                };
+                ("Checked git status".to_string(), content, outcome)
+            }
+            ToolAction::ReadGitDiff { staged } => {
+                let (content, outcome) = match self.git.diff(repository_root, *staged) {
+                    Ok(diff) if diff.trim().is_empty() => {
+                        ("No differences.".to_string(), ActionOutcome::Ok)
+                    }
+                    Ok(diff) => (diff, ActionOutcome::Ok),
+                    Err(error) => (
+                        format!("Cannot read git diff: {error}"),
+                        ActionOutcome::Failed,
+                    ),
+                };
+                (
+                    format!("Read git diff{}", if *staged { " (staged)" } else { "" }),
+                    content,
+                    outcome,
+                )
+            }
+            other => unreachable!("not a read-only action: {other:?}"),
+        }
+    }
+
+    /// Run an all-read-only round's calls concurrently, collecting results in
+    /// the model's call order. `thread::scope` plus joining in order is the
+    /// determinism: whichever thread finishes first, result `i` is the one the
+    /// model asked for at position `i`, so the recorded log is identical to the
+    /// sequential one (`context.md` §3 on why this is the primitive).
+    fn run_read_only_batch(
+        &self,
+        repository_root: &Path,
+        session: &Session,
+        task: &Task,
+        actions: &[DecodedCall],
+    ) -> Vec<(String, String, ActionOutcome)> {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = actions
+                .iter()
+                .map(|(_, action)| {
+                    scope.spawn(move || {
+                        self.dispatch_read_only_action(repository_root, session, task, action)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("read-only tool thread panicked"))
+                .collect()
         })
     }
 }
@@ -2899,6 +3140,39 @@ fn build_model_prompt(
     output
 }
 
+/// Clamp the within-turn message array to a bounded window, stating what was
+/// elided.
+///
+/// The first two messages are the initial system prompt and the user request
+/// and are always kept. The rest are call/result pairs — an assistant message
+/// and its tool results — and are dropped from the oldest end in whole pairs, so
+/// a tool result is never left without the call it answers. The session log
+/// still holds every round; only the request is bounded. Spec 47 requirement 6,
+/// the half `OBSERVATIONS.md` entry 6 names.
+fn bounded_messages(messages: &[ModelMessage], max_messages: usize) -> Vec<ModelMessage> {
+    if messages.len() <= max_messages {
+        return messages.to_vec();
+    }
+    // The head and the notice are never dropped, so the effective floor is
+    // three messages whatever a repository sets.
+    let head = messages[..2].to_vec();
+    let tail = &messages[2..];
+    let budget = max_messages.saturating_sub(3);
+    let mut drop_count = tail.len().saturating_sub(budget);
+    // Whole pairs: an odd drop would leave a tool result without its call.
+    if !drop_count.is_multiple_of(2) {
+        drop_count += 1;
+    }
+    let drop_count = drop_count.min(tail.len());
+    let mut bounded = head;
+    bounded.push(ModelMessage::system(format!(
+        "Earlier rounds of this turn were elided to bound the request: {drop_count} messages ({} call results) omitted. The session log still holds them; repeat a read if you need it.",
+        drop_count / 2
+    )));
+    bounded.extend_from_slice(&tail[drop_count..]);
+    bounded
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandRequest {
     command: String,
@@ -2966,6 +3240,53 @@ enum ToolAction {
     },
 }
 
+/// What dispatching a tool can change beyond its own result.
+///
+/// The one place that question is answered. Spec 17's recovery reads the
+/// [`ActionEffect::WritesRepository`] answer through [`tool_action_marker`]'s
+/// boolean; requirement 8's batching reads [`ActionEffect::ReadOnly`] through
+/// [`action_is_batchable_read_only`]. Both come off one exhaustive match, so a
+/// new tool cannot become batchable or side-effecting by omission, and there is
+/// no second list to keep in sync with spec 17.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionEffect {
+    /// Reads repository or session state and returns it. No write, no turn
+    /// control, so it is safe to run beside another read.
+    ReadOnly,
+    /// Can leave a side effect outside the session log. A crash mid-flight
+    /// leaves an unknown outcome, and it must not run concurrently.
+    WritesRepository,
+    /// Writes nothing outside the session log, but advances or ends the turn:
+    /// planning, completing a step, proposing a patch or an edit. Safe for
+    /// crash recovery, not a candidate for batching.
+    ShapesTurn,
+}
+
+fn action_effect(action: &ToolAction) -> ActionEffect {
+    match action {
+        ToolAction::Command(_) | ToolAction::WebDiagnostic(_) | ToolAction::McpCall { .. } => {
+            ActionEffect::WritesRepository
+        }
+        ToolAction::ProposePatch(_)
+        | ToolAction::ProposePlan(_)
+        | ToolAction::CompleteStep
+        | ToolAction::EditFile { .. } => ActionEffect::ShapesTurn,
+        ToolAction::ReadFile { .. }
+        | ToolAction::ListDirectory { .. }
+        | ToolAction::SearchContent { .. }
+        | ToolAction::SearchCodebase { .. }
+        | ToolAction::ReadGitStatus
+        | ToolAction::ReadGitDiff { .. } => ActionEffect::ReadOnly,
+    }
+}
+
+/// Whether a tool may be dispatched alongside another in the same round.
+/// Derived from [`action_effect`] rather than declared beside it, so there is
+/// no second list to drift.
+fn action_is_batchable_read_only(action: &ToolAction) -> bool {
+    matches!(action_effect(action), ActionEffect::ReadOnly)
+}
+
 /// The action marker parameters for a dispatched tool: a stable name, a
 /// reference identifying *which* invocation, and whether a crash mid-flight
 /// could have left a side effect.
@@ -2975,36 +3296,40 @@ enum ToolAction {
 /// proposing writes nothing to the repository. Applying one is, and is bracketed
 /// separately in `edit.rs`.
 fn tool_action_marker(action: &ToolAction) -> (&'static str, String, bool) {
+    // Spec 17's answer, unchanged in value: turn-shaping writes are confined to
+    // the append-only session log, so a crash leaves `interrupted`, not
+    // `unknown_external_outcome`.
+    let side_effecting = matches!(action_effect(action), ActionEffect::WritesRepository);
     match action {
-        ToolAction::Command(request) => ("run_command", request.command.clone(), true),
-        ToolAction::ProposePatch(edit) => ("propose_patch", edit.summary.clone(), false),
-        // Both write only to the session log, which is append-only and
-        // idempotent to re-read, so a crash in either leaves nothing
-        // half-applied in the world.
-        ToolAction::ProposePlan(steps) => ("propose_plan", steps.len().to_string(), false),
-        ToolAction::CompleteStep => ("complete_step", String::new(), false),
-        ToolAction::ReadFile { path, .. } => ("read_file", path.clone(), false),
-        ToolAction::ListDirectory { dir, .. } => {
-            ("list_directory", dir.clone().unwrap_or_default(), false)
+        ToolAction::Command(request) => ("run_command", request.command.clone(), side_effecting),
+        ToolAction::ProposePatch(edit) => ("propose_patch", edit.summary.clone(), side_effecting),
+        ToolAction::ProposePlan(steps) => ("propose_plan", steps.len().to_string(), side_effecting),
+        ToolAction::CompleteStep => ("complete_step", String::new(), side_effecting),
+        ToolAction::ReadFile { path, .. } => ("read_file", path.clone(), side_effecting),
+        ToolAction::ListDirectory { dir, .. } => (
+            "list_directory",
+            dir.clone().unwrap_or_default(),
+            side_effecting,
+        ),
+        ToolAction::SearchContent { pattern, .. } => {
+            ("search_content", pattern.clone(), side_effecting)
         }
-        ToolAction::SearchContent { pattern, .. } => ("search_content", pattern.clone(), false),
-        // Proposing writes nothing to the repository — the same reason
-        // ProposePatch is false. Applying one is bracketed separately in
-        // edit.rs.
-        ToolAction::EditFile { summary, .. } => ("edit_file", summary.clone(), false),
-        ToolAction::SearchCodebase { query, .. } => ("search_codebase", query.clone(), false),
-        ToolAction::ReadGitStatus => ("read_git_status", String::new(), false),
-        ToolAction::ReadGitDiff { staged } => ("read_git_diff", staged.to_string(), false),
-        // Drives a real browser and can navigate or click, so its outcome is
-        // not knowable after a crash.
-        ToolAction::WebDiagnostic(call) => ("web_diagnostic", call.url.clone(), true),
-        // An MCP call can mutate a remote system, and §4 rules out probing to
-        // find out whether it did.
+        ToolAction::EditFile { summary, .. } => ("edit_file", summary.clone(), side_effecting),
+        ToolAction::SearchCodebase { query, .. } => {
+            ("search_codebase", query.clone(), side_effecting)
+        }
+        ToolAction::ReadGitStatus => ("read_git_status", String::new(), side_effecting),
+        ToolAction::ReadGitDiff { staged } => ("read_git_diff", staged.to_string(), side_effecting),
+        ToolAction::WebDiagnostic(call) => ("web_diagnostic", call.url.clone(), side_effecting),
         ToolAction::McpCall {
             server_id,
             tool_name,
             ..
-        } => ("mcp_call", format!("{server_id}/{tool_name}"), true),
+        } => (
+            "mcp_call",
+            format!("{server_id}/{tool_name}"),
+            side_effecting,
+        ),
     }
 }
 
@@ -3462,26 +3787,40 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
     }
 }
 
-fn first_decodable_tool_action(
+/// A decoded call and what it asks for; `None` is the text-envelope fallback.
+type DecodedCall = (Option<ToolCall>, ToolAction);
+/// A call that could not be decoded, with the note to feed back to the model.
+type UndecodableCall = (ToolCall, String);
+
+/// Every call in a round that decodes, in the order the model made them, plus
+/// the ones that did not and the note to feed back for each.
+///
+/// A first-only walk used to silently drop the rest of a round, so the
+/// multi-call shape spec 47 requirement 8 batches never actually reached
+/// dispatch. An `Err` is a rejected call; an `Ok(None)` is a recognized tool
+/// whose required arguments were missing or empty, and is reported through
+/// [`undecodable_tool_call_note`] so a truncated `arguments` string still says
+/// so.
+fn decodable_tool_actions(
     calls: &[ToolCall],
-) -> (Option<ToolCall>, Option<ToolAction>, Option<String>) {
+    truncated: bool,
+) -> (Vec<DecodedCall>, Vec<UndecodableCall>) {
+    let mut actions = Vec::new();
+    let mut undecodable = Vec::new();
     for call in calls {
         match tool_action_from_call(call) {
-            Ok(Some(action)) => return (Some(call.clone()), Some(action), None),
-            Ok(None) => {}
-            Err(error) => {
-                return (
-                    Some(call.clone()),
-                    None,
-                    Some(format!(
-                        "Your `{}` call was rejected before execution: {error}. Retry with well-formed arguments matching the tool schema.",
-                        call.name
-                    )),
-                );
-            }
+            Ok(Some(action)) => actions.push((Some(call.clone()), action)),
+            Ok(None) => undecodable.push((call.clone(), undecodable_tool_call_note(call, truncated))),
+            Err(error) => undecodable.push((
+                call.clone(),
+                format!(
+                    "Your `{}` call was rejected before execution: {error}. Retry with well-formed arguments matching the tool schema.",
+                    call.name
+                ),
+            )),
         }
     }
-    (None, None, None)
+    (actions, undecodable)
 }
 
 /// Feedback for a tool call whose arguments couldn't be decoded. When the
@@ -3877,7 +4216,13 @@ fn sandbox_command_context(execution: &CommandExecution) -> String {
     output.push_str(&execution.working_directory);
     output.push('\n');
     output.push_str("Exit code: ");
-    output.push_str(&execution.exit_code.unwrap_or(-1).to_string());
+    match execution.termination {
+        CommandTermination::Exited => {
+            output.push_str(&execution.exit_code.unwrap_or(-1).to_string());
+        }
+        CommandTermination::TimedOut => output.push_str("none (timed out)"),
+        CommandTermination::Cancelled => output.push_str("none (cancelled by user)"),
+    }
     output.push_str("\n\nSTDOUT:\n");
     output.push_str(&truncate_for_prompt(&execution.stdout, 8_000));
     output.push_str("\n\nSTDERR:\n");
@@ -3994,5 +4339,80 @@ mod evidence_tests {
         // would not be invented. The step's own status comes from the absence
         // of confirming evidence, not from a fabricated failure record.
         assert_eq!(evidence_for(&ActionOutcome::Failed, "action_1"), None);
+    }
+
+    /// Requirement 5: a command that was killed reports why it stopped. `-1` is
+    /// what `exit_code.unwrap_or(-1)` prints, and a killed command reads as a
+    /// failed one if its termination is not named.
+    #[test]
+    fn a_timed_out_command_reports_its_termination_not_a_negative_exit_code() {
+        let execution = CommandExecution {
+            id: "cmd_1".to_string(),
+            command: "sleep 30".to_string(),
+            working_directory: "/tmp".to_string(),
+            risk: crate::command_policy::CommandRisk::Low,
+            approved_by: None,
+            started_at_ms: 0,
+            completed_at_ms: 1,
+            exit_code: None,
+            termination: crate::command_runner::CommandTermination::TimedOut,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+
+        let context = sandbox_command_context(&execution);
+
+        assert!(context.contains("timed out"), "{context}");
+        assert!(
+            !context.contains("-1"),
+            "a killed command must not read as exit -1: {context}"
+        );
+    }
+
+    /// Requirement 6's second half: the within-turn array is bounded, and the
+    /// elision is stated. A request that grows with every round is what reaches
+    /// the token ceiling on array size rather than on work.
+    #[test]
+    fn a_long_turn_is_clamped_and_says_what_it_cut() {
+        let mut messages = vec![ModelMessage::system("system"), ModelMessage::user("prompt")];
+        for index in 0..20 {
+            messages.push(ModelMessage::assistant(format!("assistant {index}")));
+            messages.push(ModelMessage::tool(
+                format!("call_{index}"),
+                format!("tool {index}"),
+            ));
+        }
+
+        let bounded = bounded_messages(&messages, 10);
+
+        assert!(
+            bounded.len() <= 10,
+            "the request must be bounded: {}",
+            bounded.len()
+        );
+        assert_eq!(bounded[0].content, "system");
+        assert_eq!(bounded[1].content, "prompt");
+        assert!(
+            bounded[2].content.contains("elided"),
+            "the cut must be stated: {}",
+            bounded[2].content
+        );
+        assert!(
+            bounded[3].content.starts_with("assistant"),
+            "a retained tool result must keep the call before it: {}",
+            bounded[3].content
+        );
+    }
+
+    #[test]
+    fn a_turn_inside_the_window_is_left_alone() {
+        let messages = vec![ModelMessage::system("system"), ModelMessage::user("prompt")];
+        let bounded = bounded_messages(&messages, 24);
+        assert_eq!(bounded.len(), 2);
+        assert!(
+            !bounded
+                .iter()
+                .any(|message| message.content.contains("elided"))
+        );
     }
 }

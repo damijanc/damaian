@@ -188,7 +188,7 @@ would otherwise default to repo-writable.
 | Class | Repository behaviour | Fields |
 |---|---|---|
 | **Forbidden** | Ignored, audited | `shell`, `data_dir`, `model_provider`, `model_name`, `model_base_url`, `model_api_key_env`, `model_reasoning_level`, `model_providers`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `allowed_roots` |
-| **Restrict-only** | Applied only in the more restrictive direction | `restricted_patterns`, `ignore_patterns`, `command_blocklist` (union); `require_approval_for_file_edits`, `require_approval_for_risky_commands`, `require_approval_for_all_commands` (logical OR); `mcp_enabled`, per-server `enabled` (logical AND); `mcp_server_allowlist` (intersection when both non-empty); `max_read_lines`, `max_list_entries`, `max_search_matches`, `max_match_line_chars` (lower value wins) |
+| **Restrict-only** | Applied only in the more restrictive direction | `restricted_patterns`, `ignore_patterns`, `command_blocklist` (union); `require_approval_for_file_edits`, `require_approval_for_risky_commands`, `require_approval_for_all_commands` (logical OR); `mcp_enabled`, per-server `enabled` (logical AND); `mcp_server_allowlist` (intersection when both non-empty); `max_read_lines`, `max_list_entries`, `max_search_matches`, `max_match_line_chars`, `command_timeout_secs`, `agent_max_turn_messages` (lower value wins) |
 | **User-owned** | Never taken from repository config — §5.4 | `command_allowlist` |
 | **Free** | Applied as today | `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, `agent_max_tool_rounds`, `agent_web_debug_max_tool_rounds`, `agent_tool_retry_limit`, `mcp_servers` definitions (subject to the restrict-only enable rules above) |
 
@@ -238,6 +238,11 @@ raising one widens what leaves the machine. The classification is pinned by
 `repository_config_may_lower_the_navigation_caps_but_not_raise_them` — until
 then no restrict-only key had a trust test at all, so an unclassified key would
 have been a silent hole rather than a failing one.
+
+The same slice's later half adds `command_timeout_secs` on the same lower-wins
+shape: shortening how long a command may run is a restriction, but lengthening a
+deadline the user set would let a cloned repository run its commands past the
+user's bound.
 
 Requirement 3 is satisfied by these applying immediately with no prompt. A
 repository asking for *less* capability needs no defence, and prompting for it

@@ -3144,11 +3144,27 @@ code.command-approval-command {
    marker left behind on a turn the user stopped. */
 .turn-indicator {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   margin: 6px 0 0;
   color: var(--muted);
   font-size: 12px;
+}
+
+/* A running command's output, under the phase line it belongs to. Full width
+   so it wraps to its own row; `order` keeps it last however the flex items
+   are laid out. */
+.turn-indicator-output {
+  flex-basis: 100%;
+  order: 10;
+  margin: 2px 0 0;
+  max-height: 8em;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--muted);
 }
 
 .turn-indicator[data-state="stopped"] {

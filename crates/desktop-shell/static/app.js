@@ -2981,6 +2981,12 @@ function startTurnIndicator(target, onStop) {
   label.setAttribute("aria-live", "polite");
   label.textContent = "Starting";
 
+  // Streamed command output (requirement 5). Its own element so a line of
+  // command output does not replace the phase label it is not.
+  const output = document.createElement("span");
+  output.className = "turn-indicator-output";
+  output.hidden = true;
+
   // Ticks every second. Inside the aria-live #chat-log it would otherwise be
   // read out once per second, which is unusable.
   const elapsed = document.createElement("span");
@@ -2993,7 +2999,7 @@ function startTurnIndicator(target, onStop) {
   stop.textContent = "Stop";
   stop.addEventListener("click", () => onStop());
 
-  row.append(dot, label, elapsed, stop);
+  row.append(dot, label, output, elapsed, stop);
   target.body.after(row);
 
   const startedAt = Date.now();
@@ -3009,6 +3015,11 @@ function startTurnIndicator(target, onStop) {
   return {
     phase(payload) {
       if (done) return;
+      if (payload.phase === "output") {
+        output.hidden = false;
+        output.textContent += payload.label;
+        return;
+      }
       // Any non-model phase means this round's streaming is over, so the next
       // model round is free to say "Waiting for model" again instead of leaving
       // the previous tool's label up for the rest of the turn.

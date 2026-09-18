@@ -898,3 +898,244 @@ fn every_new_tool_records_an_audit_event() {
         "an audit entry must never carry a secret from the search it recorded"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Requirement 8 · batching and concurrent dispatch
+// ---------------------------------------------------------------------------
+
+/// Requirement 8, first half. A round that asks for two read-only calls must
+/// execute both — `first_decodable_tool_action` used to return on the first
+/// decode and silently drop the rest, so the multi-call shape the spec assumed
+/// the code already had did not exist. The second file's content is the
+/// observable proof that the second call reached dispatch.
+#[test]
+fn a_round_executes_every_read_only_call_it_was_given() {
+    let repo = temp_dir("batch-two-reads");
+    write_fixture(&repo, "src/one.rs", "pub fn one() {}\n");
+    write_fixture(&repo, "src/two.rs", "pub fn two() {}\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+
+    // One model message carrying both calls, then an answer. The two calls
+    // share a turn because they arrived in one `tool_calls` vector.
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Both files read.".to_string()],
+        vec![
+            vec![
+                ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments_json: "{\"path\":\"src/one.rs\"}".to_string(),
+                },
+                ToolCall {
+                    id: "call_2".to_string(),
+                    name: "read_file".to_string(),
+                    arguments_json: "{\"path\":\"src/two.rs\"}".to_string(),
+                },
+            ],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(&repo, "Read both files.", &[], &mut adapter, &mut on_token)
+        .unwrap();
+
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    let tool_contents: Vec<&str> = messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .map(|message| message.content.as_str())
+        .collect();
+
+    assert!(
+        tool_contents
+            .iter()
+            .any(|text| text.contains("pub fn one()")),
+        "the first call's result must be present: {tool_contents:?}"
+    );
+    assert!(
+        tool_contents
+            .iter()
+            .any(|text| text.contains("pub fn two()")),
+        "the second call in the same round must run, not be dropped: {tool_contents:?}"
+    );
+}
+
+/// Requirement 8: a concurrent batch's results are recorded in the model's
+/// call order, not in completion order. Three calls with three distinct
+/// contents, so the assertion is on the order and not just on presence.
+#[test]
+fn a_read_only_batch_records_results_in_the_models_call_order() {
+    let repo = temp_dir("batch-order");
+    write_fixture(&repo, "src/a.rs", "pub fn alpha() {}\n");
+    write_fixture(&repo, "src/b.rs", "pub fn beta() {}\n");
+    write_fixture(&repo, "src/c.rs", "pub fn gamma() {}\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+
+    let reads = ["src/a.rs", "src/b.rs", "src/c.rs"]
+        .iter()
+        .enumerate()
+        .map(|(index, path)| ToolCall {
+            id: format!("call_{}", index + 1),
+            name: "read_file".to_string(),
+            arguments_json: format!("{{\"path\":\"{path}\"}}"),
+        })
+        .collect();
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Read all three.".to_string()],
+        vec![reads, Vec::new()],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(&repo, "Read three files.", &[], &mut adapter, &mut on_token)
+        .unwrap();
+
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    let tool_contents: Vec<&str> = messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .map(|message| message.content.as_str())
+        .collect();
+
+    let position = |needle: &str| {
+        tool_contents
+            .iter()
+            .position(|text| text.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?}: {tool_contents:?}"))
+    };
+    assert!(
+        position("alpha") < position("beta") && position("beta") < position("gamma"),
+        "results must be recorded in the model's call order: {tool_contents:?}"
+    );
+}
+
+/// Requirement 8: a round that mixes a read-only call with a mutating one runs
+/// the mutating call sequentially. The read before it still ran and was
+/// recorded; the command then stopped the turn for approval.
+#[test]
+fn a_round_mixing_reads_and_a_mutating_call_runs_sequentially() {
+    let repo = temp_dir("batch-mixed");
+    write_fixture(&repo, "src/one.rs", "pub fn one() {}\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), String::new()],
+        vec![
+            vec![
+                ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments_json: "{\"path\":\"src/one.rs\"}".to_string(),
+                },
+                ToolCall {
+                    id: "call_2".to_string(),
+                    name: "run_command".to_string(),
+                    arguments_json: "{\"command\":\"npm test\",\"reason\":\"Run the tests\"}"
+                        .to_string(),
+                },
+            ],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Read src/one.rs, then run the tests.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert!(
+        result.command_proposal.is_some(),
+        "the mutating call must stop for approval"
+    );
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.role == "tool" && message.content.contains("pub fn one()")),
+        "the read that preceded the mutating call must still have run: {messages:?}"
+    );
+}
+
+/// Requirement 8: session-log order after a concurrent round is deterministic.
+/// Three fresh runs of the same read-only round must produce the same role and
+/// content sequence, because the results are joined in call order.
+#[test]
+fn repeated_read_only_rounds_produce_the_same_session_sequence() {
+    let mut sequences = Vec::new();
+    for run in 0..3 {
+        let repo = temp_dir(&format!("batch-determinism-{run}"));
+        write_fixture(&repo, "src/a.rs", "pub fn alpha() {}\n");
+        write_fixture(&repo, "src/b.rs", "pub fn beta() {}\n");
+        let mut config = test_config(&repo);
+        config.model_providers.push(native_tool_provider());
+        let engine = WorkspaceEngine::new(config);
+
+        let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+            vec![String::new(), "Done.".to_string()],
+            vec![
+                vec![
+                    ToolCall {
+                        id: "call_1".to_string(),
+                        name: "read_file".to_string(),
+                        arguments_json: "{\"path\":\"src/a.rs\"}".to_string(),
+                    },
+                    ToolCall {
+                        id: "call_2".to_string(),
+                        name: "read_file".to_string(),
+                        arguments_json: "{\"path\":\"src/b.rs\"}".to_string(),
+                    },
+                ],
+                Vec::new(),
+            ],
+        );
+        let mut on_token = |_token: &str| {};
+
+        let result = engine
+            .chat_orchestrator
+            .ask(&repo, "Read both.", &[], &mut adapter, &mut on_token)
+            .unwrap();
+        let sequence: Vec<(String, String)> = engine
+            .session_store
+            .read_messages(&result.session.id)
+            .unwrap()
+            .into_iter()
+            .map(|message| (message.role, message.content))
+            .collect();
+        sequences.push(sequence);
+    }
+
+    assert_eq!(
+        sequences[0], sequences[1],
+        "a concurrent round must log the same order every run"
+    );
+    assert_eq!(
+        sequences[1], sequences[2],
+        "a concurrent round must log the same order every run"
+    );
+}

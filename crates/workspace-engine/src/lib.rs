@@ -51,7 +51,7 @@ pub use checkpoint::{
 pub use command_policy::{
     CommandClassification, CommandPolicy, CommandRisk, allow_always_eligible,
 };
-pub use command_runner::{CommandExecution, CommandRunner};
+pub use command_runner::{CommandExecution, CommandRunOptions, CommandRunner, CommandTermination};
 pub use config::{
     Config, ConfigOverlay, ConfigScope, DEFAULT_CONTEXT_TOKEN_BUDGET, McpServerConfig,
     McpServerConfigOverlay, McpTransport, ModelProviderConfig, ModelProviderConfigOverlay,

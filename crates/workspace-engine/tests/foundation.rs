@@ -3973,7 +3973,14 @@ fn proposes_command_and_requires_approval_for_risky_execution() {
 
     let error = engine
         .validation_orchestrator
-        .run_proposal(&proposal.id, false, "tester")
+        .run_proposal(
+            &proposal.id,
+            false,
+            "tester",
+            None,
+            &CancelToken::new(),
+            &mut |_line: &str| {},
+        )
         .expect_err("approval should be required");
     assert!(matches!(error, ClientError::ApprovalRequired(_)));
 
@@ -3991,7 +3998,14 @@ fn executes_stored_command_and_persists_redacted_output() {
 
     let record = engine
         .validation_orchestrator
-        .run_proposal(&proposal.id, true, "tester")
+        .run_proposal(
+            &proposal.id,
+            true,
+            "tester",
+            None,
+            &CancelToken::new(),
+            &mut |_line: &str| {},
+        )
         .unwrap();
 
     assert_eq!(record.execution.exit_code, Some(0));

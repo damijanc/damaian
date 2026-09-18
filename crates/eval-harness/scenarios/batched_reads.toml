@@ -1,0 +1,31 @@
+name = "batched_reads"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Read src/upload.rs and src/checkout.rs and summarise them"
+
+# Spec 47 requirement 8's batching half: one model message asks for two reads,
+# and the engine must dispatch both. Before batching, `first_decodable_tool_action`
+# returned on the first and silently dropped the second, so `tool_calls_at_least`
+# fails. Both assertions are script-derived — the script decides the calls and
+# the deterministic tier scripts every call — so they are `deterministic_only`.
+#
+# **What this cannot measure.** Concurrency: the assertions see calls and
+# rounds, not wall-clock, so whether the batch ran faster is the engine tests'
+# order/timing concern, not this scenario's. Nor can it measure fewer rounds
+# against the old behavior in a way the live tier could use, because the
+# deterministic tier scripts the rounds.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs" } },
+  { name = "read_file", arguments = { path = "src/checkout.rs" } },
+]
+
+[[turn]]
+content = "Both files read: upload.rs handles uploads and checkout.rs handles checkout."
+
+[assert]
+tool_calls_at_least = 2
+tool_rounds_at_most = 1
+deterministic_only = ["tool_calls_at_least", "tool_rounds_at_most"]
+files_changed_outside_patch = 0

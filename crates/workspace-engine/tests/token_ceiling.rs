@@ -181,15 +181,25 @@ fn the_stop_reports_the_ceiling_and_what_was_actually_spent() {
 }
 
 #[test]
-fn a_ceiling_the_turn_never_approaches_changes_nothing() {
+fn a_ceiling_the_turn_never_approaches_does_not_stop_it() {
     // The complement of the stop tests. Without this, a ceiling that fired
     // unconditionally would pass every assertion above.
+    //
+    // Since spec 47 requirement 6, a roomy ceiling also means the round cap is
+    // not the end: the turn runs its configured segment, continues under the
+    // ceiling, and the *absolute* round cap is what finally stops it. So the
+    // assertion is "past the segment, and not a token stop" — the old
+    // `calls > 2` would no longer distinguish a continuation from the old
+    // single forced-final round.
     let repo = temp_repo("roomy");
     let engine = engine_with_ceiling(&repo, Some(10_000_000));
     let (result, calls) = ask(&engine, &repo, "Look at the source", &mut keeps_working());
 
     assert_ne!(result.task.status, TaskStatus::TokenBudgetExhausted);
-    assert!(calls > 2, "got {calls} calls");
+    assert!(
+        calls > 8,
+        "a roomy ceiling continues past the default eight-round segment, got {calls} calls"
+    );
 }
 
 #[test]
@@ -519,5 +529,144 @@ fn a_turn_after_an_unsuperseded_task_starts_with_no_plan() {
             .unwrap()
             .is_none(),
         "nothing handed work over, so nothing should carry"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Requirement 6: bounded, recorded continuation past the round cap
+// ---------------------------------------------------------------------------
+
+fn engine_with_ceiling_and_rounds(
+    repo: &Path,
+    ceiling: Option<u64>,
+    rounds: u32,
+) -> WorkspaceEngine {
+    WorkspaceEngine::new(Config {
+        data_dir: repo.join(".damaian"),
+        agent_max_task_tokens: ceiling,
+        agent_max_tool_rounds: rounds,
+        enable_index_watcher: false,
+        ..Config::default()
+    })
+}
+
+fn native_tool_provider() -> workspace_engine::ModelProviderConfig {
+    workspace_engine::ModelProviderConfig {
+        id: "openai".to_string(),
+        label: "OpenAI".to_string(),
+        base_url: String::new(),
+        api_key_env: String::new(),
+        models: Vec::new(),
+        supports_native_tools: true,
+        max_output_tokens: None,
+        context_token_budget: None,
+        provider_reports_usage: true,
+        price_per_million_input_tokens: None,
+        price_per_million_output_tokens: None,
+    }
+}
+
+fn audit_events(repo: &Path) -> String {
+    fs::read_to_string(repo.join(".damaian/audit/events.jsonl")).unwrap_or_default()
+}
+
+/// Requirement 6. Under a token ceiling, reaching the round cap is not the end:
+/// the turn takes another segment and says so in the audit log. The scripted
+/// model keeps asking for a tool past the cap, then answers.
+#[test]
+fn a_turn_continues_past_its_round_cap_under_the_ceiling() {
+    let repo = temp_repo("continues");
+    let engine = engine_with_ceiling_and_rounds(&repo, Some(10_000_000), 2);
+    let command = "DAMAIAN_COMMAND_V1\nCOMMAND: ls src\nREASON: Look.\nEND_COMMAND\n".to_string();
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            command.clone(),
+            command.clone(),
+            command,
+            "Done looking.".to_string(),
+        ],
+        vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+    );
+
+    let (result, calls) = ask(&engine, &repo, "Look at the source", &mut adapter);
+
+    assert_eq!(
+        result.task.status,
+        TaskStatus::Complete,
+        "under a ceiling the round cap is not the end"
+    );
+    assert_eq!(
+        calls, 4,
+        "two ordinary rounds, one continuation, one answer"
+    );
+    assert!(
+        audit_events(&repo).contains("turn_continued"),
+        "the continuation must appear in the audit log"
+    );
+}
+
+/// The complement: with no ceiling there is no bound to continue under, so the
+/// fixed round cap still stops the turn exactly as before, and nothing is
+/// recorded as a continuation.
+#[test]
+fn without_a_ceiling_the_round_cap_still_stops_the_turn() {
+    let repo = temp_repo("no-continue");
+    let engine = engine_with_ceiling_and_rounds(&repo, None, 2);
+    let (result, calls) = ask(&engine, &repo, "Look at the source", &mut keeps_working());
+
+    assert_eq!(result.task.status, TaskStatus::ToolBudgetExhausted);
+    assert_eq!(calls, 3, "rounds 0 and 1, then the forced-final round");
+    assert!(
+        !audit_events(&repo).contains("turn_continued"),
+        "no ceiling means no continuation to record"
+    );
+}
+
+/// Requirement 6's "state intact": the plan proposed before the cap is still
+/// the turn's plan after a continuation.
+#[test]
+fn a_continuation_keeps_the_turns_plan_intact() {
+    let repo = temp_repo("continue-plan");
+    let mut config = Config {
+        data_dir: repo.join(".damaian"),
+        agent_max_task_tokens: Some(10_000_000),
+        agent_max_tool_rounds: 1,
+        enable_index_watcher: false,
+        ..Config::default()
+    };
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), String::new(), "Done.".to_string()],
+        vec![
+            vec![workspace_engine::ToolCall {
+                id: "p1".to_string(),
+                name: "propose_plan".to_string(),
+                arguments_json: r#"{"steps":[{"title":"Look"},{"title":"Report"}]}"#.to_string(),
+            }],
+            // The forced-final round still asks for a tool, which is what
+            // triggers the continuation.
+            vec![workspace_engine::ToolCall {
+                id: "r1".to_string(),
+                name: "read_file".to_string(),
+                arguments_json: r#"{"path":"src/a.rs"}"#.to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+
+    let (result, _) = ask(&engine, &repo, "Look at the source", &mut adapter);
+
+    let plan = engine
+        .session_store
+        .read_task_plan(&result.session.id, &result.task.id)
+        .unwrap()
+        .expect("the plan proposed before the cap survives the continuation");
+    assert_eq!(plan.steps.len(), 2);
+    assert_eq!(plan.steps[0].title, "Look");
+    assert!(
+        audit_events(&repo).contains("turn_continued"),
+        "this test is only meaningful if a continuation actually happened"
     );
 }

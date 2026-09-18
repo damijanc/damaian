@@ -1,6 +1,8 @@
 # Feature Spec: Local Evaluation Harness and Metric Baseline
 
-Status: Done. All thirteen scenarios in §5.4 run and pass. The resume scenario
+Status: Done. The scenarios in §5.4 run and pass, sixteen in total after spec
+47 added `navigated_edit` (its first slice) and `batched_reads` (requirement 8).
+The resume scenario
 shipped as `blocked_on = "spec-17"`, reporting `notApplicable: "spec-17"` in
 every run; spec 17 landed and unblocked it, so `recovery_success` is now a
 measured value rather than a deferral marker. The deterministic tier takes **2.8s**

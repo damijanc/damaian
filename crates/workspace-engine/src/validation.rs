@@ -1,8 +1,9 @@
 use crate::audit::AuditLog;
+use crate::cancel::CancelToken;
 use crate::command_policy::{
     CommandClassification, CommandPolicy, CommandRisk, allow_always_eligible,
 };
-use crate::command_runner::{CommandExecution, CommandRunner};
+use crate::command_runner::{CommandExecution, CommandRunOptions, CommandRunner};
 use crate::config::ConfigOverlay;
 use crate::error::{ClientError, Result};
 use crate::hash::{create_id, now_millis, repository_id_for_root};
@@ -207,6 +208,9 @@ impl ValidationOrchestrator {
         proposal_id: &str,
         approved: bool,
         approved_by: &str,
+        task_id: Option<&str>,
+        cancel: &CancelToken,
+        on_output: &mut dyn FnMut(&str),
     ) -> Result<CommandRunRecord> {
         let proposal = self.command_store.load_proposal(proposal_id)?;
         if proposal.blocked {
@@ -223,9 +227,13 @@ impl ValidationOrchestrator {
             &proposal.command,
             &proposal.working_directory,
             &proposal.reason,
-            approved,
-            Some(approved_by),
-            None,
+            CommandRunOptions {
+                approved,
+                approved_by: Some(approved_by),
+                task_id,
+                cancel,
+                on_output,
+            },
         )?;
         let record = self.command_store.save_execution(&proposal, &execution)?;
         self.audit_log.record(
@@ -478,6 +486,7 @@ fn serialize_execution_summary(
         "EXIT_CODE",
         &execution.exit_code.unwrap_or(-1).to_string(),
     );
+    write_field(&mut output, "TERMINATION", execution.termination.as_str());
     write_field(&mut output, "STDOUT_REF", &stdout_ref.to_string_lossy());
     write_field(&mut output, "STDERR_REF", &stderr_ref.to_string_lossy());
     output.push_str("END_COMMAND_EXECUTION\n");
