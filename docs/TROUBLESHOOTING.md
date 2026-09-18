@@ -895,6 +895,33 @@ apply — the file was edited after the diff was generated. This check is a
 product guarantee, not a bug. Regenerate the proposal. Pre-edit copies for
 already-applied patches are under `rollback/<patch-id>/`.
 
+### An `edit_file` proposal is refused
+
+When the assistant proposes a snippet edit (`edit_file`) and it is refused, the
+model quotes the reason back. Two refusals are expected, not bugs:
+
+- **`old_text did not match`** — the file changed since the model read it. Ask
+  the assistant to re-read the file and propose again; it is working from a
+  stale view. This refusal exists precisely so a stale view lands in a refusal
+  instead of a change to the wrong region.
+- **`old_text matched N times`** — the snippet is not unique enough to anchor
+  on. Ask the assistant to include more surrounding context in `old_text` so it
+  matches exactly once.
+
+Neither refusal writes anything to disk. A refused edit goes back to the model
+as a tool result, so it can retry within the same turn.
+
+### A file read or search result was truncated
+
+A large file read reports a line range with the file's real length ("lines
+1–400 of 4420"), and a search or directory listing says how many results were
+cut ("50 of 231 matches"). A result that was cut shorter than requested adds a
+`(truncated by lines|bytes)` notice. This is deliberate: a truncated result that
+reads as complete is the failure the caps exist to prevent. The caps are
+`max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and
+`max_match_line_chars` (500); a repository config may lower one but never raise
+it.
+
 ### A file the model should see is missing from context
 
 Two independent filters, both visible in `config-show`:

@@ -26,6 +26,87 @@ pub struct GeneratedEdit {
     pub changes: Vec<ProposedChange>,
 }
 
+/// A change expressed as the text it replaces rather than the file it rewrites.
+///
+/// Spec 47 §5.3. The anchor must match **exactly once**: zero matches and two
+/// matches are both refusals, because the alternative — picking one — is a
+/// wrong-region write that only a human reading the diff would catch, and that
+/// is the one review step this spec must not lean on harder than it already
+/// does. A stale view of the file therefore lands in a refusal rather than in
+/// the wrong place, which is why this anchors on text and not a line range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionEdit {
+    pub path: String,
+    pub old_text: String,
+    pub new_text: String,
+}
+
+/// Converts anchored edits into the same [`ProposedChange`] a whole-file
+/// proposal produces.
+///
+/// This is what keeps requirement 4's promise structurally rather than by
+/// assertion: `PatchEngine::create_patch` re-reads the old file and diffs
+/// against `new_content`, so it cannot tell a spliced change from a whole-file
+/// one. Diff review, hunk selection, redaction, checkpointing and audit are
+/// untouched because nothing downstream can distinguish them.
+pub fn region_edits_to_changes(
+    root: impl AsRef<Path>,
+    path_policy: &crate::path_policy::PathPolicy,
+    edits: &[RegionEdit],
+) -> Result<Vec<ProposedChange>> {
+    let mut changes: Vec<ProposedChange> = Vec::new();
+    for edit in edits {
+        if edit.old_text.is_empty() {
+            return Err(ClientError::InvalidInput(format!(
+                "{}: old_text is empty; use propose_patch to create a file",
+                edit.path
+            )));
+        }
+        let target = path_policy.resolve_for_write(&root, &edit.path)?;
+        path_policy.assert_not_restricted(&target.relative_path, false)?;
+
+        // A second edit to the same file builds on the first. Reading from disk
+        // each time would compute the second against content the first already
+        // replaced, and silently drop one of them.
+        let current = match changes
+            .iter()
+            .find(|change| change.path == target.relative_path)
+        {
+            Some(existing) => existing.new_content.clone(),
+            None => fs::read_to_string(&target.absolute_path)?,
+        };
+
+        let count = current.matches(&edit.old_text).count();
+        if count == 0 {
+            return Err(ClientError::InvalidInput(format!(
+                "{}: old_text did not match; the file may have changed since you read it",
+                target.relative_path
+            )));
+        }
+        if count > 1 {
+            return Err(ClientError::InvalidInput(format!(
+                "{}: old_text matched {count} times; include more context so it matches once",
+                target.relative_path
+            )));
+        }
+        let new_content = current.replacen(&edit.old_text, &edit.new_text, 1);
+
+        match changes
+            .iter_mut()
+            .find(|change| change.path == target.relative_path)
+        {
+            Some(existing) => existing.new_content = new_content,
+            None => changes.push(ProposedChange {
+                path: target.relative_path,
+                new_content,
+                status: Some("modified".to_string()),
+                allow_restricted: false,
+            }),
+        }
+    }
+    Ok(changes)
+}
+
 // No `Eq`: it carries a `ModelRun`, whose `reported_cost` is an `Option<f64>`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EditProposalResult {

@@ -9,6 +9,7 @@ use crate::edit::{EditOrchestrator, PatchStore};
 use crate::file_access::FileAccessController;
 use crate::git_service::GitService;
 use crate::indexer::ProjectIndexer;
+use crate::navigation::NavigationController;
 use crate::patch_engine::PatchEngine;
 use crate::path_policy::PathPolicy;
 use crate::repository_trust::RepositoryTrustStore;
@@ -56,6 +57,12 @@ impl WorkspaceEngine {
             path_policy.clone(),
         );
         let indexer = ProjectIndexer::new(config.clone(), scanner.clone(), audit_log.clone());
+        let navigation = NavigationController::new(
+            config.clone(),
+            audit_log.clone(),
+            scanner.clone(),
+            path_policy.clone(),
+        );
         let context_manager = ContextManager::new(
             file_access.clone(),
             scanner.clone(),
@@ -98,6 +105,8 @@ impl WorkspaceEngine {
             validation_orchestrator.clone(),
             command_store.clone(),
             file_access.clone(),
+            navigation,
+            path_policy.clone(),
             git.clone(),
             patch_engine.clone(),
             patch_store.clone(),

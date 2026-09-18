@@ -4,7 +4,7 @@
 
 **Implements:** [`proposal.md`](proposal.md) §5, requirements 1–4 · background and
 corrections in [`context.md`](context.md)
-**Started:** 2026-09-18
+**Started:** 2026-09-18 — **Done:** 2026-09-18
 
 **Goal:** Give the agent a working floor — reads that return a range instead of
 a whole file, listing and content search as tools, and edits whose payload is
@@ -32,19 +32,21 @@ MIT/Apache-2.0, both on `deny.toml`'s allow-list.
 | 2 · Ranged reads | Done | `LineRange`, `ReadWindow`, and `FileRead.{line_range,total_lines,truncated_by}`; `max_read_lines` (400) added restrict-only with a new `restrict_only_limit` helper and a `parse_read_lines` that refuses 0. 4 new tests; byte cap mutation-tested (disabling it fails `a_few_enormous_lines_…`). **Plan deviation:** the plan's `range: Option<LineRange>` was wrong — `None` would have meant "capped" for `context_manager` too, silently shrinking what every task sees, and its own comment contradicted the code. Replaced with a three-variant `ReadWindow` so each call site states its intent: `Whole` (context assembly, keeps the original `max_file_bytes` refusal), `Default` (the tool, capped), `Range` (also capped, so a large range cannot step around the cap). Also needed `#[allow(clippy::too_many_arguments)]` with a reason. |
 | 3 · `list_directory` | Done | `navigation.rs` with `NavigationController` and `DirectoryListing`; a `tree_walk` visitor, `max_list_entries` (200) restrict-only. 3 new tests (8 in file). Restricted paths are checked **per entry**, not just on the starting directory, because a path can name a secret (`deploy/prod-key.pem`). **Beyond the plan:** added `repository_config_may_lower_the_navigation_caps_but_not_raise_them` to `repository_config_trust.rs` — no restrict-only key had a trust test at all, so an unclassed key would have been a silent hole. The `.env` fixture tests the restriction rather than the ignore rules: `.env` is in `DEFAULT_RESTRICTED_PATTERNS` and deliberately not in `DEFAULT_IGNORE_PATTERNS`. |
 | 4 · `search_content` | Done | `ContentMatch`/`ContentSearch` on `NavigationController`; `regex` promoted to a direct dependency (lockfile diff is **one line** — the edge only, no version change, no new packages); `max_search_matches` (50) and `max_match_line_chars` (500) restrict-only. 6 new tests, not the planned 5 — added `a_max_matches_argument_cannot_raise_the_configured_cap`, because asserting only that the argument is honoured would pass if it could also raise the cap. Redaction mutation-tested: replacing `redact(line)` with the raw line fails the secret test with the key visible. `cargo deny check` green. **Doc correction:** the proposal and context said `regex` arrives via `syntect` and `tokenizers`; `cargo tree -i regex` shows `tokenizers` only — `syntect` is built with `regex-fancy` and pulls `fancy-regex`. Both files corrected. |
-| 5 · `edit_file` splice | Not started | |
-| 6 · Wire the four tools | Not started | |
-| 7 · Acceptance criteria, docs, close the slice | Not started | |
+| 5 · `edit_file` splice | Done | `RegionEdit` and `region_edits_to_changes` in `edit.rs`; anchor must match exactly once, zero and two matches both refuse, and the two-match refusal names the count. 6 new tests, not the planned 5 — added `two_edits_to_one_file_build_on_each_other`, because two edits to one file read from disk each time would silently drop the first. **Plan correction:** the 150 KB fixture was specified as `(1..=6000)` lines of `fn f{n}() {{}}\n`, which is only ~84 KB — the assertion would have passed a fixture that never exceeded the threshold. Built at 12 000 lines instead. Fail-closed rule mutation-tested: `if count > 1` → `> 2` fails the twice-match test. |
+| 6 · Wire the four tools | Done | Four tool definitions and three new `ToolAction` variants (`ListDirectory`, `SearchContent`, `EditFile`); `ReadFile` grew a `range: Option<LineRange>`. `ChatOrchestrator` gained `navigation` and `path_policy` fields (the plan's file-structure table omitted both, but the dispatch arms need them). `read_file`'s schema now carries `start_line`/`end_line`, and its result states the range and any truncation. 2 new tests, matching the plan. The `edit_file` arm reuses the `ProposePatch` arm's `create_patch` body verbatim, so requirement 4's "indistinguishable downstream" holds by construction. |
+| 7 · Acceptance criteria, docs, close the slice | Done | 3 new tests (25 in file): the region/whole-file patch equivalence, one truncation notice per read tool, and the audit-event test. **Plan correction:** the audit test as written asserted on `.damaian/audit.log`; the log is actually `data_dir/audit/events.jsonl` (`audit.rs:61`). Full suite: **678 passed, 16 skipped** (not the planned 675 — Task 4 and Task 5 each added one test beyond plan). **Missed call site:** `damaian-cli/src/main.rs:150` still called `read_file` with six arguments after Task 2's signature change and did not compile; fixed to `ReadWindow::Whole`. |
 
 **Baseline measured 2026-09-17:** `cargo nextest run --workspace --locked` is
 **652 passed, 16 skipped**, and takes about five minutes locally — see
 `OBSERVATIONS.md` entry 8 for why, and the Global Constraints for what that means
 for this plan.
 
-The running check per task is the count in `tests/agent_tools.rs` — 1, 5, 8, 13,
-18, 20, 23 as Tasks 1–7 land. Task 7 verifies the whole workspace once, at
-**675**. A task whose file count comes out wrong has a missing or duplicated
-test; find it then rather than at the end.
+The running check per task is the count in `tests/agent_tools.rs` — 1, 5, 8, 14,
+20, 22, 25 as Tasks 1–7 land. (The plan originally wrote 1, 5, 8, 13, 18, 20,
+23; Task 4 added six tests rather than five, and Task 5 did the same, so the
+real count runs two ahead from Task 4 onward — recorded in those rows.) Task 7
+verifies the whole workspace once, at **678**. A task whose file count comes out
+wrong has a missing or duplicated test; find it then rather than at the end.
 
 ## Global Constraints
 
@@ -905,7 +907,7 @@ Suggested subject: `Search file contents as a tool, capped and redacted`
 - Consumes: nothing from Tasks 1–4.
 - Produces: `RegionEdit { path: String, old_text: String, new_text: String }`; `region_edits_to_changes(root: &Path, path_policy: &PathPolicy, edits: &[RegionEdit]) -> Result<Vec<ProposedChange>>`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -1029,12 +1031,12 @@ fn a_ten_line_change_in_a_150kb_file_has_a_ten_line_payload() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools`
 Expected: FAIL to compile — `RegionEdit` does not exist.
 
-- [ ] **Step 3: Implement the splice**
+- [x] **Step 3: Implement the splice**
 
 In `edit.rs`:
 
@@ -1106,25 +1108,25 @@ pub fn region_edits_to_changes(
 }
 ```
 
-- [ ] **Step 4: Run the new tests**
+- [x] **Step 4: Run the new tests**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools`
 Expected: PASS, 18 tests in this file.
 
-- [ ] **Step 5: Mutation-test the fail-closed rule**
+- [x] **Step 5: Mutation-test the fail-closed rule**
 
 Change `if count > 1` to `if count > 2` and re-run.
 `an_anchor_matching_twice_is_refused_and_names_the_count` must fail. Restore it.
 This is the assertion the whole design rests on; a test that passes either way
 is worse than none.
 
-- [ ] **Step 6: Targeted tests, fmt and clippy**
+- [x] **Step 6: Targeted tests, fmt and clippy**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools` — 18 tests, all
 passing. Then `cargo fmt --all -- --check` and
 `cargo clippy --workspace --all-targets --locked -- -D warnings`.
 
-- [ ] **Step 7: Show the change and the gate result, and ask before committing**
+- [x] **Step 7: Show the change and the gate result, and ask before committing**
 
 Suggested subject: `Propose an edit as an anchored region instead of a whole file`
 
@@ -1140,7 +1142,7 @@ Suggested subject: `Propose an edit as an anchored region instead of a whole fil
 - Consumes: Tasks 2–5.
 - Produces: tool names `read_file` (extended), `list_directory`, `search_content`, `edit_file`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 /// Acceptance criterion 5: navigating requires no allowlist entry and no change
@@ -1234,13 +1236,13 @@ fn native_tool_provider() -> ModelProviderConfig {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools`
 Expected: FAIL — `list_directory` is not a known tool, so the turn does not
 dispatch it.
 
-- [ ] **Step 3: Add the tool definitions**
+- [x] **Step 3: Add the tool definitions**
 
 Beside the existing ones (`chat.rs:2985`):
 
@@ -1276,7 +1278,7 @@ total line count.
 
 Push all three into the `native_tools` vector at `chat.rs:1231-1238`.
 
-- [ ] **Step 4: Add the enum variants, decode arms and marker arms**
+- [x] **Step 4: Add the enum variants, decode arms and marker arms**
 
 `ToolAction` gains:
 
@@ -1307,7 +1309,7 @@ empty required field with `Ok(None)`, and return the action.
 
 Add progress labels at `:2920`.
 
-- [ ] **Step 5: Add the dispatch arms**
+- [x] **Step 5: Add the dispatch arms**
 
 Beside `ToolAction::ReadFile` (`:2033`). Each mirrors the existing arm's
 `(label, content, outcome)` triple. The content strings are what the model
@@ -1318,18 +1320,18 @@ reads, so they carry the notices:
 - `ReadFile` → `"Content of {path}, lines {start}–{end} of {total}:\n{content}"`, plus `" (truncated by {lines|bytes}; ask for a narrower range)"` when `truncated_by` is set.
 - `EditFile` → `region_edits_to_changes`, then the **same** `PatchEngine::create_patch` call the `ProposePatch` arm makes. Reuse that arm's body rather than writing a second one; if the two bodies differ, requirement 4's promise is broken. A refusal returns `ActionOutcome::Failed` with the error text, so the model can retry within the remaining rounds.
 
-- [ ] **Step 6: Run the new tests**
+- [x] **Step 6: Run the new tests**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools`
 Expected: PASS, 20 tests in this file.
 
-- [ ] **Step 7: Targeted tests, fmt and clippy**
+- [x] **Step 7: Targeted tests, fmt and clippy**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools` — 20 tests, all
 passing. Then `cargo fmt --all -- --check` and
 `cargo clippy --workspace --all-targets --locked -- -D warnings`.
 
-- [ ] **Step 8: Show the change and the gate result, and ask before committing**
+- [x] **Step 8: Show the change and the gate result, and ask before committing**
 
 Suggested subject: `Offer ranged reads, listing, search and anchored edits as tools`
 
@@ -1340,7 +1342,7 @@ Suggested subject: `Offer ranged reads, listing, search and anchored edits as to
 **Files:**
 - Modify: `crates/workspace-engine/tests/agent_tools.rs`, `docs/USER_GUIDE.md`, `docs/TROUBLESHOOTING.md`, `CHANGELOG.md`, `docs/specs/47_agent_working_capability/proposal.md`, `docs/specs/47_agent_working_capability/tasks.md`, `docs/specs/README.md`
 
-- [ ] **Step 1: Write the equivalence test**
+- [x] **Step 1: Write the equivalence test**
 
 The criterion no earlier task covers: a region edit and a whole-file proposal
 must reach disk identically.
@@ -1388,7 +1390,7 @@ fn a_region_edit_and_a_whole_file_proposal_produce_the_same_patch() {
 }
 ```
 
-- [ ] **Step 2: Write the truncation-notice test**
+- [x] **Step 2: Write the truncation-notice test**
 
 ```rust
 /// §5.5: a truncated result that reads as complete is the failure this design
@@ -1424,7 +1426,7 @@ fn every_capped_read_tool_states_what_it_cut() {
 }
 ```
 
-- [ ] **Step 3: Write the audit test**
+- [x] **Step 3: Write the audit test**
 
 Requirement 7: every new tool records through `AuditLog::record`, on the same
 terms as the tools it sits beside. Nothing else in this plan asserts it.
@@ -1460,13 +1462,13 @@ assertion — `grep -n "fn record" -A 20 crates/workspace-engine/src/audit.rs`
 shows where it writes. If it is not `.damaian/audit.log`, use the real path
 rather than adjusting the expectation to whatever the test happens to find.
 
-- [ ] **Step 4: Run the full suite**
+- [x] **Step 4: Run the full suite**
 
 Run: `cargo nextest run --workspace --locked` — expected **675**. This is the
 **one** full-suite run of the slice, so allow about five minutes for it and use a
 `timeout` of at least 600000. Every earlier task deferred to here.
 
-- [ ] **Step 5: Documentation**
+- [x] **Step 5: Documentation**
 
 - `docs/USER_GUIDE.md`: a short section naming the four tools and saying plainly
   that none of them can write to the repository or run a command, and that an
@@ -1477,7 +1479,7 @@ Run: `cargo nextest run --workspace --locked` — expected **675**. This is the
   truncation notice means and which config key raises the cap.
 - `CHANGELOG.md`: a row under **Unreleased**, component **Engine**.
 
-- [ ] **Step 6: Close the slice in all four places**
+- [x] **Step 6: Close the slice in all four places**
 
 The rule in `AGENTS.md`, "Before you change a feature":
 
@@ -1488,10 +1490,10 @@ The rule in `AGENTS.md`, "Before you change a feature":
 3. This file's Progress table and its `**Started:** … — **Done:** …` header.
 4. The `docs/specs/README.md` row.
 
-- [ ] **Step 7: Full quality gate**
+- [x] **Step 7: Full quality gate**
 
 All seven commands.
 
-- [ ] **Step 8: Show the change and the gate result, and ask before committing**
+- [x] **Step 8: Show the change and the gate result, and ask before committing**
 
 Suggested subject: `Document the agent tool floor and close the first slice`

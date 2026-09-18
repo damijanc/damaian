@@ -1,9 +1,10 @@
 # Feature Spec: Agent Working Capability
 
-Status: In progress. Requirements 1–4 are designed (§5) and being built as the
-first slice: ranged reads, `list_directory` and `search_content`, and
-anchor-based region edits. Requirements 5, 6 and 8 are designed only to the
-extent of the decisions recorded in §5.6, and follow as their own slices.
+Status: In progress. The first slice is built and done: requirements 1–4 —
+ranged reads, `list_directory` and `search_content`, and anchor-based region
+edits — are implemented, tested, and closed out (see
+[`tasks.md`](tasks.md)). Requirements 5, 6 and 8 are designed only to the extent
+of the decisions recorded in §5.6, and follow as their own slices.
 Order: 47 of 47
 Plan: none. Like [`07`](../07_generated_secret_override.md),
 [`08`](../08_stop_and_progress.md), [`13`](../13_docker_command_support.md) and
@@ -323,4 +324,41 @@ the spec is done when both do.
 
 ## 7. Implementation Notes
 
-To be completed during implementation.
+What implementing the first slice found that contradicted §5 or the plan, in
+order of consequence.
+
+1. **`read_file`'s range argument is not an `Option<LineRange>`.** §5.2 said the
+   tool takes an optional range. `None` cannot say which of two callers it
+   serves: context assembly wants the *whole* file and applies its own token
+   budget, while the tool wants a bounded window. Encoding both as "no range"
+   would have silently capped context assembly the day the line cap landed. The
+   signature takes a three-variant `ReadWindow` (`Whole` / `Default` / `Range`)
+   so each call site states its intent, and a large requested range is clamped
+   to the cap rather than allowed to step around it.
+
+2. **The orchestrator needed two fields the plan did not list.** `tasks.md`'s
+   file-structure table names `chat.rs` as "four tool definitions, four decode
+   arms, four dispatch arms" and stops there. Wiring `list_directory`,
+   `search_content` and `edit_file` in fact required `ChatOrchestrator` to hold a
+   `NavigationController` (for the two navigation tools) and a `PathPolicy` (for
+   `region_edits_to_changes`), both passed in from `workspace_engine.rs`.
+
+3. **The audit log path in the plan's own test was wrong.** Task 7's audit test
+   asserted on `.damaian/audit.log`; `AuditLog::record` writes
+   `data_dir/audit/events.jsonl` (`audit.rs:61`). The test uses the real path.
+
+4. **The 150 KB fixture as written never reached 150 KB.** Task 5's plan built it
+   as 6000 lines of `fn f{n}() {}\n`, which is roughly 84 KB — the assertion
+   would have passed a fixture that never exceeded the threshold it was supposed
+   to exceed. It is built at 12 000 lines instead, with the length asserted.
+
+5. **One `read_file` call site was missed.** `damaian-cli/src/main.rs` still
+   passed six arguments after the ranged-read signature change and only failed to
+   compile at the whole-workspace test run in Task 7. Fixed to `ReadWindow::Whole`,
+   which preserves the CLI's read-the-whole-file behaviour.
+
+6. **The `edit_file` tool shape differs from §5.2's table.** The table named a
+   single `path`/`old_text`/`new_text` triple; the schema takes `summary` plus an
+   `edits` array, so one call can propose several anchored edits and they compose
+   against each other rather than each being spliced against the on-disk file
+   independently — which would silently drop all but the last edit to one file.

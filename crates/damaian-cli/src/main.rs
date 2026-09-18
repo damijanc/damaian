@@ -4,7 +4,7 @@ use std::path::Path;
 use workspace_engine::{
     CURRENT_DATA_SCHEMA_VERSION, CommandProposal, CommandRisk, Config, ConfigOverlay, ConfigScope,
     CurlModelTransport, DataSchemaOutcome, MockModelAdapter, OpenAICompatibleAdapter,
-    ProcessRegistry, SearchResult, WorkspaceEngine, command_approval_prompt,
+    ProcessRegistry, ReadWindow, SearchResult, WorkspaceEngine, command_approval_prompt,
     ensure_data_dir_schema, parse_hunk_selection, patch_diff_text, patch_hunk_summary,
     render_markdown_to_ansi,
 };
@@ -144,10 +144,15 @@ fn run() -> workspace_engine::Result<()> {
             let repo = require_arg(&args, 1, "<repo>")?;
             let engine = engine_for_repo(repo)?;
             let path = require_arg(&args, 2, "<path>")?;
-            let file =
-                engine
-                    .file_access
-                    .read_file(repo, path, Some("cli"), Some(repo), false, false)?;
+            let file = engine.file_access.read_file(
+                repo,
+                path,
+                Some("cli"),
+                Some(repo),
+                false,
+                false,
+                ReadWindow::Whole,
+            )?;
             print!("{}", file.content);
             if !file.content.ends_with('\n') {
                 println!();

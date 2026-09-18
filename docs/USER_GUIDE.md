@@ -69,6 +69,18 @@ Sessions are shown under their project folder in the sidebar. Select an existing
 
 Context file buttons open the referenced file in Visual Studio Code.
 
+### Agent tools for reading and navigating
+
+With native tool-calling enabled, Damaian offers the assistant four tools that
+need no approval and never touch the working folder: `read_file` (with an
+optional line range), `list_directory`, `search_content`, and `edit_file`. The
+first three only read, so they can never change a file or run a command.
+`edit_file` proposes a change to a snippet of a file, but nothing is written to
+disk — the proposal appears as a patch preview and waits for your approval, on
+the same terms as a whole-file `propose_patch`. A large file read is reported as
+a range with the file's real line count ("lines 1–400 of 4420"), so a truncated
+result says so rather than reading as the whole file.
+
 ## Provider Limits and Retries
 
 A model provider can refuse a call — rate limiting ("you are going too fast"), a

@@ -7,9 +7,9 @@ use crate::command_policy::allow_always_eligible;
 use crate::command_runner::CommandExecution;
 use crate::config::{Config, McpTransport};
 use crate::context_manager::ContextManager;
-use crate::edit::{GeneratedEdit, PatchStore};
+use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes};
 use crate::error::{ClientError, Result};
-use crate::file_access::FileAccessController;
+use crate::file_access::{FileAccessController, LineRange, ReadWindow};
 use crate::git_service::{GitService, GitStatus};
 use crate::hash::{create_id, now_millis};
 use crate::indexer::{ProjectIndexer, SearchResult};
@@ -18,7 +18,9 @@ use crate::model::{
     ModelAdapter, ModelMessage, ModelRequest, ModelRun, TokenUsage, ToolCall, ToolDefinition,
     model_request_json,
 };
+use crate::navigation::NavigationController;
 use crate::patch_engine::{PatchEngine, ProposedChange, ProposedFilePatch, ProposedPatch};
+use crate::path_policy::PathPolicy;
 use crate::plan::TaskPlan;
 use crate::secret_scanner::SecretScanner;
 use crate::session::{ChatMessage, Session, SessionStore, Task, TaskStatus, TaskUsage};
@@ -357,6 +359,8 @@ pub struct ChatOrchestrator {
     command_store: CommandStore,
     pending_commands: PendingCommandStore,
     file_access: FileAccessController,
+    navigation: NavigationController,
+    path_policy: PathPolicy,
     git: GitService,
     patch_engine: PatchEngine,
     patch_store: PatchStore,
@@ -380,6 +384,8 @@ impl ChatOrchestrator {
         validation_orchestrator: ValidationOrchestrator,
         command_store: CommandStore,
         file_access: FileAccessController,
+        navigation: NavigationController,
+        path_policy: PathPolicy,
         git: GitService,
         patch_engine: PatchEngine,
         patch_store: PatchStore,
@@ -397,6 +403,8 @@ impl ChatOrchestrator {
             command_store,
             pending_commands,
             file_access,
+            navigation,
+            path_policy,
             git,
             patch_engine,
             patch_store,
@@ -1233,6 +1241,9 @@ impl ChatOrchestrator {
                 propose_plan_tool_definition(),
                 complete_step_tool_definition(),
                 read_file_tool_definition(),
+                list_directory_tool_definition(),
+                search_content_tool_definition(),
+                edit_file_tool_definition(),
                 search_codebase_tool_definition(),
                 read_git_status_tool_definition(),
                 read_git_diff_tool_definition(),
@@ -2030,7 +2041,11 @@ impl ChatOrchestrator {
                         )
                     }
                 },
-                ToolAction::ReadFile(path) => {
+                ToolAction::ReadFile { path, range } => {
+                    let window = match range {
+                        Some(range) => ReadWindow::Range(range),
+                        None => ReadWindow::Default,
+                    };
                     let (content, outcome) = match self.file_access.read_file(
                         repository_root,
                         &path,
@@ -2038,21 +2053,158 @@ impl ChatOrchestrator {
                         Some(&session.repository_id),
                         false,
                         false,
-                        crate::file_access::ReadWindow::Default,
+                        window,
                     ) {
-                        Ok(file_read) => (
-                            format!("Content of {}:\n{}", file_read.path, file_read.content),
-                            ActionOutcome::FileRead {
-                                path: file_read.path.clone(),
-                                hash: file_read.hash.clone(),
-                            },
-                        ),
+                        Ok(file_read) => {
+                            let mut content = format!(
+                                "Content of {}, lines {}–{} of {}:",
+                                file_read.path,
+                                file_read.line_range.start,
+                                file_read.line_range.end,
+                                file_read.total_lines,
+                            );
+                            if let Some(reason) = &file_read.truncated_by {
+                                content.push_str(&format!(
+                                    " (truncated by {reason}; ask for a narrower range)"
+                                ));
+                            }
+                            content.push_str(&format!("\n{}", file_read.content));
+                            (
+                                content,
+                                ActionOutcome::FileRead {
+                                    path: file_read.path.clone(),
+                                    hash: file_read.hash.clone(),
+                                },
+                            )
+                        }
                         Err(error) => (
                             format!("Cannot read {path}: {error}"),
                             ActionOutcome::Failed,
                         ),
                     };
                     (format!("Read `{path}`"), content, outcome)
+                }
+                ToolAction::ListDirectory { dir, depth } => {
+                    match self.navigation.list_directory(
+                        repository_root,
+                        dir.as_deref(),
+                        depth,
+                        Some(&task.id),
+                        Some(&session.repository_id),
+                    ) {
+                        Ok(listing) => {
+                            let dir_name = dir.as_deref().unwrap_or(".");
+                            let content = if listing.truncated {
+                                format!(
+                                    "Listing of {dir_name} ({} of {} paths):\n{}",
+                                    listing.paths.len(),
+                                    listing.total_found,
+                                    listing.paths.join("\n")
+                                )
+                            } else {
+                                format!(
+                                    "Listing of {dir_name} ({} paths):\n{}",
+                                    listing.total_found,
+                                    listing.paths.join("\n")
+                                )
+                            };
+                            (format!("Listed {dir_name}"), content, ActionOutcome::Ok)
+                        }
+                        Err(error) => (
+                            "Attempted to list the directory.".to_string(),
+                            format!("Cannot list that directory: {error}"),
+                            ActionOutcome::Failed,
+                        ),
+                    }
+                }
+                ToolAction::SearchContent {
+                    pattern,
+                    path_glob,
+                    max_matches,
+                } => {
+                    match self.navigation.search_content(
+                        repository_root,
+                        &pattern,
+                        path_glob.as_deref(),
+                        max_matches,
+                        Some(&task.id),
+                        Some(&session.repository_id),
+                    ) {
+                        Ok(found) => {
+                            let mut lines = found
+                                .matches
+                                .iter()
+                                .map(|m| format!("{}:{}: {}", m.path, m.line, m.text))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if !lines.is_empty() {
+                                lines.push('\n');
+                            }
+                            let content = format!(
+                                "{} matches for \"{}\" across {} files (showing {}):\n{}",
+                                found.total_found,
+                                pattern,
+                                found.files_searched,
+                                found.matches.len(),
+                                lines,
+                            );
+                            (
+                                format!("Searched for \"{pattern}\""),
+                                content,
+                                ActionOutcome::Ok,
+                            )
+                        }
+                        Err(error) => (
+                            "Attempted to search the repository.".to_string(),
+                            format!("Cannot search: {error}"),
+                            ActionOutcome::Failed,
+                        ),
+                    }
+                }
+                ToolAction::EditFile { summary, edits } => {
+                    match region_edits_to_changes(repository_root, &self.path_policy, &edits)
+                        .and_then(|changes| {
+                            self.patch_engine.create_patch(
+                                repository_root,
+                                &changes,
+                                Some(&task.id),
+                                &summary,
+                            )
+                        }) {
+                        Ok(patch) => {
+                            // See `ProposedPatch::session_id`: the engine does
+                            // not know the session, this orchestrator does.
+                            let mut patch = patch;
+                            patch.session_id = session.id.clone();
+                            self.patch_store.save(&patch)?;
+                            let response = patch_proposal_response(&patch);
+                            // A patch waiting for review is a clean stop, not
+                            // a crash — finish the marker before breaking.
+                            self.session_store
+                                .finish_action(action_marker, "awaiting_review")?;
+                            let proposal = agent_patch_proposal(&patch);
+                            let mut proposal_run = model_run;
+                            proposal_run.content = response.clone();
+                            break (
+                                proposal_run,
+                                response,
+                                TurnProposals {
+                                    patch: Some(proposal),
+                                    ..Default::default()
+                                },
+                                StopReason::Answered,
+                            );
+                        }
+                        // Fed back as a tool result rather than aborting the
+                        // turn, so the model can see why (a stale anchor, a
+                        // restricted path) and correct itself within the
+                        // remaining rounds.
+                        Err(error) => (
+                            format!("Attempted to edit files: {summary}"),
+                            format!("Cannot apply that edit: {error}"),
+                            ActionOutcome::Failed,
+                        ),
+                    }
                 }
                 ToolAction::SearchCodebase {
                     query,
@@ -2780,7 +2932,23 @@ enum ToolAction {
     /// the step ended — the engine derives that from the evidence accrued
     /// while the step was in progress (§5.3).
     CompleteStep,
-    ReadFile(String),
+    ReadFile {
+        path: String,
+        range: Option<LineRange>,
+    },
+    ListDirectory {
+        dir: Option<String>,
+        depth: Option<usize>,
+    },
+    SearchContent {
+        pattern: String,
+        path_glob: Option<String>,
+        max_matches: Option<usize>,
+    },
+    EditFile {
+        summary: String,
+        edits: Vec<RegionEdit>,
+    },
     SearchCodebase {
         query: String,
         semantic: bool,
@@ -2815,7 +2983,15 @@ fn tool_action_marker(action: &ToolAction) -> (&'static str, String, bool) {
         // half-applied in the world.
         ToolAction::ProposePlan(steps) => ("propose_plan", steps.len().to_string(), false),
         ToolAction::CompleteStep => ("complete_step", String::new(), false),
-        ToolAction::ReadFile(path) => ("read_file", path.clone(), false),
+        ToolAction::ReadFile { path, .. } => ("read_file", path.clone(), false),
+        ToolAction::ListDirectory { dir, .. } => {
+            ("list_directory", dir.clone().unwrap_or_default(), false)
+        }
+        ToolAction::SearchContent { pattern, .. } => ("search_content", pattern.clone(), false),
+        // Proposing writes nothing to the repository — the same reason
+        // ProposePatch is false. Applying one is bracketed separately in
+        // edit.rs.
+        ToolAction::EditFile { summary, .. } => ("edit_file", summary.clone(), false),
         ToolAction::SearchCodebase { query, .. } => ("search_codebase", query.clone(), false),
         ToolAction::ReadGitStatus => ("read_git_status", String::new(), false),
         ToolAction::ReadGitDiff { staged } => ("read_git_diff", staged.to_string(), false),
@@ -2918,7 +3094,15 @@ fn tool_action_label(action: &ToolAction) -> String {
         ToolAction::ProposePatch(_) => "Preparing a patch".to_string(),
         ToolAction::ProposePlan(steps) => format!("Planning {} steps", steps.len()),
         ToolAction::CompleteStep => "Finishing a step".to_string(),
-        ToolAction::ReadFile(path) => format!("Reading {path}"),
+        ToolAction::ReadFile { path, .. } => format!("Reading {path}"),
+        ToolAction::ListDirectory { dir, .. } => match dir {
+            Some(dir) => format!("Listing {dir}"),
+            None => "Listing the repository".to_string(),
+        },
+        ToolAction::SearchContent { pattern, .. } => {
+            format!("Searching for \"{pattern}\"")
+        }
+        ToolAction::EditFile { summary, .. } => format!("Preparing an edit: {summary}"),
         ToolAction::SearchCodebase { query, .. } => format!("Searching for \"{query}\""),
         ToolAction::ReadGitStatus => "Reading git status".to_string(),
         ToolAction::ReadGitDiff { staged } => {
@@ -2986,8 +3170,32 @@ fn complete_step_tool_definition() -> ToolDefinition {
 fn read_file_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "read_file".to_string(),
-        description: "Read a file from the repository to help answer the user's question.".to_string(),
-        parameters_json: "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Repository-relative file path\"}},\"required\":[\"path\"]}".to_string(),
+        description: "Read a file from the repository to help answer the user's question. The result states the lines returned and the file's total line count, so a truncated read says so rather than reading as the whole file.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Repository-relative file path\"},\"start_line\":{\"type\":\"integer\",\"description\":\"First line to return, 1-based; default 1\"},\"end_line\":{\"type\":\"integer\",\"description\":\"Last line to return, inclusive; default is the last line or the read cap\"}},\"required\":[\"path\"]}".to_string(),
+    }
+}
+
+fn list_directory_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "list_directory".to_string(),
+        description: "List repository-relative file paths, honouring .gitignore. Prefer this over a shell command: it needs no approval.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"dir\":{\"type\":\"string\",\"description\":\"Repository-relative directory; defaults to the repository root\"},\"depth\":{\"type\":\"integer\",\"description\":\"Maximum directory depth to descend\"}},\"required\":[]}".to_string(),
+    }
+}
+
+fn search_content_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "search_content".to_string(),
+        description: "Search file contents by regular expression and return path, line number and the matching line. Use this to find call sites; use search_codebase to find which files are about a topic.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":\"Regular expression\"},\"path_glob\":{\"type\":\"string\",\"description\":\"Optional glob limiting which files are searched\"},\"max_matches\":{\"type\":\"integer\",\"description\":\"Fewer matches than the configured cap; it cannot raise it\"}},\"required\":[\"pattern\"]}".to_string(),
+    }
+}
+
+fn edit_file_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "edit_file".to_string(),
+        description: "Propose a change to part of a file by replacing an exact snippet. old_text must appear exactly once, or the edit is refused. Nothing is written to disk until the user approves it.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"string\",\"description\":\"Short summary of the change\"},\"edits\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old_text\":{\"type\":\"string\",\"description\":\"Exact text to replace; must match once\"},\"new_text\":{\"type\":\"string\"}},\"required\":[\"path\",\"old_text\",\"new_text\"]}}},\"required\":[\"summary\",\"edits\"]}".to_string(),
     }
 }
 
@@ -3096,7 +3304,109 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
             else {
                 return Ok(None);
             };
-            Ok(Some(ToolAction::ReadFile(path.to_string())))
+            let start_line = arguments
+                .get("start_line")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as usize);
+            let end_line = arguments
+                .get("end_line")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as usize);
+            let range = match (start_line, end_line) {
+                (Some(start), Some(end)) => Some(LineRange { start, end }),
+                _ => None,
+            };
+            Ok(Some(ToolAction::ReadFile {
+                path: path.to_string(),
+                range,
+            }))
+        }
+        "list_directory" => {
+            let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+            else {
+                return Ok(None);
+            };
+            let dir = arguments
+                .get("dir")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let depth = arguments
+                .get("depth")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as usize);
+            Ok(Some(ToolAction::ListDirectory { dir, depth }))
+        }
+        "search_content" => {
+            let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+            else {
+                return Ok(None);
+            };
+            let Some(pattern) = arguments
+                .get("pattern")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return Ok(None);
+            };
+            let path_glob = arguments
+                .get("path_glob")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let max_matches = arguments
+                .get("max_matches")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as usize);
+            Ok(Some(ToolAction::SearchContent {
+                pattern: pattern.to_string(),
+                path_glob,
+                max_matches,
+            }))
+        }
+        "edit_file" => {
+            let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+            else {
+                return Ok(None);
+            };
+            let Some(summary) = arguments
+                .get("summary")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return Ok(None);
+            };
+            let Some(entries) = arguments.get("edits").and_then(|value| value.as_array()) else {
+                return Ok(None);
+            };
+            let edits: Vec<RegionEdit> = entries
+                .iter()
+                .filter_map(|entry| {
+                    let path = entry
+                        .get("path")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())?;
+                    let old_text = entry.get("old_text").and_then(|value| value.as_str())?;
+                    let new_text = entry.get("new_text").and_then(|value| value.as_str())?;
+                    Some(RegionEdit {
+                        path: path.to_string(),
+                        old_text: old_text.to_string(),
+                        new_text: new_text.to_string(),
+                    })
+                })
+                .collect();
+            if edits.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(ToolAction::EditFile {
+                summary: summary.to_string(),
+                edits,
+            }))
         }
         "search_codebase" => {
             let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments_json)

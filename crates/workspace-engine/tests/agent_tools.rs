@@ -7,10 +7,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use workspace_engine::edit::{RegionEdit, region_edits_to_changes};
 use workspace_engine::file_access::{FileAccessController, LineRange, ReadWindow};
 use workspace_engine::navigation::NavigationController;
 use workspace_engine::tree_walk::{self, WalkEvent};
-use workspace_engine::{AuditLog, ClientError, Config, PathPolicy, SecretScanner};
+use workspace_engine::{
+    AuditLog, ClientError, CommandPolicy, Config, MockModelAdapter, ModelProviderConfig,
+    PatchEngine, PathPolicy, ProposedChange, SecretScanner, ToolCall, WorkspaceEngine,
+};
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -471,5 +475,426 @@ fn an_invalid_pattern_is_refused_with_the_compile_error() {
     assert!(
         format!("{error}").contains("unclosed"),
         "the compile error must reach the model: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 5 · edit_file, the anchored splice (requirement 4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_anchor_matching_once_splices_and_leaves_the_rest_alone() {
+    let repo = temp_dir("edit-one");
+    write_fixture(&repo, "src/lib.rs", "fn a() {}\nfn b() {}\nfn c() {}\n");
+    let policy = PathPolicy::new(&test_config(&repo));
+
+    let changes = region_edits_to_changes(
+        &repo,
+        &policy,
+        &[RegionEdit {
+            path: "src/lib.rs".to_string(),
+            old_text: "fn b() {}".to_string(),
+            new_text: "fn b(x: u8) {}".to_string(),
+        }],
+    )
+    .unwrap();
+
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        changes[0].new_content,
+        "fn a() {}\nfn b(x: u8) {}\nfn c() {}\n"
+    );
+}
+
+#[test]
+fn an_anchor_matching_zero_times_is_refused() {
+    let repo = temp_dir("edit-zero");
+    write_fixture(&repo, "src/lib.rs", "fn a() {}\n");
+    let policy = PathPolicy::new(&test_config(&repo));
+
+    let error = region_edits_to_changes(
+        &repo,
+        &policy,
+        &[RegionEdit {
+            path: "src/lib.rs".to_string(),
+            old_text: "fn missing() {}".to_string(),
+            new_text: "fn other() {}".to_string(),
+        }],
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(error, ClientError::InvalidInput(_)),
+        "got {error:?}"
+    );
+    assert!(format!("{error}").contains("did not match"));
+}
+
+#[test]
+fn an_anchor_matching_twice_is_refused_and_names_the_count() {
+    let repo = temp_dir("edit-two");
+    write_fixture(&repo, "src/lib.rs", "fn a() {}\nfn a() {}\n");
+    let policy = PathPolicy::new(&test_config(&repo));
+
+    let error = region_edits_to_changes(
+        &repo,
+        &policy,
+        &[RegionEdit {
+            path: "src/lib.rs".to_string(),
+            old_text: "fn a() {}".to_string(),
+            new_text: "fn a(x: u8) {}".to_string(),
+        }],
+    )
+    .unwrap_err();
+
+    let message = format!("{error}");
+    assert!(
+        message.contains("2 times"),
+        "the count must reach the model: {message}"
+    );
+    assert!(message.contains("more context"));
+}
+
+/// Proposal §5.3, the reason this anchors on text rather than a line range: an
+/// anchor against a stale view of the file stops matching, so staleness lands
+/// in a refusal instead of a wrong-region write that only a human reading the
+/// diff would catch.
+#[test]
+fn an_anchor_against_a_changed_file_refuses_rather_than_writing_elsewhere() {
+    let repo = temp_dir("edit-stale");
+    write_fixture(&repo, "src/lib.rs", "fn a() {}\nfn b() {}\n");
+    let policy = PathPolicy::new(&test_config(&repo));
+    // The model read the file, then it changed underneath.
+    write_fixture(&repo, "src/lib.rs", "fn a() {}\nfn renamed() {}\n");
+
+    let error = region_edits_to_changes(
+        &repo,
+        &policy,
+        &[RegionEdit {
+            path: "src/lib.rs".to_string(),
+            old_text: "fn b() {}".to_string(),
+            new_text: "fn b(x: u8) {}".to_string(),
+        }],
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, ClientError::InvalidInput(_)));
+    assert_eq!(
+        fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+        "fn a() {}\nfn renamed() {}\n",
+        "a refused edit must write nothing"
+    );
+}
+
+/// Acceptance criterion 1: the payload is the size of the change, not the file.
+#[test]
+fn a_ten_line_change_in_a_150kb_file_has_a_ten_line_payload() {
+    let repo = temp_dir("edit-payload");
+    // ~14 bytes a line, so 12000 lines clears 150 KB with room to spare. The
+    // assertion below is what caught an undersized fixture at 6000.
+    let mut body = (1..=12_000)
+        .map(|n| format!("fn f{n}() {{}}\n"))
+        .collect::<String>();
+    body.push_str("fn target() {}\n");
+    assert!(
+        body.len() > 150_000,
+        "fixture must exceed 150 KB: {}",
+        body.len()
+    );
+    write_fixture(&repo, "src/big.rs", &body);
+    let policy = PathPolicy::new(&test_config(&repo));
+
+    let edit = RegionEdit {
+        path: "src/big.rs".to_string(),
+        old_text: "fn target() {}".to_string(),
+        new_text: (1..=10).map(|n| format!("fn target{n}() {{}}\n")).collect(),
+    };
+    let payload_bytes = edit.old_text.len() + edit.new_text.len();
+
+    let changes = region_edits_to_changes(&repo, &policy, &[edit]).unwrap();
+
+    assert!(
+        payload_bytes < 1_000,
+        "the edit payload must scale with the change, not the file: {payload_bytes}"
+    );
+    assert!(
+        changes[0].new_content.len() > 150_000,
+        "the spliced result is still the whole file"
+    );
+}
+
+/// Two edits to one file must compose, or the second would be computed against
+/// the file on disk and silently discard the first.
+#[test]
+fn two_edits_to_one_file_build_on_each_other() {
+    let repo = temp_dir("edit-compose");
+    write_fixture(&repo, "src/lib.rs", "fn a() {}\nfn b() {}\n");
+    let policy = PathPolicy::new(&test_config(&repo));
+
+    let changes = region_edits_to_changes(
+        &repo,
+        &policy,
+        &[
+            RegionEdit {
+                path: "src/lib.rs".to_string(),
+                old_text: "fn a() {}".to_string(),
+                new_text: "fn a(x: u8) {}".to_string(),
+            },
+            RegionEdit {
+                path: "src/lib.rs".to_string(),
+                old_text: "fn b() {}".to_string(),
+                new_text: "fn b(y: u8) {}".to_string(),
+            },
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(changes.len(), 1, "one file, one ProposedChange");
+    assert_eq!(changes[0].new_content, "fn a(x: u8) {}\nfn b(y: u8) {}\n");
+}
+
+// ---------------------------------------------------------------------------
+// Task 6 · the four tools, wired into the turn
+// ---------------------------------------------------------------------------
+
+/// The provider block `foundation.rs` uses to turn native tools on; without it
+/// the engine falls back to the text envelope and no tool call is dispatched.
+fn native_tool_provider() -> ModelProviderConfig {
+    ModelProviderConfig {
+        id: "openai".to_string(),
+        label: "OpenAI".to_string(),
+        base_url: String::new(),
+        api_key_env: String::new(),
+        models: Vec::new(),
+        supports_native_tools: true,
+        max_output_tokens: None,
+        context_token_budget: None,
+        provider_reports_usage: true,
+        price_per_million_input_tokens: None,
+        price_per_million_output_tokens: None,
+    }
+}
+
+/// Acceptance criterion 5: navigating requires no allowlist entry and no change
+/// to the command trust boundary, because these are engine tools that never
+/// reach `command_policy.rs`.
+#[test]
+fn navigation_needs_no_command_allowlist_entry() {
+    let repo = temp_dir("tools-allowlist");
+    write_fixture(&repo, "src/lib.rs", "pub fn apply_overlay() {}\n");
+    let mut config = test_config(&repo);
+    config.command_allowlist = Vec::new();
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+
+    // Two navigation calls, then an answer. If either needed approval the turn
+    // would stop with a `command_proposal` instead of reaching the third round.
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            String::new(),
+            "apply_overlay is defined in src/lib.rs.".to_string(),
+        ],
+        vec![
+            vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "list_directory".to_string(),
+                arguments_json: "{}".to_string(),
+            }],
+            vec![ToolCall {
+                id: "call_2".to_string(),
+                name: "search_content".to_string(),
+                arguments_json: "{\"pattern\":\"apply_overlay\"}".to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Where is apply_overlay defined?",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert!(
+        result.command_proposal.is_none(),
+        "no approval may be requested for navigation"
+    );
+    assert!(result.response.contains("src/lib.rs"));
+}
+
+/// The trust boundary itself, pinned so a later change has to be deliberate.
+#[test]
+fn the_low_risk_read_only_set_is_unchanged_by_this_spec() {
+    let repo = temp_dir("tools-boundary");
+    let policy = CommandPolicy::new(test_config(&repo));
+    for command in ["pwd", "ls", "git status", "git diff", "git log", "git show"] {
+        assert!(
+            !policy.classify(command, &repo).requires_approval,
+            "{command} must stay approval-free"
+        );
+    }
+    for command in [
+        "grep -r foo .",
+        "find . -name x",
+        "cat src/lib.rs",
+        "head -n 5 a",
+    ] {
+        assert!(
+            policy.classify(command, &repo).requires_approval,
+            "{command} must still need approval: this spec gives navigation as a \
+             tool, not at the shell"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 7 · acceptance criteria and closing the slice
+// ---------------------------------------------------------------------------
+
+/// Acceptance criterion: "same review, same hunks, same checkpoint".
+#[test]
+fn a_region_edit_and_a_whole_file_proposal_produce_the_same_patch() {
+    let repo = temp_dir("edit-equivalence");
+    let original = "fn a() {}\nfn b() {}\nfn c() {}\n";
+    let expected = "fn a() {}\nfn b(x: u8) {}\nfn c() {}\n";
+    write_fixture(&repo, "src/lib.rs", original);
+    let config = test_config(&repo);
+    let scanner = SecretScanner::default();
+    let engine = PatchEngine::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+    let policy = PathPolicy::new(&config);
+
+    let whole = engine
+        .create_patch(
+            &repo,
+            &[ProposedChange {
+                path: "src/lib.rs".to_string(),
+                new_content: expected.to_string(),
+                status: Some("modified".to_string()),
+                allow_restricted: false,
+            }],
+            None,
+            "change b",
+        )
+        .unwrap();
+
+    let region_changes = region_edits_to_changes(
+        &repo,
+        &policy,
+        &[RegionEdit {
+            path: "src/lib.rs".to_string(),
+            old_text: "fn b() {}".to_string(),
+            new_text: "fn b(x: u8) {}".to_string(),
+        }],
+    )
+    .unwrap();
+    let region = engine
+        .create_patch(&repo, &region_changes, None, "change b")
+        .unwrap();
+
+    assert_eq!(region.files[0].new_content, whole.files[0].new_content);
+    assert_eq!(region.files[0].new_hash, whole.files[0].new_hash);
+    assert_eq!(region.files[0].base_hash, whole.files[0].base_hash);
+    assert_eq!(region.files[0].diff, whole.files[0].diff);
+    assert_eq!(region.files[0].hunks, whole.files[0].hunks);
+    assert_eq!(region.files[0].status, whole.files[0].status);
+}
+
+/// §5.5: a truncated result that reads as complete is the failure this design
+/// exists to prevent. One assertion per read tool.
+#[test]
+fn every_capped_read_tool_states_what_it_cut() {
+    let repo = temp_dir("notices");
+    for n in 1..=300 {
+        write_fixture(&repo, &format!("src/m{n}.rs"), "let needle = 1;\n");
+    }
+    let body = (1..=1000)
+        .map(|n| format!("line {n}\n"))
+        .collect::<String>();
+    write_fixture(&repo, "big.rs", &body);
+    let config = Config {
+        max_list_entries: 10,
+        max_search_matches: 10,
+        max_read_lines: 10,
+        ..test_config(&repo)
+    };
+    let nav = navigation_for(&repo, &config);
+    let scanner = SecretScanner::default();
+    let access = FileAccessController::new(
+        config.clone(),
+        test_audit(&repo, scanner.clone()),
+        scanner,
+        PathPolicy::new(&config),
+    );
+
+    let listing = nav.list_directory(&repo, None, None, None, None).unwrap();
+    assert!(listing.truncated && listing.total_found > listing.paths.len());
+
+    let found = nav
+        .search_content(&repo, "needle", None, None, None, None)
+        .unwrap();
+    assert!(found.truncated && found.total_found > found.matches.len());
+
+    let read = access
+        .read_file(
+            &repo,
+            "big.rs",
+            None,
+            None,
+            false,
+            false,
+            ReadWindow::Default,
+        )
+        .unwrap();
+    assert_eq!(read.truncated_by, Some("lines".to_string()));
+    assert!(read.total_lines > read.line_range.end);
+}
+
+/// Requirement 7. `read_file` already audits as `file_read`; the two new
+/// navigation tools must too, and an `edit_file` proposal must reach the audit
+/// log by the same `patch_proposed` event a whole-file proposal produces —
+/// which is the audit half of "indistinguishable downstream".
+#[test]
+fn every_new_tool_records_an_audit_event() {
+    let repo = temp_dir("audit-tools");
+    write_fixture(&repo, "src/lib.rs", "pub fn apply_overlay() {}\n");
+    let config = test_config(&repo);
+    let nav = navigation_for(&repo, &config);
+
+    nav.list_directory(&repo, None, None, Some("task-1"), Some("repo-1"))
+        .unwrap();
+    nav.search_content(
+        &repo,
+        "apply_overlay",
+        None,
+        None,
+        Some("task-1"),
+        Some("repo-1"),
+    )
+    .unwrap();
+
+    let events = fs::read_to_string(repo.join(".damaian/audit/events.jsonl")).unwrap();
+    assert!(
+        events.contains("directory_listed"),
+        "list_directory must audit"
+    );
+    assert!(
+        events.contains("content_searched"),
+        "search_content must audit"
+    );
+    assert!(
+        !events.contains("AKIA") && !events.contains("sk_live"),
+        "an audit entry must never carry a secret from the search it recorded"
     );
 }
