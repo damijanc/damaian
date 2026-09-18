@@ -149,7 +149,7 @@ A message whose parts are a single `Text` serialises to exactly the string body
 it does today — byte-identical, so no provider sees a changed request shape
 because the type changed. Only a message actually carrying an image serialises
 to the content-array form. This matters beyond tidiness:
-[spec 49](49_prompt_cache_accounting_and_reuse.md) depends on prefix stability,
+[spec 49](49_prompt_cache_accounting_and_reuse/proposal.md) depends on prefix stability,
 and a request body that changed shape for every message would invalidate every
 cached prefix in exchange for nothing.
 
@@ -295,7 +295,7 @@ the content, and never a derived description of it.
 - An image is attached by paste, by drop and through the attach control, and
   reaches a provider that supports images.
 - A message carrying only text serialises to a request body byte-identical to
-  today's — asserted by test, because [spec 49](49_prompt_cache_accounting_and_reuse.md)'s
+  today's — asserted by test, because [spec 49](49_prompt_cache_accounting_and_reuse/proposal.md)'s
   prefix stability depends on it.
 - With a provider that does not support images, the attach control states so and
   a turn carrying an image cannot be sent. No request is ever sent with an

@@ -32,7 +32,7 @@ channel a wait is reported through, and the cancellation that must interrupt it)
 (owns the usage a refused call must not inflate),
 [`../45_crash_recovery_prompt.md`](../45_crash_recovery_prompt.md) (the card that must
 be able to name this outcome), and
-[`../49_prompt_cache_accounting_and_reuse.md`](../49_prompt_cache_accounting_and_reuse.md)
+[`../49_prompt_cache_accounting_and_reuse/proposal.md`](../49_prompt_cache_accounting_and_reuse/proposal.md)
 (the sibling work package on the same response metadata).
 
 Motivation and current state moved to [`context.md`](context.md) when this spec

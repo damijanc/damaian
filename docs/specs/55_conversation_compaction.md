@@ -26,7 +26,7 @@ is measured against),
 [`27_context_inspector.md`](27_context_inspector.md) (where a summary is seen),
 [`30_memory_retrieval_and_lifecycle.md`](30_memory_retrieval_and_lifecycle.md)
 (the injection-resistance pattern §5.6 reuses),
-[`49_prompt_cache_accounting_and_reuse.md`](49_prompt_cache_accounting_and_reuse.md)
+[`49_prompt_cache_accounting_and_reuse/proposal.md`](49_prompt_cache_accounting_and_reuse/proposal.md)
 (whose prefix stability compaction necessarily breaks — see §5.5), and
 [`51_external_reference_retrieval.md`](51_external_reference_retrieval.md)
 (fetched content that a summariser may otherwise launder).
@@ -92,7 +92,7 @@ central loop.
   and results are appended.
 - **The ordering in that string is the opposite of cache-friendly.** Volatile
   conversation comes first and comparatively stable repository context last,
-  which is the reverse of what [spec 49](49_prompt_cache_accounting_and_reuse.md)
+  which is the reverse of what [spec 49](49_prompt_cache_accounting_and_reuse/proposal.md)
   §5.3 needs. That spec assumes the sections are separately orderable; today they
   are concatenated in one string. Recorded here because this spec touches that
   string and is the natural place to notice it — resolving it belongs to spec 49
@@ -299,7 +299,7 @@ Both run **at a turn boundary, before the request is assembled — never between
 tool rounds.** Three reasons, and the first is the one that would be discovered
 late:
 
-- [Spec 49](49_prompt_cache_accounting_and_reuse.md) caches on an exact prefix.
+- [Spec 49](49_prompt_cache_accounting_and_reuse/proposal.md) caches on an exact prefix.
   Compaction rewrites the middle of the conversation and therefore invalidates
   it. Doing it once at a boundary costs one cache miss and leaves the following
   rounds of that turn hitting a stable prefix. Doing it mid-turn costs a miss for
