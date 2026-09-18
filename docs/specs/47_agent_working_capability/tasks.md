@@ -29,7 +29,7 @@ MIT/Apache-2.0, both on `deny.toml`'s allow-list.
 | Task | State | Notes |
 |---|---|---|
 | 1 · Extract the walk | Done | `tree_walk.rs` with a `WalkEvent` visitor; `ProjectIndexer::walk` deleted and `index_repository` now drives it through `add_file`, which was already factored out so nothing had to move. 1 new test. **Plan correction:** the plan named the skip reason `not_a_regular_file`; the index has always spelled it `not_regular_file` and its tests assert on it. Guarded by the 11 existing index tests, all green. |
-| 2 · Ranged reads | Not started | |
+| 2 · Ranged reads | Done | `LineRange`, `ReadWindow`, and `FileRead.{line_range,total_lines,truncated_by}`; `max_read_lines` (400) added restrict-only with a new `restrict_only_limit` helper and a `parse_read_lines` that refuses 0. 4 new tests; byte cap mutation-tested (disabling it fails `a_few_enormous_lines_…`). **Plan deviation:** the plan's `range: Option<LineRange>` was wrong — `None` would have meant "capped" for `context_manager` too, silently shrinking what every task sees, and its own comment contradicted the code. Replaced with a three-variant `ReadWindow` so each call site states its intent: `Whole` (context assembly, keeps the original `max_file_bytes` refusal), `Default` (the tool, capped), `Range` (also capped, so a large range cannot step around the cap). Also needed `#[allow(clippy::too_many_arguments)]` with a reason. |
 | 3 · `list_directory` | Not started | |
 | 4 · `search_content` | Not started | |
 | 5 · `edit_file` splice | Not started | |
@@ -358,7 +358,7 @@ Suggested subject: `Lift the tree walk out of the indexer so one walker serves b
 - Consumes: nothing from Task 1.
 - Produces: `LineRange { start: usize, end: usize }` (1-based, inclusive); `FileAccessController::read_file(..., range: Option<LineRange>)`; `FileRead` gains `line_range: LineRange`, `total_lines: usize`, `truncated_by: Option<&'static str>` where the value is `"lines"` or `"bytes"`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -466,12 +466,12 @@ fn a_few_enormous_lines_are_cut_by_bytes_and_say_so() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools`
 Expected: FAIL to compile — `read_file` takes six arguments, not seven.
 
-- [ ] **Step 3: Add the config key**
+- [x] **Step 3: Add the config key**
 
 In `config.rs`: add `pub max_read_lines: usize` to `Config` beside
 `max_file_bytes` (`:145`), default `400` in the `Default` impl (`:1320`), the
@@ -502,7 +502,7 @@ fn restrict_only_limit(
 
 Call it from the overlay-apply block beside `agent_max_task_tokens` (`:735`).
 
-- [ ] **Step 4: Change `read_file`**
+- [x] **Step 4: Change `read_file`**
 
 Add to `file_access.rs`:
 
@@ -541,24 +541,24 @@ string it might read as "the file is empty".
 Update the four existing `read_file` call sites to pass `None`. Find them with
 `grep -rn "\.read_file(" crates/`.
 
-- [ ] **Step 5: Run the new tests**
+- [x] **Step 5: Run the new tests**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools`
 Expected: PASS, 5 tests in this file.
 
-- [ ] **Step 6: Mutation-test the byte cap**
+- [x] **Step 6: Mutation-test the byte cap**
 
 Delete the byte-trim loop from Step 4 and re-run. `a_few_enormous_lines_are_cut_by_bytes_and_say_so`
 must fail. Restore it and confirm it passes. A cap that no test can distinguish
 from its absence is not a cap.
 
-- [ ] **Step 7: Targeted tests, fmt and clippy**
+- [x] **Step 7: Targeted tests, fmt and clippy**
 
 Run: `cargo nextest run -p workspace-engine --test agent_tools` — 5 tests, all
 passing. Then `cargo fmt --all -- --check` and
 `cargo clippy --workspace --all-targets --locked -- -D warnings`.
 
-- [ ] **Step 8: Show the change and the gate result, and ask before committing**
+- [x] **Step 8: Show the change and the gate result, and ask before committing**
 
 Suggested subject: `Read a file by line range and bound what a read returns`
 

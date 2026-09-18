@@ -220,6 +220,9 @@ impl ContextManager {
         if files.iter().any(|existing| existing == path) {
             return;
         }
+        // `Whole`, not the tool's bounded window: this function has its own
+        // `token_budget` and `add_text` decides what fits. Capping here would
+        // silently shrink what every task sees. Spec 26 owns the ranged version.
         let Ok(file) = self.file_access.read_file(
             repository_root,
             path,
@@ -227,6 +230,7 @@ impl ContextManager {
             Some(repository_id),
             false,
             allow_outside_root,
+            crate::file_access::ReadWindow::Whole,
         ) else {
             return;
         };

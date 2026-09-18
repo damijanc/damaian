@@ -2038,6 +2038,7 @@ impl ChatOrchestrator {
                         Some(&session.repository_id),
                         false,
                         false,
+                        crate::file_access::ReadWindow::Default,
                     ) {
                         Ok(file_read) => (
                             format!("Content of {}:\n{}", file_read.path, file_read.content),
