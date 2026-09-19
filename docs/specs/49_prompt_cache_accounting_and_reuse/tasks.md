@@ -11,7 +11,7 @@ corrections in [`context.md`](context.md)
 | Task | State | Notes |
 |---|---|---|
 | 1 · `cached_input_tokens` on `TokenUsage` | Done | 3 tests, all failing to compile before the field existed. Six construction sites: `extract_usage`'s measured arm (task 2 fills it), the two `estimated_cost` calls in `chat.rs`, `recovery.rs` and `desktop-shell/src/lib.rs` (all four build a `TokenUsage` from a `TaskUsage`, so task 5 fills them), and `token_accounting.rs`'s `measured` helper. Each carries a comment naming the task that supplies the real value, so a `None` left behind is not mistaken for a decision. |
-| 2 · Parse the split, normalised to a subset | Not started | |
+| 2 · Parse the split, normalised to a subset | Done | 5 tests (the plan's four plus `a_reported_cache_hit_of_zero_is_kept_as_a_measured_zero`, the other side of the silence-is-not-zero rule). Step 3's open question decided as the plan recommended: `extract_usage` now returns a named `ReportedUsage` rather than a fourth tuple element — four fields, two of them `Option`s of different meaning, is past what positional access reads safely. Alias list is exhaustive, not a prefix match: `prompt_tokens_details.cached_tokens` (OpenAI), `prompt_cache_hit_tokens` (DeepSeek), `cached_tokens`, `cache_read_input_tokens`. The miss count is read only to recognise the shape and never added to anything. Invariant mutation-tested: removing `<=` fails `a_cached_count_above_the_input_count_is_dropped_to_none`. |
 | 3 · Capability detection per provider | Not started | |
 | 4 · The cached rate and the upper bound | Not started | |
 | 5 · Per-task aggregation | Not started | |
@@ -127,22 +127,22 @@ hit-plus-miss counts that sum to the total. Both normalise to the subset form
 here, at the parse boundary, so no later layer has to know which provider it is
 reading.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
   - `a_hit_count_beside_a_total_parses_as_a_subset`.
   - `hit_and_miss_counts_that_sum_to_the_total_parse_as_a_subset`.
   - `a_cached_count_above_the_input_count_is_dropped_to_none` — the invariant.
     A provider reporting this is describing something this spec does not
     understand, and a number whose meaning is unknown is worse than no number.
   - `a_usage_object_with_no_cache_field_parses_as_none`.
-- [ ] **Step 2: Run to verify they fail**
-- [ ] **Step 3: Extend `extract_usage`** to return the cached figure. Prefer
+- [x] **Step 2: Run to verify they fail**
+- [x] **Step 3: Extend `extract_usage`** to return the cached figure. Prefer
       widening the return type into a small named struct over a fourth tuple
       element — the tuple is already at three and the call sites read better for
       it. Record in the Progress table if you decide otherwise and why.
-- [ ] **Step 4: Update the call sites** the compiler names.
-- [ ] **Step 5: Mutation-test the invariant** — remove the `<=` check and
+- [x] **Step 4: Update the call sites** the compiler names.
+- [x] **Step 5: Mutation-test the invariant** — remove the `<=` check and
       confirm `a_cached_count_above_the_input_count_is_dropped_to_none` fails.
-- [ ] **Step 6: Scoped checks, then show and ask**
+- [x] **Step 6: Scoped checks, then show and ask**
 
 ## Task 3: Capability detection per provider
 

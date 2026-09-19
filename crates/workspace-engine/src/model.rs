@@ -1251,12 +1251,10 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
         // Before the struct literal moves `content` out of scope.
         let reported = extract_usage(&raw);
         let usage = match reported {
-            Some((input_tokens, output_tokens, _)) => TokenUsage {
-                input_tokens,
-                output_tokens,
-                // `extract_usage` does not read a cache split yet; spec 49's
-                // task 2 adds it at that parse boundary.
-                cached_input_tokens: None,
+            Some(reported) => TokenUsage {
+                input_tokens: reported.input_tokens,
+                output_tokens: reported.output_tokens,
+                cached_input_tokens: reported.cached_input_tokens,
                 source: UsageSource::Measured,
             },
             None => TokenUsage::estimated(
@@ -1283,7 +1281,7 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
             truncated: response_was_truncated(&raw),
             reasoning_content: extract_reasoning_content(&raw),
             usage,
-            reported_cost: reported.and_then(|(_, _, cost)| cost),
+            reported_cost: reported.and_then(|reported| reported.cost),
             usage_reporting_unsupported,
         })
     }
@@ -1410,8 +1408,29 @@ fn api_reasoning_effort<'a>(
     }
 }
 
-/// The provider's own token figures, when it reported any: input, output, and
-/// the cost it charged if it says.
+/// What a provider reported about one call: the figures [`extract_usage`]
+/// found in its `usage` object.
+///
+/// A named struct rather than a tuple because the cache split makes it four
+/// fields, two of which are `Option`s of different meaning, and a call site
+/// reading `.cached_input_tokens` cannot transpose them the way `.2` and `.3`
+/// can.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReportedUsage {
+    /// The total prompt tokens, cached and uncached together.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// The part of `input_tokens` the provider served from its prompt cache,
+    /// normalised to a subset here so no later layer has to know which
+    /// provider it is reading. `None` means this provider reported no split.
+    /// Spec 49 §5.2.
+    pub cached_input_tokens: Option<u64>,
+    /// The cost the provider charged, where it says.
+    pub cost: Option<f64>,
+}
+
+/// The provider's own token figures, when it reported any: input, output, what
+/// it served from cache, and the cost it charged if it says.
 ///
 /// Reads the whole body rather than hooking the incremental reader. Usage
 /// arrives on a final chunk whose `choices` array is empty, which
@@ -1425,7 +1444,7 @@ fn api_reasoning_effort<'a>(
 /// `input_tokens`/`output_tokens` is accepted as an alias, because providers
 /// differ and a missed alias silently downgrades a measured figure to an
 /// estimate.
-pub fn extract_usage(raw: &str) -> Option<(u64, u64, Option<f64>)> {
+pub fn extract_usage(raw: &str) -> Option<ReportedUsage> {
     let mut found = None;
     for payload in usage_payloads(raw) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
@@ -1446,10 +1465,46 @@ pub fn extract_usage(raw: &str) -> Option<(u64, u64, Option<f64>)> {
         // figure with a fabricated zero in it.
         if let (Some(input), Some(output)) = (input, output) {
             let cost = usage.get("cost").and_then(serde_json::Value::as_f64);
-            found = Some((input, output, cost));
+            found = Some(ReportedUsage {
+                input_tokens: input,
+                output_tokens: output,
+                cached_input_tokens: extract_cached_input_tokens(usage, input),
+                cost,
+            });
         }
     }
     found
+}
+
+/// The part of `input_tokens` a provider says it served from its prompt cache,
+/// normalised to a subset. Spec 49 §5.2: providers report in two shapes and
+/// both arrive here, so no later layer has to know which one it is reading.
+///
+/// - A hit count beside the total, as OpenAI's
+///   `prompt_tokens_details.cached_tokens`. Already a subset.
+/// - Hit and miss counts that sum to the total, as DeepSeek's
+///   `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`. The hit count is
+///   the subset; the miss count is already inside `prompt_tokens` and is read
+///   only to recognise the shape, never added to anything.
+///
+/// The alias list is exhaustive on purpose rather than a prefix match: a
+/// wrong guess at what a field means records a number whose meaning is
+/// unknown, which §5.2 ranks as worse than no number. A provider using a name
+/// not listed here reports `None` — "not reported" — and
+/// [`OpenAICompatibleAdapter`] records that it does not report a split.
+fn extract_cached_input_tokens(usage: &serde_json::Value, input_tokens: u64) -> Option<u64> {
+    let cached = usage
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .or_else(|| usage.get("prompt_cache_hit_tokens"))
+        .or_else(|| usage.get("cached_tokens"))
+        .or_else(|| usage.get("cache_read_input_tokens"))
+        .and_then(serde_json::Value::as_u64)?;
+    // The invariant. A cached count above the input count means this provider
+    // is describing something the spec does not model — a total that excludes
+    // the cached part, say — and the honest answer is that we do not know,
+    // not a number we have guessed the meaning of.
+    (cached <= input_tokens).then_some(cached)
 }
 
 /// The JSON payloads of a response body, whether it is an SSE stream or a
@@ -2537,19 +2592,107 @@ mod tests {
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11902,\"completion_tokens\":812}}\n\n",
             "data: [DONE]\n"
         );
-        assert_eq!(extract_usage(raw), Some((11902, 812, None)));
+        assert_eq!(
+            extract_usage(raw),
+            Some(ReportedUsage {
+                input_tokens: 11902,
+                output_tokens: 812,
+                cached_input_tokens: None,
+                cost: None,
+            })
+        );
     }
 
     #[test]
     fn usage_accepts_the_input_output_naming_some_providers_use() {
         let raw = "data: {\"choices\":[],\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}\n";
-        assert_eq!(extract_usage(raw), Some((7, 3, None)));
+        assert_eq!(
+            extract_usage(raw),
+            Some(ReportedUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+                cached_input_tokens: None,
+                cost: None,
+            })
+        );
     }
 
     #[test]
     fn a_reported_cost_is_carried_when_the_provider_sends_one() {
         let raw = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"cost\":0.00031}}\n";
-        assert_eq!(extract_usage(raw), Some((5, 2, Some(0.00031))));
+        assert_eq!(
+            extract_usage(raw),
+            Some(ReportedUsage {
+                input_tokens: 5,
+                output_tokens: 2,
+                cached_input_tokens: None,
+                cost: Some(0.00031),
+            })
+        );
+    }
+
+    #[test]
+    fn a_hit_count_beside_a_total_parses_as_a_subset() {
+        // OpenAI's shape: `prompt_tokens` is already the total and
+        // `prompt_tokens_details.cached_tokens` is how much of it hit.
+        let raw = concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":50,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":768}}}\n"
+        );
+        let usage = extract_usage(raw).expect("usage parses");
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.cached_input_tokens, Some(768));
+    }
+
+    #[test]
+    fn hit_and_miss_counts_that_sum_to_the_total_parse_as_a_subset() {
+        // DeepSeek's shape: hit and miss are reported separately and sum to
+        // `prompt_tokens`. Only the hit count is the subset; the miss count is
+        // already inside the total and must not be added to anything.
+        let raw = concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":50,",
+            "\"prompt_cache_hit_tokens\":768,\"prompt_cache_miss_tokens\":232}}\n"
+        );
+        let usage = extract_usage(raw).expect("usage parses");
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.cached_input_tokens, Some(768));
+    }
+
+    #[test]
+    fn a_cached_count_above_the_input_count_is_dropped_to_none() {
+        // The invariant. A provider reporting more cached tokens than input
+        // tokens is describing something this spec does not understand, and a
+        // number whose meaning is unknown is worse than no number. The input
+        // and output figures still stand — only the cache claim is dropped.
+        let raw = concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":140}}}\n"
+        );
+        let usage = extract_usage(raw).expect("usage parses");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cached_input_tokens, None);
+    }
+
+    #[test]
+    fn a_usage_object_with_no_cache_field_parses_as_none() {
+        // Silence is not zero: this provider did not say, which is distinct
+        // from saying that nothing hit.
+        let raw = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11902,\"completion_tokens\":812}}\n";
+        let usage = extract_usage(raw).expect("usage parses");
+        assert_eq!(usage.cached_input_tokens, None);
+    }
+
+    #[test]
+    fn a_reported_cache_hit_of_zero_is_kept_as_a_measured_zero() {
+        // The other side of the same distinction: this provider reported a
+        // split and none of it hit. Recording that as `None` would lose a
+        // measurement.
+        let raw = concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":50,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n"
+        );
+        let usage = extract_usage(raw).expect("usage parses");
+        assert_eq!(usage.cached_input_tokens, Some(0));
     }
 
     #[test]
