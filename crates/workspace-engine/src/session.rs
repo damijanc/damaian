@@ -290,6 +290,23 @@ pub struct TaskUsage {
     /// would understate the bill while looking authoritative.
     pub reported_cost: Option<f64>,
     pub run_count: u32,
+    /// Cached input tokens summed over the runs whose provider reported a
+    /// split. `None` when no run did — never `Some(0)`, which would render as
+    /// "caching is broken" when the truth is "we cannot see it".
+    /// Spec 49 §5.6.
+    pub cached_input_tokens: Option<u64>,
+    /// The input tokens of those same runs, and therefore the denominator
+    /// [`Self::cached_input_tokens`] is a rate *of*.
+    ///
+    /// Carried rather than reusing [`Self::input_tokens`] because a task can
+    /// mix runs that reported a split with runs that did not: dividing a
+    /// partial numerator by the whole task's input would silently dilute the
+    /// rate with runs nobody can see into. The same failure #19's
+    /// `reported_cost` rule guards against, one field over.
+    pub cache_reported_input_tokens: u64,
+    /// How many contributing runs reported no split, so a surface can say what
+    /// the rate covers rather than implying it covers everything.
+    pub runs_without_cache_report: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -782,16 +799,26 @@ impl SessionStore {
             Some(reason) => format!(",\"reason\":\"{}\"", escape_json(reason)),
             None => String::new(),
         };
+        // Omitted entirely when the provider reported no split, rather than
+        // written as a zero. The reader defaults a missing key to "not
+        // reported", so an event written today by a provider that says nothing
+        // is indistinguishable from one written before the field existed —
+        // which is correct, because both mean the same thing. Spec 49 §5.2.
+        let cached = match usage.cached_input_tokens {
+            Some(cached) => format!(",\"cachedInputTokens\":{cached}"),
+            None => String::new(),
+        };
         self.append_session_event(
             session_id,
             "task_usage_recorded",
             &format!(
-                "{{\"taskId\":\"{}\",\"runId\":\"{}\"{},\"inputTokens\":{},\"outputTokens\":{},\"source\":\"{}\",\"reportedCost\":{}{}}}",
+                "{{\"taskId\":\"{}\",\"runId\":\"{}\"{},\"inputTokens\":{},\"outputTokens\":{}{},\"source\":\"{}\",\"reportedCost\":{}{}}}",
                 escape_json(task_id),
                 escape_json(run_id),
                 marker,
                 usage.input_tokens,
                 usage.output_tokens,
+                cached,
                 usage.source.as_str(),
                 cost,
                 reason
@@ -843,6 +870,14 @@ impl SessionStore {
                 .payload
                 .get("reportedCost")
                 .and_then(|value| value.as_f64());
+            // Absent means the provider reported no split. Spec 49's rule that
+            // silence is not zero, at the read boundary: an event written
+            // before the field existed and one written today by a provider
+            // that says nothing are the same fact and read the same way.
+            let cached = event
+                .payload
+                .get("cachedInputTokens")
+                .and_then(|value| value.as_u64());
 
             let costed = every_run_costed.entry(task_id.clone()).or_insert(true);
             *costed = *costed && cost.is_some();
@@ -853,10 +888,21 @@ impl SessionStore {
                 source: UsageSource::Measured,
                 reported_cost: None,
                 run_count: 0,
+                cached_input_tokens: None,
+                cache_reported_input_tokens: 0,
+                runs_without_cache_report: 0,
             });
             total.input_tokens += input;
             total.output_tokens += output;
             total.run_count += 1;
+            match cached {
+                Some(cached) => {
+                    total.cached_input_tokens =
+                        Some(total.cached_input_tokens.unwrap_or(0) + cached);
+                    total.cache_reported_input_tokens += input;
+                }
+                None => total.runs_without_cache_report += 1,
+            }
             if source == UsageSource::Estimated {
                 total.source = UsageSource::Estimated;
             }

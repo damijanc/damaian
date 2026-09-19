@@ -2640,9 +2640,7 @@ impl ChatOrchestrator {
             self.config.estimated_cost(&TokenUsage {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
-                // `TaskUsage` carries no cached total yet; spec 49's task 5
-                // adds it and this reads it.
-                cached_input_tokens: None,
+                cached_input_tokens: usage.cached_input_tokens,
                 source: usage.source,
             })
         });
@@ -2714,9 +2712,7 @@ impl ChatOrchestrator {
             self.config.estimated_cost(&TokenUsage {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
-                // `TaskUsage` carries no cached total yet; spec 49's task 5
-                // adds it and this reads it.
-                cached_input_tokens: None,
+                cached_input_tokens: usage.cached_input_tokens,
                 source: usage.source,
             })
         });

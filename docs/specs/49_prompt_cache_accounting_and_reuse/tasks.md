@@ -14,7 +14,7 @@ corrections in [`context.md`](context.md)
 | 2 · Parse the split, normalised to a subset | Done | 5 tests (the plan's four plus `a_reported_cache_hit_of_zero_is_kept_as_a_measured_zero`, the other side of the silence-is-not-zero rule). Step 3's open question decided as the plan recommended: `extract_usage` now returns a named `ReportedUsage` rather than a fourth tuple element — four fields, two of them `Option`s of different meaning, is past what positional access reads safely. Alias list is exhaustive, not a prefix match: `prompt_tokens_details.cached_tokens` (OpenAI), `prompt_cache_hit_tokens` (DeepSeek), `cached_tokens`, `cache_read_input_tokens`. The miss count is read only to recognise the shape and never added to anything. Invariant mutation-tested: removing `<=` fails `a_cached_count_above_the_input_count_is_dropped_to_none`. |
 | 3 · Capability detection per provider | Done | 4 tests. `reports_cache_split: Option<bool>` on `OpenAICompatibleAdapter`, set from the same place as `supports_usage`. Two deliberate differences from that field, both recorded in doc comments: it needs **no probe** (a split either is or is not in a usage object already parsed, whereas asking for usage is what a provider rejects), and the accessor returns `Option<bool>` rather than collapsing to a default — `probe_supports_usage` must answer before it knows because it gates an outgoing field, this one only describes what was seen. Made **monotone** (`true` sticks) after noticing an unqualified assignment lets a provider that omits the field on one call flip the surface from a hit rate to "not reported" and back. Not generalised into a shared type: the existing mechanism *is* `Option<bool>` plus a reader, and the two want opposite defaults. Both guards falsified — dropping the monotone term fails the later-call test, and keying on `self.provider.contains("deepseek")` fails the no-split test, which is why that test's provider is named `deepseek`. |
 | 4 · The cached rate and the upper bound | Done | 6 tests (the plan's five plus `a_reported_cache_miss_is_not_an_upper_bound`). **Return shape decided:** `Option<CostEstimate>`, a struct with private fields, `amount()`/`is_upper_bound()`, no `Deref`, no `From<CostEstimate> for f64` and no public constructor taking a bare number — so reaching the figure means naming the method, and a reviewer can see every place that does. The label is enforced structurally at the one funnel: `task_usage_json` takes the whole `CostEstimate`, and all three shell call sites already went through it. `ChatTurnResult.estimated_cost` changed type with it. **Trust boundary confirmed, not assumed:** a `model_provider.<id>` entry from repository scope is rejected whole (`config.rs`), so the new key inherits Forbidden; pinned anyway in `repository_config_cannot_change_usage_reporting_or_prices`, because the class is per entry rather than per field. `push_model_provider_overlay`'s exhaustive destructuring caught the new key and forced the save path — the guard working as its comment says it should. Both guards falsified: collapsing `None` into `Some(0)` fails two tests, and returning `exact` instead of `upper_bound` fails the bound test. |
-| 5 · Per-task aggregation | Not started | |
+| 5 · Per-task aggregation | Done | 5 tests. `TaskUsage` gains three fields, not one: `cached_input_tokens` (sum over reporting runs, `None` when none did), `cache_reported_input_tokens` (**the denominator those runs are a rate of**) and `runs_without_cache_report`. The mixed case is why the denominator is separate — dividing a partial numerator by the whole task's input dilutes the rate with runs nobody can see into. The writer **omits** `cachedInputTokens` rather than writing a zero, so an event written today by a silent provider is byte-identical to a pre-field one; both are the same fact. Also wired the four `TaskUsage`→`TokenUsage` sites left as `None` in task 1, so the upper-bound label now propagates to a task's cost with no extra machinery. **Mutation found a fake test:** `one_run_without_a_split_does_not_erase_the_others` originally recorded the cache-reporting run first, where the buggy `= total.input_tokens` coincides with the right answer, so it passed against a broken implementation. Reordered so the non-reporting run comes first (1000 against 6000); the mutation now fails it. |
 | 6 · Surfaces: shell and web UI | Not started | |
 | 7 · The `cache_hit_rate` harness metric | Not started | |
 | 8 · Prefix-stability guards | Not started | |
@@ -196,7 +196,7 @@ exact figure. Task 6 still owns rendering it.
 
 **Requirements:** 2, 8. **Files:** `session.rs`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
   - `a_tasks_cached_tokens_are_the_sum_of_its_runs`.
   - `a_task_whose_runs_never_reported_a_split_reports_not_reported` — the total
     is `None`, never `Some(0)`.
@@ -207,9 +207,9 @@ exact figure. Task 6 still owns rendering it.
     already guards against.
   - `a_tasks_cost_is_an_upper_bound_when_any_run_was` — the label propagates on
     the same "weakest term" principle as `UsageSource`.
-- [ ] **Step 2: Run to verify they fail**
-- [ ] **Step 3: Extend `TaskUsage` and `read_task_usage`**
-- [ ] **Step 4: Scoped checks, then show and ask**
+- [x] **Step 2: Run to verify they fail**
+- [x] **Step 3: Extend `TaskUsage` and `read_task_usage`**
+- [x] **Step 4: Scoped checks, then show and ask**
 
 ## Task 6: Surfaces — shell and web UI
 

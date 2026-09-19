@@ -74,6 +74,190 @@ fn measured(input: u64, output: u64) -> TokenUsage {
     }
 }
 
+/// A measured run from a provider that *does* report a cache split.
+fn measured_with_cache(input: u64, output: u64, cached: u64) -> TokenUsage {
+    TokenUsage {
+        cached_input_tokens: Some(cached),
+        ..measured(input, output)
+    }
+}
+
+/// Spec 49 task 5: the cache figures aggregate through the same
+/// `read_task_usage` that owns every other per-task total.
+mod cached_tokens {
+    use super::*;
+
+    #[test]
+    fn a_tasks_cached_tokens_are_the_sum_of_its_runs() {
+        let fixture = fixture("cached-sum");
+        for (run, input, cached) in [("modelrun_1", 1000, 800), ("modelrun_2", 2000, 1500)] {
+            fixture
+                .store
+                .record_task_usage(
+                    &fixture.task,
+                    run,
+                    None,
+                    measured_with_cache(input, 10, cached),
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+
+        let usage = fixture
+            .store
+            .read_task_usage(&fixture.task.session_id)
+            .unwrap();
+        let total = usage.get(&fixture.task.id).expect("usage");
+
+        assert_eq!(total.cached_input_tokens, Some(2300));
+        assert_eq!(total.cache_reported_input_tokens, 3000);
+        assert_eq!(total.runs_without_cache_report, 0);
+
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn a_task_whose_runs_never_reported_a_split_reports_not_reported() {
+        // `None`, never `Some(0)`. A zero here renders as "caching is broken"
+        // when the truth is "we cannot see it".
+        let fixture = fixture("cached-none");
+        fixture
+            .store
+            .record_task_usage(
+                &fixture.task,
+                "modelrun_1",
+                None,
+                measured(100, 10),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let usage = fixture
+            .store
+            .read_task_usage(&fixture.task.session_id)
+            .unwrap();
+        let total = usage.get(&fixture.task.id).expect("usage");
+
+        assert_eq!(total.cached_input_tokens, None);
+        assert_eq!(total.cache_reported_input_tokens, 0);
+        assert_eq!(total.runs_without_cache_report, 1);
+
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn one_run_without_a_split_does_not_erase_the_others() {
+        // The mixed case. The sum is over the runs that reported, and the
+        // denominator is those same runs' input tokens — not the task's, which
+        // would silently dilute the rate with runs nobody can see into. A
+        // partial sum over a whole-task denominator is the failure #19's
+        // `reported_cost` rule already guards against.
+        //
+        // The **non-reporting run is recorded first on purpose.** With the
+        // reporting run first, a buggy `cache_reported_input_tokens =
+        // total.input_tokens` coincides with the right answer at the moment it
+        // runs, and this test passes while guarding nothing — which is exactly
+        // what it did when first written, found by mutating the
+        // implementation. In this order the two differ, 1000 against 6000.
+        let fixture = fixture("cached-mixed");
+        fixture
+            .store
+            .record_task_usage(
+                &fixture.task,
+                "modelrun_1",
+                None,
+                measured(5000, 10),
+                None,
+                None,
+            )
+            .unwrap();
+        fixture
+            .store
+            .record_task_usage(
+                &fixture.task,
+                "modelrun_2",
+                None,
+                measured_with_cache(1000, 10, 800),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let usage = fixture
+            .store
+            .read_task_usage(&fixture.task.session_id)
+            .unwrap();
+        let total = usage.get(&fixture.task.id).expect("usage");
+
+        assert_eq!(total.input_tokens, 6000);
+        assert_eq!(total.cached_input_tokens, Some(800));
+        assert_eq!(
+            total.cache_reported_input_tokens, 1000,
+            "the rate's denominator is the reporting runs, not the task"
+        );
+        assert_eq!(total.runs_without_cache_report, 1);
+
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn a_reported_zero_is_kept_apart_from_silence() {
+        let fixture = fixture("cached-zero");
+        fixture
+            .store
+            .record_task_usage(
+                &fixture.task,
+                "modelrun_1",
+                None,
+                measured_with_cache(1000, 10, 0),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let usage = fixture
+            .store
+            .read_task_usage(&fixture.task.session_id)
+            .unwrap();
+        let total = usage.get(&fixture.task.id).expect("usage");
+
+        assert_eq!(total.cached_input_tokens, Some(0));
+        assert_eq!(total.runs_without_cache_report, 0);
+
+        fixture.cleanup();
+    }
+
+    #[test]
+    fn an_event_written_before_the_field_existed_counts_as_not_reported() {
+        // The migration case at the aggregation layer. An old log has no
+        // `cachedInputTokens`, and that must read as silence rather than as a
+        // measured zero. Written as raw JSON because the writer can no longer
+        // produce an event without the field.
+        let fixture = fixture("cached-legacy");
+        fixture
+            .store
+            .record_task_usage(
+                &fixture.task,
+                "modelrun_1",
+                None,
+                measured(100, 10),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let log = fixture.session_log();
+        assert!(
+            !log.contains("\"cachedInputTokens\":0"),
+            "a run that reported no split must not write a zero: {log}"
+        );
+
+        fixture.cleanup();
+    }
+}
+
 #[test]
 fn a_tasks_usage_is_the_sum_of_its_runs() {
     let fixture = fixture("sum");
