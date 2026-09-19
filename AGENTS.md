@@ -37,6 +37,12 @@ spec carries a `Status:` line. Read the relevant spec before changing behaviour
 it covers, and update the spec when you change the design — not just the code.
 `docs/specs/README.md` lists them in implementation order.
 
+**Before picking the next spec to build, read that file's "What to build next"
+section.** Most unstarted specs are blocked by another spec's `Depends on:`
+line, two of them unblock most of the rest, and whether two specs can be built
+at the same time is decided by one file-level constraint rather than by the
+dependency graph. It also says which specs may never be built concurrently.
+
 **A spec is summarised in four places, and they move together.** Its own
 `Status:` line, its row in `docs/specs/README.md`, and — for a folder spec — the
 progress table in its `tasks.md` and that file's `**Started:** … — **Done:** …`

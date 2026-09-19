@@ -3,7 +3,9 @@
 Status: Done
 Source: gap analysis against `ai_coding_assistant_specification.md` and `ai_coding_assistant_must_have.md`, and a review of the current implementation (2026-07-17).
 
-These specs describe features that close gaps between the product specification and the current state of the codebase. They are meant to be implemented one at a time, in the order listed. Each spec is self-contained: motivation, current state (with file references), requirements, non-goals, design, and acceptance criteria.
+These specs describe features that close gaps between the product specification and the current state of the codebase. Each spec is self-contained: motivation, current state (with file references), requirements, non-goals, design, and acceptance criteria.
+
+They were meant to be implemented one at a time, in the order listed. That still holds by default, but **[What to build next](#what-to-build-next-and-what-may-run-in-parallel) is the section to read before picking one** — it records which specs are actually unblocked, which two keystones the rest of the directory waits on, and the one file-level constraint that decides whether two specs can be built at the same time.
 
 Specs 1–6 came from the original gap analysis. Later entries are added as
 design changes come up; #7 came from a reported bug rather than the analysis,
@@ -65,7 +67,89 @@ directory was renamed from `ROADMAP` to `PLAN` because it was never a roadmap:
 | `docs/PLAN/` | no | The delivery plan: phases, work packages, dashboard, and `OBSERVATIONS.md`, the inbox for things noticed but not yet decided |
 | This directory | yes | What was decided and built |
 
+## What to build next, and what may run in parallel
+
+Derived on 2026-09-19 from the `Depends on:` line of every unstarted spec (see
+[Every spec names its prerequisites](#every-spec-names-its-prerequisites)),
+which is the source of truth — this section is a reading of those lines, not a
+second opinion. Re-derive it rather than trusting it if the table below disagrees with
+a spec's own header.
+
+**Only four specs have every dependency built:** [#20](20_working_modes.md),
+[#49](49_prompt_cache_accounting_and_reuse/proposal.md) (in progress),
+[#56](56_provider_fallback_consent.md), and [#38](38_subagent_model.md) (which
+depends on nothing here, but is explicitly speculative — its own §1 allows
+abandoning it). Everything else is transitively blocked, and the graph is
+unusually linear:
+
+```
+#20 working modes ──> #22 findings ──> #23 verification, #32 hooks, #35 commit prep
+                 │                └──> #24 repo map ──> #25 symbols
+                 │                                 └──> #26 context assembly
+                 ├──> #31 profiles ──> #52 MCP server mode
+                 ├──> #33 MCP mgmt  ──┘
+                 └──> #50 clarification, #51 fetch
+
+#26 context assembly ──> #27 inspector ──> #28 ──> #29 ──> #30  (memory, serial)
+                    ├──> #54 image input, #55 compaction, #51 fetch
+                    └──> #49's reuse slice
+```
+
+**#20 and #26 are the keystones.** Thirteen specs sit downstream of #20 and it
+is ready now; the whole tail waits on #26. Preferring a spec that unblocks
+nothing over one of these costs more than it looks like it does.
+
+| | Build | Why here |
+|---|---|---|
+| 1 | #49's accounting slice | Planned, in flight, and it corrects a figure that is wrong today |
+| 2 | **#20 working modes** | The keystone: unblocks 13 specs, ready now |
+| 3 | **#22 findings** | Second keystone; also closes #21's deferred `Evidence::Findings` |
+| 4 | #24 → #26 | #26 is the real unlock; #25 follows #24 |
+| 5 | #55 compaction | Also unblocks #49's reuse slice, which is why that slice waits |
+| 6 | #27, #54, #51, #23 | The fan-out once #26 has landed |
+| 7 | #28 → #29 → #30 | Memory, strictly serial |
+| 8 | #35 → #36/#37; #31/#33 → #52; #32 | Delivery and extensibility clusters |
+| 9 | #38/#39/#40 | Last, and #40 may legitimately conclude "do not" |
+
+[#56](56_provider_fallback_consent.md) is the opportunistic one: small, ready,
+and it closes the half of #48 that shipped as only a negative guarantee.
+
+### Parallel work
+
+Two specs may be built at once, which is a **deliberate exception to the
+one-at-a-time rule above**, under one constraint that comes from this
+repository's own history: [#47](47_agent_working_capability/context.md) was
+deferred behind #17 because both edit `chat.rs`, and its line numbers drifted
+twice in a single session while #17 was in flight. The binding constraint is not
+the dependency graph, it is that file.
+
+- **Safe together:** a spec that touches `chat.rs` and one that does not. #49's
+  accounting slice states outright that it changes no request and touches
+  `model.rs`, `config.rs`, `session.rs`, `app.js` and the harness — so it pairs
+  with #20, which lives in `chat.rs` and the UI.
+- **Not together:** #20 and #56 — both touch approval and resume in `chat.rs`.
+- **Never together:** #26, #55 and #49's reuse slice. All three rewrite
+  `build_model_prompt` and the assembly around it; that shared function is why
+  #49's second slice is blocked in the first place. #54 and #55 also both
+  restructure the message array.
+- **Genuinely independent once #26 lands:** #27, #51 and #23.
+
+Running two tracks: give each worktree its own `CARGO_TARGET_DIR` (a shared one
+thrashes), agree up front which track owns `chat.rs` so the other rebases, and
+expect the quality gate rather than the work to be the bottleneck — clippy is
+about 18 minutes cold and the suite about 5, so two gates running at once on one
+machine contend for the same cores.
+
+**Keeping this honest:** when a spec becomes Done, move it out of the ready set
+and promote whatever its `Depends on:` line was blocking. If that upkeep lapses,
+re-derive from the `Depends on:` lines — the cost is one pass over the unstarted
+specs, which is how this section was produced.
+
 ## Implementation order
+
+Per-spec rationale, in spec-number order. For *what to build next*, read the
+section above — this table records why each spec sits where it does, not which
+is ready.
 
 | # | Spec | Why this order |
 |---|------|-----------------|
