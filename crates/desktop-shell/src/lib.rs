@@ -3177,6 +3177,9 @@ fn task_states_json(
                     let estimated_cost = config.estimated_cost(&TokenUsage {
                         input_tokens: total.input_tokens,
                         output_tokens: total.output_tokens,
+                        // `TaskUsage` carries no cached total yet; spec 49's
+                        // task 5 adds it and this reads it.
+                        cached_input_tokens: None,
                         source: total.source,
                     });
                     let body = task_usage_json(Some(total), estimated_cost);

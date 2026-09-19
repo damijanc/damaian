@@ -198,24 +198,42 @@ impl UsageSource {
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// How many of `input_tokens` the provider served from its prompt cache.
+    /// A subset of `input_tokens`, never additional to it.
+    ///
+    /// `None` means the provider did not report a cache split — not that
+    /// nothing was cached. `Some(0)` means it reported a split and none hit.
+    /// Collapsing the two would turn silence into a measured zero, which is
+    /// the error spec 19 exists to prevent. Spec 49 §5.2.
+    ///
+    /// `#[serde(default)]` so every event written before this field existed
+    /// reads back as `None` — correct, since those calls predate any cache
+    /// measurement — and no session log is rewritten.
+    #[serde(default)]
+    pub cached_input_tokens: Option<u64>,
     pub source: UsageSource,
 }
 
 impl TokenUsage {
     /// The only zero that is a fact rather than a guess: no request was sent,
-    /// so nothing was billed.
+    /// so nothing was billed — and, for the same reason, nothing was cached.
     pub fn measured_zero() -> Self {
         Self {
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: Some(0),
             source: UsageSource::Measured,
         }
     }
 
+    /// Always `cached_input_tokens: None`. Spec 49 requirement 3: there is no
+    /// way to estimate a cache hit from payload size, and inventing one would
+    /// be spec 19's cardinal error in a new place.
     pub fn estimated(input_tokens: u64, output_tokens: u64) -> Self {
         Self {
             input_tokens,
             output_tokens,
+            cached_input_tokens: None,
             source: UsageSource::Estimated,
         }
     }
@@ -1236,6 +1254,9 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
             Some((input_tokens, output_tokens, _)) => TokenUsage {
                 input_tokens,
                 output_tokens,
+                // `extract_usage` does not read a cache split yet; spec 49's
+                // task 2 adds it at that parse boundary.
+                cached_input_tokens: None,
                 source: UsageSource::Measured,
             },
             None => TokenUsage::estimated(
@@ -2479,6 +2500,34 @@ mod tests {
 
         assert!(format!("{error}").contains("Insufficient balance"));
         assert_eq!(adapter.transport.requests.len(), 1);
+    }
+
+    #[test]
+    fn an_estimated_usage_never_claims_a_cache_hit() {
+        // Spec 49 requirement 3: there is no estimated cache hit. Payload size
+        // says nothing about what a provider served from its cache, and a
+        // number invented here would wear the same label as a measured one.
+        assert_eq!(TokenUsage::estimated(120, 40).cached_input_tokens, None);
+    }
+
+    #[test]
+    fn a_measured_zero_reports_a_cached_zero() {
+        // The one zero that is a fact: no request was sent, so "nothing was
+        // cached" is as true as "nothing was billed". Distinct from `None`,
+        // which means the provider did not say.
+        assert_eq!(TokenUsage::measured_zero().cached_input_tokens, Some(0));
+    }
+
+    #[test]
+    fn a_usage_event_written_before_this_field_reads_back_as_none() {
+        // Spec 49 §5.2's migration criterion. Every `task_usage_recorded`
+        // event already in a session log predates cache measurement, so it
+        // must read back as "not reported" rather than as a measured zero —
+        // and no log is rewritten to achieve that.
+        let stored = r#"{"inputTokens":11902,"outputTokens":812,"source":"measured"}"#;
+        let usage: TokenUsage = serde_json::from_str(stored).expect("legacy usage parses");
+        assert_eq!(usage.input_tokens, 11902);
+        assert_eq!(usage.cached_input_tokens, None);
     }
 
     #[test]

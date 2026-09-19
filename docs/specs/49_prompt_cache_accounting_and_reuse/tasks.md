@@ -4,13 +4,13 @@
 
 **Implements:** [`proposal.md`](proposal.md) §5.1's first slice · background and
 corrections in [`context.md`](context.md)
-**Started:** not started — **Done:** —
+**Started:** 2026-09-19 — **Done:** —
 
 ## Progress
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · `cached_input_tokens` on `TokenUsage` | Not started | |
+| 1 · `cached_input_tokens` on `TokenUsage` | Done | 3 tests, all failing to compile before the field existed. Six construction sites: `extract_usage`'s measured arm (task 2 fills it), the two `estimated_cost` calls in `chat.rs`, `recovery.rs` and `desktop-shell/src/lib.rs` (all four build a `TokenUsage` from a `TaskUsage`, so task 5 fills them), and `token_accounting.rs`'s `measured` helper. Each carries a comment naming the task that supplies the real value, so a `None` left behind is not mistaken for a decision. |
 | 2 · Parse the split, normalised to a subset | Not started | |
 | 3 · Capability detection per provider | Not started | |
 | 4 · The cached rate and the upper bound | Not started | |
@@ -101,7 +101,7 @@ Read before starting; each is load-bearing for a task below.
 
 **Requirements:** 1, 3. **Files:** `model.rs`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
   - `an_estimated_usage_never_claims_a_cache_hit` — `TokenUsage::estimated(..)`
     has `cached_input_tokens: None`.
   - `a_measured_zero_reports_a_cached_zero` — `measured_zero()` is `Some(0)`,
@@ -109,14 +109,14 @@ Read before starting; each is load-bearing for a task below.
   - `a_usage_event_written_before_this_field_reads_back_as_none` — deserialize a
     `task_usage_recorded` payload with no cache field and assert `None`, not
     `Some(0)`. This is the migration criterion; write it now, not in Task 5.
-- [ ] **Step 2: Run them and confirm they fail to compile or assert**
-- [ ] **Step 3: Add the field** with `#[serde(default)]` and the doc comment
+- [x] **Step 2: Run them and confirm they fail to compile or assert**
+- [x] **Step 3: Add the field** with `#[serde(default)]` and the doc comment
       from [`proposal.md`](proposal.md) §5.2 — the one that says what `None`
       means, because that distinction is the whole point of the `Option`.
-- [ ] **Step 4: Fix the construction sites** the compiler names.
-- [ ] **Step 5: Scoped checks** — `cargo nextest run -p workspace-engine -E
+- [x] **Step 4: Fix the construction sites** the compiler names.
+- [x] **Step 5: Scoped checks** — `cargo nextest run -p workspace-engine -E
       'test(usage)'`, `cargo fmt`, `cargo clippy -p workspace-engine`.
-- [ ] **Step 6: Show the change and the check result, and ask before committing**
+- [x] **Step 6: Show the change and the check result, and ask before committing**
 
 ## Task 2: Parse the split, normalised to a subset
 

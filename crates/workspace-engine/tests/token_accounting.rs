@@ -67,6 +67,9 @@ fn measured(input: u64, output: u64) -> TokenUsage {
     TokenUsage {
         input_tokens: input,
         output_tokens: output,
+        // A measured run from a provider that reports no cache split: not
+        // reported, which is distinct from reported-and-zero.
+        cached_input_tokens: None,
         source: UsageSource::Measured,
     }
 }

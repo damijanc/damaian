@@ -207,6 +207,7 @@ fn export_markdown_redacts_with_a_count_and_includes_tasks_and_plans() {
             TokenUsage {
                 input_tokens: 10,
                 output_tokens: 20,
+                cached_input_tokens: None,
                 source: UsageSource::Measured,
             },
             Some(0.001),
