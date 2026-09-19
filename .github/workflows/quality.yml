@@ -50,6 +50,14 @@ jobs:
       - name: Lint web assets
         run: npm run lint:web
 
+      # Advisory: reports a spec marked Done while another still calls it
+      # **not built**, which is what makes docs/specs/README.md's "What to build
+      # next" wrong. It exits 0 and annotates, so it never fails this job — a
+      # documentation inconsistency should not stop a build. `--strict` is the
+      # switch if that changes.
+      - name: Check spec dependency status (advisory)
+        run: npm run specs:check
+
       - name: Check for typos
         uses: crate-ci/typos@v1.49.0
 

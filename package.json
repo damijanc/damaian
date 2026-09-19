@@ -8,6 +8,7 @@
   "scripts": {
     "lint:web": "biome check",
     "lint:web:fix": "biome check --write",
+    "specs:check": "node scripts/check-spec-status.mjs",
     "changelog:update": "node scripts/update-changelog.mjs",
     "changelog:check": "node scripts/update-changelog.mjs --check",
     "updater:enable-artifacts": "node scripts/enable-updater-artifacts.mjs",

@@ -279,6 +279,25 @@ the part of it that can be checked locally without pushing a tag.
 
 ## 7. Implementation notes
 
+**2026-09-19 — an advisory check, `npm run specs:check`.** `quality.lint` now
+runs `scripts/check-spec-status.mjs`, which reports a spec's `Depends on:` line
+disagreeing with the depended-on spec's own `Status:` line, in either direction.
+It exists because [`README.md`](README.md)'s "What to build next" is *derived*
+from those lines, so one stale line makes the directory's own sequencing advice
+wrong, and re-deriving it cannot repair the source it reads. The failure has
+occurred twice and neither occurrence was caught by review — see `AGENTS.md`,
+"Finishing a spec goes further than those four".
+
+**It warns and exits 0, so the gate is still the seven blocking checks.** The
+trade was considered and refused: a documentation inconsistency that stops a
+build stops the person who just finished the spec, which is precisely the moment
+you want someone marking things Done rather than avoiding it. Under GitHub
+Actions each finding becomes a `::warning` annotation with a file and line, so
+the report is visible on the run and the pull request without gating it.
+`--strict` exits 1 and is the switch if that trade ever changes — a flag rather
+than an edit, so flipping it is a decision and not a rewrite. Node built-ins
+only, so it needs no `npm ci`.
+
 **2026-09-16 — the test step became `cargo nextest run`.** `quality.rust` now
 runs `cargo nextest run --workspace --locked --final-status-level slow`, with
 `cargo-nextest` installed by a pinned `taiki-e/install-action`. The gate is

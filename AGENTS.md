@@ -50,14 +50,38 @@ header. When you change what a spec says or what is true of it, update all four
 in the same change. Leaving one behind is the easiest way to make this directory
 lie.
 
+**Finishing a spec goes further than those four.** A spec that becomes Done
+changes what is true of *other* documents, and none of them notice on their own.
+Do all of this in the same change that marks it Done:
+
+1. **Flip every `Depends on:` line that names it "not built".** Find them with
+   `grep -rn "<spec-file-or-folder>" docs/specs/*.md docs/specs/*/*.md`. This is
+   the one that matters most, because `docs/specs/README.md`'s
+   "What to build next" is *derived* from those lines: a spec that is Done but
+   still marked **not built** somewhere leaves its dependants looking blocked,
+   and re-deriving that section does not repair it — the source it reads is what
+   is wrong.
+2. **Promote what it unblocked** in "What to build next": move it out of the
+   ready set, and move anything whose last unbuilt dependency it was into it.
+3. **Remove its entry from `CHANGELOG.md`'s `Unreleased` section.** That section
+   is by its own definition work that is *specified but not built*, so a shipped
+   feature still listed there states the opposite of the truth. Do not add a
+   release row by hand — the release pipeline writes those.
+4. **Update `docs/USER_GUIDE.md` and `docs/TROUBLESHOOTING.md`** if the spec
+   changed anything a user sees or can misread. A capability nobody is told
+   about is a capability nobody uses.
+
 The reason is measured, not theoretical. On 2026-09-15 three such summaries were
 found asserting the **opposite** of what their own specs recorded: the index
 still said the eval harness's live tier was "not yet verified against a real
 provider" and that "no provider has been tested for usage reporting", five days
-after both had been done and written up in those specs' §7. The proposals were
-correct the whole time; only the summaries around them were not. The index is
-where a reader starts, so a stale row is not a cosmetic problem — it is work
-someone repeats.
+after both had been done and written up in those specs' §7. On 2026-09-18 the
+same failure turned up one document over: #53 had shipped search and export, and
+`CHANGELOG.md` still listed "Search across past sessions and export one as a
+document" under `Unreleased`, the section reserved for work that is *not* built.
+Every time, the spec itself was correct and only the documents around it were
+not. The index is where a reader starts, so a stale row is not a cosmetic
+problem — it is work someone repeats.
 
 ### Closing out a task in a folder spec
 
@@ -164,6 +188,21 @@ npm run lint:web
 typos
 cargo deny check
 ```
+
+**One further check is advisory and does not gate anything:**
+
+```sh
+npm run specs:check
+```
+
+It reports a spec's `Depends on:` line disagreeing with that spec's own
+`Status:` line, in either direction, and **exits 0 either way** — CI runs it and
+surfaces each finding as a warning annotation. It is advisory on purpose: the
+person a blocked build would stop is usually the one who just finished the
+spec, and a gate that punishes marking something Done teaches people not to.
+Read its output when you finish a spec; `npm run specs:check -- --strict` exits
+1 if you want it to fail for you, and is the switch if this ever needs to
+become blocking.
 
 Notes:
 

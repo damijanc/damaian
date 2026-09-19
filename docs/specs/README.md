@@ -141,9 +141,12 @@ about 18 minutes cold and the suite about 5, so two gates running at once on one
 machine contend for the same cores.
 
 **Keeping this honest:** when a spec becomes Done, move it out of the ready set
-and promote whatever its `Depends on:` line was blocking. If that upkeep lapses,
-re-derive from the `Depends on:` lines — the cost is one pass over the unstarted
-specs, which is how this section was produced.
+and promote whatever it was blocking — one item on the checklist in
+[`../../AGENTS.md`](../../AGENTS.md)'s "Before you change a feature", which is
+the canonical list of what a finished spec makes stale. The step that keeps
+*this* section true is flipping the `Depends on:` lines that named the finished
+spec **not built**: re-deriving from those lines is how this section was
+produced, and it repairs nothing while the lines themselves are wrong.
 
 ## Implementation order
 
