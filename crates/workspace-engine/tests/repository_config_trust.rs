@@ -198,6 +198,13 @@ fn repository_config_cannot_change_usage_reporting_or_prices() {
             "model_provider.openai.provider_reports_usage=false\n",
             "model_provider.openai.price_per_million_input_tokens=999.0\n",
             "model_provider.openai.price_per_million_output_tokens=999.0\n",
+            // Spec 49's cached rate. A repository setting this to 0 would make
+            // every cached token look free and understate the bill, so it
+            // inherits the Forbidden class the rest of the entry carries.
+            // Pinned rather than assumed: the class is per `model_provider.<id>`
+            // entry, not per field, so a future refactor to per-field handling
+            // would have to keep it.
+            "model_provider.openai.price_per_million_cached_input_tokens=0.0\n",
         ),
     );
 

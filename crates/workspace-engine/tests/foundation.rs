@@ -2042,6 +2042,7 @@ fn chat_dispatches_native_tool_call_when_provider_supports_it() {
         provider_reports_usage: true,
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,
+        price_per_million_cached_input_tokens: None,
     });
     let engine = WorkspaceEngine::new(config);
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
@@ -2357,6 +2358,7 @@ fn chat_chains_multiple_native_tool_calls_within_one_turn() {
         provider_reports_usage: true,
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,
+        price_per_million_cached_input_tokens: None,
     });
     let engine = WorkspaceEngine::new(config);
     // The model asks to run `pwd`, then—after seeing that result—asks to
@@ -2433,6 +2435,7 @@ fn native_tool_provider() -> ModelProviderConfig {
         provider_reports_usage: true,
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,
+        price_per_million_cached_input_tokens: None,
     }
 }
 
@@ -4265,7 +4268,150 @@ fn configured_rates_produce_a_cost_from_the_users_own_numbers() {
         .estimated_cost(&TokenUsage::estimated(2_000_000, 1_000_000))
         .expect("configured rates should produce a figure");
 
-    assert!((cost - (0.27 * 2.0 + 1.10)).abs() < 1e-9, "cost was {cost}");
+    assert!(
+        (cost.amount() - (0.27 * 2.0 + 1.10)).abs() < 1e-9,
+        "cost was {}",
+        cost.amount()
+    );
+    assert!(
+        !cost.is_upper_bound(),
+        "a run with no cache split reported is priced exactly, not as a bound"
+    );
+}
+
+/// Spec 49 §5.3's table, one test per row.
+mod cached_rate {
+    use super::*;
+
+    /// 1,000,000 input tokens of which 800,000 hit the cache.
+    fn cached_usage() -> TokenUsage {
+        TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cached_input_tokens: Some(800_000),
+            source: UsageSource::Measured,
+        }
+    }
+
+    fn config_with(extra: &str) -> Config {
+        let mut config = Config::default();
+        config.apply_overlay(
+            ConfigOverlay::parse(&format!(
+                concat!(
+                    "model_provider=deepseek\n",
+                    "model_provider.deepseek.price_per_million_input_tokens=0.27\n",
+                    "model_provider.deepseek.price_per_million_output_tokens=1.10\n",
+                    "{}"
+                ),
+                extra
+            ))
+            .unwrap(),
+        );
+        config
+    }
+
+    #[test]
+    fn a_configured_cached_rate_splits_the_input_tokens_across_two_rates() {
+        let config =
+            config_with("model_provider.deepseek.price_per_million_cached_input_tokens=0.027\n");
+
+        let estimate = config
+            .estimated_cost(&cached_usage())
+            .expect("configured rates should produce a figure");
+
+        // 200,000 uncached at 0.27/M + 800,000 cached at 0.027/M + 1M output.
+        let expected = 0.27 * 0.2 + 0.027 * 0.8 + 1.10;
+        assert!(
+            (estimate.amount() - expected).abs() < 1e-9,
+            "cost was {}",
+            estimate.amount()
+        );
+        assert!(
+            !estimate.is_upper_bound(),
+            "with a cached rate configured the figure is exact, not a bound"
+        );
+    }
+
+    #[test]
+    fn a_split_with_no_cached_rate_is_priced_at_the_full_rate_and_labelled_a_bound() {
+        // §5.3's deliberate softening of #19's both-rates-or-nothing rule. The
+        // direction of the error is what makes it safe: without a cached rate
+        // the figure can only be too high, and "at most $0.04" is useful where
+        // a silent blank is not.
+        let config = config_with("");
+
+        let estimate = config
+            .estimated_cost(&cached_usage())
+            .expect("the base rates alone still produce a figure");
+
+        let expected = 0.27 + 1.10;
+        assert!(
+            (estimate.amount() - expected).abs() < 1e-9,
+            "cost was {}",
+            estimate.amount()
+        );
+        assert!(
+            estimate.is_upper_bound(),
+            "a figure that ignores a reported cache discount must say it is a ceiling"
+        );
+    }
+
+    #[test]
+    fn no_split_reported_is_priced_exactly_as_before() {
+        let config = config_with("");
+
+        let estimate = config
+            .estimated_cost(&TokenUsage::estimated(1_000_000, 1_000_000))
+            .expect("configured rates should produce a figure");
+
+        assert!((estimate.amount() - (0.27 + 1.10)).abs() < 1e-9);
+        assert!(
+            !estimate.is_upper_bound(),
+            "nothing was reported as cached, so nothing is being ignored"
+        );
+    }
+
+    #[test]
+    fn a_cached_rate_alone_does_not_produce_a_cost() {
+        // #19's both-rates rule is softened for the *label*, never for the
+        // requirement that both base rates exist.
+        let mut config = Config::default();
+        config.apply_overlay(
+            ConfigOverlay::parse(concat!(
+                "model_provider=deepseek\n",
+                "model_provider.deepseek.price_per_million_cached_input_tokens=0.027\n",
+            ))
+            .unwrap(),
+        );
+
+        assert!(config.estimated_cost(&cached_usage()).is_none());
+    }
+
+    #[test]
+    fn a_reported_cache_miss_is_not_an_upper_bound() {
+        // `Some(0)` is a measurement, not silence: the provider said none of
+        // it hit, so the full rate is exactly right and labelling it a bound
+        // would understate what we know.
+        let config = config_with("");
+        let usage = TokenUsage {
+            cached_input_tokens: Some(0),
+            ..cached_usage()
+        };
+
+        let estimate = config.estimated_cost(&usage).expect("a figure");
+
+        assert!(!estimate.is_upper_bound());
+    }
+
+    #[test]
+    fn a_mistyped_cached_price_is_refused_rather_than_quietly_wrong() {
+        assert!(
+            ConfigOverlay::parse(
+                "model_provider.deepseek.price_per_million_cached_input_tokens=free\n"
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]

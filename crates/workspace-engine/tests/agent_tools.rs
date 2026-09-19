@@ -672,6 +672,7 @@ fn native_tool_provider() -> ModelProviderConfig {
         provider_reports_usage: true,
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,
+        price_per_million_cached_input_tokens: None,
     }
 }
 

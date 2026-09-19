@@ -13,7 +13,7 @@ corrections in [`context.md`](context.md)
 | 1 · `cached_input_tokens` on `TokenUsage` | Done | 3 tests, all failing to compile before the field existed. Six construction sites: `extract_usage`'s measured arm (task 2 fills it), the two `estimated_cost` calls in `chat.rs`, `recovery.rs` and `desktop-shell/src/lib.rs` (all four build a `TokenUsage` from a `TaskUsage`, so task 5 fills them), and `token_accounting.rs`'s `measured` helper. Each carries a comment naming the task that supplies the real value, so a `None` left behind is not mistaken for a decision. |
 | 2 · Parse the split, normalised to a subset | Done | 5 tests (the plan's four plus `a_reported_cache_hit_of_zero_is_kept_as_a_measured_zero`, the other side of the silence-is-not-zero rule). Step 3's open question decided as the plan recommended: `extract_usage` now returns a named `ReportedUsage` rather than a fourth tuple element — four fields, two of them `Option`s of different meaning, is past what positional access reads safely. Alias list is exhaustive, not a prefix match: `prompt_tokens_details.cached_tokens` (OpenAI), `prompt_cache_hit_tokens` (DeepSeek), `cached_tokens`, `cache_read_input_tokens`. The miss count is read only to recognise the shape and never added to anything. Invariant mutation-tested: removing `<=` fails `a_cached_count_above_the_input_count_is_dropped_to_none`. |
 | 3 · Capability detection per provider | Done | 4 tests. `reports_cache_split: Option<bool>` on `OpenAICompatibleAdapter`, set from the same place as `supports_usage`. Two deliberate differences from that field, both recorded in doc comments: it needs **no probe** (a split either is or is not in a usage object already parsed, whereas asking for usage is what a provider rejects), and the accessor returns `Option<bool>` rather than collapsing to a default — `probe_supports_usage` must answer before it knows because it gates an outgoing field, this one only describes what was seen. Made **monotone** (`true` sticks) after noticing an unqualified assignment lets a provider that omits the field on one call flip the surface from a hit rate to "not reported" and back. Not generalised into a shared type: the existing mechanism *is* `Option<bool>` plus a reader, and the two want opposite defaults. Both guards falsified — dropping the monotone term fails the later-call test, and keying on `self.provider.contains("deepseek")` fails the no-split test, which is why that test's provider is named `deepseek`. |
-| 4 · The cached rate and the upper bound | Not started | |
+| 4 · The cached rate and the upper bound | Done | 6 tests (the plan's five plus `a_reported_cache_miss_is_not_an_upper_bound`). **Return shape decided:** `Option<CostEstimate>`, a struct with private fields, `amount()`/`is_upper_bound()`, no `Deref`, no `From<CostEstimate> for f64` and no public constructor taking a bare number — so reaching the figure means naming the method, and a reviewer can see every place that does. The label is enforced structurally at the one funnel: `task_usage_json` takes the whole `CostEstimate`, and all three shell call sites already went through it. `ChatTurnResult.estimated_cost` changed type with it. **Trust boundary confirmed, not assumed:** a `model_provider.<id>` entry from repository scope is rejected whole (`config.rs`), so the new key inherits Forbidden; pinned anyway in `repository_config_cannot_change_usage_reporting_or_prices`, because the class is per entry rather than per field. `push_model_provider_overlay`'s exhaustive destructuring caught the new key and forced the save path — the guard working as its comment says it should. Both guards falsified: collapsing `None` into `Some(0)` fails two tests, and returning `exact` instead of `upper_bound` fails the bound test. |
 | 5 · Per-task aggregation | Not started | |
 | 6 · Surfaces: shell and web UI | Not started | |
 | 7 · The `cache_hit_rate` harness metric | Not started | |
@@ -167,7 +167,7 @@ figure is exact or an upper bound, so the return type changes — pick a shape
 that makes the label impossible to drop on the way to a surface, and say in the
 Progress table what you picked.
 
-- [ ] **Step 1: Write the failing tests**, one per row of
+- [x] **Step 1: Write the failing tests**, one per row of
       [`proposal.md`](proposal.md) §5.3's table:
   - cached rate configured + split reported → two rates, exact.
   - cached rate unset + split reported → full rate on all input, **upper bound**.
@@ -175,15 +175,22 @@ Progress table what you picked.
   - either rate missing → `None`, as today.
   - `a_cached_rate_alone_does_not_produce_a_cost` — #19's both-rates rule is
     softened for the label, never for the requirement that both base rates exist.
-- [ ] **Step 2: Run to verify they fail**
-- [ ] **Step 3: Add `price_per_million_cached_input_tokens`** to
+- [x] **Step 2: Run to verify they fail**
+- [x] **Step 3: Add `price_per_million_cached_input_tokens`** to
       `ModelProviderConfig`, and classify it in
       [`../34_repository_config_trust_boundary.md`](../34_repository_config_trust_boundary.md)'s
       table in the same change. A `model_provider` key is **Forbidden** in
       repository scope; confirm the new key inherits that rather than assuming
       it, and add the trust test if it does not.
-- [ ] **Step 4: Implement the split**
-- [ ] **Step 5: Scoped checks, then show and ask**
+- [x] **Step 4: Implement the split**
+- [x] **Step 5: Scoped checks, then show and ask**
+
+**Deviation from "Files: `config.rs`":** changing the return type necessarily moved
+`ChatTurnResult.estimated_cost` (`chat.rs`) and `task_usage_json`
+(`desktop-shell/src/lib.rs`), which now also emits
+`estimatedCostIsUpperBound`. Emitting the flag here rather than deferring it to
+Task 6 avoids a window in which the JSON carries a ceiling presented as an
+exact figure. Task 6 still owns rendering it.
 
 ## Task 5: Per-task aggregation
 

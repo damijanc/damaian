@@ -299,6 +299,63 @@ pub struct ModelProviderConfig {
     /// The user's own price per million output tokens. Both rates must be set
     /// for a cost to be computed; one alone would silently omit half the bill.
     pub price_per_million_output_tokens: Option<f64>,
+    /// The user's own price per million input tokens the provider served from
+    /// its prompt cache — commonly a fraction of the uncached rate. `None`
+    /// does **not** suppress the cost the way a missing base rate does: the
+    /// figure is computed at the full input rate and labelled an upper bound
+    /// instead, because that error can only run in the safe direction.
+    /// Spec 49 §5.3.
+    pub price_per_million_cached_input_tokens: Option<f64>,
+}
+
+/// A cost computed from the user's own configured rates, and whether it is
+/// exact or a ceiling.
+///
+/// The two travel together rather than as an `f64` beside a `bool` because
+/// the label is the part that gets dropped: a caller that forgets it prints a
+/// figure which reads as what the user will be billed, when the truth is "no
+/// more than this". Spec 49 §5.3.
+///
+/// The fields are private and there is deliberately no `Deref`, no
+/// `From<CostEstimate> for f64` and no public constructor taking a bare
+/// number: reaching the amount means naming [`Self::amount`], and every
+/// surface that does is a place a reviewer can see is also asking
+/// [`Self::is_upper_bound`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CostEstimate {
+    amount: f64,
+    upper_bound: bool,
+}
+
+impl CostEstimate {
+    /// Every input token priced at the rate that actually applies to it.
+    pub(crate) fn exact(amount: f64) -> Self {
+        Self {
+            amount,
+            upper_bound: false,
+        }
+    }
+
+    /// The provider reported cached tokens and the user configured no cached
+    /// rate, so this prices them as though none were cached. It can only be
+    /// too high.
+    pub(crate) fn upper_bound(amount: f64) -> Self {
+        Self {
+            amount,
+            upper_bound: true,
+        }
+    }
+
+    pub fn amount(&self) -> f64 {
+        self.amount
+    }
+
+    /// True when the figure ignores a cache discount the provider reported.
+    /// A surface rendering the amount must say so — "at most $0.04", not
+    /// "$0.04".
+    pub fn is_upper_bound(&self) -> bool {
+        self.upper_bound
+    }
 }
 
 // No `Eq`: the price rates are `Option<f64>`.
@@ -315,6 +372,7 @@ pub struct ModelProviderConfigOverlay {
     pub provider_reports_usage: Option<bool>,
     pub price_per_million_input_tokens: Option<f64>,
     pub price_per_million_output_tokens: Option<f64>,
+    pub price_per_million_cached_input_tokens: Option<f64>,
 }
 
 /// How the client talks to an MCP server. `Stdio` spawns a local subprocess
@@ -950,14 +1008,48 @@ impl Config {
     ///
     /// Both rates must be set. One alone would produce a number that silently
     /// omits half the bill, which is worse than showing nothing.
-    pub fn estimated_cost(&self, usage: &TokenUsage) -> Option<f64> {
+    ///
+    /// Where the provider reported cached input tokens and the user has
+    /// configured a cached rate, the input tokens are split across the two
+    /// rates. Where they have not, the figure is computed at the full input
+    /// rate and comes back labelled an upper bound — see [`CostEstimate`].
+    /// Spec 49 §5.3.
+    pub fn estimated_cost(&self, usage: &TokenUsage) -> Option<CostEstimate> {
         let provider = self.model_provider_config(&self.model_provider)?;
         let input_rate = provider.price_per_million_input_tokens?;
         let output_rate = provider.price_per_million_output_tokens?;
-        Some(
-            (usage.input_tokens as f64 / 1_000_000.0) * input_rate
-                + (usage.output_tokens as f64 / 1_000_000.0) * output_rate,
-        )
+        let output_cost = (usage.output_tokens as f64 / 1_000_000.0) * output_rate;
+
+        // `None` is "the provider did not say", and a provider that said
+        // nothing is not owed a discount. `Some(0)` is a measurement — it said
+        // none hit — so the full rate is exactly right and calling it a bound
+        // would understate what we know.
+        let cached = usage.cached_input_tokens.filter(|cached| *cached > 0);
+        let Some(cached) = cached else {
+            return Some(CostEstimate::exact(
+                (usage.input_tokens as f64 / 1_000_000.0) * input_rate + output_cost,
+            ));
+        };
+
+        match provider.price_per_million_cached_input_tokens {
+            Some(cached_rate) => {
+                // `extract_usage` guarantees the subset invariant, so this
+                // cannot underflow.
+                let uncached = usage.input_tokens.saturating_sub(cached);
+                Some(CostEstimate::exact(
+                    (uncached as f64 / 1_000_000.0) * input_rate
+                        + (cached as f64 / 1_000_000.0) * cached_rate
+                        + output_cost,
+                ))
+            }
+            // The user has not said what a cached token costs, so the only
+            // honest figure is the one that assumes no discount — which can
+            // only be too high, never too low. #19 shows nothing for a figure
+            // that could be too low; this one is safe to show and label.
+            None => Some(CostEstimate::upper_bound(
+                (usage.input_tokens as f64 / 1_000_000.0) * input_rate + output_cost,
+            )),
+        }
     }
 
     pub fn max_output_tokens(&self) -> Option<u32> {
@@ -1075,6 +1167,9 @@ impl Config {
             if let Some(value) = overlay.price_per_million_output_tokens {
                 provider.price_per_million_output_tokens = Some(value);
             }
+            if let Some(value) = overlay.price_per_million_cached_input_tokens {
+                provider.price_per_million_cached_input_tokens = Some(value);
+            }
             return;
         }
 
@@ -1090,6 +1185,7 @@ impl Config {
             provider_reports_usage: overlay.provider_reports_usage.unwrap_or(true),
             price_per_million_input_tokens: overlay.price_per_million_input_tokens,
             price_per_million_output_tokens: overlay.price_per_million_output_tokens,
+            price_per_million_cached_input_tokens: overlay.price_per_million_cached_input_tokens,
             id,
         });
     }
@@ -1796,6 +1892,10 @@ impl ConfigOverlay {
             "price_per_million_output_tokens" => {
                 provider.price_per_million_output_tokens = Some(parse_price(provider_key, value)?);
             }
+            "price_per_million_cached_input_tokens" => {
+                provider.price_per_million_cached_input_tokens =
+                    Some(parse_price(provider_key, value)?);
+            }
             _ => {
                 return Err(ClientError::InvalidInput(format!(
                     "Unknown model provider config key: model_provider.{provider_key}"
@@ -2009,6 +2109,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             provider_reports_usage: true,
             price_per_million_input_tokens: None,
             price_per_million_output_tokens: None,
+            price_per_million_cached_input_tokens: None,
         }),
         "deepseek" => Some(ModelProviderConfig {
             id: "deepseek".to_string(),
@@ -2030,6 +2131,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             provider_reports_usage: true,
             price_per_million_input_tokens: None,
             price_per_million_output_tokens: None,
+            price_per_million_cached_input_tokens: None,
         }),
         "openai-compatible" => Some(ModelProviderConfig {
             id: "openai-compatible".to_string(),
@@ -2043,6 +2145,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             provider_reports_usage: true,
             price_per_million_input_tokens: None,
             price_per_million_output_tokens: None,
+            price_per_million_cached_input_tokens: None,
         }),
         _ => None,
     }
@@ -2182,6 +2285,7 @@ fn push_model_provider_overlay(output: &mut String, provider: &ModelProviderConf
         provider_reports_usage,
         price_per_million_input_tokens,
         price_per_million_output_tokens,
+        price_per_million_cached_input_tokens,
     } = provider;
 
     if let Some(value) = label {
@@ -2239,6 +2343,13 @@ fn push_model_provider_overlay(output: &mut String, provider: &ModelProviderConf
         push_line(
             output,
             &format!("model_provider.{id}.price_per_million_output_tokens"),
+            &value.to_string(),
+        );
+    }
+    if let Some(value) = price_per_million_cached_input_tokens {
+        push_line(
+            output,
+            &format!("model_provider.{id}.price_per_million_cached_input_tokens"),
             &value.to_string(),
         );
     }

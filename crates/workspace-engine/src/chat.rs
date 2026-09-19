@@ -5,7 +5,7 @@ use crate::checkpoint::{
 };
 use crate::command_policy::allow_always_eligible;
 use crate::command_runner::{CommandExecution, CommandTermination};
-use crate::config::{Config, McpTransport};
+use crate::config::{Config, CostEstimate, McpTransport};
 use crate::context_manager::ContextManager;
 use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes};
 use crate::error::{ClientError, Result};
@@ -329,7 +329,10 @@ pub struct ChatTurnResult {
     /// any. Kept separate from [`TaskUsage::reported_cost`] on purpose: one is
     /// what the provider charged, the other is the user's own arithmetic, and
     /// presenting the second as the first would launder a guess into a fact.
-    pub estimated_cost: Option<f64>,
+    ///
+    /// A [`CostEstimate`] rather than a bare `f64` so the upper-bound label
+    /// travels with the number: spec 49 §5.3.
+    pub estimated_cost: Option<CostEstimate>,
 }
 
 /// What a turn ended holding out for a human, if anything.

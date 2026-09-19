@@ -53,10 +53,11 @@ pub use command_policy::{
 };
 pub use command_runner::{CommandExecution, CommandRunOptions, CommandRunner, CommandTermination};
 pub use config::{
-    Config, ConfigOverlay, ConfigScope, DEFAULT_CONTEXT_TOKEN_BUDGET, McpServerConfig,
-    McpServerConfigOverlay, McpTransport, ModelProviderConfig, ModelProviderConfigOverlay,
-    RejectedConfigKey, RepositoryConfigReport, RepositoryKeyClass, normalize_mcp_server_id,
-    normalize_model_provider, normalize_model_reasoning_level, parse_mcp_transport,
+    Config, ConfigOverlay, ConfigScope, CostEstimate, DEFAULT_CONTEXT_TOKEN_BUDGET,
+    McpServerConfig, McpServerConfigOverlay, McpTransport, ModelProviderConfig,
+    ModelProviderConfigOverlay, RejectedConfigKey, RepositoryConfigReport, RepositoryKeyClass,
+    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
+    parse_mcp_transport,
 };
 pub use context_manager::{ContextItem, ContextManager, ContextPlan};
 pub use data_schema::{

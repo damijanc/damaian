@@ -53,6 +53,7 @@ pub fn mock_provider() -> ModelProviderConfig {
         // a number the baseline could not reproduce on another machine.
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,
+        price_per_million_cached_input_tokens: None,
     }
 }
 
@@ -196,6 +197,7 @@ pub fn live_config(data_dir: &Path, provider: &str, model: &str) -> Config {
         // figure could not be reproduced on another machine.
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,
+        price_per_million_cached_input_tokens: None,
     });
     config
 }

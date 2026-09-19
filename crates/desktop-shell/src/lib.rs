@@ -9,7 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use workspace_engine::{
     AgentPlanProposal, CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions,
-    ChatTurnResult, Config, CurlModelTransport, DataSchemaOutcome, ExportFormat,
+    ChatTurnResult, Config, CostEstimate, CurlModelTransport, DataSchemaOutcome, ExportFormat,
     GeneratedSecretWarning, McpClient, McpServerConfig, McpTokenResolver, McpTransport,
     OpenAICompatibleAdapter, PlanRevisionStep, ProcessRegistry, ProposedFilePatch,
     ResumeDecisionOptions, SearchOptions, Session, StepStatus, TaskPlan, TaskUsage, TokenUsage,
@@ -3025,7 +3025,14 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
 /// `estimated_cost` is the user's own rates applied to these tokens, and is a
 /// separate field from `reportedCost` on purpose: one is what the provider
 /// charged, the other is arithmetic the user configured.
-pub(crate) fn task_usage_json(usage: Option<&TaskUsage>, estimated_cost: Option<f64>) -> String {
+///
+/// Takes the whole [`CostEstimate`] rather than its amount so the upper-bound
+/// label cannot be lost on the way to the client: this is the single funnel
+/// every caller goes through. Spec 49 §5.3.
+pub(crate) fn task_usage_json(
+    usage: Option<&TaskUsage>,
+    estimated_cost: Option<CostEstimate>,
+) -> String {
     let Some(usage) = usage else {
         return "null".to_string();
     };
@@ -3040,7 +3047,14 @@ pub(crate) fn task_usage_json(usage: Option<&TaskUsage>, estimated_cost: Option<
             None => String::new(),
         },
         match estimated_cost {
-            Some(cost) => format!(",\"estimatedCost\":{cost}"),
+            // `estimatedCostIsUpperBound` rides with the figure rather than
+            // being derivable from it: a client cannot tell a ceiling from an
+            // exact number by looking at the number.
+            Some(estimate) => format!(
+                ",\"estimatedCost\":{},\"estimatedCostIsUpperBound\":{}",
+                estimate.amount(),
+                estimate.is_upper_bound()
+            ),
             None => String::new(),
         }
     )
