@@ -1001,6 +1001,20 @@ pub struct OpenAICompatibleAdapter<T: ModelTransport> {
     /// profile is the durable home for this observation; the shape is chosen
     /// so WP3 can adopt it rather than rediscover it.
     supports_usage: Option<bool>,
+    /// Whether this provider has been observed reporting a prompt-cache split
+    /// in its usage object. `None` until a call has been seen. Spec 49 §5.4.
+    ///
+    /// The same shape as `supports_usage` and set from the same place, but it
+    /// costs no extra request: `supports_usage` needs a two-pass probe because
+    /// asking is what a provider rejects, while a cache split either is or is
+    /// not in a usage object we already parsed. Never inferred from
+    /// `provider`.
+    ///
+    /// Monotone — once observed `true` it stays `true`. A provider that
+    /// reported a split can legitimately omit the field on a later call, and
+    /// letting that flip the answer back would make the surface alternate
+    /// between a hit rate and "not reported" for one provider.
+    reports_cache_split: Option<bool>,
 }
 
 impl<T: ModelTransport> OpenAICompatibleAdapter<T> {
@@ -1018,6 +1032,7 @@ impl<T: ModelTransport> OpenAICompatibleAdapter<T> {
             model: model.into(),
             transport,
             supports_usage: None,
+            reports_cache_split: None,
         }
     }
 
@@ -1026,6 +1041,19 @@ impl<T: ModelTransport> OpenAICompatibleAdapter<T> {
     /// absent would mean never measuring anything.
     pub fn probe_supports_usage(&self) -> bool {
         self.supports_usage.unwrap_or(true)
+    }
+
+    /// Whether this provider reports a prompt-cache split, as observed rather
+    /// than assumed. `None` before any call has been seen.
+    ///
+    /// Deliberately not collapsed to a `bool` with a default the way
+    /// [`Self::probe_supports_usage`] is. That one gates a field on an
+    /// outgoing request, so it must answer before it knows; this one only
+    /// describes what was seen, and a default here would be a claim about a
+    /// provider nobody has called yet. Spec 49's rule that silence is not zero,
+    /// one layer up from the token count.
+    pub fn reports_cache_split(&self) -> Option<bool> {
+        self.reports_cache_split
     }
 
     /// One send, with the existing connection-level retry policy.
@@ -1235,8 +1263,13 @@ impl<T: ModelTransport> ModelAdapter for OpenAICompatibleAdapter<T> {
             if let Some(message) = extract_error_message(&raw) {
                 return Err(ClientError::Io(format!("Model provider error: {message}")));
             }
-            if ask_for_usage && extract_usage(&raw).is_some() {
+            if ask_for_usage && let Some(reported) = extract_usage(&raw) {
                 self.supports_usage = Some(true);
+                // Monotone: `true` once observed. Read from what arrived, not
+                // from `self.provider`. Spec 49 §5.4.
+                let seen_before = self.reports_cache_split.unwrap_or(false);
+                self.reports_cache_split =
+                    Some(seen_before || reported.cached_input_tokens.is_some());
             }
             break (raw, content, total_retries, body);
         };
@@ -2497,6 +2530,88 @@ mod tests {
         assert_eq!(run.usage.source, UsageSource::Estimated);
         assert!(run.usage_reporting_unsupported);
         assert!(!adapter.probe_supports_usage());
+    }
+
+    #[test]
+    fn a_provider_that_reports_no_cache_split_is_recorded_as_not_reporting_one() {
+        // Named `deepseek` deliberately: a provider that does cache, so a
+        // implementation keyed on the name rather than on what arrived would
+        // record `true` here and be caught. Spec 49 §5.4.
+        let transport = MockModelTransport::new(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2}}\n",
+        );
+        let mut adapter =
+            OpenAICompatibleAdapter::with_provider("deepseek", "test-model", transport);
+        adapter
+            .stream_response(
+                &usage_request(),
+                &CancelToken::new(),
+                &mut |_token| {},
+                &mut |_| {},
+            )
+            .expect("the mock stream should produce a run");
+
+        assert_eq!(adapter.reports_cache_split(), Some(false));
+    }
+
+    #[test]
+    fn a_provider_that_reports_a_cache_split_is_recorded_as_reporting_one() {
+        let transport = MockModelTransport::new(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":1000,",
+            "\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":768}}}\n"
+        ));
+        let mut adapter = OpenAICompatibleAdapter::with_provider("anon", "test-model", transport);
+        let run = adapter
+            .stream_response(
+                &usage_request(),
+                &CancelToken::new(),
+                &mut |_token| {},
+                &mut |_| {},
+            )
+            .expect("the mock stream should produce a run");
+
+        assert_eq!(adapter.reports_cache_split(), Some(true));
+        assert_eq!(run.usage.cached_input_tokens, Some(768));
+    }
+
+    #[test]
+    fn a_later_call_without_a_split_does_not_unrecord_the_capability() {
+        // The observation is monotone. A provider that reported a split once
+        // can legitimately omit the field on a later call, and treating that
+        // as "this provider cannot report cache usage" would make the surface
+        // flap between a hit rate and "not reported" for the same provider.
+        let transport = MockModelTransport::sequence(vec![
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":{\"prompt_tokens\":1000,",
+                "\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":768}}}\n"
+            )
+            .to_string(),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2}}\n"
+                .to_string(),
+        ]);
+        let mut adapter = OpenAICompatibleAdapter::new("test-model", transport);
+        for _ in 0..2 {
+            adapter
+                .stream_response(
+                    &usage_request(),
+                    &CancelToken::new(),
+                    &mut |_token| {},
+                    &mut |_| {},
+                )
+                .expect("the mock stream should produce a run");
+        }
+
+        assert_eq!(adapter.reports_cache_split(), Some(true));
+    }
+
+    #[test]
+    fn a_provider_not_yet_observed_has_no_opinion_on_cache_reporting() {
+        // Unlike `supports_usage`, which defaults to `true` because it gates a
+        // request field, this one is descriptive: before any call there is
+        // nothing to say, and a default in either direction would be a claim.
+        let transport = MockModelTransport::new("");
+        let adapter = OpenAICompatibleAdapter::with_provider("openai", "test-model", transport);
+        assert_eq!(adapter.reports_cache_split(), None);
     }
 
     #[test]

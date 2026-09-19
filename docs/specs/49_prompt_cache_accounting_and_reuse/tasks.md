@@ -12,7 +12,7 @@ corrections in [`context.md`](context.md)
 |---|---|---|
 | 1 · `cached_input_tokens` on `TokenUsage` | Done | 3 tests, all failing to compile before the field existed. Six construction sites: `extract_usage`'s measured arm (task 2 fills it), the two `estimated_cost` calls in `chat.rs`, `recovery.rs` and `desktop-shell/src/lib.rs` (all four build a `TokenUsage` from a `TaskUsage`, so task 5 fills them), and `token_accounting.rs`'s `measured` helper. Each carries a comment naming the task that supplies the real value, so a `None` left behind is not mistaken for a decision. |
 | 2 · Parse the split, normalised to a subset | Done | 5 tests (the plan's four plus `a_reported_cache_hit_of_zero_is_kept_as_a_measured_zero`, the other side of the silence-is-not-zero rule). Step 3's open question decided as the plan recommended: `extract_usage` now returns a named `ReportedUsage` rather than a fourth tuple element — four fields, two of them `Option`s of different meaning, is past what positional access reads safely. Alias list is exhaustive, not a prefix match: `prompt_tokens_details.cached_tokens` (OpenAI), `prompt_cache_hit_tokens` (DeepSeek), `cached_tokens`, `cache_read_input_tokens`. The miss count is read only to recognise the shape and never added to anything. Invariant mutation-tested: removing `<=` fails `a_cached_count_above_the_input_count_is_dropped_to_none`. |
-| 3 · Capability detection per provider | Not started | |
+| 3 · Capability detection per provider | Done | 4 tests. `reports_cache_split: Option<bool>` on `OpenAICompatibleAdapter`, set from the same place as `supports_usage`. Two deliberate differences from that field, both recorded in doc comments: it needs **no probe** (a split either is or is not in a usage object already parsed, whereas asking for usage is what a provider rejects), and the accessor returns `Option<bool>` rather than collapsing to a default — `probe_supports_usage` must answer before it knows because it gates an outgoing field, this one only describes what was seen. Made **monotone** (`true` sticks) after noticing an unqualified assignment lets a provider that omits the field on one call flip the surface from a hit rate to "not reported" and back. Not generalised into a shared type: the existing mechanism *is* `Option<bool>` plus a reader, and the two want opposite defaults. Both guards falsified — dropping the monotone term fails the later-call test, and keying on `self.provider.contains("deepseek")` fails the no-split test, which is why that test's provider is named `deepseek`. |
 | 4 · The cached rate and the upper bound | Not started | |
 | 5 · Per-task aggregation | Not started | |
 | 6 · Surfaces: shell and web UI | Not started | |
@@ -148,15 +148,15 @@ reading.
 
 **Requirements:** 6. **Files:** `model.rs`.
 
-- [ ] **Step 1: Write the failing test** — after a call whose usage object
+- [x] **Step 1: Write the failing test** — after a call whose usage object
       carried no split, the adapter records that this provider does not report
       one; after a call that did, it records that it does. Never keyed on the
       provider's name, and never probed a second time.
-- [ ] **Step 2: Run to verify it fails**
-- [ ] **Step 3: Implement** on the `supports_usage` pattern — observed once,
+- [x] **Step 2: Run to verify it fails**
+- [x] **Step 3: Implement** on the `supports_usage` pattern — observed once,
       reused for the process. Read how `supports_usage` does it before writing a
       second mechanism; if the existing one generalises, generalise it.
-- [ ] **Step 4: Scoped checks, then show and ask**
+- [x] **Step 4: Scoped checks, then show and ask**
 
 ## Task 4: The cached rate and the upper bound
 
