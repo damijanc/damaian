@@ -13,7 +13,7 @@ Related implementation specs:
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (task state, action markers, and the PID registry),
 [`18_local_evaluation_harness/`](18_local_evaluation_harness/proposal.md)
-(measures the readiness gates), [`20_working_modes.md`](20_working_modes.md) and
+(measures the readiness gates), [`20_working_modes/proposal.md`](20_working_modes/proposal.md) and
 [`31_permission_profiles.md`](31_permission_profiles.md) (the boundary a
 subagent inherits and cannot widen),
 [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md),
@@ -92,10 +92,10 @@ Nothing in this phase exists, deliberately. What it builds on:
   by [spec 17](17_durable_task_state_and_crash_recovery/proposal.md), with `seq`-ordered
   events and action markers.
 - **The tool list has one construction site**, `chat.rs:711-731`, filtered by
-  mode in [spec 20](20_working_modes.md) §5.2 — the same place a subagent's
+  mode in [spec 20](20_working_modes/proposal.md) §5.2 — the same place a subagent's
   narrower list is built.
 - **Mode and profile are the capability boundary**
-  ([spec 20](20_working_modes.md), [spec 31](31_permission_profiles.md)), with
+  ([spec 20](20_working_modes/proposal.md), [spec 31](31_permission_profiles.md)), with
   the effective capability defined as `profile ∩ mode`
   ([spec 31](31_permission_profiles.md) §5.6).
 - **The PID registry exists** for spawned children —
@@ -225,7 +225,7 @@ parent's value and the declaration's request:
 
 | Dimension | Rule |
 |---|---|
-| Mode | The more restrictive of parent mode and requested mode ([spec 20](20_working_modes.md)) |
+| Mode | The more restrictive of parent mode and requested mode ([spec 20](20_working_modes/proposal.md)) |
 | Tools | Parent's set ∩ kind's maximum ∩ requested set |
 | Path scope | Parent's scope ∩ requested scope, then `path_policy.rs` |
 | Profile denies | Inherited wholesale; a child cannot clear one |

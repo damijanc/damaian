@@ -14,7 +14,7 @@ assembly). Related implementation specs:
 [`05_clickable_file_references.md`](05_clickable_file_references.md)
 (navigation to referenced content),
 [`11_agents_md_support.md`](11_agents_md_support.md),
-[`20_working_modes.md`](20_working_modes.md) (session-scoped state pattern),
+[`20_working_modes/proposal.md`](20_working_modes/proposal.md) (session-scoped state pattern),
 [`26_context_assembly.md`](26_context_assembly.md) (produces the manifest this
 renders — this spec is unusable without it).
 
@@ -61,7 +61,7 @@ retrieval heuristics cannot make at all.
   `SessionStore::allow_browser_diagnostics_for_session` /
   `browser_diagnostics_allowed_for_session`
   (`crates/workspace-engine/src/session.rs:261-291`) append an event and replay
-  the log. [Spec 20](20_working_modes.md) §5.4 follows it for session mode; pins
+  the log. [Spec 20](20_working_modes/proposal.md) §5.4 follows it for session mode; pins
   and path restrictions follow it here.
 - **Clickable file references exist** ([spec 05](05_clickable_file_references.md)),
   opening a file in the app or the configured editor. This is the "open
@@ -192,7 +192,7 @@ Post-send is a record and is read-only.
 
 Pins and restrictions persist as appended session events, following the
 `browser_diagnostics_allowed_for_session` pattern (`session.rs:261-291`) and
-[spec 20](20_working_modes.md) §5.4:
+[spec 20](20_working_modes/proposal.md) §5.4:
 
 ```json
 {"seq":88,"eventType":"context_pin_added","sessionId":"session_...",

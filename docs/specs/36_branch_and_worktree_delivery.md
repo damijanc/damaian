@@ -14,7 +14,7 @@ implementation specs:
 [`16_session_checkpoints_and_rewind.md`](16_session_checkpoints_and_rewind.md)
 (checkpoint scoping when a worktree is in play),
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md),
-[`20_working_modes.md`](20_working_modes.md),
+[`20_working_modes/proposal.md`](20_working_modes/proposal.md),
 [`31_permission_profiles.md`](31_permission_profiles.md) and
 [`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)
 (Git mutation is a capability repository config cannot grant),
@@ -306,7 +306,7 @@ acceptance criteria for this section are marked conditional.
 
 Every mutation here is a Git mutation and therefore a capability:
 
-- Code mode only ([spec 20](20_working_modes.md)); refused in Ask, Plan, and
+- Code mode only ([spec 20](20_working_modes/proposal.md)); refused in Ask, Plan, and
   Review.
 - Permitted only under a profile allowing Git mutation
   ([spec 31](31_permission_profiles.md)), which repository config cannot grant

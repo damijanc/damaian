@@ -5,7 +5,7 @@ Order: 50 of 53
 Plan: `docs/PLAN/02_phase_2_complete_task_workflow.md`, Phase 2, Work
 Package 8 (Should). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#20](20_working_modes.md) (modes) — **not built**;
+Depends on: [#20](20_working_modes/proposal.md) (modes) — **not built**;
 [#21](21_task_plan_progress_and_budget/proposal.md) (the plan gate and turn
 budget) — built. Everything else named below is a cross-reference, not a
 prerequisite.
@@ -17,7 +17,7 @@ surface this adds to),
 (own the approval path this must never become),
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (owns the waiting state and reattach machinery this reuses),
-[`20_working_modes.md`](20_working_modes.md) (the capability boundary this sits
+[`20_working_modes/proposal.md`](20_working_modes/proposal.md) (the capability boundary this sits
 inside), [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md)
 (owns the plan review gate and the budget this counts against), and
 [`29_memory_creation_and_consent.md`](29_memory_creation_and_consent.md) (the
@@ -216,7 +216,7 @@ prompt for those contexts instructs it to proceed under an explicitly stated
 assumption and record it — which lands in the task report (Phase 5 WP7) as a
 line saying what was assumed and why.
 
-[Spec 20](20_working_modes.md)'s mode gate is the mechanism: the tool is
+[Spec 20](20_working_modes/proposal.md)'s mode gate is the mechanism: the tool is
 read-only and available in every mode, and the headless case is an execution
 context that narrows the offered set, never a mode that widens one.
 

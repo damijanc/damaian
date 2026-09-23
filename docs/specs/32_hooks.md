@@ -17,7 +17,7 @@ specs: [`10_persistent_command_approval.md`](10_persistent_command_approval.md),
 [`13_docker_command_support.md`](13_docker_command_support.md),
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (the PID registry hook processes use, and the action markers hooks sit between),
-[`20_working_modes.md`](20_working_modes.md),
+[`20_working_modes/proposal.md`](20_working_modes/proposal.md),
 [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md),
 [`22_findings_model_and_panel.md`](22_findings_model_and_panel.md) (hooks return
 `Finding`s), [`23_verification_loop.md`](23_verification_loop.md),
@@ -37,7 +37,7 @@ user's own check can run and say no.
 
 The alternatives users are left with are all worse. `AGENTS.md` can *ask* the
 agent to follow a rule, but an instruction is a request the model may forget or
-reason around; [spec 20](20_working_modes.md) §5.5 is explicit that repository
+reason around; [spec 20](20_working_modes/proposal.md) §5.5 is explicit that repository
 instructions are data, not capability. A `restricted_patterns` entry can block a
 path but cannot express "not without asking me" or "only if the tests pass".
 

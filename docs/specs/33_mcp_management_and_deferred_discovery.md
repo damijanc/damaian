@@ -5,7 +5,7 @@ Order: 33 of 33
 Plan: `docs/PLAN/04_phase_4_customization_and_extensibility.md`, Phase 4,
 Work Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#20](20_working_modes.md) (modes) — **not built**;
+Depends on: [#20](20_working_modes/proposal.md) (modes) — **not built**;
 [#26](26_context_assembly.md) (the context budget schemas count against) —
 **not built**; [#31](31_permission_profiles.md) (the profile a server cannot
 widen) — **not built**. Everything else named below is a cross-reference, not a
@@ -17,7 +17,7 @@ adapter, tool calling), section 7.6 (tool and action orchestrator), section 7.8
 [`03_structured_tool_calling.md`](03_structured_tool_calling.md),
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (the PID registry MCP servers are the primary client of),
-[`20_working_modes.md`](20_working_modes.md) (mode filters MCP tools),
+[`20_working_modes/proposal.md`](20_working_modes/proposal.md) (mode filters MCP tools),
 [`26_context_assembly.md`](26_context_assembly.md) (the context budget this
 protects), [`31_permission_profiles.md`](31_permission_profiles.md) (the profile
 that governs external writes).
@@ -172,7 +172,7 @@ Requirement 1's per-tool enable and disable, with the essential property from th
 roadmap's acceptance criteria: **a disabled tool is absent from the model's tool
 list, not merely refused on call.** Absent is cheaper (no schema, no tokens) and
 safer (the model cannot try), and it is the same principle as
-[spec 20](20_working_modes.md) §5.2 layer 1 — withholding beats refusing.
+[spec 20](20_working_modes/proposal.md) §5.2 layer 1 — withholding beats refusing.
 
 Resolution is an intersection, following
 [spec 31](31_permission_profiles.md) §5.2: a tool is offered only if MCP is

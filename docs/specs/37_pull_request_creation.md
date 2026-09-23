@@ -314,7 +314,7 @@ a path that should already be clean, which is the right place for one.
 
 ### 5.7 Approval and policy
 
-- Code mode only ([spec 20](20_working_modes.md)). Ask, Plan, and Review cannot
+- Code mode only ([spec 20](20_working_modes/proposal.md)). Ask, Plan, and Review cannot
   push or publish.
 - Permitted only under a profile allowing remote writes
   ([spec 31](31_permission_profiles.md)), which repository config cannot grant

@@ -34,7 +34,7 @@ cancellation this extends to multi-step tasks),
 (the durable task state and append rules this persists through),
 [`19_token_and_cost_accounting/proposal.md`](../19_token_and_cost_accounting/proposal.md) (supplies
 the token figures the ceiling is enforced against),
-[`20_working_modes.md`](../20_working_modes.md) (Plan mode produces plans it does
+[`20_working_modes/proposal.md`](../20_working_modes/proposal.md) (Plan mode produces plans it does
 not execute).
 
 Motivation and current state moved to [`context.md`](context.md) when this spec
@@ -263,7 +263,7 @@ resume, and the remaining steps are what resumption starts from.
 Requirement 4: after a plan is created and before any mutating step runs, the
 plan is presented and the user may reorder, edit titles, delete steps, or
 approve. This is a gate in Code mode and the natural terminus in Plan mode
-([spec 20](../20_working_modes.md)) — Plan mode produces the plan and stops, and
+([spec 20](../20_working_modes/proposal.md)) — Plan mode produces the plan and stops, and
 switching to Code carries it over intact.
 
 Mid-execution editing is a non-goal, and the reason is worth recording: a step

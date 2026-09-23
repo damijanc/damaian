@@ -267,7 +267,7 @@ asserted by test at each resolution tier.
 Session-scope memory is **not** a separate store: it lives in the session event
 log alongside everything else session-scoped, following the pattern
 `browser_diagnostics_allowed_for_session` (`session.rs:261-291`) and
-[spec 20](20_working_modes.md) §5.4 already use. A session-scoped fact dies with
+[spec 20](20_working_modes/proposal.md) §5.4 already use. A session-scoped fact dies with
 its session, so a store that outlives the session would be a leak to clean up
 rather than a feature.
 

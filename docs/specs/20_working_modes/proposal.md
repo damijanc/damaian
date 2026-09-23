@@ -1,24 +1,29 @@
 # Feature Spec: Working Modes
 
-Status: Not started
+Status: In progress. Split into a folder and planned on 2026-09-23. Design
+unchanged from the original flat spec; corrections to its "Current State"
+section and §5.1's matrix — the tool inventory grew after this spec was
+written and before it was built — are in [`context.md`](context.md), not
+inlined here, the way spec 49 kept its own corrections separate. Read
+`context.md` before starting any task in [`tasks.md`](tasks.md).
 Order: 20 of 23
 Plan: `docs/PLAN/02_phase_2_complete_task_workflow.md`, Phase 2, Work
 Package 1 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#16](16_session_checkpoints_and_rewind.md) (checkpoints) — built;
-[#17](17_durable_task_state_and_crash_recovery/proposal.md) (durable task
-state) — built; [#18](18_local_evaluation_harness/proposal.md) (the harness) —
-built; [#19](19_token_and_cost_accounting/proposal.md) (token accounting) —
+Depends on: [#16](../16_session_checkpoints_and_rewind.md) (checkpoints) — built;
+[#17](../17_durable_task_state_and_crash_recovery/proposal.md) (durable task
+state) — built; [#18](../18_local_evaluation_harness/proposal.md) (the harness) —
+built; [#19](../19_token_and_cost_accounting/proposal.md) (token accounting) —
 built. Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 (command approval), section 7.6 (tool and action orchestrator), section 7.8 (risk
 classification and approval). Related implementation specs:
-[`03_structured_tool_calling.md`](03_structured_tool_calling.md) (the native tool
+[`03_structured_tool_calling.md`](../03_structured_tool_calling.md) (the native tool
 surface this filters, and the text-envelope fallback that must be filtered with
-it), [`06_mcp_support.md`](06_mcp_support.md),
-[`11_agents_md_support.md`](11_agents_md_support.md) (instruction precedence),
-[`12_web_app_troubleshooting.md`](12_web_app_troubleshooting.md),
-[`13_docker_command_support.md`](13_docker_command_support.md).
+it), [`06_mcp_support.md`](../06_mcp_support.md),
+[`11_agents_md_support.md`](../11_agents_md_support.md) (instruction precedence),
+[`12_web_app_troubleshooting.md`](../12_web_app_troubleshooting.md),
+[`13_docker_command_support.md`](../13_docker_command_support.md).
 
 ## 1. Motivation
 
@@ -33,7 +38,7 @@ settings — `require_approval_for_file_edits`,
 user is asked*, not *what is possible*. A read-only session is not expressible.
 
 That matters for two reasons beyond tidiness. Approval fatigue is real, and
-[spec 10](10_persistent_command_approval.md) exists because users learned to
+[spec 10](../10_persistent_command_approval.md) exists because users learned to
 click through prompts they stopped reading; a session that cannot mutate anything
 needs no prompts to click through. And a capability the model is offered is a
 capability the model will eventually use — the cheapest way to guarantee the
@@ -44,6 +49,15 @@ tool list, so refusing it is not a judgement the model or the policy layer has t
 make correctly under pressure.
 
 ## 2. Current State
+
+> The tool list below is what existed when this spec was written. Five more
+> native tools (`propose_plan`, `complete_step`, `list_directory`,
+> `search_content`, `edit_file`) landed after, from specs built in the
+> meantime, and before this one. [`context.md`](context.md) §1 has the
+> current, authoritative list and where each one lands in §5.1's matrix.
+> Treat the six-tool list and the `chat.rs`/`mcp.rs` line numbers below as
+> history, not current fact — re-read the actual files before relying on
+> either.
 
 - **No mode concept exists.** Every session gets the same capabilities.
 - **The tool list has exactly one construction site**, which is what makes this
@@ -59,7 +73,7 @@ make correctly under pressure.
   `self.config.supports_native_tools()` is true (`chat.rs:710`). Providers
   without native tool calling are driven by the `DAMAIAN_EDIT_V1` and
   `DAMAIAN_COMMAND_V1` text envelopes from
-  [spec 03](03_structured_tool_calling.md), whose instructions live in the system
+  [spec 03](../03_structured_tool_calling.md), whose instructions live in the system
   prompt. **This is the escape hatch**: withholding a tool definition does
   nothing for a provider that was never given tool definitions.
 - **Per-session state has an established pattern.**
@@ -67,9 +81,9 @@ make correctly under pressure.
   `browser_diagnostics_allowed_for_session`
   (`crates/workspace-engine/src/session.rs:261-291`) append an event and replay
   the log to recover the value — session-scoped approval from
-  [spec 12](12_web_app_troubleshooting.md).
+  [spec 12](../12_web_app_troubleshooting.md).
 - **Repository instruction precedence is already defined.**
-  [Spec 11](11_agents_md_support.md) establishes how `AGENTS.md` content is
+  [Spec 11](../11_agents_md_support.md) establishes how `AGENTS.md` content is
   ordered against user and admin config.
 - **Command policy is independent of intent.** `CommandPolicy` classifies a
   command by what it does (`command_policy.rs`), with hard blocks, a configured
@@ -133,7 +147,12 @@ pub enum SessionMode {
 
 The permission matrix is the primary artifact of this work package. It is
 expressed once, in code, as a function of mode and tool class — not duplicated
-across call sites:
+across call sites. This table is as originally written; [`context.md`](context.md)
+§1 extends it with the five tools that didn't exist yet (`propose_plan`,
+`complete_step` join a new "planning" row between `read_git_diff` and
+`propose_patch`, Plan and Code only; `list_directory` and `search_content`
+join the read row above; `edit_file` joins the `propose_patch` row as the
+same "mutation proposal" class) — read both together, not this table alone:
 
 | Tool class | Ask | Plan | Code | Review |
 |---|---|---|---|---|
@@ -207,7 +226,7 @@ read-only however it is spelled.
 
 This is already handled and must not be re-solved: `CommandPolicy` has
 `contains_shell_control` detection and a hard-blocked set, and
-[spec 13](13_docker_command_support.md) established that anything not provably
+[spec 13](../13_docker_command_support.md) established that anything not provably
 sandbox-safe is not automatic. Plan mode's rule is therefore mechanical: a
 command runs in Plan **only** if `CommandPolicy` classifies it as read-only *and*
 it requires no approval. Anything that would produce an approval card is refused
@@ -215,7 +234,7 @@ in Plan rather than prompted, because a prompt in Plan mode invites the user to
 approve their way out of the mode they chose.
 
 `command_allowlist` and `Allow Always` entries from
-[spec 10](10_persistent_command_approval.md) do **not** widen a mode. An
+[spec 10](../10_persistent_command_approval.md) do **not** widen a mode. An
 allowlisted `npm run build` is still refused in Ask and Plan: the allowlist says
 "do not ask me again", not "this is read-only". Acceptance asserts this
 explicitly.
@@ -244,13 +263,13 @@ when it ran. The turn captures its mode at start and uses that captured value fo
 the whole turn, so a mode change cannot take effect halfway through a tool loop.
 
 The replay reads events by parsed `eventType` rather than
-`line.contains(...)`, per [spec 17](17_durable_task_state_and_crash_recovery/proposal.md)
+`line.contains(...)`, per [spec 17](../17_durable_task_state_and_crash_recovery/proposal.md)
 §5.2 — the existing browser-diagnostics reader uses substring matching, and this
 one should not copy that part.
 
 ### 5.5 Repository instructions cannot widen a mode
 
-[Spec 11](11_agents_md_support.md) establishes `AGENTS.md` precedence. Requirement
+[Spec 11](../11_agents_md_support.md) establishes `AGENTS.md` precedence. Requirement
 5 adds a hard rule on top: **`AGENTS.md` is data with respect to capability.**
 
 Mode is resolved from session state and user action only. No `AGENTS.md` key,
@@ -272,7 +291,7 @@ selection; switching to a more restrictive one needs no confirmation.
 
 Moving from Plan to Code is the common transition and the one worth making
 smooth: a plan produced in Plan mode stays intact when the user switches to Code
-to execute it ([spec 21](21_task_plan_progress_and_budget/proposal.md) owns the plan).
+to execute it ([spec 21](../21_task_plan_progress_and_budget/proposal.md) owns the plan).
 
 Where a tool was refused by mode, the turn says which mode blocked it and what
 mode would allow it, so the user is not left guessing why the agent declined.
@@ -316,7 +335,7 @@ refusal, and where the mode event is in the session log.
 - A mode refusal tells the user which mode blocked the action and which would
   allow it.
 - Every quality-gate command from `AGENTS.md` passes, and the
-  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no increase
+  [spec 18](../18_local_evaluation_harness/proposal.md) baseline shows no increase
   in approval-policy violations.
 
 ## 7. Implementation Notes

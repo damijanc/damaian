@@ -299,7 +299,7 @@ A commit is a Git mutation and therefore a capability, not a convenience:
   committing — [spec 10](10_persistent_command_approval.md)'s persistent
   approval is exact-command for shell commands, and a standing permission to
   commit would remove the review step that requirement 1 exists to guarantee.
-- It is available only in Code mode ([spec 20](20_working_modes.md)) and only
+- It is available only in Code mode ([spec 20](20_working_modes/proposal.md)) and only
   under a profile that permits Git mutation
   ([spec 31](31_permission_profiles.md)). Ask, Plan, and Review cannot commit.
 - Repository config cannot grant it

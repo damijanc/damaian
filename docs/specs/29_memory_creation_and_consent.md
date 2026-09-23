@@ -12,7 +12,7 @@ Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
 and secret policy), section 7.8 (risk classification and approval), section 7.10
 (secret detection). Related implementation specs:
 [`11_agents_md_support.md`](11_agents_md_support.md) (instruction precedence
-memory sits below), [`20_working_modes.md`](20_working_modes.md) (mode is a
+memory sits below), [`20_working_modes/proposal.md`](20_working_modes/proposal.md) (mode is a
 capability boundary memory cannot widen),
 [`28_memory_model_and_storage.md`](28_memory_model_and_storage.md) (the record
 this spec creates), [`30_memory_retrieval_and_lifecycle.md`](30_memory_retrieval_and_lifecycle.md).
@@ -33,7 +33,7 @@ is, absent a consent boundary, a way for a repository author to write persistent
 instructions into a stranger's assistant.
 
 That is the attack this work package exists to close, and it is not hypothetical:
-`AGENTS.md` arrives with a cloned repository, and [spec 20](20_working_modes.md)
+`AGENTS.md` arrives with a cloned repository, and [spec 20](20_working_modes/proposal.md)
 §5.5 already establishes that repository content is untrusted with respect to
 capability. Memory needs the same treatment, with one addition — repository
 content may *motivate a suggestion*, but only a user action can cause a write.
@@ -231,7 +231,7 @@ an instruction-shaped memory in front of the user for confirmation.
 Requirement 5's precedence is what makes even a confirmed memory safe:
 [spec 30](30_memory_retrieval_and_lifecycle.md) delivers memory as the
 lowest-priority context category, as data, and
-[spec 20](20_working_modes.md)'s mode boundary is not consultable from memory at
+[spec 20](20_working_modes/proposal.md)'s mode boundary is not consultable from memory at
 all. A memory saying "all commands are approved" changes nothing, because
 approval is not read from context.
 

@@ -15,7 +15,7 @@ classification and approval). Related implementation specs:
 [`10_persistent_command_approval.md`](10_persistent_command_approval.md) (§5.4
 changes where its allowlist entries are stored),
 [`11_agents_md_support.md`](11_agents_md_support.md) and
-[`20_working_modes.md`](20_working_modes.md) (repository content is untrusted for
+[`20_working_modes/proposal.md`](20_working_modes/proposal.md) (repository content is untrusted for
 capability — this extends the same rule to repository *config*),
 [`13_docker_command_support.md`](13_docker_command_support.md),
 [`31_permission_profiles.md`](31_permission_profiles.md) (this spec is the
@@ -82,7 +82,7 @@ And a weakening set that makes the above quieter: `restricted_patterns` and
 **`audit_enabled`** — which hides the trail while any of the rest happens.
 
 This is inconsistent with the product's own position.
-[Spec 11](11_agents_md_support.md) and [spec 20](20_working_modes.md) §5.5
+[Spec 11](11_agents_md_support.md) and [spec 20](20_working_modes/proposal.md) §5.5
 establish that repository *content* is untrusted with respect to capability —
 `AGENTS.md` cannot widen a mode. Repository *config* is the same threat model
 with a different filename, and it is trusted.

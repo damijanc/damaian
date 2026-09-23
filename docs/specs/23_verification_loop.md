@@ -126,7 +126,7 @@ not decide whether to verify.** It may request checks, and it participates in
 repair, but the sequence — verify, find, repair, rerun, report — is Damaian's, so
 a model that would rather declare success cannot skip it.
 
-The loop is entered only in Code mode ([spec 20](20_working_modes.md)); in Ask,
+The loop is entered only in Code mode ([spec 20](20_working_modes/proposal.md)); in Ask,
 Plan, and Review there is nothing applied to verify.
 
 It appends steps to the task plan from

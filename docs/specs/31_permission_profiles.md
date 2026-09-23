@@ -5,7 +5,7 @@ Order: 31 of 33
 Plan: `docs/PLAN/04_phase_4_customization_and_extensibility.md`, Phase 4,
 Work Package 3 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#20](20_working_modes.md) (the mode a profile is narrowed by) —
+Depends on: [#20](20_working_modes/proposal.md) (the mode a profile is narrowed by) —
 **not built**. Everything else named below is a cross-reference, not a
 prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
@@ -18,7 +18,7 @@ config, and §1's live defect is closed),
 [`11_agents_md_support.md`](11_agents_md_support.md) (repository content is
 untrusted),
 [`13_docker_command_support.md`](13_docker_command_support.md),
-[`20_working_modes.md`](20_working_modes.md) (mode narrows a profile; the
+[`20_working_modes/proposal.md`](20_working_modes/proposal.md) (mode narrows a profile; the
 permission matrix this extends),
 [`32_hooks.md`](32_hooks.md) and
 [`33_mcp_management_and_deferred_discovery.md`](33_mcp_management_and_deferred_discovery.md)
@@ -60,7 +60,7 @@ single unchained command is still enough — `npm install` runs postinstall
 scripts, `make` runs a Makefile the repository controls, `curl -o` writes a file.
 
 This is inconsistent with the product's own stance elsewhere.
-[Spec 11](11_agents_md_support.md) and [spec 20](20_working_modes.md) §5.5 both
+[Spec 11](11_agents_md_support.md) and [spec 20](20_working_modes/proposal.md) §5.5 both
 establish that repository content is untrusted with respect to capability;
 `AGENTS.md` cannot widen a mode. Repository *config* is treated as trusted, and
 it is the same threat model with a different filename.
@@ -126,7 +126,7 @@ system can read the resolved state.
   (`config.rs:475-488`) requires the global switch, the server's own `enabled`,
   **and** membership of `mcp_server_allowlist` when that list is non-empty — an
   intersection rather than a last-writer-wins override.
-- **Mode exists as a capability boundary** ([spec 20](20_working_modes.md)) with
+- **Mode exists as a capability boundary** ([spec 20](20_working_modes/proposal.md)) with
   a permission matrix as its primary artifact.
 
 ## 3. Requirements
@@ -137,7 +137,7 @@ system can read the resolved state.
    from.
 3. More specific deny rules override allow rules. Deny always wins.
 4. **Repository configuration cannot weaken a user-level deny.**
-5. Mode ([spec 20](20_working_modes.md)) narrows a profile and can never widen
+5. Mode ([spec 20](20_working_modes/proposal.md)) narrows a profile and can never widen
    one. The effective capability is the intersection.
 6. Profile changes affect new actions, not actions already executing.
 7. Sanitized profile configuration can be exported and imported.
@@ -275,11 +275,11 @@ effective capability = profile ∩ mode
 ```
 
 The profile says what this installation permits; the mode
-([spec 20](20_working_modes.md)) says what this session is doing. Ask mode under
+([spec 20](20_working_modes/proposal.md)) says what this session is doing. Ask mode under
 `Full repository development` cannot edit files; Code mode under `Read-only`
 cannot either. Neither can widen the other.
 
-[Spec 20](20_working_modes.md)'s permission matrix gains the profile dimension,
+[Spec 20](20_working_modes/proposal.md)'s permission matrix gains the profile dimension,
 and the matrix test extends rather than duplicates — that matrix is named as
 that work package's primary artifact, and this one adds an axis to it.
 
@@ -315,7 +315,7 @@ closed.
 ### 5.8 Profile changes mid-session
 
 Requirement 6. A profile change takes effect for the next action, not the
-executing one — the same rule [spec 20](20_working_modes.md) §5.4 applies to
+executing one — the same rule [spec 20](20_working_modes/proposal.md) §5.4 applies to
 mode, where a turn captures its mode at start.
 
 An action already running to completion under the old profile is not aborted:
@@ -366,7 +366,7 @@ secret, command, path, and key boundaries.
 - Adding a new config field without classifying it as capability or preference
   fails to compile.
 - The permission matrix passes across every profile crossed with every tool
-  class, extending [spec 20](20_working_modes.md)'s matrix rather than
+  class, extending [spec 20](20_working_modes/proposal.md)'s matrix rather than
   duplicating it.
 - `profile ∩ mode` holds in both directions: Ask mode under the most permissive
   profile cannot edit; Code mode under Read-only cannot edit.
