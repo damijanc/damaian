@@ -16,7 +16,7 @@ corrections in [`context.md`](context.md)
 | 4 · The cached rate and the upper bound | Done | 6 tests (the plan's five plus `a_reported_cache_miss_is_not_an_upper_bound`). **Return shape decided:** `Option<CostEstimate>`, a struct with private fields, `amount()`/`is_upper_bound()`, no `Deref`, no `From<CostEstimate> for f64` and no public constructor taking a bare number — so reaching the figure means naming the method, and a reviewer can see every place that does. The label is enforced structurally at the one funnel: `task_usage_json` takes the whole `CostEstimate`, and all three shell call sites already went through it. `ChatTurnResult.estimated_cost` changed type with it. **Trust boundary confirmed, not assumed:** a `model_provider.<id>` entry from repository scope is rejected whole (`config.rs`), so the new key inherits Forbidden; pinned anyway in `repository_config_cannot_change_usage_reporting_or_prices`, because the class is per entry rather than per field. `push_model_provider_overlay`'s exhaustive destructuring caught the new key and forced the save path — the guard working as its comment says it should. Both guards falsified: collapsing `None` into `Some(0)` fails two tests, and returning `exact` instead of `upper_bound` fails the bound test. |
 | 5 · Per-task aggregation | Done | 5 tests. `TaskUsage` gains three fields, not one: `cached_input_tokens` (sum over reporting runs, `None` when none did), `cache_reported_input_tokens` (**the denominator those runs are a rate of**) and `runs_without_cache_report`. The mixed case is why the denominator is separate — dividing a partial numerator by the whole task's input dilutes the rate with runs nobody can see into. The writer **omits** `cachedInputTokens` rather than writing a zero, so an event written today by a silent provider is byte-identical to a pre-field one; both are the same fact. Also wired the four `TaskUsage`→`TokenUsage` sites left as `None` in task 1, so the upper-bound label now propagates to a task's cost with no extra machinery. **Mutation found a fake test:** `one_run_without_a_split_does_not_erase_the_others` originally recorded the cache-reporting run first, where the buggy `= total.input_tokens` coincides with the right answer, so it passed against a broken implementation. Reordered so the non-reporting run comes first (1000 against 6000); the mutation now fails it. |
 | 6 · Surfaces: shell and web UI | Done | `task_usage_json` emits `cachedInputTokens`/`cacheHitRate`/`runsWithoutCacheReport`, guarded by 7 new tests in a `cache_fields` module in `desktop-shell/src/lib.rs`; `app.js` renders it via `formatCostAtYourRates`/`formatCacheHitRate`/`cacheUsageTitle`, wired into the recovery-spend line and `markMessageUsage`. `cargo nextest run -p desktop-shell -E 'test(cache)'` (7/7 pass), `node --check`, and `npm run lint:web` (clean; one unrelated pre-existing info-level hit in `scripts/check-spec-status.mjs`) verified 2026-09-23. **Step 4 browser verification (2026-09-23):** rebuilt `damaian-desktop-shell` (binary already reflected the source — nothing recompiled since the Sep 19 edits), started an isolated instance on port 47651 with a scratch `DAMAIAN_DATA_DIR`, and drove `formatCacheHitRate`/`cacheUsageTitle`/`formatCostAtYourRates`/`markMessageUsage`/`recoverySpendLine` from the browser console: a reported split renders `"75% cached"` and composes with the upper-bound label (`"at most $0.0018 at your rates"`); an unreported split shows no rate at all and puts the "not reported... this is not 0%" sentence in the row's tooltip instead; a partial report reads `"50% cached (of 1 of 2 calls)"`. No console errors. Instance stopped by PID, scratch data dir removed. `node --check` and `npm run lint:web` re-run clean after. |
-| 7 · The `cache_hit_rate` harness metric | Not started | |
+| 7 · The `cache_hit_rate` harness metric | Done | 4 tests: the 3 planned plus `a_run_without_a_cache_report_does_not_dilute_the_rate` (the mixed-task case, one side of the pooled-sum choice below). `MetricSet::KEYS` 20 → 21, `every_metric_in_the_spec_appears_in_the_output` holds it. **Reads through `TaskUsage`, not a second aggregation**: `RunRecord` gains `cache: Option<CacheUsage>` (`cached_input_tokens`, `cache_reported_input_tokens`), populated in `runner.rs` from the same `recorded_usage: Option<TaskUsage>` that already fills `tokens`/`cost`. `metrics.rs` sums numerator and denominator **across tasks before dividing** (pooled rate), not an average of per-task rates — `the_cache_hit_rate_metric_sums_before_dividing` picks numbers (100/1000 and 800/1000) that a naive per-run average would score differently from the pooled 900/2000. `notApplicable: "no-cache-report"` when the denominator sums to zero, i.e. no task's runs reported a split — never `0%`. `cargo nextest run -p eval-harness` 64/64 passed, `cargo fmt --all -- --check` clean for the touched files (a pre-existing unrelated diff in `desktop-shell/src/lib.rs` predates this task, confirmed via `git stash`), `cargo clippy -p eval-harness --all-targets --locked -- -D warnings` clean. `evals/baseline.json` left untouched per Step 4, deferred to Task 10. |
 | 8 · Prefix-stability guards | Not started | |
 | 9 · Dormant explicit breakpoints | Not started | |
 | 10 · Docs, acceptance criteria, close the slice | Not started | |
@@ -231,19 +231,19 @@ exact figure. Task 6 still owns rendering it.
 
 **Requirements:** 8. **Files:** `eval-harness/src/{metrics,record}.rs`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
   - the metric appears in the output (`MetricSet::KEYS` 20 → 21; the existing
     `every_metric_in_the_spec_appears_in_the_output` will hold you to it).
   - it reads through `read_task_usage`, not a second count.
   - it reports `notApplicable` when no run reported a split — the shape the
     harness already has for a metric nothing supplied.
-- [ ] **Step 2: Run to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Do NOT regenerate `evals/baseline.json` yet** — it is a human
+- [x] **Step 2: Run to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Do NOT regenerate `evals/baseline.json` yet** — it is a human
       review gate (#18 §5.7), and a regeneration that lands with unrelated drift
       is a regeneration nobody reads. Task 10 decides whether this slice is the
       right moment, and if it is, every number gets read before it is committed.
-- [ ] **Step 5: Scoped checks, then show and ask**
+- [x] **Step 5: Scoped checks, then show and ask**
 
 ## Task 8: Prefix-stability guards
 

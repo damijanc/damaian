@@ -86,6 +86,24 @@ pub struct RecordedPlan {
     pub steps_outstanding: u64,
 }
 
+/// A task's prompt-cache accounting, read back from `TaskUsage`
+/// (`SessionStore::read_task_usage`, spec 49) rather than derived here —
+/// `metrics.rs` sums these across runs instead of aggregating a second time.
+///
+/// Present on `RunRecord::cache` only when at least one run in the task
+/// reported a split; `None` means none did, which is a different fact from a
+/// reported split of zero.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheUsage {
+    /// Cached input tokens summed over the runs that reported a split.
+    pub cached_input_tokens: u64,
+    /// The input tokens of those same runs — the rate's denominator, per
+    /// `TaskUsage::cache_reported_input_tokens`. Kept apart from the task's
+    /// total input tokens so a run that did not report cannot dilute the rate.
+    pub cache_reported_input_tokens: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssertionOutcome {
@@ -152,6 +170,10 @@ pub struct RunRecord {
     /// comparable. A reader diffing a live run against the deterministic
     /// baseline needs to see that in the record rather than infer it.
     pub native_tools: bool,
+    /// Spec 49 §5.6's per-task cache accounting, read through
+    /// `TaskUsage`. `None` when no run in the task reported a split.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheUsage>,
 }
 
 impl RunRecord {
@@ -189,6 +211,7 @@ impl RunRecord {
             recovery: None,
             plan: None,
             native_tools: false,
+            cache: None,
         }
     }
 

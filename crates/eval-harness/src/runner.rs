@@ -10,7 +10,7 @@ use workspace_engine::{
 
 use crate::fixture::{self, Materialized};
 use crate::record::{
-    RecordedApproval, RecordedCheck, RecordedPlan, RecordedRecovery, RunRecord, Tokens,
+    CacheUsage, RecordedApproval, RecordedCheck, RecordedPlan, RecordedRecovery, RunRecord, Tokens,
 };
 use crate::scenario::{CrashMidAction, Scenario, Tier};
 use crate::trace::{self, Trace};
@@ -542,6 +542,15 @@ fn drive(
             .unwrap_or(false),
     };
     run_record.cost = recorded_usage.and_then(|usage| usage.reported_cost);
+    // Spec 49 §5.6: read through the same `TaskUsage`, not a second
+    // aggregation. `cached_input_tokens` is `None` when no run in the task
+    // reported a split, which `and_then` carries straight into `record.cache`.
+    run_record.cache = recorded_usage.and_then(|usage| {
+        usage.cached_input_tokens.map(|cached| CacheUsage {
+            cached_input_tokens: cached,
+            cache_reported_input_tokens: usage.cache_reported_input_tokens,
+        })
+    });
     run_record.sanitize(scanner);
 
     Ok(Run {

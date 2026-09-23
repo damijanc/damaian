@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::record::{RecordedPlan, RunRecord};
+use crate::record::{CacheUsage, RecordedPlan, RunRecord};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -40,9 +40,9 @@ pub struct MetricSet {
 }
 
 impl MetricSet {
-    /// Every row of spec 18 §5.6, in the spec's order, then spec 21's. The
-    /// array exists so a test can enumerate it: requirement 5 is that no
-    /// measure quietly disappears.
+    /// Every row of spec 18 §5.6, in the spec's order, then spec 21's, then
+    /// spec 49's. The array exists so a test can enumerate it: requirement 5
+    /// is that no measure quietly disappears.
     ///
     /// Sixteen keys for §5.6's fifteen rows. Latency is one row reported as two
     /// values (median and p90, as that row itself asks for), and the two memory
@@ -51,10 +51,11 @@ impl MetricSet {
     /// spec's named measures absent from the output, which is the exact failure
     /// requirement 5 guards against.
     ///
-    /// The last four are spec 21's plan rows. They live here rather than in a
-    /// metric set of their own because requirement 5 is about *the* report — a
-    /// measure kept somewhere else is a measure a baseline diff does not cover.
-    pub const KEYS: [&'static str; 20] = [
+    /// The next four are spec 21's plan rows, and the last is spec 49's
+    /// `cache_hit_rate`. They live here rather than in a metric set of their
+    /// own because requirement 5 is about *the* report — a measure kept
+    /// somewhere else is a measure a baseline diff does not cover.
+    pub const KEYS: [&'static str; 21] = [
         "task_completion_rate",
         "check_pass_rate",
         "approval_policy_violations",
@@ -75,6 +76,7 @@ impl MetricSet {
         "plan_steps_verified",
         "plan_steps_completed_unverified",
         "plan_steps_blocked",
+        "cache_hit_rate",
     ];
 
     pub fn get(&self, key: &str) -> Option<&Metric> {
@@ -389,6 +391,39 @@ impl MetricSet {
                 count_or_no_data(total, planned.len(), "no-plans"),
             );
         }
+
+        // Spec 49 §5.6, read through `RunRecord::cache` — itself read through
+        // `TaskUsage` (`read_task_usage`), not re-derived here. Summed
+        // numerator-over-denominator across tasks rather than averaged per
+        // task, for the same reason a per-task rate sums its own runs before
+        // dividing: an average of rates weights a low-volume task the same as
+        // a high-volume one. A task whose runs never reported a split
+        // contributes to neither sum, so it cannot dilute the ones that did.
+        let cache_reports: Vec<&CacheUsage> = runnable
+            .iter()
+            .filter_map(|record| record.cache.as_ref())
+            .collect();
+        let cached_numerator: u64 = cache_reports
+            .iter()
+            .map(|cache| cache.cached_input_tokens)
+            .sum();
+        let cached_denominator: u64 = cache_reports
+            .iter()
+            .map(|cache| cache.cache_reported_input_tokens)
+            .sum();
+        push(
+            "cache_hit_rate",
+            "Prompt-cache hit rate",
+            if cached_denominator == 0 {
+                MetricValue::NotApplicable {
+                    phase: "no-cache-report".to_string(),
+                }
+            } else {
+                MetricValue::Number {
+                    value: cached_numerator as f64 / cached_denominator as f64,
+                }
+            },
+        );
 
         MetricSet { metrics }
     }

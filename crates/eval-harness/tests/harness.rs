@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use eval_harness::assertions;
 use eval_harness::metrics::{MetricSet, MetricValue};
 use eval_harness::record::{
-    AssertionOutcome, RecordedPlan, RecordedRecovery, RecordedToolCall, RunRecord, Tokens,
+    AssertionOutcome, CacheUsage, RecordedPlan, RecordedRecovery, RecordedToolCall, RunRecord,
+    Tokens,
 };
 use eval_harness::report;
 use eval_harness::scenario::{self, Tier};
@@ -1773,5 +1774,85 @@ fn a_planned_scenario_runs_end_to_end_and_reports_what_its_steps_came_to() {
             MetricValue::Count { value } => assert_eq!(*value, expected, "`{key}`"),
             other => panic!("`{key}` should be a count from a planned run, got {other:?}"),
         }
+    }
+}
+
+fn record_with_cache(scenario: &str, cache: CacheUsage) -> RunRecord {
+    let mut record = RunRecord::new(scenario, "4", "deterministic", "mock", "mock");
+    record.cache = Some(cache);
+    record
+}
+
+/// Spec 49 §5.6: the rate is summed numerator-over-denominator across runs,
+/// not averaged per run — the same reason `TaskUsage::cache_reported_input_tokens`
+/// is carried as its own field rather than reusing `input_tokens`. Two runs at
+/// 50% and 100% must not average to 75%; they must sum to 900/1200 = 75% here
+/// by construction of the numbers below, so pick numbers that would catch a
+/// naive per-run average landing on a different figure than the pooled sum.
+#[test]
+fn the_cache_hit_rate_metric_sums_before_dividing() {
+    let records = vec![
+        record_with_cache(
+            "a",
+            CacheUsage {
+                cached_input_tokens: 100,
+                cache_reported_input_tokens: 1000,
+            },
+        ),
+        record_with_cache(
+            "b",
+            CacheUsage {
+                cached_input_tokens: 800,
+                cache_reported_input_tokens: 1000,
+            },
+        ),
+    ];
+
+    let set = MetricSet::compute(&records);
+    match &set.get("cache_hit_rate").expect("cache_hit_rate").value {
+        MetricValue::Number { value } => assert_eq!(*value, 900.0 / 2000.0),
+        other => panic!("cache_hit_rate should be a number, got {other:?}"),
+    }
+}
+
+/// A run whose task never saw a reported split must not dilute a rate that
+/// other runs in the same set did report — the mixed-denominator rule #19's
+/// `reported_cost` guards, carried into the harness.
+#[test]
+fn a_run_without_a_cache_report_does_not_dilute_the_rate() {
+    let records = vec![
+        record_with_cache(
+            "a",
+            CacheUsage {
+                cached_input_tokens: 500,
+                cache_reported_input_tokens: 1000,
+            },
+        ),
+        RunRecord::new("b", "4", "deterministic", "mock", "mock"),
+    ];
+
+    let set = MetricSet::compute(&records);
+    match &set.get("cache_hit_rate").expect("cache_hit_rate").value {
+        MetricValue::Number { value } => assert_eq!(*value, 0.5),
+        other => panic!("cache_hit_rate should be a number, got {other:?}"),
+    }
+}
+
+/// §5.6: "never 0%" for a provider that reports no split at all — the harness
+/// shape for a metric nothing supplied, same as the plan rows above.
+#[test]
+fn the_cache_hit_rate_metric_reports_not_applicable_when_nothing_reported_a_split() {
+    let records = vec![RunRecord::new("a", "4", "deterministic", "mock", "mock")];
+
+    let set = MetricSet::compute(&records);
+    match &set.get("cache_hit_rate").expect("cache_hit_rate").value {
+        MetricValue::NotApplicable { phase } => assert!(
+            !phase.is_empty(),
+            "the phase marker should name why there is no data"
+        ),
+        other => panic!(
+            "cache_hit_rate must report notApplicable rather than 0% when no run reported a \
+             split, got {other:?}"
+        ),
     }
 }
