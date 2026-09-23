@@ -4863,10 +4863,16 @@ mod tests {
 
         #[test]
         fn an_upper_bound_cost_says_so() {
-            let json = json_for(usage_with(Some(6_000), 8_000, 0), Some(upper_bound_estimate()));
+            let json = json_for(
+                usage_with(Some(6_000), 8_000, 0),
+                Some(upper_bound_estimate()),
+            );
 
             assert!(json.contains("\"estimatedCost\":1"), "{json}");
-            assert!(json.contains("\"estimatedCostIsUpperBound\":true"), "{json}");
+            assert!(
+                json.contains("\"estimatedCostIsUpperBound\":true"),
+                "{json}"
+            );
         }
     }
 

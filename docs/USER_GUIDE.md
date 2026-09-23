@@ -462,17 +462,64 @@ spend. The result is labelled `at your rates`, because it is your arithmetic
 rather than the provider's invoice. Anything under a hundredth of a cent shows
 as `<$0.0001` rather than rounding to zero.
 
-**One rate per direction may not fit your provider's pricing.** Several charge
-more than one input price — a cached prompt costs a fraction of an uncached
-one, and some vary by time of day. DeepSeek, for instance, bills a cache miss
-around fifty times a cache hit, and doubles both during weekday peak hours.
-Damaian multiplies tokens by the single rate you give it and cannot tell which
-price actually applied, so pick the rate matching how you mostly work, and read
-the result as an order of magnitude rather than an amount owed. The token
-counts themselves are exact wherever they are not marked estimated.
+**One rate per direction may not fit your provider's pricing.** Some providers
+vary by time of day — DeepSeek, for instance, doubles both its cache-hit and
+cache-miss rates during weekday peak hours — and Damaian has no way to tell
+which price window applied, so pick the rate matching how you mostly work and
+read a time-varying provider's figure as an order of magnitude rather than an
+amount owed. Cache pricing itself has its own dedicated rate; see
+[Prompt cache hit rate](#prompt-cache-hit-rate) below. The token counts
+themselves are exact wherever they are not marked estimated.
 
 Where a provider does report a cost of its own, that figure is shown instead
 and carries no such label.
+
+### Prompt cache hit rate
+
+Where a provider serves part of a request's input tokens from its own prompt
+cache and reports the split, the turn's usage line adds a hit rate:
+
+```text
+~12,714 tokens (estimated) · 3 model calls · at most $0.0018 at your rates · 75% cached
+```
+
+**The hit count is measured only — never estimated.** There is no way to
+estimate a cache hit from a payload's size, so a turn with no provider-reported
+usage shows the estimated token total described above but no cache figure at
+all, rather than a guessed one.
+
+**"Not reported" is not 0%.** Hovering the usage line explains why no
+percentage shows: either this provider never reports a cache split, or it
+reported one but the turn had no input tokens to measure it against. Both read
+as "the split cannot be seen from here," never as "nothing was cached" — an
+actual 0% only appears when the provider explicitly reports zero cached tokens
+for a call that had some to report on.
+
+If some of a turn's model calls reported a split and others did not, the
+percentage covers only the calls that did, and the label says how many:
+`75% cached (of 2 of 3 calls)`.
+
+**Cost.** Configure a cached rate to price the split exactly:
+
+```text
+model_provider.deepseek.price_per_million_input_tokens=0.27
+model_provider.deepseek.price_per_million_output_tokens=1.10
+model_provider.deepseek.price_per_million_cached_input_tokens=0.028
+```
+
+With a cached rate set and a split reported, the cached and uncached tokens are
+billed at their own rates. Without one, Damaian still shows a figure — computed
+at the full input rate on every input token, and labelled **at most** — rather
+than nothing, because the error can only run one direction: charging the
+uncached rate on tokens that were actually cheaper can only overstate the cost,
+never understate it. A figure that could understate the true cost is
+suppressed instead, the same rule the missing-base-rate case above follows.
+
+A hit rate reflects what today's conversation happened to hit in the
+provider's own cache, not a setting you can raise, and Damaian does not yet
+change how a request is assembled to make a hit more likely — see
+[Cache hit rate reads "not reported", or seems low](./TROUBLESHOOTING.md#cache-hit-rate-reads-not-reported-or-seems-low)
+if a rate you expected to see is missing or lower than you expected.
 
 ## Local Data
 

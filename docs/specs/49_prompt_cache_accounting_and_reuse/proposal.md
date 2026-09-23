@@ -2,9 +2,9 @@
 
 Status: In progress. Split into a folder and planned on 2026-09-18. The
 accounting slice — requirements 1, 2, 3, 6 and 8, plus requirement 5's guard —
-is specified in [`tasks.md`](tasks.md) and is what gets built first. The reuse
-slice — requirement 4 — is blocked on a decision this spec does not own; see
-§5.8.
+is **Done** as of 2026-09-23; see [`tasks.md`](tasks.md) for the ten tasks and
+their tests. The reuse slice — requirement 4 — remains blocked on a decision
+this spec does not own; see §5.8.
 Order: 49 of 56
 Plan: `docs/PLAN/01_phase_1_trust_and_recovery.md`, Phase 1, Work Package 8
 (Should). That directory is local-only and not committed, so the reference is a

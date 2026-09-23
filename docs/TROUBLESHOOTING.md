@@ -1038,6 +1038,34 @@ turn was free". Only new turns have figures. Check the session log for
 grep -c task_usage_recorded ~/Library/Application\ Support/DamaianClient/sessions/<session>.jsonl
 ```
 
+### Cache hit rate reads "not reported", or seems low
+
+None of these are a malfunction:
+
+- **The provider never reports a cache split.** Most OpenAI-compatible
+  providers do not; the usage row's tooltip says so instead of showing 0%,
+  which would read as "caching is broken" when the truth is "we cannot see
+  it". See [Prompt cache hit rate](USER_GUIDE.md#prompt-cache-hit-rate).
+- **The system prompt or the enabled tool set changed.** A prompt cache
+  matches on an exact prefix
+  ([spec 49](specs/49_prompt_cache_accounting_and_reuse/proposal.md) §5.7);
+  toggling a tool or anything that edits the system prompt changes the first
+  bytes of every request after it, and the cache starts over from there.
+- **A compaction ran.** Rewriting earlier turns is itself a change to the
+  request and a fresh prefix to warm.
+- **The provider expired the cached prefix on its own schedule.** Providers
+  hold a cached prefix for a limited window — commonly a few minutes of
+  inactivity — and nothing in Damaian controls or extends it.
+- **The conversation is short.** A turn or two rarely has enough of a stable
+  prefix ahead of the volatile part to be worth a hit.
+
+None of this is a request Damaian is failing to make on your behalf: this
+slice measures whatever hit rate the provider already produces under today's
+request order. It does not yet reorder a request to make a hit more likely —
+that half is specified but blocked on a conversation-window redesign
+([spec 49](specs/49_prompt_cache_accounting_and_reuse/proposal.md) §5.8), not
+on anything you configured.
+
 ### The packaged app will not launch
 
 Expected, not a bug. The developer preview is ad-hoc signed, not Developer ID
