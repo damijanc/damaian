@@ -564,18 +564,217 @@ every current tool. Nothing calls it yet; that starts at Task 3.
 
 ## Task 2: MCP read-only capability
 
-**Requirements:** 2, 6. **Files:** `mcp.rs`.
+**Requirements:** 2, 6. **Files:** `mcp.rs`, `mode.rs`.
 
 Adds `read_only_hint: Option<bool>` to `McpTool`, parsed from the MCP
-protocol's `annotations.readOnlyHint` in `list_tools` (`mcp.rs:178-203`), per
-`context.md` §2's decision. Updates Task 1's `McpCall` arm to read it instead
-of the conservative `allow_in(Code)` placeholder. A server that omits the
-annotation or sets it `false` stays mutation-class — silence is not
-read-only, the same posture spec 49 used for cache reporting.
+protocol's `annotations.readOnlyHint` in `list_tools`, per `context.md` §2's
+decision. Updates `mode_permits`'s `McpCall` arm to read it instead of the
+conservative `allow_in(Code)` placeholder Task 1 left there. A server that
+omits the annotation or sets it `false` stays mutation-class — silence is
+not read-only, the same posture spec 49 used for cache reporting.
 
-*(Expand with full TDD steps before starting this task — not detailed here
-since Task 1 is this plan's current focus, per Global Constraints' pointer to
-`context.md`.)*
+This task does **not** touch `chat.rs`. `McpRuntime` already caches the raw
+`McpTool` list per server in `tools: HashMap<String, Vec<McpTool>>`
+(`mcp.rs:612`) — separately from `tool_definitions()`'s `Vec<ToolDefinition>`
+output, which is the generic `{name, description, parameters_json}` shape
+every tool kind flattens to and has no room for a hint. This task adds a
+lookup over that existing cache; wiring the lookup into `chat.rs`'s
+`McpCall` dispatch is Task 3/Task 6's job, once Layer 1 and Layer 3 exist to
+call it from. `mode_permits`'s signature changes regardless, since Task 1
+already established that a `ToolAction` variant needing extra context to
+decide gets that context as a parameter (`command: Option<&CommandClassification>`
+for `Command`) rather than the matrix growing a special case.
+
+**Interfaces:**
+- Consumes: `McpRuntime.tools: HashMap<String, Vec<McpTool>>` (`mcp.rs:612`,
+  private field — add a method rather than widening its visibility),
+  `McpClient::list_tools` (`mcp.rs:178-203`).
+- Produces: `McpTool.read_only_hint: Option<bool>`, a new
+  `McpRuntime::tool_read_only_hint(&self, server_id: &str, tool_name: &str) -> Option<bool>`
+  method Task 3/6 will call, and `mode_permits`'s widened signature —
+  `mcp_tool_read_only: Option<bool>` alongside `command`. Record in this
+  row if the parameter list grows differently.
+
+- [ ] **Step 1: Write the failing tests**
+
+  `list_tools` (`mcp.rs:178-203`) has no dedicated unit tests today —
+  it is exercised only through
+  `mcp_stdio_client_handshakes_lists_and_calls_tools`
+  (`crates/workspace-engine/tests/foundation.rs:4729`), a fake stdio
+  subprocess (a shell script that replies to `tools/list` with canned JSON)
+  driven through the real `McpClient`. Spinning up a subprocess per parsing
+  variant is the wrong shape for four small JSON-shape cases. Extract the
+  per-item parsing `list_tools` already does into a private pure function
+  first — `fn parse_mcp_tool(item: &serde_json::Value) -> Option<McpTool>`,
+  called once per array element inside `list_tools` — so these tests can be
+  ordinary unit tests in `mcp.rs`'s own `mod tests` (`mcp.rs:780`) against a
+  literal `serde_json::json!({...})` value, no subprocess required:
+  - `parse_mcp_tool_reads_a_true_read_only_hint` — an item with
+    `"annotations":{"readOnlyHint":true}` parses to
+    `read_only_hint == Some(true)`.
+  - `parse_mcp_tool_reads_a_false_read_only_hint` — `readOnlyHint:false`
+    parses to `Some(false)`, not dropped or defaulted.
+  - `parse_mcp_tool_with_no_annotations_object_is_none` — an item with no
+    `annotations` key at all parses to `None`. This is the
+    silence-is-not-read-only case; the test that would fail first if a
+    future edit defaulted it to `Some(false)` or `Some(true)` instead of
+    leaving it unknown.
+  - `parse_mcp_tool_with_annotations_but_no_read_only_hint_is_none` — an
+    `annotations` object present but without a `readOnlyHint` key (a server
+    that sets some other annotation) also parses to `None` — distinguishing
+    "no annotations sent" from "annotations sent, this one absent" is not
+    required by anything downstream, so both collapse to `None`; this test
+    pins that they do, rather than leaving it to be discovered as a gap
+    later.
+
+  Leave `mcp_stdio_client_handshakes_lists_and_calls_tools` as the one
+  existing integration test that still exercises `list_tools` end to end
+  through the real subprocess-and-transport path — it doesn't need a
+  read-only-hint case added, since the unit tests above now own that
+  question at the parsing layer, and duplicating it there would test the
+  transport twice for no new information.
+
+  In `mode.rs`'s test module:
+  - Extend `the_permission_matrix_matches_the_spec_table`'s (currently
+    absent) MCP coverage: a `ToolAction::McpCall` with
+    `mcp_tool_read_only: Some(true)` is allowed in all four modes; with
+    `Some(false)` or `None`, it follows the same allowed-in-Code-only shape
+    the placeholder already has.
+  - `an_mcp_call_with_no_read_only_signal_is_treated_as_mutation_class` —
+    `mcp_tool_read_only: None` refused in Ask/Plan/Review, the explicit
+    silence-is-not-a-green-light regression guard, named separately from
+    the crossing test so a future reader finds the reasoning attached to
+    the case that most needs it.
+
+- [ ] **Step 2: Run to verify they fail**
+
+  `cargo nextest run -p workspace-engine -E 'test(read_only) + test(mcp_call)'`
+
+- [ ] **Step 3: Implement `mcp.rs`**
+
+  Add the field:
+
+  ```rust
+  pub struct McpTool {
+      pub name: String,
+      pub description: String,
+      pub input_schema_json: String,
+      /// The server's own claim about whether calling this tool has side
+      /// effects, from `tools/list`'s optional `annotations.readOnlyHint`.
+      /// `None` means the server made no claim either way — not "not
+      /// read-only" and not "read-only". A hint, per the MCP spec, not a
+      /// guarantee; `mode_permits` (`mode.rs`) is what turns it into an
+      /// enforced boundary, and only a `Some(true)` widens what a
+      /// capability-restricted mode offers.
+      pub read_only_hint: Option<bool>,
+  }
+  ```
+
+  Extract the per-item parsing into a private function and call it from
+  `list_tools` (`mcp.rs:178-203`) in place of the inline loop body:
+
+  ```rust
+  fn parse_mcp_tool(item: &Value) -> Option<McpTool> {
+      let name = item.get("name").and_then(Value::as_str)?.to_string();
+      let description = item
+          .get("description")
+          .and_then(Value::as_str)
+          .unwrap_or("")
+          .to_string();
+      let input_schema = item
+          .get("inputSchema")
+          .cloned()
+          .unwrap_or_else(|| json!({ "type": "object" }));
+      let read_only_hint = item
+          .get("annotations")
+          .and_then(|a| a.get("readOnlyHint"))
+          .and_then(Value::as_bool);
+      Some(McpTool {
+          name,
+          description,
+          input_schema_json: input_schema.to_string(),
+          read_only_hint,
+      })
+  }
+  ```
+
+  `list_tools` becomes `items.iter().filter_map(parse_mcp_tool).collect()`
+  (its existing `continue`-on-missing-name behavior is exactly what
+  `filter_map` over an `Option`-returning function gives for free — confirm
+  this before assuming it, `list_tools`'s current loop may do something
+  slightly different worth preserving).
+
+  Add the lookup method near `McpRuntime`'s other accessors
+  (`requires_approval`, `mcp.rs:662`):
+
+  ```rust
+  /// The server's own read-only claim for one of its tools, from the
+  /// cached `tools/list` response — `None` both when the server made no
+  /// claim and when the tool or server is unknown to this runtime. Callers
+  /// that need to distinguish "unknown" from "known but unclaimed" should
+  /// not use this method; nothing downstream needs that distinction today.
+  pub fn tool_read_only_hint(&self, server_id: &str, tool_name: &str) -> Option<bool> {
+      self.tools
+          .get(server_id)?
+          .iter()
+          .find(|tool| tool.name == tool_name)?
+          .read_only_hint
+  }
+  ```
+
+  Fix every other `McpTool { .. }` construction site the compiler names
+  (test fixtures almost certainly construct it by struct literal) to add
+  `read_only_hint: None` unless that fixture is specifically testing the
+  hint.
+
+- [ ] **Step 4: Widen `mode_permits` and implement the real `McpCall` arm**
+
+  ```rust
+  pub(crate) fn mode_permits(
+      mode: SessionMode,
+      action: &ToolAction,
+      command: Option<&CommandClassification>,
+      mcp_tool_read_only: Option<bool>,
+  ) -> Permission {
+      // ...
+      ToolAction::McpCall { .. } => {
+          if mcp_tool_read_only == Some(true) {
+              Permission::Allowed
+          } else if mode == Code {
+              Permission::Allowed
+          } else {
+              Permission::Refused { blocked_by: mode, allowed_in: Code }
+          }
+      }
+  }
+  ```
+
+  Update every existing call site of `mode_permits` in `mode.rs`'s own
+  tests to pass `None` for the new parameter where the action under test
+  is not `McpCall` — the compiler will name each one. Remove the
+  `#[allow(dead_code)]`-adjacent "Task 2 replaces this arm" comment Task 1
+  left, since this task is what replaces it.
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+  `cargo nextest run -p workspace-engine -E 'test(mode) + test(mcp)'`
+
+- [ ] **Step 6: Mutation-test the silence case**
+
+  Temporarily change the `McpCall` arm to treat `None` the same as
+  `Some(true)` (i.e. delete the `mcp_tool_read_only == Some(true)`
+  distinction and allow whenever `mode != Code` is the only gate removed —
+  concretely, make `None` also permit outside Code) and confirm
+  `an_mcp_call_with_no_read_only_signal_is_treated_as_mutation_class` fails.
+  Revert.
+
+- [ ] **Step 7: Scoped checks**
+
+  `cargo nextest run -p workspace-engine -E 'test(mode) + test(mcp)'`,
+  `cargo fmt`, `cargo clippy -p workspace-engine --all-targets --locked --
+  -D warnings`.
+
+- [ ] **Step 8: Show the change and the check result, and ask before committing**
 
 ## Task 3: Layer 1 — tool-list construction filters by mode
 
