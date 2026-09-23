@@ -19,6 +19,7 @@ pub mod index_cache;
 pub mod indexer;
 pub mod language;
 pub mod mcp;
+pub mod mode;
 pub mod model;
 pub mod navigation;
 pub mod patch_engine;

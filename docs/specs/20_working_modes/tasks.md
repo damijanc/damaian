@@ -10,7 +10,7 @@ extended tool-class mapping in [`context.md`](context.md)
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · `SessionMode`, `ToolAction` extended with the two new mutation/planning arms it needs, and the permission-matrix function | Not started | |
+| 1 · `SessionMode`, `ToolAction` extended with the two new mutation/planning arms it needs, and the permission-matrix function | Done | `mode.rs` added, registered in `lib.rs` between `mcp` and `model`. Signature decision (Step 3): `fn mode_permits(mode: SessionMode, action: &ToolAction, command: Option<&CommandClassification>) -> Permission` — the single-function-over-the-whole-enum option, per context.md §6's preference; `Command` gets no separate function. `Permission` is `Allowed \| Refused { blocked_by: SessionMode, allowed_in: SessionMode }`, matching the sketch. `ToolAction`, `CommandRequest`, and `ProposedStep` were module-private to `chat.rs` and had to be widened to `pub(crate)` (with `CommandRequest`'s fields also `pub(crate)`) for `mode.rs` to see them — no other file referenced them before this change. Two field-name corrections against tasks.md's own sketch, confirmed by reading the real types before writing the test: `GeneratedEdit` has `changes: Vec<ProposedChange>`, not `files`; `WebDiagnosticCall` is a struct (`kind: WebDiagnosticKind, url, arguments_json, session_id, task_id`), not an enum with an `InspectPage` variant. `SessionMode`, `Permission`, `mode_permits`, and `Permission::is_allowed` carry `#[allow(dead_code)]` with a comment pointing at Task 3, since this task is self-contained by design and nothing outside its own tests calls them yet — `cargo clippy -D warnings` fails without it. Mutation test: flipped the `ProposePatch`/`EditFile` arm to also allow `Ask`, confirmed `the_permission_matrix_matches_the_spec_table` fails (`assertion failed: !mode_permits(Ask, action, None).is_allowed()`), reverted. All 9 `mode::tests` pass; `cargo fmt --all -- --check` and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` both clean. |
 | 2 · MCP read-only capability | Not started | |
 | 3 · Layer 1 — tool-list construction filters by mode | Not started | |
 | 4 · Persistence — `SessionStore::set_session_mode` / `session_mode` | Not started | |
@@ -163,7 +163,7 @@ every current tool. Nothing calls it yet; that starts at Task 3.
   signature — see Step 3 — so later tasks can cite it precisely instead of
   re-deriving it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
   Create `crates/workspace-engine/src/mode.rs` with `#[cfg(test)] mod tests`
   below the (not-yet-existing) implementation. Write these first so they fail
@@ -388,12 +388,12 @@ every current tool. Nothing calls it yet; that starts at Task 3.
   `chat.rs:3237-3400` for the authoritative shapes before writing this;
   the sketch above may not match field-for-field.
 
-- [ ] **Step 2: Run to verify they fail to compile**
+- [x] **Step 2: Run to verify they fail to compile**
 
   `cargo nextest run -p workspace-engine -E 'test(mode)'` — expect a compile
   error (`mode` module and `mode_permits` do not exist yet).
 
-- [ ] **Step 3: Decide and record the function's shape**
+- [x] **Step 3: Decide and record the function's shape**
 
   Options, per `context.md` §6:
   - `fn mode_permits(mode: SessionMode, action: &ToolAction, command: Option<&CommandClassification>) -> Permission`
@@ -424,7 +424,7 @@ every current tool. Nothing calls it yet; that starts at Task 3.
   spec 49 Task 2 recorded its `ReportedUsage` decision — a future task
   reads this row instead of re-deriving the signature from the test file.
 
-- [ ] **Step 4: Implement `SessionMode` and `mode_permits`**
+- [x] **Step 4: Implement `SessionMode` and `mode_permits`**
 
   ```rust
   use crate::chat::ToolAction;
@@ -542,23 +542,23 @@ every current tool. Nothing calls it yet; that starts at Task 3.
   arms above; remove it if the final implementation does not need it, or use
   it consistently — do not leave a half-used helper.
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
   `cargo nextest run -p workspace-engine -E 'test(mode)'`
 
-- [ ] **Step 6: Mutation-test the matrix**
+- [x] **Step 6: Mutation-test the matrix**
 
   Temporarily flip one arm (e.g. make `Ask` permit `ProposePatch`) and
   confirm `the_permission_matrix_matches_the_spec_table` fails. Revert.
   This is the work package's primary artifact per `proposal.md` §6 — it must
   be provably capable of failing.
 
-- [ ] **Step 7: Scoped checks**
+- [x] **Step 7: Scoped checks**
 
   `cargo nextest run -p workspace-engine -E 'test(mode)'`, `cargo fmt`,
   `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`.
 
-- [ ] **Step 8: Show the change and the check result, and ask before committing**
+- [x] **Step 8: Show the change and the check result, and ask before committing**
 
 ---
 

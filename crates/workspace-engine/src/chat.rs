@@ -3213,9 +3213,9 @@ fn bounded_messages(messages: &[ModelMessage], max_messages: usize) -> Vec<Model
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CommandRequest {
-    command: String,
-    reason: String,
+pub(crate) struct CommandRequest {
+    pub(crate) command: String,
+    pub(crate) reason: String,
 }
 
 /// One step as the model proposed it. Only a title and an optional detail: the
@@ -3223,7 +3223,7 @@ struct CommandRequest {
 /// the model supply them would hand it the very field requirement 6 exists to
 /// keep out of its reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ProposedStep {
+pub(crate) struct ProposedStep {
     title: String,
     detail: Option<String>,
 }
@@ -3234,7 +3234,7 @@ struct ProposedStep {
 /// the text-envelope fallback and native tool calls funnel through the same
 /// handling per variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ToolAction {
+pub(crate) enum ToolAction {
     Command(CommandRequest),
     ProposePatch(GeneratedEdit),
     /// The model's plan for this turn. §5.1: a turn is non-trivial when the
