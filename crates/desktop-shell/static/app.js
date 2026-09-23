@@ -3480,9 +3480,14 @@ function recoverySpendLine(task) {
   ];
   if (typeof task.reportedCost === "number") {
     parts.push(formatCost(task.reportedCost));
-  } else if (typeof task.estimatedCost === "number") {
-    parts.push(`${formatCost(task.estimatedCost)} at your rates`);
+  } else {
+    const atYourRates = formatCostAtYourRates(task);
+    if (atYourRates) parts.push(atYourRates);
   }
+  const cached = formatCacheHitRate(task);
+  if (cached) parts.push(cached);
+  const cacheTitle = cacheUsageTitle(task);
+  if (cacheTitle) row.title = cacheTitle;
   const spent = `Spent before it stopped: ${parts.join(" · ")}.`;
   row.textContent = task.includesLostCall
     ? `${spent} That includes the model call that was still in flight, which was billed even ` +
@@ -3934,6 +3939,48 @@ function formatCost(cost) {
   return `$${cost.toFixed(4)}`;
 }
 
+// Per docs/specs/49_prompt_cache_accounting_and_reuse/ §5.3. A figure computed
+// at the full input rate while the provider reported cached tokens can only be
+// too high, so it is shown rather than suppressed — but never as though it were
+// exact. Composes with `formatCost`, so a sub-$0.0001 bound still reads
+// `at most <$0.0001`.
+function formatCostAtYourRates(usage) {
+  if (typeof usage.estimatedCost !== "number") return null;
+  const figure = formatCost(usage.estimatedCost);
+  return usage.estimatedCostIsUpperBound
+    ? `at most ${figure} at your rates`
+    : `${figure} at your rates`;
+}
+
+// §5.6. A hit rate is only ever shown when the provider actually reported one:
+// an unreported split must never render as 0%, which reads as "caching is
+// broken" when the truth is "we cannot see it". That case is explained in the
+// row's tooltip instead of taking a permanent slot in a one-line summary.
+//
+// `cacheHitRate` is a rate over the runs that reported, not over the task, so
+// where some runs stayed silent the text says how many it covers rather than
+// implying it covers everything.
+function formatCacheHitRate(usage) {
+  if (typeof usage.cacheHitRate !== "number") return null;
+  const percent = `${Math.round(usage.cacheHitRate * 100)}% cached`;
+  const silent = usage.runsWithoutCacheReport ?? 0;
+  if (silent === 0) return percent;
+  const covered = usage.runCount - silent;
+  return `${percent} (of ${covered} of ${usage.runCount} calls)`;
+}
+
+// The sentence §5.6 requires for a provider that reports nothing. Lives in the
+// tooltip rather than the visible row: stated on every turn it would be
+// permanent chrome saying the same thing forever, which is what specs 41–44
+// were written to remove.
+function cacheUsageTitle(usage) {
+  if (typeof usage.cacheHitRate === "number") return null;
+  if (typeof usage.cachedInputTokens === "number") {
+    return "This provider reported a cache split for this turn, but no input tokens to measure it against.";
+  }
+  return "Cache usage not reported by this provider. This is not 0% — it means the split cannot be seen from here.";
+}
+
 // Per docs/specs/19_token_and_cost_accounting/. An estimated figure is always
 // marked as one: a total is only as trustworthy as its weakest term, so a
 // single estimated call makes the whole turn's number an approximation.
@@ -3961,9 +4008,14 @@ function markMessageUsage(target, usage) {
   // which is which rather than letting them look alike.
   if (typeof usage.reportedCost === "number") {
     parts.push(formatCost(usage.reportedCost));
-  } else if (typeof usage.estimatedCost === "number") {
-    parts.push(`${formatCost(usage.estimatedCost)} at your rates`);
+  } else {
+    const atYourRates = formatCostAtYourRates(usage);
+    if (atYourRates) parts.push(atYourRates);
   }
+  const cached = formatCacheHitRate(usage);
+  if (cached) parts.push(cached);
+  const cacheTitle = cacheUsageTitle(usage);
+  if (cacheTitle) row.title = cacheTitle;
   label.textContent = parts.join(" · ");
   row.append(label);
   target.body.after(row);
