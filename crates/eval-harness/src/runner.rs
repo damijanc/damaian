@@ -54,6 +54,7 @@ pub fn mock_provider() -> ModelProviderConfig {
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,
         price_per_million_cached_input_tokens: None,
+        supports_explicit_cache_breakpoints: false,
     }
 }
 
@@ -198,6 +199,7 @@ pub fn live_config(data_dir: &Path, provider: &str, model: &str) -> Config {
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,
         price_per_million_cached_input_tokens: None,
+        supports_explicit_cache_breakpoints: false,
     });
     config
 }

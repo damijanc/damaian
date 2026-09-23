@@ -205,6 +205,11 @@ fn repository_config_cannot_change_usage_reporting_or_prices() {
             // entry, not per field, so a future refactor to per-field handling
             // would have to keep it.
             "model_provider.openai.price_per_million_cached_input_tokens=0.0\n",
+            // Spec 49 Task 9's dormant breakpoint switch. A repository turning
+            // this on would change the request body a user's own provider
+            // config never asked for, so it inherits the same Forbidden class
+            // rather than being assumed dormant everywhere.
+            "model_provider.openai.supports_explicit_cache_breakpoints=true\n",
         ),
     );
 
@@ -217,6 +222,10 @@ fn repository_config_cannot_change_usage_reporting_or_prices() {
     assert!(
         config.provider_reports_usage(),
         "the user's default must survive a repository trying to turn it off"
+    );
+    assert!(
+        !config.supports_explicit_cache_breakpoints(),
+        "a repository must not be able to turn on the dormant breakpoint switch"
     );
 
     fixture.cleanup();

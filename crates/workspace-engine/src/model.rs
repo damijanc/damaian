@@ -262,6 +262,12 @@ pub struct ModelRequest {
     /// both pointless and sometimes rejected on a non-streaming call.
     /// Spec 19 §5.2.
     pub request_usage: bool,
+    /// Ask the provider to mark an explicit prompt-cache breakpoint. Dormant:
+    /// set from [`crate::Config::supports_explicit_cache_breakpoints`], which
+    /// defaults to `false` for every provider, so no configured provider
+    /// turns this on and the request body is unchanged from before this
+    /// field existed. Spec 49 §5.5.
+    pub emit_cache_breakpoints: bool,
 }
 
 // No `Eq`: `reported_cost` is an `Option<f64>`. Nothing uses a run as a map key
@@ -1418,6 +1424,12 @@ pub fn model_request_json(request: &ModelRequest) -> String {
             .join(",");
         body.push_str(&format!(",\"tools\":[{tools_json}]"));
     }
+    // Dormant (spec 49 §5.5): no configured provider sets
+    // `supports_explicit_cache_breakpoints`, so this stays off and the body
+    // below is never reached in normal use.
+    if request.emit_cache_breakpoints {
+        body.push_str(",\"cache_control\":{\"type\":\"ephemeral\"}");
+    }
     body.push('}');
     body
 }
@@ -2451,6 +2463,7 @@ mod tests {
             tools: None,
             max_tokens: None,
             request_usage: false,
+            emit_cache_breakpoints: false,
         }
     }
 
@@ -2502,6 +2515,30 @@ mod tests {
     #[test]
     fn a_request_that_does_not_ask_for_usage_omits_the_option() {
         assert!(!model_request_json(&test_request()).contains("stream_options"));
+    }
+
+    #[test]
+    fn a_request_with_breakpoints_off_is_byte_identical_to_todays_body() {
+        // Spec 49 §9: the slice changes no request. `test_request()` already
+        // carries `emit_cache_breakpoints: false`, so this pins the exact
+        // body model_request_json produced before this field existed —
+        // dropping this assertion, not just leaving it passing, is the point.
+        let body = model_request_json(&test_request());
+        assert_eq!(
+            body,
+            "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"stream\":false}"
+        );
+    }
+
+    #[test]
+    fn a_request_with_breakpoints_on_carries_the_marker() {
+        let request = ModelRequest {
+            emit_cache_breakpoints: true,
+            ..test_request()
+        };
+        assert!(
+            model_request_json(&request).contains("\"cache_control\":{\"type\":\"ephemeral\"}")
+        );
     }
 
     #[test]

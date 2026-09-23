@@ -125,6 +125,7 @@ fn provider(id: &str) -> ModelProviderConfig {
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,
         price_per_million_cached_input_tokens: None,
+        supports_explicit_cache_breakpoints: false,
     }
 }
 

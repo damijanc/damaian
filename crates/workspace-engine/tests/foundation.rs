@@ -2043,6 +2043,7 @@ fn chat_dispatches_native_tool_call_when_provider_supports_it() {
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,
         price_per_million_cached_input_tokens: None,
+        supports_explicit_cache_breakpoints: false,
     });
     let engine = WorkspaceEngine::new(config);
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
@@ -2359,6 +2360,7 @@ fn chat_chains_multiple_native_tool_calls_within_one_turn() {
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,
         price_per_million_cached_input_tokens: None,
+        supports_explicit_cache_breakpoints: false,
     });
     let engine = WorkspaceEngine::new(config);
     // The model asks to run `pwd`, then—after seeing that result—asks to
@@ -2436,6 +2438,7 @@ fn native_tool_provider() -> ModelProviderConfig {
         price_per_million_input_tokens: None,
         price_per_million_output_tokens: None,
         price_per_million_cached_input_tokens: None,
+        supports_explicit_cache_breakpoints: false,
     }
 }
 
@@ -3669,6 +3672,7 @@ fn builds_openai_request_json_and_extracts_stream_tokens() {
         tools: None,
         max_tokens: None,
         request_usage: false,
+        emit_cache_breakpoints: false,
     };
     let body = model_request_json(&request);
     assert!(body.contains("\"model\":\"test-model\""));
@@ -3691,6 +3695,7 @@ fn reports_openai_compatible_error_payloads() {
         tools: None,
         max_tokens: None,
         request_usage: false,
+        emit_cache_breakpoints: false,
     };
     let body = model_request_json(&request);
     assert!(!body.contains("reasoning_effort"));

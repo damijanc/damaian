@@ -1432,6 +1432,7 @@ impl ChatOrchestrator {
                 tools,
                 max_tokens: self.config.max_output_tokens(),
                 request_usage: self.config.provider_reports_usage(),
+                emit_cache_breakpoints: self.config.supports_explicit_cache_breakpoints(),
             };
 
             let token_estimate: usize = request

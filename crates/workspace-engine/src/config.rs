@@ -306,6 +306,13 @@ pub struct ModelProviderConfig {
     /// instead, because that error can only run in the safe direction.
     /// Spec 49 §5.3.
     pub price_per_million_cached_input_tokens: Option<f64>,
+    /// Whether this provider requires an explicit prompt-cache breakpoint
+    /// marker rather than caching automatically. Defaults to `false`.
+    /// Declared now because adding it later is a config-schema change across
+    /// persisted provider settings, but dormant: no configured provider sets
+    /// it, so turning it on is the only thing that changes a request body.
+    /// Spec 49 §5.5.
+    pub supports_explicit_cache_breakpoints: bool,
 }
 
 /// A cost computed from the user's own configured rates, and whether it is
@@ -373,6 +380,7 @@ pub struct ModelProviderConfigOverlay {
     pub price_per_million_input_tokens: Option<f64>,
     pub price_per_million_output_tokens: Option<f64>,
     pub price_per_million_cached_input_tokens: Option<f64>,
+    pub supports_explicit_cache_breakpoints: Option<bool>,
 }
 
 /// How the client talks to an MCP server. `Stdio` spawns a local subprocess
@@ -971,6 +979,19 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// Whether the active model provider requires an explicit prompt-cache
+    /// breakpoint marker rather than caching automatically. Defaults to
+    /// false for any provider that hasn't explicitly opted in — dormant
+    /// today because no built-in or configured provider sets it. Spec 49
+    /// §5.5.
+    pub fn supports_explicit_cache_breakpoints(&self) -> bool {
+        self.model_provider_config(&self.model_provider)
+            .cloned()
+            .or_else(|| builtin_model_provider_config(&self.model_provider))
+            .map(|provider| provider.supports_explicit_cache_breakpoints)
+            .unwrap_or(false)
+    }
+
     /// The explicit `max_tokens` to send for the active provider and model.
     /// `None` leaves the field off the request entirely.
     ///
@@ -1170,6 +1191,9 @@ impl Config {
             if let Some(value) = overlay.price_per_million_cached_input_tokens {
                 provider.price_per_million_cached_input_tokens = Some(value);
             }
+            if let Some(value) = overlay.supports_explicit_cache_breakpoints {
+                provider.supports_explicit_cache_breakpoints = value;
+            }
             return;
         }
 
@@ -1186,6 +1210,9 @@ impl Config {
             price_per_million_input_tokens: overlay.price_per_million_input_tokens,
             price_per_million_output_tokens: overlay.price_per_million_output_tokens,
             price_per_million_cached_input_tokens: overlay.price_per_million_cached_input_tokens,
+            supports_explicit_cache_breakpoints: overlay
+                .supports_explicit_cache_breakpoints
+                .unwrap_or(false),
             id,
         });
     }
@@ -1896,6 +1923,9 @@ impl ConfigOverlay {
                 provider.price_per_million_cached_input_tokens =
                     Some(parse_price(provider_key, value)?);
             }
+            "supports_explicit_cache_breakpoints" => {
+                provider.supports_explicit_cache_breakpoints = Some(parse_bool(field, value)?);
+            }
             _ => {
                 return Err(ClientError::InvalidInput(format!(
                     "Unknown model provider config key: model_provider.{provider_key}"
@@ -2110,6 +2140,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             price_per_million_input_tokens: None,
             price_per_million_output_tokens: None,
             price_per_million_cached_input_tokens: None,
+            supports_explicit_cache_breakpoints: false,
         }),
         "deepseek" => Some(ModelProviderConfig {
             id: "deepseek".to_string(),
@@ -2132,6 +2163,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             price_per_million_input_tokens: None,
             price_per_million_output_tokens: None,
             price_per_million_cached_input_tokens: None,
+            supports_explicit_cache_breakpoints: false,
         }),
         "openai-compatible" => Some(ModelProviderConfig {
             id: "openai-compatible".to_string(),
@@ -2146,6 +2178,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             price_per_million_input_tokens: None,
             price_per_million_output_tokens: None,
             price_per_million_cached_input_tokens: None,
+            supports_explicit_cache_breakpoints: false,
         }),
         _ => None,
     }
@@ -2286,6 +2319,7 @@ fn push_model_provider_overlay(output: &mut String, provider: &ModelProviderConf
         price_per_million_input_tokens,
         price_per_million_output_tokens,
         price_per_million_cached_input_tokens,
+        supports_explicit_cache_breakpoints,
     } = provider;
 
     if let Some(value) = label {
@@ -2350,6 +2384,13 @@ fn push_model_provider_overlay(output: &mut String, provider: &ModelProviderConf
         push_line(
             output,
             &format!("model_provider.{id}.price_per_million_cached_input_tokens"),
+            &value.to_string(),
+        );
+    }
+    if let Some(value) = supports_explicit_cache_breakpoints {
+        push_line(
+            output,
+            &format!("model_provider.{id}.supports_explicit_cache_breakpoints"),
             &value.to_string(),
         );
     }
