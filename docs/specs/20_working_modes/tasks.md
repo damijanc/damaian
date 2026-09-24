@@ -924,16 +924,219 @@ to introduce by picking the "more correct-looking" reader here.
 
 **Requirements:** 2, 6. **Files:** `chat.rs`.
 
-Filters `native_tools` (`chat.rs:1267-1293`) by `mode_permits`, reading the
-turn's mode via `SessionStore::session_mode` (Task 3), captured once per turn
-per `proposal.md` §5.4 — read it before the tool list is built, not per
-action. For `run_command`, whether the tool definition itself is offered
-cannot depend on a specific command's classification — the decision here is
-coarser: offer `run_command_tool_definition()` whenever *some* command could
-pass in this mode (i.e., not in Ask), and let Layer 3 refuse individual
-commands. Acceptance criterion: "no tool capable of mutation appears in the
-tool list sent to the model — asserted against the constructed list, not the
-prompt," in Ask and Plan.
+Filters `native_tools` (`chat.rs:1267-1293` as of Task 3 — re-confirm before
+editing, `chat.rs` line numbers drift, per this plan's own `AGENTS.md`
+citation on why #47 was once deferred behind another spec editing the same
+file) by `mode_permits`, reading the turn's mode via `self.session_store
+.session_mode(&session.id)` (Task 3) **once, before `native_tools` is
+built** — never inside the tool loop, never re-read later in the turn, per
+`proposal.md` §5.4's "captured at start" rule.
+
+`mode_permits` decides per `ToolAction` *variant*, not per tool definition,
+so filtering the definition list means asking it about a representative
+action of each definition's kind rather than a real one — there is no real
+`path`, `command`, or `arguments_json` yet, only the intent to offer the
+tool at all. Build one placeholder `ToolAction` per definition (field values
+don't matter; only the variant does, for every arm except `Command` and
+`McpCall`) and ask `mode_permits(mode, &placeholder, ..).is_allowed()`.
+
+**`run_command` is the one case that needs a synthetic classification, not a
+real one** — per the task's original framing, whether the *definition* is
+offered cannot depend on one specific command, only on whether *any*
+command could pass in this mode. Ask `mode_permits` about the most
+permissive command there is (`CommandRisk::Low`, `requires_approval: false`)
+rather than hand-coding `mode != Ask` directly next to it — the latter
+would be exactly the second `match mode` the Global Constraints forbid, even
+though it would happen to produce the same three-mode answer today.
+
+**MCP tools need a per-tool lookup**, since `mcp.tool_definitions()` returns
+flat, namespaced `ToolDefinition`s with no room for a hint. For each one,
+`parse_namespaced_tool_name` (`mcp.rs:45`, already used two lines below in
+the existing `browser_mcp_server_ids` filter) recovers `(server_id,
+tool_name)`; `mcp.tool_read_only_hint(&server_id, &tool_name)` (Task 2) is
+the value to pass as `mode_permits`'s fourth argument.
+
+Acceptance criterion: "no tool capable of mutation appears in the tool list
+sent to the model — asserted against the constructed list, not the prompt,"
+in Ask and Plan.
+
+**Interfaces:**
+- Consumes: `mode_permits` (`mode.rs`, Task 1/2), `SessionStore::session_mode`
+  (Task 3), `McpRuntime::tool_read_only_hint` (Task 2), `parse_namespaced_tool_name`
+  (`mcp.rs:45`).
+- Produces: nothing new for later tasks to call — this task's output is
+  `native_tools`'s filtered content itself, observed by Task 4's own test
+  against the constructed `Vec<ToolDefinition>`, and by Task 10's acceptance
+  walk.
+
+- [ ] **Step 1: Write the failing tests**
+
+  Find how `run_agentic_turn` (or the tool-list construction specifically)
+  is already exercised by existing tests in `chat.rs`'s own test module or
+  `tests/foundation.rs` — `MockModelAdapter` is the seam (per this plan's
+  Interface reference), so a test almost certainly already drives a turn
+  through it and could be adapted to also inspect `adapter.requests[0]`'s
+  tool list, the same seam spec 49 Task 8 used for its prefix-stability
+  guards. Match whatever fixture-building pattern (a temp repo, a session,
+  a task) those existing tests already use rather than inventing a new one.
+  - `ask_mode_offers_no_run_command_tool_definition_at_all` — construct a
+    session in `SessionMode::Ask` (via `set_session_mode`, Task 3), run a
+    turn, and assert the tool list sent to `MockModelAdapter` contains none
+    of: `run_command`, `propose_patch`, `edit_file`, `propose_plan`,
+    `complete_step`. This is the sharpest version of the acceptance
+    criterion — Ask offers **no commands at all**, not even read-only ones
+    (`proposal.md` §5.1's own callout), so this test should find zero tool
+    names from that list, not merely miss the mutating ones.
+  - `plan_mode_offers_run_command_but_not_propose_patch_or_edit_file` — Plan
+    mode's tool list contains `run_command` (since some command — a
+    read-only one — could pass) but not `propose_patch`, `edit_file`,
+    `propose_plan`, or `complete_step`. Note `propose_plan`/`complete_step`
+    are refused here too, by `context.md` §1's table — Ask and Review lack
+    them, but so does nothing else; only Plan and Code carry them, so this
+    test's "but not" list must still name them, don't drop them from the
+    assertion just because `run_command` already made it through.
+  - `code_mode_offers_every_native_tool` — regression guard that Task 4
+    changed nothing about today's behavior for the mode migration defaults
+    to (`requirement 7`), including `propose_plan`/`complete_step`.
+  - `review_mode_offers_read_only_commands_and_web_diagnostics_but_not_mutation`
+    — Review's specific shape from `proposal.md` §5.1's callout: reviewing
+    often means reproducing a change, so browser diagnostics and read-only
+    commands are offered, but `propose_patch`/`edit_file` are not.
+  - `an_mcp_tool_without_a_read_only_hint_is_withheld_in_ask` — a fixture
+    MCP server (reuse whatever the existing MCP-related chat tests already
+    construct — `mcp_stdio_client_handshakes_lists_and_calls_tools` in
+    `tests/foundation.rs` is the closest precedent, though it tests
+    `McpClient` directly rather than a full turn) whose `tools/list`
+    response has no `annotations` object at all; its tool is absent from
+    Ask's list.
+  - `an_mcp_tool_with_a_true_read_only_hint_is_offered_in_ask` — same
+    fixture shape, `readOnlyHint: true`; the tool is present in Ask's list.
+
+- [ ] **Step 2: Run to verify they fail**
+
+  `cargo nextest run -p workspace-engine -E 'test(mode_mode) + test(ask_mode) + test(plan_mode) + test(code_mode) + test(review_mode) + test(mcp_tool)'` —
+  adjust the filter once the real test names and module placement are
+  decided in Step 1; this is a starting guess, not a fixed command.
+
+- [ ] **Step 3: Implement**
+
+  Read `mode: SessionMode` once, immediately before `native_tools` is
+  constructed:
+
+  ```rust
+  let mode = self.session_store.session_mode(&session.id);
+  ```
+
+  Then filter the `tools` vec inside the `supports_native_tools().then(||
+  ...)` closure. A sketch — adjust field names to whatever Step 1 confirmed
+  the real `ToolAction` construction requires, matching `mode.rs`'s own
+  tests for the exact current shapes rather than this plan's history of
+  sketches that turned out to need correction:
+
+  ```rust
+  let permits = |action: &ToolAction| mode_permits(mode, action, None, None).is_allowed();
+  let permissive_command = CommandClassification {
+      command: String::new(),
+      risk: CommandRisk::Low,
+      blocked: false,
+      requires_approval: false,
+      reasons: vec![],
+      expected_effects: String::new(),
+      may_use_network: false,
+  };
+  let run_command_permitted =
+      mode_permits(mode, &ToolAction::Command(CommandRequest {
+          command: String::new(),
+          reason: String::new(),
+      }), Some(&permissive_command), None).is_allowed();
+
+  let mut tools = Vec::new();
+  if run_command_permitted {
+      tools.push(run_command_tool_definition());
+  }
+  if permits(&ToolAction::ProposePatch(GeneratedEdit { summary: String::new(), changes: vec![] })) {
+      tools.push(propose_patch_tool_definition());
+  }
+  if permits(&ToolAction::ProposePlan(vec![])) {
+      tools.push(propose_plan_tool_definition());
+      tools.push(complete_step_tool_definition());
+  }
+  // read_file / list_directory / search_content / search_codebase /
+  // read_git_status / read_git_diff: always permitted (every mode allows
+  // reads), so push unconditionally rather than routing a known-Allowed
+  // case through `permits` — but confirm this against `mode.rs`'s matrix
+  // test rather than assuming it stays true forever.
+  tools.push(read_file_tool_definition());
+  tools.push(list_directory_tool_definition());
+  tools.push(search_content_tool_definition());
+  if permits(&ToolAction::EditFile { summary: String::new(), edits: vec![] }) {
+      tools.push(edit_file_tool_definition());
+  }
+  tools.push(search_codebase_tool_definition());
+  tools.push(read_git_status_tool_definition());
+  tools.push(read_git_diff_tool_definition());
+  if self.web_diagnostics_runner.is_some()
+      && permits(&ToolAction::WebDiagnostic(WebDiagnosticCall {
+          kind: WebDiagnosticKind::Inspect,
+          url: String::new(),
+          arguments_json: "{}".to_string(),
+          session_id: None,
+          task_id: None,
+      }))
+  {
+      tools.push(inspect_web_page_tool_definition());
+      tools.push(run_web_scenario_tool_definition());
+  }
+  tools.extend(
+      mcp.tool_definitions()
+          .into_iter()
+          .filter(|tool| {
+              parse_namespaced_tool_name(&tool.name)
+                  .map(|(server_id, _)| !browser_mcp_server_ids.contains(&server_id))
+                  .unwrap_or(true)
+          })
+          .filter(|tool| {
+              let Some((server_id, tool_name)) = parse_namespaced_tool_name(&tool.name) else {
+                  return true;
+              };
+              let hint = mcp.tool_read_only_hint(&server_id, &tool_name);
+              mode_permits(
+                  mode,
+                  &ToolAction::McpCall {
+                      server_id,
+                      tool_name,
+                      arguments_json: String::new(),
+                  },
+                  None,
+                  hint,
+              )
+              .is_allowed()
+          }),
+  );
+  ```
+
+  This sketch keeps the existing browser-server-id filter and adds the mode
+  filter as a second `.filter(...)` in the same chain — check whether
+  merging them into one closure reads better once the real code is in
+  front of you; either is fine as long as both conditions are actually
+  applied, and note which you chose in this row.
+
+  Drop the `#[allow(dead_code)]` on `mode_permits` and `Permission::is_allowed`
+  in `mode.rs` now that this is their real caller (leave `Permission` itself
+  and `SessionMode`'s `#[allow(dead_code)]`, if any remain, for whichever
+  later task is their first real caller — check current state, don't assume
+  Task 1/2/3's notes are still accurate about what's still unused).
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+- [ ] **Step 5: Scoped checks**
+
+  `cargo nextest run -p workspace-engine -E 'test(mode)'` (broadened to
+  catch the new chat.rs-level tests too — confirm the filter actually
+  matches them once they're named), `cargo fmt`, `cargo clippy -p
+  workspace-engine --all-targets --locked -- -D warnings`.
+
+- [ ] **Step 6: Show the change and the check result, and ask before committing**
 
 ## Task 5: Layer 2 — the non-native fallback's envelopes
 
