@@ -1609,14 +1609,159 @@ one-paragraph description implied.
 ## Task 8: UI — mode control and refusal messaging
 
 **Requirements:** 3, 6. **Files:** `desktop-shell/src/lib.rs`,
-`static/app.js`.
+`static/app.js`, `mode.rs`.
 
-Mode control in the conversation header (always visible, not a settings
-panel). Switching to a more permissive mode is explicit; switching to a more
-restrictive one needs no confirmation. A refusal surfaces `blocked_by` and
-`allowed_in`. A plan made in Plan mode stays intact across a Plan→Code
-switch (spec 21 owns the plan's persistence; this task only confirms the
-switch does not clear it).
+**No dependency on Task 7.** Task 7 fixes an internal correctness bug
+inside `mode_permits`'s Command arm (`command_policy.rs`, `mode.rs`) with
+no API, JSON, or UI-facing surface change — this task builds against the
+already-stable `SessionStore::set_session_mode`/`session_mode` (Task 3) and
+`refusal_message` (Task 6) surfaces, neither of which Task 7 touches. Safe
+to run in a separate session in parallel, **but both this task and Task 7
+will want to edit `tasks.md`'s own Progress table** — whichever session
+finishes and commits first, the other should pull/rebase before writing
+its own row rather than risk clobbering the other's. If both run in the
+same checkout rather than separate worktrees, this file (and only this
+file) is the one place they can collide.
+
+**Refusal messaging needs no new rendering — verify this, don't build it.**
+`context.md`'s Task 6 row: a main-loop or resume refusal reaches the
+orchestrator as `refusal_message`'s text inside an `ActionOutcome::Failed`
+tool result, fed back to the model on the same plumbing as any other failed
+tool call. `app.js` has no `role === "tool"` rendering at all — tool
+results are not shown to the user directly; the model's own next assistant
+message is what the user sees, and that message is what will contain the
+mode/permission explanation, in the model's own words, having received
+`refusal_message`'s wording as its tool result. `proposal.md` §5.6's "the
+turn says which mode blocked it" is therefore satisfied by Task 6 alone
+feeding the right text to the model — confirm this with an end-to-end test
+rather than building a new UI element for it.
+
+**Interfaces:**
+- Consumes: `SessionStore::set_session_mode`/`session_mode` (Task 3),
+  `SessionMode::as_str()` (Task 3) and a new inverse parser this task adds.
+- Produces: `session_json` gains a `mode` field; a new
+  `POST /api/session-mode` endpoint; `app.js` gains a mode control and its
+  wiring.
+
+- [ ] **Step 1: Write the failing backend tests**
+
+  In `desktop-shell/src/lib.rs`'s existing test module:
+  - `session_json_includes_the_mode` — a session with no `session_mode_set`
+    event serializes with `"mode":"code"` (requirement 7's default, made
+    visible over the wire — this is the JSON-level version of Task 3's
+    `a_session_with_no_mode_event_reads_as_code`).
+  - `post_session_mode_changes_it_and_returns_the_updated_session` — POST
+    `/api/session-mode` with `session_id`/`mode=ask` returns a session JSON
+    with `"mode":"ask"`, and a follow-up `GET /api/session` for the same id
+    also reads `"mode":"ask"` — proving the write actually persisted, not
+    just echoed back.
+  - `post_session_mode_rejects_an_unknown_mode_string` — `mode=sideways` (or
+    similar) is a 4xx/error response, not a silent fallback to `code` or a
+    panic.
+
+  In `mode.rs`'s test module:
+  - `session_mode_parses_its_own_as_str_output_for_all_four_modes` — the
+    round-trip guard for whatever parser this task adds (`from_str`,
+    `parse`, or similar — Step 3 decides the exact name).
+
+- [ ] **Step 2: Run to verify they fail to compile**
+
+- [ ] **Step 3: Add the inverse parser to `SessionMode`**
+
+  ```rust
+  impl SessionMode {
+      pub(crate) fn parse(value: &str) -> Option<Self> {
+          match value {
+              "ask" => Some(Self::Ask),
+              "plan" => Some(Self::Plan),
+              "code" => Some(Self::Code),
+              "review" => Some(Self::Review),
+              _ => None,
+          }
+      }
+  }
+  ```
+
+  Naming it `parse` rather than implementing `std::str::FromStr` is a
+  choice, not a given — check whether anything else in this codebase's
+  convention (`CommandRisk`, `UsageSource`) implements `FromStr` for a
+  similar wire-form enum before picking; match the existing convention if
+  one exists, note in this row if you deviate and why.
+
+- [ ] **Step 4: Add `mode` to `session_json` and thread it through every
+      caller**
+
+  `session_json` (`desktop-shell/src/lib.rs:3178`, as of Task 7) takes only
+  `&Session`; the three call sites that build the full session response
+  (`GET /api/session` at line 543, `POST /api/session-create` at 602,
+  `POST /api/session-rename` at 627, as of Task 7 — re-confirm, this file
+  has not been touched by Tasks 1-7 so these should be stable but verify)
+  all have `engine.session_store` in scope. Widen the signature to
+  `session_json(session: &Session, mode: SessionMode) -> String`, add
+  `,"mode":"{}"` with `mode.as_str()` to its format string, and pass
+  `engine.session_store.session_mode(&session.id)` at each of the three
+  call sites.
+
+- [ ] **Step 5: Add `POST /api/session-mode`**
+
+  Follow `POST /api/session-rename`'s shape exactly (`lib.rs:627-642` as of
+  Task 7): parse the form, require `session_id` and `mode` via
+  `required_form`, parse `mode` with `SessionMode::parse` and reject an
+  unparseable value with a clear error rather than defaulting, call
+  `engine.session_store.set_session_mode(&session_id, mode, "user")` (the
+  `set_by` is always `"user"` here — this endpoint exists *because* it is
+  a user action, per requirement 4), then respond with the same
+  `{"session": ...}` shape the other session endpoints use, built from the
+  now-updated session.
+
+- [ ] **Step 6: Run backend tests to verify they pass**
+
+- [ ] **Step 7: Backend scoped checks**
+
+  `cargo nextest run -p desktop-shell -E 'test(session_mode) + test(mode)'`,
+  `cargo fmt`, `cargo clippy -p desktop-shell --all-targets --locked -- -D
+  warnings`.
+
+- [ ] **Step 8: Wire the frontend**
+
+  Before writing any JS, read `renderThreadHeader()` (`app.js:272-297`) —
+  the function that already renders `#thread-repo`/`#thread-session` and is
+  driven off `setRepoState`/`syncSessionListActive`, per its own leading
+  comment — and whatever loads `projectSessionsByPath` (the cache
+  `renderThreadHeader` reads `session` from) to find where a fetched
+  session's shape needs a `mode` field threaded through on the JS side too
+  — this plan has not traced that path exhaustively; confirm it before
+  assuming `session.mode` is already available where `renderThreadHeader`
+  needs it.
+
+  Add a mode control (a `<select>` is the simplest widget that satisfies
+  "switching to a more permissive mode is an explicit selection" without
+  extra confirmation machinery — every option is one explicit choice
+  either direction) next to `#thread-session`, populated with the four
+  modes, reflecting the current session's mode, calling `/api/session-mode`
+  on change and re-rendering the header from the response. No confirmation
+  dialog in either direction — requirement 4 already guarantees only a
+  user's own selection can change mode, so the selection itself is the
+  explicit action `proposal.md` §5.6 asks for.
+
+- [ ] **Step 9: Verify in the browser**
+
+  Rebuild and restart (`include_str!`-embedded static assets), open a
+  session, confirm the mode control shows `Code` by default, switching to
+  each mode updates it and persists across a reload, and that a turn
+  refused by mode (e.g. ask the model to propose a patch in Ask mode) shows
+  the model's own explanation mentioning the mode, in the conversation —
+  not a separate UI element, per this task's "no new rendering" note above.
+
+- [ ] **Step 10: Confirm Plan→Code plan continuity**
+
+  In Plan mode, produce a plan (`propose_plan`), switch to Code via the
+  new control, and confirm the plan panel still shows the same plan — no
+  new code should be needed for this (spec 21 owns plan persistence,
+  keyed by task, and mode is an orthogonal session property), but this
+  step is the check that confirms it rather than assumes it.
+
+- [ ] **Step 11: `node --check`, `npm run lint:web`, then show and ask**
 
 ## Task 9: Migration and eval-harness guard
 
