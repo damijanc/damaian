@@ -151,10 +151,22 @@ impl ValidationOrchestrator {
         working_directory: impl AsRef<Path>,
         command: &str,
     ) -> bool {
-        let classification = self
-            .command_policy
-            .classify(command, working_directory.as_ref());
+        let classification = self.classify_command(working_directory, command);
         classification.requires_approval || classification.blocked
+    }
+
+    /// The classification [`Self::propose_command`] would store, without
+    /// storing it. Spec 20's Layer 3 asks the session mode about a command
+    /// before the turn commits to proposing it, for the same reason
+    /// [`Self::command_needs_approval`] exists: a refused command must leave
+    /// no pending proposal behind.
+    pub fn classify_command(
+        &self,
+        working_directory: impl AsRef<Path>,
+        command: &str,
+    ) -> CommandClassification {
+        self.command_policy
+            .classify(command, working_directory.as_ref())
     }
 
     pub fn propose_command(

@@ -14,7 +14,7 @@ use crate::git_service::{GitService, GitStatus};
 use crate::hash::{create_id, now_millis};
 use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
-use crate::mode::{SessionMode, mode_permits};
+use crate::mode::{Permission, SessionMode, mode_permits, refusal_message};
 use crate::model::{
     ModelAdapter, ModelMessage, ModelRequest, ModelRun, TokenUsage, ToolCall, ToolDefinition,
     model_request_json,
@@ -772,6 +772,12 @@ impl ChatOrchestrator {
         }
         let repository_root = PathBuf::from(&pending.repository_root);
         let mut messages = pending.messages;
+        // Layer 3's resume-path points (`context.md` §8): approving a paused
+        // action is a new decision, so it answers to the session's mode now,
+        // not the mode it was requested under — the user may have switched
+        // since. Read once, for whichever branch below runs; a decline needs
+        // no check, since nothing is about to happen either way.
+        let mode = self.session_store.session_mode(&pending.session.id);
 
         // Three kinds of paused action resume through here: a browser
         // diagnostic, an MCP tool call, or the original shell-command path.
@@ -780,7 +786,15 @@ impl ChatOrchestrator {
         {
             let call = web_call.call.clone();
             let summary = web_diagnostic_summary(&call);
-            let decision = if approved && decision_options.allow_browser_diagnostics_for_session {
+            let permission =
+                mode_permits(mode, &ToolAction::WebDiagnostic(call.clone()), None, None);
+            let refused = approved && !permission.is_allowed();
+            // A refused approval grants nothing, including session-wide
+            // consent: that consent governs diagnostics within a mode that
+            // allows them, and this one does not.
+            let decision = if refused {
+                "refused_by_mode"
+            } else if approved && decision_options.allow_browser_diagnostics_for_session {
                 self.session_store
                     .allow_browser_diagnostics_for_session(&pending.session.id, approved_by)?;
                 "approved_for_session"
@@ -801,7 +815,9 @@ impl ChatOrchestrator {
                     ("url", call.url.clone()),
                 ],
             )?;
-            let content = if approved {
+            let content = if refused {
+                refusal_message(permission)
+            } else if approved {
                 self.run_web_diagnostic_call(&call)
             } else {
                 format!(
@@ -815,20 +831,37 @@ impl ChatOrchestrator {
             let summary = mcp_call_summary(&mcp_call.server_id, &mcp_call.tool_name);
             let content = if approved {
                 let mut mcp = self.build_mcp_runtime(&pending.session.id);
-                match mcp.call_tool(
-                    &mcp_call.server_id,
-                    &mcp_call.tool_name,
-                    &mcp_call.arguments_json,
-                ) {
-                    Ok(result) => {
-                        let text = self.scanner.redact(&result.text).text;
-                        if result.is_error {
-                            format!("MCP tool reported an error:\n{text}")
-                        } else {
-                            text
+                // A fresh runtime has fetched no tool lists, and the read-only
+                // hint lives in them; without this every hint reads as `None`.
+                mcp.tool_definitions();
+                let permission = mode_permits(
+                    mode,
+                    &ToolAction::McpCall {
+                        server_id: mcp_call.server_id.clone(),
+                        tool_name: mcp_call.tool_name.clone(),
+                        arguments_json: String::new(),
+                    },
+                    None,
+                    mcp.tool_read_only_hint(&mcp_call.server_id, &mcp_call.tool_name),
+                );
+                if !permission.is_allowed() {
+                    refusal_message(permission)
+                } else {
+                    match mcp.call_tool(
+                        &mcp_call.server_id,
+                        &mcp_call.tool_name,
+                        &mcp_call.arguments_json,
+                    ) {
+                        Ok(result) => {
+                            let text = self.scanner.redact(&result.text).text;
+                            if result.is_error {
+                                format!("MCP tool reported an error:\n{text}")
+                            } else {
+                                text
+                            }
                         }
+                        Err(error) => format!("MCP tool call failed: {error}"),
                     }
-                    Err(error) => format!("MCP tool call failed: {error}"),
                 }
             } else {
                 format!(
@@ -843,7 +876,25 @@ impl ChatOrchestrator {
                 command: proposal.command.clone(),
                 reason: proposal.reason.clone(),
             };
-            let content = if approved {
+            // The stored proposal is what `run_proposal` would execute, so its
+            // own classification is what the mode is asked about.
+            let permission = mode_permits(
+                mode,
+                &ToolAction::Command(command_request.clone()),
+                Some(&CommandClassification {
+                    command: proposal.command.clone(),
+                    risk: proposal.risk,
+                    blocked: proposal.blocked,
+                    requires_approval: proposal.requires_approval,
+                    reasons: proposal.reasons.clone(),
+                    expected_effects: proposal.expected_effects.clone(),
+                    may_use_network: proposal.may_use_network,
+                }),
+                None,
+            );
+            let content = if approved && !permission.is_allowed() {
+                refusal_message(permission)
+            } else if approved {
                 // The census has to be taken before the command runs: once it
                 // has, the pre-command bytes are gone.
                 let census = self
@@ -1909,6 +1960,15 @@ impl ChatOrchestrator {
                 if sink.cancel.is_cancelled() {
                     break;
                 }
+                // Layer 3 (`proposal.md` §5.2): the mode captured at the top of
+                // the turn is asked about every action before anything else can
+                // act on it. Before the review gate, so no plan review is raised
+                // for a step the mode is about to refuse; before dispatch, so a
+                // refused command leaves no stored proposal and no approval card
+                // behind. One site for every class rather than one per arm, so a
+                // new `ToolAction` variant cannot reach its arm unchecked.
+                let permission = self.action_permission(mode, repository_root, &tool_action, &mcp);
+
                 // The review gate (§5.5). Checked before the action is bracketed,
                 // let alone dispatched: there is no marker to finish and nothing
                 // to undo, because nothing has happened yet. That is the whole
@@ -1923,6 +1983,7 @@ impl ChatOrchestrator {
                 // panel in front of every trivial question (§5.1).
                 if let Some(current) = plan.as_ref()
                     && !plan_approved
+                    && permission.is_allowed()
                     && action_awaits_plan_review(&tool_action, |command| {
                         self.validation_orchestrator
                             .command_needs_approval(repository_root, command)
@@ -2022,284 +2083,306 @@ impl ChatOrchestrator {
                 // by construction. Spec 21 requirement 6 reads a step's status from
                 // this value, so it has to be the tool's answer, not the
                 // dispatcher's.
-                let (assistant_summary, tool_result_text, action_outcome) =
-                    if action_is_batchable_read_only(&tool_action) {
-                        match precomputed.as_ref() {
-                            // Precomputed by the concurrent batch, indexed by the
-                            // model's call order.
-                            Some(results) => results[index].clone(),
-                            None => self.dispatch_read_only_action(
-                                repository_root,
-                                &session,
-                                &task,
-                                &tool_action,
-                            ),
-                        }
-                    } else {
-                        match tool_action {
-                ToolAction::Command(command_request) => {
-                        let proposal = self.validation_orchestrator.propose_command(
+                let (assistant_summary, tool_result_text, action_outcome) = if !permission
+                    .is_allowed()
+                {
+                    // A failed tool result rather than an error, so the
+                    // model can tell the user why in its next message
+                    // (§5.6) instead of the turn just ending.
+                    (
+                        format!(
+                            "Attempted to call `{}`.",
+                            tool_action_marker(&tool_action).0
+                        ),
+                        refusal_message(permission),
+                        ActionOutcome::Failed,
+                    )
+                } else if action_is_batchable_read_only(&tool_action) {
+                    match precomputed.as_ref() {
+                        // Precomputed by the concurrent batch, indexed by the
+                        // model's call order.
+                        Some(results) => results[index].clone(),
+                        None => self.dispatch_read_only_action(
                             repository_root,
-                            &command_request.command,
-                            &command_request.reason,
-                        )?;
-
-                        if proposal.requires_approval || proposal.blocked {
-                            let response = command_proposal_response(&proposal);
-                            self.pending_commands.save(&PendingChatTurn {
-                                proposal_id: proposal.id.clone(),
-                                session: session.clone(),
-                                task: task.clone(),
-                                repository_root: repository_root.to_string_lossy().to_string(),
-                                context_files: context_files.clone(),
-                                round,
-                                messages: messages.clone(),
-                                matched_tool_call: matched_tool_call.clone(),
-                                last_content: redacted.clone(),
-                                turn_options,
-                                reasoning_content: model_run.reasoning_content.clone(),
-                                mcp_call: None,
-                                web_diagnostic_call: None,
-                                plan_review: None,
-                            })?;
-                            self.note_pending_approvals(
-                                &session,
-                                &task,
-                                vec![PendingApproval {
-                                    kind: "command".to_string(),
-                                    proposal_id: proposal.id.clone(),
-                                }],
-                            );
-                            // A clean stop for a human decision, not a crash: the
-                            // action is finished so the classifier does not read a
-                            // dangling marker as an unknown outcome.
-                            self.session_store
-                                .finish_action(action_marker, "awaiting_approval")?;
-                            let mut proposal_run = model_run;
-                            proposal_run.content = response.clone();
-                            terminal = Some((
-                                proposal_run,
-                                response,
-                                TurnProposals {
-                                    command: Some(agent_command_proposal(&self.config, &proposal)),
-                                    ..Default::default()
-                                },
-                                StopReason::Answered,
-                            ));
-                            break;
-                        }
-
-                        let cancel = sink.cancel;
-                        // Borrow only the progress field, so `cancel` can be read
-                        // for the same call without two conflicting borrows of the
-                        // sink.
-                        let on_progress = &mut *sink.on_progress;
-                        let mut on_output = |line: &str| {
-                            on_progress(TurnProgress::Phase(TurnPhase::new(
-                                PhaseKind::Output,
-                                line,
-                                round,
-                                max_rounds,
-                            )));
-                        };
-                        let record = self.validation_orchestrator.run_proposal(
-                            &proposal.id,
-                            false,
-                            "sandbox",
-                            Some(&task.id),
-                            cancel,
-                            &mut on_output,
-                        )?;
-                        let command_context = sandbox_command_context(&record.execution);
-                        // The exit code is in hand right here, one statement before
-                        // the marker is finished. Nothing downstream can recover it
-                        // — `CommandExecution` is never persisted to the session log
-                        // — so it is carried out of the arm rather than looked up.
-                        let exit_code = record.execution.exit_code;
-                        (
-                            tool_call_summary(&command_request),
-                            command_context,
-                            ActionOutcome::CommandExit(exit_code),
-                        )
+                            &session,
+                            &task,
+                            &tool_action,
+                        ),
                     }
-                    ToolAction::ProposePatch(generated_edit) => {
-                        match self.patch_engine.create_patch(
-                            repository_root,
-                            &generated_edit.changes,
-                            Some(&task.id),
-                            &generated_edit.summary,
-                        ) {
-                            Ok(patch) => {
-                                // See `ProposedPatch::session_id`: the engine does
-                                // not know the session, this orchestrator does.
-                                let mut patch = patch;
-                                patch.session_id = session.id.clone();
-                                self.patch_store.save(&patch)?;
-                                let response = patch_proposal_response(&patch);
-                                // A patch waiting for review is a clean stop, not
-                                // a crash — finish the marker before breaking.
+                } else {
+                    match tool_action {
+                        ToolAction::Command(command_request) => {
+                            let proposal = self.validation_orchestrator.propose_command(
+                                repository_root,
+                                &command_request.command,
+                                &command_request.reason,
+                            )?;
+
+                            if proposal.requires_approval || proposal.blocked {
+                                let response = command_proposal_response(&proposal);
+                                self.pending_commands.save(&PendingChatTurn {
+                                    proposal_id: proposal.id.clone(),
+                                    session: session.clone(),
+                                    task: task.clone(),
+                                    repository_root: repository_root.to_string_lossy().to_string(),
+                                    context_files: context_files.clone(),
+                                    round,
+                                    messages: messages.clone(),
+                                    matched_tool_call: matched_tool_call.clone(),
+                                    last_content: redacted.clone(),
+                                    turn_options,
+                                    reasoning_content: model_run.reasoning_content.clone(),
+                                    mcp_call: None,
+                                    web_diagnostic_call: None,
+                                    plan_review: None,
+                                })?;
+                                self.note_pending_approvals(
+                                    &session,
+                                    &task,
+                                    vec![PendingApproval {
+                                        kind: "command".to_string(),
+                                        proposal_id: proposal.id.clone(),
+                                    }],
+                                );
+                                // A clean stop for a human decision, not a crash: the
+                                // action is finished so the classifier does not read a
+                                // dangling marker as an unknown outcome.
                                 self.session_store
-                                    .finish_action(action_marker, "awaiting_review")?;
-                                let proposal = agent_patch_proposal(&patch);
+                                    .finish_action(action_marker, "awaiting_approval")?;
                                 let mut proposal_run = model_run;
                                 proposal_run.content = response.clone();
                                 terminal = Some((
                                     proposal_run,
                                     response,
                                     TurnProposals {
-                                        patch: Some(proposal),
+                                        command: Some(agent_command_proposal(
+                                            &self.config,
+                                            &proposal,
+                                        )),
                                         ..Default::default()
                                     },
                                     StopReason::Answered,
                                 ));
                                 break;
                             }
-                            // Fed back as a tool result rather than aborting the
-                            // turn, so the model can see why (e.g. a restricted
-                            // or out-of-repo path) and correct itself within the
-                            // remaining rounds instead of the turn just failing.
-                            Err(error) => (
-                                format!("Attempted to propose a patch: {}", generated_edit.summary),
-                                format!("Cannot propose that patch: {error}"),
-                                ActionOutcome::Failed,
-                            ),
-                        }
-                    }
-                    ToolAction::ProposePlan(steps) => {
-                        if plan.is_some() {
-                            // Refused rather than replaced. Steps already carry
-                            // evidence tied to a state of the repository, and
-                            // rewriting the plan underneath that evidence produces
-                            // a history that no longer describes what happened —
-                            // the same reason §5.5 rules out mid-execution edits.
+
+                            let cancel = sink.cancel;
+                            // Borrow only the progress field, so `cancel` can be read
+                            // for the same call without two conflicting borrows of the
+                            // sink.
+                            let on_progress = &mut *sink.on_progress;
+                            let mut on_output = |line: &str| {
+                                on_progress(TurnProgress::Phase(TurnPhase::new(
+                                    PhaseKind::Output,
+                                    line,
+                                    round,
+                                    max_rounds,
+                                )));
+                            };
+                            let record = self.validation_orchestrator.run_proposal(
+                                &proposal.id,
+                                false,
+                                "sandbox",
+                                Some(&task.id),
+                                cancel,
+                                &mut on_output,
+                            )?;
+                            let command_context = sandbox_command_context(&record.execution);
+                            // The exit code is in hand right here, one statement before
+                            // the marker is finished. Nothing downstream can recover it
+                            // — `CommandExecution` is never persisted to the session log
+                            // — so it is carried out of the arm rather than looked up.
+                            let exit_code = record.execution.exit_code;
                             (
+                                tool_call_summary(&command_request),
+                                command_context,
+                                ActionOutcome::CommandExit(exit_code),
+                            )
+                        }
+                        ToolAction::ProposePatch(generated_edit) => {
+                            match self.patch_engine.create_patch(
+                                repository_root,
+                                &generated_edit.changes,
+                                Some(&task.id),
+                                &generated_edit.summary,
+                            ) {
+                                Ok(patch) => {
+                                    // See `ProposedPatch::session_id`: the engine does
+                                    // not know the session, this orchestrator does.
+                                    let mut patch = patch;
+                                    patch.session_id = session.id.clone();
+                                    self.patch_store.save(&patch)?;
+                                    let response = patch_proposal_response(&patch);
+                                    // A patch waiting for review is a clean stop, not
+                                    // a crash — finish the marker before breaking.
+                                    self.session_store
+                                        .finish_action(action_marker, "awaiting_review")?;
+                                    let proposal = agent_patch_proposal(&patch);
+                                    let mut proposal_run = model_run;
+                                    proposal_run.content = response.clone();
+                                    terminal = Some((
+                                        proposal_run,
+                                        response,
+                                        TurnProposals {
+                                            patch: Some(proposal),
+                                            ..Default::default()
+                                        },
+                                        StopReason::Answered,
+                                    ));
+                                    break;
+                                }
+                                // Fed back as a tool result rather than aborting the
+                                // turn, so the model can see why (e.g. a restricted
+                                // or out-of-repo path) and correct itself within the
+                                // remaining rounds instead of the turn just failing.
+                                Err(error) => (
+                                    format!(
+                                        "Attempted to propose a patch: {}",
+                                        generated_edit.summary
+                                    ),
+                                    format!("Cannot propose that patch: {error}"),
+                                    ActionOutcome::Failed,
+                                ),
+                            }
+                        }
+                        ToolAction::ProposePlan(steps) => {
+                            if plan.is_some() {
+                                // Refused rather than replaced. Steps already carry
+                                // evidence tied to a state of the repository, and
+                                // rewriting the plan underneath that evidence produces
+                                // a history that no longer describes what happened —
+                                // the same reason §5.5 rules out mid-execution edits.
+                                (
                             "Attempted to propose a second plan.".to_string(),
                             "This turn already has a plan. Work through its remaining steps with complete_step, or stop and start a new turn if the plan is wrong.".to_string(),
                             ActionOutcome::Failed,
                         )
-                        } else {
-                            let now = now_millis();
-                            let mut proposed = crate::plan::TaskPlan::new(&task.id, now);
-                            for (index, step) in steps.iter().enumerate() {
-                                proposed.steps.push(crate::plan::PlanStep {
-                                    id: format!("step_{}", index + 1),
-                                    // Model-authored text, redacted like any other:
-                                    // a title is rendered in the panel and written
-                                    // to the log, so a secret echoed into one must
-                                    // not survive there.
-                                    title: self.scanner.redact(&step.title).text,
-                                    detail: step
-                                        .detail
-                                        .as_ref()
-                                        .map(|detail| self.scanner.redact(detail).text),
-                                    // The engine's to set, not the model's.
-                                    status: if index == 0 {
-                                        crate::plan::StepStatus::InProgress
-                                    } else {
-                                        crate::plan::StepStatus::Pending
-                                    },
-                                    depends_on: Vec::new(),
-                                    started_at_ms: (index == 0).then_some(now),
-                                    completed_at_ms: None,
-                                    evidence: Vec::new(),
-                                });
+                            } else {
+                                let now = now_millis();
+                                let mut proposed = crate::plan::TaskPlan::new(&task.id, now);
+                                for (index, step) in steps.iter().enumerate() {
+                                    proposed.steps.push(crate::plan::PlanStep {
+                                        id: format!("step_{}", index + 1),
+                                        // Model-authored text, redacted like any other:
+                                        // a title is rendered in the panel and written
+                                        // to the log, so a secret echoed into one must
+                                        // not survive there.
+                                        title: self.scanner.redact(&step.title).text,
+                                        detail: step
+                                            .detail
+                                            .as_ref()
+                                            .map(|detail| self.scanner.redact(detail).text),
+                                        // The engine's to set, not the model's.
+                                        status: if index == 0 {
+                                            crate::plan::StepStatus::InProgress
+                                        } else {
+                                            crate::plan::StepStatus::Pending
+                                        },
+                                        depends_on: Vec::new(),
+                                        started_at_ms: (index == 0).then_some(now),
+                                        completed_at_ms: None,
+                                        evidence: Vec::new(),
+                                    });
+                                }
+                                self.session_store.create_plan(&task, &proposed)?;
+                                sink.plan(&proposed);
+                                let summary = format!("Planned {} steps.", proposed.steps.len());
+                                let first = proposed.steps[0].title.clone();
+                                plan = Some(proposed);
+                                (
+                                    summary,
+                                    format!(
+                                        "Plan recorded. The current step is: {first}. Call complete_step when its work is done."
+                                    ),
+                                    ActionOutcome::Ok,
+                                )
                             }
-                            self.session_store.create_plan(&task, &proposed)?;
-                            sink.plan(&proposed);
-                            let summary = format!("Planned {} steps.", proposed.steps.len());
-                            let first = proposed.steps[0].title.clone();
-                            plan = Some(proposed);
-                            (
-                                summary,
-                                format!(
-                                    "Plan recorded. The current step is: {first}. Call complete_step when its work is done."
-                                ),
-                                ActionOutcome::Ok,
-                            )
                         }
-                    }
-                    ToolAction::CompleteStep => match plan.as_mut() {
-                        None => (
-                            "Attempted to complete a step.".to_string(),
-                            "There is no plan for this turn, so there is no step to complete."
-                                .to_string(),
-                            ActionOutcome::Failed,
-                        ),
-                        Some(current) => {
-                            // The model asked to move on; it does not get to say
-                            // how the step ended. §5.3: the status is a function
-                            // of the evidence, and this is the only place a step
-                            // reaches a terminal status.
-                            let accrued = std::mem::take(&mut step_evidence);
-                            let now = now_millis();
-                            let mut finished_title = String::new();
-                            let mut status = crate::plan::StepStatus::Completed;
-                            if let Some(open) = current
-                                .steps
-                                .iter_mut()
-                                .find(|step| step.status == crate::plan::StepStatus::InProgress)
-                            {
-                                // Extends rather than replaces. A step can already
-                                // carry evidence this turn never saw: a patch
-                                // applied after the turn that proposed it appends
-                                // through the log (`edit.rs`), and a resumed plan
-                                // arrives with everything its earlier turns
-                                // recorded. Assigning here would silently drop
-                                // both, and the step would then be judged on a
-                                // fraction of what is known about it.
-                                open.evidence.extend(accrued);
-                                status = crate::plan::status_from_evidence(&open.evidence);
-                                open.status = status;
-                                open.completed_at_ms = Some(now);
-                                finished_title = open.title.clone();
-                                let closed = open.clone();
-                                self.session_store.update_plan_step(&task, &closed)?;
-                            }
-
-                            // A blocked step does not hand off: the next step's
-                            // prerequisite failed, and starting it anyway would
-                            // build on work that did not happen.
-                            let mut next_title = None;
-                            if status == crate::plan::StepStatus::Completed
-                                && let Some(next) = current
+                        ToolAction::CompleteStep => match plan.as_mut() {
+                            None => (
+                                "Attempted to complete a step.".to_string(),
+                                "There is no plan for this turn, so there is no step to complete."
+                                    .to_string(),
+                                ActionOutcome::Failed,
+                            ),
+                            Some(current) => {
+                                // The model asked to move on; it does not get to say
+                                // how the step ended. §5.3: the status is a function
+                                // of the evidence, and this is the only place a step
+                                // reaches a terminal status.
+                                let accrued = std::mem::take(&mut step_evidence);
+                                let now = now_millis();
+                                let mut finished_title = String::new();
+                                let mut status = crate::plan::StepStatus::Completed;
+                                if let Some(open) = current
                                     .steps
                                     .iter_mut()
-                                    .find(|step| step.status == crate::plan::StepStatus::Pending)
-                            {
-                                next.status = crate::plan::StepStatus::InProgress;
-                                next.started_at_ms = Some(now);
-                                next_title = Some(next.title.clone());
-                                let started = next.clone();
-                                self.session_store.update_plan_step(&task, &started)?;
-                            }
-                            // Once, after the handoff rather than after each of its
-                            // two writes: between them the closing step is already
-                            // terminal and the next has not opened, so a panel
-                            // updated mid-handoff would blink through a state with
-                            // no current step. The log keeps both writes; the panel
-                            // does not need them.
-                            sink.plan(current);
+                                    .find(|step| step.status == crate::plan::StepStatus::InProgress)
+                                {
+                                    // Extends rather than replaces. A step can already
+                                    // carry evidence this turn never saw: a patch
+                                    // applied after the turn that proposed it appends
+                                    // through the log (`edit.rs`), and a resumed plan
+                                    // arrives with everything its earlier turns
+                                    // recorded. Assigning here would silently drop
+                                    // both, and the step would then be judged on a
+                                    // fraction of what is known about it.
+                                    open.evidence.extend(accrued);
+                                    status = crate::plan::status_from_evidence(&open.evidence);
+                                    open.status = status;
+                                    open.completed_at_ms = Some(now);
+                                    finished_title = open.title.clone();
+                                    let closed = open.clone();
+                                    self.session_store.update_plan_step(&task, &closed)?;
+                                }
 
-                            let result = match (status, &next_title) {
-                                (crate::plan::StepStatus::Blocked, _) => format!(
-                                    "Step \"{finished_title}\" is blocked: a command it ran did not succeed. Fix that before moving on; the remaining steps are still pending."
-                                ),
-                                (_, Some(next)) => format!(
-                                    "Step \"{finished_title}\" is complete. The current step is now: {next}."
-                                ),
-                                (_, None) => format!(
-                                    "Step \"{finished_title}\" is complete. That was the last step."
-                                ),
-                            };
-                            (
-                                format!("Finished: {finished_title}"),
-                                result,
-                                ActionOutcome::Ok,
+                                // A blocked step does not hand off: the next step's
+                                // prerequisite failed, and starting it anyway would
+                                // build on work that did not happen.
+                                let mut next_title = None;
+                                if status == crate::plan::StepStatus::Completed
+                                    && let Some(next) = current.steps.iter_mut().find(|step| {
+                                        step.status == crate::plan::StepStatus::Pending
+                                    })
+                                {
+                                    next.status = crate::plan::StepStatus::InProgress;
+                                    next.started_at_ms = Some(now);
+                                    next_title = Some(next.title.clone());
+                                    let started = next.clone();
+                                    self.session_store.update_plan_step(&task, &started)?;
+                                }
+                                // Once, after the handoff rather than after each of its
+                                // two writes: between them the closing step is already
+                                // terminal and the next has not opened, so a panel
+                                // updated mid-handoff would blink through a state with
+                                // no current step. The log keeps both writes; the panel
+                                // does not need them.
+                                sink.plan(current);
+
+                                let result = match (status, &next_title) {
+                                    (crate::plan::StepStatus::Blocked, _) => format!(
+                                        "Step \"{finished_title}\" is blocked: a command it ran did not succeed. Fix that before moving on; the remaining steps are still pending."
+                                    ),
+                                    (_, Some(next)) => format!(
+                                        "Step \"{finished_title}\" is complete. The current step is now: {next}."
+                                    ),
+                                    (_, None) => format!(
+                                        "Step \"{finished_title}\" is complete. That was the last step."
+                                    ),
+                                };
+                                (
+                                    format!("Finished: {finished_title}"),
+                                    result,
+                                    ActionOutcome::Ok,
+                                )
+                            }
+                        },
+                        ToolAction::EditFile { summary, edits } => {
+                            match region_edits_to_changes(
+                                repository_root,
+                                &self.path_policy,
+                                &edits,
                             )
-                        }
-                    },
-                    ToolAction::EditFile { summary, edits } => {
-                        match region_edits_to_changes(repository_root, &self.path_policy, &edits)
                             .and_then(|changes| {
                                 self.patch_engine.create_patch(
                                     repository_root,
@@ -2308,229 +2391,230 @@ impl ChatOrchestrator {
                                     &summary,
                                 )
                             }) {
-                            Ok(patch) => {
-                                // See `ProposedPatch::session_id`: the engine does
-                                // not know the session, this orchestrator does.
-                                let mut patch = patch;
-                                patch.session_id = session.id.clone();
-                                self.patch_store.save(&patch)?;
-                                let response = patch_proposal_response(&patch);
-                                // A patch waiting for review is a clean stop, not
-                                // a crash — finish the marker before breaking.
+                                Ok(patch) => {
+                                    // See `ProposedPatch::session_id`: the engine does
+                                    // not know the session, this orchestrator does.
+                                    let mut patch = patch;
+                                    patch.session_id = session.id.clone();
+                                    self.patch_store.save(&patch)?;
+                                    let response = patch_proposal_response(&patch);
+                                    // A patch waiting for review is a clean stop, not
+                                    // a crash — finish the marker before breaking.
+                                    self.session_store
+                                        .finish_action(action_marker, "awaiting_review")?;
+                                    let proposal = agent_patch_proposal(&patch);
+                                    let mut proposal_run = model_run;
+                                    proposal_run.content = response.clone();
+                                    terminal = Some((
+                                        proposal_run,
+                                        response,
+                                        TurnProposals {
+                                            patch: Some(proposal),
+                                            ..Default::default()
+                                        },
+                                        StopReason::Answered,
+                                    ));
+                                    break;
+                                }
+                                // Fed back as a tool result rather than aborting the
+                                // turn, so the model can see why (a stale anchor, a
+                                // restricted path) and correct itself within the
+                                // remaining rounds.
+                                Err(error) => (
+                                    format!("Attempted to edit files: {summary}"),
+                                    format!("Cannot apply that edit: {error}"),
+                                    ActionOutcome::Failed,
+                                ),
+                            }
+                        }
+                        ToolAction::WebDiagnostic(call) => {
+                            let call = call.with_context(&session.id, &task.id);
+                            let session_approved = if call.is_low_risk() {
+                                false
+                            } else {
                                 self.session_store
-                                    .finish_action(action_marker, "awaiting_review")?;
-                                let proposal = agent_patch_proposal(&patch);
+                                    .browser_diagnostics_allowed_for_session(&session.id)?
+                            };
+                            if !call.is_low_risk() && !session_approved {
+                                let proposal_id = create_id("webdiag");
+                                let proposal =
+                                    web_diagnostic_approval_proposal(&proposal_id, &call);
+                                let response = proposal.prompt.clone();
+                                self.pending_commands.save(&PendingChatTurn {
+                                    proposal_id,
+                                    session: session.clone(),
+                                    task: task.clone(),
+                                    repository_root: repository_root.to_string_lossy().to_string(),
+                                    context_files: context_files.clone(),
+                                    round,
+                                    messages: messages.clone(),
+                                    matched_tool_call: matched_tool_call.clone(),
+                                    last_content: redacted.clone(),
+                                    turn_options,
+                                    reasoning_content: model_run.reasoning_content.clone(),
+                                    mcp_call: None,
+                                    web_diagnostic_call: Some(PendingWebDiagnosticCall { call }),
+                                    plan_review: None,
+                                })?;
+                                self.note_pending_approvals(
+                                    &session,
+                                    &task,
+                                    vec![PendingApproval {
+                                        kind: "browser_diagnostic".to_string(),
+                                        proposal_id: proposal.id.clone(),
+                                    }],
+                                );
+                                // A clean stop for a human decision, not a crash: the
+                                // action is finished so the classifier does not read a
+                                // dangling marker as an unknown outcome.
+                                self.session_store
+                                    .finish_action(action_marker, "awaiting_approval")?;
                                 let mut proposal_run = model_run;
                                 proposal_run.content = response.clone();
                                 terminal = Some((
                                     proposal_run,
                                     response,
                                     TurnProposals {
-                                        patch: Some(proposal),
+                                        command: Some(proposal),
                                         ..Default::default()
                                     },
                                     StopReason::Answered,
                                 ));
                                 break;
                             }
-                            // Fed back as a tool result rather than aborting the
-                            // turn, so the model can see why (a stale anchor, a
-                            // restricted path) and correct itself within the
-                            // remaining rounds.
-                            Err(error) => (
-                                format!("Attempted to edit files: {summary}"),
-                                format!("Cannot apply that edit: {error}"),
-                                ActionOutcome::Failed,
-                            ),
-                        }
-                    }
-                    ToolAction::WebDiagnostic(call) => {
-                        let call = call.with_context(&session.id, &task.id);
-                        let session_approved = if call.is_low_risk() {
-                            false
-                        } else {
-                            self.session_store
-                                .browser_diagnostics_allowed_for_session(&session.id)?
-                        };
-                        if !call.is_low_risk() && !session_approved {
-                            let proposal_id = create_id("webdiag");
-                            let proposal = web_diagnostic_approval_proposal(&proposal_id, &call);
-                            let response = proposal.prompt.clone();
-                            self.pending_commands.save(&PendingChatTurn {
-                                proposal_id,
-                                session: session.clone(),
-                                task: task.clone(),
-                                repository_root: repository_root.to_string_lossy().to_string(),
-                                context_files: context_files.clone(),
-                                round,
-                                messages: messages.clone(),
-                                matched_tool_call: matched_tool_call.clone(),
-                                last_content: redacted.clone(),
-                                turn_options,
-                                reasoning_content: model_run.reasoning_content.clone(),
-                                mcp_call: None,
-                                web_diagnostic_call: Some(PendingWebDiagnosticCall { call }),
-                                plan_review: None,
-                            })?;
-                            self.note_pending_approvals(
-                                &session,
-                                &task,
-                                vec![PendingApproval {
-                                    kind: "browser_diagnostic".to_string(),
-                                    proposal_id: proposal.id.clone(),
-                                }],
-                            );
-                            // A clean stop for a human decision, not a crash: the
-                            // action is finished so the classifier does not read a
-                            // dangling marker as an unknown outcome.
-                            self.session_store
-                                .finish_action(action_marker, "awaiting_approval")?;
-                            let mut proposal_run = model_run;
-                            proposal_run.content = response.clone();
-                            terminal = Some((
-                                proposal_run,
-                                response,
-                                TurnProposals {
-                                    command: Some(proposal),
-                                    ..Default::default()
-                                },
-                                StopReason::Answered,
-                            ));
-                            break;
-                        }
-                        if session_approved {
-                            self.audit_log.record(
-                                "browser_diagnostic_session_approval_used",
-                                &[
-                                    ("actor", "system".to_string()),
-                                    ("sessionId", session.id.clone()),
-                                    ("taskId", task.id.clone()),
-                                    ("tool", call.name().to_string()),
-                                    ("url", call.url.clone()),
-                                ],
-                            )?;
-                        }
-
-                        let signature = web_diagnostic_signature(&call);
-                        let retry_limit = self.config.agent_tool_retry_limit;
-                        let (content, outcome) = if failed_browser_calls
-                            .get(&signature)
-                            .copied()
-                            .unwrap_or_default()
-                            >= retry_limit
-                        {
-                            // Refused rather than attempted, because the same call
-                            // has already failed its retry limit. Still a failure:
-                            // the tool produced no diagnostic.
-                            (browser_retry_limit_note(retry_limit), ActionOutcome::Failed)
-                        } else {
-                            let report = self.run_web_diagnostic_report(&call);
-                            let content = self.format_web_diagnostic_result(report);
-                            let failed = browser_tool_result_failed(&content);
-                            if failed {
-                                *failed_browser_calls.entry(signature).or_insert(0) += 1;
+                            if session_approved {
+                                self.audit_log.record(
+                                    "browser_diagnostic_session_approval_used",
+                                    &[
+                                        ("actor", "system".to_string()),
+                                        ("sessionId", session.id.clone()),
+                                        ("taskId", task.id.clone()),
+                                        ("tool", call.name().to_string()),
+                                        ("url", call.url.clone()),
+                                    ],
+                                )?;
                             }
-                            let outcome = if failed {
-                                ActionOutcome::Failed
-                            } else {
-                                ActionOutcome::Ok
-                            };
-                            (content, outcome)
-                        };
-                        (web_diagnostic_summary(&call), content, outcome)
-                    }
-                    ToolAction::McpCall {
-                        server_id,
-                        tool_name,
-                        arguments_json,
-                    } => {
-                        // MCP tools reach an external service and can have side
-                        // effects, so unless the server is marked no-approval we
-                        // pause the turn exactly like a command needing approval:
-                        // persist state keyed by a fresh proposal id and hand the
-                        // user a proposal to accept or decline.
-                        if mcp.requires_approval(&server_id) {
-                            let proposal_id = create_id("mcp");
-                            let proposal = mcp_approval_proposal(
-                                &proposal_id,
-                                &server_id,
-                                &tool_name,
-                                &arguments_json,
-                            );
-                            let response = proposal.prompt.clone();
-                            self.pending_commands.save(&PendingChatTurn {
-                                proposal_id,
-                                session: session.clone(),
-                                task: task.clone(),
-                                repository_root: repository_root.to_string_lossy().to_string(),
-                                context_files: context_files.clone(),
-                                round,
-                                messages: messages.clone(),
-                                matched_tool_call: matched_tool_call.clone(),
-                                last_content: redacted.clone(),
-                                turn_options,
-                                reasoning_content: model_run.reasoning_content.clone(),
-                                mcp_call: Some(PendingMcpCall {
-                                    server_id,
-                                    tool_name,
-                                    arguments_json,
-                                }),
-                                web_diagnostic_call: None,
-                                plan_review: None,
-                            })?;
-                            self.note_pending_approvals(
-                                &session,
-                                &task,
-                                vec![PendingApproval {
-                                    kind: "mcp_tool".to_string(),
-                                    proposal_id: proposal.id.clone(),
-                                }],
-                            );
-                            let mut proposal_run = model_run;
-                            proposal_run.content = response.clone();
-                            terminal = Some((
-                                proposal_run,
-                                response,
-                                TurnProposals {
-                                    command: Some(proposal),
-                                    ..Default::default()
-                                },
-                                StopReason::Answered,
-                            ));
-                            break;
-                        }
 
-                        // No approval required: run it now and feed the result back.
-                        let summary = mcp_call_summary(&server_id, &tool_name);
-                        let (content, outcome) =
-                            match mcp.call_tool(&server_id, &tool_name, &arguments_json) {
-                                Ok(result) => {
-                                    let text = self.scanner.redact(&result.text).text;
-                                    // `is_error` is the server's own verdict on its
-                                    // call. Reaching the server is not the same as
-                                    // the call working, and only the server knows
-                                    // which happened.
-                                    if result.is_error {
-                                        (
-                                            format!("MCP tool reported an error:\n{text}"),
-                                            ActionOutcome::Failed,
-                                        )
-                                    } else {
-                                        (text, ActionOutcome::Ok)
-                                    }
+                            let signature = web_diagnostic_signature(&call);
+                            let retry_limit = self.config.agent_tool_retry_limit;
+                            let (content, outcome) = if failed_browser_calls
+                                .get(&signature)
+                                .copied()
+                                .unwrap_or_default()
+                                >= retry_limit
+                            {
+                                // Refused rather than attempted, because the same call
+                                // has already failed its retry limit. Still a failure:
+                                // the tool produced no diagnostic.
+                                (browser_retry_limit_note(retry_limit), ActionOutcome::Failed)
+                            } else {
+                                let report = self.run_web_diagnostic_report(&call);
+                                let content = self.format_web_diagnostic_result(report);
+                                let failed = browser_tool_result_failed(&content);
+                                if failed {
+                                    *failed_browser_calls.entry(signature).or_insert(0) += 1;
                                 }
-                                Err(error) => (
-                                    format!("MCP tool call failed: {error}"),
-                                    ActionOutcome::Failed,
-                                ),
+                                let outcome = if failed {
+                                    ActionOutcome::Failed
+                                } else {
+                                    ActionOutcome::Ok
+                                };
+                                (content, outcome)
                             };
-                        (summary, content, outcome)
+                            (web_diagnostic_summary(&call), content, outcome)
+                        }
+                        ToolAction::McpCall {
+                            server_id,
+                            tool_name,
+                            arguments_json,
+                        } => {
+                            // MCP tools reach an external service and can have side
+                            // effects, so unless the server is marked no-approval we
+                            // pause the turn exactly like a command needing approval:
+                            // persist state keyed by a fresh proposal id and hand the
+                            // user a proposal to accept or decline.
+                            if mcp.requires_approval(&server_id) {
+                                let proposal_id = create_id("mcp");
+                                let proposal = mcp_approval_proposal(
+                                    &proposal_id,
+                                    &server_id,
+                                    &tool_name,
+                                    &arguments_json,
+                                );
+                                let response = proposal.prompt.clone();
+                                self.pending_commands.save(&PendingChatTurn {
+                                    proposal_id,
+                                    session: session.clone(),
+                                    task: task.clone(),
+                                    repository_root: repository_root.to_string_lossy().to_string(),
+                                    context_files: context_files.clone(),
+                                    round,
+                                    messages: messages.clone(),
+                                    matched_tool_call: matched_tool_call.clone(),
+                                    last_content: redacted.clone(),
+                                    turn_options,
+                                    reasoning_content: model_run.reasoning_content.clone(),
+                                    mcp_call: Some(PendingMcpCall {
+                                        server_id,
+                                        tool_name,
+                                        arguments_json,
+                                    }),
+                                    web_diagnostic_call: None,
+                                    plan_review: None,
+                                })?;
+                                self.note_pending_approvals(
+                                    &session,
+                                    &task,
+                                    vec![PendingApproval {
+                                        kind: "mcp_tool".to_string(),
+                                        proposal_id: proposal.id.clone(),
+                                    }],
+                                );
+                                let mut proposal_run = model_run;
+                                proposal_run.content = response.clone();
+                                terminal = Some((
+                                    proposal_run,
+                                    response,
+                                    TurnProposals {
+                                        command: Some(proposal),
+                                        ..Default::default()
+                                    },
+                                    StopReason::Answered,
+                                ));
+                                break;
+                            }
+
+                            // No approval required: run it now and feed the result back.
+                            let summary = mcp_call_summary(&server_id, &tool_name);
+                            let (content, outcome) =
+                                match mcp.call_tool(&server_id, &tool_name, &arguments_json) {
+                                    Ok(result) => {
+                                        let text = self.scanner.redact(&result.text).text;
+                                        // `is_error` is the server's own verdict on its
+                                        // call. Reaching the server is not the same as
+                                        // the call working, and only the server knows
+                                        // which happened.
+                                        if result.is_error {
+                                            (
+                                                format!("MCP tool reported an error:\n{text}"),
+                                                ActionOutcome::Failed,
+                                            )
+                                        } else {
+                                            (text, ActionOutcome::Ok)
+                                        }
+                                    }
+                                    Err(error) => (
+                                        format!("MCP tool call failed: {error}"),
+                                        ActionOutcome::Failed,
+                                    ),
+                                };
+                            (summary, content, outcome)
+                        }
+                        other => {
+                            unreachable!("read-only action reached the sequential match: {other:?}")
+                        }
                     }
-                        other => unreachable!(
-                            "read-only action reached the sequential match: {other:?}"
-                        ),
-                    }
-                    };
+                };
                 // Defensive: the top-of-loop check normally catches a stop
                 // before the marker is even started, so a cancelled batch result
                 // is rare. If one arrives, close the marker cleanly and let the
@@ -2836,6 +2920,36 @@ impl ChatOrchestrator {
             usage,
             estimated_cost,
         })
+    }
+
+    /// Asks the permission matrix about one dispatched action, supplying the
+    /// context only two classes need (`mode_permits`'s own contract): a
+    /// command's classification — the same classifier `propose_command` runs,
+    /// without storing a proposal — and an MCP tool's read-only hint, from the
+    /// tool lists Layer 1 already fetched this turn.
+    fn action_permission(
+        &self,
+        mode: SessionMode,
+        repository_root: &Path,
+        action: &ToolAction,
+        mcp: &McpRuntime,
+    ) -> Permission {
+        let classification = match action {
+            ToolAction::Command(request) => Some(
+                self.validation_orchestrator
+                    .classify_command(repository_root, &request.command),
+            ),
+            _ => None,
+        };
+        let read_only_hint = match action {
+            ToolAction::McpCall {
+                server_id,
+                tool_name,
+                ..
+            } => mcp.tool_read_only_hint(server_id, tool_name),
+            _ => None,
+        };
+        mode_permits(mode, action, classification.as_ref(), read_only_hint)
     }
 
     /// Dispatch one of the read-only tools. Shared by the sequential path (a
@@ -5183,5 +5297,740 @@ mod system_prompt_tests {
                 "{mode:?} keeps a mode-dependent third paragraph"
             );
         }
+    }
+}
+
+/// Layer 3 of spec 20's working modes (`docs/specs/20_working_modes`): the
+/// orchestrator refuses at every action path, independent of what Layers 1
+/// and 2 offered the model. One test per refusal point in `context.md` §8's
+/// table, plus the cross-cutting guarantees. Every model here calls a tool it
+/// may never have been offered — that is the point: withholding is not
+/// enforcement.
+#[cfg(test)]
+mod mode_refusal_tests {
+    use super::*;
+    use crate::config::{McpServerConfig, ModelProviderConfig};
+    use crate::mode::SessionMode;
+    use crate::model::MockModelAdapter;
+    use crate::web_diagnostics::{WebDiagnosticReport, WebDiagnosticsRunner};
+    use crate::workspace_engine::WorkspaceEngine;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_repo(name: &str) -> PathBuf {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should work")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "damaian-mode-refusal-{name}-{now}-{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("README.md"), "# Mode refusal test\n").unwrap();
+        dir
+    }
+
+    fn native_provider() -> ModelProviderConfig {
+        ModelProviderConfig {
+            id: "openai".to_string(),
+            label: "OpenAI".to_string(),
+            base_url: String::new(),
+            api_key_env: String::new(),
+            models: Vec::new(),
+            supports_native_tools: true,
+            max_output_tokens: None,
+            context_token_budget: None,
+            provider_reports_usage: true,
+            price_per_million_input_tokens: None,
+            price_per_million_output_tokens: None,
+            price_per_million_cached_input_tokens: None,
+            supports_explicit_cache_breakpoints: false,
+        }
+    }
+
+    fn test_config(repo: &Path) -> Config {
+        let mut config = Config {
+            data_dir: repo.join(".damaian"),
+            enable_index_watcher: false,
+            ..Config::default()
+        };
+        config.model_providers.push(native_provider());
+        config
+    }
+
+    fn engine_with(repo: &Path) -> WorkspaceEngine {
+        WorkspaceEngine::new(test_config(repo))
+    }
+
+    /// Counts every diagnostic it is asked to run, so a test can assert the
+    /// runner was never reached rather than inferring it from the transcript.
+    #[derive(Debug, Clone, Default)]
+    struct CountingWebRunner {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl WebDiagnosticsRunner for CountingWebRunner {
+        fn inspect(&self, _call: &WebDiagnosticCall) -> Result<WebDiagnosticReport> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(WebDiagnosticReport::from_text("diagnostics", false))
+        }
+
+        fn run_scenario(&self, _call: &WebDiagnosticCall) -> Result<WebDiagnosticReport> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(WebDiagnosticReport::from_text("scenario", false))
+        }
+    }
+
+    fn engine_with_web_runner(repo: &Path) -> (WorkspaceEngine, Arc<AtomicUsize>) {
+        let runner = CountingWebRunner::default();
+        let calls = runner.calls.clone();
+        let mut engine = engine_with(repo);
+        engine
+            .chat_orchestrator
+            .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(runner));
+        (engine, calls)
+    }
+
+    /// A stdio MCP server whose one tool has no read-only hint (so it is
+    /// mutation-class) and whose `tools/call` touches `marker` — the only
+    /// reliable evidence that the call actually reached the server.
+    fn engine_with_mcp(repo: &Path, require_approval: bool) -> (WorkspaceEngine, PathBuf) {
+        let marker = repo.join("mcp-called");
+        let script = repo.join("mcp-server.sh");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2025-06-18","capabilities":{{}},"serverInfo":{{"name":"fake","version":"0"}}}}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[{{"name":"echo","description":"Echoes text","inputSchema":{{"type":"object"}}}}]}}}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      touch '{marker}'
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"echoed"}}]}}}}\n' "$id" ;;
+  esac
+done
+"#,
+                marker = marker.display()
+            ),
+        )
+        .unwrap();
+        let mut config = test_config(repo);
+        config.mcp_servers.push(McpServerConfig {
+            id: "fake".to_string(),
+            label: "Fake".to_string(),
+            transport: McpTransport::Stdio,
+            command: "sh".to_string(),
+            args: vec![script.to_string_lossy().to_string()],
+            env: Vec::new(),
+            url: String::new(),
+            auth_token_env: String::new(),
+            enabled: true,
+            require_approval,
+        });
+        (WorkspaceEngine::new(config), marker)
+    }
+
+    /// A session exists before its mode can be set, so this runs a warm-up
+    /// turn first and returns the session id with `mode` in effect.
+    fn session_in(engine: &WorkspaceEngine, repo: &Path, mode: SessionMode) -> String {
+        let mut warm = MockModelAdapter::new("Ready.");
+        let mut on_token = |_token: &str| {};
+        let first = engine
+            .chat_orchestrator
+            .ask(repo, "warm up", &[], &mut warm, &mut on_token)
+            .unwrap();
+        engine
+            .session_store
+            .set_session_mode(&first.session.id, mode, "user")
+            .unwrap();
+        first.session.id
+    }
+
+    fn turn(
+        engine: &WorkspaceEngine,
+        repo: &Path,
+        session_id: &str,
+        adapter: &mut dyn ModelAdapter,
+    ) -> ChatTurnResult {
+        let mut on_token = |_token: &str| {};
+        let cancel = CancelToken::new();
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+        };
+        engine
+            .chat_orchestrator
+            .ask_with_session(repo, "Go ahead.", &[], Some(session_id), adapter, &mut sink)
+            .unwrap()
+    }
+
+    fn resume(
+        engine: &WorkspaceEngine,
+        proposal_id: &str,
+        adapter: &mut dyn ModelAdapter,
+    ) -> ChatTurnResult {
+        let mut on_token = |_token: &str| {};
+        let cancel = CancelToken::new();
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+        };
+        engine
+            .chat_orchestrator
+            .resume_after_command_decision(proposal_id, true, "tester", adapter, &mut sink)
+            .unwrap()
+    }
+
+    fn call(id: &str, name: &str, arguments_json: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments_json: arguments_json.to_string(),
+        }
+    }
+
+    /// The model makes `calls` in its first round, then answers in plain text.
+    fn calls_then_answer(calls: Vec<ToolCall>) -> MockModelAdapter {
+        MockModelAdapter::new_sequence_with_tool_calls(
+            vec![String::new(), "Understood.".to_string()],
+            vec![calls, Vec::new()],
+        )
+    }
+
+    fn tool_results(engine: &WorkspaceEngine, session_id: &str) -> Vec<String> {
+        engine
+            .session_store
+            .read_messages(session_id)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.role == "tool")
+            .map(|message| message.content)
+            .collect()
+    }
+
+    fn assert_refused(result: &str, blocked_by: &str, allowed_in: &str) {
+        assert!(
+            result.contains("Refused")
+                && result.contains(&format!("{blocked_by} mode"))
+                && result.contains(&format!("{allowed_in} mode")),
+            "expected a refusal naming {blocked_by} as the blocker and {allowed_in} as \
+             what would allow it, got: {result}"
+        );
+    }
+
+    fn files_under(dir: &Path) -> usize {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() { files_under(&path) } else { 1 }
+            })
+            .sum()
+    }
+
+    fn stored_patches(repo: &Path) -> usize {
+        files_under(&repo.join(".damaian").join("patches"))
+    }
+
+    fn pending_chat_turns(repo: &Path) -> usize {
+        files_under(&repo.join(".damaian").join("chat").join("pending"))
+    }
+
+    fn audit_log(repo: &Path) -> String {
+        fs::read_to_string(repo.join(".damaian").join("audit").join("events.jsonl"))
+            .unwrap_or_default()
+    }
+
+    const PROPOSE_NEW_FILE: &str =
+        r#"{"summary":"Add a file","files":[{"path":"new.txt","content":"hello\n"}]}"#;
+
+    // Point 1.
+    #[test]
+    fn ask_mode_refuses_a_propose_patch_call_the_model_was_never_offered() {
+        let repo = temp_repo("ask-propose-patch");
+        let engine = engine_with(&repo);
+        let session = session_in(&engine, &repo, SessionMode::Ask);
+
+        let mut adapter =
+            calls_then_answer(vec![call("call_1", "propose_patch", PROPOSE_NEW_FILE)]);
+        let result = turn(&engine, &repo, &session, &mut adapter);
+
+        assert!(result.patch_proposal.is_none());
+        assert_eq!(stored_patches(&repo), 0, "no patch may be created");
+        assert_refused(&tool_results(&engine, &session)[0], "Ask", "Code");
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    // Point 1.
+    #[test]
+    fn ask_mode_refuses_an_edit_file_call_the_model_was_never_offered() {
+        let repo = temp_repo("ask-edit-file");
+        let engine = engine_with(&repo);
+        let session = session_in(&engine, &repo, SessionMode::Ask);
+
+        let mut adapter = calls_then_answer(vec![call(
+            "call_1",
+            "edit_file",
+            r##"{"summary":"Retitle","edits":[{"path":"README.md","old_text":"# Mode refusal test","new_text":"# Changed"}]}"##,
+        )]);
+        let result = turn(&engine, &repo, &session, &mut adapter);
+
+        assert!(result.patch_proposal.is_none());
+        assert_eq!(stored_patches(&repo), 0, "no patch may be created");
+        assert_refused(&tool_results(&engine, &session)[0], "Ask", "Code");
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    /// `context.md` §7: the chat loop neither teaches nor parses
+    /// `DAMAIAN_EDIT_V1`. This pins that as a guarantee, in every mode
+    /// including Code, so the day something wires `parse_generated_edit` into
+    /// `run_agentic_turn` without gating it, this fails instead of silently
+    /// opening a path around Layer 3.
+    #[test]
+    fn a_damaian_edit_v1_envelope_emitted_unprompted_is_never_applied_in_any_mode() {
+        let envelope = "DAMAIAN_EDIT_V1\nSUMMARY: Retitle\nFILE: README.md\nSTATUS: modified\nCONTENT:\n# Changed\nEND_FILE\nFILE: new.txt\nSTATUS: added\nCONTENT:\nhello\nEND_FILE\nEND_PATCH\n";
+        for mode in [
+            SessionMode::Ask,
+            SessionMode::Plan,
+            SessionMode::Code,
+            SessionMode::Review,
+        ] {
+            let repo = temp_repo("edit-envelope");
+            let engine = engine_with(&repo);
+            let session = session_in(&engine, &repo, mode);
+
+            let mut adapter = MockModelAdapter::new(envelope);
+            let result = turn(&engine, &repo, &session, &mut adapter);
+
+            assert!(result.patch_proposal.is_none(), "{mode:?} produced a patch");
+            assert_eq!(stored_patches(&repo), 0, "{mode:?} stored a patch");
+            assert_eq!(
+                fs::read_to_string(repo.join("README.md")).unwrap(),
+                "# Mode refusal test\n",
+                "{mode:?} changed a file"
+            );
+            assert!(!repo.join("new.txt").exists(), "{mode:?} created a file");
+
+            fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    // Point 3. `ls` would auto-run in Plan or Code without any approval card,
+    // so a check placed only on the approval branch would miss it.
+    #[test]
+    fn a_mode_that_forbids_a_command_refuses_it_before_either_the_approval_card_or_auto_run() {
+        let repo = temp_repo("ask-command");
+        let engine = engine_with(&repo);
+        let session = session_in(&engine, &repo, SessionMode::Ask);
+
+        let mut adapter = calls_then_answer(vec![
+            call(
+                "call_1",
+                "run_command",
+                r#"{"command":"ls","reason":"Look"}"#,
+            ),
+            call(
+                "call_2",
+                "run_command",
+                r#"{"command":"touch ask-marker","reason":"Change"}"#,
+            ),
+        ]);
+        let result = turn(&engine, &repo, &session, &mut adapter);
+
+        assert!(result.command_proposal.is_none(), "no approval card");
+        assert_eq!(pending_chat_turns(&repo), 0, "no paused turn saved");
+        assert!(
+            !audit_log(&repo).contains("stored_command_executed"),
+            "nothing may execute"
+        );
+        assert!(!repo.join("ask-marker").exists());
+        let results = tool_results(&engine, &session);
+        assert_refused(&results[0], "Ask", "Plan");
+        assert_refused(&results[1], "Ask", "Plan");
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    /// Task 7 owns the allowlist version; this is the mechanism: a command
+    /// needing approval in Plan is a mode refusal, never an approval card.
+    #[test]
+    fn plan_mode_still_refuses_a_command_needing_approval_outright() {
+        let repo = temp_repo("plan-command");
+        let engine = engine_with(&repo);
+        assert!(
+            engine
+                .validation_orchestrator
+                .command_needs_approval(&repo, "touch plan-marker"),
+            "the fixture command must need approval, or this proves nothing"
+        );
+        let session = session_in(&engine, &repo, SessionMode::Plan);
+
+        let mut adapter = calls_then_answer(vec![call(
+            "call_1",
+            "run_command",
+            r#"{"command":"touch plan-marker","reason":"Change"}"#,
+        )]);
+        let result = turn(&engine, &repo, &session, &mut adapter);
+
+        assert!(result.command_proposal.is_none(), "no approval card");
+        assert_eq!(pending_chat_turns(&repo), 0);
+        assert!(!repo.join("plan-marker").exists());
+        assert_refused(&tool_results(&engine, &session)[0], "Plan", "Code");
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    // Point 4 — the path `proposal.md` §5.2 never listed.
+    #[test]
+    fn ask_and_review_refuse_propose_plan_and_complete_step() {
+        for (mode, label) in [(SessionMode::Ask, "Ask"), (SessionMode::Review, "Review")] {
+            let repo = temp_repo("planning");
+            let engine = engine_with(&repo);
+            let session = session_in(&engine, &repo, mode);
+
+            let mut adapter = calls_then_answer(vec![
+                call(
+                    "call_1",
+                    "propose_plan",
+                    r#"{"steps":[{"title":"First"},{"title":"Second"}]}"#,
+                ),
+                call("call_2", "complete_step", "{}"),
+            ]);
+            let result = turn(&engine, &repo, &session, &mut adapter);
+
+            assert!(
+                engine
+                    .session_store
+                    .read_task_plan(&session, &result.task.id)
+                    .unwrap()
+                    .is_none(),
+                "{mode:?} recorded a plan"
+            );
+            let results = tool_results(&engine, &session);
+            assert_refused(&results[0], label, "Plan");
+            // Not "there is no plan": the mode refuses before the arm looks.
+            assert_refused(&results[1], label, "Plan");
+
+            fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    /// Why the mode is asked before spec 21's review gate rather than inside
+    /// the dispatch arm: Plan is where plans exist, and an unapproved plan
+    /// gates a mutating step behind a plan-review card. Asked in the arm, the
+    /// user would be handed that card for a step the mode then refuses anyway.
+    #[test]
+    fn plan_mode_refuses_a_mutation_without_first_raising_a_plan_review() {
+        let repo = temp_repo("plan-gate");
+        let engine = engine_with(&repo);
+        let session = session_in(&engine, &repo, SessionMode::Plan);
+
+        let mut adapter = calls_then_answer(vec![
+            call(
+                "call_1",
+                "propose_plan",
+                r#"{"steps":[{"title":"First"},{"title":"Second"}]}"#,
+            ),
+            call("call_2", "propose_patch", PROPOSE_NEW_FILE),
+        ]);
+        let result = turn(&engine, &repo, &session, &mut adapter);
+
+        assert!(
+            result.plan_proposal.is_none(),
+            "no plan review for a refused step"
+        );
+        assert_eq!(pending_chat_turns(&repo), 0);
+        assert_eq!(stored_patches(&repo), 0);
+        let results = tool_results(&engine, &session);
+        assert_refused(results.last().unwrap(), "Plan", "Code");
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    // Point 5. A loopback `inspect_web_page` is low risk and would run with no
+    // approval at all, so only a mode check can stop it.
+    #[test]
+    fn ask_and_plan_refuse_web_diagnostic_in_the_main_loop() {
+        for (mode, label) in [(SessionMode::Ask, "Ask"), (SessionMode::Plan, "Plan")] {
+            let repo = temp_repo("web-main");
+            let (engine, calls) = engine_with_web_runner(&repo);
+            let session = session_in(&engine, &repo, mode);
+
+            let mut adapter = calls_then_answer(vec![call(
+                "call_1",
+                "inspect_web_page",
+                r#"{"url":"http://localhost:5001/"}"#,
+            )]);
+            let result = turn(&engine, &repo, &session, &mut adapter);
+
+            assert!(result.command_proposal.is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{mode:?} ran a diagnostic");
+            assert_refused(&tool_results(&engine, &session)[0], label, "Code");
+
+            fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    // Point 6. `require_approval: false` on purpose: a check placed only
+    // inside the approval branch would let this call straight through.
+    #[test]
+    fn ask_and_plan_refuse_an_mcp_call_in_the_main_loop_even_when_the_server_needs_no_approval() {
+        let mcp_call = || calls_then_answer(vec![call("call_1", "mcp__fake__echo", "{}")]);
+
+        // Code proves the fixture: the call reaches the server and leaves its
+        // marker, so an absent marker below is a refusal, not a dead server.
+        let repo = temp_repo("mcp-main-code");
+        let (engine, marker) = engine_with_mcp(&repo, false);
+        let session = session_in(&engine, &repo, SessionMode::Code);
+        turn(&engine, &repo, &session, &mut mcp_call());
+        assert!(marker.exists(), "the fixture server must run in Code");
+        fs::remove_dir_all(repo).unwrap();
+
+        for (mode, label) in [(SessionMode::Ask, "Ask"), (SessionMode::Plan, "Plan")] {
+            let repo = temp_repo("mcp-main");
+            let (engine, marker) = engine_with_mcp(&repo, false);
+            let session = session_in(&engine, &repo, mode);
+
+            let result = turn(&engine, &repo, &session, &mut mcp_call());
+
+            assert!(result.command_proposal.is_none());
+            assert!(!marker.exists(), "{mode:?} reached the MCP server");
+            assert_refused(&tool_results(&engine, &session)[0], label, "Code");
+
+            fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    // Point 7 — the load-bearing test for `context.md` §8's decision: mode is
+    // checked when the approval is acted on, not when the command was offered.
+    #[test]
+    fn a_command_approved_after_the_session_switched_to_ask_is_refused_at_resume() {
+        let repo = temp_repo("resume-command");
+        let engine = engine_with(&repo);
+        let session = session_in(&engine, &repo, SessionMode::Code);
+
+        let mut adapter = calls_then_answer(vec![call(
+            "call_1",
+            "run_command",
+            r#"{"command":"touch resumed-marker","reason":"Change"}"#,
+        )]);
+        let first = turn(&engine, &repo, &session, &mut adapter);
+        let proposal = first
+            .command_proposal
+            .expect("Code offers the approval card");
+
+        engine
+            .session_store
+            .set_session_mode(&session, SessionMode::Ask, "user")
+            .unwrap();
+        let mut after = MockModelAdapter::new("Understood.");
+        resume(&engine, &proposal.id, &mut after);
+
+        assert!(!repo.join("resumed-marker").exists(), "the command ran");
+        assert!(!audit_log(&repo).contains("stored_command_executed"));
+        let results = tool_results(&engine, &session);
+        assert_refused(results.last().unwrap(), "Ask", "Plan");
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    // Point 8.
+    #[test]
+    fn a_web_diagnostic_approved_after_switching_to_plan_is_refused_at_resume() {
+        let repo = temp_repo("resume-web");
+        let (engine, calls) = engine_with_web_runner(&repo);
+        let session = session_in(&engine, &repo, SessionMode::Code);
+
+        let mut adapter = calls_then_answer(vec![call(
+            "call_1",
+            "run_web_scenario",
+            r##"{"url":"http://localhost:5001/","actions":[{"action":"click","selector":"#go"}]}"##,
+        )]);
+        let first = turn(&engine, &repo, &session, &mut adapter);
+        let proposal = first
+            .command_proposal
+            .expect("a scenario needs approval in Code");
+
+        engine
+            .session_store
+            .set_session_mode(&session, SessionMode::Plan, "user")
+            .unwrap();
+        let mut after = MockModelAdapter::new("Understood.");
+        resume(&engine, &proposal.id, &mut after);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the diagnostic ran");
+        let results = tool_results(&engine, &session);
+        assert_refused(results.last().unwrap(), "Plan", "Code");
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    // Point 9.
+    #[test]
+    fn an_mcp_call_approved_after_switching_to_ask_is_refused_at_resume() {
+        let repo = temp_repo("resume-mcp");
+        let (engine, marker) = engine_with_mcp(&repo, true);
+        let session = session_in(&engine, &repo, SessionMode::Code);
+
+        let mut adapter = calls_then_answer(vec![call("call_1", "mcp__fake__echo", "{}")]);
+        let first = turn(&engine, &repo, &session, &mut adapter);
+        let proposal = first
+            .command_proposal
+            .expect("the server requires approval");
+
+        engine
+            .session_store
+            .set_session_mode(&session, SessionMode::Ask, "user")
+            .unwrap();
+        let mut after = MockModelAdapter::new("Understood.");
+        resume(&engine, &proposal.id, &mut after);
+
+        assert!(!marker.exists(), "the MCP call reached the server");
+        let results = tool_results(&engine, &session);
+        assert_refused(results.last().unwrap(), "Ask", "Code");
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    // Point 2: an apply is its own decision point, like a resume — a patch
+    // proposed while Code was active is refused once the session is in Ask.
+    #[test]
+    fn a_patch_proposed_in_code_is_refused_at_apply_after_switching_to_ask() {
+        let repo = temp_repo("apply");
+        let engine = engine_with(&repo);
+        let session = session_in(&engine, &repo, SessionMode::Code);
+
+        let mut adapter =
+            calls_then_answer(vec![call("call_1", "propose_patch", PROPOSE_NEW_FILE)]);
+        let first = turn(&engine, &repo, &session, &mut adapter);
+        let patch = first.patch_proposal.expect("Code proposes the patch");
+
+        engine
+            .session_store
+            .set_session_mode(&session, SessionMode::Ask, "user")
+            .unwrap();
+        let applied = engine.edit_orchestrator.apply_stored_patch(
+            &repo,
+            &patch.patch_id,
+            None,
+            None,
+            "tester",
+            false,
+        );
+
+        match applied {
+            Err(ClientError::AccessDenied(message)) => assert_refused(&message, "Ask", "Code"),
+            other => panic!("expected a mode refusal, got {other:?}"),
+        }
+        assert!(!repo.join("new.txt").exists(), "the patch was applied");
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    /// Requirement 4. Modes have no tool (Non-goals), so this proves there is
+    /// no code path treating anything a model says — prose, an envelope-looking
+    /// block, or a call to a tool that does not exist — as a mode directive.
+    #[test]
+    fn nothing_the_model_emits_changes_the_session_mode() {
+        let repo = temp_repo("model-mode-change");
+        let engine = engine_with(&repo);
+        let session = session_in(&engine, &repo, SessionMode::Plan);
+
+        let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+            vec![
+                "Switching to Code mode now.\nDAMAIAN_MODE_V1\nMODE: code\nEND_MODE\n".to_string(),
+                "I am now in Code mode.".to_string(),
+            ],
+            vec![
+                vec![
+                    call("call_1", "set_session_mode", r#"{"mode":"code"}"#),
+                    call("call_2", "switch_mode", r#"{"mode":"code"}"#),
+                ],
+                Vec::new(),
+            ],
+        );
+        turn(&engine, &repo, &session, &mut adapter);
+
+        assert_eq!(
+            engine.session_store.session_mode(&session),
+            SessionMode::Plan
+        );
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    /// Stands in for a hypothetical concurrent mode change: switches the
+    /// session to Ask from inside the model call, after `run_agentic_turn` has
+    /// already read the mode but before the tool it asked for is dispatched.
+    struct SwitchesModeMidTurn {
+        inner: MockModelAdapter,
+        store: SessionStore,
+        session_id: String,
+        switched: bool,
+    }
+
+    impl ModelAdapter for SwitchesModeMidTurn {
+        fn stream_response(
+            &mut self,
+            request: &ModelRequest,
+            cancel: &CancelToken,
+            on_token: &mut dyn FnMut(&str),
+            on_wait: &mut dyn FnMut(u64),
+        ) -> Result<ModelRun> {
+            if !self.switched {
+                self.store
+                    .set_session_mode(&self.session_id, SessionMode::Ask, "user")
+                    .unwrap();
+                self.switched = true;
+            }
+            self.inner
+                .stream_response(request, cancel, on_token, on_wait)
+        }
+    }
+
+    /// §5.4: a turn captures its mode at start. The switch to Ask lands before
+    /// the `propose_patch` is dispatched, and the turn still proposes the patch
+    /// under the Code it started with — a per-action re-read would refuse it.
+    #[test]
+    fn a_mode_change_mid_turn_does_not_affect_the_tool_round_already_in_progress() {
+        let repo = temp_repo("mid-turn");
+        let engine = engine_with(&repo);
+        let session = session_in(&engine, &repo, SessionMode::Code);
+
+        let mut adapter = SwitchesModeMidTurn {
+            inner: calls_then_answer(vec![call("call_1", "propose_patch", PROPOSE_NEW_FILE)]),
+            store: engine.session_store.clone(),
+            session_id: session.clone(),
+            switched: false,
+        };
+        let result = turn(&engine, &repo, &session, &mut adapter);
+
+        assert_eq!(
+            engine.session_store.session_mode(&session),
+            SessionMode::Ask,
+            "the switch must have landed, or this proves nothing"
+        );
+        assert!(
+            result.patch_proposal.is_some(),
+            "the turn's captured Code mode must still govern its own round"
+        );
+
+        fs::remove_dir_all(repo).unwrap();
     }
 }

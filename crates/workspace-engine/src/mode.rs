@@ -7,11 +7,6 @@ use serde::{Deserialize, Serialize};
 /// place mode and tool identity are crossed; every enforcement layer calls
 /// through it rather than re-implementing any part of the matrix
 /// (`proposal.md` §5.1).
-// Task 1 (docs/specs/20_working_modes/tasks.md) is deliberately self-contained:
-// nothing outside this module's own tests calls these items yet. Task 4 wires
-// `mode_permits` into `chat.rs`'s tool-list construction, at which point these
-// `allow(dead_code)`s come off. (Renumbered 2026-09-24: Layer 1 wiring moved
-// from Task 3 to Task 4 so persistence, which it reads from, lands first.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SessionMode {
@@ -32,6 +27,16 @@ impl SessionMode {
             Self::Review => "review",
         }
     }
+
+    /// The name a person reads, as the mode control labels it.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Ask => "Ask",
+            Self::Plan => "Plan",
+            Self::Code => "Code",
+            Self::Review => "Review",
+        }
+    }
 }
 
 /// The result of asking whether a mode permits an action. `Refused` names
@@ -44,7 +49,6 @@ impl SessionMode {
 /// mode for `run_command` in general. A mutating command's `allowed_in` is
 /// always `Code`, even though Plan would allow a read-only command; this is
 /// the classification-dependent nature of that row, not an approximation.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Permission {
     Allowed,
@@ -58,6 +62,26 @@ impl Permission {
     pub(crate) fn is_allowed(&self) -> bool {
         matches!(self, Permission::Allowed)
     }
+}
+
+/// The one wording every Layer 3 refusal point uses (`proposal.md` §5.6:
+/// "which mode blocked it and what mode would allow it"), so nine call sites
+/// cannot drift into nine phrasings. Only ever called on a refusal — every
+/// call site has just matched `Permission::Refused` — so an `Allowed` here is
+/// a caller bug, and it panics rather than inventing a message for it.
+pub(crate) fn refusal_message(refused: Permission) -> String {
+    let Permission::Refused {
+        blocked_by,
+        allowed_in,
+    } = refused
+    else {
+        unreachable!("refusal_message called on an allowed permission")
+    };
+    format!(
+        "Refused: {} mode does not allow this. Switch to {} mode to allow it.",
+        blocked_by.label(),
+        allowed_in.label()
+    )
 }
 
 /// The permission matrix from `proposal.md` §5.1, extended per
@@ -162,7 +186,7 @@ mod tests {
     use crate::chat::{CommandRequest, ToolAction};
     use crate::command_policy::{CommandClassification, CommandRisk};
     use crate::edit::GeneratedEdit;
-    use crate::mode::{Permission, SessionMode, mode_permits};
+    use crate::mode::{Permission, SessionMode, mode_permits, refusal_message};
     use crate::web_diagnostics::{WebDiagnosticCall, WebDiagnosticKind};
 
     fn read_only_command() -> CommandClassification {
@@ -412,6 +436,25 @@ mod tests {
         };
         assert_eq!(blocked_by, SessionMode::Ask);
         assert_eq!(allowed_in, SessionMode::Code);
+    }
+
+    #[test]
+    fn a_refusal_message_names_both_modes_in_the_words_a_person_reads() {
+        let message = refusal_message(Permission::Refused {
+            blocked_by: SessionMode::Review,
+            allowed_in: SessionMode::Code,
+        });
+        assert_eq!(
+            message,
+            "Refused: Review mode does not allow this. Switch to Code mode to allow it."
+        );
+    }
+
+    /// Every call site has just matched a refusal, so an `Allowed` reaching
+    /// the helper is a caller bug — loud, not a made-up message.
+    #[test]
+    fn a_refusal_message_for_an_allowed_permission_panics() {
+        assert!(std::panic::catch_unwind(|| refusal_message(Permission::Allowed)).is_err());
     }
 
     /// `run_command` needs the command's own classification to decide,

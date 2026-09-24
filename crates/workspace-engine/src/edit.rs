@@ -1,5 +1,6 @@
 use crate::audit::AuditLog;
 use crate::cancel::CancelToken;
+use crate::chat::ToolAction;
 use crate::checkpoint::{
     CheckpointConversation, CheckpointManifest, CheckpointOrigin, CheckpointPath,
     CheckpointRequest, CheckpointStore,
@@ -9,6 +10,7 @@ use crate::context_manager::{ContextItem, ContextManager};
 use crate::error::{ClientError, Result};
 use crate::hash::{create_id, repository_id_for_root};
 use crate::indexer::ProjectIndexer;
+use crate::mode::{mode_permits, refusal_message};
 use crate::model::{ModelAdapter, ModelMessage, ModelRequest, ModelRun, TokenUsage};
 use crate::patch_engine::{
     GeneratedSecretWarning, PatchApplyResult, PatchEngine, ProposedChange, ProposedPatch,
@@ -508,6 +510,30 @@ impl EditOrchestrator {
         allow_generated_secrets: bool,
     ) -> Result<PatchApplyResult> {
         let patch = self.patch_store.load(patch_id)?;
+        // Layer 3 of spec 20's working modes: applying is its own decision,
+        // made after the turn that proposed the patch has ended, so it answers
+        // to the session's mode now — a patch proposed under Code is refused
+        // once the session is in Ask. Checked before the marker and the
+        // snapshot below, so a refusal leaves nothing to finish or undo. A
+        // legacy patch with no session has no mode to read and stays
+        // unrestricted, the same carve-out its marker gets.
+        if !patch.session_id.is_empty() {
+            let permission = mode_permits(
+                self.session_store.session_mode(&patch.session_id),
+                &ToolAction::ProposePatch(GeneratedEdit {
+                    summary: String::new(),
+                    changes: Vec::new(),
+                }),
+                None,
+                None,
+            );
+            if !permission.is_allowed() {
+                // `AccessDenied`, not `PolicyBlocked`: the latter already
+                // means the command policy blocked something, and a mode is a
+                // different boundary the user chose, not a policy verdict.
+                return Err(ClientError::AccessDenied(refusal_message(permission)));
+            }
+        }
         // Writing files is the most side-effecting action in the engine, so its
         // marker brackets the write itself rather than a caller. A patch stored
         // before `session_id` existed has no log to name, so it gets no marker —
