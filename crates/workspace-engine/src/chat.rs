@@ -14,7 +14,7 @@ use crate::git_service::{GitService, GitStatus};
 use crate::hash::{create_id, now_millis};
 use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
-use crate::mode::mode_permits;
+use crate::mode::{SessionMode, mode_permits};
 use crate::model::{
     ModelAdapter, ModelMessage, ModelRequest, ModelRun, TokenUsage, ToolCall, ToolDefinition,
     model_request_json,
@@ -707,8 +707,9 @@ impl ChatOrchestrator {
             self.config.context_token_budget(),
         );
         let model_prompt = build_model_prompt(prompt, &context.items, &prior_messages, None);
+        let mode = self.session_store.session_mode(&session.id);
         let messages = vec![
-            ModelMessage::system(system_prompt()),
+            ModelMessage::system(system_prompt(mode)),
             ModelMessage::user(model_prompt),
         ];
 
@@ -3228,9 +3229,36 @@ impl PendingCommandStore {
 /// on repeated tool calls.
 const ABSOLUTE_TOOL_ROUND_CAP: u32 = 16;
 
-fn system_prompt() -> String {
-    "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.\n\nIf the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it."
-        .to_string()
+fn system_prompt(mode: SessionMode) -> String {
+    const PREFIX: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.";
+    match mode {
+        // Ask is reads-and-explanations only: no command envelope at all, so
+        // there is nothing to invite a command the mode would refuse.
+        SessionMode::Ask => PREFIX.to_string(),
+        SessionMode::Code => format!("{PREFIX}\n\n{}", command_envelope_paragraph_unrestricted()),
+        // Plan and Review permit read-only commands but refuse anything that
+        // would need approval outright rather than raising an approval card
+        // (`proposal.md` §5.3), so the third paragraph matches that behavior.
+        SessionMode::Plan | SessionMode::Review => {
+            format!("{PREFIX}\n\n{}", command_envelope_paragraph_read_only())
+        }
+    }
+}
+
+/// The command-envelope paragraph for Code — today's wording verbatim,
+/// including the invitation to request a side-effecting command. Code is the
+/// only mode where such a request can become an approval card, so it is the
+/// only mode that should teach it.
+fn command_envelope_paragraph_unrestricted() -> &'static str {
+    "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it."
+}
+
+/// The command-envelope paragraph for Plan and Review. The envelope stays
+/// (read-only commands are permitted in both modes) but the Code-only
+/// invitation to request a side-effecting command is replaced with what will
+/// actually happen: it is refused, not queued for approval.
+fn command_envelope_paragraph_read_only() -> &'static str {
+    "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. In this mode only read-only commands that need no approval are available; a command with side effects, network access, Docker access, shell control, or unknown risk is refused outright, not queued for approval. Do not request one."
 }
 
 fn build_model_prompt(
@@ -5057,5 +5085,103 @@ done
         );
 
         fs::remove_dir_all(repo).unwrap();
+    }
+}
+
+/// Layer 2 of spec 20's working modes (`docs/specs/20_working_modes`): the
+/// non-native text-envelope fallback's system prompt. `system_prompt()` now
+/// takes the turn's mode, so Ask omits the `DAMAIAN_COMMAND_V1` envelope
+/// entirely, while Plan and Review keep it but drop the Code-only invitation
+/// to request a side-effecting command. `DAMAIAN_EDIT_V1` is not taught here
+/// in any mode (`context.md` §7), so it is not part of this layer.
+#[cfg(test)]
+mod system_prompt_tests {
+    use super::*;
+    use crate::mode::SessionMode;
+
+    /// The exact string `system_prompt()` produced before this task, copied
+    /// from the live source rather than re-typed from the plan's quotation.
+    /// `code_mode_system_prompt_is_byte_identical_to_todays` pins the Code
+    /// output against it; spec 49 Task 8's prefix-stability guards depend on
+    /// this staying true.
+    const TODAYS_CODE_SYSTEM_PROMPT: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.\n\nIf the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.";
+
+    #[test]
+    fn code_mode_system_prompt_is_byte_identical_to_todays() {
+        assert_eq!(system_prompt(SessionMode::Code), TODAYS_CODE_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn ask_mode_system_prompt_has_no_command_envelope() {
+        let prompt = system_prompt(SessionMode::Ask);
+        assert!(
+            !prompt.contains("DAMAIAN_COMMAND_V1"),
+            "Ask must teach no command envelope at all: {prompt}"
+        );
+        assert!(
+            !prompt.contains("The app will run sandbox-safe commands automatically"),
+            "Ask must not leave the envelope's guidance paragraph dangling: {prompt}"
+        );
+    }
+
+    #[test]
+    fn plan_mode_system_prompt_keeps_the_envelope_with_restricted_wording() {
+        let prompt = system_prompt(SessionMode::Plan);
+        assert!(
+            prompt.contains("DAMAIAN_COMMAND_V1"),
+            "Plan still offers read-only commands, so the envelope stays: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Damaian will pause for user approval before running it"),
+            "Plan refuses an approval-requiring command outright, so the Code-only \
+             invitation must be absent: {prompt}"
+        );
+    }
+
+    #[test]
+    fn review_mode_system_prompt_matches_plan_modes_restricted_wording() {
+        assert_eq!(
+            system_prompt(SessionMode::Review),
+            system_prompt(SessionMode::Plan),
+            "Review's command capability is identical to Plan's"
+        );
+    }
+
+    #[test]
+    fn a_mode_change_does_not_alter_the_prompt_outside_the_command_paragraph() {
+        fn first_two_paragraphs(prompt: &str) -> String {
+            prompt
+                .split("\n\n")
+                .take(2)
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        }
+
+        let ask = system_prompt(SessionMode::Ask);
+        assert_eq!(
+            first_two_paragraphs(&ask),
+            ask,
+            "Ask must end after the fixed two-paragraph prefix, with no third paragraph"
+        );
+
+        for mode in [
+            SessionMode::Ask,
+            SessionMode::Plan,
+            SessionMode::Code,
+            SessionMode::Review,
+        ] {
+            assert_eq!(
+                first_two_paragraphs(&system_prompt(mode)),
+                ask,
+                "only the third paragraph may vary with mode; {mode:?} changed the prefix"
+            );
+        }
+
+        for mode in [SessionMode::Plan, SessionMode::Code, SessionMode::Review] {
+            assert!(
+                system_prompt(mode).len() > ask.len(),
+                "{mode:?} keeps a mode-dependent third paragraph"
+            );
+        }
     }
 }

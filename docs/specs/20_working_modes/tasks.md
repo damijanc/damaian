@@ -14,7 +14,7 @@ extended tool-class mapping in [`context.md`](context.md)
 | 2 · MCP read-only capability | Done | `McpTool.read_only_hint: Option<bool>` added; `list_tools`'s inline loop extracted into a private pure `parse_mcp_tool(item: &Value) -> Option<McpTool>` (4 unit tests, no subprocess). `McpRuntime::tool_read_only_hint(server_id, tool_name) -> Option<bool>` added near `requires_approval`; unused by any caller until Task 4/6 wire it in, so no `#[allow(dead_code)]` was needed since it's `pub`. `mode_permits` widened to a 4th `mcp_tool_read_only: Option<bool>` parameter (Task 2's own decision, per its row's Interfaces note); `McpCall` arm now `mcp_tool_read_only == Some(true) \|\| mode == Code`. Every existing `mode.rs` test call site updated to pass the new parameter (compiler-named, all `None` except the new MCP cases). Mutation test: made the arm also treat `None` as permitting outside Code, confirmed `an_mcp_call_with_no_read_only_signal_is_treated_as_mutation_class` fails with `assertion failed: !mode_permits(SessionMode::Ask, &action, None, None).is_allowed()`, reverted. All 22 `mode::tests` + `mcp::tests` pass; `cargo fmt --all -- --check` (after one `cargo fmt --all` pass) and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` both clean. `chat.rs` untouched, as scoped. |
 | 3 · Persistence — `SessionStore::set_session_mode` / `session_mode` | Done | Reordered ahead of Layer 1 on 2026-09-24 — Layer 1 needs `session_mode` to read from, so it must exist first. Was "Task 4" before the swap; nothing had started on either task, so renumbering was safe. Step 1 assumed an inline `session.rs` test module near existing `browser_diagnostics` tests, but `session.rs` had no `#[cfg(test)] mod tests` at all — its existing coverage lives in `tests/foundation.rs` and other integration-test files, run against the crate's public API. Since `SessionMode` is `pub(crate)` (Task 1's decision), an integration test crate can't see it, so a new inline `mod tests` was added at the end of `session.rs` instead, following the `temp_data_dir`-with-atomic-counter fixture pattern from `checkpoint.rs`'s inline tests and the `latest_event_seq`-before-mutating rewind idiom from `tests/session_rewind.rs`. All six tests from the plan implemented as named. `set_session_mode` and `session_mode` came out `pub(crate)`, not `pub` as the sketch had them — `pub` on a method returning/taking a `pub(crate)` type is a `private_interfaces` warning, which `clippy -D warnings` rejects; both carry `#[allow(dead_code)]` with a comment naming their real caller (Task 4/6 for `session_mode`, Task 8 for `set_session_mode`), the same pattern Task 1/2 used. `cargo nextest run -p workspace-engine -E 'test(session_mode)'` (the plan's own filter) only matches 2 of the 6 test names by substring; verified all six explicitly with `-E 'test(session::tests)'` instead — recorded here so a later task doesn't reuse the narrower filter and believe it covers the module. All 16 tests in `mode::tests` + `session::tests` pass; `cargo fmt --all -- --check` and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` both clean. |
 | 4 · Layer 1 — tool-list construction filters by mode | Done | Tests live in a new inline `#[cfg(test)] mod mode_tool_list_tests` at the end of `chat.rs`, not `tests/foundation.rs`: `SessionMode` and `set_session_mode`/`session_mode` are `pub(crate)` (Task 1/3 decisions), so the integration-test crate cannot see them — the same reason Task 3 put its `session_mode` tests inline. Seam is `MockModelAdapter` + `adapter.requests[0].tools` (spec 49 Task 8's request-shape seam). Fixture: a two-turn helper (`offered_tool_names`) because a mode is set on a session that must already exist — a warm-up `ask(...)` creates the session, `set_session_mode(&id, mode, "user")`, then `ask_with_session(..., Some(&id), ...)` with a fresh adapter whose `requests[0].tools` is inspected. Real `ToolAction` field names used for the placeholders (confirmed against `chat.rs:3237-3280` and `mode.rs`'s own tests, not the plan's sketches): `ProposePatch(GeneratedEdit { summary, changes: vec![] })`, `ProposePlan(vec![])`, `ReadFile { path, range: None }`, `ListDirectory { dir: None, depth: None }`, `SearchContent { pattern, path_glob: None, max_matches: None }`, `EditFile { summary, edits: vec![] }`, `SearchCodebase { query, semantic: false, limit: 0 }`, `ReadGitDiff { staged: false }`, `WebDiagnostic(WebDiagnosticCall { kind: WebDiagnosticKind::Inspect, url, arguments_json, session_id: None, task_id: None })`, `McpCall { server_id, tool_name, arguments_json }`, and `Command(CommandRequest { command, reason })`. `run_command` is asked about a synthetic best-case `CommandClassification { command: "", risk: CommandRisk::Low, blocked: false, requires_approval: false, reasons: vec![], expected_effects: "", may_use_network: false }` routed through `mode_permits`, not a hand-coded `mode != Ask`. Deviation from the sketch's shape: every definition (including the read-only ones) is filtered through `mode_permits` rather than pushing reads unconditionally, so there is literally no second place encoding the matrix; and the browser-MCP-server-id filter and the new per-tool mode filter were **merged into one closure** in the same `tools.extend(...)` chain (the sketch's alternative) rather than kept as two chained `.filter(...)`s. **Conflict found and resolved against the authoritative sources:** the plan's own `plan_mode_offers_run_command_but_not_propose_patch_or_edit_file` bullet says Plan offers neither `propose_plan` nor `complete_step`, but `context.md` §1's planning row ("Plan and Code"), `proposal.md` §5.1 as extended, `mode.rs`'s implementation, and Task 1's crossing test all say Plan **does** permit them. Implemented per the matrix (test name kept; it asserts Plan offers `propose_plan`/`complete_step` and withholds only `propose_patch`/`edit_file`). MCP tests use a stdio shell-script fixture (`write_mcp_server`, the shape of `tests/foundation.rs`'s `mcp_stdio_client_handshakes_lists_and_calls_tools`) configured via `config.mcp_servers`; the no-hint test proves the server connected by asserting the tool **is** offered in Code before asserting it is withheld in Ask, so a dead server cannot pass it. Pre-implementation, 4 of the 6 new tests failed (`ask_mode…`, `plan_mode…`, `review_mode…`, `an_mcp_tool_without_a_read_only_hint…`) — the falsification evidence; `code_mode_offers_every_native_tool` (regression guard) and `an_mcp_tool_with_a_true_read_only_hint_is_offered_in_ask` (positive assertion) can only pass pre- and post-change. Removed the now-stale `#[allow(dead_code)]` from `mode_permits` and `Permission::is_allowed` in `mode.rs` and from `SessionStore::session_mode` in `session.rs` (chat.rs is now their real caller); left `Permission`'s and `set_session_mode`'s allows for Task 6/Task 8. `cargo nextest run -p workspace-engine` — 630 passed, 18 skipped; `cargo fmt --all -- --check` clean; `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean. |
-| 5 · Layer 2 — the non-native fallback's system-prompt envelopes | Not started | |
+| 5 · Layer 2 — the non-native fallback's system-prompt envelopes | Done | `chat.rs` only. Scope correction from `context.md` §7 held: `DAMAIAN_EDIT_V1` is not taught by `system_prompt()` in any mode and `run_agentic_turn` never parses it, so this task touched `DAMAIAN_COMMAND_V1` only. `system_prompt(mode: SessionMode) -> String` now splits the old literal at its two existing `\n\n` boundaries: `const PREFIX` (first two paragraphs, byte-copied from the live source, not retyped from the plan) plus one of two third paragraphs — `command_envelope_paragraph_unrestricted()` (Code, today's words verbatim) or `command_envelope_paragraph_read_only()` (Plan/Review: envelope retained, the Code-only "Damaian will pause for user approval before running it" invitation replaced with "refused outright, not queued for approval"); `Ask` returns `PREFIX` alone, no envelope. One call site changed at `chat.rs:711` inside `ask_with_session_with_options` (confirmed not in `run_agentic_turn`): added a second, independent `self.session_store.session_mode(&session.id)` read there and passed it to `system_prompt(mode)`, as Task 4's read at `chat.rs:1274` is a different function and does not put `mode` in scope. Tests live in a new inline `#[cfg(test)] mod system_prompt_tests` at the end of `chat.rs` (the function is module-private, so this is the same placement reason Task 3/4 recorded); the byte-identity guard pins `TODAYS_CODE_SYSTEM_PROMPT` copied from the live literal, not the plan's quotation. All 5 new tests pass; `cargo nextest run -p workspace-engine --test prompt_cache` — both spec 49 Task 8 guards pass **unmodified** (neither sets a mode, both compare Code prompts, and Code output is byte-identical); `cargo fmt --all -- --check` and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` both clean. Eval harness not run separately: the full deterministic tier is part of the deferred Task 10 workspace gate and Code-mode output is unchanged. |
 | 6 · Layer 3 — the orchestrator refuses at every action path | Not started | |
 | 7 · Command-allowlist does not widen a mode | Not started | |
 | 8 · UI — mode control, refusal messaging, Plan→Code continuity | Not started | |
@@ -1188,7 +1188,7 @@ the two reads into one parameter threaded from `ask_with_session_with_options`
 into `run_agentic_turn` would touch Task 4's already-committed code for a
 minor deduplication and is not this task's job.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
   Add near wherever `system_prompt()` is currently exercised (grep for it —
   it may have no dedicated test today, only being covered indirectly
@@ -1224,11 +1224,11 @@ minor deduplication and is not this task's job.
     varies. This is what keeps a mode change from being able to smuggle
     unrelated prompt drift in through this task.
 
-- [ ] **Step 2: Run to verify they fail to compile**
+- [x] **Step 2: Run to verify they fail to compile**
 
   `cargo nextest run -p workspace-engine -E 'test(system_prompt)'`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
   Split `system_prompt()`'s current literal at its natural paragraph
   boundary (the two `\n\n`s already in the string) into a fixed prefix (the
@@ -1268,9 +1268,9 @@ minor deduplication and is not this task's job.
   `let mode = self.session_store.session_mode(&session.id);` before the
   `messages` vec is built, and change the call to `system_prompt(mode)`.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
-- [ ] **Step 5: Confirm spec 49's guards still pass**
+- [x] **Step 5: Confirm spec 49's guards still pass**
 
   `cargo nextest run -p workspace-engine --test prompt_cache` — both tests
   should still pass unmodified, since neither sets a session mode and both
@@ -1279,13 +1279,13 @@ minor deduplication and is not this task's job.
   wording) — stop and record it rather than editing the guard to make it
   pass.
 
-- [ ] **Step 6: Scoped checks**
+- [x] **Step 6: Scoped checks**
 
   `cargo nextest run -p workspace-engine -E 'test(system_prompt) + test(mode)'`,
   `cargo nextest run -p workspace-engine --test prompt_cache`, `cargo fmt`,
   `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`.
 
-- [ ] **Step 7: Show the change and the check result, and ask before committing**
+- [x] **Step 7: Show the change and the check result, and ask before committing**
 
 ## Task 6: Layer 3 — the orchestrator refuses
 
