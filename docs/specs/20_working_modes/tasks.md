@@ -11,7 +11,7 @@ extended tool-class mapping in [`context.md`](context.md)
 | Task | State | Notes |
 |---|---|---|
 | 1 · `SessionMode`, `ToolAction` extended with the two new mutation/planning arms it needs, and the permission-matrix function | Done | `mode.rs` added, registered in `lib.rs` between `mcp` and `model`. Signature decision (Step 3): `fn mode_permits(mode: SessionMode, action: &ToolAction, command: Option<&CommandClassification>) -> Permission` — the single-function-over-the-whole-enum option, per context.md §6's preference; `Command` gets no separate function. `Permission` is `Allowed \| Refused { blocked_by: SessionMode, allowed_in: SessionMode }`, matching the sketch. `ToolAction`, `CommandRequest`, and `ProposedStep` were module-private to `chat.rs` and had to be widened to `pub(crate)` (with `CommandRequest`'s fields also `pub(crate)`) for `mode.rs` to see them — no other file referenced them before this change. Two field-name corrections against tasks.md's own sketch, confirmed by reading the real types before writing the test: `GeneratedEdit` has `changes: Vec<ProposedChange>`, not `files`; `WebDiagnosticCall` is a struct (`kind: WebDiagnosticKind, url, arguments_json, session_id, task_id`), not an enum with an `InspectPage` variant. `SessionMode`, `Permission`, `mode_permits`, and `Permission::is_allowed` carry `#[allow(dead_code)]` with a comment pointing at Task 3, since this task is self-contained by design and nothing outside its own tests calls them yet — `cargo clippy -D warnings` fails without it. Mutation test: flipped the `ProposePatch`/`EditFile` arm to also allow `Ask`, confirmed `the_permission_matrix_matches_the_spec_table` fails (`assertion failed: !mode_permits(Ask, action, None).is_allowed()`), reverted. All 9 `mode::tests` pass; `cargo fmt --all -- --check` and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` both clean. |
-| 2 · MCP read-only capability | Not started | |
+| 2 · MCP read-only capability | Done | `McpTool.read_only_hint: Option<bool>` added; `list_tools`'s inline loop extracted into a private pure `parse_mcp_tool(item: &Value) -> Option<McpTool>` (4 unit tests, no subprocess). `McpRuntime::tool_read_only_hint(server_id, tool_name) -> Option<bool>` added near `requires_approval`; unused by any caller until Task 3/6 wire it in, so no `#[allow(dead_code)]` was needed since it's `pub`. `mode_permits` widened to a 4th `mcp_tool_read_only: Option<bool>` parameter (Task 2's own decision, per its row's Interfaces note); `McpCall` arm now `mcp_tool_read_only == Some(true) \|\| mode == Code`. Every existing `mode.rs` test call site updated to pass the new parameter (compiler-named, all `None` except the new MCP cases). Mutation test: made the arm also treat `None` as permitting outside Code, confirmed `an_mcp_call_with_no_read_only_signal_is_treated_as_mutation_class` fails with `assertion failed: !mode_permits(SessionMode::Ask, &action, None, None).is_allowed()`, reverted. All 22 `mode::tests` + `mcp::tests` pass; `cargo fmt --all -- --check` (after one `cargo fmt --all` pass) and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` both clean. `chat.rs` untouched, as scoped. |
 | 3 · Layer 1 — tool-list construction filters by mode | Not started | |
 | 4 · Persistence — `SessionStore::set_session_mode` / `session_mode` | Not started | |
 | 5 · Layer 2 — the non-native fallback's system-prompt envelopes | Not started | |
@@ -595,7 +595,7 @@ for `Command`) rather than the matrix growing a special case.
   `mcp_tool_read_only: Option<bool>` alongside `command`. Record in this
   row if the parameter list grows differently.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
   `list_tools` (`mcp.rs:178-203`) has no dedicated unit tests today —
   it is exercised only through
@@ -646,11 +646,11 @@ for `Command`) rather than the matrix growing a special case.
     the crossing test so a future reader finds the reasoning attached to
     the case that most needs it.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
   `cargo nextest run -p workspace-engine -E 'test(read_only) + test(mcp_call)'`
 
-- [ ] **Step 3: Implement `mcp.rs`**
+- [x] **Step 3: Implement `mcp.rs`**
 
   Add the field:
 
@@ -727,7 +727,7 @@ for `Command`) rather than the matrix growing a special case.
   `read_only_hint: None` unless that fixture is specifically testing the
   hint.
 
-- [ ] **Step 4: Widen `mode_permits` and implement the real `McpCall` arm**
+- [x] **Step 4: Widen `mode_permits` and implement the real `McpCall` arm**
 
   ```rust
   pub(crate) fn mode_permits(
@@ -755,11 +755,11 @@ for `Command`) rather than the matrix growing a special case.
   `#[allow(dead_code)]`-adjacent "Task 2 replaces this arm" comment Task 1
   left, since this task is what replaces it.
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
   `cargo nextest run -p workspace-engine -E 'test(mode) + test(mcp)'`
 
-- [ ] **Step 6: Mutation-test the silence case**
+- [x] **Step 6: Mutation-test the silence case**
 
   Temporarily change the `McpCall` arm to treat `None` the same as
   `Some(true)` (i.e. delete the `mcp_tool_read_only == Some(true)`
@@ -768,13 +768,13 @@ for `Command`) rather than the matrix growing a special case.
   `an_mcp_call_with_no_read_only_signal_is_treated_as_mutation_class` fails.
   Revert.
 
-- [ ] **Step 7: Scoped checks**
+- [x] **Step 7: Scoped checks**
 
   `cargo nextest run -p workspace-engine -E 'test(mode) + test(mcp)'`,
   `cargo fmt`, `cargo clippy -p workspace-engine --all-targets --locked --
   -D warnings`.
 
-- [ ] **Step 8: Show the change and the check result, and ask before committing**
+- [x] **Step 8: Show the change and the check result, and ask before committing**
 
 ## Task 3: Layer 1 — tool-list construction filters by mode
 

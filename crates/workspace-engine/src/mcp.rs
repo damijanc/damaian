@@ -105,6 +105,14 @@ pub struct McpTool {
     /// The tool's JSON-Schema `inputSchema`, serialized — maps directly onto
     /// [`ToolDefinition::parameters_json`].
     pub input_schema_json: String,
+    /// The server's own claim about whether calling this tool has side
+    /// effects, from `tools/list`'s optional `annotations.readOnlyHint`.
+    /// `None` means the server made no claim either way — not "not
+    /// read-only" and not "read-only". A hint, per the MCP spec, not a
+    /// guarantee; `mode_permits` (`mode.rs`) is what turns it into an
+    /// enforced boundary, and only a `Some(true)` widens what a
+    /// capability-restricted mode offers.
+    pub read_only_hint: Option<bool>,
 }
 
 impl McpTool {
@@ -177,28 +185,11 @@ impl McpClient {
 
     pub fn list_tools(&mut self) -> Result<Vec<McpTool>> {
         let result = self.request("tools/list", json!({}), CONNECT_TIMEOUT)?;
-        let mut tools = Vec::new();
-        if let Some(items) = result.get("tools").and_then(Value::as_array) {
-            for item in items {
-                let Some(name) = item.get("name").and_then(Value::as_str) else {
-                    continue;
-                };
-                let description = item
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let input_schema = item
-                    .get("inputSchema")
-                    .cloned()
-                    .unwrap_or_else(|| json!({ "type": "object" }));
-                tools.push(McpTool {
-                    name: name.to_string(),
-                    description,
-                    input_schema_json: input_schema.to_string(),
-                });
-            }
-        }
+        let tools = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(parse_mcp_tool).collect())
+            .unwrap_or_default();
         Ok(tools)
     }
 
@@ -224,6 +215,31 @@ impl McpClient {
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
+}
+
+/// Parses one `tools/list` array item into an [`McpTool`], or `None` when the
+/// item has no `name` (the only field this repository treats as required).
+fn parse_mcp_tool(item: &Value) -> Option<McpTool> {
+    let name = item.get("name").and_then(Value::as_str)?.to_string();
+    let description = item
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let input_schema = item
+        .get("inputSchema")
+        .cloned()
+        .unwrap_or_else(|| json!({ "type": "object" }));
+    let read_only_hint = item
+        .get("annotations")
+        .and_then(|annotations| annotations.get("readOnlyHint"))
+        .and_then(Value::as_bool);
+    Some(McpTool {
+        name,
+        description,
+        input_schema_json: input_schema.to_string(),
+        read_only_hint,
+    })
 }
 
 fn notification_payload(method: &str) -> String {
@@ -666,6 +682,19 @@ impl McpRuntime {
             .unwrap_or(true)
     }
 
+    /// The server's own read-only claim for one of its tools, from the
+    /// cached `tools/list` response — `None` both when the server made no
+    /// claim and when the tool or server is unknown to this runtime. Callers
+    /// that need to distinguish "unknown" from "known but unclaimed" should
+    /// not use this method; nothing downstream needs that distinction today.
+    pub fn tool_read_only_hint(&self, server_id: &str, tool_name: &str) -> Option<bool> {
+        self.tools
+            .get(server_id)?
+            .iter()
+            .find(|tool| tool.name == tool_name)?
+            .read_only_hint
+    }
+
     fn record(&self, event: &str, fields: &[(&str, String)]) {
         if let Some(log) = &self.audit_log {
             let mut entries = vec![("actor", "system".to_string())];
@@ -870,5 +899,48 @@ mod tests {
             Some("abc123")
         );
         assert_eq!(body, "{\"result\":1}");
+    }
+
+    #[test]
+    fn parse_mcp_tool_reads_a_true_read_only_hint() {
+        let item = json!({
+            "name": "search_issues",
+            "description": "Search issues",
+            "annotations": { "readOnlyHint": true },
+        });
+        let tool = parse_mcp_tool(&item).unwrap();
+        assert_eq!(tool.read_only_hint, Some(true));
+    }
+
+    #[test]
+    fn parse_mcp_tool_reads_a_false_read_only_hint() {
+        let item = json!({
+            "name": "create_issue",
+            "description": "Create an issue",
+            "annotations": { "readOnlyHint": false },
+        });
+        let tool = parse_mcp_tool(&item).unwrap();
+        assert_eq!(tool.read_only_hint, Some(false));
+    }
+
+    #[test]
+    fn parse_mcp_tool_with_no_annotations_object_is_none() {
+        let item = json!({
+            "name": "search_issues",
+            "description": "Search issues",
+        });
+        let tool = parse_mcp_tool(&item).unwrap();
+        assert_eq!(tool.read_only_hint, None);
+    }
+
+    #[test]
+    fn parse_mcp_tool_with_annotations_but_no_read_only_hint_is_none() {
+        let item = json!({
+            "name": "search_issues",
+            "description": "Search issues",
+            "annotations": { "someOtherHint": true },
+        });
+        let tool = parse_mcp_tool(&item).unwrap();
+        assert_eq!(tool.read_only_hint, None);
     }
 }

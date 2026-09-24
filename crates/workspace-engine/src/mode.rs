@@ -59,11 +59,19 @@ impl Permission {
 /// must classify the command before asking whether the mode permits it, so
 /// this panics rather than silently defaulting when it is `None`. Every
 /// other variant ignores `command`.
+///
+/// `mcp_tool_read_only` is the server's `annotations.readOnlyHint` for a
+/// `ToolAction::McpCall`'s specific tool (`McpRuntime::tool_read_only_hint`).
+/// Only `Some(true)` widens the call beyond Code — `Some(false)` and `None`
+/// (no claim made) both stay mutation-class, the same "silence is not a
+/// green light" posture spec 49 used for cache reporting (`context.md` §2).
+/// Every other variant ignores it.
 #[allow(dead_code)]
 pub(crate) fn mode_permits(
     mode: SessionMode,
     action: &ToolAction,
     command: Option<&CommandClassification>,
+    mcp_tool_read_only: Option<bool>,
 ) -> Permission {
     use SessionMode::*;
 
@@ -125,12 +133,8 @@ pub(crate) fn mode_permits(
             },
         },
 
-        // Task 2 replaces this arm with the read-only-hint check once
-        // `McpTool.read_only_hint` exists; until then every MCP call is
-        // treated as mutation-class, the conservative default `context.md`
-        // §2 chose.
         ToolAction::McpCall { .. } => {
-            if mode == Code {
+            if mcp_tool_read_only == Some(true) || mode == Code {
                 Permission::Allowed
             } else {
                 Permission::Refused {
@@ -206,7 +210,7 @@ mod tests {
         for action in &read_actions {
             for mode in [Ask, Plan, Code, Review] {
                 assert!(
-                    mode_permits(mode, action, None).is_allowed(),
+                    mode_permits(mode, action, None, None).is_allowed(),
                     "{mode:?} should permit {action:?}"
                 );
             }
@@ -223,18 +227,18 @@ mod tests {
             },
         ];
         for action in &mutation_actions {
-            assert!(!mode_permits(Ask, action, None).is_allowed());
-            assert!(!mode_permits(Plan, action, None).is_allowed());
-            assert!(mode_permits(Code, action, None).is_allowed());
-            assert!(!mode_permits(Review, action, None).is_allowed());
+            assert!(!mode_permits(Ask, action, None, None).is_allowed());
+            assert!(!mode_permits(Plan, action, None, None).is_allowed());
+            assert!(mode_permits(Code, action, None, None).is_allowed());
+            assert!(!mode_permits(Review, action, None, None).is_allowed());
         }
 
         let planning_actions = [ToolAction::ProposePlan(vec![]), ToolAction::CompleteStep];
         for action in &planning_actions {
-            assert!(!mode_permits(Ask, action, None).is_allowed());
-            assert!(mode_permits(Plan, action, None).is_allowed());
-            assert!(mode_permits(Code, action, None).is_allowed());
-            assert!(!mode_permits(Review, action, None).is_allowed());
+            assert!(!mode_permits(Ask, action, None, None).is_allowed());
+            assert!(mode_permits(Plan, action, None, None).is_allowed());
+            assert!(mode_permits(Code, action, None, None).is_allowed());
+            assert!(!mode_permits(Review, action, None, None).is_allowed());
         }
 
         let web_action = ToolAction::WebDiagnostic(WebDiagnosticCall {
@@ -244,10 +248,44 @@ mod tests {
             session_id: None,
             task_id: None,
         });
-        assert!(!mode_permits(Ask, &web_action, None).is_allowed());
-        assert!(!mode_permits(Plan, &web_action, None).is_allowed());
-        assert!(mode_permits(Code, &web_action, None).is_allowed());
-        assert!(mode_permits(Review, &web_action, None).is_allowed());
+        assert!(!mode_permits(Ask, &web_action, None, None).is_allowed());
+        assert!(!mode_permits(Plan, &web_action, None, None).is_allowed());
+        assert!(mode_permits(Code, &web_action, None, None).is_allowed());
+        assert!(mode_permits(Review, &web_action, None, None).is_allowed());
+
+        let mcp_action = ToolAction::McpCall {
+            server_id: "sentry".into(),
+            tool_name: "search_issues".into(),
+            arguments_json: "{}".into(),
+        };
+        for mode in [Ask, Plan, Code, Review] {
+            assert!(
+                mode_permits(mode, &mcp_action, None, Some(true)).is_allowed(),
+                "{mode:?} should permit an MCP call annotated read-only"
+            );
+        }
+        for hint in [Some(false), None] {
+            assert!(!mode_permits(Ask, &mcp_action, None, hint).is_allowed());
+            assert!(!mode_permits(Plan, &mcp_action, None, hint).is_allowed());
+            assert!(mode_permits(Code, &mcp_action, None, hint).is_allowed());
+            assert!(!mode_permits(Review, &mcp_action, None, hint).is_allowed());
+        }
+    }
+
+    /// Silence is not a green light (`context.md` §2, the same posture spec
+    /// 49 used for cache reporting): a server that made no read-only claim
+    /// stays mutation-class, not "assume safe."
+    #[test]
+    fn an_mcp_call_with_no_read_only_signal_is_treated_as_mutation_class() {
+        let action = ToolAction::McpCall {
+            server_id: "sentry".into(),
+            tool_name: "search_issues".into(),
+            arguments_json: "{}".into(),
+        };
+        assert!(!mode_permits(SessionMode::Ask, &action, None, None).is_allowed());
+        assert!(!mode_permits(SessionMode::Plan, &action, None, None).is_allowed());
+        assert!(!mode_permits(SessionMode::Review, &action, None, None).is_allowed());
+        assert!(mode_permits(SessionMode::Code, &action, None, None).is_allowed());
     }
 
     #[test]
@@ -256,7 +294,9 @@ mod tests {
             command: "git status".into(),
             reason: String::new(),
         });
-        assert!(!mode_permits(SessionMode::Ask, &action, Some(&read_only_command())).is_allowed());
+        assert!(
+            !mode_permits(SessionMode::Ask, &action, Some(&read_only_command()), None).is_allowed()
+        );
     }
 
     #[test]
@@ -265,7 +305,9 @@ mod tests {
             command: "git status".into(),
             reason: String::new(),
         });
-        assert!(mode_permits(SessionMode::Plan, &action, Some(&read_only_command())).is_allowed());
+        assert!(
+            mode_permits(SessionMode::Plan, &action, Some(&read_only_command()), None).is_allowed()
+        );
     }
 
     /// §5.3's sharpest case: a command that would need approval is refused
@@ -278,7 +320,9 @@ mod tests {
             command: "git status".into(),
             reason: String::new(),
         });
-        assert!(!mode_permits(SessionMode::Plan, &action, Some(&classification)).is_allowed());
+        assert!(
+            !mode_permits(SessionMode::Plan, &action, Some(&classification), None).is_allowed()
+        );
     }
 
     #[test]
@@ -291,7 +335,8 @@ mod tests {
             !mode_permits(
                 SessionMode::Plan,
                 &action,
-                Some(&approval_required_command())
+                Some(&approval_required_command()),
+                None
             )
             .is_allowed()
         );
@@ -307,7 +352,8 @@ mod tests {
             mode_permits(
                 SessionMode::Code,
                 &action,
-                Some(&approval_required_command())
+                Some(&approval_required_command()),
+                None
             )
             .is_allowed()
         );
@@ -323,12 +369,15 @@ mod tests {
             command: "npm install".into(),
             reason: String::new(),
         });
-        assert!(mode_permits(SessionMode::Review, &read, Some(&read_only_command())).is_allowed());
+        assert!(
+            mode_permits(SessionMode::Review, &read, Some(&read_only_command()), None).is_allowed()
+        );
         assert!(
             !mode_permits(
                 SessionMode::Review,
                 &mutate,
-                Some(&approval_required_command())
+                Some(&approval_required_command()),
+                None
             )
             .is_allowed()
         );
@@ -346,7 +395,7 @@ mod tests {
         let Permission::Refused {
             blocked_by,
             allowed_in,
-        } = mode_permits(SessionMode::Ask, &action, None)
+        } = mode_permits(SessionMode::Ask, &action, None, None)
         else {
             panic!("expected a refusal");
         };
@@ -363,7 +412,8 @@ mod tests {
             command: "git status".into(),
             reason: String::new(),
         });
-        let result = std::panic::catch_unwind(|| mode_permits(SessionMode::Plan, &action, None));
+        let result =
+            std::panic::catch_unwind(|| mode_permits(SessionMode::Plan, &action, None, None));
         assert!(result.is_err());
     }
 }
