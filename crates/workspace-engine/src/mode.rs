@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 // `mode_permits` into `chat.rs`'s tool-list construction, at which point these
 // `allow(dead_code)`s come off. (Renumbered 2026-09-24: Layer 1 wiring moved
 // from Task 3 to Task 4 so persistence, which it reads from, lands first.)
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SessionMode {
@@ -20,6 +19,19 @@ pub(crate) enum SessionMode {
     Plan,
     Code,
     Review,
+}
+
+impl SessionMode {
+    /// The wire form embedded in a hand-built session-log JSON payload,
+    /// matching `CommandRisk::as_str()`'s convention (`command_policy.rs`).
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Plan => "plan",
+            Self::Code => "code",
+            Self::Review => "review",
+        }
+    }
 }
 
 /// The result of asking whether a mode permits an action. `Refused` names

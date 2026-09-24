@@ -12,7 +12,7 @@ extended tool-class mapping in [`context.md`](context.md)
 |---|---|---|
 | 1 · `SessionMode`, `ToolAction` extended with the two new mutation/planning arms it needs, and the permission-matrix function | Done | `mode.rs` added, registered in `lib.rs` between `mcp` and `model`. Signature decision (Step 3): `fn mode_permits(mode: SessionMode, action: &ToolAction, command: Option<&CommandClassification>) -> Permission` — the single-function-over-the-whole-enum option, per context.md §6's preference; `Command` gets no separate function. `Permission` is `Allowed \| Refused { blocked_by: SessionMode, allowed_in: SessionMode }`, matching the sketch. `ToolAction`, `CommandRequest`, and `ProposedStep` were module-private to `chat.rs` and had to be widened to `pub(crate)` (with `CommandRequest`'s fields also `pub(crate)`) for `mode.rs` to see them — no other file referenced them before this change. Two field-name corrections against tasks.md's own sketch, confirmed by reading the real types before writing the test: `GeneratedEdit` has `changes: Vec<ProposedChange>`, not `files`; `WebDiagnosticCall` is a struct (`kind: WebDiagnosticKind, url, arguments_json, session_id, task_id`), not an enum with an `InspectPage` variant. `SessionMode`, `Permission`, `mode_permits`, and `Permission::is_allowed` carry `#[allow(dead_code)]` with a comment pointing at Task 4 (renumbered from Task 3 on 2026-09-24, see this task's own row), since this task is self-contained by design and nothing outside its own tests calls them yet — `cargo clippy -D warnings` fails without it. Mutation test: flipped the `ProposePatch`/`EditFile` arm to also allow `Ask`, confirmed `the_permission_matrix_matches_the_spec_table` fails (`assertion failed: !mode_permits(Ask, action, None).is_allowed()`), reverted. All 9 `mode::tests` pass; `cargo fmt --all -- --check` and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` both clean. |
 | 2 · MCP read-only capability | Done | `McpTool.read_only_hint: Option<bool>` added; `list_tools`'s inline loop extracted into a private pure `parse_mcp_tool(item: &Value) -> Option<McpTool>` (4 unit tests, no subprocess). `McpRuntime::tool_read_only_hint(server_id, tool_name) -> Option<bool>` added near `requires_approval`; unused by any caller until Task 4/6 wire it in, so no `#[allow(dead_code)]` was needed since it's `pub`. `mode_permits` widened to a 4th `mcp_tool_read_only: Option<bool>` parameter (Task 2's own decision, per its row's Interfaces note); `McpCall` arm now `mcp_tool_read_only == Some(true) \|\| mode == Code`. Every existing `mode.rs` test call site updated to pass the new parameter (compiler-named, all `None` except the new MCP cases). Mutation test: made the arm also treat `None` as permitting outside Code, confirmed `an_mcp_call_with_no_read_only_signal_is_treated_as_mutation_class` fails with `assertion failed: !mode_permits(SessionMode::Ask, &action, None, None).is_allowed()`, reverted. All 22 `mode::tests` + `mcp::tests` pass; `cargo fmt --all -- --check` (after one `cargo fmt --all` pass) and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` both clean. `chat.rs` untouched, as scoped. |
-| 3 · Persistence — `SessionStore::set_session_mode` / `session_mode` | Not started | Reordered ahead of Layer 1 on 2026-09-24 — Layer 1 needs `session_mode` to read from, so it must exist first. Was "Task 4" before the swap; nothing had started on either task, so renumbering was safe. |
+| 3 · Persistence — `SessionStore::set_session_mode` / `session_mode` | Done | Reordered ahead of Layer 1 on 2026-09-24 — Layer 1 needs `session_mode` to read from, so it must exist first. Was "Task 4" before the swap; nothing had started on either task, so renumbering was safe. Step 1 assumed an inline `session.rs` test module near existing `browser_diagnostics` tests, but `session.rs` had no `#[cfg(test)] mod tests` at all — its existing coverage lives in `tests/foundation.rs` and other integration-test files, run against the crate's public API. Since `SessionMode` is `pub(crate)` (Task 1's decision), an integration test crate can't see it, so a new inline `mod tests` was added at the end of `session.rs` instead, following the `temp_data_dir`-with-atomic-counter fixture pattern from `checkpoint.rs`'s inline tests and the `latest_event_seq`-before-mutating rewind idiom from `tests/session_rewind.rs`. All six tests from the plan implemented as named. `set_session_mode` and `session_mode` came out `pub(crate)`, not `pub` as the sketch had them — `pub` on a method returning/taking a `pub(crate)` type is a `private_interfaces` warning, which `clippy -D warnings` rejects; both carry `#[allow(dead_code)]` with a comment naming their real caller (Task 4/6 for `session_mode`, Task 8 for `set_session_mode`), the same pattern Task 1/2 used. `cargo nextest run -p workspace-engine -E 'test(session_mode)'` (the plan's own filter) only matches 2 of the 6 test names by substring; verified all six explicitly with `-E 'test(session::tests)'` instead — recorded here so a later task doesn't reuse the narrower filter and believe it covers the module. All 16 tests in `mode::tests` + `session::tests` pass; `cargo fmt --all -- --check` and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` both clean. |
 | 4 · Layer 1 — tool-list construction filters by mode | Not started | |
 | 5 · Layer 2 — the non-native fallback's system-prompt envelopes | Not started | |
 | 6 · Layer 3 — the orchestrator refuses at every action path | Not started | |
@@ -817,7 +817,7 @@ to introduce by picking the "more correct-looking" reader here.
   call `session_mode` once per turn, before tool-list construction and
   before the first Layer-3 check respectively.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
   Add to `session.rs`'s existing test module (find it near the
   `browser_diagnostics` tests already there, and match their fixture style —
@@ -853,11 +853,11 @@ to introduce by picking the "more correct-looking" reader here.
     `let Ok(content) = fs::read_to_string(path) else { return Ok(false) };`
     shape.
 
-- [ ] **Step 2: Run to verify they fail to compile**
+- [x] **Step 2: Run to verify they fail to compile**
 
   `cargo nextest run -p workspace-engine -E 'test(session_mode)'`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
   ```rust
   pub fn set_session_mode(&self, session_id: &str, mode: SessionMode, set_by: &str) -> Result<()> {
@@ -909,16 +909,16 @@ to introduce by picking the "more correct-looking" reader here.
   `serde_json::Value`, but read the struct definition (`session.rs:1855-1861`)
   to confirm rather than assuming from one call site.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
   `cargo nextest run -p workspace-engine -E 'test(session_mode)'`
 
-- [ ] **Step 5: Scoped checks**
+- [x] **Step 5: Scoped checks**
 
   `cargo nextest run -p workspace-engine -E 'test(session_mode)'`, `cargo fmt`,
   `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`.
 
-- [ ] **Step 6: Show the change and the check result, and ask before committing**
+- [x] **Step 6: Show the change and the check result, and ask before committing**
 
 ## Task 4: Layer 1 — tool-list construction filters by mode
 

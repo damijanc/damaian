@@ -1,6 +1,7 @@
 use crate::audit::escape_json;
 use crate::error::Result;
 use crate::hash::{create_id, now_millis};
+use crate::mode::SessionMode;
 use crate::model::{TokenUsage, UsageSource};
 use crate::secret_scanner::SecretScanner;
 use serde::{Deserialize, Serialize};
@@ -692,6 +693,66 @@ impl SessionStore {
             }
         }
         Ok(allowed)
+    }
+
+    /// Sets the session's working mode by appending an event; the log is
+    /// never rewritten. `set_by` is always `"user"` (`proposal.md` §5.4) —
+    /// the field exists so a future non-user origin cannot be introduced
+    /// without someone noticing it already asserts otherwise.
+    // Task 8 (docs/specs/20_working_modes/tasks.md) wires this into the
+    // desktop-shell mode-switch endpoint; nothing outside this file's own
+    // tests calls it yet.
+    #[allow(dead_code)]
+    pub(crate) fn set_session_mode(
+        &self,
+        session_id: &str,
+        mode: SessionMode,
+        set_by: &str,
+    ) -> Result<()> {
+        self.append_session_event(
+            session_id,
+            "session_mode_set",
+            &format!(
+                "{{\"sessionId\":\"{}\",\"mode\":\"{}\",\"setBy\":\"{}\"}}",
+                escape_json(session_id),
+                mode.as_str(),
+                escape_json(set_by)
+            ),
+        )
+    }
+
+    /// The session's current working mode: the newest `session_mode_set`
+    /// event's mode, or `Code` (requirement 7's default) when there is none,
+    /// or when the session log is missing or unreadable.
+    ///
+    /// Reads with `parsed_events`, not `active_events`, deliberately: mode is
+    /// a capability the user configured, not conversation content, so a
+    /// rewind that discards messages must not silently reset what the
+    /// session is allowed to do (`docs/specs/20_working_modes/tasks.md`
+    /// Task 3).
+    // Task 4 and Task 6 call this once per turn, before tool-list
+    // construction and before the first Layer-3 check respectively; nothing
+    // outside this file's own tests calls it yet.
+    #[allow(dead_code)]
+    pub(crate) fn session_mode(&self, session_id: &str) -> SessionMode {
+        let path = self.session_log_path(session_id);
+        let Ok(content) = fs::read_to_string(path) else {
+            return SessionMode::Code;
+        };
+        let mut mode = SessionMode::Code;
+        for event in parsed_events(&content).0 {
+            if event.event_type != "session_mode_set" {
+                continue;
+            }
+            if let Some(parsed) = event
+                .payload
+                .get("mode")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+            {
+                mode = parsed;
+            }
+        }
+        mode
     }
 
     /// Sets [`TaskStatus::WaitingForApproval`] and records which stored
@@ -2094,4 +2155,105 @@ fn snippet_around(text: &str, match_start: usize, scanner: &SecretScanner) -> St
         snippet.push('…');
     }
     scanner.redact(&snippet).text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mode::SessionMode;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_data_dir(name: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should work")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "damaian-session-mode-{name}-{now}-{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// Requirement 7's migration criterion: a session with no
+    /// `session_mode_set` event at all — the shape of every session that
+    /// existed before this feature — reads as `Code`.
+    #[test]
+    fn a_session_with_no_mode_event_reads_as_code() {
+        let store = SessionStore::new(temp_data_dir("no-event"));
+        let session = store.create_session("repo_1", "Untouched").unwrap();
+
+        assert_eq!(store.session_mode(&session.id), SessionMode::Code);
+    }
+
+    #[test]
+    fn set_session_mode_round_trips() {
+        let store = SessionStore::new(temp_data_dir("round-trip"));
+        let session = store.create_session("repo_1", "Switched").unwrap();
+
+        store
+            .set_session_mode(&session.id, SessionMode::Ask, "user")
+            .unwrap();
+
+        assert_eq!(store.session_mode(&session.id), SessionMode::Ask);
+    }
+
+    #[test]
+    fn the_newest_mode_event_wins() {
+        let store = SessionStore::new(temp_data_dir("newest-wins"));
+        let session = store.create_session("repo_1", "Toggled").unwrap();
+
+        store
+            .set_session_mode(&session.id, SessionMode::Plan, "user")
+            .unwrap();
+        store
+            .set_session_mode(&session.id, SessionMode::Review, "user")
+            .unwrap();
+
+        assert_eq!(store.session_mode(&session.id), SessionMode::Review);
+    }
+
+    /// `proposal.md` §5.4: the field exists so a future non-user origin
+    /// cannot be added without someone noticing it already asserts
+    /// otherwise — assert what actually lands on disk, not just the
+    /// argument passed in.
+    #[test]
+    fn set_by_is_always_user() {
+        let store = SessionStore::new(temp_data_dir("set-by"));
+        let session = store.create_session("repo_1", "Attributed").unwrap();
+
+        store
+            .set_session_mode(&session.id, SessionMode::Ask, "user")
+            .unwrap();
+
+        let log = fs::read_to_string(store.session_log_path(&session.id)).unwrap();
+        assert!(log.contains("\"setBy\":\"user\""));
+    }
+
+    /// Mode is a capability the user configured, not conversation content:
+    /// a rewind that discards messages must not silently reset what the
+    /// session is allowed to do. This is the test that would fail if a
+    /// future edit switched `session_mode`'s reader to `active_events`.
+    #[test]
+    fn session_mode_survives_a_conversation_rewind() {
+        let store = SessionStore::new(temp_data_dir("rewind"));
+        let session = store.create_session("repo_1", "Rewound").unwrap();
+        let rewind_to = store.latest_event_seq(&session.id).unwrap();
+
+        store
+            .set_session_mode(&session.id, SessionMode::Ask, "user")
+            .unwrap();
+        store.rewind_conversation(&session.id, rewind_to).unwrap();
+
+        assert_eq!(store.session_mode(&session.id), SessionMode::Ask);
+    }
+
+    #[test]
+    fn an_unreadable_session_log_reads_as_code() {
+        let store = SessionStore::new(temp_data_dir("missing"));
+
+        assert_eq!(store.session_mode("never_created"), SessionMode::Code);
+    }
 }
