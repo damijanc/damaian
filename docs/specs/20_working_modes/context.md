@@ -206,3 +206,81 @@ a session at all.
   reader assume it was checked and found fine — it was found *out of
   scope*, a different thing. Whether it needs its own follow-up spec is a
   product decision, not one this plan makes silently by omission.
+
+## 8. Layer 3 is nine call sites, not the flat spec's five or §3's six
+
+Tracing every path that actually executes a mutating action (not just
+where one is *proposed*), planning against the current `chat.rs` (post
+Task 5) found two more gaps than §3 already corrected.
+
+**Gap A — `proposal.md` §5.1's table has no row for planning at all.**
+`propose_plan`/`complete_step` didn't exist when the flat spec was written
+(§1 above). Their dispatch arms — `ToolAction::ProposePlan` (`chat.rs`,
+around line 2168 as of Task 5) and `ToolAction::CompleteStep` (around line
+2221) — are a fifth main-loop refusal point Layer 3 must add, alongside the
+four the flat spec names (mutation-proposal creation, command, web
+diagnostic, MCP call).
+
+**Gap B — three of the five main-loop refusal points have a second,
+independent execution path that never touches `run_agentic_turn`'s `mode`
+variable at all.** `resume_after_command_decision_with_options`
+(`chat.rs`, around line 752 as of Task 5) is the single entry point a
+user's approval or decline of a *paused* action resumes through — and,
+despite its name, it handles three different kinds of pending action, not
+just commands, distinguished by which optional field `PendingChatTurn`
+carries:
+
+- `pending.web_diagnostic_call` — calls `self.run_web_diagnostic_call(&call)` directly (around line 805).
+- `pending.mcp_call` — calls `mcp.call_tool(...)` directly (around line 818).
+- neither — the original shell-command path — calls `self.validation_orchestrator.run_proposal(...)` directly (around line 866).
+
+None of these three branches is inside `run_agentic_turn`; this function
+never calls it. `mode` is not in scope here by any means Task 4/5 already
+established. This is the resume-path twin `proposal.md` §5.2's "Command
+execution" row already gestures at with "`ValidationOrchestrator::run_proposal`
+**and the direct command path**" — but the flat spec did not know the same
+function also resumes MCP and web-diagnostic approvals, so it only named
+the command half.
+
+**Decision, recorded here rather than assumed: check mode at resume time,
+not at proposal time.** A paused action was classified and offered under
+the mode active when the model first requested it, but approving or
+declining it is itself a new, separate user action that can happen
+arbitrarily later — long enough for the user to have switched modes in the
+meantime. Re-reading `self.session_store.session_mode(&pending.session.id)`
+fresh at the top of `resume_after_command_decision_with_options` and
+refusing before any of the three branches acts is the reading consistent
+with requirement 2's "capability boundary rather than a prompt instruction":
+the boundary is a property of the session's *current* configuration, and a
+mutation that would be refused if requested right now should not become
+approvable merely because it was requested earlier under a laxer mode. This
+is a stricter reading than "a turn captures its mode at start" strictly
+requires (that rule is about a mode change not preempting a turn already
+mid-flight synchronously) — resuming after a human pause is not "mid-flight",
+it is a new decision point, and this plan treats it as one.
+
+**Complete list of refusal points for Task 6**, superseding both
+`proposal.md` §5.2's original table and §3 above:
+
+| # | Path | Location | Mode value |
+|---|---|---|---|
+| 1 | Mutation-proposal creation (`propose_patch`/`edit_file`) | `chat.rs`, `ToolAction::ProposePatch`/`ToolAction::EditFile` arms, before `create_patch` | `run_agentic_turn`'s `mode` |
+| 2 | Mutation-proposal apply | `edit.rs`, `apply_stored_patch`, before `self.patch_engine.apply_patch(...)` | fresh read from `patch.session_id` |
+| 3 | Command proposal + execution (unified) | `chat.rs`, `ToolAction::Command` arm, immediately after `propose_command` returns, before either the approval-card branch or the auto-run branch | `run_agentic_turn`'s `mode` |
+| 4 | Planning (`propose_plan`/`complete_step`) | `chat.rs`, `ToolAction::ProposePlan`/`ToolAction::CompleteStep` arms | `run_agentic_turn`'s `mode` |
+| 5 | Web diagnostic (main loop) | `chat.rs`, `ToolAction::WebDiagnostic` arm | `run_agentic_turn`'s `mode` |
+| 6 | MCP call (main loop) | `chat.rs`, `ToolAction::McpCall` arm | `run_agentic_turn`'s `mode` |
+| 7 | Command (resume) | `resume_after_command_decision_with_options`, the no-`web_diagnostic_call`-no-`mcp_call` branch, before `run_proposal` | fresh read from `pending.session.id` |
+| 8 | Web diagnostic (resume) | same function, `pending.web_diagnostic_call` branch, before `run_web_diagnostic_call` | fresh read from `pending.session.id` |
+| 9 | MCP call (resume) | same function, `pending.mcp_call` branch, before `mcp.call_tool` | fresh read from `pending.session.id` |
+
+Points 7-9 share one function and one fresh mode read — reading mode once
+at the top of `resume_after_command_decision_with_options` and reusing it
+across whichever one of the three branches actually runs is one read, not
+three, even though the table lists three refusal points for it.
+
+**Read-only actions (`read_file`, `list_directory`, `search_content`,
+`search_codebase`, `read_git_status`, `read_git_diff`) need no Layer 3
+check anywhere** — `mode_permits` returns `Allowed` for all four modes on
+every one of them (Task 1's crossing test already pins this), so a check
+there would always pass and add nothing; Task 6 does not add one.

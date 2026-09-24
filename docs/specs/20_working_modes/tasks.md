@@ -1289,16 +1289,222 @@ minor deduplication and is not this task's job.
 
 ## Task 6: Layer 3 — the orchestrator refuses
 
-**Requirements:** 2, 4, 5, 6. **Files:** `chat.rs`, `edit.rs`, `validation.rs`.
+**Requirements:** 2, 4, 5, 6. **Files:** `chat.rs`, `edit.rs`.
 
-The five refusal points from `proposal.md` §5.2's table, corrected to six
-call sites by `context.md` §3 (the mutation-proposal class needs both its
-creation site in `chat.rs` and its apply site in `edit.rs`). Every path
-checks `mode_permits` immediately before acting and refuses with the
-`blocked_by`/`allowed_in` message from Task 1's `Permission::Refused`. This
-is the task the acceptance criteria are mostly asserted against, including
-the `DAMAIAN_EDIT_V1`-emitted-without-being-offered test via
-`MockModelAdapter`, and the mid-turn mode-change-has-no-effect test.
+**Read `context.md` §8 before anything else in this task.** Its table of
+nine refusal points, not `proposal.md` §5.2's original five or §3's six
+above it, is what this task implements — planning against the current
+`chat.rs` (post Task 5) found a fifth main-loop path §5.2 never listed
+(planning) and a second execution path for three of the others that never
+runs through `run_agentic_turn` at all (the resume-after-approval
+function). This is the task the acceptance criteria are mostly asserted
+against, including the `DAMAIAN_EDIT_V1`-emitted-without-being-offered
+test (now known to be vacuously true today per `context.md` §7 — this task
+makes it an intentional, tested guarantee), the mid-turn mode-change test,
+and the resume-time mode check `context.md` §8 decided.
+
+**Interfaces:**
+- Consumes: `mode_permits`, `Permission` (`mode.rs`), `SessionStore::session_mode`
+  (Task 3), `run_agentic_turn`'s `mode` local (Task 4/5, reused at points
+  1/3/4/5/6 in `context.md` §8's table).
+- Produces: a `refusal_message(refused: Permission) -> String` helper
+  (`mode.rs` or `chat.rs` — this task's own call), building the
+  `proposal.md` §5.6 wording ("which mode blocked it and what mode would
+  allow it") from a `Permission::Refused`'s two fields, so the nine call
+  sites share one wording rather than nine hand-written strings that can
+  drift from each other. Panics or is never called on `Permission::Allowed`
+  — record which in this row.
+
+**Shape of a refusal, main-loop points (1, 3, 4, 5, 6):** every dispatch arm
+in the `else { match tool_action { ... } }` block (`chat.rs`, around line
+2039 as of Task 5) already returns a `(String, String, ActionOutcome)` —
+summary, content, outcome — the same shape `dispatch_read_only_action`
+returns. A refusal is `(summary, refusal_message(refused), ActionOutcome::Failed)`,
+returned early from the top of the arm, before any of the arm's existing
+side-effecting work. This feeds the refusal back to the model as a failed
+tool result, on the existing plumbing, letting the model explain the
+decline to the user in its next message rather than the turn terminating
+outright — consistent with `proposal.md` §5.6 describing what "the turn
+says", not what an error page says.
+
+**Shape of a refusal, resume-path points (7, 8, 9):** `resume_after_command_decision_with_options`
+does not return the dispatch loop's 3-tuple shape — read its actual return
+type and existing decline-handling (the `else { "The user declined..." }`
+branches already visible at each of the three branches) before deciding
+how a refusal composes with it; a refusal is not a decline (the user did
+not say no, the mode says no), so reuse the wording distinction, not the
+code path, if the two need to look different to the model.
+
+- [ ] **Step 1: Write the failing tests**
+
+  One test per point in `context.md` §8's table, named for what it proves
+  rather than the code location, plus the cross-cutting ones:
+  - `ask_mode_refuses_a_propose_patch_call_the_model_was_never_offered` and
+    `ask_mode_refuses_an_edit_file_call_the_model_was_never_offered` — drive
+    a turn with `MockModelAdapter` configured to respond with a
+    `propose_patch`/`edit_file` tool call anyway (Layer 1 already withheld
+    the definition; this proves Layer 3 refuses it independent of Layer 1),
+    assert no patch was created (`patch_store`/`patch_engine` sees nothing)
+    and the tool result names Ask as the blocker and Code as what would
+    allow it.
+  - `a_damaian_edit_v1_envelope_emitted_unprompted_is_never_applied_in_any_mode`
+    — per `context.md` §7: a `MockModelAdapter` response containing a raw
+    `DAMAIAN_EDIT_V1` block (not a tool call — the text envelope a model
+    might produce from having seen Damaian's output elsewhere), in each of
+    the four modes including Code. Today this passes vacuously because
+    `run_agentic_turn` never parses one at all; this test pins that as an
+    intentional guarantee rather than an accident, so it must still pass
+    after this task and would fail the day something wires
+    `parse_generated_edit` into the chat loop without also gating it.
+  - `a_mode_that_forbids_a_command_refuses_it_before_either_the_approval_card_or_auto_run`
+    — Ask mode, any command (even a low-risk one that would auto-run in
+    Plan/Code): assert neither a `PendingChatTurn` was saved nor
+    `run_proposal` executed anything. This is point 3's unified check.
+  - `plan_mode_still_refuses_a_command_needing_approval_outright` — this is
+    Task 7's own acceptance criterion, but the refusal *mechanism* is this
+    task's; a thin regression test here that a command needing approval in
+    Plan produces a mode refusal rather than an approval card is worth
+    having even though Task 7 owns the allowlist-specific version.
+  - `ask_and_review_refuse_propose_plan_and_complete_step` — point 4, the
+    gap `proposal.md` §5.2 never listed.
+  - `ask_and_plan_refuse_web_diagnostic_in_the_main_loop` — point 5.
+  - `ask_and_plan_refuse_an_mcp_call_in_the_main_loop_even_when_the_server_needs_no_approval`
+    — point 6, phrased this way deliberately: `mcp.requires_approval`
+    being `false` must not let the call bypass the mode check the way it
+    bypasses the approval-card branch; write the fixture server with
+    `require_approval: false` specifically so a wrong implementation that
+    only checks mode inside the approval branch fails this test.
+  - `a_command_approved_after_the_session_switched_to_ask_is_refused_at_resume`
+    — point 7 and the load-bearing test for `context.md` §8's resume-time
+    decision: propose a command in Code (or let it auto-run-eligible
+    reach the approval-card branch by using a command needing approval),
+    switch the session to Ask via `set_session_mode` *before* calling
+    `resume_after_command_decision`, approve it, and assert
+    `run_proposal` never executed — refused, not run, even though it was
+    proposed while Code was active.
+  - `a_web_diagnostic_approved_after_switching_to_plan_is_refused_at_resume`
+    — point 8, same shape.
+  - `an_mcp_call_approved_after_switching_to_ask_is_refused_at_resume` —
+    point 9, same shape.
+  - `nothing_the_model_emits_changes_the_session_mode` — requirement 4:
+    configure `MockModelAdapter` to emit some plausible mode-change request
+    (however a model might phrase or attempt one — there is no tool for it,
+    since modes have no tool per the Non-goals, so this test is really
+    proving there is no code path treating any model output as a mode
+    directive) and assert `session_mode` after the turn is unchanged from
+    before it.
+  - `a_mode_change_mid_turn_does_not_affect_the_tool_round_already_in_progress`
+    — the `run_agentic_turn`-internal version of §5.4's rule: within one
+    synchronous call to `run_agentic_turn`, changing the session's mode
+    partway through (directly via `set_session_mode`, simulating a
+    hypothetical concurrent change — there is no legitimate way for this to
+    happen synchronously today, but the guard should hold regardless) does
+    not change which arm `mode_permits` sees for the rest of that call,
+    because `mode` was read once at the top and never re-read.
+
+- [ ] **Step 2: Run to verify they fail**
+
+- [ ] **Step 3: Implement `refusal_message`**
+
+  ```rust
+  fn refusal_message(refused: Permission) -> String {
+      let Permission::Refused { blocked_by, allowed_in } = refused else {
+          unreachable!("refusal_message called on an allowed permission")
+      };
+      format!(
+          "Refused: {} mode does not allow this. Switch to {} mode to allow it.",
+          blocked_by.as_str(),
+          allowed_in.as_str()
+      )
+  }
+  ```
+
+  Wire it into each of the nine points per `context.md` §8's table:
+
+  - **Point 1** (`ToolAction::ProposePatch`/`ToolAction::EditFile` arms):
+    check `mode_permits(mode, &tool_action, None, None)` first thing in
+    each arm; on refusal, return before `create_patch` is called.
+  - **Point 2** (`edit.rs`, `apply_stored_patch`): after loading `patch`,
+    before `self.patch_engine.apply_patch(...)`:
+    ```rust
+    if !patch.session_id.is_empty() {
+        let mode = self.session_store.session_mode(&patch.session_id);
+        let refused = mode_permits(
+            mode,
+            &ToolAction::ProposePatch(GeneratedEdit { summary: String::new(), changes: vec![] }),
+            None,
+            None,
+        );
+        if let Permission::Refused { .. } = refused {
+            return Err(ClientError::AccessDenied(refusal_message(refused)));
+        }
+    }
+    ```
+    `ClientError` (`error.rs:58-71`) has several variants that could fit a
+    mode refusal — `AccessDenied` and `PolicyBlocked` both read plausibly;
+    `PolicyBlocked` risks reading as "the command policy blocked this",
+    which is a different, existing concept (`command_policy.rs`) this task
+    must not conflate with mode. Pick one and record the choice and why in
+    this row rather than picking silently; whichever is chosen, use it
+    consistently across every point in this task that needs to surface a
+    `Result`-shaped refusal (only point 2 does — the main-loop points
+    return their refusal as a tool result, not an `Err`, per this task's
+    "Shape of a refusal" note above).
+    A patch with no `session_id` (the "legacy patch" case the surrounding
+    comment already names) is unrestricted, matching that comment's
+    existing reasoning rather than inventing a new rule for it. `edit.rs`
+    needs its own `use` of `mode_permits`/`ToolAction`/`Permission` —
+    `ToolAction` and `GeneratedEdit` are `pub(crate)` (Task 1), confirm
+    `edit.rs` can already see them or whether visibility needs another
+    small widening, the way `mode.rs` needed one in Task 1.
+  - **Point 3** (`ToolAction::Command` arm, `chat.rs` around line 2040):
+    immediately after `let proposal = self.validation_orchestrator.propose_command(...)?;`,
+    build a `CommandClassification` from `proposal`'s matching fields
+    (`risk`, `blocked`, `requires_approval`, `reasons`, `expected_effects`,
+    `may_use_network`, `command`) and check `mode_permits` before the
+    existing `if proposal.requires_approval || proposal.blocked` branch.
+    This one check covers both the approval-card path and the auto-run
+    path, since both are downstream of it.
+  - **Point 4** (`ToolAction::ProposePlan`/`ToolAction::CompleteStep` arms,
+    around lines 2168/2221): same shape as point 1.
+  - **Point 5** (`ToolAction::WebDiagnostic` arm, around line 2347): check
+    before the existing `session_approved`/pending-approval logic — a mode
+    refusal is checked first, independent of and prior to the existing
+    browser-diagnostics-consent system (spec 12), which governs *within* a
+    mode that already permits diagnostics at all.
+  - **Point 6** (`ToolAction::McpCall` arm, around line 2442): check before
+    the existing `mcp.requires_approval(&server_id)` branch, using
+    `mcp.tool_read_only_hint(&server_id, &tool_name)` (Task 2) as
+    `mode_permits`'s fourth argument — reuse Task 4's exact construction,
+    don't re-derive it.
+  - **Points 7-9** (`resume_after_command_decision_with_options`): read
+    `let mode = self.session_store.session_mode(&pending.session.id);`
+    once, near the top, after `pending.plan_review.is_some()` is already
+    ruled out and before the three-way branch on
+    `pending.web_diagnostic_call`/`pending.mcp_call`/neither. Check
+    `mode_permits` inside each branch's `approved` arm (a decline needs no
+    mode check — nothing is about to happen either way), using each
+    branch's own representative `ToolAction` construction.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+- [ ] **Step 5: Mutation-test at least one main-loop point and one resume
+      point**
+
+  E.g. temporarily remove point 3's check and confirm
+  `a_mode_that_forbids_a_command_refuses_it_before_either_the_approval_card_or_auto_run`
+  fails; remove point 7's and confirm
+  `a_command_approved_after_the_session_switched_to_ask_is_refused_at_resume`
+  fails. Revert both. This task has nine points; falsifying two spread
+  across the main loop and the resume path is enough to prove the pattern
+  works, not all nine individually.
+
+- [ ] **Step 6: Scoped checks**
+
+  `cargo nextest run -p workspace-engine -E 'test(mode)'`, `cargo fmt`,
+  `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`.
+
+- [ ] **Step 7: Show the change and the check result, and ask before committing**
 
 ## Task 7: Command-allowlist does not widen a mode
 
