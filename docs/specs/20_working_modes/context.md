@@ -148,3 +148,61 @@ that get the same answer, not a separate thing the function branches on)
 with every mode. Whether the function signature takes the whole
 `ToolAction` or a smaller derived key is Task 1's own decision to make and
 record, the way spec 49 Task 2 decided `extract_usage`'s return shape.
+
+## 7. `system_prompt()` does not teach `DAMAIAN_EDIT_V1` — there is nothing
+## for Layer 2 to omit
+
+`proposal.md` §5.2 Layer 2 says: "The `DAMAIAN_EDIT_V1` instruction block is
+omitted from the system prompt in Ask, Plan, and Review." Reading
+`system_prompt()` (`chat.rs:3231-3232`, one hardcoded string, no
+parameters): it contains the `DAMAIAN_COMMAND_V1` block and its guidance
+paragraph, and nothing else — no `DAMAIAN_EDIT_V1` instructions anywhere.
+Confirmed by grepping the whole file: the only two occurrences of
+`DAMAIAN_EDIT_V1` in `chat.rs` are a doc comment and a string search inside
+a different function; `run_agentic_turn`'s response-handling path never
+calls `parse_generated_edit` at all — only `parse_command_request`
+(`chat.rs:4048`). **A non-native-tool-calling provider inside an ordinary
+chat turn currently has no way to propose a file edit, in any mode.** The
+only text-envelope mutation capability the chat loop has is
+`DAMAIAN_COMMAND_V1`.
+
+`DAMAIAN_EDIT_V1` is real, but it belongs to a different, older, and
+entirely separate feature: `EditOrchestrator::propose_edit`
+(`edit.rs:293`), with its own dedicated system prompt (`edit.rs:841`) and
+its own call to `parse_generated_edit`. It is reached through
+`POST /api/propose-edit` (`desktop-shell/src/lib.rs:750`) and the CLI's
+`propose-edit` subcommand (`damaian-cli/src/main.rs:406,427`) — a one-shot
+endpoint that takes `repo`, `prompt`, and `context_files` and returns a
+patch directly. **It has no session id and no session mode to read.** This
+is not an oversight this work package can fix by threading a parameter
+through — it is a structurally different flow that predates the concept of
+a session at all.
+
+**Decisions, recorded here rather than assumed:**
+
+- Task 5 (Layer 2) is scoped to `DAMAIAN_COMMAND_V1` only. There is no
+  `DAMAIAN_EDIT_V1` teaching to omit in the chat loop's system prompt,
+  because none exists in any mode today. Do not add one — that would be
+  new capability, out of this work package's "changes no request" spirit
+  (borrowed from spec 49's own framing) applied to prompt content.
+- Task 6 (Layer 3)'s acceptance criterion — "a `DAMAIAN_EDIT_V1` envelope
+  emitted by a model in Ask, Plan, or Review mode is refused by the
+  orchestrator and not applied, even though the instructions for it were
+  never sent" — is, in the chat loop, **currently true by accident**: the
+  envelope is not parsed at all, so nothing applies it, in any mode,
+  today. Task 6 should turn this into an intentional, tested guarantee
+  (assert a `MockModelAdapter` response containing a `DAMAIAN_EDIT_V1`
+  block produces no patch and no mutation, in every mode including Code)
+  rather than leave it resting on the absence of a feature — the day
+  something *does* wire `parse_generated_edit` into `run_agentic_turn`,
+  an untested accident becomes a real hole with nothing guarding it.
+- `EditOrchestrator::propose_edit` and `/api/propose-edit` are **out of
+  scope for this work package.** It has no session, so it has no mode to
+  enforce, by construction — extending it to accept and honor a session
+  mode would be new design work (does an edit proposed outside any
+  session inherit a mode at all? from where?) that `proposal.md` never
+  anticipated and this plan's tasks do not cover. Flag this explicitly in
+  Task 10's documentation and implementation notes rather than letting a
+  reader assume it was checked and found fine — it was found *out of
+  scope*, a different thing. Whether it needs its own follow-up spec is a
+  product decision, not one this plan makes silently by omission.

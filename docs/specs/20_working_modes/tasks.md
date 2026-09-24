@@ -1138,19 +1138,154 @@ in Ask and Plan.
 
 - [x] **Step 6: Show the change and the check result, and ask before committing**
 
-## Task 5: Layer 2 — the non-native fallback's envelopes
+## Task 5: Layer 2 — the non-native fallback's envelope
 
-**Requirements:** 2, 6. **Files:** `chat.rs` (`system_prompt()` and its
-callers).
+**Requirements:** 2, 6. **Files:** `chat.rs` (`system_prompt()` and its one
+caller).
 
-Omits `DAMAIAN_EDIT_V1` from the system prompt in Ask, Plan, Review. Omits
-`DAMAIAN_COMMAND_V1` in Ask; restricts its wording to read-only commands in
-Plan and Review. **Must not break spec 49 Task 8's prefix-stability guards**
-(`crates/workspace-engine/tests/prompt_cache.rs`) — those assert the prefix
-is identical between two turns of an *unchanged* mode; a mode change between
-turns is expected to change the prefix, and the guard tests do not exercise
-that case, so this task does not need to preserve stability across a mode
-change, only within one.
+**Scope correction, `context.md` §7:** `proposal.md` §5.2 describes omitting
+both `DAMAIAN_EDIT_V1` and `DAMAIAN_COMMAND_V1` from the system prompt. Only
+the second exists to omit — `system_prompt()` (`chat.rs:3231-3232` as of
+Task 4, re-confirm) never taught `DAMAIAN_EDIT_V1` in any mode, and
+`run_agentic_turn` never parses one out of a response either. That envelope
+belongs to the wholly separate `EditOrchestrator::propose_edit` one-shot
+flow, which has no session and is out of scope for this work package
+(`context.md` §7 — read it before this task, it explains why and records
+that this was found and excluded deliberately, not missed). **This task
+touches `DAMAIAN_COMMAND_V1` only.**
+
+Omits the `DAMAIAN_COMMAND_V1` block and its guidance paragraph entirely in
+Ask (no commands at all, matching Layer 1's Ask behavior and
+`proposal.md` §5.1's own callout). Keeps the block in Plan, Review, and Code,
+varying only the guidance paragraph that follows it: Code keeps today's
+wording verbatim (byte-identical — this is the mode spec 49 Task 8's
+prefix-stability guards run under, since neither guard test ever sets a
+session mode, so both default to `SessionMode::Code`); Plan and Review get
+wording that says only read-only commands are available and that anything
+needing approval is refused outright rather than producing an approval
+card, matching Layer 3's actual behavior for those modes (`proposal.md`
+§5.3) rather than inviting the model to try something that will be refused.
+
+**Interfaces:**
+- Consumes: `SessionMode` (`mode.rs`), `SessionStore::session_mode` (Task 3).
+- Produces: `system_prompt(mode: SessionMode) -> String`, replacing the
+  current no-argument `system_prompt()`.
+
+**`system_prompt()`'s one call site is not inside `run_agentic_turn`.**
+It is `chat.rs:711`, `ModelMessage::system(system_prompt())`, inside
+`ask_with_session_with_options` (`chat.rs:616` as of Task 4) — a different,
+earlier function that builds `messages` and then calls `run_agentic_turn`
+with them (`chat.rs:714`). Task 4's `session_mode` read at `chat.rs:1274`
+is inside `run_agentic_turn` itself and out of scope here; it does **not**
+put `mode` in scope at line 711. `ask_with_session_with_options` already
+has an owned `session: Session` in scope by line 628-647 (read or created
+before the turn's task exists), so this task reads mode a second time,
+independently, at line 711: `let mode = self.session_store.session_mode(&session.id);`
+— the same call Task 4 makes, just in a sibling function. Both reads
+happen synchronously within the same turn before anything mode-dependent
+occurs, so there is no consistency risk in reading twice; consolidating
+the two reads into one parameter threaded from `ask_with_session_with_options`
+into `run_agentic_turn` would touch Task 4's already-committed code for a
+minor deduplication and is not this task's job.
+
+- [ ] **Step 1: Write the failing tests**
+
+  Add near wherever `system_prompt()` is currently exercised (grep for it —
+  it may have no dedicated test today, only being covered indirectly
+  through turns that inspect the full system message):
+  - `code_mode_system_prompt_is_byte_identical_to_todays` — pin
+    `system_prompt(SessionMode::Code)` against the exact current string
+    literal (copy it once into the test as a `const`, not by re-deriving
+    it from the function under test). This is the test spec 49 Task 8's
+    guards implicitly depend on staying true; a change here that this test
+    misses is a change those guards would only catch by accident.
+  - `ask_mode_system_prompt_has_no_command_envelope` — `system_prompt(Ask)`
+    does not contain `"DAMAIAN_COMMAND_V1"` and does not contain the
+    trailing guidance paragraph's distinguishing phrase either (e.g. "The
+    app will run sandbox-safe commands automatically") — checking only the
+    header string would pass a change that left the guidance paragraph
+    dangling with no envelope above it.
+  - `plan_mode_system_prompt_keeps_the_envelope_with_restricted_wording` —
+    `system_prompt(Plan)` still contains `"DAMAIAN_COMMAND_V1"`, but no
+    longer contains the Code-mode phrase that invites a side-effecting
+    command ("Damaian will pause for user approval before running it" or
+    equivalent) — assert the *absence* of the Code-only phrase, not merely
+    the presence of new wording, so a future edit can't reintroduce the
+    Code invitation alongside new text and still pass.
+  - `review_mode_system_prompt_matches_plan_modes_restricted_wording` — per
+    `proposal.md` §5.1, Review's command capability is identical to Plan's
+    (read-only, no approval escalation); assert the two are the same
+    string rather than separately duplicating the expectation, so the two
+    modes cannot silently drift apart.
+  - `a_mode_change_does_not_alter_the_prompt_outside_the_command_paragraph`
+    — the first two paragraphs (the general instructions and the
+    `agent_instruction`/AGENTS.md precedence paragraph) are identical
+    across all four `system_prompt(mode)` calls; only the third paragraph
+    varies. This is what keeps a mode change from being able to smuggle
+    unrelated prompt drift in through this task.
+
+- [ ] **Step 2: Run to verify they fail to compile**
+
+  `cargo nextest run -p workspace-engine -E 'test(system_prompt)'`
+
+- [ ] **Step 3: Implement**
+
+  Split `system_prompt()`'s current literal at its natural paragraph
+  boundary (the two `\n\n`s already in the string) into a fixed prefix (the
+  first two paragraphs) and a mode-dependent suffix, so Step 1's "only the
+  third paragraph varies" test is actually structural rather than
+  incidental:
+
+  ```rust
+  fn system_prompt(mode: SessionMode) -> String {
+      const PREFIX: &str = "You are a local-first coding assistant. \
+          Answer using only the provided repository context when possible. \
+          Cite relevant file paths. Do not request or expose secrets.\n\n\
+          Repository context sections named `agent_instruction` contain \
+          AGENTS.md instructions for this repository. Follow them when they \
+          apply to the files you discuss or edit. More specific nested \
+          AGENTS.md instructions override broader ones. The user's request \
+          and Damaian's safety policy take precedence over repository \
+          instructions.";
+      match mode {
+          SessionMode::Ask => PREFIX.to_string(),
+          SessionMode::Code => format!("{PREFIX}\n\n{}", command_envelope_paragraph_unrestricted()),
+          SessionMode::Plan | SessionMode::Review => {
+              format!("{PREFIX}\n\n{}", command_envelope_paragraph_read_only())
+          }
+      }
+  }
+  ```
+
+  Confirm the exact current string byte-for-byte before splitting it —
+  copy it from the live `chat.rs`, do not retype it from this plan's
+  earlier quotation of it, which may have introduced whitespace
+  differences. `command_envelope_paragraph_unrestricted()` must produce
+  exactly today's third paragraph; `code_mode_system_prompt_is_byte_identical_to_todays`
+  is what proves this rather than assuming it.
+
+  At `chat.rs:711` (inside `ask_with_session_with_options`), add
+  `let mode = self.session_store.session_mode(&session.id);` before the
+  `messages` vec is built, and change the call to `system_prompt(mode)`.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+- [ ] **Step 5: Confirm spec 49's guards still pass**
+
+  `cargo nextest run -p workspace-engine --test prompt_cache` — both tests
+  should still pass unmodified, since neither sets a session mode and both
+  therefore compare two `Code`-mode prompts. If either fails, that is a
+  finding (per this plan's Global Constraints and spec 49's own tasks.md
+  wording) — stop and record it rather than editing the guard to make it
+  pass.
+
+- [ ] **Step 6: Scoped checks**
+
+  `cargo nextest run -p workspace-engine -E 'test(system_prompt) + test(mode)'`,
+  `cargo nextest run -p workspace-engine --test prompt_cache`, `cargo fmt`,
+  `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`.
+
+- [ ] **Step 7: Show the change and the check result, and ask before committing**
 
 ## Task 6: Layer 3 — the orchestrator refuses
 
