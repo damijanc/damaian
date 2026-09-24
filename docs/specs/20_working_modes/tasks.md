@@ -10,10 +10,10 @@ extended tool-class mapping in [`context.md`](context.md)
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · `SessionMode`, `ToolAction` extended with the two new mutation/planning arms it needs, and the permission-matrix function | Done | `mode.rs` added, registered in `lib.rs` between `mcp` and `model`. Signature decision (Step 3): `fn mode_permits(mode: SessionMode, action: &ToolAction, command: Option<&CommandClassification>) -> Permission` — the single-function-over-the-whole-enum option, per context.md §6's preference; `Command` gets no separate function. `Permission` is `Allowed \| Refused { blocked_by: SessionMode, allowed_in: SessionMode }`, matching the sketch. `ToolAction`, `CommandRequest`, and `ProposedStep` were module-private to `chat.rs` and had to be widened to `pub(crate)` (with `CommandRequest`'s fields also `pub(crate)`) for `mode.rs` to see them — no other file referenced them before this change. Two field-name corrections against tasks.md's own sketch, confirmed by reading the real types before writing the test: `GeneratedEdit` has `changes: Vec<ProposedChange>`, not `files`; `WebDiagnosticCall` is a struct (`kind: WebDiagnosticKind, url, arguments_json, session_id, task_id`), not an enum with an `InspectPage` variant. `SessionMode`, `Permission`, `mode_permits`, and `Permission::is_allowed` carry `#[allow(dead_code)]` with a comment pointing at Task 3, since this task is self-contained by design and nothing outside its own tests calls them yet — `cargo clippy -D warnings` fails without it. Mutation test: flipped the `ProposePatch`/`EditFile` arm to also allow `Ask`, confirmed `the_permission_matrix_matches_the_spec_table` fails (`assertion failed: !mode_permits(Ask, action, None).is_allowed()`), reverted. All 9 `mode::tests` pass; `cargo fmt --all -- --check` and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` both clean. |
-| 2 · MCP read-only capability | Done | `McpTool.read_only_hint: Option<bool>` added; `list_tools`'s inline loop extracted into a private pure `parse_mcp_tool(item: &Value) -> Option<McpTool>` (4 unit tests, no subprocess). `McpRuntime::tool_read_only_hint(server_id, tool_name) -> Option<bool>` added near `requires_approval`; unused by any caller until Task 3/6 wire it in, so no `#[allow(dead_code)]` was needed since it's `pub`. `mode_permits` widened to a 4th `mcp_tool_read_only: Option<bool>` parameter (Task 2's own decision, per its row's Interfaces note); `McpCall` arm now `mcp_tool_read_only == Some(true) \|\| mode == Code`. Every existing `mode.rs` test call site updated to pass the new parameter (compiler-named, all `None` except the new MCP cases). Mutation test: made the arm also treat `None` as permitting outside Code, confirmed `an_mcp_call_with_no_read_only_signal_is_treated_as_mutation_class` fails with `assertion failed: !mode_permits(SessionMode::Ask, &action, None, None).is_allowed()`, reverted. All 22 `mode::tests` + `mcp::tests` pass; `cargo fmt --all -- --check` (after one `cargo fmt --all` pass) and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` both clean. `chat.rs` untouched, as scoped. |
-| 3 · Layer 1 — tool-list construction filters by mode | Not started | |
-| 4 · Persistence — `SessionStore::set_session_mode` / `session_mode` | Not started | |
+| 1 · `SessionMode`, `ToolAction` extended with the two new mutation/planning arms it needs, and the permission-matrix function | Done | `mode.rs` added, registered in `lib.rs` between `mcp` and `model`. Signature decision (Step 3): `fn mode_permits(mode: SessionMode, action: &ToolAction, command: Option<&CommandClassification>) -> Permission` — the single-function-over-the-whole-enum option, per context.md §6's preference; `Command` gets no separate function. `Permission` is `Allowed \| Refused { blocked_by: SessionMode, allowed_in: SessionMode }`, matching the sketch. `ToolAction`, `CommandRequest`, and `ProposedStep` were module-private to `chat.rs` and had to be widened to `pub(crate)` (with `CommandRequest`'s fields also `pub(crate)`) for `mode.rs` to see them — no other file referenced them before this change. Two field-name corrections against tasks.md's own sketch, confirmed by reading the real types before writing the test: `GeneratedEdit` has `changes: Vec<ProposedChange>`, not `files`; `WebDiagnosticCall` is a struct (`kind: WebDiagnosticKind, url, arguments_json, session_id, task_id`), not an enum with an `InspectPage` variant. `SessionMode`, `Permission`, `mode_permits`, and `Permission::is_allowed` carry `#[allow(dead_code)]` with a comment pointing at Task 4 (renumbered from Task 3 on 2026-09-24, see this task's own row), since this task is self-contained by design and nothing outside its own tests calls them yet — `cargo clippy -D warnings` fails without it. Mutation test: flipped the `ProposePatch`/`EditFile` arm to also allow `Ask`, confirmed `the_permission_matrix_matches_the_spec_table` fails (`assertion failed: !mode_permits(Ask, action, None).is_allowed()`), reverted. All 9 `mode::tests` pass; `cargo fmt --all -- --check` and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` both clean. |
+| 2 · MCP read-only capability | Done | `McpTool.read_only_hint: Option<bool>` added; `list_tools`'s inline loop extracted into a private pure `parse_mcp_tool(item: &Value) -> Option<McpTool>` (4 unit tests, no subprocess). `McpRuntime::tool_read_only_hint(server_id, tool_name) -> Option<bool>` added near `requires_approval`; unused by any caller until Task 4/6 wire it in, so no `#[allow(dead_code)]` was needed since it's `pub`. `mode_permits` widened to a 4th `mcp_tool_read_only: Option<bool>` parameter (Task 2's own decision, per its row's Interfaces note); `McpCall` arm now `mcp_tool_read_only == Some(true) \|\| mode == Code`. Every existing `mode.rs` test call site updated to pass the new parameter (compiler-named, all `None` except the new MCP cases). Mutation test: made the arm also treat `None` as permitting outside Code, confirmed `an_mcp_call_with_no_read_only_signal_is_treated_as_mutation_class` fails with `assertion failed: !mode_permits(SessionMode::Ask, &action, None, None).is_allowed()`, reverted. All 22 `mode::tests` + `mcp::tests` pass; `cargo fmt --all -- --check` (after one `cargo fmt --all` pass) and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` both clean. `chat.rs` untouched, as scoped. |
+| 3 · Persistence — `SessionStore::set_session_mode` / `session_mode` | Not started | Reordered ahead of Layer 1 on 2026-09-24 — Layer 1 needs `session_mode` to read from, so it must exist first. Was "Task 4" before the swap; nothing had started on either task, so renumbering was safe. |
+| 4 · Layer 1 — tool-list construction filters by mode | Not started | |
 | 5 · Layer 2 — the non-native fallback's system-prompt envelopes | Not started | |
 | 6 · Layer 3 — the orchestrator refuses at every action path | Not started | |
 | 7 · Command-allowlist does not widen a mode | Not started | |
@@ -69,8 +69,8 @@ Every task's requirements implicitly include this section.
   or `CommandPolicy`'s classification, blocklist, or allowlist semantics.
   Code mode with all-commands-approval on is a valid, unchanged combination.
 - **A turn captures its mode at start.** `proposal.md` §5.4: a mode change
-  mid-turn does not take effect until the next turn. Task 4 persists the
-  event; Task 3/Task 6 read it once per turn, not per action.
+  mid-turn does not take effect until the next turn. Task 3 persists the
+  event; Task 4/Task 6 read it once per turn, not per action.
 - **Falsify every load-bearing test.** Break what it guards and confirm it
   fails, per this repository's history of tests that passed without testing
   anything (spec 47 §7.2, spec 21's error rate, spec 49's mutation-tested
@@ -119,7 +119,7 @@ Read before starting; each is load-bearing for a task below.
   edit site.
 - `SessionStore::allow_browser_diagnostics_for_session` /
   `browser_diagnostics_allowed_for_session` (`session.rs:664-695`) — the
-  persistence pattern Task 4 follows exactly (append an event, replay by
+  persistence pattern Task 3 follows exactly (append an event, replay by
   parsed `eventType`, newest wins).
 - `PatchEngine::apply_patch` caller (`edit.rs:538`) and the `ProposePatch` /
   `EditFile` dispatch arms that create a proposal before any approval exists
@@ -132,7 +132,7 @@ Read before starting; each is load-bearing for a task below.
 - `mcp.call_tool` dispatch (`chat.rs:2400`, and the resumed-call path at
   `chat.rs:816`) — Task 6's refusal point for MCP tools.
 - `parsed_events` / `active_events` (`session.rs:1904`, `session.rs:1931`) —
-  what Task 4's reader calls; confirmed already free of the substring-match
+  what Task 3's reader calls; confirmed already free of the substring-match
   pattern `proposal.md` §5.4 warns against (`context.md` §4).
 - `system_prompt()` and the `DAMAIAN_EDIT_V1` / `DAMAIAN_COMMAND_V1`
   instruction blocks it assembles — Task 5's edit site; grep `chat.rs` for
@@ -151,7 +151,7 @@ Read before starting; each is load-bearing for a task below.
 
 This task is entirely self-contained — no wiring into `chat.rs`, `session.rs`,
 or anywhere else. It produces one pure function and proves the matrix against
-every current tool. Nothing calls it yet; that starts at Task 3.
+every current tool. Nothing calls it yet; that starts at Task 4.
 
 **Interfaces:**
 - Consumes: `ToolAction` (`chat.rs:3237-3278`, read-only — this task does not
@@ -579,7 +579,7 @@ This task does **not** touch `chat.rs`. `McpRuntime` already caches the raw
 output, which is the generic `{name, description, parameters_json}` shape
 every tool kind flattens to and has no room for a hint. This task adds a
 lookup over that existing cache; wiring the lookup into `chat.rs`'s
-`McpCall` dispatch is Task 3/Task 6's job, once Layer 1 and Layer 3 exist to
+`McpCall` dispatch is Task 4/Task 6's job, once Layer 1 and Layer 3 exist to
 call it from. `mode_permits`'s signature changes regardless, since Task 1
 already established that a `ToolAction` variant needing extra context to
 decide gets that context as a parameter (`command: Option<&CommandClassification>`
@@ -591,7 +591,7 @@ for `Command`) rather than the matrix growing a special case.
   `McpClient::list_tools` (`mcp.rs:178-203`).
 - Produces: `McpTool.read_only_hint: Option<bool>`, a new
   `McpRuntime::tool_read_only_hint(&self, server_id: &str, tool_name: &str) -> Option<bool>`
-  method Task 3/6 will call, and `mode_permits`'s widened signature —
+  method Task 4/6 will call, and `mode_permits`'s widened signature —
   `mcp_tool_read_only: Option<bool>` alongside `command`. Record in this
   row if the parameter list grows differently.
 
@@ -776,23 +776,14 @@ for `Command`) rather than the matrix growing a special case.
 
 - [x] **Step 8: Show the change and the check result, and ask before committing**
 
-## Task 3: Layer 1 — tool-list construction filters by mode
-
-**Requirements:** 2, 6. **Files:** `chat.rs`.
-
-Filters `native_tools` (`chat.rs:1267-1293`) by `mode_permits`, reading the
-turn's captured mode (Task 4 supplies the read; this task consumes it, does
-not yet persist it). For `run_command`, whether the tool definition itself is
-offered cannot depend on a specific command's classification — the decision
-here is coarser: offer `run_command_tool_definition()` whenever *some*
-command could pass in this mode (i.e., not in Ask), and let Layer 3 refuse
-individual commands. Acceptance criterion: "no tool capable of mutation
-appears in the tool list sent to the model — asserted against the constructed
-list, not the prompt," in Ask and Plan.
-
-## Task 4: Persistence
+## Task 3: Persistence
 
 **Requirements:** 3, 4, 7. **Files:** `session.rs`.
+
+**Reordered ahead of Layer 1** (was Task 4 in an earlier draft of this plan;
+renumbered 2026-09-24, before either task started): Layer 1 reads a session's
+mode via `SessionStore::session_mode`, so that reader has to exist first.
+Planning caught this before it became a stalled Task 4 with nothing to call.
 
 `SessionStore::set_session_mode(session_id, mode, set_by)` and
 `session_mode(session_id) -> SessionMode`, following
@@ -801,6 +792,148 @@ list, not the prompt," in Ask and Plan.
 (`{"sessionId":...,"mode":"code","setBy":"user"}`), read by newest-event-wins
 over parsed `eventType`. Default for no event is `Code` (requirement 7).
 `set_by` is always `"user"` and is asserted as such, per `proposal.md` §5.4.
+
+**Deliberately not using `active_events` (`session.rs:1931-1943`, the reader
+that stops at the newest rewind marker):** `browser_diagnostics_allowed_for_session`
+reads with `parsed_events(&content).0` — every event ever appended, ignoring
+rewind — and this task follows that exactly, not as an oversight but because
+a session's mode is a capability the user configured, not conversation
+content; a rewind that discards messages should not silently reset what the
+session is allowed to do. If a future task wants mode to interact with
+rewind, that is a deliberate change to make with its own test, not something
+to introduce by picking the "more correct-looking" reader here.
+
+**Interfaces:**
+- Consumes: `SessionMode` (`mode.rs`, `Serialize`/`Deserialize` already
+  derived with `#[serde(rename_all = "snake_case")]` from Task 1 — this task
+  is the first thing to actually serialize/deserialize it), `append_session_event`
+  (`session.rs:1748-1770`, private to `SessionStore` — call it, don't
+  duplicate its event-line formatting), `parsed_events` (`session.rs:1904-1917`).
+- Produces: `SessionStore::set_session_mode(&self, session_id: &str, mode: SessionMode, set_by: &str) -> Result<()>`
+  and `SessionStore::session_mode(&self, session_id: &str) -> SessionMode`
+  (infallible — a missing or unreadable log reads as the requirement-7
+  default, `Code`, the same way `browser_diagnostics_allowed_for_session`
+  reads a missing log as `false` rather than erroring). Task 4 and Task 6
+  call `session_mode` once per turn, before tool-list construction and
+  before the first Layer-3 check respectively.
+
+- [ ] **Step 1: Write the failing tests**
+
+  Add to `session.rs`'s existing test module (find it near the
+  `browser_diagnostics` tests already there, and match their fixture style —
+  a temp data dir, a `SessionStore::new`/equivalent constructor, a session id
+  string):
+  - `a_session_with_no_mode_event_reads_as_code` — a fresh session (or one
+    with unrelated events but no `session_mode_set`) reads `SessionMode::Code`
+    from `session_mode`. This is the requirement-7 migration criterion —
+    write it first, the way spec 49 Task 1 wrote its migration test before
+    anything else.
+  - `set_session_mode_round_trips` — `set_session_mode(id, SessionMode::Ask, "user")`
+    then `session_mode(id)` returns `SessionMode::Ask`.
+  - `the_newest_mode_event_wins` — two `set_session_mode` calls with
+    different modes; `session_mode` returns the second, not the first and
+    not some merge of the two.
+  - `set_by_is_always_user` — after `set_session_mode`, the raw appended
+    event's `setBy` field is literally `"user"`. `proposal.md` §5.4: "It
+    exists so that a future non-user origin cannot be added without someone
+    noticing the field already asserts otherwise" — assert the string
+    directly against the log content or the parsed event, not just that
+    `set_session_mode` was called with `"user"` as an argument, since the
+    point is what lands on disk.
+  - `session_mode_survives_a_conversation_rewind` — append a
+    `session_mode_set` event, then a `conversation_rewound` event whose
+    `throughEventSeq` is before the mode event's `seq`, then confirm
+    `session_mode` still returns the set mode, not `Code`. This is the test
+    that would fail if a future edit switched the reader to `active_events`
+    — write it now so that mistake is caught immediately, not discovered
+    later as a regression.
+  - `an_unreadable_session_log_reads_as_code` — `session_mode` on a session
+    id with no log file at all (never created) returns `Code`, not an
+    error and not a panic — mirroring `browser_diagnostics_allowed_for_session`'s
+    `let Ok(content) = fs::read_to_string(path) else { return Ok(false) };`
+    shape.
+
+- [ ] **Step 2: Run to verify they fail to compile**
+
+  `cargo nextest run -p workspace-engine -E 'test(session_mode)'`
+
+- [ ] **Step 3: Implement**
+
+  ```rust
+  pub fn set_session_mode(&self, session_id: &str, mode: SessionMode, set_by: &str) -> Result<()> {
+      self.append_session_event(
+          session_id,
+          "session_mode_set",
+          &format!(
+              "{{\"sessionId\":\"{}\",\"mode\":\"{}\",\"setBy\":\"{}\"}}",
+              escape_json(session_id),
+              mode.as_str(),
+              escape_json(set_by)
+          ),
+      )
+  }
+
+  pub fn session_mode(&self, session_id: &str) -> SessionMode {
+      let path = self.session_log_path(session_id);
+      let Ok(content) = fs::read_to_string(path) else {
+          return SessionMode::Code;
+      };
+      let mut mode = SessionMode::Code;
+      for event in parsed_events(&content).0 {
+          if event.event_type != "session_mode_set" {
+              continue;
+          }
+          if let Some(parsed) = event
+              .payload
+              .get("mode")
+              .and_then(|value| serde_json::from_value(value.clone()).ok())
+          {
+              mode = parsed;
+          }
+      }
+      mode
+  }
+  ```
+
+  This needs `SessionMode::as_str(&self) -> &'static str` on the enum in
+  `mode.rs` (matching `CommandRisk::as_str()`'s existing convention in
+  `command_policy.rs:14-21` for embedding an enum into a hand-built JSON
+  string) — add it there, and drop the `#[allow(dead_code)]` on
+  `SessionMode` itself once this gives it a real caller (leave the other
+  three `#[allow(dead_code)]`s from Task 1 in place; they come off in
+  Task 4/6, per the comment already on them).
+
+  Confirm `SessionEvent.payload`'s actual type before writing the
+  `serde_json::from_value` call — `browser_diagnostics_allowed_for_session`'s
+  `event.payload.get("allowed").and_then(|v| v.as_bool())` implies it is a
+  `serde_json::Value`, but read the struct definition (`session.rs:1855-1861`)
+  to confirm rather than assuming from one call site.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+  `cargo nextest run -p workspace-engine -E 'test(session_mode)'`
+
+- [ ] **Step 5: Scoped checks**
+
+  `cargo nextest run -p workspace-engine -E 'test(session_mode)'`, `cargo fmt`,
+  `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`.
+
+- [ ] **Step 6: Show the change and the check result, and ask before committing**
+
+## Task 4: Layer 1 — tool-list construction filters by mode
+
+**Requirements:** 2, 6. **Files:** `chat.rs`.
+
+Filters `native_tools` (`chat.rs:1267-1293`) by `mode_permits`, reading the
+turn's mode via `SessionStore::session_mode` (Task 3), captured once per turn
+per `proposal.md` §5.4 — read it before the tool list is built, not per
+action. For `run_command`, whether the tool definition itself is offered
+cannot depend on a specific command's classification — the decision here is
+coarser: offer `run_command_tool_definition()` whenever *some* command could
+pass in this mode (i.e., not in Ask), and let Layer 3 refuse individual
+commands. Acceptance criterion: "no tool capable of mutation appears in the
+tool list sent to the model — asserted against the constructed list, not the
+prompt," in Ask and Plan.
 
 ## Task 5: Layer 2 — the non-native fallback's envelopes
 
@@ -854,7 +987,7 @@ switch does not clear it).
 ## Task 9: Migration and eval-harness guard
 
 **Requirements:** 7, plus the harness half of acceptance. **Files:**
-`session.rs` (covered by Task 4's default), `eval-harness`.
+`session.rs` (covered by Task 3's default), `eval-harness`.
 
 Confirms existing sessions with no `session_mode_set` event load in Code.
 Confirms the spec 18 baseline shows no increase in approval-policy

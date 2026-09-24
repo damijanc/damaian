@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 /// through it rather than re-implementing any part of the matrix
 /// (`proposal.md` §5.1).
 // Task 1 (docs/specs/20_working_modes/tasks.md) is deliberately self-contained:
-// nothing outside this module's own tests calls these items yet. Task 3 wires
+// nothing outside this module's own tests calls these items yet. Task 4 wires
 // `mode_permits` into `chat.rs`'s tool-list construction, at which point these
-// `allow(dead_code)`s come off.
+// `allow(dead_code)`s come off. (Renumbered 2026-09-24: Layer 1 wiring moved
+// from Task 3 to Task 4 so persistence, which it reads from, lands first.)
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
