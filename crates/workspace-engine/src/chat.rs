@@ -1336,9 +1336,11 @@ impl ChatOrchestrator {
             // in this mode, so ask about the most permissive classification
             // there is. Going through `mode_permits` rather than hand-coding
             // `mode != Ask` keeps the matrix in one place even though the two
-            // happen to agree today.
+            // happen to agree today. The text must be genuinely read-only, not
+            // empty: `mode_permits` checks the command itself, not just its
+            // risk, so an allowlist cannot widen a mode.
             let permissive_command = CommandClassification {
-                command: String::new(),
+                command: "pwd".to_string(),
                 risk: CommandRisk::Low,
                 blocked: false,
                 requires_approval: false,

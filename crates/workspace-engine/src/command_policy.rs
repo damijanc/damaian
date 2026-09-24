@@ -290,7 +290,7 @@ fn is_blocked_command(command: &str) -> bool {
         || trimmed == "reboot"
 }
 
-fn is_low_risk_read_only(command: &str) -> bool {
+pub(crate) fn is_low_risk_read_only(command: &str) -> bool {
     command == "pwd"
         || command == "ls"
         || command.starts_with("ls ")

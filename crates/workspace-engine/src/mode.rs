@@ -1,5 +1,5 @@
 use crate::chat::ToolAction;
-use crate::command_policy::{CommandClassification, CommandRisk};
+use crate::command_policy::{CommandClassification, CommandRisk, is_low_risk_read_only};
 use serde::{Deserialize, Serialize};
 
 /// A session's working mode. Bounds what the model can do this turn,
@@ -96,6 +96,15 @@ pub(crate) fn refusal_message(refused: Permission) -> String {
 /// this panics rather than silently defaulting when it is `None`. Every
 /// other variant ignores `command`.
 ///
+/// Plan and Review allow a command only when it is `Low` risk, needs no
+/// approval, *and* `is_low_risk_read_only` accepts its text. The first two
+/// fields are not enough on their own. `classify_pattern` gives an
+/// allowlisted command (say `npm run build`) the same `risk: Low,
+/// requires_approval: false` as `git status`, because that is how the
+/// allowlist skips the approval prompt. Reading only those two fields would
+/// let `command_allowlist` widen a mode, which `proposal.md` §5.3 forbids
+/// (`context.md` §5). So do not drop the third check to "simplify" this.
+///
 /// `mcp_tool_read_only` is the server's `annotations.readOnlyHint` for a
 /// `ToolAction::McpCall`'s specific tool (`McpRuntime::tool_read_only_hint`).
 /// Only `Some(true)` widens the call beyond Code — `Some(false)` and `None`
@@ -144,8 +153,9 @@ pub(crate) fn mode_permits(
                  classify the command before asking whether the mode \
                  permits it",
             );
-            let read_only_no_approval =
-                classification.risk == CommandRisk::Low && !classification.requires_approval;
+            let read_only_no_approval = classification.risk == CommandRisk::Low
+                && !classification.requires_approval
+                && is_low_risk_read_only(&classification.command);
             match mode {
                 Ask => Permission::Refused {
                     blocked_by: Ask,
@@ -416,6 +426,73 @@ mod tests {
             )
             .is_allowed()
         );
+    }
+
+    /// Exactly what `classify_pattern`'s allowlist branch returns for an
+    /// allowlisted `npm run build` under the default configuration — the
+    /// same `risk`/`requires_approval` as a genuinely read-only command,
+    /// which is why those two fields alone cannot decide Plan/Review.
+    fn allowlisted_mutating_command() -> CommandClassification {
+        CommandClassification {
+            command: "npm run build".to_string(),
+            risk: CommandRisk::Low,
+            blocked: false,
+            requires_approval: false,
+            reasons: vec!["Command matches configured allowlist".to_string()],
+            expected_effects: "Configured safe command".to_string(),
+            may_use_network: false,
+        }
+    }
+
+    /// `proposal.md` §5.3: `command_allowlist` does not widen a mode.
+    #[test]
+    fn an_allowlisted_mutating_command_is_still_refused_in_plan() {
+        let action = ToolAction::Command(CommandRequest {
+            command: "npm run build".into(),
+            reason: String::new(),
+        });
+        assert_eq!(
+            mode_permits(
+                SessionMode::Plan,
+                &action,
+                Some(&allowlisted_mutating_command()),
+                None
+            ),
+            Permission::Refused {
+                blocked_by: SessionMode::Plan,
+                allowed_in: SessionMode::Code,
+            }
+        );
+    }
+
+    #[test]
+    fn an_allowlisted_mutating_command_is_still_refused_in_review() {
+        let action = ToolAction::Command(CommandRequest {
+            command: "npm run build".into(),
+            reason: String::new(),
+        });
+        assert_eq!(
+            mode_permits(
+                SessionMode::Review,
+                &action,
+                Some(&allowlisted_mutating_command()),
+                None
+            ),
+            Permission::Refused {
+                blocked_by: SessionMode::Review,
+                allowed_in: SessionMode::Code,
+            }
+        );
+    }
+
+    /// Compile-time only: `mode_permits` reads this predicate directly, so it
+    /// must stay visible to this module.
+    #[test]
+    fn is_low_risk_read_only_is_visible_to_mode_rs() {
+        assert!(crate::command_policy::is_low_risk_read_only("git status"));
+        assert!(!crate::command_policy::is_low_risk_read_only(
+            "npm run build"
+        ));
     }
 
     /// A refusal names both the mode that blocked the action and the mode
