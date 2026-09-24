@@ -55,7 +55,6 @@ pub(crate) enum Permission {
 }
 
 impl Permission {
-    #[allow(dead_code)]
     pub(crate) fn is_allowed(&self) -> bool {
         matches!(self, Permission::Allowed)
     }
@@ -79,7 +78,6 @@ impl Permission {
 /// (no claim made) both stay mutation-class, the same "silence is not a
 /// green light" posture spec 49 used for cache reporting (`context.md` §2).
 /// Every other variant ignores it.
-#[allow(dead_code)]
 pub(crate) fn mode_permits(
     mode: SessionMode,
     action: &ToolAction,

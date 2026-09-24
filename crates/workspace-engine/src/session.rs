@@ -730,10 +730,8 @@ impl SessionStore {
     /// rewind that discards messages must not silently reset what the
     /// session is allowed to do (`docs/specs/20_working_modes/tasks.md`
     /// Task 3).
-    // Task 4 and Task 6 call this once per turn, before tool-list
-    // construction and before the first Layer-3 check respectively; nothing
-    // outside this file's own tests calls it yet.
-    #[allow(dead_code)]
+    // Task 4 calls this once per turn, before tool-list construction; Task 6
+    // calls it before the first Layer-3 check.
     pub(crate) fn session_mode(&self, session_id: &str) -> SessionMode {
         let path = self.session_log_path(session_id);
         let Ok(content) = fs::read_to_string(path) else {
