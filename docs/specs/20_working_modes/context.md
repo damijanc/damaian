@@ -125,17 +125,56 @@ fixed elsewhere; Task 4 follows the pattern as it exists today with no
 special care needed beyond what §5.4 already specifies (append an event,
 replay by parsed `eventType`, newest wins).
 
-## 5. Nothing here changes what a command's risk classification means
+## 5. §5.3's rule as originally stated is wrong, and Task 7 is a real bug fix,
+## not a confirmation
 
 `CommandClassification` (`command_policy.rs:24-32`) has `risk: CommandRisk`
-(`Low`/`Medium`/`High`/`Blocked`) and `requires_approval: bool` as separate
-fields — confirmed reading `classify()` (`command_policy.rs:60`) and
-`is_low_risk_read_only` (`command_policy.rs:293`). §5.3's rule — "a command
-runs in Plan only if `CommandPolicy` classifies it as read-only *and* it
-requires no approval" — reads directly as
-`classification.risk == CommandRisk::Low && !classification.requires_approval`.
-No change to `command_policy.rs` itself is in scope (Non-goals §4), Task 3
-only reads these two fields.
+and `requires_approval: bool` as separate fields, and this section
+originally claimed §5.3's rule — "read-only *and* requires no approval" —
+reads directly as `risk == Low && !requires_approval`, with no change to
+`command_policy.rs` needed. **Reading `classify_pattern`
+(`command_policy.rs:76-187`) branch by branch (done for Task 7, corrected
+here) shows this is wrong.**
+
+Exactly two branches produce `risk: Low`: the allowlist match
+(`command_policy.rs:107-117`) and `is_low_risk_read_only`
+(`command_policy.rs:119-129`, `:293`). **Both** set
+`requires_approval: self.config.require_approval_for_all_commands` — the
+same expression, meaning both are `requires_approval: false` under the
+default configuration. A `CommandClassification` for an *allowlisted*
+`npm run build` (a command `is_validation_command` would otherwise classify
+`Medium`) is therefore `risk: Low, requires_approval: false` — **structurally
+identical** to a genuinely read-only command's classification. `mode_permits`
+cannot tell the two apart from `risk`/`requires_approval` alone, because
+`classify_pattern` collapses "the user pre-approved this string" and "this
+command is read-only by its own nature" into the same two fields on purpose
+(that collapse is exactly what makes an allowlisted command auto-run without
+a prompt — the intended, existing UX). **This means `mode_permits`'s Command
+arm, as Task 6 implemented it, currently allows an allowlisted mutating
+command in Plan and Review — precisely the hole `proposal.md` §5.3's
+"`command_allowlist` and `Allow Always` entries do not widen a mode" and
+this work package's acceptance criteria explicitly forbid.** This was not
+caught by Task 6's tests because none of them exercised an allowlisted
+command; `mode_permits`'s own crossing tests (Task 1) don't either, since
+`command_allowlist` is a `Config` concern, not something a bare
+`CommandClassification` fixture reveals as wrong on its own — a fixture
+built by hand with `risk: Low, requires_approval: false` looks the same
+whichever way it got that way.
+
+**Decision:** `mode_permits` must consult a signal independent of `risk`,
+not derived from `command_allowlist` at all. `is_low_risk_read_only(command: &str) -> bool`
+(`command_policy.rs:293`) already exists as exactly that signal — a pure
+predicate over the command string alone, consulted by `classify_pattern`
+*before* it folds the result into `risk`/`requires_approval`. Task 7 widens
+its visibility to `pub(crate)` and has `mode_permits`'s Plan/Review rule
+call it directly: `risk == Low && !requires_approval && is_low_risk_read_only(&classification.command)`.
+This changes no classification `CommandPolicy::classify` produces for any
+existing caller — `command_policy.rs`'s own behavior, the blocklist, the
+allowlist, and every risk level are untouched, satisfying the Non-goals §4
+line this section previously (wrongly) cited as ruling out any
+`command_policy.rs` change at all. What changes is `mode_permits` reading a
+third, independent fact instead of inferring it from two fields that don't
+carry it.
 
 ## 6. Open question carried into Task 1, not resolved here
 

@@ -1508,13 +1508,103 @@ code path, if the two need to look different to the model.
 
 ## Task 7: Command-allowlist does not widen a mode
 
-**Requirements:** 6. **Files:** `chat.rs` or wherever `command_allowlist` /
-`Allow Always` is currently consulted.
+**Requirements:** 6. **Files:** `command_policy.rs`, `mode.rs`.
 
-Asserts directly: an allowlisted `npm run build` is still refused in Ask and
-Plan. `context.md` §5 confirms no change to `command_policy.rs` itself is
-needed — this task only confirms the allowlist check and the mode check are
-independent gates, both required, per `proposal.md` §5.3.
+**This is a bug fix, not a confirmation.** `context.md` §5 originally
+claimed nothing here needed to change; re-reading `classify_pattern`
+branch by branch to plan this task found that claim is wrong and corrected
+it — **read the corrected §5 before starting**. In short: `classify_pattern`
+gives an allowlisted command `risk: Low, requires_approval: false`
+identically to a genuinely read-only command, because the allowlist
+match and the read-only match are two different branches that both fold
+into the same two fields. `mode_permits`'s Command arm (`mode.rs:140-160`
+as of Task 6), as it exists right now, therefore **allows an allowlisted
+mutating command in Plan and Review** — exactly what `proposal.md` §5.3 and
+this work package's acceptance criteria say must not happen. This task
+fixes it; it is not a regression-test-only task the way its earlier
+one-paragraph description implied.
+
+**Interfaces:**
+- Consumes: `is_low_risk_read_only(command: &str) -> bool`
+  (`command_policy.rs:293`, currently private — this task's one visibility
+  change), `CommandClassification.command: String` (already public).
+- Produces: nothing new for later tasks — this task only tightens
+  `mode_permits`'s existing Command arm.
+
+- [ ] **Step 1: Write the failing tests**
+
+  In `mode.rs`'s test module:
+  - `an_allowlisted_mutating_command_is_still_refused_in_plan` — construct
+    a `CommandClassification` shaped exactly the way `classify_pattern`'s
+    allowlist branch (`command_policy.rs:107-117`) produces one for a
+    command that is not textually read-only: `command: "npm run build"`,
+    `risk: CommandRisk::Low`, `requires_approval: false`, `reasons: vec!["Command matches configured allowlist".to_string()]`
+    (copy the real reason string so this fixture is recognizably "what the
+    allowlist branch actually returns," not a fixture that happens to look
+    similar). Assert `mode_permits(SessionMode::Plan, &command_action, Some(&classification), None)`
+    is `Refused`, `blocked_by: Plan, allowed_in: Code`.
+  - `an_allowlisted_mutating_command_is_still_refused_in_review` — same
+    shape, `SessionMode::Review`.
+  - `a_genuinely_read_only_command_is_unaffected` — the existing
+    `plan_permits_a_read_only_command_that_needs_no_approval` test (Task 1)
+    already covers this, but confirm it still passes after this task's
+    change rather than assuming — a fix to the false-positive case must not
+    introduce a false negative for the true-positive case in the same
+    change.
+  - `is_low_risk_read_only_is_visible_to_mode_rs` — not a behavioral test,
+    just confirms the compiler accepts `crate::command_policy::is_low_risk_read_only`
+    from `mode.rs`; if Step 1 is written before Step 3's visibility change,
+    this (and the two tests above, which call `mode_permits` on a fixture
+    that needs the fixed logic to fail correctly) won't compile yet, which
+    is the expected red state.
+
+- [ ] **Step 2: Run to verify they fail (to compile, or to assert)**
+
+- [ ] **Step 3: Widen `is_low_risk_read_only`'s visibility**
+
+  `command_policy.rs:293`: `fn is_low_risk_read_only` → `pub(crate) fn is_low_risk_read_only`.
+  No other change to `command_policy.rs` — confirm with `cargo clippy` that
+  nothing about its existing callers or their behavior moved.
+
+- [ ] **Step 4: Fix `mode_permits`'s Command arm**
+
+  ```rust
+  let read_only_no_approval = classification.risk == CommandRisk::Low
+      && !classification.requires_approval
+      && crate::command_policy::is_low_risk_read_only(&classification.command);
+  ```
+
+  Add the `use` this needs at the top of `mode.rs` if `is_low_risk_read_only`
+  isn't referenced with its full path inline. Update the doc comment above
+  `mode_permits` (`mode.rs`, the block explaining `command`'s role) to
+  record that `risk`/`requires_approval` alone are not sufficient for this
+  arm and why, so a future reader doesn't "simplify" this back to the
+  two-field version this task is fixing.
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+- [ ] **Step 6: Mutation-test**
+
+  Temporarily drop the `is_low_risk_read_only(...)` conjunct, confirm
+  `an_allowlisted_mutating_command_is_still_refused_in_plan` fails, revert.
+
+- [ ] **Step 7: Confirm this also closes the gap at every Layer 3 point**
+
+  Task 6's point 3 (main-loop command) and point 7 (resume-path command)
+  both build a `CommandClassification` and call `mode_permits` — since the
+  fix is inside `mode_permits` itself, both are fixed by this one change
+  with no edit to `chat.rs`. Run the full `mode`-filtered test suite
+  (`cargo nextest run -p workspace-engine -E 'test(mode)'`) to confirm nothing
+  Task 6 wrote regressed — in particular any Task 6 test that used a
+  low-risk `CommandClassification` fixture for a command that happens to
+  also be genuinely read-only should still pass unchanged.
+
+- [ ] **Step 8: Scoped checks**
+
+  `cargo nextest run -p workspace-engine -E 'test(mode)'`, `cargo fmt`,
+  `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`.
+
+- [ ] **Step 9: Show the change and the check result, and ask before committing**
 
 ## Task 8: UI — mode control and refusal messaging
 
