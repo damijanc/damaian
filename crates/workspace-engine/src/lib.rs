@@ -120,7 +120,9 @@ pub use validation::{
     command_approval_prompt,
 };
 pub use web_diagnostics::{
-    WEB_SCENARIO_ACTIONS, WebDiagnosticArtifact, WebDiagnosticCall, WebDiagnosticKind,
-    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
+    WEB_SCENARIO_ACTIONS, WebConsoleEntry, WebDiagnosticArtifact, WebDiagnosticCall,
+    WebDiagnosticDetails, WebDiagnosticKind, WebDiagnosticReport, WebDiagnosticsRunner,
+    WebDiagnosticsRunnerHandle, WebDomSummary, WebFailedRequest, WebScenarioStep,
+    WebSourceLocation,
 };
 pub use workspace_engine::WorkspaceEngine;

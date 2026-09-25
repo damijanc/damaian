@@ -12,7 +12,7 @@ a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.10
 (secret detection), section 19 (open gaps).
 Related implementation specs:
-[`12_web_app_troubleshooting.md`](12_web_app_troubleshooting.md) (browser
+[`12_web_app_troubleshooting.md`](12_web_app_troubleshooting/proposal.md) (browser
 diagnostics for the user's own local app — a different capability with a
 different trust model, see §4),
 [`26_context_assembly.md`](26_context_assembly.md) (the category and budget this
@@ -56,7 +56,7 @@ genuinely new attack surface. §5.3 is the part of this spec that matters.
   `read_file`, `search_codebase`, `run_command`, `propose_patch`,
   `read_git_diff`, `read_git_status`, `inspect_web_page`, `run_web_scenario`,
   `propose_plan`, `complete_step`. The two web tools drive a browser against the
-  user's own running application ([spec 12](12_web_app_troubleshooting.md)); they
+  user's own running application ([spec 12](12_web_app_troubleshooting/proposal.md)); they
   are diagnostics, not a reader.
 - **`run_command` is the accidental path.** A user who has approved `curl` once
   has given the agent the whole internet through the command allowlist, with no
@@ -103,7 +103,7 @@ genuinely new attack surface. §5.3 is the part of this spec that matters.
 - **Crawling.** One URL, one request, one response. Requirement 7 is what keeps
   this a reader rather than a crawler, and it is also why robots directives are
   out of scope: there is nothing to crawl.
-- **Rendering pages in a browser.** [Spec 12](12_web_app_troubleshooting.md)'s
+- **Rendering pages in a browser.** [Spec 12](12_web_app_troubleshooting/proposal.md)'s
   browser drives the user's own application on localhost. Pointing it at
   arbitrary internet pages would run untrusted JavaScript in a context that has
   the user's repository open, which is a categorically larger risk than an HTTP

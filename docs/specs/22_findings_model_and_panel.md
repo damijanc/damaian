@@ -12,7 +12,7 @@ Related spec sections: `ai_coding_assistant_specification.md` section 7.1 (chat
 interface), section 7.10 (secret detection), section 11 (error handling).
 Related implementation specs:
 [`05_clickable_file_references.md`](05_clickable_file_references.md) (navigation),
-[`12_web_app_troubleshooting.md`](12_web_app_troubleshooting.md) (the browser
+[`12_web_app_troubleshooting.md`](12_web_app_troubleshooting/proposal.md) (the browser
 diagnostic source, extended additively in §5.4), and
 [`23_verification_loop.md`](23_verification_loop.md), which consumes this model.
 
@@ -236,7 +236,7 @@ Two options, and this spec takes the second:
    same reason the generic parser is a fallback rather than a solution: the text
    is written for a human and its shape is not a contract.
 2. **Extend the report with structured entries.**
-   [Spec 12](12_web_app_troubleshooting.md) is `In progress`, so its runner
+   [Spec 12](12_web_app_troubleshooting/proposal.md) is `In progress`, so its runner
    contract is still being settled — this is the moment to add structure to it
    rather than parse around it afterwards.
 
@@ -364,5 +364,5 @@ To be completed during implementation. Record:
   fell through to the generic parser. A high share is not a failure of this spec,
   but it tells the next person where to add a parser.
 - Whether `WebDiagnosticReport.entries` was added in coordination with
-  [spec 12](12_web_app_troubleshooting.md), or whether that spec had already
+  [spec 12](12_web_app_troubleshooting/proposal.md), or whether that spec had already
   closed and the text-parsing fallback was used instead.

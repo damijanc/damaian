@@ -15,7 +15,7 @@ Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 handling). Related implementation specs:
 [`04_hunk_level_patch_apply.md`](04_hunk_level_patch_apply.md),
 [`10_persistent_command_approval.md`](10_persistent_command_approval.md),
-[`12_web_app_troubleshooting.md`](12_web_app_troubleshooting.md),
+[`12_web_app_troubleshooting.md`](12_web_app_troubleshooting/proposal.md),
 [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md) (the
 plan and evidence this loop populates),
 [`22_findings_model_and_panel.md`](22_findings_model_and_panel.md) (the finding
@@ -184,7 +184,7 @@ even for read-only checks, which is what they asked for.
 
 Requirement 7 asks the report to list behaviour verified through browser
 diagnostics. The loop invokes `web_diagnostics` when the task already established
-a target page — [spec 12](12_web_app_troubleshooting.md)'s session-scoped
+a target page — [spec 12](12_web_app_troubleshooting/proposal.md)'s session-scoped
 diagnostic approval applies unchanged.
 
 It does not start a dev server. Background processes are Phase 2 WP5, outside this

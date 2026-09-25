@@ -24,7 +24,7 @@ classification and approval). Related implementation specs:
 surface this filters, and the text-envelope fallback that must be filtered with
 it), [`06_mcp_support.md`](../06_mcp_support.md),
 [`11_agents_md_support.md`](../11_agents_md_support.md) (instruction precedence),
-[`12_web_app_troubleshooting.md`](../12_web_app_troubleshooting.md),
+[`12_web_app_troubleshooting.md`](../12_web_app_troubleshooting/proposal.md),
 [`13_docker_command_support.md`](../13_docker_command_support.md).
 
 ## 1. Motivation
@@ -83,7 +83,7 @@ make correctly under pressure.
   `browser_diagnostics_allowed_for_session`
   (`crates/workspace-engine/src/session.rs:261-291`) append an event and replay
   the log to recover the value — session-scoped approval from
-  [spec 12](../12_web_app_troubleshooting.md).
+  [spec 12](../12_web_app_troubleshooting/proposal.md).
 - **Repository instruction precedence is already defined.**
   [Spec 11](../11_agents_md_support.md) establishes how `AGENTS.md` content is
   ordered against user and admin config.

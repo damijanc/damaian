@@ -14,7 +14,7 @@ Related implementation specs:
 (split from it; its sweep runs at launch, earlier than spec 17's — see §5.7),
 [`06_mcp_support.md`](../06_mcp_support.md) and
 [`33_mcp_management_and_deferred_discovery.md`](../33_mcp_management_and_deferred_discovery.md)
-(MCP stdio servers), [`12_web_app_troubleshooting.md`](../12_web_app_troubleshooting.md).
+(MCP stdio servers), [`12_web_app_troubleshooting.md`](../12_web_app_troubleshooting/proposal.md).
 
 ## 1. Motivation
 

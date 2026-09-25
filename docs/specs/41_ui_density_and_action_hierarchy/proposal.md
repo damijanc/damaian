@@ -20,7 +20,7 @@ states), §7.4 (command approval), §7.7 (diff and patch engine).
 Related implementation specs:
 [`../10_persistent_command_approval.md`](../10_persistent_command_approval.md) (the
 `Allow Always` action this spec demotes to an overflow menu),
-[`../12_web_app_troubleshooting.md`](../12_web_app_troubleshooting.md) (the
+[`../12_web_app_troubleshooting.md`](../12_web_app_troubleshooting/proposal.md) (the
 session-scoped browser diagnostic grant, likewise demoted),
 [`../13_docker_command_support.md`](../13_docker_command_support.md) (Docker approvals
 render through the same card).

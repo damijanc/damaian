@@ -12,7 +12,7 @@ prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.1 (chat
 interface), section 7.10 (secret detection).
 Related implementation specs:
-[`12_web_app_troubleshooting.md`](12_web_app_troubleshooting.md) (produces the
+[`12_web_app_troubleshooting.md`](12_web_app_troubleshooting/proposal.md) (produces the
 screenshot artifacts §1 is about; `In progress`, so §5.5 is additive and must be
 coordinated rather than assumed),
 [`26_context_assembly.md`](26_context_assembly.md) (the budget and category an
@@ -29,7 +29,7 @@ path an image changes the guarantees of),
 
 **Damaian takes screenshots it cannot look at.**
 
-[Spec 12](12_web_app_troubleshooting.md)'s browser diagnostics capture
+[Spec 12](12_web_app_troubleshooting/proposal.md)'s browser diagnostics capture
 screenshots and record them as `WebDiagnosticArtifact { kind, path, mime_type,
 width, height }` on a `WebDiagnosticReport`. The model that asked for the
 diagnostic receives `report.text` and a list of file references. The pixels —
@@ -85,7 +85,7 @@ and this spec's real work is deciding honestly what to say instead.
 
 1. A user can attach an image to a turn by paste, by drop, and through the
    existing attach control.
-2. A screenshot captured by [spec 12](12_web_app_troubleshooting.md)'s
+2. A screenshot captured by [spec 12](12_web_app_troubleshooting/proposal.md)'s
    diagnostics can be made visible to the model.
 3. Image support is a provider capability that is detected or declared, never
    assumed. Where the active provider cannot accept images, the attempt fails
@@ -248,7 +248,7 @@ seen it, and it joins the next request as an `Image` part with agent-captured
 provenance. A model that wants to look at the screenshot it just requested asks
 for it, and the asking is answered by a person.
 
-[Spec 12](12_web_app_troubleshooting.md) is `In progress`, so this must be
+[Spec 12](12_web_app_troubleshooting/proposal.md) is `In progress`, so this must be
 coordinated with it in the same way [spec 22](22_findings_model_and_panel.md)
 §5.4 coordinates its `entries` addition — additively, with `text` and
 `artifacts` unchanged, and §7 recording whether that coordination happened or
@@ -321,7 +321,7 @@ the content, and never a derived description of it.
 
 To be completed during implementation. Record:
 
-- Whether [spec 12](12_web_app_troubleshooting.md) was still open enough to
+- Whether [spec 12](12_web_app_troubleshooting/proposal.md) was still open enough to
   coordinate §5.5 additively, or whether this worked around a closed spec.
 - The measured token cost of a representative screenshot against the provider's
   reported usage, since §5.6's rule is a formula taken from a vendor and the

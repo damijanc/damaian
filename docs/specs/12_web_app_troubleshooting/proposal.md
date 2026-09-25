@@ -2,14 +2,18 @@
 
 Status: In progress
 Order: 12 of 12
-Depends on: [#6](06_mcp_support.md) (MCP) — built;
-[#8](08_stop_and_progress.md) (cancellation and progress) — built;
-[#10](10_persistent_command_approval.md) (command approval) — built. Everything
+Depends on: [#6](../06_mcp_support.md) (MCP) — built;
+[#8](../08_stop_and_progress.md) (cancellation and progress) — built;
+[#10](../10_persistent_command_approval.md) (command approval) — built. Everything
 else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.5
 (tool/function calling), section 7.6 (tool and action orchestrator), section 11
 (error handling), and `docs/specs/06_mcp_support.md`,
 `docs/specs/08_stop_and_progress.md`, `docs/specs/10_persistent_command_approval.md`.
+Close-out: planned on 2026-09-25 in [`tasks.md`](tasks.md). Before that
+work, [`context.md`](context.md) compares this design with the code and the
+companion server as they are now. Read it before §5.1 and §5.3: part of this
+spec describes what was intended, not what was built.
 
 ## 1. Motivation
 
@@ -409,6 +413,11 @@ An interaction compatibility regression was identified in the legacy MCP
 the adapter-generated `steps` field. The adapter now sends only `steps` to that
 legacy tool. Spec completion remains pending a real interaction-scenario check
 against the configured browser MCP server.
+
+A re-read on 2026-09-25 found more open work than that check. Three things were
+never built: §5.1's structured report, §5.1's high-signal text form, and §5.3's
+diagnostic card. [`context.md`](context.md) §2 lists each one, and
+[`tasks.md`](tasks.md) closes them along with the live check.
 
 The native macOS/WebKit runner remains an optional future phase, not a blocker
 for this spec. Phase 1 is intentionally satisfied by the stable
