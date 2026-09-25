@@ -79,6 +79,7 @@ pub use mcp::{
     McpClient, McpRuntime, McpServerRuntime, McpTool, McpToolResult, namespaced_tool_name,
     parse_namespaced_tool_name,
 };
+pub use mode::SessionMode;
 pub use model::{
     CurlModelTransport, MockModelAdapter, MockModelTransport, ModelAdapter, ModelMessage,
     ModelRequest, ModelRun, ModelTransport, OpenAICompatibleAdapter, ResponseMeta, TokenUsage,

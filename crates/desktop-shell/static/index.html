@@ -72,6 +72,18 @@
             <h2 id="thread-session"></h2>
           </div>
           <div class="thread-actions">
+            <select
+              id="session-mode-select"
+              class="mode-select"
+              aria-label="Working mode"
+              title="Working mode: what the assistant may do in this session"
+              disabled
+            >
+              <option value="ask">Ask</option>
+              <option value="plan">Plan</option>
+              <option value="code" selected>Code</option>
+              <option value="review">Review</option>
+            </select>
             <span id="chat-status" class="status-badge">Idle</span>
             <button
               id="session-search-btn"

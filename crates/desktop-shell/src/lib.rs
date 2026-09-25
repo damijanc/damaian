@@ -12,12 +12,12 @@ use workspace_engine::{
     ChatTurnResult, Config, CostEstimate, CurlModelTransport, DataSchemaOutcome, ExportFormat,
     GeneratedSecretWarning, McpClient, McpServerConfig, McpTokenResolver, McpTransport,
     OpenAICompatibleAdapter, PlanRevisionStep, ProcessRegistry, ProposedFilePatch,
-    ResumeDecisionOptions, SearchOptions, Session, StepStatus, TaskPlan, TaskUsage, TokenUsage,
-    TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticReport,
-    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible,
-    command_approval_prompt, ensure_data_dir_schema, normalize_mcp_server_id,
-    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
-    parse_mcp_transport, patch_diff_text,
+    ResumeDecisionOptions, SearchOptions, Session, SessionMode, StepStatus, TaskPlan, TaskUsage,
+    TokenUsage, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind,
+    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
+    allow_always_eligible, command_approval_prompt, ensure_data_dir_schema,
+    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
+    parse_hunk_selection, parse_mcp_transport, patch_diff_text,
 };
 
 mod keychain;
@@ -587,7 +587,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 "application/json",
                 &format!(
                     "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}]}}",
-                    session_json(&session),
+                    session_json(&session, engine.session_store.session_mode(&session.id)),
                     messages_json(&messages),
                     task_states_json(
                         &task_statuses,
@@ -616,12 +616,13 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .session_store
                 .create_session(&repository_id, &title)
                 .map_err(|error| error.to_string())?;
+            let mode = engine.session_store.session_mode(&session.id);
             write_response(
                 stream,
                 &request,
                 200,
                 "application/json",
-                &format!("{{\"session\":{}}}", session_json(&session)),
+                &format!("{{\"session\":{}}}", session_json(&session, mode)),
             )
         }
         ("POST", "/api/session-rename") => {
@@ -633,12 +634,53 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .session_store
                 .rename_session(&session_id, &title)
                 .map_err(|error| error.to_string())?;
+            let mode = engine.session_store.session_mode(&session.id);
             write_response(
                 stream,
                 &request,
                 200,
                 "application/json",
-                &format!("{{\"session\":{}}}", session_json(&session)),
+                &format!("{{\"session\":{}}}", session_json(&session, mode)),
+            )
+        }
+        ("POST", "/api/session-mode") => {
+            let form = parse_form(&request.body);
+            let session_id = required_form(&form, "session_id")?;
+            let requested = required_form(&form, "mode")?;
+            // Rejected, never defaulted: falling back to Code would turn a
+            // malformed request into the most permissive mode there is.
+            let mode = SessionMode::parse(&requested).ok_or_else(|| {
+                format!("Unknown mode: {requested}. Expected ask, plan, code, or review.")
+            })?;
+            let engine = default_engine()?;
+            if engine
+                .session_store
+                .read_session(&session_id)
+                .map_err(|error| error.to_string())?
+                .is_none()
+            {
+                return Err(format!("Unknown session: {session_id}"));
+            }
+            // Always "user": this endpoint is the user's own selection, and
+            // nothing the model emits reaches it (spec 20 requirement 4).
+            engine
+                .session_store
+                .set_session_mode(&session_id, mode, "user")
+                .map_err(|error| error.to_string())?;
+            let Some(session) = engine
+                .session_store
+                .read_session(&session_id)
+                .map_err(|error| error.to_string())?
+            else {
+                return Err(format!("Unknown session: {session_id}"));
+            };
+            let mode = engine.session_store.session_mode(&session.id);
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &format!("{{\"session\":{}}}", session_json(&session, mode)),
             )
         }
         ("POST", "/api/session-delete") => {
@@ -3138,7 +3180,7 @@ fn patch_files_json(files: &[ProposedFilePatch]) -> String {
 fn sessions_json(sessions: &[Session]) -> String {
     sessions
         .iter()
-        .map(session_json)
+        .map(session_summary_json)
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -3175,9 +3217,27 @@ fn export_filename(
     ))
 }
 
-fn session_json(session: &Session) -> String {
+/// One session as the session list shows it. Carries no `mode`: the mode lives
+/// in a separate event, and reading it for every listed session would read
+/// every session log a second time. The open session's mode arrives through
+/// [`session_json`] instead.
+fn session_summary_json(session: &Session) -> String {
+    format!("{{{}}}", session_fields_json(session))
+}
+
+/// One session with its working mode (spec 20), for the responses that open,
+/// create, rename, or change the mode of a single session.
+fn session_json(session: &Session, mode: SessionMode) -> String {
     format!(
-        "{{\"id\":\"{}\",\"repositoryId\":\"{}\",\"title\":\"{}\",\"createdAtMs\":{},\"updatedAtMs\":{},\"summary\":\"{}\",\"origin\":\"{}\"}}",
+        "{{{},\"mode\":\"{}\"}}",
+        session_fields_json(session),
+        mode.as_str()
+    )
+}
+
+fn session_fields_json(session: &Session) -> String {
+    format!(
+        "\"id\":\"{}\",\"repositoryId\":\"{}\",\"title\":\"{}\",\"createdAtMs\":{},\"updatedAtMs\":{},\"summary\":\"{}\",\"origin\":\"{}\"",
         escape_json(&session.id),
         escape_json(&session.repository_id),
         escape_json(&session.title),
@@ -3433,15 +3493,16 @@ fn escape_json(value: &str) -> String {
 mod tests {
     use super::{
         Request, ShellOptions, TurnEvent, allowed_cors_origin, api_request_requires_token,
-        cached_model_api_key, checkpoint_list_json, checkpoint_restore_json,
+        cached_model_api_key, checkpoint_list_json, checkpoint_restore_json, default_engine,
         desktop_settings_config_path, effective_policy_for_repo, engine_for_repo,
         forget_model_api_key, generated_secret_warnings_json, handle_connection, index_html,
-        json_optional_string, keychain, mcp_browser_arguments, parse_form, parse_path_list,
-        percent_decode, plan_json, plan_proposal_json, relay_turn_events, remember_model_api_key,
-        render_markdown_with_optional_file_links, repository_config_review_json, require_api_token,
-        run_server, run_terminal_command, save_config_file, sweep_orphaned_processes,
-        task_states_json, task_usage_json, terminal_cwd_for_repo, validate_context_files,
-        validate_working_folder, validate_workspace_path, verify_data_dir_schema_at,
+        json_error, json_optional_string, keychain, mcp_browser_arguments, parse_form,
+        parse_path_list, percent_decode, plan_json, plan_proposal_json, relay_turn_events,
+        remember_model_api_key, render_markdown_with_optional_file_links,
+        repository_config_review_json, require_api_token, run_server, run_terminal_command,
+        save_config_file, sweep_orphaned_processes, task_states_json, task_usage_json,
+        terminal_cwd_for_repo, validate_context_files, validate_working_folder,
+        validate_workspace_path, verify_data_dir_schema_at, write_basic_response,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -3452,8 +3513,9 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use workspace_engine::CheckpointRestoreResult;
     use workspace_engine::{
-        AgentPlanProposal, CancelToken, Config, Evidence, GeneratedSecretWarning, PlanStep,
-        StepStatus, TaskPlan, TaskUsage, UsageSource, WorkspaceEngine,
+        AgentPlanProposal, CancelToken, Config, Evidence, GeneratedSecretWarning, MockModelAdapter,
+        PlanStep, SessionMode, StepStatus, TaskPlan, TaskUsage, ToolCall, TurnProgress, TurnSink,
+        UsageSource, WorkspaceEngine,
     };
 
     /// Points every engine built in this test binary at a throwaway data
@@ -4303,6 +4365,10 @@ mod tests {
             )
             .unwrap();
 
+        // A second session left in Ask mode, holding a turn the mode refused
+        // (spec 20 §5.6), so the mode control and a refusal can be looked at.
+        let (refused_session, _) = refused_turn_in_ask_mode(&repo);
+
         let options = ShellOptions {
             port: 4899,
             default_repo: Some(repo_arg.clone()),
@@ -4312,6 +4378,7 @@ mod tests {
         println!("  apiToken = \"{}\"", options.api_token);
         println!("  repository = {repo_arg}");
         println!("  session = {}", session.id);
+        println!("  refused-in-Ask session = {refused_session}");
         println!("  data_dir = {}", data_dir.display());
         run_server(options).expect("serve the UI");
     }
@@ -4359,6 +4426,229 @@ mod tests {
         assert!(response.contains("<h1>Title</h1>"));
         assert!(response.contains("hl-"));
         assert!(!response.contains("<script>"));
+    }
+
+    /// Serves `handle_connection` on an ephemeral port and answers a failed
+    /// route the way `run_server` does, so a test can see an error response
+    /// rather than a closed socket. Returns the port and the API token.
+    fn serve_for_test() -> (u16, String) {
+        let options = ShellOptions::new(0, None);
+        let token = options.api_token.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                if let Err(error) = handle_connection(&mut stream, &options) {
+                    let _ = write_basic_response(
+                        &mut stream,
+                        500,
+                        "application/json",
+                        &json_error(&error),
+                    );
+                }
+            }
+        });
+        (port, token)
+    }
+
+    fn send_for_test(port: u16, request: String) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to test server");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read response");
+        response
+    }
+
+    fn get_session_for_test(port: u16, token: &str, session_id: &str) -> String {
+        send_for_test(
+            port,
+            format!(
+                "GET /api/session?session_id={session_id} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-damaian-api-token: {token}\r\nconnection: close\r\n\r\n"
+            ),
+        )
+    }
+
+    fn post_session_mode_for_test(port: u16, token: &str, session_id: &str, mode: &str) -> String {
+        let body = format!("session_id={session_id}&mode={mode}");
+        send_for_test(
+            port,
+            format!(
+                "POST /api/session-mode HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/x-www-form-urlencoded\r\nx-damaian-api-token: {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    }
+
+    fn new_session_for_test(title: &str) -> String {
+        isolated_data_dir();
+        default_engine()
+            .expect("default engine")
+            .session_store
+            .create_session("repo_session_mode_test", title)
+            .expect("create session")
+            .id
+    }
+
+    /// Requirement 7's default, made visible over the wire: a session nobody
+    /// has set a mode on reads as Code.
+    #[test]
+    fn session_json_includes_the_mode() {
+        let session_id = new_session_for_test("mode default");
+        let (port, token) = serve_for_test();
+
+        let response = get_session_for_test(port, &token, &session_id);
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"mode\":\"code\""), "{response}");
+    }
+
+    /// The follow-up GET is what proves the write persisted: an endpoint that
+    /// only echoed the requested mode back would pass the first assertion.
+    #[test]
+    fn post_session_mode_changes_it_and_returns_the_updated_session() {
+        let session_id = new_session_for_test("mode switch");
+        let (port, token) = serve_for_test();
+
+        let changed = post_session_mode_for_test(port, &token, &session_id, "ask");
+        assert!(changed.starts_with("HTTP/1.1 200"), "{changed}");
+        assert!(
+            changed.contains(&format!("\"session\":{{\"id\":\"{session_id}\"")),
+            "{changed}"
+        );
+        assert!(changed.contains("\"mode\":\"ask\""), "{changed}");
+
+        let reread = get_session_for_test(port, &token, &session_id);
+        assert!(reread.contains("\"mode\":\"ask\""), "{reread}");
+    }
+
+    /// An unknown mode must not fall back to Code: silently landing in the
+    /// most permissive mode is exactly the widening requirement 4 forbids.
+    #[test]
+    fn post_session_mode_rejects_an_unknown_mode_string() {
+        let session_id = new_session_for_test("mode reject");
+        let (port, token) = serve_for_test();
+        post_session_mode_for_test(port, &token, &session_id, "review");
+
+        let rejected = post_session_mode_for_test(port, &token, &session_id, "sideways");
+
+        assert!(!rejected.starts_with("HTTP/1.1 200"), "{rejected}");
+        assert!(rejected.contains("sideways"), "{rejected}");
+        let reread = get_session_for_test(port, &token, &session_id);
+        assert!(reread.contains("\"mode\":\"review\""), "{reread}");
+    }
+
+    const REFUSED_TURN_ANSWER: &str =
+        "Ask mode does not let me change files; switch to Code and I will.";
+
+    /// Runs a real turn through the orchestrator in which an Ask-mode session's
+    /// model calls `propose_patch`, and returns the session id and the adapter
+    /// (whose `requests` show what was replayed to the model). Shared by the
+    /// end-to-end refusal test and the UI inspection server.
+    fn refused_turn_in_ask_mode(repo: &std::path::Path) -> (String, MockModelAdapter) {
+        let mut config = Config {
+            data_dir: isolated_data_dir().to_path_buf(),
+            enable_index_watcher: false,
+            ..Config::default()
+        };
+        config
+            .model_providers
+            .push(workspace_engine::ModelProviderConfig {
+                id: "openai".to_string(),
+                label: "OpenAI".to_string(),
+                base_url: String::new(),
+                api_key_env: String::new(),
+                models: Vec::new(),
+                supports_native_tools: true,
+                max_output_tokens: None,
+                context_token_budget: None,
+                provider_reports_usage: true,
+                price_per_million_input_tokens: None,
+                price_per_million_output_tokens: None,
+                price_per_million_cached_input_tokens: None,
+                supports_explicit_cache_breakpoints: false,
+            });
+        let engine = WorkspaceEngine::new(config);
+        let mut on_token = |_token: &str| {};
+        let session_id = engine
+            .chat_orchestrator
+            .ask(
+                repo,
+                "warm up",
+                &[],
+                &mut MockModelAdapter::new("Ready."),
+                &mut on_token,
+            )
+            .unwrap()
+            .session
+            .id;
+        engine
+            .session_store
+            .set_session_mode(&session_id, SessionMode::Ask, "user")
+            .unwrap();
+
+        let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+            vec![String::new(), REFUSED_TURN_ANSWER.to_string()],
+            vec![
+                vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "propose_patch".to_string(),
+                    arguments_json: r#"{"summary":"Add a file","files":[{"path":"new.txt","content":"hello\n"}]}"#
+                        .to_string(),
+                }],
+                Vec::new(),
+            ],
+        );
+        let cancel = CancelToken::new();
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+        };
+        engine
+            .chat_orchestrator
+            .ask_with_session(
+                repo,
+                "Add new.txt",
+                &[],
+                Some(&session_id),
+                &mut adapter,
+                &mut sink,
+            )
+            .unwrap();
+        (session_id, adapter)
+    }
+
+    /// Spec 20 §5.6, "the turn says which mode blocked it", end to end: a
+    /// refusal needs no rendering of its own because it reaches the user by
+    /// two existing routes. It is replayed to the model as the refused call's
+    /// tool result, so the model's next answer can explain it, and the session
+    /// payload the UI renders on load carries that tool result too.
+    #[test]
+    fn a_refused_call_reaches_the_model_and_the_session_payload() {
+        let repo = temp_path("mode-refusal-e2e");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("README.md"), "# Refusal\n").unwrap();
+        let (session_id, adapter) = refused_turn_in_ask_mode(&repo);
+
+        let refusal = "Refused: Ask mode does not allow this. Switch to Code mode to allow it.";
+        let replayed = adapter.requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .expect("the refused call's result is replayed to the model");
+        assert_eq!(replayed.tool_call_id.as_deref(), Some("call_1"));
+        assert!(replayed.content.contains(refusal), "{}", replayed.content);
+
+        let (port, token) = serve_for_test();
+        let payload = get_session_for_test(port, &token, &session_id);
+        assert!(payload.contains(REFUSED_TURN_ANSWER), "{payload}");
+        assert!(payload.contains("\"role\":\"tool\""), "{payload}");
+        assert!(payload.contains(refusal), "{payload}");
+        assert!(!repo.join("new.txt").exists());
+
+        fs::remove_dir_all(&repo).ok();
     }
 
     #[test]

@@ -699,11 +699,7 @@ impl SessionStore {
     /// never rewritten. `set_by` is always `"user"` (`proposal.md` §5.4) —
     /// the field exists so a future non-user origin cannot be introduced
     /// without someone noticing it already asserts otherwise.
-    // Task 8 (docs/specs/20_working_modes/tasks.md) wires this into the
-    // desktop-shell mode-switch endpoint; nothing outside this file's own
-    // tests calls it yet.
-    #[allow(dead_code)]
-    pub(crate) fn set_session_mode(
+    pub fn set_session_mode(
         &self,
         session_id: &str,
         mode: SessionMode,
@@ -732,7 +728,7 @@ impl SessionStore {
     /// Task 3).
     // Task 4 calls this once per turn, before tool-list construction; Task 6
     // calls it before the first Layer-3 check.
-    pub(crate) fn session_mode(&self, session_id: &str) -> SessionMode {
+    pub fn session_mode(&self, session_id: &str) -> SessionMode {
         let path = self.session_log_path(session_id);
         let Ok(content) = fs::read_to_string(path) else {
             return SessionMode::Code;

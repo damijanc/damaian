@@ -17,7 +17,7 @@ extended tool-class mapping in [`context.md`](context.md)
 | 5 · Layer 2 — the non-native fallback's system-prompt envelopes | Done | `chat.rs` only. Scope correction from `context.md` §7 held: `DAMAIAN_EDIT_V1` is not taught by `system_prompt()` in any mode and `run_agentic_turn` never parses it, so this task touched `DAMAIAN_COMMAND_V1` only. `system_prompt(mode: SessionMode) -> String` now splits the old literal at its two existing `\n\n` boundaries: `const PREFIX` (first two paragraphs, byte-copied from the live source, not retyped from the plan) plus one of two third paragraphs — `command_envelope_paragraph_unrestricted()` (Code, today's words verbatim) or `command_envelope_paragraph_read_only()` (Plan/Review: envelope retained, the Code-only "Damaian will pause for user approval before running it" invitation replaced with "refused outright, not queued for approval"); `Ask` returns `PREFIX` alone, no envelope. One call site changed at `chat.rs:711` inside `ask_with_session_with_options` (confirmed not in `run_agentic_turn`): added a second, independent `self.session_store.session_mode(&session.id)` read there and passed it to `system_prompt(mode)`, as Task 4's read at `chat.rs:1274` is a different function and does not put `mode` in scope. Tests live in a new inline `#[cfg(test)] mod system_prompt_tests` at the end of `chat.rs` (the function is module-private, so this is the same placement reason Task 3/4 recorded); the byte-identity guard pins `TODAYS_CODE_SYSTEM_PROMPT` copied from the live literal, not the plan's quotation. All 5 new tests pass; `cargo nextest run -p workspace-engine --test prompt_cache` — both spec 49 Task 8 guards pass **unmodified** (neither sets a mode, both compare Code prompts, and Code output is byte-identical); `cargo fmt --all -- --check` and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` both clean. Eval harness not run separately: the full deterministic tier is part of the deferred Task 10 workspace gate and Code-mode output is unchanged. |
 | 6 · Layer 3 — the orchestrator refuses at every action path | Done | **Provenance:** this session found the implementation already uncommitted in the working tree, with nothing in this table recording it. On the user's instruction it was adopted as a draft and verified rather than rewritten, so it was not written test-first here. Red was established afterwards instead: with the three enforcement sites switched off (the main-loop permission forced to `Allowed`, the resume mode forced to `Code`, the apply check skipped), 12 of the 15 new tests fail, each on its side-effect assertion ("the command ran", "Ask reached the MCP server", "the diagnostic ran"). The other 3 pass by design because they guard future changes: the `DAMAIAN_EDIT_V1` guarantee (vacuously true per `context.md` §7), `nothing_the_model_emits_changes_the_session_mode`, and the mid-turn test. **Deviation — one main-loop site instead of five per-arm checks.** Points 1, 3, 4, 5 and 6 share one private `action_permission(mode, repository_root, &tool_action, &mcp)` helper. It is called once per dispatched call, at the top of the per-call loop in `run_agentic_turn`, and a refusal short-circuits the whole `match` to `(summary, refusal_message(..), ActionOutcome::Failed)` before any arm runs. That way a future `ToolAction` variant cannot reach its arm unchecked. It is also placed **before spec 21's plan-review gate**, and the gate now also requires `permission.is_allowed()`, so Plan never raises a plan-review card for a step it then refuses. That is pinned by an extra test not in the plan, `plan_mode_refuses_a_mutation_without_first_raising_a_plan_review`. **Deviation — point 3 checks before `propose_command`, not after.** A new `ValidationOrchestrator::classify_command` returns the classification `propose_command` would store, without storing it, so a refused command leaves no stored proposal as well as no approval card and no run. The command is classified twice for an allowed command, which is cheap and pure. `refusal_message` lives in `mode.rs`. It uses a new `SessionMode::label()` ("Ask") rather than `as_str()` ("ask"), because the text is read by a person. It **panics** (`unreachable!`) on `Permission::Allowed`, which a test pins. The `#[allow(dead_code)]` on `Permission` and Task 1's stale comment came off. **Point 2 uses `ClientError::AccessDenied`, not `PolicyBlocked`:** `PolicyBlocked` already means "the command policy blocked this" (`command_policy.rs`, `run_proposal`), and a mode is a boundary the user chose, not a policy verdict. The check sits before the marker and snapshot, so a refusal leaves nothing to finish or undo. A patch with an empty `session_id` stays unrestricted. `edit.rs` could already see `ToolAction` and `GeneratedEdit` (`pub(crate)` since Task 1), so no visibility change was needed. It is tested by an extra test, `a_patch_proposed_in_code_is_refused_at_apply_after_switching_to_ask`. **Points 7–9:** the mode is read once, after the `plan_review` guard. The command branch builds a `CommandClassification` from the stored proposal, whose field names match exactly. The MCP branch must call `mcp.tool_definitions()` before `tool_read_only_hint`, because a fresh runtime has fetched no tool lists and every hint would otherwise read `None`. A refused web diagnostic is audited as `decision: "refused_by_mode"` and grants no session-wide consent. A decline is still worded as a decline, and a refusal uses `refusal_message`. **Known and left unchanged:** a refused call is still bracketed by `start_action`/finish, recorded as a failed attempt. A refused web diagnostic still sets `web_debug_mode`, widening that turn's round limit. A resumed command refused by mode is not `reject_proposal`'d, and since `run_proposal` ignores rejection anyway, the standalone `/api/run-command` branch can still run that id; this predates spec 20 and is recorded as `OBSERVATIONS.md` #10 for Task 8 or later. **For Task 8:** a main-loop or resume refusal reaches the UI only as tool-result text; an apply refusal arrives as `AccessDenied`. **Mutation tests** (each reverted): removing point 3 alone fails `a_mode_that_forbids_a_command…` and `plan_mode_still_refuses_a_command_needing_approval_outright`. Removing point 7 alone fails `a_command_approved_after_the_session_switched_to_ask_is_refused_at_resume`. Re-reading the mode per action fails `a_mode_change_mid_turn…`. No other test failed. The `DAMAIAN_EDIT_V1` guard was not mutation-tested, since that would mean wiring `parse_generated_edit` into the loop. Tests are inline in `#[cfg(test)] mod mode_refusal_tests` in `chat.rs` (same `pub(crate)` reason as Tasks 3–5). `cargo nextest run -p workspace-engine -E 'test(mode)'`: 137 passed. The whole `workspace-engine` crate: 652 passed, 18 skipped. `cargo fmt --all -- --check` and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`: both clean. |
 | 7 · Command-allowlist does not widen a mode | Done | Confirmed `context.md` §5 against `classify_pattern` branch by branch before writing code. Exactly two branches produce `risk: Low`: the allowlist branch and `is_low_risk_read_only`. `classify` afterwards only ever raises `Low` to `Medium` (the outside-root path check) and never lowers anything, so `is_low_risk_read_only` is the right independent signal and nothing else needed the same treatment. Both functions see the same trimmed text, since `classification.command` is `normalized`. **Fix:** `is_low_risk_read_only` became `pub(crate)`, the only change to `command_policy.rs`. Its one existing caller is untouched, and clippy is clean. `mode_permits`'s Command arm now requires `risk == Low && !requires_approval && is_low_risk_read_only(&classification.command)` for Plan/Review, and the doc comment above `mode_permits` says why two fields are not enough. **Red, in two stages:** the plan's expected compile failure (`E0603`, private function), then after the visibility change and before the fix, both allowlist tests failed on their assertion, with an allowlisted `npm run build` `Allowed` in Plan and in Review. Their fixture copies the allowlist branch's real `reasons` and `expected_effects` strings. **Deviation: one `chat.rs` line changed, contrary to Step 7's "no edit to `chat.rs`".** Layer 1 (Task 4) decides whether to offer the `run_command` definition by asking `mode_permits` about a "most permissive" classification whose `command` was `""`. That is not read-only text, so after the fix Plan and Review stopped offering `run_command` at all. `plan_mode_offers_run_command_but_not_propose_patch_or_edit_file` and `review_mode_offers_read_only_commands_and_web_diagnostics_but_not_mutation` caught it. The probe's `command` is now `"pwd"`, with a comment explaining why it must be genuinely read-only. Task 6's two Layer 3 points (main loop and resume) needed no change: both classify the real command text. **Mutation test:** dropping the new conjunct fails both allowlist tests, and the file was restored. `a_genuinely_read_only_command_is_unaffected` was not added as a new test: the existing `plan_permits_a_read_only_command_that_needs_no_approval` and `review_permits_a_read_only_command_but_not_a_mutating_one` still pass, which is what that bullet asked to confirm. `cargo nextest run -p workspace-engine -E 'test(mode)'`: 140 passed. `cargo fmt --all -- --check` and `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`: both clean. |
-| 8 · UI — mode control, refusal messaging, Plan→Code continuity | Not started | |
+| 8 · UI — mode control, refusal messaging, Plan→Code continuity | Done | Built in its own git worktree (branch `spec20-task8-ui`, from the commit that planned it), so none of Task 7's uncommitted `mode.rs`/`command_policy.rs`/`chat.rs` work is in this change. Expect a merge touching different hunks of `mode.rs` (this task: the `SessionMode` impl and one test at the head of `mod tests`). **Parser:** `SessionMode::parse(&str) -> Option<Self>`, not `FromStr`. That is the existing convention: `UsageSource::parse` (`model.rs`) and `TaskStatus::parse` (`session.rs`) are both inherent `pub fn parse`, and nothing implements `FromStr` for a wire-form enum. **Visibility deviation the plan missed:** `desktop-shell` is a separate crate, so `pub(crate)` items are invisible to it. `SessionMode`, `as_str`, `parse`, `SessionStore::set_session_mode` and `session_mode` became `pub`, and `SessionMode` is re-exported from `lib.rs`. `label`, `Permission`, `mode_permits` and `refusal_message` stay `pub(crate)`. `set_session_mode`'s `#[allow(dead_code)]` and its "Task 8 wires this" comment came off. **`session_json`:** the plan listed three callers, but there is a fourth: `sessions_json` (the `GET /api/sessions` list) maps through it. The list is what fills `projectSessionsByPath`, and `list_sessions` already reads every session log once, so adding `mode` there would read each log a second time. The list therefore keeps the old shape via a new `session_summary_json`. `session_json(&Session, SessionMode)` adds `"mode"` for the three single-session responses (`GET /api/session`, `POST /api/session-create`, `POST /api/session-rename`) and the new `POST /api/session-mode`. The new route rejects an unknown mode (`Err`, which `run_server` answers as a 500 like every other route error; there is no 4xx path in this shell), and it rejects an unknown session *before* appending an event. **JS:** because the list carries no mode, `app.js` keeps `currentSessionMode = { sessionId, mode }`, set by `loadSession` from `GET /api/session` and by the control's change handler from `POST /api/session-mode`. `renderModeControl()` (called from `renderThreadHeader`) disables the `<select>` when no session is open, since a mode belongs to an existing session and a new one starts in Code. It also re-sets the select from the last server-confirmed mode, which is how a failed switch snaps back. The control sits first in `.thread-actions` rather than inside `.thread-identity`, whose children ellipsise. No confirmation in either direction, and a running turn keeps its mode. **Refusal messaging — the plan's premise was wrong, the conclusion holds.** `app.js` *does* render tool results: `renderMessages` calls `appendChatMessage(message.role, …)` for every stored message, and `GET /api/session` returns the `role: "tool"` rows. So on load, a refusal appears as a grey `message tool` bubble ("Refused: Ask mode does not allow this. Switch to Code mode to allow it.") right above the model's own explanation. That is existing rendering, not a new element, so nothing was built for it. It is pinned by `a_refused_call_reaches_the_model_and_the_session_payload`: a real Ask-mode turn in which the model calls `propose_patch`. The test asserts that `adapter.requests[1]` replays the refusal as `call_1`'s tool result, that the `GET /api/session` payload carries both the tool row and the model's answer, and that no file was written. The turn lives in a shared `refused_turn_in_ask_mode` helper. **Tests:** `session_mode_parses_its_own_as_str_output_for_all_four_modes` (`mode.rs`, which also rejects `"sideways"` and `"Code"`), plus `session_json_includes_the_mode`, `post_session_mode_changes_it_and_returns_the_updated_session`, `post_session_mode_rejects_an_unknown_mode_string` and the e2e test in `desktop-shell`. The HTTP tests use a new `serve_for_test` that answers a route error the way `run_server` does, because the older inline servers drop the `Err` and close the socket. Red first: the parser test did not compile, and the three HTTP tests failed. **Mutations** (each reverted): defaulting an unknown mode to Code fails the reject test; skipping `set_session_mode` and echoing the request fails both the switch test and the reject test; running the e2e turn in Code fails the e2e test. **Browser:** the ignored `serves_the_ui_for_manual_inspection` harness now also seeds the refused Ask-mode session and prints its id. With it on 4899, the control is disabled and shows Code with no session open, and shows Code on a session with no mode event. Switching to Plan through the real `<select>` persisted server-side, and Review survived a full page reload. The Ask session showed Ask, the refusal bubble and the model's explanation. No console errors. **Plan→Code:** on the harness session's plan (three steps), the plan-review rows were identical in Plan, straight after switching to Code, and after reloading. `read_session_plans` takes no mode, so nothing was needed. Caveat: that plan is seeded with `create_plan`, not produced by a live `propose_plan` turn in Plan mode, because the shell has no mock-model path (`DAMAIAN_MOCK_MODEL_RESPONSE` is CLI-only) and a live provider would need the real Keychain. **Checks:** `cargo nextest run -p desktop-shell -E 'test(session_mode) + test(mode)'` — 5 passed; `cargo nextest run -p workspace-engine -E 'test(mode)'` — 138 passed; `cargo fmt --all -- --check`, and `cargo clippy -p desktop-shell -p workspace-engine --all-targets --locked -- -D warnings`, both clean; `node --check` clean; `npm run lint:web` exit 0 (its one info is already in `scripts/check-spec-status.mjs`); `typos` clean after fixing a misspelling in this task's own Step 5 text. |
 | 9 · Migration and eval-harness guard | Not started | |
 | 10 · Docs, acceptance criteria, close the slice | Not started | |
 
@@ -1645,7 +1645,7 @@ rather than building a new UI element for it.
   `POST /api/session-mode` endpoint; `app.js` gains a mode control and its
   wiring.
 
-- [ ] **Step 1: Write the failing backend tests**
+- [x] **Step 1: Write the failing backend tests**
 
   In `desktop-shell/src/lib.rs`'s existing test module:
   - `session_json_includes_the_mode` — a session with no `session_mode_set`
@@ -1666,9 +1666,9 @@ rather than building a new UI element for it.
     round-trip guard for whatever parser this task adds (`from_str`,
     `parse`, or similar — Step 3 decides the exact name).
 
-- [ ] **Step 2: Run to verify they fail to compile**
+- [x] **Step 2: Run to verify they fail to compile**
 
-- [ ] **Step 3: Add the inverse parser to `SessionMode`**
+- [x] **Step 3: Add the inverse parser to `SessionMode`**
 
   ```rust
   impl SessionMode {
@@ -1690,7 +1690,7 @@ rather than building a new UI element for it.
   similar wire-form enum before picking; match the existing convention if
   one exists, note in this row if you deviate and why.
 
-- [ ] **Step 4: Add `mode` to `session_json` and thread it through every
+- [x] **Step 4: Add `mode` to `session_json` and thread it through every
       caller**
 
   `session_json` (`desktop-shell/src/lib.rs:3178`, as of Task 7) takes only
@@ -1704,27 +1704,27 @@ rather than building a new UI element for it.
   `engine.session_store.session_mode(&session.id)` at each of the three
   call sites.
 
-- [ ] **Step 5: Add `POST /api/session-mode`**
+- [x] **Step 5: Add `POST /api/session-mode`**
 
   Follow `POST /api/session-rename`'s shape exactly (`lib.rs:627-642` as of
   Task 7): parse the form, require `session_id` and `mode` via
   `required_form`, parse `mode` with `SessionMode::parse` and reject an
-  unparseable value with a clear error rather than defaulting, call
+  unparsable value with a clear error rather than defaulting, call
   `engine.session_store.set_session_mode(&session_id, mode, "user")` (the
   `set_by` is always `"user"` here — this endpoint exists *because* it is
   a user action, per requirement 4), then respond with the same
   `{"session": ...}` shape the other session endpoints use, built from the
   now-updated session.
 
-- [ ] **Step 6: Run backend tests to verify they pass**
+- [x] **Step 6: Run backend tests to verify they pass**
 
-- [ ] **Step 7: Backend scoped checks**
+- [x] **Step 7: Backend scoped checks**
 
   `cargo nextest run -p desktop-shell -E 'test(session_mode) + test(mode)'`,
   `cargo fmt`, `cargo clippy -p desktop-shell --all-targets --locked -- -D
   warnings`.
 
-- [ ] **Step 8: Wire the frontend**
+- [x] **Step 8: Wire the frontend**
 
   Before writing any JS, read `renderThreadHeader()` (`app.js:272-297`) —
   the function that already renders `#thread-repo`/`#thread-session` and is
@@ -1746,7 +1746,7 @@ rather than building a new UI element for it.
   user's own selection can change mode, so the selection itself is the
   explicit action `proposal.md` §5.6 asks for.
 
-- [ ] **Step 9: Verify in the browser**
+- [x] **Step 9: Verify in the browser**
 
   Rebuild and restart (`include_str!`-embedded static assets), open a
   session, confirm the mode control shows `Code` by default, switching to
@@ -1755,7 +1755,7 @@ rather than building a new UI element for it.
   the model's own explanation mentioning the mode, in the conversation —
   not a separate UI element, per this task's "no new rendering" note above.
 
-- [ ] **Step 10: Confirm Plan→Code plan continuity**
+- [x] **Step 10: Confirm Plan→Code plan continuity**
 
   In Plan mode, produce a plan (`propose_plan`), switch to Code via the
   new control, and confirm the plan panel still shows the same plan — no
@@ -1763,7 +1763,7 @@ rather than building a new UI element for it.
   keyed by task, and mode is an orthogonal session property), but this
   step is the check that confirms it rather than assumes it.
 
-- [ ] **Step 11: `node --check`, `npm run lint:web`, then show and ask**
+- [x] **Step 11: `node --check`, `npm run lint:web`, then show and ask**
 
 ## Task 9: Migration and eval-harness guard
 

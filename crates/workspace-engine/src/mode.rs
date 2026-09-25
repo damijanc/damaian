@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// (`proposal.md` §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum SessionMode {
+pub enum SessionMode {
     Ask,
     Plan,
     Code,
@@ -19,12 +19,24 @@ pub(crate) enum SessionMode {
 impl SessionMode {
     /// The wire form embedded in a hand-built session-log JSON payload,
     /// matching `CommandRisk::as_str()`'s convention (`command_policy.rs`).
-    pub(crate) fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Ask => "ask",
             Self::Plan => "plan",
             Self::Code => "code",
             Self::Review => "review",
+        }
+    }
+
+    /// The inverse of [`Self::as_str`]. `None` for anything else, so a caller
+    /// must reject an unknown value rather than default it to a mode.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ask" => Some(Self::Ask),
+            "plan" => Some(Self::Plan),
+            "code" => Some(Self::Code),
+            "review" => Some(Self::Review),
+            _ => None,
         }
     }
 
@@ -221,6 +233,22 @@ mod tests {
             expected_effects: String::new(),
             may_use_network: true,
         }
+    }
+
+    /// The desktop shell's mode endpoint parses what `session_json` wrote,
+    /// so a mode that cannot read its own wire form back is unselectable.
+    #[test]
+    fn session_mode_parses_its_own_as_str_output_for_all_four_modes() {
+        for mode in [
+            SessionMode::Ask,
+            SessionMode::Plan,
+            SessionMode::Code,
+            SessionMode::Review,
+        ] {
+            assert_eq!(SessionMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(SessionMode::parse("sideways"), None);
+        assert_eq!(SessionMode::parse("Code"), None);
     }
 
     /// The work package's primary artifact per `proposal.md` §6: every

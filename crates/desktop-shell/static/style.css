@@ -647,6 +647,16 @@ button:disabled {
   gap: 8px;
 }
 
+/* Sized to the header's 30px buttons, not the form-field default, so the row
+   keeps its height. */
+.mode-select {
+  width: auto;
+  height: 30px;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 4px 8px;
+}
+
 .topbar-button {
   height: 30px;
   display: inline-grid;

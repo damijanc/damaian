@@ -1,6 +1,10 @@
 const $ = (id) => document.getElementById(id);
 
 let currentSessionId = "";
+// The open session's working mode (spec 20), from `/api/session` or
+// `/api/session-mode`. The session list carries no mode, so this is the only
+// copy; `sessionId` says which session it belongs to.
+let currentSessionMode = { sessionId: "", mode: "code" };
 let apiToken = "";
 let bootstrapPromise = null;
 let bootstrapError = null;
@@ -273,6 +277,7 @@ function renderThreadHeader() {
   const repoPath = repo();
   const repoLine = $("thread-repo");
   const sessionLine = $("thread-session");
+  renderModeControl();
 
   if (!repoPath) {
     repoLine.textContent = "No repository selected";
@@ -294,6 +299,20 @@ function renderThreadHeader() {
   sessionLine.textContent = session ? session.title : "New session";
   if (session) sessionLine.title = session.title;
   else sessionLine.removeAttribute("title");
+}
+
+// A mode belongs to a session that exists, so the control is disabled until
+// the first message creates one; that session starts in Code, which is what
+// the disabled control shows. Also how a failed switch snaps back: the select
+// is re-set from the last mode the server confirmed.
+function renderModeControl() {
+  const select = $("session-mode-select");
+  const hasSession = Boolean(repo() && currentSessionId);
+  select.disabled = !hasSession;
+  select.value =
+    hasSession && currentSessionMode.sessionId === currentSessionId
+      ? currentSessionMode.mode
+      : "code";
 }
 
 function normalizeProjectPath(value) {
@@ -5608,6 +5627,7 @@ async function loadSession(sessionId) {
   }
   const payload = await api(`/api/session?session_id=${encodeURIComponent(sessionId)}`);
   currentSessionId = payload.session.id;
+  currentSessionMode = { sessionId: payload.session.id, mode: payload.session.mode || "code" };
   localStorage.setItem(lastSessionStorageKey(), currentSessionId);
   $("session-select").value = currentSessionId;
   syncSessionListActive();
@@ -5816,6 +5836,24 @@ $("session-select").addEventListener("change", async () => {
   } catch (error) {
     toast(error.message);
   }
+});
+
+// The selection itself is the explicit user action spec 20 §5.6 asks for, in
+// either direction, so there is no confirmation step. A turn already running
+// keeps the mode it started with; the change applies from the next turn.
+$("session-mode-select").addEventListener("change", async () => {
+  const sessionId = currentSessionId;
+  if (!sessionId) return;
+  try {
+    const payload = await api(
+      "/api/session-mode",
+      form({ session_id: sessionId, mode: $("session-mode-select").value }),
+    );
+    currentSessionMode = { sessionId: payload.session.id, mode: payload.session.mode };
+  } catch (error) {
+    toast(error.message);
+  }
+  renderModeControl();
 });
 
 function looksLikeEditRequest(prompt) {
