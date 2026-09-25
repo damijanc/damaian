@@ -1761,20 +1761,12 @@ impl McpBrowserDiagnosticsRunner {
             let arguments = mcp_browser_arguments(tool_name, call)?;
             match client.call_tool(tool_name, &arguments) {
                 Ok(result) => {
-                    let mut report = WebDiagnosticReport::from_text(result.text, result.is_error);
-                    materialize_browser_artifacts(&mut report, call, &self.data_dir);
-                    report.text = format!(
-                        "{} via MCP server `{}` tool `{}`:\n{}",
-                        if report.is_error {
-                            "Browser diagnostic failed"
-                        } else {
-                            "Browser diagnostic result"
-                        },
-                        server.config.id,
-                        tool_name,
-                        report.text
-                    );
-                    return Ok(report);
+                    return Ok(browser_report_from_tool_result(
+                        WebDiagnosticReport::from_text(result.text, result.is_error),
+                        call,
+                        &self.data_dir,
+                        &format!("MCP server `{}` tool `{}`", server.config.id, tool_name),
+                    ));
                 }
                 Err(error) => {
                     last_error = Some(format!("{} {tool_name}: {error}", server.config.id));
@@ -1811,6 +1803,33 @@ fn browser_diagnostics_runner_for_config(config: &Config) -> Option<WebDiagnosti
             data_dir: config.data_dir.clone(),
         })
     })
+}
+
+/// Copies artifacts into the data dir and records which server answered.
+/// A structured report carries that in `via` and is rendered by the engine;
+/// only unstructured output gets the prose prefix.
+fn browser_report_from_tool_result(
+    mut report: WebDiagnosticReport,
+    call: &WebDiagnosticCall,
+    data_dir: &Path,
+    via: &str,
+) -> WebDiagnosticReport {
+    materialize_browser_artifacts(&mut report, call, data_dir);
+    if report.details.is_none() {
+        // Unstructured output: keep the old prose prefix, which is the only
+        // place the model learns which server answered.
+        report.text = format!(
+            "{} via {via}:\n{}",
+            if report.is_error {
+                "Browser diagnostic failed"
+            } else {
+                "Browser diagnostic result"
+            },
+            report.text
+        );
+    }
+    report.via = Some(via.to_string());
+    report
 }
 
 fn materialize_browser_artifacts(
@@ -3505,16 +3524,17 @@ fn escape_json(value: &str) -> String {
 mod tests {
     use super::{
         Request, ShellOptions, TurnEvent, allowed_cors_origin, api_request_requires_token,
-        cached_model_api_key, checkpoint_list_json, checkpoint_restore_json, default_engine,
-        desktop_settings_config_path, effective_policy_for_repo, engine_for_repo,
-        forget_model_api_key, generated_secret_warnings_json, handle_connection, index_html,
-        json_error, json_optional_string, keychain, mcp_browser_arguments, parse_form,
-        parse_path_list, percent_decode, plan_json, plan_proposal_json, relay_turn_events,
-        remember_model_api_key, render_markdown_with_optional_file_links,
-        repository_config_review_json, require_api_token, run_server, run_terminal_command,
-        save_config_file, sweep_orphaned_processes, task_states_json, task_usage_json,
-        terminal_cwd_for_repo, validate_context_files, validate_working_folder,
-        validate_workspace_path, verify_data_dir_schema_at, write_basic_response,
+        browser_report_from_tool_result, cached_model_api_key, checkpoint_list_json,
+        checkpoint_restore_json, default_engine, desktop_settings_config_path,
+        effective_policy_for_repo, engine_for_repo, forget_model_api_key,
+        generated_secret_warnings_json, handle_connection, index_html, json_error,
+        json_optional_string, keychain, mcp_browser_arguments, parse_form, parse_path_list,
+        percent_decode, plan_json, plan_proposal_json, relay_turn_events, remember_model_api_key,
+        render_markdown_with_optional_file_links, repository_config_review_json, require_api_token,
+        run_server, run_terminal_command, save_config_file, sweep_orphaned_processes,
+        task_states_json, task_usage_json, terminal_cwd_for_repo, validate_context_files,
+        validate_working_folder, validate_workspace_path, verify_data_dir_schema_at,
+        write_basic_response,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -3792,6 +3812,138 @@ mod tests {
             mcp_browser_arguments("run_web_scenario", &call).expect("arguments"),
             call.arguments_json
         );
+    }
+
+    /// Answers every diagnostic with a companion report whose screenshot is a
+    /// real file under `/…/runs/`, shaped by the same function the MCP runner
+    /// uses, so the test sees exactly what the engine would.
+    struct CompanionShapedRunner {
+        text: String,
+        data_dir: PathBuf,
+    }
+
+    impl workspace_engine::WebDiagnosticsRunner for CompanionShapedRunner {
+        fn inspect(
+            &self,
+            call: &workspace_engine::WebDiagnosticCall,
+        ) -> workspace_engine::Result<workspace_engine::WebDiagnosticReport> {
+            Ok(browser_report_from_tool_result(
+                workspace_engine::WebDiagnosticReport::from_text(self.text.clone(), false),
+                call,
+                &self.data_dir,
+                "MCP server `browser` tool `inspect_page`",
+            ))
+        }
+
+        fn run_scenario(
+            &self,
+            call: &workspace_engine::WebDiagnosticCall,
+        ) -> workspace_engine::Result<workspace_engine::WebDiagnosticReport> {
+            self.inspect(call)
+        }
+    }
+
+    #[test]
+    fn a_structured_browser_report_is_rendered_and_lists_the_materialised_artifact() {
+        let repo = temp_path("browser-artifact-e2e");
+        let runs = repo.join("runs");
+        fs::create_dir_all(&runs).unwrap();
+        fs::write(repo.join("README.md"), "# Web app\n").unwrap();
+        let screenshot = runs.join("20260925-1-page.png");
+        fs::write(&screenshot, b"\x89PNG\r\n\x1a\n").unwrap();
+        let screenshot = screenshot.to_string_lossy().to_string();
+        let text = format!(
+            r#"{{"final_url": "http://localhost:5001/", "title": "Snake Game", "status": 200,
+                "page_errors": ["ReferenceError: boom"],
+                "artifacts": ["{screenshot}"],
+                "artifact_metadata": [{{"kind": "screenshot", "path": "{screenshot}",
+                  "mime_type": "image/png", "width": 1280, "height": 720}}]}}"#
+        );
+
+        let mut config = Config {
+            data_dir: isolated_data_dir().to_path_buf(),
+            enable_index_watcher: false,
+            ..Config::default()
+        };
+        config
+            .model_providers
+            .push(workspace_engine::ModelProviderConfig {
+                id: "openai".to_string(),
+                label: "OpenAI".to_string(),
+                base_url: String::new(),
+                api_key_env: String::new(),
+                models: Vec::new(),
+                supports_native_tools: true,
+                max_output_tokens: None,
+                context_token_budget: None,
+                provider_reports_usage: true,
+                price_per_million_input_tokens: None,
+                price_per_million_output_tokens: None,
+                price_per_million_cached_input_tokens: None,
+                supports_explicit_cache_breakpoints: false,
+            });
+        let mut engine = WorkspaceEngine::new(config);
+        engine.chat_orchestrator.set_web_diagnostics_runner(
+            workspace_engine::WebDiagnosticsRunnerHandle::new(CompanionShapedRunner {
+                text,
+                data_dir: isolated_data_dir().to_path_buf(),
+            }),
+        );
+        let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+            vec![String::new(), "Found it.".to_string()],
+            vec![
+                vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "inspect_web_page".to_string(),
+                    arguments_json: r#"{"url":"http://localhost:5001/"}"#.to_string(),
+                }],
+                Vec::new(),
+            ],
+        );
+        let mut on_token = |_token: &str| {};
+        let session_id = engine
+            .chat_orchestrator
+            .ask(&repo, "Inspect the page.", &[], &mut adapter, &mut on_token)
+            .unwrap()
+            .session
+            .id;
+
+        let result = engine
+            .session_store
+            .read_messages(&session_id)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.role == "tool")
+            .expect("the diagnostic's tool result")
+            .content;
+        assert!(
+            result.starts_with("Browser diagnostic found 1 page error."),
+            "{result}"
+        );
+        assert!(
+            !result.contains("Browser diagnostic result via"),
+            "{result}"
+        );
+        assert!(
+            result.contains("- Source: MCP server `browser` tool `inspect_page`"),
+            "{result}"
+        );
+        let listed = result
+            .split("\n\nArtifacts:\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("an Artifacts: list in {result}"));
+        let prefix = format!("- screenshot: web-diagnostics/{session_id}/");
+        assert!(listed.starts_with(&prefix), "{listed}");
+        assert!(
+            listed.ends_with("/20260925-1-page.png (1280x720)"),
+            "{listed}"
+        );
+        assert!(
+            !result.contains(&screenshot),
+            "the companion's path leaked: {result}"
+        );
+
+        fs::remove_dir_all(&repo).ok();
     }
 
     #[test]

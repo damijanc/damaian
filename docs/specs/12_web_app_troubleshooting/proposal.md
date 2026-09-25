@@ -203,13 +203,21 @@ structured JSON for the UI:
 The text form starts with the highest-signal facts, for example:
 
 ```text
-Browser diagnostic failed: 1 page error.
+Browser diagnostic found 1 page error.
 - pageerror: Cannot access 'game' before initialization
-- URL: http://localhost:5001/
+- URL: http://localhost:5001/ (HTTP 200)
 - Title: Snake Game
 - Visible buttons: Log in, Register
-- Screenshot: web-diagnostics/.../page.png
+- Source: MCP server `browser` tool `inspect_page`
+
+Artifacts:
+- screenshot: web-diagnostics/.../page.png (1280x720)
 ```
+
+A diagnostic that ran is headed `Browser diagnostic found …`, even when the
+page is broken; only a runner failure (a timeout, a crashed browser) is headed
+`Browser diagnostic failed: …`, because retry counting treats that as a failed
+call and a page that throws is not one ([`context.md`](context.md) §3.2).
 
 ### 5.2 Runner Architecture
 

@@ -12,7 +12,7 @@ diagnostic card, and §8's live scenario check.
 | Task | State | Notes |
 |---|---|---|
 | 1 · Typed report: `WebDiagnosticDetails` parsed from the companion's JSON, artifact metadata, `redacted`, `tool_failed` | Done 2026-09-25 | Landed as planned in `web_diagnostics.rs`: `details`/`via` on the report, the six detail types (re-exported from `lib.rs`), one `serde_json` parse in `from_text`, `tool_failed`, `problem_count`, and `redacted` written as one explicit method per struct (artifacts included). `extract_artifacts_from_text` became `artifacts_from_value` + `artifact_record`: `artifact_metadata` first, then any `artifacts` path not already listed. Tests: the 7 new `web_diagnostics::tests` plus the 4 existing browser tests pass (11/11); all three Step 8 mutations fail the named test and were reverted; `cargo fmt --check` and `clippy -p workspace-engine -D warnings` clean. **Deviation — the secret fixture:** `ghp_…` does match the default generic-token rule, but the scanner skips a token preceded by a token byte, and `/` is one (`is_embedded_token_byte`). So a secret in a URL *path* (`…:5001/<secret>.js`) is never redacted, and the planned fixture could not pass. The test puts URL secrets in query values (`?t=<secret>`) instead, and also covers `url`, `method`, `resource_type`, an artifact path and `via`. **For Task 2:** that scanner gap means a credential in a URL path survives `redacted()`; it is a scanner property, not this task's, and is not fixed here. Every existing fixture is plain text, so `details` is `None` on all current engine paths until the runner stops prefixing (Task 2). A `dom_summary` with none of the known keys (e.g. `{"error": …}`) is `None`. |
-| 2 · Model text rendered from the typed report; retry counting on `tool_failed` | Not started | |
+| 2 · Model text rendered from the typed report; retry counting on `tool_failed` | Done 2026-09-25 | **`render_for_model`** (`web_diagnostics.rs`) is built from small helpers: `found_header`, `push_section`, `pluralize`/`noun_for`, `truncate_chars`, `WebDiagnosticDetails::problem_sections`/`push_context`, and a `model_item()` on each of console entry, failed request and step. It follows Step 3's rules exactly. Choices the plan left open: the URL line falls back to `url` when `final_url` is missing; a failed request with neither status nor failure reads `→ failed`; the 500-character cap applies to the whole item body, location included; a `tool_error` header still lists any problems the partial report carries. **`format_web_diagnostic_result`** redacts and uses the rendered text when there is one, and otherwise runs today's code byte for byte. `Artifacts:` is unchanged. **Step 6:** the `WebDiagnostic` arm was `browser_tool_result_failed`'s **only** caller, so the function was deleted. It had no test of its own. Runner failures still count, because the MCP runner returns either `Err` or `is_error: true`, and `foundation.rs`'s `repeated_failed_browser_diagnostics_are_stopped` (`StaticWebDiagnosticsRunner::error`, `is_error: true`) still passes. **Step 7:** the shaping after the call moved into `browser_report_from_tool_result(report, call, data_dir, via)` in `desktop-shell/src/lib.rs`, so it can be tested without an MCP server. There was no existing materialisation test, so a new end-to-end one was added: `a_structured_browser_report_is_rendered_and_lists_the_materialised_artifact`. It runs a real turn with a runner that calls that helper on a companion JSON whose screenshot is a real temp file under `…/runs/`. It pins that `Artifacts:` lists `web-diagnostics/<session>/<task>/run-…/20260925-1-page.png (1280x720)`, that the companion path does not appear, that there is no prose prefix, and that there is a `- Source:` line. **Step 8:** the §5.1 example was rewritten, with a sentence citing `context.md` §3.2. **Tests:** `workspace-engine` with filter `web_diagnostics + web + browser` 22/22 (includes the 6 new renderer tests; the 2 retry tests were run separately with `failing_tool + retry_limit`, 2/2), `desktop-shell` with filter `browser + web_diagnostic` 1/1. `cargo fmt --check` and `clippy -p workspace-engine -p desktop-shell --all-targets -D warnings` are clean. **Mutations:** (1) reverting Step 6 to the verbatim old helper fails `a_page_with_errors_is_not_a_failing_tool` (2 runs, not 4). (2) Always rendering `report.text` fails that test and the desktop-shell test on the header. (3) Skipping materialisation fails the desktop-shell test with the `/…/runs/` path. **Deviation — the Step 6 mutation:** once Step 4 is in place, the renderer heads a report "failed: …" exactly when `tool_failed()` is true. The old helper's `starts_with` clause therefore agrees with the new rule, as §3.2 intended. The two rules differ only on the old `contains("tool call failed" / "mcp tool reported an error")` clauses. So test 1's page error is `"Error: agent tool call failed: …"`, which the old rule wrongly counted. `a_companion_tool_error_counts_toward_the_retry_limit` cannot fail when Step 6 alone is reverted, but it did fail against the code from before Steps 4 and 6 (the Step 5 run: 4 runs, not 2). The retry tests use a new `FixedReportWebRunner` plus an `inspect_four_times` helper (one call per round). **For Task 3:** record from `report.redacted(&scanner)` at the same point in the arm where `report` is still an `Ok(WebDiagnosticReport)`, before `format_web_diagnostic_result` consumes it. The second dispatch site goes through `run_web_diagnostic_call` (report run and formatted in one step), so it needs the same split. `via` is now set on every MCP-runner report. The URL-path secret gap from Task 1 still applies to the rendered text. |
 | 3 · Record, persist and stream diagnostics; `/api/session` field; reveal endpoint | Not started | |
 | 4 · Diagnostic card in the desktop UI | Not started | |
 | 5 · Live scenario run, docs, and closing the spec | Not started | |
@@ -505,7 +505,7 @@ task's Progress row.
 - Consumes: Task 1's `details`, `via`, `tool_failed()`, `problem_count()`, `WebConsoleEntry::is_problem()`
 - Produces: `WebDiagnosticReport::render_for_model(&self) -> Option<String>`. It is `None` when `details` is `None`. Task 4 copies its header wording.
 
-- [ ] **Step 1: Write the failing renderer tests.** Add to `web_diagnostics.rs`'s tests:
+- [x] **Step 1: Write the failing renderer tests.** Add to `web_diagnostics.rs`'s tests:
 
 ```rust
     #[test]
@@ -597,12 +597,12 @@ task's Progress row.
     }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo nextest run -p workspace-engine -E 'test(web_diagnostics::tests)'`
 Expected: compile failure, because `render_for_model` does not exist yet.
 
-- [ ] **Step 3: Implement `render_for_model`.** The rules the tests pin:
+- [x] **Step 3: Implement `render_for_model`.** The rules the tests pin:
   - **Header when `tool_error` is `Some(m)`:** `Browser diagnostic failed: {m}`.
   - **Header otherwise:** `Browser diagnostic found {parts}.`
     - `parts` joins the non-zero counts with `", "`, in this order: page
@@ -634,7 +634,7 @@ Expected: compile failure, because `render_for_model` does not exist yet.
   Write it as a sequence of small helpers (`pluralize`, `truncate_chars`,
   `push_section`). Keep it free of I/O, so it can be tested without a runner.
 
-- [ ] **Step 4: Use it in `format_web_diagnostic_result`** (`chat.rs`).
+- [x] **Step 4: Use it in `format_web_diagnostic_result`** (`chat.rs`).
 
   When `report.render_for_model()` is `Some(text)`, redact `text` with
   `self.scanner` and use it in place of `report.text`. Skip the
@@ -644,7 +644,7 @@ Expected: compile failure, because `render_for_model` does not exist yet.
 
   When it is `None`, the code path is today's, byte for byte.
 
-- [ ] **Step 5: Write the failing retry tests** in `chat.rs`'s test module,
+- [x] **Step 5: Write the failing retry tests** in `chat.rs`'s test module,
 next to `CountingWebRunner`. Both tests use a counting runner that returns a
 fixed `WebDiagnosticReport::from_text(<json>, false)`. Both script a
 `MockModelAdapter` that calls `inspect_web_page` on `http://localhost:5001/`
@@ -669,7 +669,7 @@ Expected: both fail against the text-based rule.
 - Test 2 fails on the count: raw JSON never starts with "Browser diagnostic
   failed", so the old rule never counts it and the runner runs 4 times.
 
-- [ ] **Step 6: Count retries on `tool_failed`.** In `run_agentic_turn`'s
+- [x] **Step 6: Count retries on `tool_failed`.** In `run_agentic_turn`'s
 `ToolAction::WebDiagnostic` arm, `let failed = browser_tool_result_failed(&content)`
 becomes:
 
@@ -689,7 +689,7 @@ this arm was its only caller, delete it along with any test that only covers
 it. Record which case applied in the Progress row. Step 5's two tests should
 now pass.
 
-- [ ] **Step 7: Stop the runner prefixing structured reports.** In
+- [x] **Step 7: Stop the runner prefixing structured reports.** In
 `call_compatible_tool` (`desktop-shell/src/lib.rs`), after
 `materialize_browser_artifacts`:
 
@@ -715,11 +715,11 @@ companion's `/…/runs/…` path, is what `render_for_model`'s caller lists unde
 `Artifacts:`. Pin it in the existing materialisation test, or add one next to
 it using a temp PNG.
 
-- [ ] **Step 8: Update proposal §5.1.** Replace the text-form example with the
+- [x] **Step 8: Update proposal §5.1.** Replace the text-form example with the
 new header wording ("found … / failed: …"). Add one sentence citing
 `context.md` §3.2 for why a page error is not written as "failed".
 
-- [ ] **Step 9: Run and check**
+- [x] **Step 9: Run and check**
 
 Run: `cargo nextest run -p workspace-engine -E 'test(web_diagnostics) + test(web) + test(browser)'`
 then `cargo nextest run -p desktop-shell -E 'test(browser) + test(web_diagnostic)'`.

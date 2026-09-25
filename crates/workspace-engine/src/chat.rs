@@ -541,10 +541,17 @@ impl ChatOrchestrator {
     fn format_web_diagnostic_result(&self, report: Result<WebDiagnosticReport>) -> String {
         match report {
             Ok(report) => {
-                let mut text = self.scanner.redact(&report.text).text;
-                if report.is_error && !text.starts_with("Browser diagnostic failed") {
-                    text = format!("Browser diagnostic failed:\n{text}");
-                }
+                let mut text = match report.render_for_model() {
+                    // The renderer already chose "found …" or "failed: …".
+                    Some(rendered) => self.scanner.redact(&rendered).text,
+                    None => {
+                        let mut text = self.scanner.redact(&report.text).text;
+                        if report.is_error && !text.starts_with("Browser diagnostic failed") {
+                            text = format!("Browser diagnostic failed:\n{text}");
+                        }
+                        text
+                    }
+                };
                 if !report.artifacts.is_empty() {
                     text.push_str("\n\nArtifacts:");
                     for artifact in report.artifacts {
@@ -2516,8 +2523,14 @@ impl ChatOrchestrator {
                                 (browser_retry_limit_note(retry_limit), ActionOutcome::Failed)
                             } else {
                                 let report = self.run_web_diagnostic_report(&call);
+                                // A page that throws is not a failed call
+                                // (spec 12 `context.md` §3.2).
+                                let failed = match &report {
+                                    Ok(report) => report.tool_failed(),
+                                    // No report at all — connection or configuration failure.
+                                    Err(_) => true,
+                                };
                                 let content = self.format_web_diagnostic_result(report);
-                                let failed = browser_tool_result_failed(&content);
                                 if failed {
                                     *failed_browser_calls.entry(signature).or_insert(0) += 1;
                                 }
@@ -4275,13 +4288,6 @@ fn normalize_tool_arguments(arguments_json: &str) -> String {
         .unwrap_or_else(|_| arguments_json.trim().to_string())
 }
 
-fn browser_tool_result_failed(content: &str) -> bool {
-    let lower = content.to_ascii_lowercase();
-    lower.starts_with("browser diagnostic failed")
-        || lower.contains("mcp tool reported an error")
-        || lower.contains("tool call failed")
-}
-
 fn browser_retry_limit_note(retry_limit: u32) -> String {
     format!(
         "This browser diagnostic has already failed {retry_limit} time(s) with substantially similar arguments. Change approach: inspect the relevant source files, simplify the scenario, or ask for a different page state instead of repeating the same call."
@@ -5399,6 +5405,107 @@ mod mode_refusal_tests {
             .chat_orchestrator
             .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(runner));
         (engine, calls)
+    }
+
+    /// Returns the same report text on every call, so retry counting can be
+    /// driven by what the report says rather than by the runner erroring.
+    #[derive(Debug, Clone)]
+    struct FixedReportWebRunner {
+        text: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl WebDiagnosticsRunner for FixedReportWebRunner {
+        fn inspect(&self, _call: &WebDiagnosticCall) -> Result<WebDiagnosticReport> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(WebDiagnosticReport::from_text(self.text, false))
+        }
+
+        fn run_scenario(&self, call: &WebDiagnosticCall) -> Result<WebDiagnosticReport> {
+            self.inspect(call)
+        }
+    }
+
+    /// Runs one turn in which the model inspects the same page four times,
+    /// one call per round, then answers. Returns the runner's call count and
+    /// the four tool results.
+    fn inspect_four_times(label: &str, report_text: &'static str) -> (usize, Vec<String>) {
+        let repo = temp_repo(label);
+        let runner = FixedReportWebRunner {
+            text: report_text,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let calls = runner.calls.clone();
+        let mut engine = engine_with(&repo);
+        engine
+            .chat_orchestrator
+            .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(runner));
+        let session = session_in(&engine, &repo, SessionMode::Code);
+
+        let inspect = |id: &str| {
+            vec![call(
+                id,
+                "inspect_web_page",
+                r#"{"url":"http://localhost:5001/"}"#,
+            )]
+        };
+        let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+            vec![String::new(); 4]
+                .into_iter()
+                .chain(["Done.".to_string()])
+                .collect(),
+            vec![
+                inspect("call_1"),
+                inspect("call_2"),
+                inspect("call_3"),
+                inspect("call_4"),
+                Vec::new(),
+            ],
+        );
+        turn(&engine, &repo, &session, &mut adapter);
+
+        let results = tool_results(&engine, &session);
+        fs::remove_dir_all(repo).unwrap();
+        (calls.load(Ordering::SeqCst), results)
+    }
+
+    // Spec 12 `context.md` §3.2: inspecting a broken page three times is the
+    // page doing what the user said, not the model repeating a broken call.
+    // The page's own error mentions a failed call on purpose: the old
+    // text-matching rule counted any result containing "tool call failed".
+    #[test]
+    fn a_page_with_errors_is_not_a_failing_tool() {
+        let (runs, results) = inspect_four_times(
+            "web-page-errors",
+            r#"{"final_url": "http://localhost:5001/",
+                "page_errors": ["Error: agent tool call failed: 502 from /api/run"]}"#,
+        );
+        assert_eq!(runs, 4);
+        assert_eq!(results.len(), 4);
+        assert!(
+            results
+                .iter()
+                .all(|result| *result != browser_retry_limit_note(2))
+        );
+        assert!(
+            results[0].starts_with("Browser diagnostic found 1 page error."),
+            "{}",
+            results[0]
+        );
+    }
+
+    // The companion reports a timeout as `"error": true` with MCP `is_error`
+    // false, so only the typed report can tell it is a tool failure.
+    #[test]
+    fn a_companion_tool_error_counts_toward_the_retry_limit() {
+        let (runs, results) = inspect_four_times(
+            "web-tool-error",
+            r#"{"error": true, "message": "Timeout", "final_url": "http://localhost:5001/"}"#,
+        );
+        assert_eq!(runs, 2);
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[2], browser_retry_limit_note(2));
+        assert_eq!(results[3], browser_retry_limit_note(2));
     }
 
     /// A stdio MCP server whose one tool has no read-only hint (so it is

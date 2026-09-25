@@ -204,6 +204,90 @@ impl WebDiagnosticReport {
             via: redact_option(scanner, &self.via),
         }
     }
+
+    /// The model's view of a structured report: a header that counts the
+    /// problems, then the problems, then page context. `None` when there are
+    /// no `details`, so the caller keeps the raw text. The header wording is
+    /// mirrored by the desktop card (spec 12 Task 4); change both together.
+    pub fn render_for_model(&self) -> Option<String> {
+        let details = self.details.as_ref()?;
+        let sections = details.problem_sections();
+        let mut lines = vec![match &details.tool_error {
+            Some(message) => format!(
+                "Browser diagnostic failed: {}",
+                truncate_chars(message, MODEL_ITEM_CHARS)
+            ),
+            None => found_header(&sections),
+        }];
+        for section in &sections {
+            push_section(&mut lines, section);
+        }
+        details.push_context(&mut lines);
+        if let Some(via) = &self.via {
+            lines.push(format!("- Source: {via}"));
+        }
+        Some(lines.join("\n"))
+    }
+}
+
+/// Per-section item cap and per-item character cap for the model text, so a
+/// page that logs in a loop cannot flood the context.
+const MODEL_SECTION_ITEMS: usize = 5;
+const MODEL_ITEM_CHARS: usize = 500;
+
+/// One kind of problem, already formatted: `noun` is singular ("page error")
+/// and `items` are the line bodies after `- `.
+struct ProblemSection {
+    noun: &'static str,
+    items: Vec<String>,
+}
+
+fn found_header(sections: &[ProblemSection]) -> String {
+    let parts: Vec<String> = sections
+        .iter()
+        .filter(|section| !section.items.is_empty())
+        .map(|section| pluralize(section.items.len(), section.noun))
+        .collect();
+    if parts.is_empty() {
+        "Browser diagnostic found no page errors, console problems, or failed requests.".to_string()
+    } else {
+        format!("Browser diagnostic found {}.", parts.join(", "))
+    }
+}
+
+fn push_section(lines: &mut Vec<String>, section: &ProblemSection) {
+    for item in section.items.iter().take(MODEL_SECTION_ITEMS) {
+        lines.push(format!("- {}", truncate_chars(item, MODEL_ITEM_CHARS)));
+    }
+    let hidden = section.items.len().saturating_sub(MODEL_SECTION_ITEMS);
+    if hidden > 0 {
+        lines.push(format!(
+            "- … {hidden} more {}",
+            noun_for(hidden, section.noun)
+        ));
+    }
+}
+
+/// `1 page error`, `2 page errors`. Every noun used here pluralises with `s`.
+fn pluralize(count: usize, noun: &str) -> String {
+    format!("{count} {}", noun_for(count, noun))
+}
+
+fn noun_for(count: usize, noun: &str) -> String {
+    if count == 1 {
+        noun.to_string()
+    } else {
+        format!("{noun}s")
+    }
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(limit).collect();
+    truncated.push('…');
+    truncated
 }
 
 impl WebDiagnosticArtifact {
@@ -230,6 +314,85 @@ impl WebDiagnosticDetails {
                 .count()
             + self.failed_requests.len()
             + self.steps.iter().filter(|step| !step.success).count()
+    }
+
+    /// The same problems `problem_count` counts, split into the header's
+    /// order: page errors, console errors, console warnings, failed
+    /// requests, failed steps.
+    fn problem_sections(&self) -> Vec<ProblemSection> {
+        let console = |levels: &[&str]| -> Vec<String> {
+            self.console
+                .iter()
+                .filter(|entry| levels.contains(&entry.level.to_ascii_lowercase().as_str()))
+                .map(WebConsoleEntry::model_item)
+                .collect()
+        };
+        vec![
+            ProblemSection {
+                noun: "page error",
+                items: self
+                    .page_errors
+                    .iter()
+                    .map(|error| format!("pageerror: {error}"))
+                    .collect(),
+            },
+            ProblemSection {
+                noun: "console error",
+                items: console(&["error", "assert"]),
+            },
+            ProblemSection {
+                noun: "console warning",
+                items: console(&["warning", "warn"]),
+            },
+            ProblemSection {
+                noun: "failed request",
+                items: self
+                    .failed_requests
+                    .iter()
+                    .map(WebFailedRequest::model_item)
+                    .collect(),
+            },
+            ProblemSection {
+                noun: "failed step",
+                items: self
+                    .steps
+                    .iter()
+                    .filter(|step| !step.success)
+                    .map(WebScenarioStep::model_item)
+                    .collect(),
+            },
+        ]
+    }
+
+    fn push_context(&self, lines: &mut Vec<String>) {
+        if let Some(url) = self.final_url.as_ref().or(self.url.as_ref()) {
+            match self.status {
+                Some(status) => lines.push(format!("- URL: {url} (HTTP {status})")),
+                None => lines.push(format!("- URL: {url}")),
+            }
+        }
+        if let Some(title) = self.title.as_ref().filter(|title| !title.is_empty()) {
+            lines.push(format!("- Title: {title}"));
+        }
+        let Some(dom) = &self.dom_summary else {
+            return;
+        };
+        if !dom.buttons.is_empty() {
+            lines.push(format!("- Visible buttons: {}", dom.buttons.join(", ")));
+        }
+        if let Some(status_text) = dom.status_text.as_ref().filter(|text| !text.is_empty()) {
+            lines.push(format!("- Status text: {status_text}"));
+        }
+        if let Some(excerpt) = dom
+            .visible_text_excerpt
+            .as_ref()
+            .filter(|text| !text.is_empty())
+        {
+            lines.push(format!(
+                "- Visible text: {}",
+                truncate_chars(excerpt, MODEL_ITEM_CHARS)
+            ));
+        }
     }
 
     fn redacted(&self, scanner: &SecretScanner) -> Self {
@@ -275,6 +438,21 @@ impl WebConsoleEntry {
         )
     }
 
+    /// `console error: text (url:line:column)`, leaving out location parts
+    /// the browser did not report.
+    fn model_item(&self) -> String {
+        let mut item = format!("console {}: {}", self.level, self.text);
+        if let Some(location) = &self.location {
+            item.push_str(" (");
+            item.push_str(&location.url);
+            for part in [location.line, location.column].into_iter().flatten() {
+                item.push_str(&format!(":{part}"));
+            }
+            item.push(')');
+        }
+        item
+    }
+
     fn redacted(&self, scanner: &SecretScanner) -> Self {
         Self {
             level: redact(scanner, &self.level),
@@ -298,6 +476,29 @@ impl WebSourceLocation {
 }
 
 impl WebFailedRequest {
+    /// `failed request: GET url → 404 Not Found` for a response,
+    /// `… → net::ERR_…` for a request that never completed.
+    fn model_item(&self) -> String {
+        let target = match &self.method {
+            Some(method) => format!("{method} {}", self.url),
+            None => self.url.clone(),
+        };
+        let outcome = [
+            self.status.map(|status| status.to_string()),
+            self.failure.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+        let outcome = if outcome.is_empty() {
+            "failed".to_string()
+        } else {
+            outcome
+        };
+        format!("failed request: {target} → {outcome}")
+    }
+
     fn redacted(&self, scanner: &SecretScanner) -> Self {
         Self {
             url: redact(scanner, &self.url),
@@ -325,6 +526,15 @@ impl WebDomSummary {
 }
 
 impl WebScenarioStep {
+    fn model_item(&self) -> String {
+        let mut item = format!("step {} {} failed", self.step, self.action);
+        if let Some(error) = &self.error {
+            item.push_str(": ");
+            item.push_str(error);
+        }
+        item
+    }
+
     fn redacted(&self, scanner: &SecretScanner) -> Self {
         Self {
             step: self.step,
@@ -793,5 +1003,111 @@ mod tests {
         let serialized = serde_json::to_string(&redacted).unwrap();
         assert!(!serialized.contains(secret), "{serialized}");
         assert!(redacted.details.is_some(), "redaction keeps the structure");
+    }
+
+    #[test]
+    fn the_model_text_leads_with_the_problems_found() {
+        let text = WebDiagnosticReport::from_text(COMPANION_REPORT, false)
+            .render_for_model()
+            .unwrap();
+        let mut lines = text.lines();
+        assert_eq!(
+            lines.next(),
+            Some("Browser diagnostic found 1 page error, 1 console error, 2 failed requests.")
+        );
+        assert!(
+            text.contains(
+                "- pageerror: ReferenceError: Cannot access 'game' before initialization"
+            )
+        );
+        assert!(text.contains(
+            "- console error: Failed to load resource: 404 (http://localhost:5001/js/app.js:42:8)"
+        ));
+        assert!(
+            text.contains("- failed request: GET http://localhost:5001/api/me → 404 Not Found")
+        );
+        assert!(text.contains(
+            "- failed request: GET http://localhost:5001/ws → net::ERR_CONNECTION_REFUSED"
+        ));
+        assert!(text.contains("- URL: http://localhost:5001/ (HTTP 200)"));
+        assert!(text.contains("- Title: Snake Game"));
+        assert!(text.contains("- Visible buttons: Log in, Register"));
+        assert!(
+            !text.contains("booting"),
+            "non-problem console lines are omitted"
+        );
+        assert!(
+            !text.contains("ignored by Damaian"),
+            "the companion's own prose is not used"
+        );
+        assert!(!text.contains("\"page_errors\""), "no raw JSON");
+    }
+
+    #[test]
+    fn a_clean_page_says_so() {
+        let text = WebDiagnosticReport::from_text(
+            r#"{"final_url": "http://localhost:5001/", "title": "Ok", "status": 200,
+                "page_errors": [], "console": [], "failed_requests": []}"#,
+            false,
+        )
+        .render_for_model()
+        .unwrap();
+        assert!(text.starts_with(
+            "Browser diagnostic found no page errors, console problems, or failed requests."
+        ));
+    }
+
+    #[test]
+    fn a_tool_failure_is_headed_failed() {
+        let text = WebDiagnosticReport::from_text(
+            r#"{"error": true, "message": "Timeout 30000ms exceeded",
+                "final_url": "http://localhost:5001/"}"#,
+            false,
+        )
+        .render_for_model()
+        .unwrap();
+        assert!(text.starts_with("Browser diagnostic failed: Timeout 30000ms exceeded"));
+    }
+
+    #[test]
+    fn failed_scenario_steps_are_listed() {
+        let text = WebDiagnosticReport::from_text(
+            r#"{"final_url": "http://localhost:5001/", "results": [
+                {"step": 0, "action": "fill", "success": true},
+                {"step": 1, "action": "click", "success": false, "error": "not visible"}]}"#,
+            false,
+        )
+        .render_for_model()
+        .unwrap();
+        assert!(text.starts_with("Browser diagnostic found 1 failed step."));
+        assert!(text.contains("- step 1 click failed: not visible"));
+    }
+
+    #[test]
+    fn long_lists_and_long_items_are_bounded() {
+        let errors: Vec<String> = (0..20)
+            .map(|i| format!("\"e{i} {}\"", "x".repeat(900)))
+            .collect();
+        let text = WebDiagnosticReport::from_text(
+            format!(
+                r#"{{"final_url": "http://localhost:1/", "page_errors": [{}]}}"#,
+                errors.join(",")
+            ),
+            false,
+        )
+        .render_for_model()
+        .unwrap();
+        assert!(text.starts_with("Browser diagnostic found 20 page errors."));
+        assert_eq!(text.matches("- pageerror: ").count(), 5);
+        assert!(text.contains("- … 15 more page errors"));
+        assert!(text.lines().all(|line| line.chars().count() <= 520));
+    }
+
+    #[test]
+    fn no_details_means_no_rendering() {
+        assert_eq!(
+            WebDiagnosticReport::from_text("plain", false).render_for_model(),
+            None
+        );
     }
 }
