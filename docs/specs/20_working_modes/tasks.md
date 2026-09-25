@@ -1897,15 +1897,82 @@ state), which stays open.
 
 ## Task 10: Docs, acceptance criteria, close the slice
 
-Same shape as spec 49 Task 10: `docs/USER_GUIDE.md` (the four modes, the
-matrix in user-facing terms, why an allowlisted command is still refused in
-Ask/Plan), `docs/TROUBLESHOOTING.md` (mode refusal vs. policy refusal, where
-the mode event lives in the session log), walk `proposal.md` §6's acceptance
-list naming the test for each, update the four status records (`proposal.md`
-Status:, `docs/specs/README.md` row, this file's Progress table and
-Started/Done header), run the full seven-command gate, and follow
-`AGENTS.md`'s "When a spec becomes Done" checklist — `grep -rn
-"20_working_modes" docs/specs/*.md docs/specs/*/*.md` to find every
-`Depends on:` line this unblocks (spec 31 permission profiles and others
-found during this planning pass already name it) and re-evaluate
-`docs/specs/README.md`'s "What to build next" section.
+**Precondition: confirm Task 9's Progress row says Done before starting
+anything else.** If it does not, stop and report rather than proceeding —
+this task's quality gate and acceptance walk are meaningless against an
+unfinished slice.
+
+Same overall shape as spec 49 Task 10, adapted to this spec:
+
+- [ ] **Step 1: `docs/USER_GUIDE.md`** — the four modes (Ask, Plan, Code,
+      Review) in user-facing terms, the permission matrix from `proposal.md`
+      §5.1 (as extended by `context.md` §1) written for a user rather than
+      an implementer, why an allowlisted command is still refused in Ask and
+      Plan (`context.md` §5 — the bug Task 7 fixed is exactly what makes
+      this documented behavior true rather than aspirational), and how to
+      switch modes (Task 8's control).
+- [ ] **Step 2: `docs/TROUBLESHOOTING.md`** — how to tell a mode refusal
+      from a command-policy refusal (a mode refusal names the blocking and
+      allowing mode explicitly, per `refusal_message`; a policy refusal
+      does not), and where the `session_mode_set` event lives in the
+      session log for anyone diagnosing why a session behaves the way it
+      does.
+- [ ] **Step 3: Walk `proposal.md` §6's acceptance-criteria list** and name
+      the specific test that covers each — mirroring spec 49 Task 10's
+      §7-walk format. A criterion with no test is not met; say so rather
+      than assuming Tasks 1-9 covered everything they were asked to. Pay
+      particular attention to the last bullet ("no increase in
+      approval-policy violations") — Task 9 is what earns that one, and
+      `context.md` §9 records why it needed a real fix rather than only a
+      confirmation.
+- [ ] **Step 4: Record implementation notes** — which of the nine Layer 3
+      refusal points (`context.md` §8) ended up where, any path that could
+      not be covered (name it explicitly rather than letting the matrix
+      test's coverage be assumed complete), and the two bugs this planning
+      pass found and fixed that the flat spec did not anticipate: the
+      allowlist mode-widening bug (Task 7, `context.md` §5) and the
+      audit-invisibility of a mode-refused command (Task 9, `context.md`
+      §9). Both are worth a sentence in the permanent record — a future
+      reader auditing this spec's security claims should not have to
+      re-read nine tasks' Progress rows to find them.
+- [ ] **Step 5: Decide on `evals/baseline.json`** — Task 9 explicitly
+      deferred this decision here. Regenerate only if this slice changed
+      what a deterministic scenario measures (it does not add a new
+      scenario per Task 9's own scoping — confirm this holds before
+      deciding "no" by default), and read every number before committing if
+      you do.
+- [ ] **Step 6: Update the four status records in the same change** —
+      `proposal.md`'s `Status:` line (currently "In progress... Design
+      unchanged from the original flat spec"), `docs/specs/README.md`'s row
+      for #20 (currently "In progress"), this file's Progress table (should
+      already read all ten rows Done if Task 9 closed correctly — this step
+      confirms it, does not create it), and this file's
+      `**Started:** 2026-09-23 — **Done:** —` header (fill in today's
+      date).
+- [ ] **Step 7: Follow `AGENTS.md`'s "When a spec becomes Done" checklist**
+      — `grep -rn "20_working_modes" docs/specs/*.md docs/specs/*/*.md
+      docs/PLAN/*.md` to find every `Depends on:` line this unblocks (spec
+      31 permission profiles is the one already confirmed to name it during
+      this planning pass; there may be others — re-derive rather than
+      trusting that list as exhaustive), flip each from "Not built" to
+      "Built", re-evaluate `docs/specs/README.md`'s "What to build next"
+      section (spec 20 was the keystone that section named — confirm which
+      previously-blocked specs are now ready and update the ready set and
+      the dependency diagram), and remove spec 20's entry from
+      `CHANGELOG.md`'s `Unreleased` section (currently in the **Next** row:
+      "Four session modes — Ask, Plan, Code and Review — enforced in the
+      engine, so a read-only session cannot write a file by any route." —
+      remove this bullet from that row's list; do not add a release row,
+      the release pipeline handles that).
+- [ ] **Step 8: Full quality gate** — all seven commands from `AGENTS.md`:
+      `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+      --locked -- -D warnings`, `cargo nextest run --workspace --locked`,
+      `node --check crates/desktop-shell/static/app.js`, `npm run
+      lint:web`, `typos`, `cargo deny check`. Report the test count.
+- [ ] **Step 9: Run the eval-harness deterministic tier once more**,
+      unscoped, as the final confirmation this slice changed no scenario's
+      observable behavior (`cargo run -p eval-harness -- run --tier
+      deterministic`), per `AGENTS.md`'s guidance to run it after changes
+      touching tool dispatch and path/command policy.
+- [ ] **Step 10: Show the change and the gate result, and ask before
+      committing.**
