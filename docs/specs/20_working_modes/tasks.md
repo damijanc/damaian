@@ -1768,13 +1768,132 @@ rather than building a new UI element for it.
 ## Task 9: Migration and eval-harness guard
 
 **Requirements:** 7, plus the harness half of acceptance. **Files:**
-`session.rs` (covered by Task 3's default), `eval-harness`.
+`chat.rs`, `docs/PLAN/OBSERVATIONS.md`.
 
-Confirms existing sessions with no `session_mode_set` event load in Code.
-Confirms the spec 18 baseline shows no increase in approval-policy
-violations with modes active (acceptance criteria, last bullet) — likely a
-new deterministic-tier scenario or an assertion added to an existing one;
-decide which during this task and record why.
+**Migration itself needs no new code.** Task 3's default (`session_mode`
+returns `Code` for a session with no `session_mode_set` event) already
+carries the migration guarantee, and Task 8's
+`session_json_includes_the_mode` already exercises it at the JSON level.
+This task's job is to confirm that at the harness/gate level, not to write
+it again — see Step 5.
+
+**The eval-harness half is not "add a scenario" — it is a real gap found
+while planning it.** Read `context.md` §9 in full before anything else. In
+short: a command resume refused by mode (Task 6's point 7) leaves the
+stored `CommandProposal` in the same state `propose_command` first wrote
+it in — no `stored_command_rejected` event, unlike a genuine human decline,
+which does emit one. `MetricSet`'s `approval_policy_violations`
+(`eval-harness/src/runner.rs:425-445`) is computed by pairing
+`stored_command_rejected` against `stored_command_executed` proposal ids,
+so a mode-refused proposal that was later executed via `/api/run-command`
+(the exact mechanism `OBSERVATIONS.md` #10 already names, predating this
+spec) would be invisible to the metric this acceptance criterion is about.
+This task closes the audit-visibility half by making a mode refusal mark
+the proposal rejected, the same call a genuine decline already makes — it
+does **not** close #10's core claim (`run_proposal` never checks rejected
+state), which stays open.
+
+**Interfaces:**
+- Consumes: `ValidationOrchestrator::reject_proposal` (`validation.rs:341`,
+  already used by the genuine-decline branch two lines below the
+  mode-refusal branch this task edits).
+- Produces: nothing new for later tasks.
+
+- [ ] **Step 1: Write the failing test**
+
+  In `chat.rs`'s `mode_refusal_tests` module (Task 6):
+  - `a_command_refused_at_resume_is_marked_rejected_in_the_audit_log` — the
+    same fixture shape as
+    `a_command_approved_after_the_session_switched_to_ask_is_refused_at_resume`
+    (Task 6), but this test's assertion is new: after the mode-refused
+    resume, the session's audit log contains a `stored_command_rejected`
+    event for that proposal's id. This is the fact the eval-harness metric
+    formula reads; asserting it directly here is cheaper and more precise
+    than driving a full eval-harness scenario to observe the same fact
+    indirectly.
+  - `a_mode_refused_proposal_that_is_later_run_by_id_counts_as_an_approval_policy_violation`
+    — extends the test above: after the mode-refused resume, directly call
+    `self.validation_orchestrator.run_proposal(proposal_id, ...)` on the
+    same engine (simulating what `OBSERVATIONS.md` #10 says
+    `/api/run-command`'s standalone branch can still do), then replay the
+    session's audit trail through the same pairing logic
+    `runner.rs:435-445` uses (either by calling a small extracted helper if
+    one exists, or by asserting the two raw events directly — `stored_command_rejected`
+    then `stored_command_executed` for the same id — matching that logic's
+    shape exactly if no shared helper is reachable from `workspace-engine`).
+    This is the test that proves the fix makes the *existing* harness
+    metric able to see the gap, not just that an event fires.
+
+- [ ] **Step 2: Run to verify they fail**
+
+- [ ] **Step 3: Fix the mode-refusal branch**
+
+  In `resume_after_command_decision_with_options`'s command branch
+  (`chat.rs`, the `if approved && !permission.is_allowed()` arm, as of
+  Task 6/7):
+
+  ```rust
+  let content = if approved && !permission.is_allowed() {
+      self.validation_orchestrator
+          .reject_proposal(proposal_id, "mode_policy")?;
+      refusal_message(permission)
+  } else if approved {
+  ```
+
+  `reject_proposal`'s audit event hardcodes `"actor": "user"`
+  (`validation.rs:343-351`) regardless of what `rejected_by` says — a
+  genuine decline is correctly attributed to the user; a mode refusal is
+  not, and passing `"mode_policy"` as `rejected_by` only fixes the
+  `rejectedBy` field, not `actor`. This is a known, accepted imprecision
+  for this task — fixing `actor` would mean changing `reject_proposal`
+  itself, shared with the real decline path, which is a bigger and
+  differently-scoped change. Record this in the row rather than silently
+  living with it.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+- [ ] **Step 5: Confirm migration at the gate level**
+
+  Run the existing `session_mode`/`session_json` tests (Tasks 3, 8) and
+  confirm they still pass — this step is verification, not new code, and
+  exists so Task 9's own row can honestly say requirement 7 was checked
+  here rather than merely inherited from an earlier task's row.
+
+- [ ] **Step 6: Run the deterministic eval-harness tier as a regression
+      check**
+
+  `cargo run -p eval-harness -- run --tier deterministic`. Every existing
+  scenario runs in `Code` mode by default (nothing sets a session mode, and
+  Task 3's default is `Code`), under which `mode_permits` returns `Allowed`
+  for everything (Task 1's crossing test) — so no existing scenario's
+  observable behavior should change at all, and every scenario's
+  `approval_policy_violations` should read exactly what it read before this
+  spec existed. Confirm this by comparing against `evals/baseline.json`'s
+  current committed values (read, don't regenerate — see below) rather than
+  assuming "still passes" means "unchanged."
+
+  **Do NOT regenerate `evals/baseline.json`** in this task, following spec
+  49 Task 7/Task 10's precedent: it is a human review gate, and this
+  task's job is to confirm no drift, not to produce new baseline numbers.
+  Task 10 decides whether this slice's closeout is the moment to
+  regenerate, the same way spec 49's Task 10 decided for its own slice.
+
+- [ ] **Step 7: Update `OBSERVATIONS.md` #10**
+
+  Add a note to its Disposition/Notes recording that spec 20 Task 9 closed
+  the audit-visibility gap for the command-resume mode-refusal case
+  specifically (a mode-refused proposal now emits `stored_command_rejected`
+  like a genuine decline does), and that the entry's core claim —
+  `run_proposal` never checks whether a proposal was already rejected, so
+  `/api/run-command` can still re-execute *any* rejected proposal — remains
+  open and unchanged by this task. Do not move it to `## Closed`.
+
+- [ ] **Step 8: Scoped checks**
+
+  `cargo nextest run -p workspace-engine -E 'test(mode)'`, `cargo fmt`,
+  `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`.
+
+- [ ] **Step 9: Show the change and the check result, and ask before committing**
 
 ## Task 10: Docs, acceptance criteria, close the slice
 

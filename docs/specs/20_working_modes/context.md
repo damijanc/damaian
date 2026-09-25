@@ -323,3 +323,56 @@ three, even though the table lists three refusal points for it.
 check anywhere** — `mode_permits` returns `Allowed` for all four modes on
 every one of them (Task 1's crossing test already pins this), so a check
 there would always pass and add nothing; Task 6 does not add one.
+
+## 9. A mode-refused command resume is invisible to `approval_policy_violations`
+## — and to `/api/run-command`'s own gap — and Task 9 closes the visible half
+
+`OBSERVATIONS.md` #10 (found while adopting Task 6, per its own Evidence
+column) already names the broader problem: `run_proposal` never checks
+whether a proposal was already rejected, and `/api/run-command`'s
+standalone branch has no session to read a mode from, so a proposal that
+was declined or mode-refused inside a chat turn can still be executed
+later by id. It was deliberately left open there as predating spec 20 and
+too large for Task 6.
+
+Tracing the command branch of `resume_after_command_decision_with_options`
+(the point 7 refusal Task 6 added, `chat.rs`, the `else` block handling
+neither `web_diagnostic_call` nor `mcp_call`) found the narrower half of
+this is not merely inherited — **it is worse for a mode refusal
+specifically than for a genuine decline, and the difference is exactly
+what `AGENTS.md`'s "harness protects" reasoning is for.** The two outcomes
+differ in what they do to the stored `CommandProposal`:
+
+- **Genuine decline** (`!approved`): calls
+  `self.validation_orchestrator.reject_proposal(proposal_id, approved_by)`,
+  which emits `stored_command_rejected` (`validation.rs:341-344`).
+- **Mode refusal** (`approved && !permission.is_allowed()`): builds
+  `refusal_message(permission)` as the reply content and does **nothing
+  else** — no `reject_proposal`, no `run_proposal`, no audit event at all
+  for this outcome. The stored proposal is left exactly as `propose_command`
+  first wrote it.
+
+Consequence: `MetricSet`'s `approval_policy_violations`
+(`eval-harness/src/runner.rs:425-445`) is computed by pairing
+`stored_command_rejected` ids against `stored_command_executed` ids. A
+mode-refused proposal's id **never enters the rejected set**, so if
+`/api/run-command` later executed it — the exact mechanism `OBSERVATIONS.md`
+#10 already describes — the harness's own violation metric would not
+detect it, even though a human-legible "the engine ran something the
+mode said no to" event plainly occurred. The metric is blind to precisely
+the new failure mode this work package introduces, not just to the
+pre-existing one it already knew about.
+
+**Decision: Task 9 calls `reject_proposal` in the mode-refusal branch too**,
+the same call the decline branch already makes, so a mode refusal marks
+the proposal rejected exactly as a human decline does. This does not close
+`OBSERVATIONS.md` #10's core claim — `run_proposal` still does not consult
+rejected state, so `/api/run-command` can still re-execute *any* rejected
+proposal, mode-refused or humanly declined alike — but it does mean a
+mode-refused-then-executed command now emits the same `stored_command_rejected`
+→ `stored_command_executed` pair a genuine violation does, which is what
+lets Task 9's harness assertion (and any future fix to #10) see it at all.
+Update `OBSERVATIONS.md` #10 in the same change: record that spec 20
+Task 9 closed the audit-visibility half for the command case, and that its
+core claim (`run_proposal` not checking rejection) remains open and
+unchanged. Do not mark #10 closed — the harder fix is still undone.
