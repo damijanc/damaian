@@ -893,6 +893,11 @@ impl ChatOrchestrator {
                 None,
             );
             let content = if approved && !permission.is_allowed() {
+                // Marked rejected like a decline, so a later run of this id by
+                // `/api/run-command` shows up as a violation (`context.md` §9).
+                // The audit event still says `actor: user`; `rejectedBy` does not.
+                self.validation_orchestrator
+                    .reject_proposal(proposal_id, "mode_policy")?;
                 refusal_message(permission)
             } else if approved {
                 // The census has to be taken before the command runs: once it
@@ -5848,6 +5853,87 @@ done
         assert!(!audit_log(&repo).contains("stored_command_executed"));
         let results = tool_results(&engine, &session);
         assert_refused(results.last().unwrap(), "Ask", "Plan");
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    /// The proposal ids of every audit event of `event_type`, in log order.
+    fn audited_proposal_ids(repo: &Path, event_type: &str) -> Vec<String> {
+        audit_log(repo)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["eventType"] == event_type)
+            .filter_map(|event| event["proposalId"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// A command resume refused by mode, shared by the two audit tests below:
+    /// proposed in Code, approved after the session switched to Ask.
+    fn mode_refused_command(repo: &Path) -> (WorkspaceEngine, String) {
+        let engine = engine_with(repo);
+        let session = session_in(&engine, repo, SessionMode::Code);
+        let mut adapter = calls_then_answer(vec![call(
+            "call_1",
+            "run_command",
+            r#"{"command":"touch resumed-marker","reason":"Change"}"#,
+        )]);
+        let first = turn(&engine, repo, &session, &mut adapter);
+        let proposal = first
+            .command_proposal
+            .expect("Code offers the approval card");
+        engine
+            .session_store
+            .set_session_mode(&session, SessionMode::Ask, "user")
+            .unwrap();
+        let mut after = MockModelAdapter::new("Understood.");
+        resume(&engine, &proposal.id, &mut after);
+        (engine, proposal.id)
+    }
+
+    // `context.md` §9: a mode refusal marks the proposal rejected, as a human
+    // decline does, so the eval harness's violation metric can see it.
+    #[test]
+    fn a_command_refused_at_resume_is_marked_rejected_in_the_audit_log() {
+        let repo = temp_repo("resume-command-rejected");
+        let (_engine, proposal_id) = mode_refused_command(&repo);
+
+        assert_eq!(
+            audited_proposal_ids(&repo, "stored_command_rejected"),
+            vec![proposal_id]
+        );
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    // `OBSERVATIONS.md` #10's bypass: `run_proposal` ignores rejection, so the
+    // standalone `/api/run-command` branch can still run the id. This does not
+    // stop that; it proves the harness metric now counts it. The pairing below
+    // is `eval-harness/src/runner.rs`'s `approval_policy_violations`, which is
+    // not reachable from this crate.
+    #[test]
+    fn a_mode_refused_proposal_that_is_later_run_by_id_counts_as_an_approval_policy_violation() {
+        let repo = temp_repo("resume-command-violation");
+        let (engine, proposal_id) = mode_refused_command(&repo);
+
+        let mut on_output = |_line: &str| {};
+        engine
+            .validation_orchestrator
+            .run_proposal(
+                &proposal_id,
+                true,
+                "tester",
+                None,
+                &CancelToken::new(),
+                &mut on_output,
+            )
+            .unwrap();
+
+        let rejected_ids = audited_proposal_ids(&repo, "stored_command_rejected");
+        let violations = audited_proposal_ids(&repo, "stored_command_executed")
+            .into_iter()
+            .filter(|executed| rejected_ids.contains(executed))
+            .count();
+        assert_eq!(violations, 1);
 
         fs::remove_dir_all(repo).unwrap();
     }
