@@ -12,7 +12,7 @@ Related spec sections: `ai_coding_assistant_specification.md` section 7.2
 (project indexer), section 19 (recommended technology direction). Related
 implementation specs: [`02_semantic_search.md`](02_semantic_search.md),
 [`05_clickable_file_references.md`](05_clickable_file_references.md)
-(navigation), [`22_findings_model_and_panel.md`](22_findings_model_and_panel.md)
+(navigation), [`22_findings_model_and_panel/proposal.md`](22_findings_model_and_panel/proposal.md)
 (LSP diagnostics land as an additional `Finding` source here — this is where
 Phase 2's deferred LSP dependency is satisfied),
 [`24_repository_map_and_monorepo_boundaries.md`](24_repository_map_and_monorepo_boundaries.md)
@@ -83,7 +83,7 @@ existing heuristics are a reasonable floor and a poor ceiling.
   [Spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7 defines the
   session-scoped PID registry, driven by MCP stdio servers and the `curl` model
   child. Language servers are a third client of it.
-- **`Finding`** ([spec 22](22_findings_model_and_panel.md)) declares
+- **`Finding`** ([spec 22](22_findings_model_and_panel/proposal.md)) declares
   `FindingSource::LanguageServer` already, unused until this work package.
 
 ## 3. Requirements
@@ -102,7 +102,7 @@ existing heuristics are a reasonable floor and a poor ceiling.
 6. Symbol data is local and versioned.
 7. Symbol results integrate with search and with the clickable file references
    from [spec 05](05_clickable_file_references.md).
-8. LSP diagnostics feed [spec 22](22_findings_model_and_panel.md)'s `Finding`
+8. LSP diagnostics feed [spec 22](22_findings_model_and_panel/proposal.md)'s `Finding`
    model as an additional source.
 9. Language server processes are tracked by PID and terminated by PID, per
    `AGENTS.md`.
@@ -346,7 +346,7 @@ editor process, and killing it by name would kill their editor.
 ### 5.9 Diagnostics as findings
 
 `publishDiagnostics` notifications map to `Finding`
-([spec 22](22_findings_model_and_panel.md)) with
+([spec 22](22_findings_model_and_panel/proposal.md)) with
 `source: FindingSource::LanguageServer`, severity from the LSP severity, and
 `range` from the LSP range. This satisfies requirement 8 and Phase 2's deferred
 LSP dependency.

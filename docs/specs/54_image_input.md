@@ -249,7 +249,7 @@ provenance. A model that wants to look at the screenshot it just requested asks
 for it, and the asking is answered by a person.
 
 [Spec 12](12_web_app_troubleshooting/proposal.md) is `In progress`, so this must be
-coordinated with it in the same way [spec 22](22_findings_model_and_panel.md)
+coordinated with it in the same way [spec 22](22_findings_model_and_panel/proposal.md)
 §5.4 coordinates its `entries` addition — additively, with `text` and
 `artifacts` unchanged, and §7 recording whether that coordination happened or
 whether this spec had to work around a closed one.

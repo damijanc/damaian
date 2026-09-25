@@ -6,7 +6,7 @@ Plan: `docs/PLAN/04_phase_4_customization_and_extensibility.md`, Phase 4,
 Work Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#17](17_durable_task_state_and_crash_recovery/proposal.md)
-(durable state) — built; [#22](22_findings_model_and_panel.md) (hook findings)
+(durable state) — built; [#22](22_findings_model_and_panel/proposal.md) (hook findings)
 — **not built**; [#31](31_permission_profiles.md) (the profile hooks cannot
 widen) — **not built**. Everything else named below is a cross-reference, not a
 prerequisite.
@@ -19,7 +19,7 @@ specs: [`10_persistent_command_approval.md`](10_persistent_command_approval.md),
 (the PID registry hook processes use, and the action markers hooks sit between),
 [`20_working_modes/proposal.md`](20_working_modes/proposal.md),
 [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md),
-[`22_findings_model_and_panel.md`](22_findings_model_and_panel.md) (hooks return
+[`22_findings_model_and_panel/proposal.md`](22_findings_model_and_panel/proposal.md) (hooks return
 `Finding`s), [`23_verification_loop.md`](23_verification_loop.md),
 [`31_permission_profiles.md`](31_permission_profiles.md) (the profile a hook
 cannot widen).
@@ -70,7 +70,7 @@ be the phase's required work rather than its risky work.
   (`mcp.rs:288-345`) and the `curl` model child wrapped in `KillOnDrop`
   (`model.rs:400-406`). [Spec 17](17_durable_task_state_and_crash_recovery/proposal.md)
   §5.7 defines the session-scoped PID registry both should use.
-- **`Finding`** ([spec 22](22_findings_model_and_panel.md)) is the structured
+- **`Finding`** ([spec 22](22_findings_model_and_panel/proposal.md)) is the structured
   type a hook returns, with `SecretScanner` redaction applied at construction.
 - **`AuditLog::record`** (`audit.rs:42`) redacts every field on the way in and is
   the mechanism to reuse rather than extend.
@@ -177,7 +177,7 @@ blocking it outright. It can only move an action from automatic to gated, never
 the reverse — there is deliberately no `approve` verdict, because that would be a
 hook granting permission, which is precisely the widening requirement 6 forbids.
 
-`findings` are `Finding` values ([spec 22](22_findings_model_and_panel.md)),
+`findings` are `Finding` values ([spec 22](22_findings_model_and_panel/proposal.md)),
 which puts hook output in the same panel as compiler and test output and makes it
 navigable and repairable. `context` additions are bounded strings that enter
 context assembly as ordinary `ContextItem`s in a dedicated category
@@ -308,7 +308,7 @@ whose output is quietly truncated into valid-looking JSON.
 
 `reason` strings, `findings`, and `context` additions pass through
 `SecretScanner` before display, persistence, or entry into context. `Finding`
-already redacts at construction ([spec 22](22_findings_model_and_panel.md) §5.6),
+already redacts at construction ([spec 22](22_findings_model_and_panel/proposal.md) §5.6),
 and hook output uses that path rather than a parallel one.
 
 A hook's stderr is captured, bounded, and redacted for diagnostics, and is never

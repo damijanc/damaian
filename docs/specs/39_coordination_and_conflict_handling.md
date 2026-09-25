@@ -15,7 +15,7 @@ implementation specs:
 [`16_session_checkpoints_and_rewind.md`](16_session_checkpoints_and_rewind.md),
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md),
 [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md),
-[`22_findings_model_and_panel.md`](22_findings_model_and_panel.md),
+[`22_findings_model_and_panel/proposal.md`](22_findings_model_and_panel/proposal.md),
 [`23_verification_loop.md`](23_verification_loop.md) (the checks §5.5 reruns),
 [`38_subagent_model.md`](38_subagent_model.md) (declares the agents this
 coordinates; its §5.4 staging gates when this spec's write path is needed),
@@ -184,7 +184,7 @@ exploration, review) needs exactly one level. Deeper nesting is available by
 configuration for anyone who measures a benefit.
 
 Exceeding the depth is refused at spawn, reported as a `Finding`
-([spec 22](22_findings_model_and_panel.md)) so it surfaces in the panel rather
+([spec 22](22_findings_model_and_panel/proposal.md)) so it surfaces in the panel rather
 than only in a log, and audited. It does not fail the requesting agent — a model
 attempting to over-delegate should be told no and continue.
 

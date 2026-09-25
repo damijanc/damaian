@@ -178,7 +178,7 @@ favour of the reference should read this paragraph first.
 ### 3.6 Two design elements reference specs that do not exist yet
 
 - **`Evidence::Findings { refs: Vec<String>, failing: usize }`** references
-  finding ids from [spec 22](../22_findings_model_and_panel.md), which is Not
+  finding ids from [spec 22](../22_findings_model_and_panel/proposal.md), which is Not
   started. A variant holding ids from an id space with no producer is a field
   that can only ever be empty. It is **deferred** — added when spec 22 lands,
   with the enum marked `#[non_exhaustive]` so adding it later is not a breaking

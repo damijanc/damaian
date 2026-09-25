@@ -1,25 +1,31 @@
 # Feature Spec: Findings Model and Panel
 
-Status: Not started
+Status: In progress. Split into a folder and planned on 2026-09-25. Design
+unchanged from the original flat spec; corrections where it no longer matches
+the code — most importantly, §5.1's `Finding` has no field for the hash its own
+staleness rule compares against, and its public fields contradict §5.6's
+"no code path can create an unredacted finding" — are in
+[`context.md`](context.md), not inlined here, the way spec 20 kept its own.
+Read `context.md` before starting any task in [`tasks.md`](tasks.md).
 Order: 22 of 23
 Plan: `docs/PLAN/02_phase_2_complete_task_workflow.md`, Phase 2, Work
 Package 6 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#20](20_working_modes/proposal.md) (the mode that gates tools) —
-built; [#21](21_task_plan_progress_and_budget/proposal.md) (plan state) —
+Depends on: [#20](../20_working_modes/proposal.md) (the mode that gates tools) —
+built; [#21](../21_task_plan_progress_and_budget/proposal.md) (plan state) —
 built. Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.1 (chat
 interface), section 7.10 (secret detection), section 11 (error handling).
 Related implementation specs:
-[`05_clickable_file_references.md`](05_clickable_file_references.md) (navigation),
-[`12_web_app_troubleshooting.md`](12_web_app_troubleshooting/proposal.md) (the browser
+[`05_clickable_file_references.md`](../05_clickable_file_references.md) (navigation),
+[`12_web_app_troubleshooting.md`](../12_web_app_troubleshooting/proposal.md) (the browser
 diagnostic source, extended additively in §5.4), and
-[`23_verification_loop.md`](23_verification_loop.md), which consumes this model.
+[`23_verification_loop.md`](../23_verification_loop.md), which consumes this model.
 
 Implementation order note: the roadmap has WP3 (verification loop) requiring
 "convert failures into structured findings (WP6)" while listing WP6 as depending
 on WP3. The `Finding` type has to exist before the loop that produces them, so
-this spec is numbered ahead of [`23_verification_loop.md`](23_verification_loop.md).
+this spec is numbered ahead of [`23_verification_loop.md`](../23_verification_loop.md).
 The panel may follow the loop; the type may not.
 
 ## 1. Motivation
@@ -41,7 +47,7 @@ diagnostics, Phase 4's hook findings, Phase 5's pull-request review findings,
 Phase 6's subagent results. Defining it late means defining it four times, and
 four incompatible definitions is the normal outcome.
 
-It is also the prerequisite for [spec 23](23_verification_loop.md). A repair loop
+It is also the prerequisite for [spec 23](../23_verification_loop.md). A repair loop
 needs to know what to repair, and "the test output contained the word failed" is
 not a repair target.
 
@@ -61,7 +67,7 @@ not a repair target.
 - **Nothing is addressable.** No type in the workspace represents "one problem, at
   this file and line, from this source, with this severity".
 - **Clickable file references exist.**
-  [Spec 05](05_clickable_file_references.md) delivered in-text file references
+  [Spec 05](../05_clickable_file_references.md) delivered in-text file references
   that open the file in the app or configured editor. This is the navigation
   mechanism to reuse.
 - **Secret redaction is centralised.** `SecretScanner`, applied on the way into
@@ -82,7 +88,7 @@ not a repair target.
    dismissal, and asking the agent to fix a selected subset.
 4. Findings are redacted through `SecretScanner` before display or persistence.
 5. Navigation reuses the clickable file references from
-   [spec 05](05_clickable_file_references.md).
+   [spec 05](../05_clickable_file_references.md).
 
 ## 4. Non-goals
 
@@ -95,7 +101,7 @@ not a repair target.
   for the same line are two findings from two sources; merging them is a Phase 3
   question once LSP exists.
 - Fixing findings. This spec makes a finding addressable and lets the user select
-  a subset to fix; the repair loop is [spec 23](23_verification_loop.md).
+  a subset to fix; the repair loop is [spec 23](../23_verification_loop.md).
 - Severity normalisation across tools into a single scale with comparable
   meaning. Severity is recorded as the source reported it, mapped onto a small
   fixed set, and §5.2 is explicit that cross-source comparison is not implied.
@@ -236,7 +242,7 @@ Two options, and this spec takes the second:
    same reason the generic parser is a fallback rather than a solution: the text
    is written for a human and its shape is not a contract.
 2. **Extend the report with structured entries.**
-   [Spec 12](12_web_app_troubleshooting/proposal.md) is `In progress`, so its runner
+   [Spec 12](../12_web_app_troubleshooting/proposal.md) is `In progress`, so its runner
    contract is still being settled — this is the moment to add structure to it
    rather than parse around it afterwards.
 
@@ -268,7 +274,7 @@ The findings panel groups by source, then by file, and filters by severity and
 status. Default view is `Open` findings of severity `Error`, because a panel that
 opens showing forty warnings is a panel users close.
 
-Navigation reuses [spec 05](05_clickable_file_references.md)'s mechanism: a
+Navigation reuses [spec 05](../05_clickable_file_references.md)'s mechanism: a
 finding with a `range` renders as a clickable reference that opens the file at the
 line in the app or the configured editor. No new navigation path is added.
 
@@ -309,7 +315,7 @@ output into every finding.
 ### 5.7 Persistence
 
 Findings are appended to the session log per
-[spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.2:
+[spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) §5.2:
 
 ```json
 {"seq":260,"eventType":"finding_recorded","taskId":"task_…","finding":{…}}
@@ -319,7 +325,7 @@ Findings are appended to the session log per
 
 `SessionStore::read_findings(session_id)` replays them, newest status per ID
 winning. Findings therefore survive restart, which
-[spec 21](21_task_plan_progress_and_budget/proposal.md) needs — a step blocked by a finding
+[spec 21](../21_task_plan_progress_and_budget/proposal.md) needs — a step blocked by a finding
 must still be blocked by it after a crash.
 
 ### 5.8 Documentation
@@ -344,7 +350,7 @@ generic-fallback finding from a parsed one, and where full output lives.
 - A browser source location outside the repository is dropped rather than recorded
   as a range.
 - Clicking a finding with a range opens the referenced file and line through the
-  existing [spec 05](05_clickable_file_references.md) mechanism.
+  existing [spec 05](../05_clickable_file_references.md) mechanism.
 - Selecting findings and asking for a fix produces a scoped repair request
   carrying finding IDs, excluding stale findings with a note.
 - A finding becomes `Stale` when its file's hash no longer matches the hash
@@ -364,5 +370,5 @@ To be completed during implementation. Record:
   fell through to the generic parser. A high share is not a failure of this spec,
   but it tells the next person where to add a parser.
 - Whether `WebDiagnosticReport.entries` was added in coordination with
-  [spec 12](12_web_app_troubleshooting/proposal.md), or whether that spec had already
+  [spec 12](../12_web_app_troubleshooting/proposal.md), or whether that spec had already
   closed and the text-parsing fallback was used instead.

@@ -186,7 +186,7 @@ Every variant references something Damaian observed itself. There is no
 > §3.6. The `ref` is a `markerId` from spec 17, not a `cmd_…` id: execution ids
 > never reach the session log and the audit log that holds them expires, so the
 > exit code is the evidence and the reference is only a breadcrumb. And
-> `Findings` is deferred until [spec 22](../22_findings_model_and_panel.md)
+> `Findings` is deferred until [spec 22](../22_findings_model_and_panel/proposal.md)
 > exists to produce the ids it holds; the enum is `#[non_exhaustive]` so adding
 > it later breaks nothing.
 
@@ -195,7 +195,7 @@ The status rule:
 | Evidence present | Status |
 |---|---|
 | `CommandExit` with `exit_code: Some(0)` | `completed` |
-| `CommandExit` with a non-zero code | `blocked`, and the failure becomes a finding ([spec 22](../22_findings_model_and_panel.md)) |
+| `CommandExit` with a non-zero code | `blocked`, and the failure becomes a finding ([spec 22](../22_findings_model_and_panel/proposal.md)) |
 | `CommandExit` with `exit_code: None` | **not** `completed`. The command did not report an exit status, so nothing is known. `blocked` |
 | `PatchApplied` with hashes matching what was written | `completed` |
 | No evidence of any kind | `completed_unverified` in the report; `completed` in the plan, with an empty `evidence` vec |

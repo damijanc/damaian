@@ -309,7 +309,7 @@ text rather than a redacted preview — the same reasoning as
 commit: it is rendered in a web UI, emailed in notifications, and indexed. Check
 output quoted into the body is the realistic source, and command output has
 already been redacted once by the time it reaches a `Finding`
-([spec 22](22_findings_model_and_panel.md) §5.6) — so this is a second net over
+([spec 22](22_findings_model_and_panel/proposal.md) §5.6) — so this is a second net over
 a path that should already be clean, which is the right place for one.
 
 ### 5.7 Approval and policy

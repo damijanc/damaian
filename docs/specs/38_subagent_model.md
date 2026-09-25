@@ -17,7 +17,7 @@ Related implementation specs:
 [`31_permission_profiles.md`](31_permission_profiles.md) (the boundary a
 subagent inherits and cannot widen),
 [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md),
-[`22_findings_model_and_panel.md`](22_findings_model_and_panel.md),
+[`22_findings_model_and_panel/proposal.md`](22_findings_model_and_panel/proposal.md),
 [`26_context_assembly.md`](26_context_assembly.md),
 [`39_coordination_and_conflict_handling.md`](39_coordination_and_conflict_handling.md),
 [`40_autonomy_evaluations.md`](40_autonomy_evaluations.md). See also

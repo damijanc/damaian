@@ -7,7 +7,7 @@ Package 3 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#18](18_local_evaluation_harness/proposal.md) (the harness) —
 built; [#21](21_task_plan_progress_and_budget/proposal.md) (plan state) —
-built; [#22](22_findings_model_and_panel.md) (the finding type it repairs) —
+built; [#22](22_findings_model_and_panel/proposal.md) (the finding type it repairs) —
 **not built**. Everything else named below is a cross-reference, not a
 prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
@@ -18,7 +18,7 @@ handling). Related implementation specs:
 [`12_web_app_troubleshooting.md`](12_web_app_troubleshooting/proposal.md),
 [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md) (the
 plan and evidence this loop populates),
-[`22_findings_model_and_panel.md`](22_findings_model_and_panel.md) (the finding
+[`22_findings_model_and_panel/proposal.md`](22_findings_model_and_panel/proposal.md) (the finding
 model this loop produces and repairs against).
 
 ## 1. Motivation
@@ -85,7 +85,7 @@ After agent-generated edits are applied, the loop:
    `propose_detected_validations`.
 3. Runs approved checks.
 4. Converts failures into structured findings
-   ([spec 22](22_findings_model_and_panel.md)).
+   ([spec 22](22_findings_model_and_panel/proposal.md)).
 5. Lets the agent repair failures within `agent_tool_retry_limit`.
 6. Reruns the relevant checks.
 7. Produces a completion report listing files changed, checks passed, checks
@@ -109,7 +109,7 @@ And throughout: **an unrun check is never represented as passed.**
   written to avoid implying otherwise.
 - Repairing findings the user did not ask about. The loop repairs failures of
   checks it ran; the user-selected subset repair is
-  [spec 22](22_findings_model_and_panel.md) §5.5.
+  [spec 22](22_findings_model_and_panel/proposal.md) §5.5.
 - Committing, pushing, or opening a pull request on success — Phase 5.
 - Background processes for checks that need a running server — Phase 2 WP5,
   outside this phase's minimum slice. §5.4 handles its absence.
@@ -196,7 +196,7 @@ page is not.
 
 ### 5.5 Repair, bounded
 
-On a failing check, its findings ([spec 22](22_findings_model_and_panel.md)) are
+On a failing check, its findings ([spec 22](22_findings_model_and_panel/proposal.md)) are
 handed to the model with a repair request, bounded by `agent_tool_retry_limit`
 (`config.rs:73`):
 
@@ -242,7 +242,7 @@ being asked would spend tokens and time on a state the user may still be editing
 and it does not report them as passed.
 
 This is the same staleness idea as `FindingStatus::Stale` in
-[spec 22](22_findings_model_and_panel.md) and the same hash comparison as
+[spec 22](22_findings_model_and_panel/proposal.md) and the same hash comparison as
 `patch_engine.rs:291`, applied to check runs. Phase 2 WP7 builds the review UI
 around this; the data it needs is produced here.
 

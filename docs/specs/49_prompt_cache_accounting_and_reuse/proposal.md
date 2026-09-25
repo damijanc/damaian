@@ -178,7 +178,7 @@ surface says "not reported" rather than "0".
 defaulting to false, and the request emits a marker only when it is true.
 Declared now because declaring it costs nothing and adding it later is a
 config-schema change across persisted provider settings — the same argument
-[#22](../22_findings_model_and_panel.md) makes for declaring
+[#22](../22_findings_model_and_panel/proposal.md) makes for declaring
 `FindingSource::LanguageServer` early. No configured provider requires it, so
 nothing turns it on.
 
