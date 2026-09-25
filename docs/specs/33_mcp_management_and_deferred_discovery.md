@@ -5,7 +5,7 @@ Order: 33 of 33
 Plan: `docs/PLAN/04_phase_4_customization_and_extensibility.md`, Phase 4,
 Work Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#20](20_working_modes/proposal.md) (modes) — **not built**;
+Depends on: [#20](20_working_modes/proposal.md) (modes) — built;
 [#26](26_context_assembly.md) (the context budget schemas count against) —
 **not built**; [#31](31_permission_profiles.md) (the profile a server cannot
 widen) — **not built**. Everything else named below is a cross-reference, not a

@@ -91,6 +91,85 @@ ceiling (`agent_max_task_tokens`) rather than stopping, and the messages it
 sends are bounded by `agent_max_turn_messages` so a long turn does not grow
 without limit.
 
+## Working Modes
+
+Every session has a working mode, which decides what the assistant is *able* to
+do in that session. The four modes:
+
+- **Ask** — reads your repository and answers questions. Nothing else.
+- **Plan** — reads, runs read-only commands, and produces a plan. It cannot
+  change a file.
+- **Code** — the full set: file changes, commands and validation, each on the
+  approval terms described above. This is the default.
+- **Review** — reads, runs read-only commands and browser diagnostics, and
+  reports findings. It cannot change a file or make a plan.
+
+| The assistant wants to… | Ask | Plan | Code | Review |
+|---|---|---|---|---|
+| Read files, list folders, search, read Git status and diffs | yes | yes | yes | yes |
+| Propose a file change (`propose_patch`, `edit_file`) | no | no | yes | no |
+| Make or advance a plan (`propose_plan`, `complete_step`) | no | yes | yes | no |
+| Run a read-only command that needs no approval, such as `ls` or `git status` | no | yes | yes | yes |
+| Run any other command | no | no | yes | no |
+| Inspect a web page or run a browser scenario | no | no | yes | yes |
+| Call an MCP tool its server marks read-only | yes | yes | yes | yes |
+| Call any other MCP tool | no | no | yes | no |
+
+A mode is a boundary, not a request to the assistant. A tool the mode does not
+allow is never offered to the model. If the model tries to use it anyway, Damaian
+refuses before anything happens: no patch is stored, no approval card appears,
+no command runs. Instructions in a repository's `AGENTS.md` cannot widen a mode,
+because an `AGENTS.md` arrives with whatever you clone. The model cannot change
+the mode either. Only you can.
+
+Ask offers no commands at all, not even read-only ones, so you can be sure
+nothing happens. In Plan and Review, a command that would need your approval is
+refused outright rather than shown as an approval card, because approving it
+would let you click your way out of the mode you chose.
+
+**An allowlisted command is still refused in Ask, Plan and Review.** `Allow
+Always` means "stop asking me about this exact command", not "this command is
+read-only". An allowlisted `npm run build` runs without a prompt in Code and is
+refused in the other three modes. Plan and Review decide what counts as
+read-only from the command itself, never from your allowlist.
+
+MCP tools are read-only only when their server says so. Most servers don't mark
+their tools at all, and an unmarked tool counts as able to change things, so it
+is only offered in Code.
+
+**Switching modes.** The mode control sits in the conversation header, next to
+the session's other actions. Pick a mode and it takes effect from the next turn.
+A turn that is already running finishes in the mode it started with. The control
+is disabled until a session is open, and a new session starts in Code. No
+confirmation is asked in either direction. A plan made in Plan mode stays as it
+is when you switch to Code to carry it out.
+
+Mode is also checked when you act on something the assistant asked for earlier.
+Approving a command, MCP call or browser diagnostic that was waiting for you,
+or applying a stored patch, is refused if the session's *current* mode does not
+allow it, even though the mode allowed it when it was proposed.
+
+When something is refused, the conversation says which mode blocked it and which
+would allow it, for example: "Refused: Ask mode does not allow this. Switch to
+Code mode to allow it."
+
+Sessions created before modes existed continue in Code mode, which is what they
+could already do, so none of them lost anything. Change one with the same
+control.
+
+Known limits:
+
+- `git diff`, `git log` and `git show` count as read-only commands, but all
+  three accept `--output=<file>`, which writes a file. In Plan or Review, a path
+  inside the repository is therefore not refused. A path outside it needs
+  approval and is refused.
+- A prompt that reads like a file-change request, such as `fix the bug in the
+  config file`, goes to the separate patch-preview flow described under
+  [File Changes](#file-changes), not to the assistant's tools. That flow does not
+  read the open session's mode, so it can produce a patch preview in any mode.
+  Nothing is written unless you select `Apply Selected`. The CLI's
+  `propose-edit` has no session and no mode either.
+
 ## Provider Limits and Retries
 
 A model provider can refuse a call — rate limiting ("you are going too fast"), a

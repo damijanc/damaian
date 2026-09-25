@@ -75,45 +75,55 @@ which is the source of truth — this section is a reading of those lines, not a
 second opinion. Re-derive it rather than trusting it if the table below disagrees with
 a spec's own header.
 
-**Only three specs have every dependency built:** [#20](20_working_modes/proposal.md),
-[#56](56_provider_fallback_consent.md), and [#38](38_subagent_model.md) (which
-depends on nothing here, but is explicitly speculative — its own §1 allows
-abandoning it). [#49](49_prompt_cache_accounting_and_reuse/proposal.md)'s
-accounting slice, the fourth member of this set, shipped on 2026-09-23; its one
-remaining requirement (the reuse slice) is blocked on #55 or #26, not ready, so
-the spec as a whole no longer belongs in this set. Everything else is
-transitively blocked, and the graph is unusually linear:
+Re-derived on 2026-09-25, when [#20](20_working_modes/proposal.md) was
+finished. **Five specs now have every dependency built:**
+[#22](22_findings_model_and_panel.md), [#31](31_permission_profiles.md),
+[#50](50_model_initiated_clarification.md) — all three unblocked by #20 —
+plus [#56](56_provider_fallback_consent.md) and [#38](38_subagent_model.md)
+(which depends on nothing here, but is explicitly speculative — its own §1
+allows abandoning it). #20 also cleared one of the dependencies of
+[#33](33_mcp_management_and_deferred_discovery.md) and
+[#51](51_external_reference_retrieval.md), but both still wait on #26, and #33
+waits on #31 as well.
+[#49](49_prompt_cache_accounting_and_reuse/proposal.md)'s accounting slice
+shipped on 2026-09-23; its one remaining requirement (the reuse slice) is
+blocked on #55 or #26, not ready, so the spec as a whole does not belong in
+this set. Everything else is transitively blocked, and the graph is unusually
+linear:
 
 ```
-#20 working modes ──> #22 findings ──> #23 verification, #32 hooks, #35 commit prep
-                 │                └──> #24 repo map ──> #25 symbols
-                 │                                 └──> #26 context assembly
-                 ├──> #31 profiles ──> #52 MCP server mode
-                 ├──> #33 MCP mgmt  ──┘
-                 └──> #50 clarification, #51 fetch
+#20 working modes (done) ──> #22 findings ──> #23 verification, #32 hooks, #35 commit prep
+                        │                └──> #24 repo map ──> #25 symbols
+                        │                                 └──> #26 context assembly
+                        ├──> #31 profiles ──> #52 MCP server mode
+                        ├──> #33 MCP mgmt  ──┘   (#33 also needs #26 and #31)
+                        └──> #50 clarification, #51 fetch (#51 also needs #26)
 
 #26 context assembly ──> #27 inspector ──> #28 ──> #29 ──> #30  (memory, serial)
                     ├──> #54 image input, #55 compaction, #51 fetch
                     └──> #49's reuse slice
 ```
 
-**#20 and #26 are the keystones.** Thirteen specs sit downstream of #20 and it
-is ready now; the whole tail waits on #26. Preferring a spec that unblocks
-nothing over one of these costs more than it looks like it does.
+**#22 and #26 are the keystones now that #20 has landed.** #22 is ready and
+sits in front of #23, #24, #32 and #35, and so, through #24, in front of #26;
+the whole tail waits on #26. Preferring a spec that unblocks nothing over one
+of these costs more than it looks like it does.
 
 | | Build | Why here |
 |---|---|---|
-| 1 | **#20 working modes** | The keystone: unblocks 13 specs, ready now |
-| 2 | **#22 findings** | Second keystone; also closes #21's deferred `Evidence::Findings` |
+| 1 | **#22 findings** | The keystone now that #20 is done: ready, in front of #23, #24, #32 and #35; also closes #21's deferred `Evidence::Findings` |
+| 2 | #31 profiles | Ready; in front of #32, #33, #35 and #52, and extends #20's permission matrix |
 | 3 | #24 → #26 | #26 is the real unlock; #25 follows #24 |
 | 4 | #55 compaction | Also unblocks #49's reuse slice, which is why that slice waits |
 | 5 | #27, #54, #51, #23 | The fan-out once #26 has landed |
 | 6 | #28 → #29 → #30 | Memory, strictly serial |
-| 7 | #35 → #36/#37; #31/#33 → #52; #32 | Delivery and extensibility clusters |
+| 7 | #35 → #36/#37; #33 → #52; #32 | Delivery and extensibility clusters |
 | 8 | #38/#39/#40 | Last, and #40 may legitimately conclude "do not" |
 
 [#56](56_provider_fallback_consent.md) is the opportunistic one: small, ready,
 and it closes the half of #48 that shipped as only a negative guarantee.
+[#50](50_model_initiated_clarification.md) is ready too and unblocks nothing,
+which is why it sits off the table rather than above #24.
 [#49](49_prompt_cache_accounting_and_reuse/proposal.md)'s accounting slice is
 done, off this table for the same reason #56 will be once it ships: nothing
 left in it is unbuilt. Its reuse slice re-enters this table once #55 or #26
@@ -134,6 +144,7 @@ the dependency graph, it is that file.
   `app.js` and the harness, so it could pair with #20, which lives in `chat.rs`
   and the UI.
 - **Not together:** #20 and #56 — both touch approval and resume in `chat.rs`.
+  #20 is done (2026-09-25), so #56 no longer waits on it.
 - **Never together:** #26, #55 and #49's reuse slice. All three rewrite
   `build_model_prompt` and the assembly around it; that shared function is why
   #49's second slice is blocked in the first place. #54 and #55 also both
@@ -181,7 +192,7 @@ is ready.
 | 17 | [17_durable_task_state_and_crash_recovery/](17_durable_task_state_and_crash_recovery/proposal.md) | **Done.** Roadmap Phase 1 WP2. **Rescoped and split before implementation** — this spec is the engine core only: thirteen task states, parse-first session-log reads, before-and-after action markers, the recovery classifier, migration, pending-approval reattach, and the three recovery operations. Its central guarantee is that no action whose outcome is unknown is ever automatically repeated, enforced in `recovery::resume` so a UI cannot widen it. The kill matrix covers **all thirteen states by three crash shapes, 39 automated cells**, with one `#[ignore]`d real-`SIGKILL` test proving the on-disk signature those cells assume; it found a requirement-5 hole rather than merely confirming the code. Parse-first reads fixed a reader that *fabricated a message from a torn line*, and the sequence cache took appending 2000 events from 17.5s to 129ms by making per-append cost flat instead of doubling. The recovery prompt moved to #45 and the process registry to #46, **both now unblocked**. Note #16 already shipped the `seq` field this spec's migration section describes. Unblocked #18's thirteenth scenario, which now runs and makes `recovery_success` a measured value. |
 | 18 | [18_local_evaluation_harness/](18_local_evaluation_harness/proposal.md) | **Done.** Roadmap Phase 1 WP4. The measuring instrument every later phase's improvement claim rests on. New `crates/eval-harness` with a `damaian-eval` binary: sixteen scenarios run and pass against fixture repositories (spec 47 added `navigated_edit` and `batched_reads`; `batched_reads` also added `tool_calls_at_least` and `tool_rounds_at_most`). The thirteenth was committed as blocked on #17, reporting `notApplicable` in every run rather than being quietly absent, and #17 unblocked it: it now injects a crash and measures that recovery classifies it and refuses to repeat it, making `recovery_success` a measured value. Full coverage of the roadmap metric set, each row carrying a value, a human-sourced marker or an explicit not-applicable naming the phase that will supply it. The deterministic tier takes 2.8s and runs inside `cargo test --workspace --locked`, so it adds no quality-gate command; the live tier is credential-gated and never run by CI. It first ran against a real provider on 2026-09-10 and found seven defects **in the harness itself** — including two metrics that had been reporting a plausible constant rather than a measurement, which is the failure an eval harness exists to prevent and is least able to detect in itself. All fixed; see its §7. Found and fixed a security defect while being built: a top-level `secrets/` or `credentials/` directory was unrestricted, because `**/` requires a leading path segment. Its baseline review gate then caught the harness leaking its own seeded credential into `evals/baseline.json` — see its §7. Consumes #19's token fields, which report not-applicable until that lands. |
 | 19 | [19_token_and_cost_accounting/](19_token_and_cost_accounting/proposal.md) | **Done, with one measurement outstanding.** Roadmap Phase 1 WP6. Per-run token usage and per-task aggregation, distinguishing provider-measured from estimated and never presenting one as the other; retries, stopped turns and calls lost to a crash all count, because under-reporting is what makes Damaian look cheaper than it is. Measures only; the enforced ceiling is Phase 2. Turns spec 18's token row from `notApplicable` into a real 52,271-token figure, read through the same `read_task_usage` a session uses so the two cannot drift. **Validated against DeepSeek on 2026-09-10**: it reports usage on every call, and the `len / 4` estimate measured 2.5–6.3% high — always in the safe direction for a figure a reader acts on. OpenAI remains unmeasured, and is the one measurement the status line still calls outstanding. Planning against the code found five places where the design assumed behaviour the code does not have: a provider 4xx arrives as a *successful* read because `curl -sS` exits zero, so the probe branches on the parsed body; no test double could return a different response on a second call; a mid-stream stop discarded the partial run entirely; recovery cannot estimate a lost call from a request that no longer exists, so the estimate is written onto the action marker *before* the call; and §5.6's completion report does not exist yet, being spec 23's, so requirement 2 lands as the task-state surface. Implementation found two more: rendering a cost with `toFixed(4)` printed anything under $0.0001 as **`$0.0000`**, which reads as free, and spec 18's token metric was pinned by no test at all. |
-| 20 | [20_working_modes/](20_working_modes/proposal.md) | **In progress.** Split into a folder and planned on 2026-09-23; see `tasks.md` for the task breakdown. Roadmap Phase 2 WP1. Four session modes (Ask, Plan, Code, Review) as a capability boundary rather than a prompt instruction, enforced in three layers so the text-envelope fallback from #3 cannot be used as an escape. Its permission matrix is the artifact Phase 4 WP3 extends. Planning against the code found the tool inventory had grown since this spec was written — `propose_plan`, `complete_step`, `list_directory`, `search_content`, and `edit_file` all landed after and are not in §5.1's matrix as written; `context.md` extends it. It also found MCP tools carry no read-only annotation at all yet (`McpTool` has no such field), so the matrix's "declared read-only" row needs a small capability addition (parsing the MCP `annotations.readOnlyHint` hint) before it can be enforced. |
+| 20 | [20_working_modes/](20_working_modes/proposal.md) | **Done.** Roadmap Phase 2 WP1. Four session modes (Ask, Plan, Code, Review) as a capability boundary rather than a prompt instruction, enforced in three layers so the text-envelope fallback from #3 cannot be used as an escape: the tool list is built through one permission function (`mode_permits`), the fallback prompt drops or narrows the `DAMAIAN_COMMAND_V1` invitation, and the orchestrator refuses at nine call sites, not the five the flat spec named — the resume path handles commands, MCP calls and web diagnostics, and a stored patch is re-checked at apply. Its permission matrix is the artifact Phase 4 WP3 (#31) extends. Planning against the code found the tool inventory had grown by five tools since this spec was written, and that MCP tools carried no read-only annotation (now parsed from `annotations.readOnlyHint`; silence counts as mutation). It also found and fixed two real holes: an allowlisted mutating command was classified exactly like a read-only one, so `Allow Always` would have widened Plan and Review; and a mode-refused command left no rejection in the audit log, so the harness's `approval_policy_violations` could not see it being run later. Two known gaps stay open and are named in its §7: a rejected proposal can still be run by id through `/api/run-command`, and `git diff --output=<file>` passes the read-only check that Plan and Review rely on. |
 | 21 | [21_task_plan_progress_and_budget/](21_task_plan_progress_and_budget/proposal.md) | **Done.** Roadmap Phase 2 WP2. Ordered steps with observable evidence, so a step is never complete because the model said so, plus an enforced per-turn token ceiling using #19's accounting. Persists through #17's event log. Two model-facing tools split the authority the spec left open: `propose_plan` supplies titles only, and `complete_step` takes **no arguments by design** — the model asks to move on, the engine decides from what it observed. Planning against the code found eight statements the design assumed and the code contradicts; three changed the design: a "task" is one turn, so "per task" means per turn and a resumed turn is a *new* task whose plan is carried across explicitly; the round-budget pattern §5.4 says to copy does not stop the loop but makes one more model call, which on a grown context is the turn's most expensive — so the ceiling check moved *before* the call; and the session log had no failure outcome to read evidence from, because every tool arm recorded `"ok"` whatever the tool reported, which is the same defect that made #18's error rate 0.000 by construction. Fixing it moved that metric to 0.333 and `check_pass_rate` off a by-construction zero. Implementation found three more: the review gate cannot reuse the crash-recovery `sideEffecting` flag to decide what "mutating" means (it is conservative on purpose and would gate a sandbox-safe `ls`), so it consults the command policy instead; `renderMessages` marked *every* assistant message of a turn, so a tool-budget stop had long been rendering a duplicate row per message on reload; and `Evidence::FileRead` existed with nothing constructing one, so every reading step reported "completed unverified" while the path and hash sat in hand. `Evidence::Findings` stays deferred because #22 does not exist to produce the ids, and the acceptance criterion citing #23's fixture is restated against #18's harness as the `planned_task` scenario, which runs in CI. |
 | 22 | [22_findings_model_and_panel.md](22_findings_model_and_panel.md) | **Not started.** Roadmap Phase 2 WP6. One `Finding` type shared by compiler, test, lint, browser, and review sources, with parsers that degrade to a usable generic finding rather than losing a failure. Numbered ahead of #23 because the type must exist before the loop that produces them. |
 | 23 | [23_verification_loop.md](23_verification_loop.md) | **Not started.** Roadmap Phase 2 WP3. Sequences apply → discover checks → run → find → repair → rerun → report, driven by the orchestrator rather than the model, so a completion report distinguishes verified from assumed. Consumes #21 and #22. |

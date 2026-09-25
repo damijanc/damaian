@@ -5,7 +5,7 @@ Order: 50 of 53
 Plan: `docs/PLAN/02_phase_2_complete_task_workflow.md`, Phase 2, Work
 Package 8 (Should). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#20](20_working_modes/proposal.md) (modes) — **not built**;
+Depends on: [#20](20_working_modes/proposal.md) (modes) — built;
 [#21](21_task_plan_progress_and_budget/proposal.md) (the plan gate and turn
 budget) — built. Everything else named below is a cross-reference, not a
 prerequisite.

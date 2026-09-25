@@ -5,8 +5,8 @@ Order: 51 of 53
 Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 8 (Should). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#20](20_working_modes/proposal.md) (the mode that gates the tool) — **not
-built**; [#26](26_context_assembly.md) (the category and budget fetched content
+Depends on: [#20](20_working_modes/proposal.md) (the mode that gates the tool) —
+built; [#26](26_context_assembly.md) (the category and budget fetched content
 enters) — **not built**. Everything else named below is a cross-reference, not
 a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.10

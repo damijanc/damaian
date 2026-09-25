@@ -370,7 +370,8 @@ events. This is where **message content** lives.
 Event types: `session_created`, `session_renamed`, `task_created`,
 `task_status_updated`, `message_appended`, `action_started`, `action_finished`,
 `browser_diagnostics_approval_updated`, `conversation_rewound`, `plan_created`,
-`plan_revised`, `plan_resumed`, `plan_step_updated`, `plan_approved`.
+`plan_revised`, `plan_resumed`, `plan_step_updated`, `plan_approved`,
+`session_mode_set`.
 
 Every event carries a monotonic `seq`. Events written before that field existed
 are numbered by line order on read, which is their append order, so old
@@ -919,6 +920,47 @@ model quotes the reason back. Two refusals are expected, not bugs:
 
 Neither refusal writes anything to disk. A refused edit goes back to the model
 as a tool result, so it can retry within the same turn.
+
+### The assistant was refused: the session mode or the command policy?
+
+They are different boundaries (see the user guide's Working Modes section), and
+the wording tells them apart:
+
+- **A mode refusal** always names two modes: `Refused: <mode> mode does not
+  allow this. Switch to <mode> mode to allow it.` It appears as a grey tool-result
+  bubble in the conversation, directly above the model's own explanation. No
+  approval card is shown, because the mode forbids the action whatever you
+  would answer. When a stored patch is refused at apply, the same sentence
+  comes back as an `access_denied` error rather than `policy_blocked`.
+- **A command-policy refusal** names no mode. It reads `local policy blocks this
+  command`, or `Command proposal is blocked by policy` at run time, and it
+  happens in Code mode too.
+
+If a command you allowlisted with `Allow Always` is refused, that is a mode
+refusal and it is expected. The allowlist removes the prompt in Code. It does
+not make a command read-only in Plan or Review, and Ask runs no commands at all.
+
+To see which mode a session was in, and when it changed, read its
+`session_mode_set` events (a session with none is in Code):
+
+```bash
+jq -c 'select(.eventType=="session_mode_set") | {seq, timestampMs, mode: .payload.mode, setBy: .payload.setBy}' "$SESSION_FILE"
+```
+
+The newest event wins. A turn uses the mode in force when it started, so a
+change landing mid-turn shows up from the next turn. Approvals are the
+exception: approving a paused command, MCP call or browser diagnostic, or
+applying a stored patch, is checked against the mode *at that moment*. A
+rewind does not undo a mode change, because the mode is a setting, not part of
+the conversation.
+
+Refusals leave a trace in the audit log (`audit/events.jsonl`). A command
+refused when you approve it is recorded as `stored_command_rejected` with
+`rejectedBy: "mode_policy"`. Its `actor` field still reads `user`, which is a
+known wart. A browser diagnostic refused the same way is recorded with
+`decision: "refused_by_mode"`. A refusal inside a turn, before any approval
+card was shown, leaves no proposal at all. What it leaves is a failed
+`action_finished` in the session log, next to the tool-result message.
 
 ### A file read or search result was truncated
 

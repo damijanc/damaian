@@ -1,11 +1,13 @@
 # Feature Spec: Working Modes
 
-Status: In progress. Split into a folder and planned on 2026-09-23. Design
-unchanged from the original flat spec; corrections to its "Current State"
-section and §5.1's matrix — the tool inventory grew after this spec was
-written and before it was built — are in [`context.md`](context.md), not
-inlined here, the way spec 49 kept its own corrections separate. Read
-`context.md` before starting any task in [`tasks.md`](tasks.md).
+Status: Done (2026-09-25). Split into a folder and planned on 2026-09-23,
+built in ten tasks from 2026-09-23 to 2026-09-25. The design is unchanged from
+the original flat spec. Its corrections to "Current State" and §5.1's matrix
+(the tool inventory grew after this spec was written and before it was
+built) are in [`context.md`](context.md), not inlined here, the way spec 49
+kept its own corrections separate. §7 below records what was built, the two
+real bugs planning found, and the gaps left open. Read it before relying on
+§5.2 or §6.
 Order: 20 of 23
 Plan: `docs/PLAN/02_phase_2_complete_task_workflow.md`, Phase 2, Work
 Package 1 (Must). That directory is local-only and not committed, so the
@@ -340,9 +342,127 @@ refusal, and where the mode event is in the session log.
 
 ## 7. Implementation Notes
 
-To be completed during implementation.
+Built in ten tasks; [`tasks.md`](tasks.md)'s Progress table has the per-task
+detail. This section is the summary a security-focused reader needs without
+re-reading those rows.
 
-Record where the mode check was placed for each layer-3 path, since a missed path
-is a silent hole rather than a failing test. If any action path could not be
-covered at layer 3, name it here explicitly rather than leaving the matrix test
-to imply full coverage.
+### 7.1 Where each layer lives
+
+- **The matrix is one function.** `mode_permits(mode, &ToolAction,
+  Option<&CommandClassification>, mcp_read_only: Option<bool>) -> Permission`
+  in `crates/workspace-engine/src/mode.rs`. It matches on `ToolAction`
+  directly, so a new tool variant fails to compile until the matrix is told
+  about it. `context.md` §1's five extra tools are in it: `list_directory` and
+  `search_content` are reads, `edit_file` is in the mutation-proposal class
+  with `propose_patch`, and `propose_plan`/`complete_step` are planning (Plan
+  and Code).
+- **MCP read-only** is parsed from the tool's `annotations.readOnlyHint`
+  (`mcp.rs`, `parse_mcp_tool`). Only `Some(true)` counts. A server that says
+  nothing is treated as mutation-class.
+- **Persistence**: `SessionStore::set_session_mode` / `session_mode`
+  (`session.rs`). The event is `session_mode_set`, the newest one wins, and
+  the default is Code. It is read from `parsed_events`, not `active_events`, so
+  a rewind does not reset the mode.
+- **Layer 1**: `run_agentic_turn` reads the mode once and filters *every* tool
+  definition through `mode_permits`, reads included. The browser-MCP filter
+  and the mode filter are one closure. `run_command` is offered when a
+  best-case classification of `pwd` would be permitted, so Plan and Review
+  still see it.
+- **Layer 2**: `system_prompt(mode)`. Code is byte-identical to the
+  pre-spec prompt, so both spec 49 prompt-cache guards passed unmodified. Ask
+  drops the `DAMAIAN_COMMAND_V1` paragraph. Plan and Review keep it but say a
+  command needing approval is refused, not queued. There was no
+  `DAMAIAN_EDIT_V1` block to omit (`context.md` §7).
+- **Layer 3**: nine refusal points (`context.md` §8), not the five §5.2 names:
+
+  | # | Path | Where it landed |
+  |---|---|---|
+  | 1, 3, 4, 5, 6 | Mutation proposal, command, planning, web diagnostic, MCP (main loop) | One `action_permission` check at the top of `run_agentic_turn`'s per-call loop, before any `match` arm runs and before spec 21's plan-review gate. A command is classified with `classify_command` (no stored proposal) before `propose_command`, so a refusal leaves no proposal, no approval card and no run. |
+  | 2 | Stored-patch apply | `edit.rs`, `apply_stored_patch`, before the apply marker and snapshot, with a fresh read of `patch.session_id`'s mode. Refuses with `ClientError::AccessDenied`, not `PolicyBlocked`. |
+  | 7, 8, 9 | Resume of a paused command, web diagnostic, MCP call | `resume_after_command_decision_with_options`, one fresh mode read for all three branches. Checked at resume time, not at proposal time (`context.md` §8). |
+
+  One main-loop site rather than five per-arm checks was a deliberate
+  deviation: a future `ToolAction` variant cannot reach its arm unchecked.
+  Read-only actions get no Layer 3 check, because the matrix allows them in
+  every mode.
+- **UI**: a `<select>` in the thread header (`app.js`, `renderModeControl`),
+  `POST /api/session-mode`, and `"mode"` on the single-session payloads. The
+  session *list* deliberately does not carry the mode, since that would read
+  every session log twice. A refusal reaches the user as the existing grey
+  tool-result bubble; no new element was needed.
+
+### 7.2 Two real bugs this planning pass found and fixed
+
+Neither was anticipated by the flat spec. Both would have shipped as holes in
+a security claim.
+
+1. **An allowlisted command widened Plan and Review** (`context.md` §5, Task 7).
+   `classify_pattern`'s allowlist branch and its genuinely-read-only branch
+   produce the same `risk: Low, requires_approval: false`, so `mode_permits`
+   could not tell `Allow Always` on `npm run build` from `git status`. §5.3's
+   rule, read as those two fields, let an allowlisted mutating command run in
+   Plan and Review. Fixed by also requiring
+   `command_policy::is_low_risk_read_only(&command)`, a predicate over the
+   command text alone that the allowlist cannot influence. No classification
+   `CommandPolicy` produces changed.
+2. **A mode-refused command was invisible to the audit log** (`context.md` §9,
+   Task 9). A human decline at resume called `reject_proposal`. A mode refusal
+   at resume did nothing to the stored proposal. So if that id was later run
+   (see 7.3), `approval_policy_violations` could not count it: the metric pairs
+   `stored_command_rejected` with `stored_command_executed`, and no rejection
+   existed. Fixed by calling `reject_proposal(id, "mode_policy")` in the
+   mode-refusal branch too.
+
+### 7.3 Paths not covered, named rather than implied
+
+- **A rejected proposal can still be run by id**
+  (`OBSERVATIONS.md` #10, open). `run_proposal` never checks rejected state,
+  and `/api/run-command`'s standalone branch has no session to read a mode
+  from. 7.2's fix makes such a run *visible* as a violation. It does not
+  prevent it.
+- **`git diff|log|show --output=<file>` passes the read-only check**
+  (`OBSERVATIONS.md` #11, open). `is_low_risk_read_only` matches by prefix, so
+  in Plan and Review this writes a file inside the repository. It predates
+  this spec (Code auto-runs it too), but 7.2's fix made that predicate the
+  mode's read-only signal. Closing it is a `CommandPolicy` classification
+  change, which §4 rules out without its own spec change.
+- **The desktop app's edit-request shortcut ignores the mode**
+  (`OBSERVATIONS.md` #12, found in Task 10). A prompt `looksLikeEditRequest`
+  matches (`app.js`) goes to `/api/propose-edit` instead of a chat turn.
+  `EditOrchestrator::propose_edit` creates its own new session, which reads as
+  Code, so an Ask-mode conversation can still yield an applicable patch
+  preview. The user typed the request and must still press Apply, so this is
+  not a model-initiated escape, and it falls outside every §6 criterion. But
+  it contradicts the plain reading of "Ask cannot change a file".
+  `context.md` §7 ruled `propose_edit` out of scope as having "no session",
+  which undersold it. The CLI's `propose-edit` has no session and no mode.
+- **Smaller, recorded in the Task 6 and Task 9 rows**: a refused call is still
+  bracketed by `start_action`/finish as a failed attempt; a refused web
+  diagnostic still widens that turn's round limit (`web_debug_mode`); and the
+  mode-refusal `stored_command_rejected` event says `actor: user`, because
+  `reject_proposal` hardcodes it, with only `rejectedBy` saying `mode_policy`.
+
+### 7.4 Acceptance criteria (§6), each with the test that covers it
+
+Tests are in `crates/workspace-engine/src/` unless marked `desktop-shell`.
+
+| Criterion | Covered by | Verdict |
+|---|---|---|
+| Every session reports a mode; no event reads as Code | `session::tests::a_session_with_no_mode_event_reads_as_code`, `set_session_mode_round_trips`, `the_newest_mode_event_wins`; `desktop-shell` `session_json_includes_the_mode` | Met |
+| In Ask and Plan, no mutation-capable tool is in the constructed list | `chat::mode_tool_list_tests::ask_mode_offers_no_run_command_tool_definition_at_all`, `plan_mode_offers_run_command_but_not_propose_patch_or_edit_file`, `an_mcp_tool_without_a_read_only_hint_is_withheld_in_ask` (asserted against `adapter.requests[0].tools`) | Met, with one reading stated: Plan is offered `run_command` because §5.1 gives it read-only commands. The mutating half of that tool is refused at Layer 3, not withheld. |
+| The matrix is crossed with every mode and tool class | `mode::tests::the_permission_matrix_matches_the_spec_table` (every `ToolAction` variant × four modes; mutation-tested in Task 1), plus the command and MCP sub-cases in `mode::tests` | Met |
+| A file-writing command is refused in Ask and Plan even when allowlisted | `chat::mode_refusal_tests::an_allowlisted_command_that_writes_a_file_is_refused_in_ask_and_plan` (end to end through a real `command_allowlist`; added in Task 10 and mutation-tested against 7.2's fix), `mode::tests::an_allowlisted_mutating_command_is_still_refused_in_plan` / `_in_review` | **Met for the allowlist, not for every file-writing command.** `git diff --output=x` still runs in Plan (7.3, #11). |
+| An approval-needing command is refused outright in Plan, with no card | `chat::mode_refusal_tests::plan_mode_still_refuses_a_command_needing_approval_outright`, `mode::tests::plan_refuses_a_command_that_would_require_approval_even_if_low_risk` | Met |
+| A `DAMAIAN_EDIT_V1` envelope in Ask, Plan or Review is not applied | `chat::mode_refusal_tests::a_damaian_edit_v1_envelope_emitted_unprompted_is_never_applied_in_any_mode` (`MockModelAdapter`, all four modes) | Met, but by absence: the chat loop never parses the envelope (`context.md` §7). The test guards the day someone wires it in. It was not mutation-tested, since that would mean wiring it in. |
+| An `AGENTS.md` instructing edits has no effect in Ask | `chat::mode_refusal_tests::an_agents_md_granting_edits_has_no_effect_in_ask_mode` (asserts the instruction reached the model, the tool list, the refusal and the mode). Added in Task 10: no earlier task had a test for this bullet. Mutation-tested by letting an `AGENTS.md` force Code. | Met |
+| Nothing the model emits changes the mode | `chat::mode_refusal_tests::nothing_the_model_emits_changes_the_session_mode` | Met |
+| A mid-session change does not take effect within a running turn | `chat::mode_refusal_tests::a_mode_change_mid_turn_does_not_affect_the_tool_round_already_in_progress` (mutation-tested in Task 6) | Met |
+| Existing sessions load in Code after migration | `session::tests::a_session_with_no_mode_event_reads_as_code`; checked in the browser in Task 8 on a session with no mode event | Met |
+| A refusal names the blocking and the allowing mode | `mode::tests::a_refusal_names_the_blocking_mode_and_the_permitting_mode`, `a_refusal_message_names_both_modes_in_the_words_a_person_reads`; every `mode_refusal_tests` case via `assert_refused`; `desktop-shell` `a_refused_call_reaches_the_model_and_the_session_payload` | Met |
+| The quality gate passes, and the baseline shows no increase in approval-policy violations | The seven-command gate and the deterministic tier on 2026-09-25 (Task 10's Progress row); `chat::mode_refusal_tests::a_command_refused_at_resume_is_marked_rejected_in_the_audit_log` and `a_mode_refused_proposal_that_is_later_run_by_id_counts_as_an_approval_policy_violation` | Met: 0 violations in all 16 scenarios, as in `evals/baseline.json`. Every deterministic scenario runs in the default Code mode, so the baseline shows modes changed nothing there. It does not exercise a non-Code mode. What Task 9 earned is that a mode-refused command which later runs now *counts*, so the metric can move. Before Task 9 it could not. |
+
+**`evals/baseline.json` was not regenerated.** No scenario sets a mode or
+references one, no commit in this slice touched `evals/` or
+`crates/eval-harness`, and Code's prompt and tool list are byte-identical to
+before. The Task 9 and Task 10 runs matched every recorded number except
+wall-clock latency.
