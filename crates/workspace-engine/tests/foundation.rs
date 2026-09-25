@@ -3640,7 +3640,7 @@ fn propose_edit_includes_agents_md_in_edit_prompt() {
 
     let proposal = engine
         .edit_orchestrator
-        .propose_edit(&repo, "Update src/lib.rs", &[], &mut adapter)
+        .propose_edit(&repo, "Update src/lib.rs", &[], None, &mut adapter)
         .unwrap();
 
     assert!(proposal.context_files.contains(&"AGENTS.md".to_string()));
@@ -3733,7 +3733,7 @@ fn proposes_edit_stores_patch_and_applies_selected_files() {
 
     let proposal = engine
         .edit_orchestrator
-        .propose_edit(&repo, "Update constants", &[], &mut adapter)
+        .propose_edit(&repo, "Update constants", &[], None, &mut adapter)
         .unwrap();
 
     assert_eq!(proposal.patch.files.len(), 2);
@@ -3770,6 +3770,143 @@ fn proposes_edit_stores_patch_and_applies_selected_files() {
         fs::read_to_string(repo.join("src/b.js")).unwrap(),
         "export const b = 1;\n"
     );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+const MODE_EDIT_RESPONSE: &str = "DAMAIAN_EDIT_V1\nSUMMARY: Update a\nFILE: src/a.js\nSTATUS: modified\nCONTENT:\nexport const a = 2;\nEND_FILE\nEND_PATCH\n";
+
+/// An engine over a one-file repo plus an existing chat session in `mode`,
+/// the session the desktop app passes to `/api/propose-edit`.
+fn engine_with_origin_session(
+    name: &str,
+    mode: workspace_engine::SessionMode,
+) -> (PathBuf, WorkspaceEngine, String) {
+    let repo = temp_dir(name);
+    write_fixture(&repo, "src/a.js", "export const a = 1;\n");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let session = engine
+        .session_store
+        .create_session("repo_1", "Chat")
+        .unwrap();
+    engine
+        .session_store
+        .set_session_mode(&session.id, mode, "user")
+        .unwrap();
+    (repo, engine, session.id)
+}
+
+/// Spec 20 §7.3 / `OBSERVATIONS.md` #12: the edit flow writes into a session
+/// of its own, which reads as Code, so without this an Ask-mode conversation
+/// got an applicable patch. The refusal comes before any model call and leaves
+/// nothing behind.
+#[test]
+fn propose_edit_from_an_ask_or_plan_session_is_refused_before_the_model_is_called() {
+    for mode in [
+        workspace_engine::SessionMode::Ask,
+        workspace_engine::SessionMode::Plan,
+        workspace_engine::SessionMode::Review,
+    ] {
+        let (repo, engine, origin) = engine_with_origin_session("edit-origin-refused", mode);
+        let sessions_before = engine.session_store.list_sessions(None).unwrap().len();
+        let mut adapter = MockModelAdapter::new(MODE_EDIT_RESPONSE);
+
+        let error = engine
+            .edit_orchestrator
+            .propose_edit(&repo, "Update a", &[], Some(&origin), &mut adapter)
+            .expect_err("a mode that forbids patches must refuse");
+
+        assert!(
+            matches!(error, ClientError::AccessDenied(ref message)
+                if message.contains(&format!("{mode:?} mode")) && message.contains("Code mode")),
+            "{mode:?}: expected a mode refusal, got {error:?}"
+        );
+        assert!(adapter.requests.is_empty(), "{mode:?} called the model");
+        assert_eq!(
+            engine.session_store.list_sessions(None).unwrap().len(),
+            sessions_before,
+            "{mode:?} created an edit session"
+        );
+        assert!(
+            !repo.join(".damaian").join("patches").exists(),
+            "{mode:?} stored a patch"
+        );
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+}
+
+/// The apply half: a patch proposed while the conversation was in Code is
+/// refused once the conversation switches to Ask, even though the edit
+/// session the patch lives in still reads as Code.
+#[test]
+fn an_edit_patch_is_refused_at_apply_after_its_origin_session_switches_to_ask() {
+    let (repo, engine, origin) =
+        engine_with_origin_session("edit-origin-apply", workspace_engine::SessionMode::Code);
+    let mut adapter = MockModelAdapter::new(MODE_EDIT_RESPONSE);
+    let proposal = engine
+        .edit_orchestrator
+        .propose_edit(&repo, "Update a", &[], Some(&origin), &mut adapter)
+        .expect("Code allows the proposal");
+    assert_eq!(proposal.patch.origin_session_id, origin);
+    assert_ne!(
+        proposal.patch.session_id, origin,
+        "the edit flow keeps its own session"
+    );
+    assert_eq!(
+        engine
+            .session_store
+            .session_mode(&proposal.patch.session_id),
+        workspace_engine::SessionMode::Code,
+        "the edit session reads as Code, which is why origin has to be checked"
+    );
+
+    engine
+        .session_store
+        .set_session_mode(&origin, workspace_engine::SessionMode::Ask, "user")
+        .unwrap();
+    let error = engine
+        .edit_orchestrator
+        .apply_stored_patch(&repo, &proposal.patch.id, None, None, "tester", false)
+        .expect_err("Ask must refuse the apply");
+
+    assert!(
+        matches!(error, ClientError::AccessDenied(ref message) if message.contains("Ask mode")),
+        "expected a mode refusal, got {error:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("src/a.js")).unwrap(),
+        "export const a = 1;\n",
+        "nothing may be written"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// An unknown session id would read as Code, the default, so it must be an
+/// error rather than a silent permission.
+#[test]
+fn propose_edit_rejects_an_unknown_origin_session() {
+    let (repo, engine, _origin) =
+        engine_with_origin_session("edit-origin-unknown", workspace_engine::SessionMode::Ask);
+    let mut adapter = MockModelAdapter::new(MODE_EDIT_RESPONSE);
+
+    let error = engine
+        .edit_orchestrator
+        .propose_edit(
+            &repo,
+            "Update a",
+            &[],
+            Some("session_missing"),
+            &mut adapter,
+        )
+        .expect_err("an unknown session must not pass as Code");
+
+    assert!(
+        matches!(error, ClientError::InvalidInput(_)),
+        "got {error:?}"
+    );
+    assert!(adapter.requests.is_empty());
 
     fs::remove_dir_all(repo).unwrap();
 }
@@ -3812,7 +3949,7 @@ fn propose_edit_records_failure_when_patch_touches_restricted_path() {
 
     let error = engine
         .edit_orchestrator
-        .propose_edit(&repo, "introduce a .env file", &[], &mut adapter)
+        .propose_edit(&repo, "introduce a .env file", &[], None, &mut adapter)
         .unwrap_err();
 
     // The message has to name the offending path, or the user cannot tell which
@@ -3838,7 +3975,7 @@ fn propose_edit_records_failure_when_model_output_is_unparsable() {
 
     let error = engine
         .edit_orchestrator
-        .propose_edit(&repo, "validate the README", &[], &mut adapter)
+        .propose_edit(&repo, "validate the README", &[], None, &mut adapter)
         .unwrap_err();
 
     assert!(
@@ -3865,7 +4002,7 @@ fn rejects_selected_patch_files_without_modifying_workspace() {
     let mut adapter = MockModelAdapter::new(response);
     let proposal = engine
         .edit_orchestrator
-        .propose_edit(&repo, "Update constants", &[], &mut adapter)
+        .propose_edit(&repo, "Update constants", &[], None, &mut adapter)
         .unwrap();
 
     let rejected = vec!["src/b.js".to_string()];
@@ -3920,7 +4057,7 @@ fn rejects_unknown_selected_patch_file() {
     let mut adapter = MockModelAdapter::new(response);
     let proposal = engine
         .edit_orchestrator
-        .propose_edit(&repo, "Update value", &[], &mut adapter)
+        .propose_edit(&repo, "Update value", &[], None, &mut adapter)
         .unwrap();
     let approved = vec!["src/app.js".to_string(), "src/missing.js".to_string()];
 
@@ -3950,7 +4087,7 @@ fn rejects_stored_patch_without_modifying_workspace() {
     let mut adapter = MockModelAdapter::new(response);
     let proposal = engine
         .edit_orchestrator
-        .propose_edit(&repo, "Update value", &[], &mut adapter)
+        .propose_edit(&repo, "Update value", &[], None, &mut adapter)
         .unwrap();
 
     let rejected_path = engine

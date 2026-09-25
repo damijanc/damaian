@@ -639,6 +639,7 @@ fn a_patch_saved_now_round_trips_its_session() {
     let patch = workspace_engine::ProposedPatch {
         id: "patch_v2".to_string(),
         session_id: "session_abc".to_string(),
+        origin_session_id: "session_chat".to_string(),
         task_id: Some("task_abc".to_string()),
         summary: "with a session".to_string(),
         status: "pending".to_string(),
@@ -659,7 +660,33 @@ fn a_patch_saved_now_round_trips_its_session() {
     )
     .unwrap();
     assert!(
-        raw.starts_with("DAMAIAN_STORED_PATCH_V2\n"),
-        "new patches are written as V2"
+        raw.starts_with("DAMAIAN_STORED_PATCH_V3\n"),
+        "new patches are written as V3"
     );
+}
+
+/// V3 added `ORIGIN_SESSION_ID`. A V2 patch already on disk keeps its session
+/// and simply has no origin, which apply treats as nothing extra to check.
+#[test]
+fn a_v2_stored_patch_still_loads_with_an_empty_origin() {
+    let data_dir = temp_data_dir("patch-v2-legacy");
+    let store = workspace_engine::PatchStore::new(&data_dir);
+    let v2 = concat!(
+        "DAMAIAN_STORED_PATCH_V2\n",
+        "PATCH_ID 8\npatch_v2\n",
+        "SESSION_ID 11\nsession_abc\n",
+        "TASK_ID 0\n\n",
+        "SUMMARY 2\nv2\n",
+        "STATUS 7\npending\n",
+        "CREATED_AT_MS 1\n1\n",
+        "FILE_COUNT 1\n0\n",
+        "END_PATCH\n",
+    );
+    let patches = data_dir.join("patches").join("pending");
+    fs::create_dir_all(&patches).unwrap();
+    fs::write(patches.join("patch_v2.dpatch"), v2).unwrap();
+
+    let loaded = store.load("patch_v2").expect("a V2 patch must still load");
+    assert_eq!(loaded.session_id, "session_abc");
+    assert_eq!(loaded.origin_session_id, "", "a V2 patch has no origin");
 }

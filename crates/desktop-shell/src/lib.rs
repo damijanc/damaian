@@ -794,6 +794,12 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             let form = parse_form(&request.body);
             let repo = required_form(&form, "repo")?;
             let prompt = required_form(&form, "prompt")?;
+            // The chat session the prompt was typed in, so its mode governs
+            // this flow too. Absent for a caller with no session open.
+            let session_id = form
+                .get("session_id")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
             let engine = engine_for_repo_with_model_options(&repo, &form)?;
             let context_files = form
                 .get("context_files")
@@ -815,7 +821,13 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             );
             let result = engine
                 .edit_orchestrator
-                .propose_edit(&repo, &prompt, &context_files, &mut adapter)
+                .propose_edit(
+                    &repo,
+                    &prompt,
+                    &context_files,
+                    session_id.as_deref(),
+                    &mut adapter,
+                )
                 .map_err(|error| error.to_string())?;
             write_response(
                 stream,

@@ -403,7 +403,7 @@ fn run() -> workspace_engine::Result<()> {
                 let mut adapter = MockModelAdapter::new(mock_response);
                 engine
                     .edit_orchestrator
-                    .propose_edit(repo, &prompt, &[], &mut adapter)?
+                    .propose_edit(repo, &prompt, &[], None, &mut adapter)?
             } else {
                 let api_key = env::var(&engine.config.model_api_key_env).map_err(|_| {
                     workspace_engine::ClientError::InvalidInput(format!(
@@ -424,7 +424,7 @@ fn run() -> workspace_engine::Result<()> {
                 );
                 engine
                     .edit_orchestrator
-                    .propose_edit(repo, &prompt, &[], &mut adapter)?
+                    .propose_edit(repo, &prompt, &[], None, &mut adapter)?
             };
             print!("{}", patch_diff_text(&result.patch));
             eprintln!("patch_id={}", result.patch.id);

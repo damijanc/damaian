@@ -150,7 +150,7 @@ fn rewinding_a_turn_restores_an_applied_patch_and_the_conversation() {
 
     let proposal = engine
         .edit_orchestrator
-        .propose_edit(&repo, "Bump a", &[], &mut adapter)
+        .propose_edit(&repo, "Bump a", &[], None, &mut adapter)
         .expect("the edit should be proposed");
     engine
         .edit_orchestrator

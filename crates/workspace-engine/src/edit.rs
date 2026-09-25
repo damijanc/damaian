@@ -292,13 +292,62 @@ impl EditOrchestrator {
         error
     }
 
+    /// Refuses unless `session_id`'s mode allows a mutation proposal. An
+    /// empty id has no mode to read and is allowed, the carve-out a legacy
+    /// patch and the CLI's sessionless `propose-edit` both rely on.
+    fn refuse_unless_mode_permits_patches(&self, session_id: &str) -> Result<()> {
+        if session_id.is_empty() {
+            return Ok(());
+        }
+        let permission = mode_permits(
+            self.session_store.session_mode(session_id),
+            &ToolAction::ProposePatch(GeneratedEdit {
+                summary: String::new(),
+                changes: Vec::new(),
+            }),
+            None,
+            None,
+        );
+        if permission.is_allowed() {
+            Ok(())
+        } else {
+            // `AccessDenied`, not `PolicyBlocked`: the latter already means the
+            // command policy blocked something, and a mode is a different
+            // boundary the user chose, not a policy verdict.
+            Err(ClientError::AccessDenied(refusal_message(permission)))
+        }
+    }
+
+    /// Proposes a patch from one prompt, in a session of its own.
+    ///
+    /// `origin_session_id` is the chat session the user asked from, if any.
+    /// Its mode is checked before anything is created or any model is called,
+    /// and it is stored on the patch so apply re-checks it. The edit session
+    /// itself has no mode event and would always read as Code, which is how an
+    /// Ask-mode conversation used to get an applicable patch through this flow
+    /// (spec 20 §7.3).
     pub fn propose_edit(
         &self,
         repository_root: impl AsRef<Path>,
         prompt: &str,
         explicit_paths: &[String],
+        origin_session_id: Option<&str>,
         model_adapter: &mut dyn ModelAdapter,
     ) -> Result<EditProposalResult> {
+        let origin_session_id = origin_session_id.unwrap_or_default();
+        // An unknown id would read as Code, the default, so a typo or a stale
+        // id must not pass as permission.
+        if !origin_session_id.is_empty()
+            && self
+                .session_store
+                .read_session(origin_session_id)?
+                .is_none()
+        {
+            return Err(ClientError::InvalidInput(format!(
+                "Unknown session: {origin_session_id}"
+            )));
+        }
+        self.refuse_unless_mode_permits_patches(origin_session_id)?;
         let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, &repository_root)?;
         let session = self
             .session_store
@@ -434,6 +483,7 @@ impl EditOrchestrator {
         // the log its marker and its recovery reattachment belong to.
         let mut patch = patch;
         patch.session_id = session.id.clone();
+        patch.origin_session_id = origin_session_id.to_string();
         self.patch_store
             .save(&patch)
             .map_err(|error| self.record_edit_failure(&session.id, &task, error))?;
@@ -455,6 +505,7 @@ impl EditOrchestrator {
                 ("sessionId", session.id.clone()),
                 ("taskId", task.id.clone()),
                 ("patchId", patch.id.clone()),
+                ("originSessionId", patch.origin_session_id.clone()),
                 (
                     "files",
                     patch
@@ -517,23 +568,10 @@ impl EditOrchestrator {
         // snapshot below, so a refusal leaves nothing to finish or undo. A
         // legacy patch with no session has no mode to read and stays
         // unrestricted, the same carve-out its marker gets.
-        if !patch.session_id.is_empty() {
-            let permission = mode_permits(
-                self.session_store.session_mode(&patch.session_id),
-                &ToolAction::ProposePatch(GeneratedEdit {
-                    summary: String::new(),
-                    changes: Vec::new(),
-                }),
-                None,
-                None,
-            );
-            if !permission.is_allowed() {
-                // `AccessDenied`, not `PolicyBlocked`: the latter already
-                // means the command policy blocked something, and a mode is a
-                // different boundary the user chose, not a policy verdict.
-                return Err(ClientError::AccessDenied(refusal_message(permission)));
-            }
-        }
+        // A patch from the edit flow also names the conversation it was
+        // proposed from, whose mode can change after the preview appears.
+        self.refuse_unless_mode_permits_patches(&patch.session_id)?;
+        self.refuse_unless_mode_permits_patches(&patch.origin_session_id)?;
         // Writing files is the most side-effecting action in the engine, so its
         // marker brackets the write itself rather than a caller. A patch stored
         // before `session_id` existed has no log to name, so it gets no marker —
@@ -904,9 +942,10 @@ fn edit_session_title(prompt: &str) -> String {
 
 fn serialize_patch(patch: &ProposedPatch) -> String {
     let mut output = String::new();
-    output.push_str("DAMAIAN_STORED_PATCH_V2\n");
+    output.push_str("DAMAIAN_STORED_PATCH_V3\n");
     write_field(&mut output, "PATCH_ID", &patch.id);
     write_field(&mut output, "SESSION_ID", &patch.session_id);
+    write_field(&mut output, "ORIGIN_SESSION_ID", &patch.origin_session_id);
     write_field(
         &mut output,
         "TASK_ID",
@@ -945,15 +984,16 @@ fn serialize_patch(patch: &ProposedPatch) -> String {
 
 fn deserialize_patch(raw: &str) -> Result<ProposedPatch> {
     let mut cursor = Cursor::new(raw);
-    // Both versions are accepted. V1 predates `SESSION_ID`; nothing is
-    // converted and no file is rewritten, so a patch already on disk keeps
-    // working and simply has no session. `read_field` is name-checked, so a
-    // version mismatch fails closed rather than silently reading the next
-    // field's value.
+    // Every version is accepted. V1 predates `SESSION_ID` and V2 predates
+    // `ORIGIN_SESSION_ID`; nothing is converted and no file is rewritten, so a
+    // patch already on disk keeps working and simply has no session, or no
+    // origin. `read_field` is name-checked, so a version mismatch fails closed
+    // rather than silently reading the next field's value.
     let version = cursor.read_line()?;
-    let has_session = match version.as_str() {
-        "DAMAIAN_STORED_PATCH_V2" => true,
-        "DAMAIAN_STORED_PATCH_V1" => false,
+    let (has_session, has_origin) = match version.as_str() {
+        "DAMAIAN_STORED_PATCH_V3" => (true, true),
+        "DAMAIAN_STORED_PATCH_V2" => (true, false),
+        "DAMAIAN_STORED_PATCH_V1" => (false, false),
         other => {
             return Err(ClientError::InvalidInput(format!(
                 "Unknown stored patch format: {other}"
@@ -963,6 +1003,11 @@ fn deserialize_patch(raw: &str) -> Result<ProposedPatch> {
     let id = cursor.read_field("PATCH_ID")?;
     let session_id = if has_session {
         cursor.read_field("SESSION_ID")?
+    } else {
+        String::new()
+    };
+    let origin_session_id = if has_origin {
+        cursor.read_field("ORIGIN_SESSION_ID")?
     } else {
         String::new()
     };
@@ -1001,6 +1046,7 @@ fn deserialize_patch(raw: &str) -> Result<ProposedPatch> {
     Ok(ProposedPatch {
         id,
         session_id,
+        origin_session_id,
         task_id,
         summary,
         status,

@@ -426,16 +426,28 @@ a security claim.
   this spec (Code auto-runs it too), but 7.2's fix made that predicate the
   mode's read-only signal. Closing it is a `CommandPolicy` classification
   change, which §4 rules out without its own spec change.
-- **The desktop app's edit-request shortcut ignores the mode**
-  (`OBSERVATIONS.md` #12, found in Task 10). A prompt `looksLikeEditRequest`
-  matches (`app.js`) goes to `/api/propose-edit` instead of a chat turn.
-  `EditOrchestrator::propose_edit` creates its own new session, which reads as
-  Code, so an Ask-mode conversation can still yield an applicable patch
-  preview. The user typed the request and must still press Apply, so this is
-  not a model-initiated escape, and it falls outside every §6 criterion. But
-  it contradicts the plain reading of "Ask cannot change a file".
-  `context.md` §7 ruled `propose_edit` out of scope as having "no session",
-  which undersold it. The CLI's `propose-edit` has no session and no mode.
+- **The desktop app's edit-request shortcut ignored the mode. Fixed after
+  close-out, on 2026-09-25.** Found in Task 10: a prompt `looksLikeEditRequest`
+  matches (`app.js`) goes to `/api/propose-edit` instead of a chat turn. At the
+  time, `EditOrchestrator::propose_edit` always created its own new session,
+  which reads as Code, so an Ask-mode conversation could still yield an
+  applicable patch preview. `context.md` §7 ruled `propose_edit` out of scope
+  as having "no session", which undersold it. Now `app.js` sends the open
+  `session_id`, and `propose_edit` takes it as `origin_session_id`. An unknown
+  id is an `InvalidInput`, because it would otherwise read as Code. The origin
+  session's mode is checked before any session, checkpoint or model call
+  exists. The proposal still writes into its own edit session, so your
+  conversation's history is untouched. The origin is stored on the patch as
+  `ProposedPatch::origin_session_id`, which bumped the stored format to
+  `DAMAIAN_STORED_PATCH_V3`; V1 and V2 still load. `apply_stored_patch`
+  re-checks both sessions, so switching the conversation to Ask after the
+  preview appears refuses the apply, the same as a chat patch (layer 3 point
+  2). Tests in `tests/foundation.rs`:
+  `propose_edit_from_an_ask_or_plan_session_is_refused_before_the_model_is_called`,
+  `an_edit_patch_is_refused_at_apply_after_its_origin_session_switches_to_ask`
+  and `propose_edit_rejects_an_unknown_origin_session`; V2 compatibility is in
+  `tests/session_rewind.rs`. **Still open:** the CLI's `propose-edit` has no
+  session, so no mode applies to it.
 - **Smaller, recorded in the Task 6 and Task 9 rows**: a refused call is still
   bracketed by `start_action`/finish as a failed attempt; a refused web
   diagnostic still widens that turn's round limit (`web_debug_mode`); and the

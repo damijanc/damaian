@@ -5878,6 +5878,9 @@ async function proposePatchFromChat(prompt, assistantMessage) {
     form({
       repo: patchRepo,
       prompt,
+      // The open session's mode governs this flow too; the server refuses the
+      // proposal, before any model call, when that mode forbids patches.
+      session_id: currentSessionId,
       context_files: pinnedContextFiles.join("\n"),
       ...chatModelFormFields(),
     }),

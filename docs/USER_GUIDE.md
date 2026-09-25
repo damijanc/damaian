@@ -144,6 +144,12 @@ is disabled until a session is open, and a new session starts in Code. No
 confirmation is asked in either direction. A plan made in Plan mode stays as it
 is when you switch to Code to carry it out.
 
+A prompt that reads like a file-change request, such as `fix the bug in the
+config file`, goes to the patch-preview flow described under
+[File Changes](#file-changes) rather than to the assistant's tools. That flow
+follows the open session's mode too: outside Code it is refused before the model
+is asked anything.
+
 Mode is also checked when you act on something the assistant asked for earlier.
 Approving a command, MCP call or browser diagnostic that was waiting for you,
 or applying a stored patch, is refused if the session's *current* mode does not
@@ -163,12 +169,7 @@ Known limits:
   three accept `--output=<file>`, which writes a file. In Plan or Review, a path
   inside the repository is therefore not refused. A path outside it needs
   approval and is refused.
-- A prompt that reads like a file-change request, such as `fix the bug in the
-  config file`, goes to the separate patch-preview flow described under
-  [File Changes](#file-changes), not to the assistant's tools. That flow does not
-  read the open session's mode, so it can produce a patch preview in any mode.
-  Nothing is written unless you select `Apply Selected`. The CLI's
-  `propose-edit` has no session and no mode either.
+- The CLI's `propose-edit` runs outside any session, so no mode applies to it.
 
 ## Provider Limits and Retries
 

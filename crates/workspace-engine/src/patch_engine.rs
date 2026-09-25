@@ -42,6 +42,13 @@ pub struct ProposedPatch {
     /// `create_patch` leaves this empty and the orchestrator that owns the
     /// session fills it in before saving.
     pub session_id: String,
+    /// The chat session the user proposed this patch from, when it differs
+    /// from `session_id`, or empty. `EditOrchestrator::propose_edit` writes
+    /// into a session of its own, which always reads as Code, so apply
+    /// re-checks this session's mode instead: switching the conversation to
+    /// Ask after the preview appears must still refuse the apply (spec 20
+    /// §7.3).
+    pub origin_session_id: String,
     pub summary: String,
     pub status: String,
     pub created_at_ms: u128,
@@ -210,6 +217,7 @@ impl PatchEngine {
             // Filled in by the caller that owns the session — see the field's
             // doc comment.
             session_id: String::new(),
+            origin_session_id: String::new(),
             summary: summary.to_string(),
             status: "pending".to_string(),
             created_at_ms: now_millis(),

@@ -300,6 +300,7 @@ fn a_pending_approval_survives_restart_with_its_proposal() {
     let patch = workspace_engine::ProposedPatch {
         id: "patch_pending".to_string(),
         session_id: fixture.session_id.clone(),
+        origin_session_id: String::new(),
         task_id: Some("task_x".to_string()),
         summary: "waiting".to_string(),
         status: "pending".to_string(),
