@@ -1823,17 +1823,66 @@ pub fn classify_refusal(meta: &ResponseMeta, raw: &str) -> Option<ProviderRefusa
     classify_refusal_from_body(raw)
 }
 
-/// The body-only fallback: a provider error object's structured `code`/`type`
-/// field, examined only when no status classified the response. Free prose is
-/// never the signal — a message mentioning "connection" or a request id
-/// carrying "429" must not drive a refusal, which is the point of reading the
-/// `code`/`type` field rather than the `message`.
+/// The body-only fallback, examined only when no status classified the
+/// response. The signal is a provider error object: a top-level JSON object,
+/// or an SSE `data:` event, whose own key is `error`. Nothing else counts — the
+/// raw body of a stream is every token the model produced, so a substring
+/// search over it matches the model's own answer (spec 48 §7: a streamed token
+/// `error` became `"content":"error"` and failed a completed task). A stream
+/// that delivered content and then finished normally is never a refusal, even
+/// if an error event appeared in it.
 fn classify_refusal_from_body(raw: &str) -> Option<ProviderRefusal> {
-    if !raw.contains("\"error\"") {
+    let events: Vec<serde_json::Value> = match serde_json::from_str(raw.trim()) {
+        Ok(value) => vec![value],
+        Err(_) => raw
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("data:"))
+            .map(str::trim)
+            .filter(|payload| *payload != "[DONE]")
+            .filter_map(|payload| serde_json::from_str(payload).ok())
+            .collect(),
+    };
+
+    let mut error_object = None;
+    let mut delivered_content = false;
+    let mut finished_normally = false;
+    for event in &events {
+        if let Some(error) = event.get("error").filter(|error| !error.is_null()) {
+            error_object.get_or_insert(error);
+        }
+        for choice in event
+            .get("choices")
+            .and_then(|choices| choices.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let delta = choice.get("delta").or_else(|| choice.get("message"));
+            delivered_content |= delta.is_some_and(|delta| {
+                ["content", "reasoning_content"].iter().any(|field| {
+                    delta
+                        .get(field)
+                        .and_then(|text| text.as_str())
+                        .is_some_and(|text| !text.is_empty())
+                }) || delta
+                    .get("tool_calls")
+                    .is_some_and(|calls| !calls.is_null())
+            });
+            // A `finish_reason` of `"error"` is how some providers end a stream
+            // they aborted; it is not a normal finish.
+            finished_normally |= choice
+                .get("finish_reason")
+                .and_then(|reason| reason.as_str())
+                .is_some_and(|reason| reason != "error");
+        }
+    }
+
+    if delivered_content && finished_normally {
         return None;
     }
-    let code = extract_string_field(raw, "code")
-        .or_else(|| extract_string_field(raw, "type"))
+    let error = error_object?;
+    let code = ["code", "type"]
+        .iter()
+        .find_map(|field| error.get(field).and_then(|value| value.as_str()))
         .unwrap_or_default()
         .to_lowercase();
     Some(
@@ -2299,6 +2348,127 @@ mod tests {
                 retry_after_secs: None
             })
         );
+    }
+
+    /// One DeepSeek `chat.completion.chunk` SSE event, in the shape the
+    /// provider documents: every chunk carries `choices[].delta`, the last one
+    /// a `finish_reason`, and a `usage` block when `stream_options` asked.
+    fn deepseek_chunk(delta: &str, finish_reason: &str, usage: &str) -> String {
+        format!(
+            "data: {{\"id\":\"8f1c\",\"object\":\"chat.completion.chunk\",\"created\":1790000000,\
+             \"model\":\"deepseek-v4-flash\",\"system_fingerprint\":\"fp_1\",\"choices\":[{{\
+             \"index\":0,\"delta\":{delta},\"logprobs\":null,\"finish_reason\":{finish_reason}}}]\
+             {usage}}}\n\n"
+        )
+    }
+
+    #[test]
+    fn a_completed_2xx_stream_is_not_a_refusal_even_with_an_error_event_in_it() {
+        let meta = ResponseMeta {
+            status: Some(200),
+            retry_after_secs: None,
+        };
+        let raw = [
+            "data: {\"error\":{\"code\":\"rate_limit_exceeded\"}}\n\n".to_string(),
+            completed_stream_naming_the_error_field(),
+        ]
+        .concat();
+        assert_eq!(classify_refusal(&meta, &raw), None);
+    }
+
+    /// A complete streamed answer about a tool result's `error` field. The
+    /// model emits the bare word as one token — here after a backtick — so one
+    /// chunk's JSON reads `"content":"error"`, carrying the quoted substring the
+    /// old body check matched on. Spec 48 §7.
+    fn completed_stream_naming_the_error_field() -> String {
+        [
+            deepseek_chunk("{\"role\":\"assistant\",\"content\":\"\"}", "null", ""),
+            deepseek_chunk(
+                "{\"reasoning_content\":\"The companion JSON has an \"}",
+                "null",
+                "",
+            ),
+            deepseek_chunk("{\"reasoning_content\":\"error\"}", "null", ""),
+            deepseek_chunk("{\"reasoning_content\":\" key set to null.\"}", "null", ""),
+            deepseek_chunk("{\"content\":\"The page loaded; `\"}", "null", ""),
+            deepseek_chunk("{\"content\":\"error\"}", "null", ""),
+            deepseek_chunk("{\"content\":\"` is null.\"}", "null", ""),
+            deepseek_chunk(
+                "{\"content\":\"\"}",
+                "\"stop\"",
+                ",\"usage\":{\"prompt_tokens\":2048,\"completion_tokens\":24,\
+                 \"total_tokens\":2072,\"prompt_cache_hit_tokens\":1920,\
+                 \"prompt_cache_miss_tokens\":128}",
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn a_completed_2xx_stream_whose_content_names_error_is_not_a_refusal() {
+        let meta = ResponseMeta {
+            status: Some(200),
+            retry_after_secs: None,
+        };
+        assert_eq!(
+            classify_refusal(&meta, &completed_stream_naming_the_error_field()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_completed_stream_naming_error_streams_its_answer_end_to_end() {
+        let transport = MockModelTransport::sequence_with_status(vec![(
+            completed_stream_naming_the_error_field(),
+            Some(200),
+            None,
+        )]);
+        let mut adapter = OpenAICompatibleAdapter::new("deepseek-v4-flash", transport);
+        let run = adapter
+            .stream_response(
+                &test_request(),
+                &CancelToken::new(),
+                &mut |_| {},
+                &mut |_| {},
+            )
+            .expect("a completed 200 stream is an answer, not a refusal");
+        assert_eq!(run.content, "The page loaded; `error` is null.");
+    }
+
+    #[test]
+    fn a_2xx_stream_carrying_an_error_event_is_classified_from_it() {
+        // A provider that accepts the request, streams, then emits an error
+        // object as its own `data:` event instead of finishing.
+        let meta = ResponseMeta {
+            status: Some(200),
+            retry_after_secs: None,
+        };
+        let raw = [
+            deepseek_chunk("{\"content\":\"Partial\"}", "null", ""),
+            "data: {\"error\":{\"code\":\"server_overloaded\",\"message\":\"try later\"}}\n\n"
+                .to_string(),
+        ]
+        .concat();
+        assert_eq!(
+            classify_refusal(&meta, &raw),
+            Some(ProviderRefusal::Overloaded {
+                retry_after_secs: None
+            })
+        );
+    }
+
+    #[test]
+    fn a_2xx_body_whose_error_key_is_not_top_level_is_not_a_refusal() {
+        // `error` nested inside a non-error object is data, not a provider
+        // error object.
+        let meta = ResponseMeta {
+            status: Some(200),
+            retry_after_secs: None,
+        };
+        let raw = "{\"choices\":[{\"message\":{\"content\":\"{\\\"error\\\":null}\"}}],\
+                   \"meta\":{\"error\":{\"code\":\"rate_limit_exceeded\"}}}";
+        assert_eq!(classify_refusal(&meta, raw), None);
     }
 
     #[test]

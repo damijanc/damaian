@@ -169,10 +169,16 @@ log and the UI can branch on a value instead of a sentence.
 Classification order, and it is not negotiable:
 
 1. **Status, when the transport reported one.** The table above, exhaustively.
-2. **Body, only when the status is absent.** A mock, or a provider returning 200
-   with an error object — which some do. The body check looks at a provider
-   error object's `type`/`code` field, not at free prose.
-3. **Nothing else.** No substring search over the message.
+2. **Body, only when no status classified the response.** The status is absent
+   (a mock), or it is 1xx–3xx — a provider returning 200 with an error object,
+   which some do. A provider error object is a top-level JSON object, or an SSE
+   `data:` event, whose own key is `error`. Nothing nested counts, and nothing
+   found by searching the raw text: for a stream, the raw is every token the
+   model produced (§7). The check reads that object's `code`/`type` field, not
+   free prose. A stream that delivered content and finished with a
+   non-`"error"` `finish_reason` is an answer, not a refusal, even if an error
+   event appeared in it.
+3. **Nothing else.** No substring search over the message or the body.
 
 `is_retryable_message` stays, narrowed to what it is actually reachable for:
 curl's own transport-level stderr. Its `"rate limit"` and `"429"` arms are
@@ -340,30 +346,52 @@ specified separately in
 [spec 56](../56_provider_fallback_consent.md). §5.6 is its requirement, not this
 spec's.
 
-**Open defect, found 2026-09-28: a completed 200 stream was classified as a
-refusal.** This came from spec 12's live scenario run (its `proposal.md` §8),
-with DeepSeek `deepseek-v4-flash`. The call ran after an approved browser
-scenario. It streamed a complete answer over HTTP 200, then `classify_refusal`
-returned `ProviderRefusal::Unknown`. The task ended `failed`, the answer was
-already on screen, and the audit's `message` was only the code:
-`provider_refused (provider refused after 1 attempts)`. So
-`extract_error_message` found nothing in the body.
+**Defect fixed 2026-09-28: a completed 200 stream was classified as a
+refusal.** Found in spec 12's live scenario run (its `proposal.md` §8), with
+DeepSeek `deepseek-v4-flash`. The call after an approved browser scenario
+streamed a complete answer over HTTP 200, and `classify_refusal` returned
+`ProviderRefusal::Unknown`. The task ended `failed` with the answer already on
+screen.
 
-The path is in `model.rs`. `classify_refusal`'s status match falls through on
-1xx–3xx to `classify_refusal_from_body`. That function treats any raw body
-containing `"error"` as a refusal, and a body with no recognised `code`/`type`
-becomes `Unknown`. §5.2 step 2 does intend to cover "a provider returning 200
-with an error object". But what the check scans is the whole SSE stream,
-matched as a substring, not a top-level error object. For a stream that has
-already delivered content, that is exactly the free-text matching §5.2 step 3
-rules out. Which bytes matched is not known, because the raw stream is not
-logged. This also bears on the first open item below.
+*The trigger.* `classify_refusal_from_body` treated any raw body containing the
+quoted substring `"error"` as a refusal, and the raw of a streamed call is the
+whole SSE stream. DeepSeek sends each token in its own
+`chat.completion.chunk` event. When the model emits the bare word `error` as
+one token (after a backtick or a quote, as in "`` `error` `` is null"), that
+chunk's JSON reads `"content":"error"` (or `"reasoning_content":"error"`). That
+is the substring. No chunk has a `code` or `type` field, so the result was
+`Unknown`. No chunk has a `message` field either, so `extract_error_message`
+found nothing, which matches the audit's bare
+`provider_refused (provider refused after 1 attempts)`. A tool result
+discussing companion JSON with an `error` key makes that token likely. This was
+reproduced from the documented DeepSeek stream format, not from the live bytes,
+because the raw stream is not logged. It explains every observed fact, but it
+is the demonstrated cause, not a captured one.
+
+*The fix.* §5.2 step 2 now defines the error object structurally: the body is
+parsed as one JSON value, or else split into SSE `data:` events. Only a
+top-level `error` key counts, and its own `code`/`type` is read. A stream that
+delivered content and finished with a non-`"error"` `finish_reason` is never a
+refusal. Non-2xx classification is unchanged. Pinned in `model.rs` by
+`a_completed_2xx_stream_whose_content_names_error_is_not_a_refusal`,
+`a_completed_stream_naming_error_streams_its_answer_end_to_end` (the adapter
+returns the answer instead of `Err`),
+`a_completed_2xx_stream_is_not_a_refusal_even_with_an_error_event_in_it`,
+`a_2xx_body_whose_error_key_is_not_top_level_is_not_a_refusal`, and
+`a_2xx_stream_carrying_an_error_event_is_classified_from_it`. The first, second
+and fourth failed before the fix, the first two with exactly the live run's
+`Some(Unknown)`.
+
+*Whether any configured provider returns an error object with HTTP 200.* Not
+established. The one live 200 "refusal" on record was this false positive, not
+an error object. No configured provider has been observed sending one, so
+§5.2's second step is still a fallback for mocks and for a mid-stream error
+event, not a measured behaviour.
 
 Still to record from implementation:
 
-- Whether any configured provider returns an error object with HTTP 200, which
-  would make §5.2's second classification step load-bearing rather than a
-  fallback for mocks.
+- Whether any configured provider returns an error object with HTTP 200 (see
+  above: not observed so far).
 - The observed `Retry-After` behaviour of each provider tested — whether one is
   sent at all, and whether it is honest.
 - Whether the wall-clock ceiling of 90s proved too short or too long in
