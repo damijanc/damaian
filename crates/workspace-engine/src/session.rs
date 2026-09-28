@@ -1345,6 +1345,47 @@ impl SessionStore {
         Ok(plans)
     }
 
+    /// Appends one browser diagnostic run (spec 12 `context.md` §3.3). The
+    /// record must already be redacted: this store writes what it is given.
+    pub fn append_web_diagnostic(
+        &self,
+        session_id: &str,
+        record: &crate::web_diagnostics::WebDiagnosticRecord,
+    ) -> Result<()> {
+        let payload = serde_json::to_string(record).map_err(|error| {
+            crate::error::ClientError::Io(format!("web diagnostic serialization: {error}"))
+        })?;
+        self.append_session_event(session_id, "web_diagnostic_recorded", &payload)
+    }
+
+    /// Every task's diagnostic runs, keyed by task id, in log order. Reads
+    /// `active_events`, so a rewound turn's diagnostics go with it, as its
+    /// plan does.
+    pub fn read_session_web_diagnostics(
+        &self,
+        session_id: &str,
+    ) -> Result<HashMap<String, Vec<crate::web_diagnostics::WebDiagnosticRecord>>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(HashMap::new());
+        };
+        let mut records: HashMap<String, Vec<crate::web_diagnostics::WebDiagnosticRecord>> =
+            HashMap::new();
+        for event in active_events(&content) {
+            if event.event_type != "web_diagnostic_recorded" {
+                continue;
+            }
+            if let Ok(record) =
+                serde_json::from_value::<crate::web_diagnostics::WebDiagnosticRecord>(event.payload)
+            {
+                records
+                    .entry(record.task_id.clone())
+                    .or_default()
+                    .push(record);
+            }
+        }
+        Ok(records)
+    }
+
     /// Records that the user reviewed this task's plan and let the work go
     /// ahead. Spec 21 §5.5.
     ///
@@ -2242,6 +2283,66 @@ mod tests {
         store.rewind_conversation(&session.id, rewind_to).unwrap();
 
         assert_eq!(store.session_mode(&session.id), SessionMode::Ask);
+    }
+
+    fn web_record(id: &str, task_id: &str, page_error: &str) -> crate::WebDiagnosticRecord {
+        let json = serde_json::json!({
+            "url": "http://localhost:5001/",
+            "status": 200,
+            "page_errors": [page_error],
+        });
+        crate::WebDiagnosticRecord {
+            id: id.to_string(),
+            task_id: task_id.to_string(),
+            tool: "inspect_web_page".to_string(),
+            url: "http://localhost:5001/".to_string(),
+            recorded_at_ms: 1,
+            report: crate::WebDiagnosticReport::from_text(json.to_string(), false),
+        }
+    }
+
+    /// `context.md` §3.3: diagnostics replay per task in log order, and a
+    /// rewound turn's diagnostics go with it, as its plan does.
+    #[test]
+    fn web_diagnostics_replay_per_task_in_order_and_drop_with_a_rewind() {
+        let store = SessionStore::new(temp_data_dir("web-diagnostics"));
+        let session = store.create_session("repo_1", "Diagnosed").unwrap();
+        let task_a = store
+            .create_task(&session.id, "why is the page blank?", "mock", "m")
+            .unwrap();
+        let task_b = store
+            .create_task(&session.id, "and the login form?", "mock", "m")
+            .unwrap();
+        let r1 = web_record("webdiagrec_1", &task_a.id, "first");
+        let r2 = web_record("webdiagrec_2", &task_b.id, "second");
+        let r3 = web_record("webdiagrec_3", &task_a.id, "third");
+
+        store.append_web_diagnostic(&session.id, &r1).unwrap();
+        store.append_web_diagnostic(&session.id, &r2).unwrap();
+        let before_r3 = store.latest_event_seq(&session.id).unwrap();
+        store.append_web_diagnostic(&session.id, &r3).unwrap();
+
+        let all = store.read_session_web_diagnostics(&session.id).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[&task_a.id], vec![r1.clone(), r3]);
+        assert_eq!(all[&task_b.id], vec![r2]);
+
+        store.rewind_conversation(&session.id, before_r3).unwrap();
+
+        let rewound = store.read_session_web_diagnostics(&session.id).unwrap();
+        assert_eq!(rewound[&task_a.id], vec![r1]);
+    }
+
+    #[test]
+    fn a_session_with_no_log_has_no_web_diagnostics() {
+        let store = SessionStore::new(temp_data_dir("web-diagnostics-missing"));
+
+        assert!(
+            store
+                .read_session_web_diagnostics("never_created")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

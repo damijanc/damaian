@@ -13,7 +13,7 @@ diagnostic card, and §8's live scenario check.
 |---|---|---|
 | 1 · Typed report: `WebDiagnosticDetails` parsed from the companion's JSON, artifact metadata, `redacted`, `tool_failed` | Done 2026-09-25 | Landed as planned in `web_diagnostics.rs`: `details`/`via` on the report, the six detail types (re-exported from `lib.rs`), one `serde_json` parse in `from_text`, `tool_failed`, `problem_count`, and `redacted` written as one explicit method per struct (artifacts included). `extract_artifacts_from_text` became `artifacts_from_value` + `artifact_record`: `artifact_metadata` first, then any `artifacts` path not already listed. Tests: the 7 new `web_diagnostics::tests` plus the 4 existing browser tests pass (11/11); all three Step 8 mutations fail the named test and were reverted; `cargo fmt --check` and `clippy -p workspace-engine -D warnings` clean. **Deviation — the secret fixture:** `ghp_…` does match the default generic-token rule, but the scanner skips a token preceded by a token byte, and `/` is one (`is_embedded_token_byte`). So a secret in a URL *path* (`…:5001/<secret>.js`) is never redacted, and the planned fixture could not pass. The test puts URL secrets in query values (`?t=<secret>`) instead, and also covers `url`, `method`, `resource_type`, an artifact path and `via`. **For Task 2:** that scanner gap means a credential in a URL path survives `redacted()`; it is a scanner property, not this task's, and is not fixed here. Every existing fixture is plain text, so `details` is `None` on all current engine paths until the runner stops prefixing (Task 2). A `dom_summary` with none of the known keys (e.g. `{"error": …}`) is `None`. |
 | 2 · Model text rendered from the typed report; retry counting on `tool_failed` | Done 2026-09-25 | **`render_for_model`** (`web_diagnostics.rs`) is built from small helpers: `found_header`, `push_section`, `pluralize`/`noun_for`, `truncate_chars`, `WebDiagnosticDetails::problem_sections`/`push_context`, and a `model_item()` on each of console entry, failed request and step. It follows Step 3's rules exactly. Choices the plan left open: the URL line falls back to `url` when `final_url` is missing; a failed request with neither status nor failure reads `→ failed`; the 500-character cap applies to the whole item body, location included; a `tool_error` header still lists any problems the partial report carries. **`format_web_diagnostic_result`** redacts and uses the rendered text when there is one, and otherwise runs today's code byte for byte. `Artifacts:` is unchanged. **Step 6:** the `WebDiagnostic` arm was `browser_tool_result_failed`'s **only** caller, so the function was deleted. It had no test of its own. Runner failures still count, because the MCP runner returns either `Err` or `is_error: true`, and `foundation.rs`'s `repeated_failed_browser_diagnostics_are_stopped` (`StaticWebDiagnosticsRunner::error`, `is_error: true`) still passes. **Step 7:** the shaping after the call moved into `browser_report_from_tool_result(report, call, data_dir, via)` in `desktop-shell/src/lib.rs`, so it can be tested without an MCP server. There was no existing materialisation test, so a new end-to-end one was added: `a_structured_browser_report_is_rendered_and_lists_the_materialised_artifact`. It runs a real turn with a runner that calls that helper on a companion JSON whose screenshot is a real temp file under `…/runs/`. It pins that `Artifacts:` lists `web-diagnostics/<session>/<task>/run-…/20260925-1-page.png (1280x720)`, that the companion path does not appear, that there is no prose prefix, and that there is a `- Source:` line. **Step 8:** the §5.1 example was rewritten, with a sentence citing `context.md` §3.2. **Tests:** `workspace-engine` with filter `web_diagnostics + web + browser` 22/22 (includes the 6 new renderer tests; the 2 retry tests were run separately with `failing_tool + retry_limit`, 2/2), `desktop-shell` with filter `browser + web_diagnostic` 1/1. `cargo fmt --check` and `clippy -p workspace-engine -p desktop-shell --all-targets -D warnings` are clean. **Mutations:** (1) reverting Step 6 to the verbatim old helper fails `a_page_with_errors_is_not_a_failing_tool` (2 runs, not 4). (2) Always rendering `report.text` fails that test and the desktop-shell test on the header. (3) Skipping materialisation fails the desktop-shell test with the `/…/runs/` path. **Deviation — the Step 6 mutation:** once Step 4 is in place, the renderer heads a report "failed: …" exactly when `tool_failed()` is true. The old helper's `starts_with` clause therefore agrees with the new rule, as §3.2 intended. The two rules differ only on the old `contains("tool call failed" / "mcp tool reported an error")` clauses. So test 1's page error is `"Error: agent tool call failed: …"`, which the old rule wrongly counted. `a_companion_tool_error_counts_toward_the_retry_limit` cannot fail when Step 6 alone is reverted, but it did fail against the code from before Steps 4 and 6 (the Step 5 run: 4 runs, not 2). The retry tests use a new `FixedReportWebRunner` plus an `inspect_four_times` helper (one call per round). **For Task 3:** record from `report.redacted(&scanner)` at the same point in the arm where `report` is still an `Ok(WebDiagnosticReport)`, before `format_web_diagnostic_result` consumes it. The second dispatch site goes through `run_web_diagnostic_call` (report run and formatted in one step), so it needs the same split. `via` is now set on every MCP-runner report. The URL-path secret gap from Task 1 still applies to the rendered text. That gap is now closed (2026-09-25): a `ghp`, `github_pat` or `xox*` token right after `/` is redacted, while the short prefixes `sk`/`pk`/`rk` still ignore a `/`-preceded match to keep paths such as `pkg_…` and `skills_…` intact. |
-| 3 · Record, persist and stream diagnostics; `/api/session` field; reveal endpoint | Not started | |
+| 3 · Record, persist and stream diagnostics; `/api/session` field; reveal endpoint | Done 2026-09-28 | **Landed:** `WebDiagnosticRecord` (`web_diagnostics.rs`, re-exported). `SessionStore::append_web_diagnostic` / `read_session_web_diagnostics` (`session.rs`, event `web_diagnostic_recorded`, replayed over `active_events`, keyed by task id in log order; a missing log is an empty map). `ChatOrchestrator::run_and_record_web_diagnostic` is the only place a diagnostic runs: both the agentic arm and the approval resume call it, and `run_web_diagnostic_call` was deleted. The record takes `task_id`/`session_id` from the call's `with_context`, so the resume records under the task that asked for it. A record is written only when the runner returned a report (`Ok`), not for `Err`. **Id prefix:** `"webdiag"` was already the approval proposal's id (`chat.rs`), so records use `create_id("webdiagrec")`. **Shell:** `TurnEvent::WebDiagnostic(Box<WebDiagnosticRecord>)`, `web_diagnostic_json` (`serde_json::to_string`, `{}` on the impossible error, like `plan_json`'s evidence fallback), `task_states_json` gained a `web_diagnostics` parameter before `config`, and `POST /api/reveal-web-diagnostic-artifact` loads config with `config_for_repo` (the config half of `engine_for_repo`, so no engine is built) and runs `open -R` through the pure `web_diagnostic_reveal_target`. **For Task 4 — the wire contract:** (1) SSE event name **`web_diagnostic`**; its `data` is exactly one record's JSON. (2) Record JSON: `{"id":"webdiagrec_…","taskId":"task_…","tool":"inspect_web_page"|"run_web_scenario","url":"…","recordedAtMs":<number>,"report":{"text","artifacts":[{kind,path,mime_type,width,height}],"is_error","details":{url,final_url,title,status,page_errors,console:[{level,text,location:{url,line,column}}],failed_requests,dom_summary,steps,tool_error}|null,"via"}}`: camelCase envelope, snake_case report (Global Constraints). Artifact `path`s are the materialised `web-diagnostics/<session>/<task>/run-…/…` relative paths, redacted. (3) `/api/session`: `tasks[].webDiagnostics: [record…]` in run order, **absent** (not `[]`) for a task with none. (4) Reveal: `POST /api/reveal-web-diagnostic-artifact`, form fields **`repo`** (required, may not be empty) and **`path`** (the artifact's `web-diagnostics/…` relative path, as in the record); responds `{"path":"<absolute canonical path>"}`, or the standard error JSON for a path outside `<data-dir>/web-diagnostics/`, an absolute path, or `..`. **Tests:** `session::tests` 2 new (replay per task/order/rewind, missing log); `chat::mode_refusal_tests` 2 new (`a_web_diagnostic_is_recorded_redacted_and_streamed`, `an_approved_web_diagnostic_is_recorded_at_resume`, both seeding Task 1's `ghp_abcdefghijklmnopqrstuvwxyz0123456789` in a page error and reading the `.jsonl` directly); desktop-shell 4 new (`/api/session` HTTP round trip via `serve_for_test`, no-field case, SSE text via `write_sse_event` into a `Vec<u8>`, reveal-target refusals) plus the ignored `reveal_web_diagnostic_artifact_endpoint_selects_the_file_in_finder` (run line in its doc comment; isolated temp data dir, ephemeral port). `desktop-shell` `test(web_diagnostic) + test(session)` 10/10; `workspace-engine` `test(web) + test(browser) + test(session)` 54/54; `cargo fmt --check` and `clippy -p workspace-engine -p desktop-shell --all-targets --locked -D warnings` clean; `cargo check --workspace --all-targets` clean. The ignored Finder test was not run. **Mutations:** (1) record from `report` instead of `report.redacted(..)`: both engine tests fail on the secret assertions. (2) the resume path back to the unrecorded run: `an_approved_web_diagnostic_is_recorded_at_resume` fails and the turn test still passes. (Extra) passing an empty map to `task_states_json` in `/api/session` fails the HTTP round trip. All reverted. **Deviations:** (a) `TurnProgress::WebDiagnostic` carries `Box<WebDiagnosticRecord>`, not the bare record. Clippy's `large_enum_variant` rejects the unboxed ~480-byte variant under `-D warnings`. (b) The persistence test is in `session.rs`'s inline `mod tests` as the task says, but the `read_session_plans` tests it was meant to sit beside are actually in `tests/plan.rs`. It uses the same store calls they use (`create_session`, `create_task`, `latest_event_seq`, `rewind_conversation`). (c) The shell tests only went red at compile time (they name symbols that did not exist yet), so the extra mutation above stands in for a behavioural red. |
 | 4 · Diagnostic card in the desktop UI | Not started | |
 | 5 · Live scenario run, docs, and closing the spec | Not started | |
 
@@ -752,7 +752,7 @@ desktop-shell --all-targets --locked -- -D warnings`. Update the Progress row.
   - `/api/session` `tasks[].webDiagnostics: [record…]`. The field is absent when a task has none.
   - `POST /api/reveal-web-diagnostic-artifact` with form `{repo, path}`, returning `{"path": …}`
 
-- [ ] **Step 1: The record type.** In `web_diagnostics.rs`:
+- [x] **Step 1: The record type.** In `web_diagnostics.rs`:
 
 ```rust
 /// One diagnostic run as the session keeps it: already redacted (the
@@ -773,7 +773,7 @@ pub struct WebDiagnosticRecord {
 
 Re-export it from `lib.rs`.
 
-- [ ] **Step 2: Write the failing persistence test.** In `session.rs`, next to
+- [x] **Step 2: Write the failing persistence test.** In `session.rs`, next to
 the existing `read_session_plans` tests. Find them with
 `grep -n "fn .*read_session_plans\|mod .*tests" crates/workspace-engine/src/session.rs`,
 and use whatever store fixture those tests use.
@@ -794,7 +794,7 @@ Write it out in full against the real fixture helpers. The comment above
 describes the assertions, not code to leave in the test. Build the records
 with `WebDiagnosticReport::from_text(<small companion JSON>, false)`.
 
-- [ ] **Step 3: Implement the pair.** `append_web_diagnostic` serialises the
+- [x] **Step 3: Implement the pair.** `append_web_diagnostic` serialises the
 record with `serde_json::to_string` and calls
 `append_session_event(session_id, "web_diagnostic_recorded", &payload)`, the
 same way `append_plan` does. `read_session_web_diagnostics` walks
@@ -803,9 +803,9 @@ payload, skips any that fail, and pushes each onto
 `map.entry(record.task_id.clone())`. A missing log returns an empty map, like
 `read_session_plans`.
 
-- [ ] **Step 4: Run.** `cargo nextest run -p workspace-engine -E 'test(web_diagnostics_replay)'`. It should pass.
+- [x] **Step 4: Run.** `cargo nextest run -p workspace-engine -E 'test(web_diagnostics_replay)'`. It should pass.
 
-- [ ] **Step 5: Write the failing engine test.** In `chat.rs`'s test module:
+- [x] **Step 5: Write the failing engine test.** In `chat.rs`'s test module:
   1. Run a turn whose model calls `inspect_web_page` once.
   2. Use a runner that returns companion JSON with a seeded fake secret in a
      page error. Use the same fixture token Task 1 settled on.
@@ -825,7 +825,7 @@ payload, skips any that fail, and pushes each onto
   `resume_after_command_decision_with_options` do. Resume with approval, and
   assert the record is appended and emitted there too.
 
-- [ ] **Step 6: Implement the helper and wire both sites.** In `ChatOrchestrator`:
+- [x] **Step 6: Implement the helper and wire both sites.** In `ChatOrchestrator`:
 
 ```rust
 /// Runs a browser diagnostic, records what it found, and returns the
@@ -875,9 +875,9 @@ the style of `Plan`. Say it is sent once per run, not per change. Add
 nothing else changes. Check with `cargo check` for any exhaustive match on
 `TurnProgress` besides `turn_progress_event`.
 
-- [ ] **Step 7: Run.** `cargo nextest run -p workspace-engine -E 'test(web) + test(browser)'`. Everything should pass.
+- [x] **Step 7: Run.** `cargo nextest run -p workspace-engine -E 'test(web) + test(browser)'`. Everything should pass.
 
-- [ ] **Step 8: Shell plumbing.** In `desktop-shell/src/lib.rs`:
+- [x] **Step 8: Shell plumbing.** In `desktop-shell/src/lib.rs`:
   - `TurnEvent::WebDiagnostic(Box<WebDiagnosticRecord>)`. Box it for the same
     reason `Plan` is boxed.
   - Map it in `turn_progress_event`.
@@ -903,7 +903,7 @@ nothing else changes. Check with `cargo check` for any exhaustive match on
      with the record JSON. Assert on the `write_sse_event` output into a
      `Vec<u8>`.
 
-- [ ] **Step 9: The reveal endpoint.** Add `("POST", "/api/reveal-web-diagnostic-artifact")`:
+- [x] **Step 9: The reveal endpoint.** Add `("POST", "/api/reveal-web-diagnostic-artifact")`:
   1. `parse_form`, then `required_form` for `repo` and `path`.
   2. Load the config the way `GET /api/web-diagnostic-artifact` does for
      `repo`.
@@ -922,7 +922,7 @@ nothing else changes. Check with `cargo check` for any exhaustive match on
   doc comment with its run line, modelled exactly on
   `reveal_in_finder_endpoint_opens_the_requested_repository_root`.
 
-- [ ] **Step 10: Checks.** `cargo nextest run -p desktop-shell -E 'test(web_diagnostic) + test(session)'`
+- [x] **Step 10: Checks.** `cargo nextest run -p desktop-shell -E 'test(web_diagnostic) + test(session)'`
 and `cargo nextest run -p workspace-engine -E 'test(web) + test(browser) + test(session)'`.
 Then `cargo fmt --all -- --check` and `cargo clippy -p workspace-engine -p
 desktop-shell --all-targets --locked -- -D warnings`.

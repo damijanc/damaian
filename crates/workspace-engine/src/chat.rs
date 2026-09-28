@@ -30,8 +30,8 @@ use crate::validation::{
 };
 use crate::vector_index::VectorIndexCache;
 use crate::web_diagnostics::{
-    WEB_SCENARIO_ACTIONS, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticReport,
-    WebDiagnosticsRunnerHandle,
+    WEB_SCENARIO_ACTIONS, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
+    WebDiagnosticReport, WebDiagnosticsRunnerHandle,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -186,6 +186,12 @@ pub enum TurnProgress {
     /// never existed. The plan is small and changes a handful of times per
     /// turn, so there is nothing to save by being clever here.
     Plan(TaskPlan),
+    /// One browser diagnostic run, already redacted, sent once per run when
+    /// it finishes (spec 12 `context.md` §3.3). The same record is appended
+    /// to the session log, so a reload shows what the live stream did.
+    /// Boxed because a record carries a whole report, several times larger
+    /// than every other variant.
+    WebDiagnostic(Box<WebDiagnosticRecord>),
 }
 
 /// The per-turn side channel: where answer tokens go, where progress goes, and
@@ -214,6 +220,10 @@ impl TurnSink<'_> {
 
     fn plan(&mut self, plan: &TaskPlan) {
         (self.on_progress)(TurnProgress::Plan(plan.clone()));
+    }
+
+    fn web_diagnostic(&mut self, record: WebDiagnosticRecord) {
+        (self.on_progress)(TurnProgress::WebDiagnostic(Box::new(record)));
     }
 }
 
@@ -534,8 +544,39 @@ impl ChatOrchestrator {
         }
     }
 
-    fn run_web_diagnostic_call(&self, call: &WebDiagnosticCall) -> String {
-        self.format_web_diagnostic_result(self.run_web_diagnostic_report(call))
+    /// Runs a browser diagnostic, records what it found, and returns the
+    /// model-facing text plus whether the *tool* failed (`context.md` §3.2).
+    /// Both dispatch sites — the agentic turn and the approval resume — go
+    /// through here, so neither can forget to persist or redact.
+    fn run_and_record_web_diagnostic(
+        &self,
+        call: &WebDiagnosticCall,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<(String, bool)> {
+        let report = self.run_web_diagnostic_report(call);
+        // No report at all — connection or configuration failure — is a
+        // failed call too.
+        let failed = report
+            .as_ref()
+            .map_or(true, WebDiagnosticReport::tool_failed);
+        if let (Ok(report), Some(session_id), Some(task_id)) =
+            (&report, call.session_id.as_deref(), call.task_id.as_deref())
+        {
+            // `webdiag` already names the approval proposal; a distinct prefix
+            // keeps the two id kinds apart.
+            let record = WebDiagnosticRecord {
+                id: create_id("webdiagrec"),
+                task_id: task_id.to_string(),
+                tool: call.name().to_string(),
+                url: self.scanner.redact(&call.url).text,
+                recorded_at_ms: now_millis(),
+                report: report.redacted(&self.scanner),
+            };
+            self.session_store
+                .append_web_diagnostic(session_id, &record)?;
+            sink.web_diagnostic(record);
+        }
+        Ok((self.format_web_diagnostic_result(report), failed))
     }
 
     fn format_web_diagnostic_result(&self, report: Result<WebDiagnosticReport>) -> String {
@@ -825,7 +866,7 @@ impl ChatOrchestrator {
             let content = if refused {
                 refusal_message(permission)
             } else if approved {
-                self.run_web_diagnostic_call(&call)
+                self.run_and_record_web_diagnostic(&call, sink)?.0
             } else {
                 format!(
                     "The user declined to run `{}` against `{}`. Do not request the same browser diagnostic again; answer using what you already know, noting the limitation if it matters.",
@@ -2522,15 +2563,10 @@ impl ChatOrchestrator {
                                 // the tool produced no diagnostic.
                                 (browser_retry_limit_note(retry_limit), ActionOutcome::Failed)
                             } else {
-                                let report = self.run_web_diagnostic_report(&call);
                                 // A page that throws is not a failed call
                                 // (spec 12 `context.md` §3.2).
-                                let failed = match &report {
-                                    Ok(report) => report.tool_failed(),
-                                    // No report at all — connection or configuration failure.
-                                    Err(_) => true,
-                                };
-                                let content = self.format_web_diagnostic_result(report);
+                                let (content, failed) =
+                                    self.run_and_record_web_diagnostic(&call, sink)?;
                                 if failed {
                                     *failed_browser_calls.entry(signature).or_insert(0) += 1;
                                 }
@@ -5506,6 +5542,146 @@ mod mode_refusal_tests {
         assert_eq!(results.len(), 4);
         assert_eq!(results[2], browser_retry_limit_note(2));
         assert_eq!(results[3], browser_retry_limit_note(2));
+    }
+
+    /// The fake token Task 1's redaction test uses; `ghp_` matches the
+    /// default generic-token rule.
+    const WEB_SECRET: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    const REPORT_WITH_SECRET: &str = r#"{"final_url": "http://localhost:5001/", "status": 200,
+        "page_errors": ["Error: token ghp_abcdefghijklmnopqrstuvwxyz0123456789 rejected"]}"#;
+
+    fn engine_with_fixed_report(repo: &Path, text: &'static str) -> WorkspaceEngine {
+        let mut engine = engine_with(repo);
+        engine
+            .chat_orchestrator
+            .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(FixedReportWebRunner {
+                text,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }));
+        engine
+    }
+
+    fn web_records(events: &[TurnProgress]) -> Vec<crate::WebDiagnosticRecord> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TurnProgress::WebDiagnostic(record) => Some((**record).clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn session_log(repo: &Path, session_id: &str) -> String {
+        fs::read_to_string(
+            repo.join(".damaian")
+                .join("sessions")
+                .join(format!("{session_id}.jsonl")),
+        )
+        .unwrap()
+    }
+
+    // Spec 12 `context.md` §3.3: a run is recorded, redacted, and streamed.
+    #[test]
+    fn a_web_diagnostic_is_recorded_redacted_and_streamed() {
+        let repo = temp_repo("web-record");
+        let engine = engine_with_fixed_report(&repo, REPORT_WITH_SECRET);
+        let session = session_in(&engine, &repo, SessionMode::Code);
+
+        let mut adapter = calls_then_answer(vec![call(
+            "call_1",
+            "inspect_web_page",
+            r#"{"url":"http://localhost:5001/"}"#,
+        )]);
+        let mut events = Vec::new();
+        let mut on_token = |_token: &str| {};
+        let cancel = CancelToken::new();
+        let mut on_progress = |event: TurnProgress| events.push(event);
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+        };
+        let result = engine
+            .chat_orchestrator
+            .ask_with_session(
+                &repo,
+                "Go ahead.",
+                &[],
+                Some(&session),
+                &mut adapter,
+                &mut sink,
+            )
+            .unwrap();
+
+        let emitted = web_records(&events);
+        assert_eq!(emitted.len(), 1, "one run, one record");
+        let record = &emitted[0];
+        assert_eq!(record.task_id, result.task.id);
+        assert_eq!(record.tool, "inspect_web_page");
+        assert_eq!(record.report.details.as_ref().unwrap().page_errors.len(), 1);
+        let stored = engine
+            .session_store
+            .read_session_web_diagnostics(&session)
+            .unwrap();
+        assert_eq!(stored[&result.task.id], vec![record.clone()]);
+        assert!(!format!("{record:?}").contains(WEB_SECRET));
+        assert!(!session_log(&repo, &session).contains(WEB_SECRET));
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    // The approval resume is the second dispatch site; it must record too.
+    #[test]
+    fn an_approved_web_diagnostic_is_recorded_at_resume() {
+        let repo = temp_repo("web-record-resume");
+        let engine = engine_with_fixed_report(&repo, REPORT_WITH_SECRET);
+        let session = session_in(&engine, &repo, SessionMode::Code);
+
+        let mut adapter = calls_then_answer(vec![call(
+            "call_1",
+            "inspect_web_page",
+            r#"{"url":"https://staging.example.com/"}"#,
+        )]);
+        let first = turn(&engine, &repo, &session, &mut adapter);
+        let proposal = first
+            .command_proposal
+            .expect("a non-loopback page needs approval");
+        assert!(
+            engine
+                .session_store
+                .read_session_web_diagnostics(&session)
+                .unwrap()
+                .is_empty(),
+            "nothing ran before the approval"
+        );
+
+        let mut events = Vec::new();
+        let mut on_token = |_token: &str| {};
+        let cancel = CancelToken::new();
+        let mut on_progress = |event: TurnProgress| events.push(event);
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+        };
+        let mut after = MockModelAdapter::new("Understood.");
+        engine
+            .chat_orchestrator
+            .resume_after_command_decision(&proposal.id, true, "tester", &mut after, &mut sink)
+            .unwrap();
+
+        let emitted = web_records(&events);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].task_id, first.task.id);
+        assert_eq!(emitted[0].url, "https://staging.example.com/");
+        let stored = engine
+            .session_store
+            .read_session_web_diagnostics(&session)
+            .unwrap();
+        assert_eq!(stored[&first.task.id], emitted);
+        assert!(!session_log(&repo, &session).contains(WEB_SECRET));
+
+        fs::remove_dir_all(repo).unwrap();
     }
 
     /// A stdio MCP server whose one tool has no read-only hint (so it is

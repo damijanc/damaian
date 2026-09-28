@@ -95,6 +95,21 @@ pub struct WebDiagnosticReport {
     pub via: Option<String>,
 }
 
+/// One diagnostic run as the session keeps it: already redacted (the
+/// session log is not, spec 17 §5.4), and self-describing so the card can
+/// render it without the tool message beside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebDiagnosticRecord {
+    pub id: String,
+    pub task_id: String,
+    /// `inspect_web_page` or `run_web_scenario`.
+    pub tool: String,
+    pub url: String,
+    pub recorded_at_ms: u128,
+    pub report: WebDiagnosticReport,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebDiagnosticDetails {
     pub url: Option<String>,

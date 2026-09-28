@@ -14,8 +14,8 @@ use workspace_engine::{
     OpenAICompatibleAdapter, PlanRevisionStep, ProcessRegistry, ProposedFilePatch,
     ResumeDecisionOptions, SearchOptions, Session, SessionMode, StepStatus, TaskPlan, TaskUsage,
     TokenUsage, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind,
-    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
-    allow_always_eligible, command_approval_prompt, ensure_data_dir_schema,
+    WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
+    WorkspaceEngine, allow_always_eligible, command_approval_prompt, ensure_data_dir_schema,
     normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
     parse_hunk_selection, parse_mcp_transport, patch_diff_text,
 };
@@ -580,6 +580,14 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 .session_store
                 .read_task_failure_kinds(&session_id)
                 .map_err(|error| error.to_string())?;
+            // Each turn's browser diagnostics, joined by `taskId` (spec 12
+            // `context.md` §3.3). Already redacted when recorded. Without
+            // this the card would exist only for the turn that ran it, and a
+            // reload would fall back to bare thumbnails.
+            let task_web_diagnostics = engine
+                .session_store
+                .read_session_web_diagnostics(&session_id)
+                .map_err(|error| error.to_string())?;
             write_response(
                 stream,
                 &request,
@@ -594,6 +602,7 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                         &task_usage,
                         &task_plans,
                         &task_failure_kinds,
+                        &task_web_diagnostics,
                         &engine.config
                     )
                 ),
@@ -718,6 +727,20 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             let form = parse_form(&request.body);
             let repo = required_form(&form, "repo")?;
             let path = reveal_in_finder(&repo)?;
+            write_response(
+                stream,
+                &request,
+                200,
+                "application/json",
+                &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
+            )
+        }
+        ("POST", "/api/reveal-web-diagnostic-artifact") => {
+            let form = parse_form(&request.body);
+            let repo = required_form(&form, "repo")?;
+            let relative_path = required_form(&form, "path")?;
+            let config = config_for_repo(&repo)?;
+            let path = reveal_web_diagnostic_artifact(&config, &relative_path)?;
             write_response(
                 stream,
                 &request,
@@ -1484,6 +1507,7 @@ fn turn_progress_event(progress: TurnProgress) -> TurnEvent {
         TurnProgress::Session(session_id) => TurnEvent::Session(session_id),
         TurnProgress::Phase(phase) => TurnEvent::Phase(phase),
         TurnProgress::Plan(plan) => TurnEvent::Plan(Box::new(plan)),
+        TurnProgress::WebDiagnostic(record) => TurnEvent::WebDiagnostic(record),
     }
 }
 
@@ -1900,6 +1924,33 @@ fn web_diagnostic_artifact_path(config: &Config, relative_path: &str) -> Result<
         return Err("artifact path escapes the Damaian data directory".to_string());
     }
     Ok(canonical)
+}
+
+/// Where `POST /api/reveal-web-diagnostic-artifact` may point Finder: exactly
+/// what `GET /api/web-diagnostic-artifact` may read (spec 12 `context.md`
+/// §3.4), so nothing outside `<data-dir>/web-diagnostics/` can be revealed.
+fn web_diagnostic_reveal_target(config: &Config, path: &str) -> Result<PathBuf, String> {
+    web_diagnostic_artifact_path(config, path)
+}
+
+fn reveal_web_diagnostic_artifact(config: &Config, path: &str) -> Result<PathBuf, String> {
+    let file = web_diagnostic_reveal_target(config, path)?;
+    let status = Command::new("open")
+        .arg("-R")
+        .arg(&file)
+        .status()
+        .map_err(|error| format!("failed to open Finder: {error}"))?;
+    if status.success() {
+        Ok(file)
+    } else {
+        Err(format!("Finder launch failed with status {status}"))
+    }
+}
+
+/// A recorded diagnostic as the card reads it, live or on reload. The record
+/// is camelCase at the envelope and snake_case inside `report`.
+fn web_diagnostic_json(record: &WebDiagnosticRecord) -> String {
+    serde_json::to_string(record).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn content_type_for_path(path: &Path) -> &'static str {
@@ -2891,6 +2942,8 @@ enum TurnEvent {
     /// an unboxed one would make every `TurnEvent` — one per streamed token —
     /// carry its footprint.
     Plan(Box<TaskPlan>),
+    /// Boxed for the same reason as `Plan`: a record carries a whole report.
+    WebDiagnostic(Box<WebDiagnosticRecord>),
     Token(String),
     Done(Box<ChatTurnResult>),
     Failed(String),
@@ -3005,6 +3058,9 @@ fn relay_turn_events<W: Write>(
                             write_sse_event(out, "phase", &phase_json(phase))
                         }
                         TurnEvent::Plan(plan) => write_sse_event(out, "plan", &plan_json(plan)),
+                        TurnEvent::WebDiagnostic(record) => {
+                            write_sse_event(out, "web_diagnostic", &web_diagnostic_json(record))
+                        }
                         TurnEvent::Token(token) => write_sse_event(
                             out,
                             "token",
@@ -3290,6 +3346,7 @@ fn task_states_json(
     usage: &HashMap<String, TaskUsage>,
     plans: &HashMap<String, TaskPlan>,
     failure_kinds: &HashMap<String, String>,
+    web_diagnostics: &HashMap<String, Vec<WebDiagnosticRecord>>,
     config: &Config,
 ) -> String {
     let mut entries: Vec<&String> = statuses.keys().collect();
@@ -3328,13 +3385,27 @@ fn task_states_json(
                 Some(kind) => format!(",\"failureKind\":\"{}\"", escape_json(kind)),
                 None => String::new(),
             };
+            // Absent when the turn ran no diagnostic, like `plan`, so the
+            // card appears only for turns that have one.
+            let web_diagnostics_field = match web_diagnostics.get(*id) {
+                Some(records) if !records.is_empty() => format!(
+                    ",\"webDiagnostics\":[{}]",
+                    records
+                        .iter()
+                        .map(web_diagnostic_json)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                _ => String::new(),
+            };
             format!(
-                "{{\"id\":\"{}\",\"status\":\"{}\"{}{}{}}}",
+                "{{\"id\":\"{}\",\"status\":\"{}\"{}{}{}{}}}",
                 escape_json(id),
                 escape_json(&statuses[*id]),
                 usage_json,
                 failure_kind_field,
-                plan_json_field
+                plan_json_field,
+                web_diagnostics_field
             )
         })
         .collect::<Vec<_>>()
@@ -3532,9 +3603,10 @@ mod tests {
         percent_decode, plan_json, plan_proposal_json, relay_turn_events, remember_model_api_key,
         render_markdown_with_optional_file_links, repository_config_review_json, require_api_token,
         run_server, run_terminal_command, save_config_file, sweep_orphaned_processes,
-        task_states_json, task_usage_json, terminal_cwd_for_repo, validate_context_files,
-        validate_working_folder, validate_workspace_path, verify_data_dir_schema_at,
-        write_basic_response,
+        task_states_json, task_usage_json, terminal_cwd_for_repo, turn_progress_event,
+        validate_context_files, validate_working_folder, validate_workspace_path,
+        verify_data_dir_schema_at, web_diagnostic_json, web_diagnostic_reveal_target,
+        write_basic_response, write_sse_event,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -3547,7 +3619,7 @@ mod tests {
     use workspace_engine::{
         AgentPlanProposal, CancelToken, Config, Evidence, GeneratedSecretWarning, MockModelAdapter,
         PlanStep, SessionMode, StepStatus, TaskPlan, TaskUsage, ToolCall, TurnProgress, TurnSink,
-        UsageSource, WorkspaceEngine,
+        UsageSource, WebDiagnosticRecord, WebDiagnosticReport, WorkspaceEngine,
     };
 
     /// Points every engine built in this test binary at a throwaway data
@@ -4085,6 +4157,38 @@ mod tests {
             response.starts_with("HTTP/1.1 200"),
             "unexpected response: {response}"
         );
+    }
+
+    /// Actually launches Finder, so this is excluded from normal `cargo
+    /// test` runs, like `reveal_in_finder_endpoint_opens_the_requested_repository_root`.
+    /// Run manually with `cargo test -p desktop-shell -- --ignored
+    /// reveal_web_diagnostic_artifact_endpoint_selects_the_file_in_finder` to
+    /// verify end-to-end. It writes only under the isolated temp data dir.
+    #[test]
+    #[ignore]
+    fn reveal_web_diagnostic_artifact_endpoint_selects_the_file_in_finder() {
+        let data_dir = isolated_data_dir();
+        let relative = "web-diagnostics/session_reveal/task_reveal/run-1/page.png";
+        let file = data_dir.join(relative);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, b"png").unwrap();
+        let (port, token) = serve_for_test();
+
+        let repo = std::env::temp_dir();
+        let body = format!("repo={}&path={relative}", repo.to_string_lossy());
+        let response = send_for_test(
+            port,
+            format!(
+                "POST /api/reveal-web-diagnostic-artifact HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/x-www-form-urlencoded\r\nx-damaian-api-token: {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "unexpected response: {response}"
+        );
+        assert!(response.contains("page.png"), "{response}");
     }
 
     /// The reported bug end to end: `apply selected` on flagged content used
@@ -5197,6 +5301,7 @@ mod tests {
             &usage,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             &Config::default(),
         );
 
@@ -5341,6 +5446,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             &Config::default(),
         );
 
@@ -5360,6 +5466,7 @@ mod tests {
             &statuses,
             &HashMap::new(),
             &plans,
+            &HashMap::new(),
             &HashMap::new(),
             &Config::default(),
         );
@@ -5384,10 +5491,150 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             &Config::default(),
         );
 
         assert!(!json.contains("\"plan\""), "{json}");
+    }
+
+    fn sample_web_diagnostic_record(task_id: &str) -> WebDiagnosticRecord {
+        WebDiagnosticRecord {
+            id: "webdiagrec_1".to_string(),
+            task_id: task_id.to_string(),
+            tool: "inspect_web_page".to_string(),
+            url: "http://localhost:5001/".to_string(),
+            recorded_at_ms: 1_758_800_000_000,
+            report: WebDiagnosticReport::from_text(
+                r#"{"final_url": "http://localhost:5001/", "status": 200,
+                    "page_errors": ["ReferenceError: game is not defined"]}"#,
+                false,
+            ),
+        }
+    }
+
+    /// Spec 12 `context.md` §3.3: the card must survive a reload, so the
+    /// recorded report rides on `/api/session`'s task, whole.
+    #[test]
+    fn a_reopened_session_carries_each_turns_web_diagnostics() {
+        isolated_data_dir();
+        let engine = default_engine().expect("default engine");
+        let session = engine
+            .session_store
+            .create_session("repo_web_diagnostic_test", "diagnosed")
+            .expect("create session");
+        let task = engine
+            .session_store
+            .create_task(&session.id, "why is it blank?", "mock", "m")
+            .expect("create task");
+        engine
+            .session_store
+            .append_web_diagnostic(&session.id, &sample_web_diagnostic_record(&task.id))
+            .expect("append record");
+        let (port, token) = serve_for_test();
+
+        let response = get_session_for_test(port, &token, &session.id);
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let body = response.split("\r\n\r\n").nth(1).expect("a body");
+        let json: serde_json::Value = serde_json::from_str(body).expect("JSON body");
+        let task_json = json["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .find(|entry| entry["id"] == task.id.as_str())
+            .expect("the task");
+        assert_eq!(
+            task_json["webDiagnostics"][0]["report"]["details"]["page_errors"][0],
+            "ReferenceError: game is not defined",
+            "{body}"
+        );
+        assert_eq!(task_json["webDiagnostics"][0]["taskId"], task.id.as_str());
+    }
+
+    #[test]
+    fn a_turn_that_never_diagnosed_carries_no_web_diagnostics_field() {
+        let statuses = HashMap::from([("task_1".to_string(), "complete".to_string())]);
+        let web_diagnostics = HashMap::from([(
+            "task_2".to_string(),
+            vec![sample_web_diagnostic_record("task_2")],
+        )]);
+
+        let json = task_states_json(
+            &statuses,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &web_diagnostics,
+            &Config::default(),
+        );
+
+        assert!(json.contains("\"id\":\"task_1\""), "{json}");
+        assert!(!json.contains("webDiagnostics"), "{json}");
+    }
+
+    #[test]
+    fn a_web_diagnostic_progress_event_streams_as_web_diagnostic() {
+        let record = sample_web_diagnostic_record("task_1");
+
+        let event = turn_progress_event(TurnProgress::WebDiagnostic(Box::new(record.clone())));
+        let TurnEvent::WebDiagnostic(streamed) = event else {
+            panic!("expected TurnEvent::WebDiagnostic");
+        };
+        let mut out = Vec::new();
+        write_sse_event(&mut out, "web_diagnostic", &web_diagnostic_json(&streamed)).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        let data = text
+            .strip_prefix("event: web_diagnostic\ndata: ")
+            .and_then(|rest| rest.strip_suffix("\n\n"))
+            .unwrap_or_else(|| panic!("not a web_diagnostic event: {text}"));
+        let parsed: WebDiagnosticRecord = serde_json::from_str(data).expect("record JSON");
+        assert_eq!(parsed, record);
+        assert!(data.contains("\"recordedAtMs\":"), "{data}");
+    }
+
+    /// Spec 12 `context.md` §3.4: reveal reuses the artifact path check, so
+    /// nothing outside `<data-dir>/web-diagnostics/` can be shown in Finder.
+    #[test]
+    fn web_diagnostic_reveal_target_accepts_only_artifacts_under_the_data_dir() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "damaian-reveal-target-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let run_dir = data_dir.join("web-diagnostics/session_1/task_1/run-1");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(run_dir.join("page.png"), b"png").unwrap();
+        fs::write(data_dir.join("config-secret.txt"), b"no").unwrap();
+        let config = Config {
+            data_dir: data_dir.clone(),
+            enable_index_watcher: false,
+            ..Config::default()
+        };
+
+        let accepted = web_diagnostic_reveal_target(
+            &config,
+            "web-diagnostics/session_1/task_1/run-1/page.png",
+        )
+        .expect("a real artifact is accepted");
+        assert!(accepted.ends_with("run-1/page.png"), "{accepted:?}");
+
+        for refused in [
+            "config-secret.txt",
+            "sessions/session_1.jsonl",
+            "/etc/hosts",
+            "web-diagnostics/../config-secret.txt",
+        ] {
+            assert!(
+                web_diagnostic_reveal_target(&config, refused).is_err(),
+                "{refused} must be refused"
+            );
+        }
+
+        fs::remove_dir_all(data_dir).unwrap();
     }
 
     // The list view needs the counts and the coverage flag, and must not grow

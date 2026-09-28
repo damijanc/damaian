@@ -121,8 +121,8 @@ pub use validation::{
 };
 pub use web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebConsoleEntry, WebDiagnosticArtifact, WebDiagnosticCall,
-    WebDiagnosticDetails, WebDiagnosticKind, WebDiagnosticReport, WebDiagnosticsRunner,
-    WebDiagnosticsRunnerHandle, WebDomSummary, WebFailedRequest, WebScenarioStep,
-    WebSourceLocation,
+    WebDiagnosticDetails, WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport,
+    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WebDomSummary, WebFailedRequest,
+    WebScenarioStep, WebSourceLocation,
 };
 pub use workspace_engine::WorkspaceEngine;
