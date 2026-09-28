@@ -419,8 +419,61 @@ Implemented:
 An interaction compatibility regression was identified in the legacy MCP
 `run_scenario` adapter: it forwarded both the Damaian-owned `actions` field and
 the adapter-generated `steps` field. The adapter now sends only `steps` to that
-legacy tool. Spec completion remains pending a real interaction-scenario check
-against the configured browser MCP server.
+legacy tool.
+
+**Live scenario check, 2026-09-28 (Task 5 Step 1): the diagnostics passed, but
+the turn failed, so the spec stays open.** The run used snake-game on
+`localhost:5001` (Docker Compose), the companion `playwright-mcp`, and
+DeepSeek `deepseek-v4-flash`. The shell was a separate instance of this
+checkout on port 4901 with its own data directory. The committed snake-game no
+longer has the Register bug, so a throwaway `updateHighScoreDisplay();` before
+`const game = …` recreated it for the run. That line throws "Cannot access
+'game' before initialization" at module load, and it was reverted afterwards.
+The standalone `damaian-desktop-shell` cannot be driven from a browser: its
+API token only reaches the webview through Tauri, and the Tauri app is pinned
+to port 4765. So a throwaway launcher outside the repository called this
+checkout's public `desktop_shell::run_server` with a known token. The server
+code was unchanged.
+
+What held:
+
+- **Turn 1**, "Why does the Register button do nothing on …?". The model
+  called `inspect_web_page` with no approval, because it was loopback. It
+  received `Browser diagnostic found 1 page error.` followed by the
+  `pageerror:` line, the URL, the title and the `Source:` line. In the same
+  turn it named the cause and proposed the right patch (criteria 1 and 2).
+  The card appeared **during the turn**, which was the first real test of the
+  live `web_diagnostic` handler.
+- **Turn 2** asked for a reproduction. The model proposed `run_web_scenario`:
+  fill `#username` and `#password`, click `#register-btn`, wait 1000 ms,
+  screenshot. The prompt showed the target origin and `BROWSER-MEDIUM`. Once
+  approved, the companion ran all 8 steps successfully. The card appeared
+  during the resume, which was the first real test of the resume handler. It
+  showed 2 page errors, a DOM summary, and two 1280×900 PNG screenshots stored under
+  `<data-dir>/web-diagnostics/<session>/<task>/run-…/` (criteria 3 and 5).
+- **Reveal in Finder** returned the canonical path under the data directory,
+  and Finder opened that folder.
+- **After a restart** of the shell, both cards replayed from
+  `web_diagnostic_recorded` and both screenshots loaded again.
+
+What failed: turn 2's last model call streamed a complete, correct answer
+over HTTP 200. `classify_refusal` then classified it as `provider_refused`
+(`Unknown`), so the task ended `failed`, and that turn's approval card shows
+Approve enabled again. This is spec 48's classifier, not this spec's code.
+`classify_refusal` falls through to the body check on a 200, although spec 48
+§5.2 says the body is checked only when the status is absent. The body check
+treats any raw stream containing `"error"` with no recognised code as a
+refusal. The exact bytes that matched are unknown, because the raw stream is
+not logged. Spec 48 §7 records the defect. Criteria 1–3 and 5 must be re-run
+once it is fixed, before this spec closes.
+
+Two smaller findings from the run, neither blocking:
+
+- The legacy `run_scenario` adapter adds a `goto` of its own, so the page loads
+  twice and each load-time error is reported twice.
+- Turn 1's inspection came back with an empty `dom_summary` and no
+  screenshot, although the companion turns both on by default. The model's
+  arguments are not logged, so it is not known whether it turned them off.
 
 A re-read on 2026-09-25 found more open work than that check. Three things were
 never built: §5.1's structured report, §5.1's high-signal text form, and §5.3's

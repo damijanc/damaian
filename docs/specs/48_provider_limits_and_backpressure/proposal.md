@@ -340,6 +340,25 @@ specified separately in
 [spec 56](../56_provider_fallback_consent.md). §5.6 is its requirement, not this
 spec's.
 
+**Open defect, found 2026-09-28: a completed 200 stream was classified as a
+refusal.** This came from spec 12's live scenario run (its `proposal.md` §8),
+with DeepSeek `deepseek-v4-flash`. The call ran after an approved browser
+scenario. It streamed a complete answer over HTTP 200, then `classify_refusal`
+returned `ProviderRefusal::Unknown`. The task ended `failed`, the answer was
+already on screen, and the audit's `message` was only the code:
+`provider_refused (provider refused after 1 attempts)`. So
+`extract_error_message` found nothing in the body.
+
+The path is in `model.rs`. `classify_refusal`'s status match falls through on
+1xx–3xx to `classify_refusal_from_body`. That function treats any raw body
+containing `"error"` as a refusal, and a body with no recognised `code`/`type`
+becomes `Unknown`. §5.2 step 2 does intend to cover "a provider returning 200
+with an error object". But what the check scans is the whole SSE stream,
+matched as a substring, not a top-level error object. For a stream that has
+already delivered content, that is exactly the free-text matching §5.2 step 3
+rules out. Which bytes matched is not known, because the raw stream is not
+logged. This also bears on the first open item below.
+
 Still to record from implementation:
 
 - Whether any configured provider returns an error object with HTTP 200, which
