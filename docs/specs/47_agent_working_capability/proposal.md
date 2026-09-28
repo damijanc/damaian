@@ -525,3 +525,24 @@ What implementing them found, in the order that mattered.
    `tool_calls_at_least` and `tool_rounds_at_most`; its long-stale "thirteen
    scenarios" was corrected to sixteen. `evals/baseline.json` is regenerated only
    alongside that scenario and read before it is committed.
+
+**Open defect, found 2026-09-28: a batched round loses its reasoning after
+the first call, and DeepSeek's thinking mode rejects the next request.** Found
+in the re-run of spec 12's live scenario check (its `proposal.md` §8), with
+DeepSeek `deepseek-v4-flash`. One model response asked for `read_file` and
+`inspect_web_page`. Both ran. The next request came back HTTP 400: "The
+`reasoning_content` in the thinking mode must be passed back to the API." It
+was classified `provider_bad_request` with the provider's own message, which is
+correct, and the task ended `failed` before the model could answer.
+
+The cause is item 3's feed-back. `chat.rs` sends each call of a batched round
+back as its own `assistant_with_tool_calls` message, followed by its tool
+result, and only the first of those messages carries
+`model_run.reasoning_content`; each later one gets `None` (`first_in_round`).
+`ModelMessage::reasoning_content`'s own doc says the reasoning "must be
+replayed verbatim on any assistant message that carries `tool_calls`". So every
+multi-call round against a thinking-mode DeepSeek model fails. Nothing about it
+is browser-specific. The only native-call replay test,
+`chat_replays_reasoning_content_on_native_tool_call_rounds`
+(`tests/foundation.rs`), uses a one-call round and checks only the first
+tool-call message it finds, so it cannot see the gap.

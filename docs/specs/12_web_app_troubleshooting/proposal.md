@@ -460,12 +460,24 @@ What failed: turn 2's last model call streamed a complete, correct answer
 over HTTP 200. `classify_refusal` then classified it as `provider_refused`
 (`Unknown`), so the task ended `failed`, and that turn's approval card shows
 Approve enabled again. This is spec 48's classifier, not this spec's code.
-`classify_refusal` falls through to the body check on a 200, although spec 48
-§5.2 says the body is checked only when the status is absent. The body check
-treats any raw stream containing `"error"` with no recognised code as a
-refusal. The exact bytes that matched are unknown, because the raw stream is
-not logged. Spec 48 §7 records the defect. Criteria 1–3 and 5 must be re-run
-once it is fixed, before this spec closes.
+On a 200, `classify_refusal` falls through to a body check. That check
+treated any raw stream containing `"error"` with no recognised code as a
+refusal. Spec 48 §7 records the trigger (a streamed `"content":"error"`
+token) and the fix, which was made the same day.
+
+**Re-run, 2026-09-28, after the spec 48 fix: failed on a different defect.**
+The setup was the same, except for a fresh data directory. The throwaway line
+had no marker comment this time, so the model could not read the answer from
+it. In turn 1, one model response asked for `read_file` and
+`inspect_web_page`. The inspection found the page error, this time with a DOM
+summary and a screenshot. The next request came back HTTP 400 from DeepSeek:
+"The `reasoning_content` in the thinking mode must be passed back to the API."
+It was correctly classified `provider_bad_request`, so spec 48's fix held for
+a genuine refusal. The task ended `failed` before the model answered, so the
+live card and the scenario were not reached. The cause is spec 47's batched
+rounds: every call after the first in a round is sent back without its
+reasoning. Spec 47 §7 records it. Criteria 1–3 and 5 must be re-run once it is
+fixed, before this spec closes.
 
 Two smaller findings from the run, neither blocking:
 
@@ -473,7 +485,8 @@ Two smaller findings from the run, neither blocking:
   twice and each load-time error is reported twice.
 - Turn 1's inspection came back with an empty `dom_summary` and no
   screenshot, although the companion turns both on by default. The model's
-  arguments are not logged, so it is not known whether it turned them off.
+  arguments are not logged. In the re-run, the same inspection returned both,
+  so the model's own capture flags are the likely explanation.
 
 A re-read on 2026-09-25 found more open work than that check. Three things were
 never built: §5.1's structured report, §5.1's high-signal text form, and §5.3's
