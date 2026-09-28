@@ -5,6 +5,9 @@ let currentSessionId = "";
 // `/api/session-mode`. The session list carries no mode, so this is the only
 // copy; `sessionId` says which session it belongs to.
 let currentSessionMode = { sessionId: "", mode: "code" };
+// Whether the open session has recorded browser diagnostics; see
+// `appendWebDiagnosticArtifacts`.
+let sessionHasRecordedDiagnostics = false;
 let apiToken = "";
 let bootstrapPromise = null;
 let bootstrapError = null;
@@ -2750,6 +2753,7 @@ function clearSessionList() {
 
 function clearChat() {
   $("chat-log").innerHTML = "";
+  sessionHasRecordedDiagnostics = false;
   setChatStatus("Idle");
 }
 
@@ -3129,7 +3133,12 @@ async function finalizeChatMessage(target, content) {
   $("chat-log").scrollTop = $("chat-log").scrollHeight;
 }
 
+// Spec 12 `context.md` §3.3: a session with recorded diagnostics shows its
+// screenshots in the diagnostic card, so the path-scraped thumbnails here are
+// left to older sessions, which have nothing else. `sessionHasRecordedDiagnostics`
+// is reset whenever a session renders, and set by a live `web_diagnostic` event.
 function appendWebDiagnosticArtifacts(container, content) {
+  if (sessionHasRecordedDiagnostics) return;
   const paths = webDiagnosticArtifactPaths(content);
   if (!paths.length) return;
 
@@ -3223,6 +3232,12 @@ function renderMessages(messages, tasks = []) {
   // A task with no plan carries no `plan` field at all, which is how a trivial
   // turn stays panel-free rather than showing an empty plan.
   const planByTask = new Map(tasks.filter((task) => task.plan).map((task) => [task.id, task.plan]));
+  // Likewise `webDiagnostics` is absent, not empty, for a task that ran none.
+  const diagnosticsByTask = new Map(
+    tasks.filter((task) => task.webDiagnostics).map((task) => [task.id, task.webDiagnostics]),
+  );
+  // Set before any message renders: each one runs the legacy thumbnail scan.
+  sessionHasRecordedDiagnostics = diagnosticsByTask.size > 0;
   // Whatever a turn appends *after* its answer — a stop row, the plan panel —
   // belongs to the turn, not to each of its messages. A turn that dispatched
   // tools wrote one assistant message per tool before its answer, and marking
@@ -3262,6 +3277,9 @@ function renderMessages(messages, tasks = []) {
         if (planByTask.has(message.taskId)) {
           renderPlanPanel(bubble, planByTask.get(message.taskId));
         }
+        (diagnosticsByTask.get(message.taskId) || []).forEach((record) => {
+          renderWebDiagnosticCard(bubble, record);
+        });
       }
       if (message.taskId) markMessageUsage(bubble, usageByTask.get(message.taskId));
     }
@@ -4275,6 +4293,321 @@ function describeEvidence(entry) {
   return "recorded";
 }
 
+// The browser diagnostic card (spec 12 §5.3). Every string in `record.report`
+// came from a web page, so all of it goes in through `textContent`.
+//
+// The header mirrors `WebDiagnosticReport::render_for_model` in
+// workspace-engine's `web_diagnostics.rs` — sections, order, plurals and the
+// 500-character cap on a tool error. That Rust is the source of truth: if the
+// two ever read differently, this is the one to fix.
+const WEB_DIAGNOSTIC_ITEM_CHARS = 500;
+const WEB_DIAGNOSTIC_VISIBLE_ITEMS = 5;
+const WEB_DIAGNOSTIC_IMAGE = /\.(?:png|jpe?g|webp|gif)$/i;
+
+// Characters, not UTF-16 units, to match Rust's `chars().count()`.
+function truncateWebDiagnosticText(text, limit) {
+  const chars = Array.from(String(text ?? ""));
+  return chars.length <= limit ? chars.join("") : `${chars.slice(0, limit).join("")}…`;
+}
+
+function webDiagnosticConsoleIs(entry, levels) {
+  return levels.includes(String(entry.level || "").toLowerCase());
+}
+
+// `problem_sections`, in its order. `items` are only counted here; the lists
+// below format their own lines.
+function webDiagnosticSections(details) {
+  const entries = Array.isArray(details.console) ? details.console : [];
+  const steps = Array.isArray(details.steps) ? details.steps : [];
+  return [
+    { noun: "page error", items: details.page_errors || [] },
+    {
+      noun: "console error",
+      items: entries.filter((entry) => webDiagnosticConsoleIs(entry, ["error", "assert"])),
+    },
+    {
+      noun: "console warning",
+      items: entries.filter((entry) => webDiagnosticConsoleIs(entry, ["warning", "warn"])),
+    },
+    { noun: "failed request", items: details.failed_requests || [] },
+    { noun: "failed step", items: steps.filter((step) => !step.success) },
+  ];
+}
+
+function webDiagnosticHeader(report) {
+  const details = report.details;
+  if (!details) {
+    return report.is_error ? "Browser diagnostic failed" : "Browser diagnostic result";
+  }
+  if (typeof details.tool_error === "string") {
+    return `Browser diagnostic failed: ${truncateWebDiagnosticText(
+      details.tool_error,
+      WEB_DIAGNOSTIC_ITEM_CHARS,
+    )}`;
+  }
+  const parts = webDiagnosticSections(details)
+    .filter((section) => section.items.length)
+    .map(
+      (section) =>
+        `${section.items.length} ${section.noun}${section.items.length === 1 ? "" : "s"}`,
+    );
+  return parts.length
+    ? `Browser diagnostic found ${parts.join(", ")}.`
+    : "Browser diagnostic found no page errors, console problems, or failed requests.";
+}
+
+function webDiagnosticLocation(location) {
+  if (!location?.url) return "";
+  return [location.url, location.line, location.column]
+    .filter((part) => part !== null && part !== undefined)
+    .join(":");
+}
+
+function webDiagnosticRequestLine(request) {
+  const target = request.method ? `${request.method} ${request.url}` : request.url;
+  const outcome = [request.status, request.failure]
+    .filter((part) => part !== null && part !== undefined && part !== "")
+    .join(" ");
+  return `${target} → ${outcome || "failed"}`;
+}
+
+// One labelled list, its first five items shown and the rest behind a toggle.
+// `line` returns the item's text and, optionally, a source location.
+function webDiagnosticList(label, items, line) {
+  const section = document.createElement("div");
+  section.className = "web-diagnostic-card-section";
+  const heading = document.createElement("span");
+  heading.className = "web-diagnostic-card-label";
+  heading.textContent = label;
+  const list = document.createElement("ul");
+  list.className = "web-diagnostic-card-list";
+  items.forEach((item, index) => {
+    const { text, location } = line(item);
+    const entry = document.createElement("li");
+    entry.title = text;
+    entry.textContent = truncateWebDiagnosticText(text, WEB_DIAGNOSTIC_ITEM_CHARS);
+    if (location) {
+      const where = document.createElement("span");
+      where.className = "web-diagnostic-card-location";
+      where.textContent = location;
+      entry.append(" ", where);
+    }
+    entry.hidden = index >= WEB_DIAGNOSTIC_VISIBLE_ITEMS;
+    list.append(entry);
+  });
+  section.append(heading, list);
+
+  if (items.length > WEB_DIAGNOSTIC_VISIBLE_ITEMS) {
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "btn-sm btn-quiet web-diagnostic-card-more";
+    toggle.textContent = `Show all ${items.length}`;
+    toggle.setAttribute("aria-expanded", "false");
+    toggle.addEventListener("click", () => {
+      const expand = toggle.getAttribute("aria-expanded") !== "true";
+      toggle.setAttribute("aria-expanded", expand ? "true" : "false");
+      toggle.textContent = expand ? "Show fewer" : `Show all ${items.length}`;
+      [...list.children].forEach((entry, index) => {
+        entry.hidden = !expand && index >= WEB_DIAGNOSTIC_VISIBLE_ITEMS;
+      });
+    });
+    section.append(toggle);
+  }
+  return section;
+}
+
+function webDiagnosticDomPanel(dom) {
+  const buttons = Array.isArray(dom.buttons) ? dom.buttons : [];
+  const rows = [
+    ["Buttons", buttons.join(", ")],
+    ["Status text", dom.status_text || ""],
+    ["Visible text", dom.visible_text_excerpt || ""],
+  ].filter(([, value]) => value);
+  if (!rows.length) return null;
+  const panel = document.createElement("dl");
+  panel.className = "web-diagnostic-card-dom";
+  rows.forEach(([label, value]) => {
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const description = document.createElement("dd");
+    description.textContent = value;
+    panel.append(term, description);
+  });
+  return panel;
+}
+
+function webDiagnosticScreenshot(artifact) {
+  const path = artifact.path;
+  const name = path.split("/").pop() || "screenshot";
+  const item = document.createElement("figure");
+  item.className = "web-diagnostic-artifact";
+
+  const image = document.createElement("img");
+  image.alt = name;
+  image.loading = "lazy";
+
+  const caption = document.createElement("figcaption");
+  caption.title = path;
+  caption.textContent =
+    artifact.width && artifact.height ? `${name} · ${artifact.width}×${artifact.height}` : name;
+
+  const actions = document.createElement("div");
+  actions.className = "web-diagnostic-artifact-actions";
+  const reveal = document.createElement("button");
+  reveal.type = "button";
+  reveal.className = "btn-sm btn-quiet";
+  reveal.textContent = "Reveal in Finder";
+  const failure = document.createElement("p");
+  failure.className = "web-diagnostic-card-error";
+  failure.hidden = true;
+  reveal.addEventListener("click", async () => {
+    failure.hidden = true;
+    try {
+      await api("/api/reveal-web-diagnostic-artifact", form({ repo: repo(), path }));
+    } catch (error) {
+      failure.textContent = error.message;
+      failure.hidden = false;
+    }
+  });
+  actions.append(reveal, failure);
+
+  item.append(image, caption, actions);
+  void loadWebDiagnosticArtifact(image, path);
+  return item;
+}
+
+function renderWebDiagnosticCard(message, record) {
+  const report = record?.report;
+  if (!report) return;
+  const host = message.body.parentElement;
+  if (!host || (record.id && host.querySelector(`[data-record-id="${CSS.escape(record.id)}"]`))) {
+    return;
+  }
+  const details = report.details || null;
+
+  const card = document.createElement("section");
+  card.className = "web-diagnostic-card";
+  if (record.id) card.dataset.recordId = record.id;
+
+  const header = document.createElement("div");
+  header.className = "web-diagnostic-card-header";
+  const title = document.createElement("strong");
+  title.className = "web-diagnostic-card-title";
+  title.textContent = webDiagnosticHeader(report);
+  // Another runner's result carries no counts, so it claims neither state.
+  title.dataset.state =
+    report.is_error || typeof details?.tool_error === "string"
+      ? "failed"
+      : !details
+        ? "unknown"
+        : webDiagnosticSections(details).some((section) => section.items.length)
+          ? "problems"
+          : "clean";
+  const target = document.createElement("span");
+  target.className = "web-diagnostic-card-target";
+  target.textContent = [record.tool === "run_web_scenario" ? "Scenario" : "Inspected", record.url]
+    .filter(Boolean)
+    .join(" · ");
+  header.append(title, target);
+  card.append(header);
+
+  const footer = document.createElement("div");
+  footer.className = "web-diagnostic-card-footer";
+  // Disclosure panels go above the footer, next to what they explain
+  // (docs/UI_STYLE_GUIDE.md §7), so they are collected and placed last.
+  const panels = [];
+
+  if (details) {
+    const meta = [
+      details.final_url,
+      details.status ? `HTTP ${details.status}` : "",
+      details.title,
+    ].filter(Boolean);
+    if (meta.length) {
+      const row = document.createElement("p");
+      row.className = "web-diagnostic-card-meta";
+      meta.forEach((value) => {
+        const part = document.createElement("span");
+        part.textContent = value;
+        row.append(part);
+      });
+      card.append(row);
+    }
+
+    const [pageErrors, consoleErrors, consoleWarnings, failedRequests, failedSteps] =
+      webDiagnosticSections(details).map((section) => section.items);
+    // Errors and warnings are counted apart in the header but read as one
+    // list, in the order the page logged them.
+    const consoleProblems = (details.console || []).filter(
+      (entry) => consoleErrors.includes(entry) || consoleWarnings.includes(entry),
+    );
+    const lists = [
+      ["Page errors", pageErrors, (error) => ({ text: error })],
+      [
+        "Console",
+        consoleProblems,
+        (entry) => ({
+          text: `${entry.level}: ${entry.text}`,
+          location: webDiagnosticLocation(entry.location),
+        }),
+      ],
+      [
+        "Failed requests",
+        failedRequests,
+        (request) => ({ text: webDiagnosticRequestLine(request) }),
+      ],
+      [
+        "Failed steps",
+        failedSteps,
+        (step) => ({
+          text: `step ${step.step} ${step.action}${step.error ? `: ${step.error}` : ""}`,
+        }),
+      ],
+    ];
+    lists.forEach(([label, items, line]) => {
+      if (items.length) card.append(webDiagnosticList(label, items, line));
+    });
+
+    const dom = details.dom_summary ? webDiagnosticDomPanel(details.dom_summary) : null;
+    if (dom) {
+      footer.append(createDisclosure("Page summary", dom));
+      panels.push(dom);
+    }
+  } else if (report.text) {
+    const raw = document.createElement("pre");
+    raw.className = "web-diagnostic-card-raw";
+    raw.textContent = report.text;
+    footer.append(createDisclosure("Diagnostic output", raw));
+    panels.push(raw);
+  }
+
+  const screenshots = (report.artifacts || []).filter(
+    (artifact) =>
+      typeof artifact.path === "string" &&
+      artifact.path.startsWith("web-diagnostics/") &&
+      WEB_DIAGNOSTIC_IMAGE.test(artifact.path),
+  );
+  if (screenshots.length) {
+    const grid = document.createElement("div");
+    grid.className = "web-diagnostic-artifacts";
+    screenshots.forEach((artifact) => {
+      grid.append(webDiagnosticScreenshot(artifact));
+    });
+    card.append(grid);
+  }
+
+  card.append(...panels);
+  if (footer.childElementCount) card.append(footer);
+
+  // In run order, directly under the answer and ahead of the plan panel.
+  const cards = host.querySelectorAll(".web-diagnostic-card");
+  if (cards.length) {
+    cards[cards.length - 1].after(card);
+  } else {
+    message.body.after(card);
+  }
+}
+
 function renderProjectList() {
   const list = $("project-list");
   list.innerHTML = "";
@@ -4945,6 +5278,10 @@ function createPlanReview(proposal, proposalRepo) {
         plan(planPayload) {
           renderPlanPanel(assistantMessage, planPayload);
         },
+        webDiagnostic(record) {
+          sessionHasRecordedDiagnostics = true;
+          renderWebDiagnosticCard(assistantMessage, record);
+        },
         token(token) {
           assistantText += token;
           updateChatMessage(assistantMessage, assistantText);
@@ -5496,6 +5833,10 @@ function createCommandApprovalPreview(
         plan(planPayload) {
           renderPlanPanel(assistantMessage, planPayload);
         },
+        webDiagnostic(record) {
+          sessionHasRecordedDiagnostics = true;
+          renderWebDiagnosticCard(assistantMessage, record);
+        },
         token(token) {
           assistantText += token;
           updateChatMessage(assistantMessage, assistantText);
@@ -5709,6 +6050,7 @@ function processSseEvent(raw, handlers) {
   if (event === "session" && handlers.session) handlers.session(payload.sessionId || "");
   if (event === "phase" && handlers.phase) handlers.phase(payload);
   if (event === "plan" && handlers.plan) handlers.plan(payload);
+  if (event === "web_diagnostic" && handlers.webDiagnostic) handlers.webDiagnostic(payload);
   if (event === "done") handlers.done(payload);
   if (event === "error") handlers.error(payload);
 }
@@ -5992,6 +6334,10 @@ async function sendChatPrompt(options = {}) {
         },
         plan(payload) {
           renderPlanPanel(assistantMessage, payload);
+        },
+        webDiagnostic(record) {
+          sessionHasRecordedDiagnostics = true;
+          renderWebDiagnosticCard(assistantMessage, record);
         },
         token(token) {
           assistantText += token;

@@ -4637,6 +4637,10 @@ mod tests {
         // (spec 20 §5.6), so the mode control and a refusal can be looked at.
         let (refused_session, _) = refused_turn_in_ask_mode(&repo);
 
+        let (diagnosed_session, expected_card_header) =
+            recorded_web_diagnostic_session(&engine, &repository_id, &data_dir);
+        let legacy_session = legacy_web_diagnostic_session(&engine, &repository_id, &data_dir);
+
         let options = ShellOptions {
             port: 4899,
             default_repo: Some(repo_arg.clone()),
@@ -4647,8 +4651,239 @@ mod tests {
         println!("  repository = {repo_arg}");
         println!("  session = {}", session.id);
         println!("  refused-in-Ask session = {refused_session}");
+        println!("  recorded web diagnostic session = {diagnosed_session}");
+        println!("    card header should read: {expected_card_header}");
+        println!("  legacy web diagnostic session (regex thumbnails) = {legacy_session}");
         println!("  data_dir = {}", data_dir.display());
         run_server(options).expect("serve the UI");
+    }
+
+    /// A browser diagnostic turn as spec 12 Task 3 records it: the tool
+    /// message listing the materialised screenshot, plus the redacted record
+    /// the card renders. Returns the session id and `render_for_model`'s header
+    /// line, which the card must reproduce word for word.
+    fn recorded_web_diagnostic_session(
+        engine: &WorkspaceEngine,
+        repository_id: &str,
+        data_dir: &std::path::Path,
+    ) -> (String, String) {
+        let store = &engine.session_store;
+        let session = store
+            .create_session(repository_id, "Why does the snake game not start?")
+            .unwrap();
+        let task = store
+            .create_task(
+                &session.id,
+                "why does the snake game not start?",
+                "mock",
+                "mock",
+            )
+            .unwrap();
+        let relative = format!("web-diagnostics/{}/{}/run-1/page.png", session.id, task.id);
+        write_inspection_png(&data_dir.join(&relative), [163, 55, 55]);
+
+        let warnings: Vec<String> = (1..=6)
+            .map(|n| format!(r#"{{"type": "warning", "text": "Deprecated API call {n}"}}"#))
+            .collect();
+        let companion = format!(
+            r#"{{"url": "http://localhost:5001/", "final_url": "http://localhost:5001/play",
+                "title": "Snake Game", "status": 200,
+                "page_errors": ["ReferenceError: Cannot access 'game' before initialization"],
+                "console": [
+                  {{"type": "log", "text": "booting"}},
+                  {{"type": "error", "text": "Failed to load resource: 404",
+                    "location": {{"url": "http://localhost:5001/js/app.js", "lineNumber": 41, "columnNumber": 7}}}},
+                  {}
+                ],
+                "failed_requests": [
+                  {{"url": "http://localhost:5001/api/me", "method": "GET", "status": 404,
+                    "status_text": "Not Found"}},
+                  {{"url": "http://localhost:5001/ws", "method": "GET",
+                    "failure": "net::ERR_CONNECTION_REFUSED"}}
+                ],
+                "results": [
+                  {{"step": 0, "action": "goto", "success": true}},
+                  {{"step": 1, "action": "click", "success": false,
+                    "error": "locator('#start') is not visible"}}
+                ],
+                "dom_summary": {{"forms": 1, "buttons": ["Start", "Log in"],
+                  "status_text": "Loading…", "visible_text_excerpt": "Snake\nScore: 0\nStart"}}}}"#,
+            warnings.join(",\n")
+        );
+        let mut report = WebDiagnosticReport::from_text(companion, false);
+        report.artifacts = vec![workspace_engine::WebDiagnosticArtifact {
+            kind: "screenshot".to_string(),
+            path: relative.clone(),
+            mime_type: Some("image/png".to_string()),
+            width: Some(160),
+            height: Some(90),
+        }];
+        report.via = Some("MCP server `browser` tool `run_scenario`".to_string());
+        let header = report
+            .render_for_model()
+            .and_then(|text| text.lines().next().map(str::to_string))
+            .expect("a structured report renders");
+
+        store
+            .append_message(
+                &session.id,
+                Some(&task.id),
+                "user",
+                "why does the snake game not start?",
+            )
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                Some(&task.id),
+                "assistant",
+                "Running a browser scenario against the game.",
+            )
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                Some(&task.id),
+                "tool",
+                &format!("{header}\n\nArtifacts:\n- screenshot: {relative} (160x90)"),
+            )
+            .unwrap();
+        store
+            .append_web_diagnostic(
+                &session.id,
+                &WebDiagnosticRecord {
+                    id: "webdiagrec_inspection".to_string(),
+                    task_id: task.id.clone(),
+                    tool: "run_web_scenario".to_string(),
+                    url: "http://localhost:5001/".to_string(),
+                    recorded_at_ms: 1_759_000_000_000,
+                    report: report.redacted(&engine.scanner),
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                Some(&task.id),
+                "assistant",
+                "`game` is read before it is declared in `app.js`, so the start button never renders.",
+            )
+            .unwrap();
+        // Finished, so the crash recovery sweep leaves the turn alone.
+        store
+            .update_task_status(&task, workspace_engine::TaskStatus::Complete, None)
+            .unwrap();
+        (session.id, header)
+    }
+
+    /// A session from before spec 12 Task 3: no recorded diagnostic, only a
+    /// tool message whose text names the screenshot, which the legacy regex
+    /// thumbnails must keep showing.
+    fn legacy_web_diagnostic_session(
+        engine: &WorkspaceEngine,
+        repository_id: &str,
+        data_dir: &std::path::Path,
+    ) -> String {
+        let store = &engine.session_store;
+        let session = store
+            .create_session(
+                repository_id,
+                "Check the landing page (before recorded diagnostics)",
+            )
+            .unwrap();
+        let task = store
+            .create_task(&session.id, "check the landing page", "mock", "mock")
+            .unwrap();
+        let relative = format!("web-diagnostics/{}/{}/run-1/page.png", session.id, task.id);
+        write_inspection_png(&data_dir.join(&relative), [161, 92, 24]);
+        for (role, content) in [
+            ("user", "check the landing page".to_string()),
+            ("assistant", "Inspecting the page.".to_string()),
+            (
+                "tool",
+                format!(
+                    "Browser diagnostic result via MCP server `browser` tool `inspect_page`:\nNo problems found.\n\nArtifacts:\n- screenshot: {relative} (160x90)"
+                ),
+            ),
+            ("assistant", "The landing page loads cleanly.".to_string()),
+        ] {
+            store
+                .append_message(&session.id, Some(&task.id), role, &content)
+                .unwrap();
+        }
+        store
+            .update_task_status(&task, workspace_engine::TaskStatus::Complete, None)
+            .unwrap();
+        session.id
+    }
+
+    /// Writes a real 160×90 PNG, a stand-in page with an `accent`-coloured
+    /// banner, so the thumbnails have something to show. Stored (uncompressed)
+    /// deflate keeps it free of an image dependency.
+    fn write_inspection_png(path: &std::path::Path, accent: [u8; 3]) {
+        const WIDTH: u32 = 160;
+        const HEIGHT: u32 = 90;
+        let mut pixels = Vec::new();
+        for y in 0..HEIGHT {
+            pixels.push(0); // filter type: none
+            for x in 0..WIDTH {
+                let rgb = if y < 14 {
+                    [23, 107, 93]
+                } else if (26..40).contains(&y) && (12..148).contains(&x) {
+                    accent
+                } else {
+                    [255, 255, 255]
+                };
+                pixels.extend_from_slice(&rgb);
+            }
+        }
+        // zlib header, one stored block per 65535 bytes, then Adler-32.
+        let mut zlib = vec![0x78, 0x01];
+        let blocks: Vec<&[u8]> = pixels.chunks(65_535).collect();
+        for (index, block) in blocks.iter().enumerate() {
+            zlib.push(u8::from(index + 1 == blocks.len()));
+            let len = block.len() as u16;
+            zlib.extend_from_slice(&len.to_le_bytes());
+            zlib.extend_from_slice(&(!len).to_le_bytes());
+            zlib.extend_from_slice(block);
+        }
+        let (mut a, mut b) = (1u32, 0u32);
+        for byte in &pixels {
+            a = (a + u32::from(*byte)) % 65_521;
+            b = (b + a) % 65_521;
+        }
+        zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&WIDTH.to_be_bytes());
+        ihdr.extend_from_slice(&HEIGHT.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        for (kind, data) in [(&b"IHDR"[..], ihdr), (b"IDAT", zlib), (b"IEND", Vec::new())] {
+            png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let start = png.len();
+            png.extend_from_slice(kind);
+            png.extend_from_slice(&data);
+            let crc = png_crc(&png[start..]);
+            png.extend_from_slice(&crc.to_be_bytes());
+        }
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, png).unwrap();
+    }
+
+    fn png_crc(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
     }
 
     fn percent_encode_for_test(value: &str) -> String {

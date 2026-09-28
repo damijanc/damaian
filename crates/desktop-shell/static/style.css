@@ -914,6 +914,11 @@ button:disabled {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 10px;
+}
+
+/* The legacy thumbnails scraped from a message's text sit under its prose; in
+   the diagnostic card the grid's own gap does the spacing. */
+.message-body > .web-diagnostic-artifacts {
   margin-top: 12px;
 }
 
@@ -3333,6 +3338,148 @@ code.command-approval-command {
 
 .plan-step-evidence[hidden] {
   display: none;
+}
+
+/* The browser diagnostic card. Spec 12 §5.3. A secondary surface under the
+   answer, built on the plan panel's tokens. */
+.web-diagnostic-card {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  font-size: 12px;
+}
+
+.web-diagnostic-card-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+}
+
+.web-diagnostic-card-title {
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.web-diagnostic-card-title[data-state="problems"] {
+  color: var(--warn);
+}
+
+.web-diagnostic-card-title[data-state="failed"] {
+  color: var(--danger);
+}
+
+.web-diagnostic-card-title[data-state="clean"] {
+  color: var(--ok);
+}
+
+.web-diagnostic-card-target,
+.web-diagnostic-card-meta {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.web-diagnostic-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  margin: 0;
+}
+
+.web-diagnostic-card-section {
+  display: grid;
+  justify-items: start;
+  gap: 4px;
+  min-width: 0;
+}
+
+.web-diagnostic-card-label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.web-diagnostic-card-list {
+  display: grid;
+  gap: 2px;
+  justify-self: stretch;
+  margin: 0;
+  padding-left: 16px;
+  overflow-wrap: anywhere;
+}
+
+.web-diagnostic-card-list > [hidden] {
+  display: none;
+}
+
+.web-diagnostic-card-location {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+.web-diagnostic-card-dom {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.web-diagnostic-card-dom[hidden] {
+  display: none;
+}
+
+.web-diagnostic-card-dom dt {
+  color: var(--muted);
+}
+
+.web-diagnostic-card-dom dd {
+  max-height: 160px;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.web-diagnostic-card-raw {
+  max-height: 240px;
+  overflow: auto;
+}
+
+.web-diagnostic-card-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+
+/* `auto-fill` rather than the legacy grid's `auto-fit`: a run usually has one
+   screenshot, and `auto-fit` stretched it to the card's full width. */
+.web-diagnostic-card .web-diagnostic-artifacts {
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+}
+
+.web-diagnostic-artifact-actions {
+  display: grid;
+  justify-items: start;
+  gap: 4px;
+  padding: 0 4px 6px;
+}
+
+.web-diagnostic-card-error {
+  margin: 0;
+  padding: 0 4px;
+  color: var(--danger);
+  font-size: 11px;
 }
 
 /* The review card's editable rows. Spec 21 §5.5. */
