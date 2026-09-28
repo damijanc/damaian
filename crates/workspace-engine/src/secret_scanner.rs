@@ -311,12 +311,22 @@ impl SecretScanner {
             b"xoxr-".as_slice(),
             b"xoxs-".as_slice(),
         ];
+        // A prefix only counts at a token boundary, so `sk` inside `risk` or
+        // `pk` inside `/usr/lib/pkg-config-…` is not a key. `/` stays a
+        // boundary-blocking byte for the short prefixes, whose path segments
+        // (`skills_…`, `pkg_…`) are common, but not for the distinctive ones:
+        // a GitHub or Slack token right after `/` in a URL path is a leak.
+        let distinctive = |prefix: &[u8]| !matches!(prefix, b"sk" | b"pk" | b"rk");
         let bytes = text.as_bytes();
         for index in 0..bytes.len() {
-            if index > 0 && is_embedded_token_byte(bytes[index - 1]) {
+            let previous = index.checked_sub(1).map(|before| bytes[before]);
+            if previous.is_some_and(|byte| is_embedded_token_byte(byte) && byte != b'/') {
                 continue;
             }
             for prefix in prefixes {
+                if previous == Some(b'/') && !distinctive(prefix) {
+                    continue;
+                }
                 if bytes[index..].starts_with(prefix) {
                     let end = take_while(text, index, is_token_byte);
                     if end - index >= prefix.len() + 20

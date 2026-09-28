@@ -980,8 +980,8 @@ mod tests {
     #[test]
     fn redacted_scrubs_every_captured_string() {
         // The scanner's generic-token rule matches `ghp` + 20 token bytes, but
-        // not when a token byte such as `/` precedes it — so inside URLs the
-        // secret sits in a query value, where a leaked token actually appears.
+        // not when a word byte such as `.` or `_` precedes it — so inside URLs
+        // the secret sits in a query value or right after a `/`.
         let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
         let raw = format!(
             r#"{{"final_url": "http://localhost:5001/?t={secret}", "title": "{secret}",
@@ -994,7 +994,7 @@ mod tests {
                 "dom_summary": {{"buttons": ["{secret}"], "status_text": "{secret}",
                   "visible_text_excerpt": "{secret}"}},
                 "results": [{{"step": 0, "action": "{secret}", "success": false, "error": "{secret}"}}],
-                "artifacts": ["/tmp/runs/shot.png?t={secret}"],
+                "artifacts": ["/tmp/runs/shot.png?t={secret}", "http://localhost:5001/{secret}.js"],
                 "error": true, "message": "{secret}"}}"#
         );
         let mut report = WebDiagnosticReport::from_text(raw, false);

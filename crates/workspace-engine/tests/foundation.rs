@@ -207,6 +207,59 @@ fn redacts_slack_xoxs_tokens() {
 }
 
 #[test]
+fn redacts_github_tokens_in_url_paths() {
+    let scanner = SecretScanner::default();
+    for token in [
+        "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+        "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+    ] {
+        let result = scanner.redact(&format!("http://localhost:5001/{token}.js:12"));
+
+        assert!(!result.text.contains(token), "{}", result.text);
+        assert!(
+            result
+                .text
+                .starts_with("http://localhost:5001/[REDACTED_GENERIC_API_KEY_"),
+            "{}",
+            result.text
+        );
+        assert!(result.text.ends_with("]:12"), "{}", result.text);
+    }
+}
+
+#[test]
+fn redacts_tokens_at_the_start_of_a_file_path_segment() {
+    let scanner = SecretScanner::default();
+    let token = "xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwx";
+    let result = scanner.redact(&format!("cat /tmp/{token}"));
+
+    assert!(!result.text.contains(token), "{}", result.text);
+    assert!(
+        result
+            .text
+            .starts_with("cat /tmp/[REDACTED_GENERIC_API_KEY_"),
+        "{}",
+        result.text
+    );
+}
+
+#[test]
+fn does_not_redact_short_prefixes_at_the_start_of_path_segments() {
+    let scanner = SecretScanner::default();
+    for text in [
+        "src/risk_management_module_name.rs",
+        "/usr/lib/pkg-config-something-long",
+        "docs/specs/skills_and_workflows_long.md",
+        "http://host/desk/pkg_manager_settings_x",
+    ] {
+        let result = scanner.redact(text);
+
+        assert_eq!(result.text, text);
+        assert!(result.findings.is_empty(), "{text}: {:?}", result.findings);
+    }
+}
+
+#[test]
 fn scans_non_ascii_text_without_panicking() {
     let scanner = SecretScanner::default();
     let result = scanner.redact("AI Coding Assistant Client — Must-Have Features");
