@@ -2337,6 +2337,259 @@ fn chat_replays_reasoning_content_after_command_approval() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+/// Checks the feed-back of one batched round in `messages`: a single assistant
+/// message lists every call in `call_ids`, in order, carrying `reasoning`; it
+/// is followed by exactly one `tool` result per call, in the same order; and
+/// no assistant message anywhere lists one of those calls a second time.
+/// DeepSeek's thinking mode rejects a request with an assistant `tool_calls`
+/// message that lost its reasoning, and every provider rejects a call listed
+/// with no result, or twice.
+fn assert_round_fed_back_once(messages: &[ModelMessage], call_ids: &[&str], reasoning: &str) {
+    for message in messages.iter().filter(|m| !m.tool_calls.is_empty()) {
+        assert_eq!(
+            message.reasoning_content.as_deref(),
+            Some(reasoning),
+            "every assistant tool-call message must carry the round's reasoning: {messages:#?}"
+        );
+    }
+    for id in call_ids {
+        let listed = messages
+            .iter()
+            .flat_map(|m| &m.tool_calls)
+            .filter(|call| call.id == *id)
+            .count();
+        assert_eq!(
+            listed, 1,
+            "`{id}` must be listed exactly once: {messages:#?}"
+        );
+        let results = messages
+            .iter()
+            .filter(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some(*id))
+            .count();
+        assert_eq!(
+            results, 1,
+            "`{id}` must have exactly one result: {messages:#?}"
+        );
+    }
+    let index = messages
+        .iter()
+        .position(|m| m.tool_calls.iter().any(|call| call.id == call_ids[0]))
+        .expect("the round's assistant message");
+    let listed: Vec<&str> = messages[index]
+        .tool_calls
+        .iter()
+        .map(|call| call.id.as_str())
+        .collect();
+    assert_eq!(
+        listed, call_ids,
+        "one assistant message carries the whole round"
+    );
+    let results: Vec<Option<&str>> = messages[index + 1..=index + call_ids.len()]
+        .iter()
+        .map(|m| m.tool_call_id.as_deref())
+        .collect();
+    let expected: Vec<Option<&str>> = call_ids.iter().map(|id| Some(*id)).collect();
+    assert_eq!(results, expected, "results follow the round, in call order");
+}
+
+/// Regression, spec 47 §7: a batched round used to go back as one assistant
+/// message per call, and only the first carried the reasoning. A thinking-mode
+/// DeepSeek model then rejected the next request with HTTP 400 — every
+/// multi-call round failed.
+#[test]
+fn chat_replays_reasoning_content_on_every_call_of_a_batched_round() {
+    let repo = temp_dir("chat-reasoning-replay-batched");
+    write_fixture(&repo, "README.md", "# Reasoning replay test\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            "Let me look around.".to_string(),
+            "The README is short and the tree is clean.".to_string(),
+        ],
+        vec![
+            vec![
+                ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments_json: "{\"path\":\"README.md\"}".to_string(),
+                },
+                ToolCall {
+                    id: "call_2".to_string(),
+                    name: "read_git_status".to_string(),
+                    arguments_json: "{}".to_string(),
+                },
+            ],
+            Vec::new(),
+        ],
+    )
+    .with_reasoning_content(vec![
+        Some("I should read the README and check git status.".to_string()),
+        None,
+    ]);
+    let mut on_token = |_token: &str| {};
+
+    engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Describe this repository.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    assert_eq!(adapter.requests.len(), 2, "both calls ran in one round");
+    assert_round_fed_back_once(
+        &adapter.requests[1].messages,
+        &["call_1", "call_2"],
+        "I should read the README and check git status.",
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// The same round shape across an approval pause: the first call ran, the
+/// second needs approval, and the resumed request is rebuilt from the
+/// persisted `PendingChatTurn`. The terminal call must join the round's one
+/// assistant message — not be listed twice, and not arrive without reasoning.
+#[test]
+fn chat_replays_reasoning_content_when_a_batched_round_resumes_after_approval() {
+    let repo = temp_dir("chat-reasoning-replay-batched-approval");
+    write_fixture(&repo, "README.md", "# Reasoning replay test\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            "Let me read and then check.".to_string(),
+            "The repository looks as expected.".to_string(),
+        ],
+        vec![
+            vec![
+                ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments_json: "{\"path\":\"README.md\"}".to_string(),
+                },
+                ToolCall {
+                    id: "call_2".to_string(),
+                    name: "run_command".to_string(),
+                    arguments_json:
+                        "{\"command\":\"echo checking-repo\",\"reason\":\"Inspect before answering\"}"
+                            .to_string(),
+                },
+            ],
+            Vec::new(),
+        ],
+    )
+    .with_reasoning_content(vec![
+        Some("I need the README, then a command.".to_string()),
+        None,
+    ]);
+    let mut on_token = |_token: &str| {};
+
+    let first = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Check the repository.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+    let proposal = first
+        .command_proposal
+        .expect("unclassified command should require approval");
+
+    resume_command_decision(&engine, &proposal.id, true, &mut adapter);
+
+    assert_eq!(adapter.requests.len(), 2);
+    assert_round_fed_back_once(
+        &adapter.requests[1].messages,
+        &["call_1", "call_2"],
+        "I need the README, then a command.",
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// A batched round with one call that ran and one that did not decode: the
+/// undecodable one is reported as plain assistant text after the round, and
+/// that message is still part of the response, so it must carry the reasoning
+/// too. The call that never parsed must not appear in `tool_calls`.
+#[test]
+fn chat_replays_reasoning_content_on_an_undecodable_call_in_a_batched_round() {
+    let repo = temp_dir("chat-reasoning-replay-batched-undecodable");
+    write_fixture(&repo, "README.md", "# Reasoning replay test\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Answered without the patch.".to_string()],
+        vec![
+            vec![
+                ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_git_status".to_string(),
+                    arguments_json: "{}".to_string(),
+                },
+                ToolCall {
+                    id: "call_2".to_string(),
+                    name: "propose_patch".to_string(),
+                    arguments_json: "{\"summary\":\"Scaffold entry po".to_string(),
+                },
+            ],
+            Vec::new(),
+        ],
+    )
+    .with_reasoning_content(vec![
+        Some("Status first, then the patch.".to_string()),
+        None,
+    ]);
+    let mut on_token = |_token: &str| {};
+
+    engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Scaffold the project.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    let messages = &adapter.requests[1].messages;
+    assert_round_fed_back_once(messages, &["call_1"], "Status first, then the patch.");
+    assert!(
+        messages
+            .iter()
+            .flat_map(|m| &m.tool_calls)
+            .all(|call| call.id != "call_2"),
+        "a call that never parsed has no result, so it must not be listed"
+    );
+    let first_assistant = messages
+        .iter()
+        .position(|m| m.role == "assistant")
+        .expect("the round's assistant message");
+    for message in messages[first_assistant..]
+        .iter()
+        .filter(|m| m.role == "assistant")
+    {
+        assert_eq!(
+            message.reasoning_content.as_deref(),
+            Some("Status first, then the patch."),
+            "every assistant message of the response must carry its reasoning"
+        );
+    }
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
 /// The undecodable-tool-call recovery also replays the assistant turn as plain
 /// text, deliberately, so it has the same obligation: the correction round must
 /// carry the reasoning or thinking mode rejects it and the retry never happens.

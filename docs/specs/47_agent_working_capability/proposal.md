@@ -503,8 +503,8 @@ What implementing them found, in the order that mattered.
    bound (`OBSERVATIONS.md` entry 6).
 6. **The array half is one restrict-only key.** `agent_max_turn_messages`
    (default 24) drives `bounded_messages`, which keeps the system+user seed,
-   drops the oldest call/result pairs in whole pairs, and states the elision in a
-   notice. The session log still holds every round; only the request is bounded.
+   drops the oldest rounds whole (item 10 changed this from pairs), and states
+   the elision in a notice. The session log still holds every round; only the request is bounded.
    That resolves `OBSERVATIONS.md` entry 6 — the entry's disposition is written
    here because `docs/PLAN/` is uncommitted and absent from the branch this slice
    was built on.
@@ -525,24 +525,53 @@ What implementing them found, in the order that mattered.
    `tool_calls_at_least` and `tool_rounds_at_most`; its long-stale "thirteen
    scenarios" was corrected to sixteen. `evals/baseline.json` is regenerated only
    alongside that scenario and read before it is committed.
+10. **A batched round is fed back as one assistant message (fixed
+    2026-09-28).** Item 3 first sent each call of a round back as its own
+    `assistant_with_tool_calls` message plus its result, and only the first
+    carried `model_run.reasoning_content`. `ModelMessage::reasoning_content`'s
+    own doc says the reasoning must be replayed on every assistant message that
+    carries `tool_calls`, so every multi-call round against a thinking-mode
+    DeepSeek model was rejected with HTTP 400 ("The `reasoning_content` in the
+    thinking mode must be passed back to the API."). Spec 12's live scenario
+    re-run found it with `deepseek-v4-flash`: `read_file` and
+    `inspect_web_page` both ran, the next request was classified
+    `provider_bad_request`, and the task ended `failed`. The one native-call
+    replay test used a one-call round, so it could not see the gap.
 
-**Open defect, found 2026-09-28: a batched round loses its reasoning after
-the first call, and DeepSeek's thinking mode rejects the next request.** Found
-in the re-run of spec 12's live scenario check (its `proposal.md` §8), with
-DeepSeek `deepseek-v4-flash`. One model response asked for `read_file` and
-`inspect_web_page`. Both ran. The next request came back HTTP 400: "The
-`reasoning_content` in the thinking mode must be passed back to the API." It
-was classified `provider_bad_request` with the provider's own message, which is
-correct, and the task ended `failed` before the model could answer.
+    The fix changes the shape, not only the reasoning. A round is now one
+    assistant message carrying the model's content and reasoning once, whose
+    `tool_calls` lists the calls that ran, followed by one `tool` message per
+    call in call order — the shape spec 03 §7 now states. The message is grown
+    in place as each result lands, so item 3's rule holds unchanged: at any
+    terminal break `messages` is already a valid request, and a call that never
+    ran is never listed, since providers reject a call with no result.
+    Repeating the reasoning on each split message was the fallback and was not
+    needed: the resume path is the one place that had to learn about the round,
+    and one flag covers it. `PendingChatTurn` gained
+    `round_calls_fed_back`; when it is set, the
+    resumed call joins the round's assistant message instead of opening a
+    second one, so the resumed request matches the uninterrupted round and
+    lists no call twice. It is `#[serde(default)]`, so a pending turn saved
+    before the fix still loads and resumes in the split shape it was written
+    in — a limitation for turns already paused mid-round across the upgrade,
+    not a path new turns can reach. `matched_tool_call` stays singular, as item
+    3 decided.
+    The same review found a second instance of the defect: a call that could
+    not be decoded, in a round where another call ran, was reported as a plain
+    assistant message with no reasoning. It now carries the round's reasoning.
+    The shape change also broke item 6's clamp, which dropped messages in
+    pairs: with one assistant message followed by several results, a pair cut
+    could keep a result whose call it had dropped. `bounded_messages` now cuts
+    at a round's start, moving forward to the next round. When there is no
+    next round it moves back to the start of the latest one instead, so a
+    single round larger than the budget exceeds the bound rather than losing
+    the results the model just asked for.
 
-The cause is item 3's feed-back. `chat.rs` sends each call of a batched round
-back as its own `assistant_with_tool_calls` message, followed by its tool
-result, and only the first of those messages carries
-`model_run.reasoning_content`; each later one gets `None` (`first_in_round`).
-`ModelMessage::reasoning_content`'s own doc says the reasoning "must be
-replayed verbatim on any assistant message that carries `tool_calls`". So every
-multi-call round against a thinking-mode DeepSeek model fails. Nothing about it
-is browser-specific. The only native-call replay test,
-`chat_replays_reasoning_content_on_native_tool_call_rounds`
-(`tests/foundation.rs`), uses a one-call round and checks only the first
-tool-call message it finds, so it cannot see the gap.
+    Pinned in `tests/foundation.rs` by
+    `chat_replays_reasoning_content_on_every_call_of_a_batched_round`,
+    `chat_replays_reasoning_content_when_a_batched_round_resumes_after_approval`
+    (the second call is the approval-gated one) and
+    `chat_replays_reasoning_content_on_an_undecodable_call_in_a_batched_round`,
+    all three of which failed on the split shape, and the clamp by
+    `a_clamp_never_splits_a_batched_round` (`chat.rs`). The live confirmation is spec 12's
+    Task 5 Step 1 re-run.

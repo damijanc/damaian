@@ -1007,11 +1007,22 @@ impl ChatOrchestrator {
         )?;
 
         if let Some(call) = &pending.matched_tool_call {
-            messages.push(ModelMessage::assistant_with_tool_calls(
-                pending.last_content.clone(),
-                vec![call.clone()],
-                pending.reasoning_content.clone(),
-            ));
+            // When earlier calls of the round ran, the round's assistant
+            // message is the last one with `tool_calls` — only their results
+            // follow it — and this call joins it, so the resumed request holds
+            // the response once, as the uninterrupted round would have.
+            let round_message = pending
+                .round_calls_fed_back
+                .then(|| messages.iter().rposition(|m| !m.tool_calls.is_empty()))
+                .flatten();
+            match round_message {
+                Some(index) => messages[index].tool_calls.push(call.clone()),
+                None => messages.push(ModelMessage::assistant_with_tool_calls(
+                    pending.last_content.clone(),
+                    vec![call.clone()],
+                    pending.reasoning_content.clone(),
+                )),
+            }
             messages.push(ModelMessage::tool(call.id.clone(), tool_result_content));
         } else {
             messages.push(
@@ -2003,7 +2014,12 @@ impl ChatOrchestrator {
                 None
             };
             let mut terminal: Option<(ModelRun, String, TurnProposals, StopReason)> = None;
-            let mut first_in_round = true;
+            // Index in `messages` of this round's one assistant message, once
+            // its first call has run. Later calls join it (spec 03 §7): a
+            // response is one assistant turn, whatever number of calls it made.
+            let mut round_message: Option<usize> = None;
+            // Kept out of `model_run`, which a terminal arm moves.
+            let round_reasoning = model_run.reasoning_content.clone();
             for (index, (matched_tool_call, tool_action)) in
                 calls_this_round.into_iter().enumerate()
             {
@@ -2063,6 +2079,7 @@ impl ChatOrchestrator {
                         last_content: redacted.clone(),
                         turn_options,
                         reasoning_content: model_run.reasoning_content.clone(),
+                        round_calls_fed_back: round_message.is_some(),
                         mcp_call: None,
                         web_diagnostic_call: None,
                         plan_review: Some(PendingPlanReview {
@@ -2187,6 +2204,7 @@ impl ChatOrchestrator {
                                     last_content: redacted.clone(),
                                     turn_options,
                                     reasoning_content: model_run.reasoning_content.clone(),
+                                    round_calls_fed_back: round_message.is_some(),
                                     mcp_call: None,
                                     web_diagnostic_call: None,
                                     plan_review: None,
@@ -2507,6 +2525,7 @@ impl ChatOrchestrator {
                                     last_content: redacted.clone(),
                                     turn_options,
                                     reasoning_content: model_run.reasoning_content.clone(),
+                                    round_calls_fed_back: round_message.is_some(),
                                     mcp_call: None,
                                     web_diagnostic_call: Some(PendingWebDiagnosticCall { call }),
                                     plan_review: None,
@@ -2610,6 +2629,7 @@ impl ChatOrchestrator {
                                     last_content: redacted.clone(),
                                     turn_options,
                                     reasoning_content: model_run.reasoning_content.clone(),
+                                    round_calls_fed_back: round_message.is_some(),
                                     mcp_call: Some(PendingMcpCall {
                                         server_id,
                                         tool_name,
@@ -2732,25 +2752,24 @@ impl ChatOrchestrator {
 
                 // Feed this call back before the next one in the round, so a
                 // terminal break still carries everything that already ran.
-                // Only the first assistant message of a round repeats the
-                // model's prose and reasoning; a later one would duplicate
-                // them.
+                // The round is one assistant message carrying the model's prose
+                // and reasoning once, and it lists only calls that ran: each
+                // call joins it as its result lands, so `messages` is a valid
+                // request at every break. Splitting it per call dropped the
+                // reasoning from all but the first, and DeepSeek's thinking mode
+                // rejects the next request over that (spec 47 §7).
                 if let Some(call) = &matched_tool_call {
-                    let content = if first_in_round {
-                        redacted.clone()
-                    } else {
-                        String::new()
-                    };
-                    let reasoning = if first_in_round {
-                        model_run.reasoning_content.clone()
-                    } else {
-                        None
-                    };
-                    messages.push(ModelMessage::assistant_with_tool_calls(
-                        content,
-                        vec![call.clone()],
-                        reasoning,
-                    ));
+                    match round_message {
+                        Some(index) => messages[index].tool_calls.push(call.clone()),
+                        None => {
+                            round_message = Some(messages.len());
+                            messages.push(ModelMessage::assistant_with_tool_calls(
+                                redacted.clone(),
+                                vec![call.clone()],
+                                round_reasoning.clone(),
+                            ));
+                        }
+                    }
                     messages.push(ModelMessage::tool(
                         call.id.clone(),
                         tool_result_text.clone(),
@@ -2767,7 +2786,6 @@ impl ChatOrchestrator {
                         "Command result:\n{tool_result_text}"
                     )));
                 }
-                first_in_round = false;
             }
 
             if let Some(finished) = terminal {
@@ -2791,7 +2809,10 @@ impl ChatOrchestrator {
                 )?;
                 self.session_store
                     .append_message(&session.id, Some(&task.id), "tool", note)?;
-                messages.push(ModelMessage::assistant(summary));
+                // Still this response's turn, so it carries the reasoning:
+                // thinking mode rejects any assistant message that lost it.
+                messages
+                    .push(ModelMessage::assistant(summary).with_reasoning_content(round_reasoning));
                 messages.push(ModelMessage::user(note.clone()));
             }
 
@@ -3270,6 +3291,14 @@ struct PendingChatTurn {
     /// existed loadable.
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// True when earlier calls of the paused round already ran, so `messages`
+    /// ends with the round's assistant message and their results. The resumed
+    /// call joins that message rather than opening a second one for the same
+    /// response. `#[serde(default)]` keeps pending turns written before this
+    /// field existed loadable; they resume in the per-call shape they were
+    /// saved in.
+    #[serde(default)]
+    round_calls_fed_back: bool,
     /// Present when the paused action is an MCP tool call rather than a shell
     /// command; carries everything needed to execute it on resume. `#[serde(default)]`
     /// keeps older on-disk pending turns (which predate MCP) loadable.
@@ -3486,9 +3515,9 @@ fn build_model_prompt(
 /// elided.
 ///
 /// The first two messages are the initial system prompt and the user request
-/// and are always kept. The rest are call/result pairs — an assistant message
-/// and its tool results — and are dropped from the oldest end in whole pairs, so
-/// a tool result is never left without the call it answers. The session log
+/// and are always kept. The rest are rounds — an assistant message and its
+/// results, one per call — and are dropped from the oldest end in whole rounds,
+/// so a tool result is never left without the call it answers. The session log
 /// still holds every round; only the request is bounded. Spec 47 requirement 6,
 /// the half `OBSERVATIONS.md` entry 6 names.
 fn bounded_messages(messages: &[ModelMessage], max_messages: usize) -> Vec<ModelMessage> {
@@ -3501,15 +3530,31 @@ fn bounded_messages(messages: &[ModelMessage], max_messages: usize) -> Vec<Model
     let tail = &messages[2..];
     let budget = max_messages.saturating_sub(3);
     let mut drop_count = tail.len().saturating_sub(budget);
-    // Whole pairs: an odd drop would leave a tool result without its call.
-    if !drop_count.is_multiple_of(2) {
-        drop_count += 1;
+    // Whole rounds: every round opens with its assistant message, and a
+    // batched round's one message is followed by a result per call, so the
+    // cut lands on a round's start. Stopping inside a round would leave a
+    // tool result without its call, which providers reject. The cut moves
+    // forward to the next round — unless there is none, because dropping the
+    // latest round would take away the results the model just asked for.
+    // Then it moves back to that round's start, and the request exceeds the
+    // bound by the part of one round that does not fit.
+    if drop_count < tail.len() && tail[drop_count].role != "assistant" {
+        let is_round_start = |message: &ModelMessage| message.role == "assistant";
+        drop_count = match tail[drop_count..].iter().position(is_round_start) {
+            Some(offset) => drop_count + offset,
+            None => tail[..drop_count]
+                .iter()
+                .rposition(is_round_start)
+                .unwrap_or(0),
+        };
     }
-    let drop_count = drop_count.min(tail.len());
+    let results = tail[..drop_count]
+        .iter()
+        .filter(|message| message.role != "assistant")
+        .count();
     let mut bounded = head;
     bounded.push(ModelMessage::system(format!(
-        "Earlier rounds of this turn were elided to bound the request: {drop_count} messages ({} call results) omitted. The session log still holds them; repeat a read if you need it.",
-        drop_count / 2
+        "Earlier rounds of this turn were elided to bound the request: {drop_count} messages ({results} call results) omitted. The session log still holds them; repeat a read if you need it."
     )));
     bounded.extend_from_slice(&tail[drop_count..]);
     bounded
@@ -4737,6 +4782,54 @@ mod evidence_tests {
             "a retained tool result must keep the call before it: {}",
             bounded[3].content
         );
+    }
+
+    /// A batched round is one assistant message and a result per call, so a
+    /// cut by pairs could keep a result whose call was dropped. The cut must
+    /// land on a round's start instead.
+    #[test]
+    fn a_clamp_never_splits_a_batched_round() {
+        let mut messages = vec![ModelMessage::system("system"), ModelMessage::user("prompt")];
+        for round in 0..6 {
+            let calls: Vec<ToolCall> = (0..3)
+                .map(|call| ToolCall {
+                    id: format!("call_{round}_{call}"),
+                    name: "read_file".to_string(),
+                    arguments_json: "{}".to_string(),
+                })
+                .collect();
+            messages.push(ModelMessage::assistant_with_tool_calls(
+                format!("round {round}"),
+                calls.clone(),
+                Some("reasoning".to_string()),
+            ));
+            for call in calls {
+                messages.push(ModelMessage::tool(call.id, "result"));
+            }
+        }
+
+        let last_round = &messages[messages.len() - 4..];
+        for max in 3..messages.len() {
+            let bounded = bounded_messages(&messages, max);
+            let kept_only_the_latest_round = bounded[3..] == *last_round;
+            assert!(
+                bounded.len() <= max || kept_only_the_latest_round,
+                "bounded to {max}: {}",
+                bounded.len()
+            );
+            let listed: Vec<&str> = bounded
+                .iter()
+                .flat_map(|message| &message.tool_calls)
+                .map(|call| call.id.as_str())
+                .collect();
+            for message in bounded.iter().filter(|message| message.role == "tool") {
+                let id = message.tool_call_id.as_deref().unwrap();
+                assert!(
+                    listed.contains(&id),
+                    "bounded to {max}: `{id}` lost its call"
+                );
+            }
+        }
     }
 
     #[test]
