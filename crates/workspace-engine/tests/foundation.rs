@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
     AuditLog, CancelToken, ChatTurnOptions, ChatTurnResult, ClientError, CommandPolicy,
@@ -2896,6 +2897,159 @@ fn web_scenarios_require_approval_before_interaction() {
     fs::remove_dir_all(repo).unwrap();
 }
 
+/// Counts every diagnostic it is asked to run, so a test can assert the
+/// runner was never reached rather than inferring it from the transcript.
+#[derive(Debug, Clone, Default)]
+struct CountingWebDiagnosticsRunner {
+    calls: Arc<AtomicUsize>,
+}
+
+impl WebDiagnosticsRunner for CountingWebDiagnosticsRunner {
+    fn inspect(&self, _call: &WebDiagnosticCall) -> workspace_engine::Result<WebDiagnosticReport> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(WebDiagnosticReport::from_text("diagnostics", false))
+    }
+
+    fn run_scenario(
+        &self,
+        _call: &WebDiagnosticCall,
+    ) -> workspace_engine::Result<WebDiagnosticReport> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(WebDiagnosticReport::from_text("scenario", false))
+    }
+}
+
+/// Asks one turn in which the model makes a single browser diagnostic call,
+/// and returns the turn with the number of diagnostics the runner ran.
+fn ask_with_one_web_diagnostic(
+    label: &str,
+    tool: &str,
+    arguments_json: &str,
+) -> (ChatTurnResult, usize) {
+    let repo = temp_dir(label);
+    write_fixture(&repo, "README.md", "# Web app\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let mut engine = WorkspaceEngine::new(config);
+    let runner = CountingWebDiagnosticsRunner::default();
+    let calls = runner.calls.clone();
+    engine
+        .chat_orchestrator
+        .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(runner));
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Done.".to_string()],
+        vec![
+            vec![ToolCall {
+                id: "call_web".to_string(),
+                name: tool.to_string(),
+                arguments_json: arguments_json.to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Check the web app.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    fs::remove_dir_all(repo).unwrap();
+    (result, calls.load(Ordering::SeqCst))
+}
+
+// Spec 12 criterion 6: a remote URL needs approval, and the prompt names
+// the origin the browser will navigate to, before anything runs.
+#[test]
+fn a_remote_web_inspection_requires_approval_and_shows_its_origin() {
+    let (result, runs) = ask_with_one_web_diagnostic(
+        "chat-web-remote-inspection",
+        "inspect_web_page",
+        r#"{"url":"https://example.com/app"}"#,
+    );
+
+    assert_eq!(runs, 0);
+    assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+    let proposal = result
+        .command_proposal
+        .expect("remote inspection needs approval");
+    assert_eq!(proposal.risk, "browser-high");
+    assert!(proposal.requires_approval);
+    assert!(
+        proposal
+            .prompt
+            .contains("Target origin: `https://example.com`"),
+        "{}",
+        proposal.prompt
+    );
+    assert!(proposal.prompt.contains("https://example.com/app"));
+}
+
+#[test]
+fn a_remote_web_scenario_requires_approval_as_high_risk() {
+    let (result, runs) = ask_with_one_web_diagnostic(
+        "chat-web-remote-scenario",
+        "run_web_scenario",
+        r##"{"url":"https://example.com/app","actions":[{"action":"click","selector":"#register-btn"}]}"##,
+    );
+
+    assert_eq!(runs, 0);
+    assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+    let proposal = result
+        .command_proposal
+        .expect("remote scenario needs approval");
+    assert_eq!(proposal.risk, "browser-high");
+    assert!(
+        proposal
+            .prompt
+            .contains("Target origin: `https://example.com`"),
+        "{}",
+        proposal.prompt
+    );
+    assert!(proposal.prompt.contains("https://example.com/app"));
+}
+
+// A host that only starts with a loopback name, or hides one in userinfo,
+// is remote. The prompt must name the host the browser will actually reach.
+#[test]
+fn loopback_look_alike_urls_require_approval_and_show_the_real_origin() {
+    for (url, origin) in [
+        (
+            "http://localhost.example.com/",
+            "http://localhost.example.com",
+        ),
+        (
+            "http://127.0.0.1.example.com/",
+            "http://127.0.0.1.example.com",
+        ),
+        ("http://localhost@example.com/", "http://example.com"),
+    ] {
+        let (result, runs) = ask_with_one_web_diagnostic(
+            "chat-web-loopback-look-alike",
+            "inspect_web_page",
+            &format!(r#"{{"url":"{url}"}}"#),
+        );
+
+        assert_eq!(runs, 0, "{url}");
+        assert_eq!(result.task.status, TaskStatus::WaitingForApproval, "{url}");
+        let proposal = result.command_proposal.expect("look-alike needs approval");
+        assert_eq!(proposal.risk, "browser-high", "{url}");
+        assert!(
+            proposal
+                .prompt
+                .contains(&format!("Target origin: `{origin}`")),
+            "{url}: {}",
+            proposal.prompt
+        );
+    }
+}
+
 #[test]
 fn browser_diagnostic_session_approval_allows_later_scenarios() {
     let repo = temp_dir("chat-web-session-approval");
@@ -2985,6 +3139,126 @@ fn browser_diagnostic_session_approval_allows_later_scenarios() {
     assert!(second.command_proposal.is_none());
     assert_eq!(second.task.status, TaskStatus::Complete);
     assert!(second.response.contains("session diagnostic approval"));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// Spec 12 §5.4: "Allow browser diagnostics for this session" covers loopback
+// only. After it is granted, a remote URL still needs its own approval, is
+// not offered the grant, and cannot extend it at resume.
+#[test]
+fn browser_diagnostic_session_approval_does_not_cover_remote_urls() {
+    let repo = temp_dir("chat-web-session-approval-remote");
+    write_fixture(&repo, "README.md", "# Web app\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let mut engine = WorkspaceEngine::new(config);
+    let runner = CountingWebDiagnosticsRunner::default();
+    let runs = runner.calls.clone();
+    engine
+        .chat_orchestrator
+        .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(runner));
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![ToolCall {
+            id: "call_web".to_string(),
+            name: "run_web_scenario".to_string(),
+            arguments_json: r##"{"url":"http://localhost:5001/","actions":[{"action":"click","selector":"#register-btn"}]}"##.to_string(),
+        }]],
+    );
+    let mut on_token = |_token: &str| {};
+    let local = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Try registering on the local web app.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+    let local_proposal = local.command_proposal.expect("scenario needs approval");
+    let granted = resume_command_decision_with_options(
+        &engine,
+        &local_proposal.id,
+        true,
+        ResumeDecisionOptions {
+            allow_browser_diagnostics_for_session: true,
+        },
+        &mut MockModelAdapter::new("The local scenario ran."),
+    );
+    let session_id = granted.session.id.clone();
+    assert!(
+        engine
+            .session_store
+            .browser_diagnostics_allowed_for_session(&session_id)
+            .unwrap()
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+    let mut remote_adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Done.".to_string()],
+        vec![
+            vec![ToolCall {
+                id: "call_remote".to_string(),
+                name: "inspect_web_page".to_string(),
+                arguments_json: r#"{"url":"https://example.com/app"}"#.to_string(),
+            }],
+            Vec::new(),
+        ],
+    );
+    let cancel = CancelToken::new();
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+    };
+    let remote = engine
+        .chat_orchestrator
+        .ask_with_session(
+            &repo,
+            "Now check the deployed app.",
+            &[],
+            Some(&session_id),
+            &mut remote_adapter,
+            &mut sink,
+        )
+        .unwrap();
+
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert_eq!(remote.task.status, TaskStatus::WaitingForApproval);
+    let remote_proposal = remote
+        .command_proposal
+        .expect("the session grant does not cover a remote URL");
+    assert_eq!(remote_proposal.risk, "browser-high");
+    assert!(!remote_proposal.allow_browser_diagnostics_for_session);
+
+    // A client that asks for the session grant anyway gets a one-off approval.
+    let resumed = resume_command_decision_with_options(
+        &engine,
+        &remote_proposal.id,
+        true,
+        ResumeDecisionOptions {
+            allow_browser_diagnostics_for_session: true,
+        },
+        &mut MockModelAdapter::new("The remote page loaded."),
+    );
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+    let audit_log =
+        fs::read_to_string(repo.join(".damaian").join("audit").join("events.jsonl")).unwrap();
+    let remote_decision = audit_log
+        .lines()
+        .find(|line| {
+            line.contains("browser_diagnostic_approval_decision")
+                && line.contains(&remote_proposal.id)
+        })
+        .expect("remote decision is audited");
+    assert!(
+        remote_decision.contains("approved_once"),
+        "{remote_decision}"
+    );
 
     fs::remove_dir_all(repo).unwrap();
 }

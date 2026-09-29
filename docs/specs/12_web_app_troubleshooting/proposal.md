@@ -286,6 +286,18 @@ Allow browser diagnostics for this session
 This is not a global allowlist. It expires with the session and is recorded in
 the audit log.
 
+The grant covers loopback targets only. A remote URL is always high risk,
+whether it is an inspection or a scenario. It needs its own approval every
+time, even after the grant. Its approval prompt does not offer the session
+option, and asking for the grant when approving a remote diagnostic records
+a one-off approval instead.
+
+"Loopback" means the host the browser will reach. That host comes after any
+userinfo, so `http://localhost:5001@example.com/` is `example.com`. A host
+that only starts with a loopback name, such as `localhost.example.com`, is
+remote. The prompt's `Target origin:` line shows `scheme://host[:port]` without
+the userinfo.
+
 ### 5.5 Tool Round Policy
 
 Replace the hard-coded limit with config values:
@@ -506,14 +518,16 @@ screenshot loaded again. The throwaway line was reverted.
 | 3 | Live, the 2026-09-29 scenario (fill two inputs, click, wait: page errors, console, failed requests, visible text, screenshot); `a_structured_browser_report_is_rendered_and_lists_the_materialised_artifact` for the artifact |
 | 4 | `invalid_web_scenario_actions_are_rejected_before_execution` |
 | 5 | `a_structured_browser_report_is_rendered_and_lists_the_materialised_artifact`; live, stored under `<data-dir>/web-diagnostics/…` and shown in the card |
-| 6 | **Unmet: no test.** The code gates it: `WebDiagnosticCall::is_low_risk` is a loopback inspection only, a remote URL gets `browser-high`, and `web_diagnostic_approval_proposal` writes `Target origin:`. But no test pins a remote URL's approval or the origin line. `web_scenarios_require_approval_before_interaction` covers a loopback scenario and checks `browser-medium` only. The live runs showed the origin line for loopback only. |
+| 6 | `a_remote_web_inspection_requires_approval_and_shows_its_origin`, `a_remote_web_scenario_requires_approval_as_high_risk`, `loopback_look_alike_urls_require_approval_and_show_the_real_origin`, `browser_diagnostic_session_approval_does_not_cover_remote_urls` (`tests/foundation.rs`: each asserts the runner was not called); `only_a_loopback_host_is_low_risk` (`web_diagnostics.rs`). Writing these tests found three defects, all fixed on 2026-09-29. (1) `http://localhost:5001@example.com/` counted as loopback, so it ran with no approval. (2) A remote scenario was rated `browser-medium`. (3) The origin line included userinfo (`http://localhost@example.com`). The session grant was also narrowed to loopback (§5.4). |
 | 7 | `redacted_scrubs_every_captured_string` (`web_diagnostics.rs`); `a_web_diagnostic_is_recorded_redacted_and_streamed` and `an_approved_web_diagnostic_is_recorded_at_resume` (`chat.rs`) |
 | 8 | `config_overlay_supports_agent_tool_round_limits`; `web_debug_prompts_use_the_web_round_limit` |
 | 9 | `repeated_failed_browser_diagnostics_are_stopped`; `a_companion_tool_error_counts_toward_the_retry_limit` |
 | 10 | `tool_round_exhaustion_is_terminal_when_model_still_requests_tools` |
 | 11 | `mcp_stdio_client_handshakes_lists_and_calls_tools`; `an_mcp_tool_with_a_true_read_only_hint_is_offered_in_ask` |
 
-Criterion 6 keeps this spec open until a test pins it.
+Each of the 11 criteria is now mapped to evidence. The rest of Task 5 (user
+docs, the spec 22 hand-off, status records, the full gate) is what keeps this
+spec open.
 
 Smaller findings from the runs, none blocking:
 

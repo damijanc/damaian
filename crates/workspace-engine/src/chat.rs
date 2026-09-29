@@ -842,7 +842,12 @@ impl ChatOrchestrator {
             // allows them, and this one does not.
             let decision = if refused {
                 "refused_by_mode"
-            } else if approved && decision_options.allow_browser_diagnostics_for_session {
+            } else if approved
+                && decision_options.allow_browser_diagnostics_for_session
+                && call.targets_loopback()
+            {
+                // A remote proposal never offers the session grant, so a
+                // request for one here is approved once instead.
                 self.session_store
                     .allow_browser_diagnostics_for_session(&pending.session.id, approved_by)?;
                 "approved_for_session"
@@ -2502,7 +2507,10 @@ impl ChatOrchestrator {
                         }
                         ToolAction::WebDiagnostic(call) => {
                             let call = call.with_context(&session.id, &task.id);
-                            let session_approved = if call.is_low_risk() {
+                            // Spec 12 §5.4: the session grant never reaches a
+                            // remote URL.
+                            let session_approved = if call.is_low_risk() || !call.targets_loopback()
+                            {
                                 false
                             } else {
                                 self.session_store
@@ -4490,14 +4498,15 @@ fn web_diagnostic_approval_proposal(
     call: &WebDiagnosticCall,
 ) -> AgentCommandProposal {
     let arguments = truncate_for_prompt(call.arguments_json.trim(), 500);
+    // Spec 12 §5.4: anything outside loopback is high risk, whatever the tool.
     let risk = if call.is_low_risk() {
         "browser-low"
-    } else if matches!(call.kind, WebDiagnosticKind::Scenario) {
+    } else if call.targets_loopback() && matches!(call.kind, WebDiagnosticKind::Scenario) {
         "browser-medium"
     } else {
         "browser-high"
     };
-    let origin = url_origin_for_prompt(&call.url);
+    let origin = call.origin();
     let prompt = format!(
         "The assistant wants to run `{}` against `{}`.\nTarget origin: `{origin}`\n\nArguments:\n{arguments}\n\nBrowser diagnostics may navigate pages, use current browser state, or interact with forms. Approve to run it, or decline.",
         call.name(),
@@ -4511,24 +4520,9 @@ fn web_diagnostic_approval_proposal(
         requires_approval: true,
         blocked: false,
         allow_always: false,
-        allow_browser_diagnostics_for_session: !call.is_low_risk(),
-    }
-}
-
-fn url_origin_for_prompt(url: &str) -> String {
-    let trimmed = url.trim();
-    let Some((scheme, rest)) = trimmed.split_once("://") else {
-        return trimmed.to_string();
-    };
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .trim();
-    if authority.is_empty() {
-        trimmed.to_string()
-    } else {
-        format!("{scheme}://{authority}")
+        // The session grant covers loopback only, so a remote URL is never
+        // offered it: each remote diagnostic is approved on its own.
+        allow_browser_diagnostics_for_session: !call.is_low_risk() && call.targets_loopback(),
     }
 }
 

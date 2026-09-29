@@ -67,7 +67,21 @@ impl WebDiagnosticCall {
     }
 
     pub fn is_low_risk(&self) -> bool {
-        self.kind == WebDiagnosticKind::Inspect && is_loopback_url(&self.url)
+        self.kind == WebDiagnosticKind::Inspect && self.targets_loopback()
+    }
+
+    /// Whether the browser would reach `localhost`, `127.0.0.1` or `[::1]`.
+    pub fn targets_loopback(&self) -> bool {
+        is_loopback_url(&self.url)
+    }
+
+    /// `scheme://host[:port]` the browser will navigate to, without any
+    /// userinfo, for the approval prompt. The URL itself when it cannot be parsed.
+    pub fn origin(&self) -> String {
+        match scheme_and_host(&self.url) {
+            Some((scheme, host)) => format!("{scheme}://{host}"),
+            None => self.url.trim().to_string(),
+        }
     }
 }
 
@@ -635,18 +649,28 @@ fn validate_scenario_actions(arguments: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Splits `scheme://[userinfo@]host[:port]…` into the scheme and the host and
+/// port the browser will reach. Userinfo runs to the authority's last `@`, so
+/// `http://localhost:5001@example.com/` is `example.com`; for http(s) a `\`
+/// ends the authority just as `/` does.
+fn scheme_and_host(url: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = url.trim().split_once("://")?;
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or_default();
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_port)| host_port)
+        .trim();
+    (!host_port.is_empty()).then_some((scheme, host_port))
+}
+
 fn is_loopback_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
-    if !lower.starts_with("http://") && !lower.starts_with("https://") {
-        return false;
-    }
-    let Some(after_scheme) = lower.split_once("://").map(|(_, rest)| rest) else {
+    let Some((scheme, host_port)) = scheme_and_host(&lower) else {
         return false;
     };
-    let host_port = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
+    if scheme != "http" && scheme != "https" {
+        return false;
+    }
     let host = if let Some(rest) = host_port.strip_prefix('[') {
         rest.split(']').next().unwrap_or_default()
     } else {
@@ -1124,5 +1148,38 @@ mod tests {
             WebDiagnosticReport::from_text("plain", false).render_for_model(),
             None
         );
+    }
+
+    fn inspection(url: &str) -> WebDiagnosticCall {
+        let arguments = serde_json::json!({ "url": url }).to_string();
+        WebDiagnosticCall::from_tool_call("inspect_web_page", &arguments)
+            .unwrap()
+            .unwrap()
+    }
+
+    // Spec 12 §5.4: only an inspection of `localhost`, `127.0.0.1` or `[::1]`
+    // runs without approval. The host the browser reaches decides it, not a
+    // prefix of the authority.
+    #[test]
+    fn only_a_loopback_host_is_low_risk() {
+        for url in [
+            "http://localhost:5001/",
+            "http://127.0.0.1/",
+            "http://[::1]:8080/",
+            "HTTPS://LOCALHOST/app",
+        ] {
+            assert!(inspection(url).is_low_risk(), "{url}");
+        }
+        for url in [
+            "https://example.com/app",
+            "http://localhost.example.com/",
+            "http://127.0.0.1.example.com/",
+            "http://localhost@example.com/",
+            "http://localhost:5001@example.com/",
+            "http://127.0.0.1:80@example.com/",
+            "file:///etc/hosts",
+        ] {
+            assert!(!inspection(url).is_low_risk(), "{url}");
+        }
     }
 }
