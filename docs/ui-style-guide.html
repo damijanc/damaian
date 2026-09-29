@@ -541,6 +541,106 @@
     </section>
 
     <section class="sg-section">
+      <h2>Browser diagnostic card</h2>
+      <p class="sg-hint">
+        One card per browser diagnostic that ran, under the assistant's answer. The header is the
+        same sentence the model reads (<code>render_for_model</code>), coloured by
+        <code>data-state</code>: problems, failed, clean, or unknown for a runner that is not the
+        companion. Lists show five items, then a quiet <em>Show all n</em>. Screenshot actions and
+        the disclosure are quiet buttons. Nothing on the card is filled, because it reports rather
+        than asks.
+      </p>
+      <div class="sg-card">
+        <section class="web-diagnostic-card">
+          <div class="web-diagnostic-card-header">
+            <strong class="web-diagnostic-card-title" data-state="problems"
+              >Browser diagnostic found 1 page error, 1 console error, 6 console warnings, 1 failed
+              request.</strong
+            >
+            <span class="web-diagnostic-card-target">Scenario · http://localhost:5001/</span>
+          </div>
+          <p class="web-diagnostic-card-meta">
+            <span>http://localhost:5001/</span><span>HTTP 200</span><span>Snake Game</span>
+          </p>
+          <div class="web-diagnostic-card-section">
+            <span class="web-diagnostic-card-label">Page errors</span>
+            <ul class="web-diagnostic-card-list">
+              <li>Cannot access 'game' before initialization</li>
+            </ul>
+          </div>
+          <div class="web-diagnostic-card-section">
+            <span class="web-diagnostic-card-label">Console</span>
+            <ul class="web-diagnostic-card-list">
+              <li>
+                error: Failed to load leaderboard
+                <span class="web-diagnostic-card-location"
+                  >http://localhost:5001/static/js/api.js:14:11</span
+                >
+              </li>
+              <li>warning: Deprecated keyCode used</li>
+              <li>warning: Deprecated keyCode used</li>
+              <li>warning: Deprecated keyCode used</li>
+              <li>warning: Deprecated keyCode used</li>
+              <li hidden>warning: Deprecated keyCode used</li>
+              <li hidden>warning: Deprecated keyCode used</li>
+            </ul>
+            <button
+              type="button"
+              class="btn-sm btn-quiet web-diagnostic-card-more"
+              aria-expanded="false"
+            >
+              Show all 7
+            </button>
+          </div>
+          <div class="web-diagnostic-card-section">
+            <span class="web-diagnostic-card-label">Failed requests</span>
+            <ul class="web-diagnostic-card-list">
+              <li>GET http://localhost:5001/api/leaderboard → 500 INTERNAL SERVER ERROR</li>
+            </ul>
+          </div>
+          <div class="web-diagnostic-artifacts">
+            <figure class="web-diagnostic-artifact">
+              <img
+                alt="page.png"
+                src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='90'%3E%3Crect width='160' height='90' fill='%23d9d6cf'/%3E%3C/svg%3E"
+              />
+              <figcaption title="web-diagnostics/session/task/run-1/page.png">
+                page.png · 1280×720
+              </figcaption>
+              <div class="web-diagnostic-artifact-actions">
+                <button type="button" class="btn-sm btn-quiet">Reveal in Finder</button>
+              </div>
+            </figure>
+          </div>
+          <div class="web-diagnostic-card-footer">
+            <button type="button" class="disclosure" aria-expanded="false">
+              <span class="disclosure-caret" aria-hidden="true"></span> Page summary
+            </button>
+          </div>
+        </section>
+      </div>
+      <div class="sg-card">
+        <section class="web-diagnostic-card">
+          <div class="web-diagnostic-card-header">
+            <strong class="web-diagnostic-card-title" data-state="unknown"
+              >Browser diagnostic result</strong
+            >
+            <span class="web-diagnostic-card-target">Inspected · http://localhost:3000/</span>
+          </div>
+          <div class="web-diagnostic-card-footer">
+            <button type="button" class="disclosure" aria-expanded="false">
+              <span class="disclosure-caret" aria-hidden="true"></span> Diagnostic output
+            </button>
+          </div>
+        </section>
+        <p class="sg-note">
+          A browser server that is not the companion: no typed details, so no counts, no lists and
+          no state colour. Only the raw result, behind the disclosure.
+        </p>
+      </div>
+    </section>
+
+    <section class="sg-section">
       <h2>Disclosure</h2>
       <p class="sg-hint">
         One implementation, two callers. Collapsed by default and never remembered; the label

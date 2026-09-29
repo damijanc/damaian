@@ -81,6 +81,7 @@ isolated tree — that is the intended way to test without touching real data.
 | `commands/rejected/<id>.dcmd` | Rejected command proposals | [validation.rs:93](../crates/workspace-engine/src/validation.rs:93) |
 | `chat/pending/<proposal-id>.json` | Suspended chat turn awaiting a command decision | [chat.rs:859](../crates/workspace-engine/src/chat.rs:859) |
 | `processes/<pid>-<start-time-us>.json` | One live child process this instance spawned, written **before** the child is returned to its caller and unlinked on clean exit | [process_registry.rs:164](../crates/workspace-engine/src/process_registry.rs:164) |
+| `web-diagnostics/<session-id>/<task-id>/run-<ms>/` | Browser diagnostic screenshots, copied out of the browser server's own output. Images are **not** secret-scanned; they show whatever the page showed | `materialize_browser_artifacts` ([desktop-shell/src/lib.rs](../crates/desktop-shell/src/lib.rs)) |
 | `vector-index/<repo-id>.bin` | Semantic-search embeddings cache | [vector_index.rs:149](../crates/workspace-engine/src/vector_index.rs:149) |
 | `models/all-MiniLM-L6-v2/` | Downloaded embedding model (semantic search only) | [embeddings.rs:27](../crates/workspace-engine/src/embeddings.rs:27) |
 
@@ -371,7 +372,7 @@ Event types: `session_created`, `session_renamed`, `task_created`,
 `task_status_updated`, `message_appended`, `action_started`, `action_finished`,
 `browser_diagnostics_approval_updated`, `conversation_rewound`, `plan_created`,
 `plan_revised`, `plan_resumed`, `plan_step_updated`, `plan_approved`,
-`session_mode_set`.
+`session_mode_set`, `web_diagnostic_recorded`.
 
 Every event carries a monotonic `seq`. Events written before that field existed
 are numbered by line order on read, which is their append order, so old
@@ -472,6 +473,59 @@ Rewinding takes plans and approvals with it: `read_task_plan` and
 `conversation_rewound`, unlike token usage, which is read from every event
 because what was billed was billed regardless of where the conversation now
 sits.
+
+### Browser diagnostics
+
+Each `inspect_web_page` or `run_web_scenario` that returned a report appends
+one `web_diagnostic_recorded` event. Its payload is the whole record the card
+renders: `id`, `taskId`, `tool`, `url`, `recordedAtMs`, and `report`
+(`text`, `artifacts`, `is_error`, `details`, `via`). The envelope is
+camelCase and the report is snake_case. The session log is otherwise stored
+unredacted, but this record is built from the **redacted** report, so what
+you see here is what the model and the UI saw. A runner that returned an
+error instead of a report writes no record, only the tool message.
+
+```bash
+jq -c 'select(.eventType=="web_diagnostic_recorded") | .payload | {tool, url, via: .report.via, is_error: .report.is_error, page_errors: .report.details.page_errors}' "$SESSION_FILE"
+```
+
+Replay goes through the same active-event window as plans, so a rewound turn's
+diagnostics disappear from the UI with it. They stay in the file.
+
+Screenshots are under `web-diagnostics/<session-id>/<task-id>/run-<ms>/` in
+the data directory. The record's artifact `path` is relative to the data
+directory. **Reveal in Finder** (`POST /api/reveal-web-diagnostic-artifact`)
+and the thumbnail endpoint only resolve canonical paths inside
+`web-diagnostics/`. An absolute path, a `..`, or anything else is refused.
+
+**Two shapes of runner.** A browser server that returns the companion's JSON
+object (`page_errors`, `console`, `failed_requests`, `dom_summary`, …) gets
+typed `details`. The model reads Damaian's own summary, `Browser diagnostic
+found …`, and the card lists each problem. Any other browser server's result
+is kept as text: `details` is `null`, the model reads the raw text as before,
+and the card has only a header, any screenshots and a **Diagnostic output**
+disclosure. **To tell them apart, check the card for problem lists**, or check
+`.payload.report.details` for `null`. Nothing is wrong with the second shape.
+It is the fallback for a server Damaian does not know.
+
+**"Found" is not "failed".** A header that says *found N page errors* means
+the diagnostic worked and the page is broken. *Browser diagnostic failed* means
+the tool itself failed: MCP `is_error`, or the companion's `"error": true`
+(for example, a scenario step with invalid arguments). Only the second counts
+toward `agent_tool_retry_limit`, so a model that keeps inspecting a broken
+page is not stopped for it.
+
+Known quirks:
+
+- **Each load-time error is listed two or three times after a scenario.** The
+  legacy `run_scenario` adapter adds a `goto` to the steps, and the companion
+  and the model may also navigate, so the page loads more than once and each
+  load throws again. The count in the header is inflated. The error is real.
+- **The diagnostic's arguments are not recorded.** For an approval-gated call
+  they are in the approval message (`message_appended`, "The assistant wants
+  to run …"). A loopback inspection runs without approval, so for that call
+  they are not written anywhere. That matters when a report is missing its
+  screenshot or DOM summary, because the model may have turned `capture` off.
 
 ### A turn stopped early: which budget ran out
 

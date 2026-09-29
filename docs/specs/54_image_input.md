@@ -13,8 +13,8 @@ Related spec sections: `ai_coding_assistant_specification.md` section 7.1 (chat
 interface), section 7.10 (secret detection).
 Related implementation specs:
 [`12_web_app_troubleshooting.md`](12_web_app_troubleshooting/proposal.md) (produces the
-screenshot artifacts §1 is about; `In progress`, so §5.5 is additive and must be
-coordinated rather than assumed),
+screenshot artifacts §1 is about; Done 2026-09-29, so §5.5 builds on its
+shipped artifact record rather than coordinating a change to it),
 [`26_context_assembly.md`](26_context_assembly.md) (the budget and category an
 image enters through),
 [`27_context_inspector.md`](27_context_inspector.md) (where a user sees what was
@@ -248,11 +248,17 @@ seen it, and it joins the next request as an `Image` part with agent-captured
 provenance. A model that wants to look at the screenshot it just requested asks
 for it, and the asking is answered by a person.
 
-[Spec 12](12_web_app_troubleshooting/proposal.md) is `In progress`, so this must be
-coordinated with it in the same way [spec 22](22_findings_model_and_panel/proposal.md)
-§5.4 coordinates its `entries` addition — additively, with `text` and
-`artifacts` unchanged, and §7 recording whether that coordination happened or
-whether this spec had to work around a closed one.
+[Spec 12](12_web_app_troubleshooting/proposal.md) is Done (2026-09-29) and closed
+without an image-input seam, so this spec works against what it shipped rather
+than coordinating a change to it. Each screenshot is a `WebDiagnosticArtifact`
+(`kind`, a data-dir-relative `path` under `web-diagnostics/…`, `mime_type`,
+`width`, `height`) on the redacted report. That report is persisted in the
+`web_diagnostic_recorded` session event and read back through
+`GET /api/web-diagnostic-artifact`, which only resolves paths inside
+`web-diagnostics/`. The transcript's diagnostic card already renders these
+artifacts, so "the user includes one, having seen it" starts from that card.
+Spec 12 sends the model text only (its non-goal: no images in phase 1), so
+nothing there has to be undone.
 
 ### 5.6 Cost
 
@@ -321,8 +327,10 @@ the content, and never a derived description of it.
 
 To be completed during implementation. Record:
 
-- Whether [spec 12](12_web_app_troubleshooting/proposal.md) was still open enough to
-  coordinate §5.5 additively, or whether this worked around a closed spec.
+- ~~Whether [spec 12](12_web_app_troubleshooting/proposal.md) was still open enough to
+  coordinate §5.5 additively, or whether this worked around a closed spec.~~
+  Answered 2026-09-29: spec 12 closed first, and §5.5 now builds on its shipped
+  `WebDiagnosticArtifact` and `web_diagnostic_recorded` record.
 - The measured token cost of a representative screenshot against the provider's
   reported usage, since §5.6's rule is a formula taken from a vendor and the
   only way to know it is right is to compare it with a measurement.

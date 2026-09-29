@@ -232,6 +232,13 @@ upgrade silently swallows every failure from that tool.
 
 ### 5.4 Browser findings need the runner to say more
 
+> **Superseded in part, 2026-09-29.** Spec 12 is Done, and it built this
+> structure as `WebDiagnosticReport.details: Option<WebDiagnosticDetails>`
+> (page errors, console entries with source locations, failed requests), not
+> as the `entries` field below. Findings come from `details`, and no
+> `WebDiagnosticEntry` is added. See [`context.md`](context.md) §7.1 and Task 6.
+> The option analysis below is kept as the reasoning; its shape is not built.
+
 `WebDiagnosticReport` is `{ text, artifacts, is_error }`
 (`web_diagnostics.rs:83`). Requirement 1 wants console and network errors as
 individual findings, and a single boolean over a prose blob cannot supply them.

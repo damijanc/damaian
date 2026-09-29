@@ -136,9 +136,45 @@ acceptance criterion. Two consequences for the parsers:
 
 ## 7. Things the proposal says that were checked and hold
 
-- Spec 12 is still `In progress`, so §5.4's plan to extend
-  `WebDiagnosticReport` rather than parse its text still applies. The struct is
-  at `web_diagnostics.rs:83`, exactly as cited.
+- **Superseded 2026-09-29 by spec 12's close-out; see §7.1 below.** This note
+  used to say that spec 12 was `In progress`, so that §5.4's plan to extend
+  `WebDiagnosticReport` with `entries` still applied.
+
+### 7.1 The browser structure now exists (spec 12, 2026-09-29)
+
+Spec 12's close-out built what §5.4 planned to add, under a different shape.
+Its [`context.md`](../12_web_app_troubleshooting/context.md) §3.5 records the
+decision. `WebDiagnosticReport` (`web_diagnostics.rs`) now carries
+`details: Option<WebDiagnosticDetails>`, parsed once from the browser
+companion's JSON in `WebDiagnosticReport::from_text`, and redacted by
+`WebDiagnosticReport::redacted`. The typed values Task 6 needs are:
+
+- `details.page_errors: Vec<String>`: uncaught page exceptions, with no
+  location.
+- `details.console: Vec<WebConsoleEntry>` with `level`, `text` and
+  `location: Option<WebSourceLocation { url, line, column }>`.
+  `WebConsoleEntry::is_problem()` selects errors, warnings and asserts.
+- `details.failed_requests: Vec<WebFailedRequest>` with `url`, `method`,
+  `resource_type`, `status` and `failure`.
+- `WebDiagnosticReport::tool_failed()`: the runner itself failed (MCP
+  `is_error`, or the companion's `"error": true`). That is not the page being
+  broken.
+
+So **Task 6 converts these into `Finding`s and must not add
+`WebDiagnosticEntry`, `WebEntryKind` or `WebDiagnosticReport.entries`**. Those
+would be a second browser structure next to `details`. Map the page errors,
+the `is_problem()` console entries and the failed requests. A console
+`location` becomes a `SourceRange` only when it resolves inside the
+repository. Note that `location.url` is the *served* URL (for example
+`http://localhost:5001/static/js/main.js`), not a file path, so the resolution
+rule has to map a URL path to a repository file, or give up to `range: None`.
+§5.4's "no entries and `is_error: true` yields one generic finding" becomes
+"`details` is `None`, or `tool_failed()` is true with nothing to convert". A
+runner that is not the companion always has `details: None`.
+
+That answers proposal §7's open question. `entries` was never added. Spec 12
+supplied the structure itself, as `WebDiagnosticDetails`, and the runner
+already emits it for the companion.
 - Spec 05 is Done, and its navigation is what the panel reuses (Task 10).
 - `CommandExecution` is at `command_runner.rs:16-32`, not `11-22`. It has since
   gained `termination: CommandTermination`. The generic parser (Task 2) should

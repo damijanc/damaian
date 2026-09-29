@@ -466,6 +466,66 @@ edit. A [rewind](#rewind) past the point where you approved takes the approval
 with it: you are asked again, because you have moved the conversation back to
 before you saw the plan.
 
+## Browser Diagnostics
+
+When a browser MCP server is configured, such as a Playwright server under
+**Settings → MCP Servers**, the assistant can look at a web page the way you see it.
+It can open a URL and report what the page did, or run a short scenario:
+fill a field, click a button, wait, take a screenshot. This is how it finds
+problems that `curl` cannot see, such as a script that throws on load and
+leaves a button with nothing attached to it.
+
+### What needs your approval
+
+- **Inspecting a local page** (`localhost`, `127.0.0.1`, `[::1]`) runs
+  without asking. It only opens the page and reads it.
+- **A scenario on a local page** asks first, because it types and clicks. The
+  prompt shows the steps and the target origin. **Allow browser diagnostics
+  for this session** covers later local scenarios in the same session.
+- **Anything outside your machine**, whether an inspection or a scenario, asks
+  every time and shows the origin it will reach. The session option never
+  covers a remote URL.
+
+### The diagnostic card
+
+Each diagnostic that ran leaves a card under the assistant's answer:
+
+- **The header** counts what went wrong, for example *Browser diagnostic
+  found 1 page error, 2 console warnings.* A page with no problems reads
+  *found no page errors, console problems, or failed requests.*
+- **The target line** says *Inspected* or *Scenario*, and the URL.
+- **The page line** gives the final URL, the HTTP status and the page title.
+- **Page errors** are uncaught exceptions: the first thing to read when
+  something "does nothing".
+- **Console** lists errors and warnings in the order the page logged them,
+  with the source file and line when the browser gave one.
+- **Failed requests** lists requests that could not be sent, and responses of
+  400 or above.
+- **Failed steps** lists the scenario steps that did not succeed.
+- **Screenshots** are thumbnails. **Reveal in Finder** selects the image file
+  on disk.
+- **Page summary** opens the page's buttons, form fields, status text and a
+  visible-text excerpt.
+
+A list longer than five items shows the first five and a **Show all** toggle.
+
+**A page with errors is a successful diagnostic.** The header says *found*,
+and the assistant is meant to read the errors, not retry. Only a header that
+says **Browser diagnostic failed** means the diagnostic itself did not run:
+the browser could not start, a step's arguments were rejected, or it timed
+out. Repeating a failed call counts toward the retry limit; finding page
+errors does not.
+
+What the assistant reads is the same summary as the header, as text.
+Everything in it has been through the secret scanner first. Screenshots are
+for you. Phase 1 does not send images to the model.
+
+Cards survive a reload and a restart. A browser server that is not
+Playwright-shaped still works, but its card has no problem lists: only the
+header, any screenshots, and a **Diagnostic output** disclosure with the raw
+result (see
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#browser-diagnostics)).
+
 ## Capping What One Turn May Spend
 
 `agent_max_task_tokens` stops a turn once it has spent that many tokens, rather

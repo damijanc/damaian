@@ -15,7 +15,7 @@ decisions it left open in [`context.md`](context.md)
 | 3 · Rust diagnostics parser (`cargo build`/`check`/`clippy`) | Not started | |
 | 4 · Rust test parser (`cargo test`), delegating compile errors to Task 3 | Not started | |
 | 5 · Biome parser | Not started | |
-| 6 · Browser findings — `WebDiagnosticReport.entries` | Not started | |
+| 6 · Browser findings from spec 12's `WebDiagnosticDetails` | Not started | Re-scoped 2026-09-29 by spec 12's close-out: no `entries` field (`context.md` §7.1). |
 | 7 · Recording, persistence, staleness, `Evidence::Findings` | Not started | |
 | 8 · Dismissal and the scoped repair request | Not started | |
 | 9 · Shell API | Not started | |
@@ -87,7 +87,7 @@ Every task's requirements implicitly include this section.
 | `crates/workspace-engine/src/finding.rs` | New: the types, `FindingDraft`, `Finding::new` (Task 1); `FindingParser`, dispatch, and the generic parser (Task 2) |
 | `crates/workspace-engine/src/finding/` or inline modules | Rust diagnostics, Rust test, and Biome parsers (Tasks 3–5). Task 2 decides between a submodule directory and inline `mod`s, and records the choice |
 | `crates/workspace-engine/src/lib.rs` | `pub mod finding;` (Task 1) |
-| `crates/workspace-engine/src/web_diagnostics.rs` | `WebDiagnosticEntry`, `WebEntryKind`, `WebDiagnosticReport.entries`, and findings from a report (Task 6) |
+| `crates/workspace-engine/src/web_diagnostics.rs` | Findings from a report's `WebDiagnosticDetails`, which spec 12 already defines (Task 6) |
 | `crates/workspace-engine/src/session.rs` | `finding_recorded` and `finding_status_changed` events, and `read_findings` (Task 7) |
 | `crates/workspace-engine/src/plan.rs` | `Evidence::Findings` (Task 7, closing spec 21's deferral) |
 | `crates/workspace-engine/src/validation.rs` (and `chat.rs` if needed) | The recording call sites (Task 7) |
@@ -750,18 +750,28 @@ repository with a lint error seeded into a scratch copy.
 
 ## Task 6: Browser findings
 
-**Files:** `web_diagnostics.rs`. Coordinate with spec 12, which is In
-progress.
+**Files:** `web_diagnostics.rs`. **Updated 2026-09-29 by spec 12's
+close-out:** read `context.md` §7.1 first.
 
-`WebDiagnosticEntry` / `WebEntryKind` as in proposal §5.4. The field
-`WebDiagnosticReport.entries: Vec<WebDiagnosticEntry>` is additive, with
-`#[serde(default)]` so older payloads still parse. Findings come from
-entries. A report with no entries and `is_error: true` yields one generic
-finding. A `source` that does not resolve to a path inside the repository
-root, such as a bundled URL, `node_modules`, or an absolute path outside the
-root, is dropped to `range: None`. Record in §7 whether the runner was
-changed to emit entries, or whether only the type landed and spec 12 still
-has to supply them.
+Spec 12 already types the browser evidence as
+`WebDiagnosticReport.details: Option<WebDiagnosticDetails>`. **Do not add
+`WebDiagnosticEntry`, `WebEntryKind` or `WebDiagnosticReport.entries`.**
+Findings come from `details`:
+
+- each of `page_errors`;
+- each `console` entry for which `WebConsoleEntry::is_problem()` is true,
+  whose `location` becomes a `SourceRange` when it resolves inside the
+  repository;
+- each of `failed_requests`.
+
+A report with `details: None` and `tool_failed()` true yields one generic
+finding. A location that does not resolve to a path inside the repository root
+is dropped to `range: None`: a served URL no rule maps, a bundled URL,
+`node_modules`, or an absolute path outside the root. The report is already
+redacted where the engine records it, but `Finding::new` still redacts
+(`context.md` §6). Proposal §7's question about `entries` is answered in
+`context.md` §7.1: they were never added, because spec 12 supplied
+`WebDiagnosticDetails` instead.
 
 ## Task 7: Recording, persistence, staleness, `Evidence::Findings`
 

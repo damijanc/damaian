@@ -1,6 +1,9 @@
 # Feature Spec: First-Class Web App Troubleshooting
 
-Status: In progress
+Status: Done (2026-09-29). The close-out in [`tasks.md`](tasks.md) built the
+structured report, the model text and the diagnostic card, and checked them
+against a live scenario run. §8 records the runs and maps every acceptance
+criterion to its evidence.
 Order: 12 of 12
 Depends on: [#6](../06_mcp_support.md) (MCP) — built;
 [#8](../08_stop_and_progress.md) (cancellation and progress) — built;
