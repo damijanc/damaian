@@ -476,13 +476,56 @@ It was correctly classified `provider_bad_request`, so spec 48's fix held for
 a genuine refusal. The task ended `failed` before the model answered, so the
 live card and the scenario were not reached. The cause is spec 47's batched
 rounds: every call after the first in a round is sent back without its
-reasoning. Spec 47 §7 records it. Criteria 1–3 and 5 must be re-run once it is
-fixed, before this spec closes.
+reasoning. Spec 47 §7 records it, and it was fixed the same day.
 
-Two smaller findings from the run, neither blocking:
+**Second re-run, 2026-09-29, with both fixes: passed.** This used a fresh data
+directory and the throwaway line with no marker comment. The first round
+batched `list_directory` and `read_file`, and the next DeepSeek call
+succeeded, so spec 47's fix held against the real provider. The model went
+straight to `run_web_scenario`, and the prompt showed the target origin and
+`BROWSER-MEDIUM`. Its first attempt sent `goto` with `value` instead of `url`.
+The companion rejected that before running, and Damaian recorded it as a tool
+failure (`is_error`, a "Browser diagnostic failed" card). The model corrected
+the argument and asked again. Once approved, all 8 steps ran. The result had
+the page errors, a DOM summary with the buttons, status text and visible
+text, and one 1000×800 screenshot under `<data-dir>/web-diagnostics/…`. The
+model's answer after the resume streamed normally and was not classified as a
+refusal, so spec 48's fix held. With no hint in the code, the model named the
+TDZ cause and proposed the right fix: move the call below `new Game(…)`. Both
+cards arrived during the turn, through the resume path; a DOM observer
+recorded each insertion with no page reload. Reveal in Finder returned the
+canonical path. After a restart of the shell, both cards replayed and the
+screenshot loaded again. The throwaway line was reverted.
+
+**Acceptance criteria (Task 5 Step 2):**
+
+| # | Evidence |
+|---|---|
+| 1 | `chat_dispatches_first_class_web_inspection_tool` (`tests/foundation.rs`: no command proposal); live, the loopback `inspect_web_page` ran without approval |
+| 2 | `a_structured_browser_report_is_rendered_and_lists_the_materialised_artifact` (`desktop-shell`); live, turn 1 of every run |
+| 3 | Live, the 2026-09-29 scenario (fill two inputs, click, wait: page errors, console, failed requests, visible text, screenshot); `a_structured_browser_report_is_rendered_and_lists_the_materialised_artifact` for the artifact |
+| 4 | `invalid_web_scenario_actions_are_rejected_before_execution` |
+| 5 | `a_structured_browser_report_is_rendered_and_lists_the_materialised_artifact`; live, stored under `<data-dir>/web-diagnostics/…` and shown in the card |
+| 6 | **Unmet: no test.** The code gates it: `WebDiagnosticCall::is_low_risk` is a loopback inspection only, a remote URL gets `browser-high`, and `web_diagnostic_approval_proposal` writes `Target origin:`. But no test pins a remote URL's approval or the origin line. `web_scenarios_require_approval_before_interaction` covers a loopback scenario and checks `browser-medium` only. The live runs showed the origin line for loopback only. |
+| 7 | `redacted_scrubs_every_captured_string` (`web_diagnostics.rs`); `a_web_diagnostic_is_recorded_redacted_and_streamed` and `an_approved_web_diagnostic_is_recorded_at_resume` (`chat.rs`) |
+| 8 | `config_overlay_supports_agent_tool_round_limits`; `web_debug_prompts_use_the_web_round_limit` |
+| 9 | `repeated_failed_browser_diagnostics_are_stopped`; `a_companion_tool_error_counts_toward_the_retry_limit` |
+| 10 | `tool_round_exhaustion_is_terminal_when_model_still_requests_tools` |
+| 11 | `mcp_stdio_client_handshakes_lists_and_calls_tools`; `an_mcp_tool_with_a_true_read_only_hint_is_offered_in_ask` |
+
+Criterion 6 keeps this spec open until a test pins it.
+
+Smaller findings from the runs, none blocking:
 
 - The legacy `run_scenario` adapter adds a `goto` of its own, so the page loads
-  twice and each load-time error is reported twice.
+  twice and each load-time error is reported twice. When the model's own steps
+  also start with a `goto`, it loads three times (3 identical page errors on
+  2026-09-29).
+- `validate_scenario_actions` (`web_diagnostics.rs`) checks only each step's
+  action name, so it does not require `url` on a `goto` step. The model's
+  `{"action":"goto","value":…}` passed Damaian's validation and was rejected
+  only by the companion. Criterion 4 covers action names, so it
+  still holds; this gap sits next to it.
 - Turn 1's inspection came back with an empty `dom_summary` and no
   screenshot, although the companion turns both on by default. The model's
   arguments are not logged. In the re-run, the same inspection returned both,
