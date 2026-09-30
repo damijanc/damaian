@@ -5839,6 +5839,19 @@ fn a_set_ceiling_survives_a_round_trip_through_the_overlay_text() {
 }
 
 #[test]
+fn command_timeout_and_turn_message_window_survive_a_round_trip_through_the_overlay_text() {
+    // Both keys parse, so a save that drops them erases the user's own setting
+    // the next time anything rewrites the file — Allow Always among them.
+    let overlay =
+        ConfigOverlay::parse("command_timeout_secs=90\nagent_max_turn_messages=12\n").unwrap();
+    let text = overlay.to_policy_text();
+    assert!(text.contains("command_timeout_secs=90"), "got: {text}");
+    assert!(text.contains("agent_max_turn_messages=12"), "got: {text}");
+
+    assert_eq!(ConfigOverlay::parse(&text).unwrap(), overlay);
+}
+
+#[test]
 fn config_rejects_a_ceiling_too_low_to_be_meaningful() {
     // A ceiling of zero — or of ten — stops every turn before its first call,
     // which is indistinguishable from Damaian being broken. Refuse it at parse

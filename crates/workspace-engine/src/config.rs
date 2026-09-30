@@ -1973,147 +1973,200 @@ impl ConfigOverlay {
     }
 
     pub fn to_policy_text(&self) -> String {
+        // Exhaustive destructuring, deliberately without `..`: a field added to
+        // `ConfigOverlay` fails to compile here, and one bound but never written
+        // is an unused variable, which the lint gate rejects. Every `save()`
+        // rewrites the whole file through this function, so a field it skips
+        // is erased from the user's config by any unrelated write.
+        let ConfigOverlay {
+            data_dir,
+            max_file_bytes,
+            max_read_lines,
+            max_list_entries,
+            max_search_matches,
+            max_match_line_chars,
+            max_command_output_bytes,
+            command_timeout_secs,
+            allowed_roots,
+            ignore_patterns,
+            restricted_patterns,
+            command_allowlist,
+            command_allowlist_by_repository,
+            command_blocklist,
+            secret_patterns,
+            require_approval_for_file_edits,
+            require_approval_for_risky_commands,
+            require_approval_for_all_commands,
+            block_generated_secrets,
+            audit_enabled,
+            audit_retention_days,
+            checkpoint_retention_days,
+            checkpoint_max_total_bytes,
+            checkpoint_census_max_paths,
+            enable_semantic_search,
+            agent_max_tool_rounds,
+            agent_web_debug_max_tool_rounds,
+            agent_tool_retry_limit,
+            agent_max_task_tokens,
+            agent_max_turn_messages,
+            shell,
+            model_provider,
+            model_name,
+            model_base_url,
+            model_api_key_env,
+            model_reasoning_level,
+            model_providers,
+            mcp_enabled,
+            mcp_server_allowlist,
+            mcp_servers,
+        } = self;
         let mut output = String::new();
-        if let Some(value) = &self.data_dir {
+        if let Some(value) = data_dir {
             push_line(&mut output, "data_dir", &value.to_string_lossy());
         }
-        if let Some(value) = self.max_read_lines {
+        if let Some(value) = max_read_lines {
             push_line(&mut output, "max_read_lines", &value.to_string());
         }
-        if let Some(value) = self.max_list_entries {
+        if let Some(value) = max_list_entries {
             push_line(&mut output, "max_list_entries", &value.to_string());
         }
-        if let Some(value) = self.max_search_matches {
+        if let Some(value) = max_search_matches {
             push_line(&mut output, "max_search_matches", &value.to_string());
         }
-        if let Some(value) = self.max_match_line_chars {
+        if let Some(value) = max_match_line_chars {
             push_line(&mut output, "max_match_line_chars", &value.to_string());
         }
-        if let Some(value) = self.max_file_bytes {
+        if let Some(value) = max_file_bytes {
             push_line(&mut output, "max_file_bytes", &value.to_string());
         }
-        if let Some(value) = self.max_command_output_bytes {
+        if let Some(value) = max_command_output_bytes {
             push_line(&mut output, "max_command_output_bytes", &value.to_string());
         }
-        if let Some(value) = &self.allowed_roots {
+        if let Some(value) = command_timeout_secs {
+            push_line(&mut output, "command_timeout_secs", &value.to_string());
+        }
+        if let Some(value) = allowed_roots {
             push_line(&mut output, "allowed_roots", &join_paths(value));
         }
-        if let Some(value) = &self.ignore_patterns {
+        if let Some(value) = ignore_patterns {
             push_line(&mut output, "ignore_patterns", &join_list(value));
         }
-        if let Some(value) = &self.restricted_patterns {
+        if let Some(value) = restricted_patterns {
             push_line(&mut output, "restricted_patterns", &join_list(value));
         }
-        if let Some(value) = &self.command_allowlist {
+        if let Some(value) = command_allowlist {
             push_line(&mut output, "command_allowlist", &join_list(value));
         }
-        for (repository_id, entries) in &self.command_allowlist_by_repository {
+        for (repository_id, entries) in command_allowlist_by_repository {
             push_line(
                 &mut output,
                 &format!("command_allowlist.{repository_id}"),
                 &join_list(entries),
             );
         }
-        if let Some(value) = &self.command_blocklist {
+        if let Some(value) = command_blocklist {
             push_line(&mut output, "command_blocklist", &join_list(value));
         }
-        if let Some(value) = &self.secret_patterns {
+        if let Some(value) = secret_patterns {
             push_line(&mut output, "secret_patterns", &join_list(value));
         }
-        if let Some(value) = self.require_approval_for_file_edits {
+        if let Some(value) = require_approval_for_file_edits {
             push_line(
                 &mut output,
                 "require_approval_for_file_edits",
                 &value.to_string(),
             );
         }
-        if let Some(value) = self.require_approval_for_risky_commands {
+        if let Some(value) = require_approval_for_risky_commands {
             push_line(
                 &mut output,
                 "require_approval_for_risky_commands",
                 &value.to_string(),
             );
         }
-        if let Some(value) = self.require_approval_for_all_commands {
+        if let Some(value) = require_approval_for_all_commands {
             push_line(
                 &mut output,
                 "require_approval_for_all_commands",
                 &value.to_string(),
             );
         }
-        if let Some(value) = self.block_generated_secrets {
+        if let Some(value) = block_generated_secrets {
             push_line(&mut output, "block_generated_secrets", &value.to_string());
         }
-        if let Some(value) = self.audit_enabled {
+        if let Some(value) = audit_enabled {
             push_line(&mut output, "audit_enabled", &value.to_string());
         }
-        if let Some(value) = self.audit_retention_days {
+        if let Some(value) = audit_retention_days {
             push_line(&mut output, "audit_retention_days", &value.to_string());
         }
-        if let Some(value) = self.checkpoint_retention_days {
+        if let Some(value) = checkpoint_retention_days {
             push_line(&mut output, "checkpoint_retention_days", &value.to_string());
         }
-        if let Some(value) = self.checkpoint_max_total_bytes {
+        if let Some(value) = checkpoint_max_total_bytes {
             push_line(
                 &mut output,
                 "checkpoint_max_total_bytes",
                 &value.to_string(),
             );
         }
-        if let Some(value) = self.checkpoint_census_max_paths {
+        if let Some(value) = checkpoint_census_max_paths {
             push_line(
                 &mut output,
                 "checkpoint_census_max_paths",
                 &value.to_string(),
             );
         }
-        if let Some(value) = self.enable_semantic_search {
+        if let Some(value) = enable_semantic_search {
             push_line(&mut output, "enable_semantic_search", &value.to_string());
         }
-        if let Some(value) = self.agent_max_tool_rounds {
+        if let Some(value) = agent_max_tool_rounds {
             push_line(&mut output, "agent_max_tool_rounds", &value.to_string());
         }
-        if let Some(value) = self.agent_web_debug_max_tool_rounds {
+        if let Some(value) = agent_web_debug_max_tool_rounds {
             push_line(
                 &mut output,
                 "agent_web_debug_max_tool_rounds",
                 &value.to_string(),
             );
         }
-        if let Some(value) = self.agent_max_task_tokens {
+        if let Some(value) = agent_max_task_tokens {
             push_line(&mut output, "agent_max_task_tokens", &value.to_string());
         }
-        if let Some(value) = self.agent_tool_retry_limit {
+        if let Some(value) = agent_tool_retry_limit {
             push_line(&mut output, "agent_tool_retry_limit", &value.to_string());
         }
-        if let Some(value) = &self.shell {
+        if let Some(value) = agent_max_turn_messages {
+            push_line(&mut output, "agent_max_turn_messages", &value.to_string());
+        }
+        if let Some(value) = shell {
             push_line(&mut output, "shell", value);
         }
-        if let Some(value) = &self.model_provider {
+        if let Some(value) = model_provider {
             push_line(&mut output, "model_provider", value);
         }
-        if let Some(value) = &self.model_name {
+        if let Some(value) = model_name {
             push_line(&mut output, "model_name", value);
         }
-        if let Some(value) = &self.model_base_url {
+        if let Some(value) = model_base_url {
             push_line(&mut output, "model_base_url", value);
         }
-        if let Some(value) = &self.model_api_key_env {
+        if let Some(value) = model_api_key_env {
             push_line(&mut output, "model_api_key_env", value);
         }
-        if let Some(value) = &self.model_reasoning_level {
+        if let Some(value) = model_reasoning_level {
             push_line(&mut output, "model_reasoning_level", value);
         }
-        for provider in &self.model_providers {
+        for provider in model_providers {
             push_model_provider_overlay(&mut output, provider);
         }
-        if let Some(value) = self.mcp_enabled {
+        if let Some(value) = mcp_enabled {
             push_line(&mut output, "mcp_enabled", &value.to_string());
         }
-        if let Some(value) = &self.mcp_server_allowlist {
+        if let Some(value) = mcp_server_allowlist {
             push_line(&mut output, "mcp_server_allowlist", &join_list(value));
         }
-        for server in &self.mcp_servers {
+        for server in mcp_servers {
             push_mcp_server_overlay(&mut output, server);
         }
         output
