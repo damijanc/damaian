@@ -27,6 +27,7 @@ pub mod patch_engine;
 pub mod path_policy;
 pub mod plan;
 pub mod process_registry;
+pub mod profile;
 pub mod recovery;
 mod render;
 pub mod repository_trust;
@@ -99,6 +100,9 @@ pub use plan::{
 pub use process_registry::{
     ProcessIdentity, ProcessKind, ProcessRegistry, RegisteredProcess, RegistrationHandle,
     SweepDecision, SweepReport, SweepScope,
+};
+pub use profile::{
+    ProfileCapabilities, ProfileId, ProfileSelection, review_profile_rejections, select_profile,
 };
 pub use recovery::{
     ReattachedApproval, RecoveredTask, abandon, classify_all, classify_session, headline,

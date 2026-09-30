@@ -1,6 +1,7 @@
 use crate::error::{ClientError, Result};
 use crate::hash::repository_id_for_root;
 use crate::model::TokenUsage;
+use crate::profile::{ProfileCapabilities, ProfileId};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -54,15 +55,21 @@ pub const DEFAULT_RESTRICTED_PATTERNS: &[&str] = &[
     "**/credentials/**",
 ];
 
-/// Where a [`ConfigOverlay`] came from. Only [`ConfigScope::Repository`] is
+/// Where a [`ConfigOverlay`] came from. [`ConfigScope::Repository`] is
 /// untrusted: that file arrives with a clone, so it may add restrictions but
 /// never remove one. See `docs/specs/34_repository_config_trust_boundary.md`.
+/// [`ConfigScope::Profile`] is restrict-only too, by design rather than
+/// distrust (spec 31, `context.md` §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigScope {
     User,
     /// Untrusted: arrives with a clone.
     Repository,
     Admin,
+    /// The permission profile selected for this checkout, applied last. It
+    /// narrows capability exactly as far as repository config may, and sets
+    /// no preference or redirecting key.
+    Profile,
 }
 
 /// Why a repository-sourced key was not honoured.
@@ -122,6 +129,13 @@ pub struct RepositoryConfigReport {
     /// `command_allowlist` entries found in repository config. Never applied;
     /// carried so the user can be offered the one-time migration.
     pub repository_allowlist_entries: Vec<String>,
+    /// The permission profile applied last, when this checkout has one
+    /// selected (spec 31).
+    pub permission_profile: Option<ProfileId>,
+    /// Keys the selected profile carried and could not apply. Deliberately
+    /// not in [`Self::rejected_keys`], nor in [`Self::is_empty`]: they are not
+    /// the repository's refusals and must not reach its notice.
+    pub profile_rejected_keys: Vec<RejectedConfigKey>,
 }
 
 impl RepositoryConfigReport {
@@ -139,7 +153,9 @@ impl RepositoryConfigReport {
     }
 }
 
-#[derive(Debug, Clone)]
+// `PartialEq` so spec 31 can pin "no profile selected changes nothing" as one
+// comparison. No `Eq`: provider price rates are `Option<f64>`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub data_dir: PathBuf,
     pub max_file_bytes: u64,
@@ -175,6 +191,11 @@ pub struct Config {
     /// repository-scoped load folds the matching entries into
     /// [`Self::command_allowlist`].
     pub command_allowlist_by_repository: BTreeMap<String, Vec<String>>,
+    /// The permission profile the user selected for each checkout, keyed by
+    /// repository id the way `Allow Always` is. User-owned: a repository
+    /// cannot choose its own profile in either direction (spec 31,
+    /// `context.md` §4).
+    pub permission_profile_by_repository: BTreeMap<String, ProfileId>,
     pub command_blocklist: Vec<String>,
     pub secret_patterns: Vec<String>,
     pub require_approval_for_file_edits: bool,
@@ -567,6 +588,21 @@ impl Config {
         {
             config.apply_overlay_scoped(ConfigOverlay::load(path)?, ConfigScope::Admin);
         }
+        // Last and restrict-only (spec 31, `context.md` §4), so admin can
+        // widen the base but cannot undo a narrower profile the user chose.
+        // With no selection nothing is applied, which is Full: the empty
+        // overlay.
+        if let Some(root) = repository_root
+            && let Some(profile) = config
+                .permission_profile_by_repository
+                .get(&repository_id_for_root(root))
+                .cloned()
+        {
+            let (overlay, mut rejected) = profile.overlay(&config.data_dir)?;
+            rejected.extend(config.apply_overlay_scoped(overlay, ConfigScope::Profile));
+            report.profile_rejected_keys = rejected;
+            report.permission_profile = Some(profile);
+        }
         if let Some(root) = repository_root {
             config.apply_repository_allowlist(root);
         }
@@ -623,6 +659,7 @@ impl Config {
             restricted_patterns,
             command_allowlist,
             command_allowlist_by_repository,
+            permission_profile_by_repository,
             command_blocklist,
             secret_patterns,
             require_approval_for_file_edits,
@@ -657,7 +694,14 @@ impl Config {
         } = overlay;
 
         let mut rejected = Vec::new();
-        let trusted = scope != ConfigScope::Repository;
+        // Exhaustive, so a new scope is a decision and never trusted by
+        // default.
+        let trusted = match scope {
+            ConfigScope::User | ConfigScope::Admin => true,
+            // A profile narrows exactly as far as an untrusted repository may:
+            // it adds restrictions and removes none (spec 31, `context.md` §4).
+            ConfigScope::Repository | ConfigScope::Profile => false,
+        };
         let forbidden = RepositoryKeyClass::Forbidden;
 
         // Forbidden: redirects execution, model traffic, credentials, or where
@@ -773,6 +817,17 @@ impl Config {
                 rejected.push(RejectedConfigKey::new(key, RepositoryKeyClass::UserOwned));
             }
         }
+        // User-owned for the same reason: choosing a checkout's profile is the
+        // user's decision, and a profile cannot select another profile.
+        for (repository_id, profile) in permission_profile_by_repository {
+            let key = format!("permission_profile.{repository_id}");
+            if trusted {
+                self.permission_profile_by_repository
+                    .insert(repository_id, profile);
+            } else {
+                rejected.push(RejectedConfigKey::new(key, RepositoryKeyClass::UserOwned));
+            }
+        }
 
         // Restrict-only: either scope may add a restriction; a repository
         // cannot take one away.
@@ -875,10 +930,18 @@ impl Config {
             );
         }
         for server in mcp_servers {
-            if trusted {
-                self.upsert_mcp_server(server);
-            } else {
-                self.upsert_mcp_server_from_repository(server, &mut rejected);
+            match scope {
+                ConfigScope::User | ConfigScope::Admin => self.upsert_mcp_server(server),
+                ConfigScope::Repository => {
+                    self.upsert_mcp_server_from_repository(server, true, &mut rejected)
+                }
+                // A server definition is not a profile key: it is where
+                // `auth_token_env` lives, and an export must never carry one
+                // (`context.md` §9). A profile may only disable or gate a
+                // server the user already has.
+                ConfigScope::Profile => {
+                    self.upsert_mcp_server_from_repository(server, false, &mut rejected)
+                }
             }
         }
 
@@ -964,14 +1027,23 @@ impl Config {
         // Forbidden: lowering a checkpoint budget destroys the user's own
         // recovery data for a repository a clone brought with it, so a
         // repository cannot set these even though they look like budgets.
-        if let Some(value) = scoped(
-            checkpoint_retention_days,
-            "checkpoint_retention_days",
-            trusted,
-            forbidden,
-            &mut rejected,
-        ) {
-            self.checkpoint_retention_days = value;
+        // The user's own profile may lower the retention window, which is
+        // what Offline private is for (`context.md` §3).
+        if let Some(value) = checkpoint_retention_days {
+            match scope {
+                ConfigScope::User | ConfigScope::Repository | ConfigScope::Admin => {
+                    if let Some(value) = scoped(
+                        Some(value),
+                        "checkpoint_retention_days",
+                        trusted,
+                        forbidden,
+                        &mut rejected,
+                    ) {
+                        self.checkpoint_retention_days = value;
+                    }
+                }
+                ConfigScope::Profile => lower_wins(&mut self.checkpoint_retention_days, value),
+            }
         }
         if let Some(value) = scoped(
             checkpoint_max_total_bytes,
@@ -992,26 +1064,60 @@ impl Config {
             self.checkpoint_census_max_paths = value;
         }
 
-        // Free: preferences and budgets, with no capability behind them.
-        if let Some(value) = max_file_bytes {
+        // Free: preferences and budgets, with no capability behind them. A
+        // profile narrows capability and does not reconfigure Damaian, so it
+        // sets none of these (`context.md` §4).
+        if let Some(value) = preference(max_file_bytes, "max_file_bytes", scope, &mut rejected) {
             self.max_file_bytes = value;
         }
-        if let Some(value) = max_command_output_bytes {
+        if let Some(value) = preference(
+            max_command_output_bytes,
+            "max_command_output_bytes",
+            scope,
+            &mut rejected,
+        ) {
             self.max_command_output_bytes = value;
         }
+        // The one preference a profile sets, and only lower: Offline private
+        // keeps less history (`context.md` §3).
         if let Some(value) = audit_retention_days {
-            self.audit_retention_days = value;
+            match scope {
+                ConfigScope::User | ConfigScope::Repository | ConfigScope::Admin => {
+                    self.audit_retention_days = value;
+                }
+                ConfigScope::Profile => lower_wins(&mut self.audit_retention_days, value),
+            }
         }
-        if let Some(value) = enable_semantic_search {
+        if let Some(value) = preference(
+            enable_semantic_search,
+            "enable_semantic_search",
+            scope,
+            &mut rejected,
+        ) {
             self.enable_semantic_search = value;
         }
-        if let Some(value) = agent_max_tool_rounds {
+        if let Some(value) = preference(
+            agent_max_tool_rounds,
+            "agent_max_tool_rounds",
+            scope,
+            &mut rejected,
+        ) {
             self.agent_max_tool_rounds = value;
         }
-        if let Some(value) = agent_web_debug_max_tool_rounds {
+        if let Some(value) = preference(
+            agent_web_debug_max_tool_rounds,
+            "agent_web_debug_max_tool_rounds",
+            scope,
+            &mut rejected,
+        ) {
             self.agent_web_debug_max_tool_rounds = value;
         }
-        if let Some(value) = agent_tool_retry_limit {
+        if let Some(value) = preference(
+            agent_tool_retry_limit,
+            "agent_tool_retry_limit",
+            scope,
+            &mut rejected,
+        ) {
             self.agent_tool_retry_limit = value;
         }
 
@@ -1348,9 +1454,13 @@ impl Config {
     /// classification table and is refused anyway: overlaying the `command` of
     /// a server the user has already enabled would redirect a process they
     /// trust, which requirement 2 forbids.
+    ///
+    /// `may_define` is false at profile scope, where a definition is refused
+    /// even for a new server and nothing is created.
     fn upsert_mcp_server_from_repository(
         &mut self,
         overlay: McpServerConfigOverlay,
+        may_define: bool,
         rejected: &mut Vec<RejectedConfigKey>,
     ) {
         let McpServerConfigOverlay {
@@ -1398,7 +1508,7 @@ impl Config {
             ("url", url.is_some()),
             ("auth_token_env", auth_token_env.is_some()),
         ];
-        if already_configured {
+        if already_configured || !may_define {
             for (field, present) in definition {
                 if present {
                     rejected.push(RejectedConfigKey::new(
@@ -1406,6 +1516,10 @@ impl Config {
                         RepositoryKeyClass::Forbidden,
                     ));
                 }
+            }
+            if !already_configured {
+                // Nothing to narrow, and creating an entry would be defining one.
+                return;
             }
         } else {
             if definition.iter().all(|(_, present)| !present) {
@@ -1439,6 +1553,17 @@ impl Config {
             if !self.command_allowlist.contains(&entry) {
                 self.command_allowlist.push(entry);
             }
+        }
+    }
+
+    /// The resolved values spec 31's refusal points consult.
+    pub fn profile_capabilities(&self) -> ProfileCapabilities {
+        ProfileCapabilities {
+            allow_file_edits: self.allow_file_edits,
+            command_access: self.command_access,
+            allow_browser_diagnostics: self.allow_browser_diagnostics,
+            allow_mutating_mcp_tools: self.allow_mutating_mcp_tools,
+            mcp_enabled: self.mcp_enabled,
         }
     }
 
@@ -1500,9 +1625,9 @@ impl Config {
             "command_allowlist",
             &join_list(&self.command_allowlist),
         );
-        // Deliberately not the per-repository map: this text answers "what
+        // Deliberately not the per-repository maps: this text answers "what
         // applies in this repository", and another checkout's `Allow Always`
-        // grants do not. They are visible in user config, which Settings shows
+        // grants and profile selection do not. They are visible in user config, which Settings shows
         // verbatim.
         push_line(
             &mut output,
@@ -1659,6 +1784,7 @@ impl Default for Config {
                 .collect(),
             command_allowlist: Vec::new(),
             command_allowlist_by_repository: BTreeMap::new(),
+            permission_profile_by_repository: BTreeMap::new(),
             command_blocklist: Vec::new(),
             secret_patterns: Vec::new(),
             require_approval_for_file_edits: true,
@@ -1715,6 +1841,8 @@ pub struct ConfigOverlay {
     pub command_allowlist: Option<Vec<String>>,
     /// `command_allowlist.<repository_id>` entries, from user or admin config.
     pub command_allowlist_by_repository: BTreeMap<String, Vec<String>>,
+    /// `permission_profile.<repository_id>` entries, from user or admin config.
+    pub permission_profile_by_repository: BTreeMap<String, ProfileId>,
     pub command_blocklist: Option<Vec<String>>,
     pub secret_patterns: Option<Vec<String>>,
     pub require_approval_for_file_edits: Option<bool>,
@@ -1831,6 +1959,8 @@ classify_overlay_fields! {
     restricted_patterns => Capability,
     command_allowlist => Capability,
     command_allowlist_by_repository => Capability,
+    // User-owned at repository scope, like the allowlist map above.
+    permission_profile_by_repository => Capability,
     command_blocklist => Capability,
     secret_patterns => Capability,
     require_approval_for_file_edits => Capability,
@@ -1965,6 +2095,9 @@ impl ConfigOverlay {
         if let Some(repository_id) = key.strip_prefix("command_allowlist.") {
             return self.set_repository_command_allowlist(repository_id, value);
         }
+        if let Some(repository_id) = key.strip_prefix("permission_profile.") {
+            return self.set_repository_permission_profile(repository_id, value);
+        }
         match key {
             "data_dir" => self.data_dir = Some(PathBuf::from(value)),
             "max_file_bytes" => self.max_file_bytes = Some(parse_u64(key, value)?),
@@ -2079,6 +2212,25 @@ impl ConfigOverlay {
         }
         self.command_allowlist_by_repository
             .insert(repository_id.to_string(), split_list(value));
+        Ok(())
+    }
+
+    /// `permission_profile.<repository_id>=<profile id>` — the profile the
+    /// user selected for one checkout. Refused at repository scope when the
+    /// overlay is applied.
+    fn set_repository_permission_profile(
+        &mut self,
+        repository_id: &str,
+        value: &str,
+    ) -> Result<()> {
+        let repository_id = repository_id.trim();
+        if !repository_id.starts_with("repo_") {
+            return Err(ClientError::InvalidInput(format!(
+                "Invalid repository id in config key: permission_profile.{repository_id}"
+            )));
+        }
+        self.permission_profile_by_repository
+            .insert(repository_id.to_string(), ProfileId::parse(value)?);
         Ok(())
     }
 
@@ -2200,6 +2352,7 @@ impl ConfigOverlay {
             restricted_patterns,
             command_allowlist,
             command_allowlist_by_repository,
+            permission_profile_by_repository,
             command_blocklist,
             secret_patterns,
             require_approval_for_file_edits,
@@ -2274,6 +2427,13 @@ impl ConfigOverlay {
                 &mut output,
                 &format!("command_allowlist.{repository_id}"),
                 &join_list(entries),
+            );
+        }
+        for (repository_id, profile) in permission_profile_by_repository {
+            push_line(
+                &mut output,
+                &format!("permission_profile.{repository_id}"),
+                profile.as_str(),
             );
         }
         if let Some(value) = command_blocklist {
@@ -2876,6 +3036,35 @@ fn scoped<T>(
             None
         }
         None => None,
+    }
+}
+
+/// A preference key. Every scope but a profile applies it as given; a profile
+/// narrows capability and does not reconfigure Damaian, so there it is
+/// refused (spec 31, `context.md` §4).
+fn preference<T>(
+    value: Option<T>,
+    key: &str,
+    scope: ConfigScope,
+    rejected: &mut Vec<RejectedConfigKey>,
+) -> Option<T> {
+    match scope {
+        ConfigScope::User | ConfigScope::Repository | ConfigScope::Admin => value,
+        ConfigScope::Profile => {
+            if value.is_some() {
+                rejected.push(RejectedConfigKey::new(key, RepositoryKeyClass::Forbidden));
+            }
+            None
+        }
+    }
+}
+
+/// A retention window a profile may only shorten. A profile value is an upper
+/// bound ("keep at most this long"), so a higher one is the documented merge
+/// rather than a refusal, and nothing is recorded — as with `union_patterns`.
+fn lower_wins(current: &mut u64, value: u64) {
+    if value < *current {
+        *current = value;
     }
 }
 

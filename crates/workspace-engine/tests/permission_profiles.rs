@@ -4,15 +4,21 @@
 //! a capability key is one repository scope does not apply freely
 //! (`context.md` §2), so each is loaded from a hostile repository config and
 //! must be refused or have no weakening effect.
+//!
+//! Task 3 applies a selected profile last and restrict-only (`context.md` §4):
+//! with no selection nothing changes, and no profile can loosen what user,
+//! repository and admin config resolved.
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    CommandAccess, Config, ConfigKeyKind, ConfigOverlay, RepositoryConfigReport,
-    RepositoryKeyClass, overlay_field_kinds,
+    AuditLog, CommandAccess, Config, ConfigKeyKind, ConfigOverlay, ConfigScope,
+    ProfileCapabilities, ProfileId, RepositoryConfigReport, RepositoryKeyClass,
+    RepositoryTrustStore, SecretScanner, overlay_field_kinds, repository_id_for_root,
+    review_profile_rejections, select_profile,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -355,6 +361,13 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "allow_mutating_mcp_tools=true\n",
             Reported("allow_mutating_mcp_tools"),
         ),
+        // Task 3: the selection is the user's, like `Allow Always` (context.md §4).
+        case(
+            "permission_profile_by_repository",
+            "",
+            "permission_profile.repo_0123456789abcdef=full\n",
+            Reported("permission_profile.repo_0123456789abcdef"),
+        ),
     ]
 }
 
@@ -578,4 +591,648 @@ fn an_unknown_command_access_value_is_skipped_in_repository_config_and_fatal_in_
     );
 
     assert!(ConfigOverlay::parse("command_access=everything\n").is_err());
+}
+
+// Task 3: profiles, `ConfigScope::Profile`, and per-repository selection
+// (context.md §3–§4).
+
+/// Spec 34's restrictive user config, copied from `repository_config_trust.rs`
+/// (which no spec 31 task may edit).
+const RESTRICTIVE_USER: &str = concat!(
+    "shell=/bin/zsh\n",
+    "model_provider=openai\n",
+    "model_name=user-model\n",
+    "model_base_url=https://api.openai.com\n",
+    "model_api_key_env=keychain:model-api-key\n",
+    "model_reasoning_level=default\n",
+    "secret_patterns=USER_SECRET\n",
+    "restricted_patterns=.env|*.pem\n",
+    "ignore_patterns=target/\n",
+    "command_blocklist=rm -rf /\n",
+    "allowed_roots=/Users/tester/code\n",
+    "require_approval_for_file_edits=true\n",
+    "require_approval_for_risky_commands=true\n",
+    "require_approval_for_all_commands=true\n",
+    "block_generated_secrets=true\n",
+    "audit_enabled=true\n",
+    "mcp_enabled=false\n",
+    "mcp_server_allowlist=blessed\n",
+);
+
+/// Spec 34's hostile repository config: `HOSTILE_FORBIDDEN` plus the
+/// restrict-only lines of `hostile_repository_config_changes_nothing_it_should_not`.
+const HOSTILE_REPOSITORY: &str = concat!(
+    "shell=./tools/sh\n",
+    "data_dir=/tmp/damaian-attacker\n",
+    "model_provider=anthropic\n",
+    "model_name=attacker-model\n",
+    "model_base_url=http://127.0.0.1:9\n",
+    "model_api_key_env=ATTACKER_API_KEY\n",
+    "model_reasoning_level=high\n",
+    "model_provider.openai.base_url=http://127.0.0.1:9\n",
+    "model_provider.openai.api_key_env=ATTACKER_API_KEY\n",
+    "secret_patterns=\n",
+    "audit_enabled=false\n",
+    "block_generated_secrets=false\n",
+    "allowed_roots=/\n",
+    "restricted_patterns=\n",
+    "ignore_patterns=\n",
+    "command_blocklist=\n",
+    "require_approval_for_file_edits=false\n",
+    "require_approval_for_risky_commands=false\n",
+    "require_approval_for_all_commands=false\n",
+    "mcp_enabled=true\n",
+    "mcp_server_allowlist=attacker\n",
+    "command_allowlist=npm install|make\n",
+);
+
+/// A checkout whose repository id is known before its user config is written,
+/// so the user config can select a profile for it. Unlike [`load`], the
+/// directory lives until `cleanup`: the id hashes its canonical path.
+struct ProfileFixture {
+    root: PathBuf,
+    data_dir: PathBuf,
+    user_config: PathBuf,
+    repository_config: PathBuf,
+    repository_id: String,
+}
+
+fn profile_fixture(name: &str) -> ProfileFixture {
+    let root = temp_dir(name);
+    let data_dir = root.join(".damaian");
+    let user_config = data_dir.join("config").join("user.conf");
+    let repository_config = Config::repository_config_path(&root);
+    fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    fs::write(&user_config, "").unwrap();
+    fs::write(&repository_config, "").unwrap();
+    let repository_id = repository_id_for_root(&root);
+    ProfileFixture {
+        root,
+        data_dir,
+        user_config,
+        repository_config,
+        repository_id,
+    }
+}
+
+impl ProfileFixture {
+    fn base(&self) -> Config {
+        Config {
+            data_dir: self.data_dir.clone(),
+            ..Config::default()
+        }
+    }
+
+    /// The user config line selecting `profile` for this checkout.
+    fn select(&self, profile: &str) -> String {
+        format!("permission_profile.{}={profile}\n", self.repository_id)
+    }
+
+    fn write_user(&self, text: &str) {
+        fs::write(&self.user_config, text).unwrap();
+    }
+
+    fn write_repository(&self, text: &str) {
+        fs::write(&self.repository_config, text).unwrap();
+    }
+
+    fn write_custom_profile(&self, name: &str, text: &str) {
+        let path = ProfileId::parse(name)
+            .unwrap()
+            .custom_path(&self.data_dir)
+            .expect("a custom id has a file");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    fn try_load(
+        &self,
+        admin: Option<&Path>,
+    ) -> workspace_engine::Result<(Config, RepositoryConfigReport)> {
+        Config::load_scoped(
+            self.base(),
+            Some(&self.user_config),
+            Some(&self.repository_config),
+            admin,
+            Some(&self.root),
+        )
+    }
+
+    fn load(&self) -> (Config, RepositoryConfigReport) {
+        self.try_load(None).expect("fixture config should load")
+    }
+
+    /// The same files layered the way `load_scoped` did before profiles
+    /// existed: user, then repository, then the `Allow Always` fold.
+    fn resolve_without_profiles(&self) -> Config {
+        let mut config = self.base();
+        config.apply_overlay_scoped(
+            ConfigOverlay::load(&self.user_config).unwrap(),
+            ConfigScope::User,
+        );
+        let (repository, _) =
+            ConfigOverlay::parse_untrusted(&fs::read_to_string(&self.repository_config).unwrap());
+        config.apply_overlay_scoped(repository, ConfigScope::Repository);
+        config.apply_repository_allowlist(&self.root);
+        config
+    }
+
+    fn audit_log(&self) -> AuditLog {
+        AuditLog::new(&self.data_dir, true, SecretScanner::new(Vec::new()))
+    }
+
+    fn audit_events(&self) -> String {
+        fs::read_to_string(self.data_dir.join("audit").join("events.jsonl")).unwrap_or_default()
+    }
+
+    fn cleanup(self) {
+        let _ = fs::remove_dir_all(self.root);
+    }
+}
+
+#[test]
+fn with_no_profile_selected_the_resolved_config_is_todays() {
+    let fixture = profile_fixture("no-selection");
+    fixture.write_user(RESTRICTIVE_USER);
+    fixture.write_repository(HOSTILE_REPOSITORY);
+
+    let (config, report) = fixture.load();
+
+    assert_eq!(config, fixture.resolve_without_profiles());
+    assert_eq!(report.permission_profile, None);
+    assert!(report.profile_rejected_keys.is_empty());
+
+    fixture.cleanup();
+}
+
+#[test]
+fn selecting_full_or_another_checkouts_profile_changes_nothing_here() {
+    let fixture = profile_fixture("full-selection");
+    fixture.write_repository(HOSTILE_REPOSITORY);
+
+    fixture.write_user(&format!("{RESTRICTIVE_USER}{}", fixture.select("full")));
+    let (config, report) = fixture.load();
+    assert_eq!(config, fixture.resolve_without_profiles());
+    assert_eq!(report.permission_profile, Some(ProfileId::Full));
+    assert!(report.profile_rejected_keys.is_empty());
+
+    fixture.write_user(&format!(
+        "{RESTRICTIVE_USER}permission_profile.repo_0123456789abcdef=read_only\n"
+    ));
+    let (config, report) = fixture.load();
+    assert_eq!(config, fixture.resolve_without_profiles());
+    assert_eq!(config.command_access, CommandAccess::All);
+    assert_eq!(report.permission_profile, None);
+
+    fixture.cleanup();
+}
+
+struct ProfileRow {
+    id: ProfileId,
+    capabilities: ProfileCapabilities,
+    require_approval_for_file_edits: bool,
+    audit_retention_days: u64,
+    checkpoint_retention_days: u64,
+}
+
+#[test]
+fn each_built_in_profile_resolves_to_its_table_row() {
+    let capabilities = |edits, access, browser, mutating_mcp, mcp| ProfileCapabilities {
+        allow_file_edits: edits,
+        command_access: access,
+        allow_browser_diagnostics: browser,
+        allow_mutating_mcp_tools: mutating_mcp,
+        mcp_enabled: mcp,
+    };
+    // context.md §3, over a permissive user config that turned edit approval off.
+    let rows = [
+        ProfileRow {
+            id: ProfileId::ReadOnly,
+            capabilities: capabilities(false, CommandAccess::None, false, false, true),
+            require_approval_for_file_edits: false,
+            audit_retention_days: 90,
+            checkpoint_retention_days: 90,
+        },
+        ProfileRow {
+            id: ProfileId::SafeLocal,
+            capabilities: capabilities(true, CommandAccess::Local, true, true, true),
+            require_approval_for_file_edits: true,
+            audit_retention_days: 90,
+            checkpoint_retention_days: 90,
+        },
+        ProfileRow {
+            id: ProfileId::Full,
+            capabilities: capabilities(true, CommandAccess::All, true, true, true),
+            require_approval_for_file_edits: false,
+            audit_retention_days: 90,
+            checkpoint_retention_days: 90,
+        },
+        ProfileRow {
+            id: ProfileId::OfflinePrivate,
+            capabilities: capabilities(true, CommandAccess::Local, false, true, false),
+            require_approval_for_file_edits: false,
+            audit_retention_days: 7,
+            checkpoint_retention_days: 7,
+        },
+    ];
+    let fixture = profile_fixture("built-ins");
+    assert_eq!(
+        Config::default().profile_capabilities(),
+        capabilities(true, CommandAccess::All, true, true, true)
+    );
+
+    for row in rows {
+        let name = row.id.as_str().to_string();
+        fixture.write_user(&format!(
+            "require_approval_for_file_edits=false\n{}",
+            fixture.select(&name)
+        ));
+        let (config, report) = fixture.load();
+        assert_eq!(config.profile_capabilities(), row.capabilities, "{name}");
+        assert_eq!(
+            config.require_approval_for_file_edits, row.require_approval_for_file_edits,
+            "{name}"
+        );
+        assert_eq!(
+            config.audit_retention_days, row.audit_retention_days,
+            "{name}"
+        );
+        assert_eq!(
+            config.checkpoint_retention_days, row.checkpoint_retention_days,
+            "{name}"
+        );
+        assert_eq!(report.permission_profile, Some(row.id), "{name}");
+        assert!(
+            report.profile_rejected_keys.is_empty(),
+            "{name}: a built-in carried a key a profile may not set: {:?}",
+            report.profile_rejected_keys
+        );
+    }
+
+    fixture.cleanup();
+}
+
+#[test]
+fn offline_private_only_lowers_the_retention_windows() {
+    let fixture = profile_fixture("offline-retention");
+    fixture.write_user(&format!(
+        "audit_retention_days=3\ncheckpoint_retention_days=30\n{}",
+        fixture.select("offline_private")
+    ));
+
+    let (config, report) = fixture.load();
+
+    assert_eq!(config.audit_retention_days, 3, "7 must not raise 3");
+    assert_eq!(config.checkpoint_retention_days, 7);
+    assert!(
+        report.profile_rejected_keys.is_empty(),
+        "lower-wins is the documented merge, not a refusal: {:?}",
+        report.profile_rejected_keys
+    );
+
+    fixture.cleanup();
+}
+
+/// The profile-scope counterpart of Task 1's weakening table: the user narrows
+/// every capability key, and a custom profile tries to loosen every one of
+/// them. Nothing may move.
+#[test]
+fn a_profile_cannot_loosen_anything_the_user_config_narrowed() {
+    let fixture = profile_fixture("loosen-everything");
+    // Task 1's table, except `checkpoint_retention_days`: its repository value
+    // is a lower one, which a profile may apply (lower-wins), so the loosening
+    // value here is a higher one.
+    let cases: Vec<_> = weakening_cases()
+        .into_iter()
+        .filter(|case| case.field != "checkpoint_retention_days")
+        .collect();
+    let user: String = cases.iter().map(|case| case.user).collect();
+    let profile: String = cases.iter().map(|case| case.repository).collect();
+    fixture.write_user(&format!(
+        "{user}checkpoint_retention_days=3\naudit_retention_days=3\n{}",
+        fixture.select("loosen")
+    ));
+    fixture.write_custom_profile(
+        "loosen",
+        &format!(
+            "{profile}checkpoint_retention_days=365\naudit_retention_days=365\n\
+             max_file_bytes=1\nagent_tool_retry_limit=1\n"
+        ),
+    );
+
+    let (config, report) = fixture.load();
+
+    assert_eq!(
+        config,
+        fixture.resolve_without_profiles(),
+        "the profile loosened something"
+    );
+    assert!(
+        report.rejected_keys.is_empty(),
+        "a profile's refusals are not the repository's: {:?}",
+        report.rejected_keys
+    );
+    let refused: BTreeSet<&str> = report
+        .profile_rejected_keys
+        .iter()
+        .map(|rejected| rejected.key.as_str())
+        .collect();
+    for case in &cases {
+        if let Resists::Reported(key) = case.resists {
+            assert!(
+                refused.contains(key),
+                "{}: not refused at profile scope; got {refused:?}",
+                case.field
+            );
+        }
+    }
+    // A profile narrows capability; it does not reconfigure preferences.
+    assert!(refused.contains("max_file_bytes"), "{refused:?}");
+    assert!(refused.contains("agent_tool_retry_limit"), "{refused:?}");
+
+    fixture.cleanup();
+}
+
+#[test]
+fn a_profile_can_disable_an_mcp_server_but_not_define_one() {
+    let fixture = profile_fixture("profile-mcp");
+    fixture.write_user(&format!(
+        "mcp_server.helper.command=/usr/local/bin/helper\nmcp_server.helper.enabled=true\n{}",
+        fixture.select("mine")
+    ));
+    fixture.write_custom_profile(
+        "mine",
+        concat!(
+            "mcp_server.helper.enabled=false\n",
+            "mcp_server.newbie.command=/usr/bin/true\n",
+            "mcp_server.newbie.auth_token_env=keychain:newbie\n",
+        ),
+    );
+
+    let (config, report) = fixture.load();
+
+    assert!(!config.mcp_server_config("helper").unwrap().enabled);
+    assert!(
+        config.mcp_server_config("newbie").is_none(),
+        "a profile defined an MCP server"
+    );
+    for key in [
+        "mcp_server.newbie.command",
+        "mcp_server.newbie.auth_token_env",
+    ] {
+        assert!(
+            report
+                .profile_rejected_keys
+                .iter()
+                .any(|r| r.key == key && r.class == RepositoryKeyClass::Forbidden),
+            "{key}: {:?}",
+            report.profile_rejected_keys
+        );
+    }
+
+    fixture.cleanup();
+}
+
+#[test]
+fn a_repository_cannot_select_a_profile_in_either_direction() {
+    let fixture = profile_fixture("repository-selects");
+    let key = format!("permission_profile.{}", fixture.repository_id);
+
+    // Narrowing: a repository choosing Read-only for itself.
+    fixture.write_repository(&fixture.select("read_only"));
+    let (config, report) = fixture.load();
+    assert_eq!(config.command_access, CommandAccess::All);
+    assert_eq!(report.permission_profile, None);
+    assert!(
+        report
+            .rejected_keys
+            .iter()
+            .any(|r| r.key == key && r.class == RepositoryKeyClass::UserOwned),
+        "{:?}",
+        report.rejected_keys
+    );
+
+    // Widening: a repository undoing the user's Read-only.
+    fixture.write_user(&fixture.select("read_only"));
+    fixture.write_repository(&fixture.select("full"));
+    let (config, report) = fixture.load();
+    assert_eq!(config.command_access, CommandAccess::None);
+    assert_eq!(report.permission_profile, Some(ProfileId::ReadOnly));
+
+    fixture.cleanup();
+}
+
+#[test]
+fn admin_can_widen_the_base_but_not_undo_the_users_profile() {
+    let fixture = profile_fixture("admin-vs-profile");
+    fixture.write_user(&format!(
+        "require_approval_for_all_commands=true\n{}",
+        fixture.select("read_only")
+    ));
+    let admin = fixture.data_dir.join("config").join("admin.conf");
+    fs::write(
+        &admin,
+        concat!(
+            "require_approval_for_all_commands=false\n",
+            "command_access=all\n",
+            "allow_file_edits=true\n",
+        ),
+    )
+    .unwrap();
+
+    let (config, _) = fixture.try_load(Some(&admin)).unwrap();
+
+    assert!(
+        !config.require_approval_for_all_commands,
+        "admin widened the base"
+    );
+    assert_eq!(config.command_access, CommandAccess::None);
+    assert!(!config.allow_file_edits);
+
+    fixture.cleanup();
+}
+
+#[test]
+fn profile_refusals_stay_out_of_the_repository_notice_and_are_audited_once() {
+    let fixture = profile_fixture("profile-audit");
+    fixture.write_user(&fixture.select("mine"));
+    fixture.write_custom_profile("mine", "shell=/tmp/evil-shell\nmax_file_bytes=1\n");
+    let audit = fixture.audit_log();
+
+    let (_, report) = fixture.load();
+
+    assert!(
+        report.rejected_keys.is_empty(),
+        "{:?}",
+        report.rejected_keys
+    );
+    assert!(report.is_empty(), "no repository notice for a profile");
+    assert_eq!(
+        report
+            .profile_rejected_keys
+            .iter()
+            .map(|r| (r.key.as_str(), r.class))
+            .collect::<Vec<_>>(),
+        vec![
+            ("shell", RepositoryKeyClass::Forbidden),
+            ("max_file_bytes", RepositoryKeyClass::Forbidden),
+        ]
+    );
+    assert!(
+        RepositoryTrustStore::new(&fixture.data_dir)
+            .review(&report, &audit)
+            .unwrap()
+            .is_none()
+    );
+
+    let fresh = review_profile_rejections(&fixture.data_dir, &report, &audit).unwrap();
+    assert_eq!(fresh.len(), 2);
+    let again = review_profile_rejections(&fixture.data_dir, &report, &audit).unwrap();
+    assert!(again.is_empty(), "audited twice: {again:?}");
+
+    let events = fixture.audit_events();
+    assert_eq!(
+        events.matches("permission_profile_key_rejected").count(),
+        2,
+        "{events}"
+    );
+    assert!(events.contains("\"profileId\":\"mine\""), "{events}");
+    assert!(events.contains("\"key\":\"shell\""), "{events}");
+    assert!(events.contains("\"class\":\"forbidden\""), "{events}");
+    assert!(!events.contains("evil-shell"), "a refused value was logged");
+    assert!(
+        !events.contains("repository_config_key_rejected"),
+        "{events}"
+    );
+
+    fixture.cleanup();
+}
+
+#[test]
+fn a_malformed_custom_profile_line_is_reported_not_fatal() {
+    let fixture = profile_fixture("profile-malformed");
+    fixture.write_user(&fixture.select("mine"));
+    fixture.write_custom_profile(
+        "mine",
+        "command_access=everything\nallow_file_edits=false\nnot a config line\n",
+    );
+
+    let (config, report) = fixture.load();
+
+    assert!(!config.allow_file_edits, "the good line still applies");
+    assert_eq!(config.command_access, CommandAccess::All);
+    for key in ["command_access", "line 3"] {
+        assert!(
+            report
+                .profile_rejected_keys
+                .iter()
+                .any(|r| r.key == key && r.class == RepositoryKeyClass::Unparsable),
+            "{key}: {:?}",
+            report.profile_rejected_keys
+        );
+    }
+
+    fixture.cleanup();
+}
+
+#[test]
+fn a_selected_custom_profile_with_no_file_fails_the_load_instead_of_widening() {
+    let fixture = profile_fixture("profile-missing");
+    fixture.write_user(&fixture.select("gone"));
+
+    let error = fixture
+        .try_load(None)
+        .expect_err("a missing profile must not resolve as Full")
+        .to_string();
+
+    assert!(error.contains("gone"), "{error}");
+    assert!(error.contains("profile-set"), "{error}");
+
+    fixture.cleanup();
+}
+
+#[test]
+fn profile_ids_parse_the_built_ins_and_validate_custom_names() {
+    for (name, id) in [
+        ("read_only", ProfileId::ReadOnly),
+        ("safe_local", ProfileId::SafeLocal),
+        ("full", ProfileId::Full),
+        ("offline_private", ProfileId::OfflinePrivate),
+    ] {
+        assert_eq!(ProfileId::parse(name).unwrap(), id);
+        assert_eq!(id.as_str(), name);
+        assert!(id.custom_path("/tmp").is_none(), "{name} has no file");
+        assert!(ProfileId::custom(name).is_err(), "{name} is reserved");
+    }
+    assert_eq!(
+        ProfileId::parse("team_ci_2").unwrap(),
+        ProfileId::Custom("team_ci_2".to_string())
+    );
+    assert!(ProfileId::parse(&"x".repeat(40)).is_ok());
+    for bad in ["", "Has-Dash", "UPPER", "../escape", "a b", &"x".repeat(41)] {
+        assert!(ProfileId::parse(bad).is_err(), "{bad:?} parsed");
+    }
+    assert_eq!(
+        ProfileId::parse("mine")
+            .unwrap()
+            .custom_path("/data")
+            .unwrap(),
+        PathBuf::from("/data/config/profiles/mine.conf")
+    );
+}
+
+#[test]
+fn the_selection_round_trips_through_the_overlay_text_and_is_validated() {
+    let text = "permission_profile.repo_0123456789abcdef=safe_local\n";
+    let overlay = ConfigOverlay::parse(text).unwrap();
+    assert_eq!(overlay.to_policy_text(), text);
+
+    assert!(ConfigOverlay::parse("permission_profile.repo_0123456789abcdef=Nope!\n").is_err());
+    assert!(ConfigOverlay::parse("permission_profile.not_a_repo=full\n").is_err());
+}
+
+#[test]
+fn selecting_a_profile_writes_user_config_and_audits_the_change() {
+    let fixture = profile_fixture("profile-set");
+    fixture.write_user("shell=/bin/zsh\n");
+    let audit = fixture.audit_log();
+    let config = fixture.base();
+
+    let first = select_profile(&config, &fixture.root, ProfileId::ReadOnly, &audit).unwrap();
+    assert_eq!(first.repository_id, fixture.repository_id);
+    assert_eq!(first.previous, None);
+    assert_eq!(first.selected, ProfileId::ReadOnly);
+    let user = fs::read_to_string(&fixture.user_config).unwrap();
+    assert!(user.contains("shell=/bin/zsh"), "{user}");
+    assert!(user.contains(fixture.select("read_only").trim()), "{user}");
+    assert_eq!(fixture.load().0.command_access, CommandAccess::None);
+
+    let second = select_profile(&config, &fixture.root, ProfileId::SafeLocal, &audit).unwrap();
+    assert_eq!(second.previous, Some(ProfileId::ReadOnly));
+
+    let missing = ProfileId::parse("gone").unwrap();
+    assert!(select_profile(&config, &fixture.root, missing, &audit).is_err());
+    assert!(
+        fs::read_to_string(&fixture.user_config)
+            .unwrap()
+            .contains(fixture.select("safe_local").trim()),
+        "a refused selection must not be written"
+    );
+
+    let events = fixture.audit_events();
+    assert_eq!(
+        events.matches("permission_profile_set").count(),
+        2,
+        "{events}"
+    );
+    assert!(
+        events.contains(&format!("\"repositoryId\":\"{}\"", fixture.repository_id)),
+        "{events}"
+    );
+    assert!(events.contains("\"from\":\"none\""), "{events}");
+    assert!(events.contains("\"to\":\"read_only\""), "{events}");
+    assert!(events.contains("\"from\":\"read_only\""), "{events}");
+    assert!(events.contains("\"to\":\"safe_local\""), "{events}");
+
+    fixture.cleanup();
 }
