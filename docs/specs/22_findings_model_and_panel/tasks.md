@@ -11,7 +11,7 @@ decisions it left open in [`context.md`](context.md)
 | Task | State | Notes |
 |---|---|---|
 | 1 · `Finding`, `FindingDraft`, and the redacting, bounding constructor | Done 2026-09-30 | `finding.rs` landed as sketched (rustfmt only), registered in `lib.rs`. Before the implementation the tests failed to compile (`E0432`). After it, `test(finding::tests)` passed 16/16. Each mutation failed its own test: (1) bound-then-redact failed `a_secret_straddling_…`; (2) no summary redaction failed `new_redacts_…`; (3) `<=`→`<` failed `a_summary_at_exactly_the_bound_…`; (4) a plain byte slice failed `details_are_bounded_on_a_char_boundary` by panicking. Privacy: a struct literal gives `E0451`, and a field read gives `E0616`. Probe these one at a time, because rustc reports `E0616` and stops before `E0451`, so a combined probe shows only one of them. Scoped fmt, clippy `-p workspace-engine` and typos are clean. |
-| 2 · Parser trait, dispatch with fall-through, generic parser | Not started | |
+| 2 · Parser trait, dispatch with fall-through, generic parser | Not started | Planned in full on 2026-09-30. Adds `FindingSource::Command`, and a cancelled run gets no generic finding (`context.md` §8). |
 | 3 · Rust diagnostics parser (`cargo build`/`check`/`clippy`) | Not started | |
 | 4 · Rust test parser (`cargo test`), delegating compile errors to Task 3 | Not started | |
 | 5 · Biome parser | Not started | |
@@ -59,7 +59,8 @@ Every task's requirements implicitly include this section.
   (`context.md` §1).
 - **Never lose a failure** (§5.3). An execution that failed and produced zero
   parsed drafts falls through to the generic parser. That covers a non-zero
-  exit, a timeout, a cancellation, and a signal (`context.md` §7). The
+  exit, a timeout, and a signal (`context.md` §7). A cancellation is not a
+  failure and never gets a generic finding (`context.md` §8.2). The
   fall-through is the rule the proposal calls "most likely to be omitted",
   so every parser task tests it against its own parser.
 - **Severity is recorded, not normalised** (§5.2). Each parser documents its
@@ -696,23 +697,477 @@ after the fact, so this task starts at `pub`.
 **Requirements:** 1, 3 (addressability), and the acceptance criteria "exactly
 one generic finding, never zero", "falls through … asserted by test", and "no
 parser produces a `range` for output that contained no location".
-**Files:** `finding.rs`.
+**Files:** modify `crates/workspace-engine/src/finding.rs`. Planned in full on
+2026-09-30. **Read `context.md` §8 first.** It records four decisions this task
+depends on, and two of them change the outline this section replaced:
 
-`trait FindingParser { fn source(&self) -> FindingSource; fn matches(&self, command: &str) -> bool; fn parse(&self, execution: &CommandExecution) -> Vec<FindingDraft>; }`.
-The return type is drafts (`context.md` §3). The dispatcher is
-`findings_from_execution(execution, parsers, scanner) -> Vec<Finding>`. The
-first matching parser wins. When the execution failed and the chosen parser
-returned zero drafts, it falls through to the generic parser. The execution
-counts as failed on `termination != Exited`, or on `Exited` with
-`exit_code != Some(0)` (`context.md` §7). A successful execution yields zero
-findings unless a parser found warnings. The generic parser produces **one**
-`Error` draft. Its summary is the first non-empty stderr line, or stdout's
-when stderr is empty, or `"<command> exited with code N"` / `"timed out"` /
-`"was cancelled"` when both are empty. Its details are the last ~40 lines, and
-it never has a range. Tests use a stub parser that `matches` and returns
-nothing, to pin the fall-through independently of any real parser.
+- a new `FindingSource::Command` (§8.1);
+- a cancelled run gets no generic finding (§8.2);
+- the generic finding's exact text (§8.3);
+- where Tasks 3–5 put their parsers (§8.4).
 
-*(Expand into full TDD steps before starting this task.)*
+This task touches only `finding.rs`. It ships no real parser, so
+`default_parsers()` is empty until Task 3. Everything is exercised through stub
+parsers, which pin the dispatch rules independently of any one tool's output
+format.
+
+**Interfaces:**
+- Consumes: Task 1's `Finding::new`, `FindingDraft`, `FindingSource` and
+  `Severity`. Also `CommandExecution` and `CommandTermination`
+  (`command_runner.rs:16-43`), read-only.
+- Produces, and Tasks 3–7 rely on these names:
+  - `FindingSource::Command`, serialised as `"command"`: the generic
+    fallback's source and nothing else's.
+  - The parser trait:
+    `pub trait FindingParser { fn source(&self) -> FindingSource; fn matches(&self, command: &str) -> bool; fn parse(&self, execution: &CommandExecution) -> Vec<FindingDraft>; }`.
+    `source()` is the parser's *primary* source. Task 4's `cargo test` parser
+    also emits `Compiler` drafts (`context.md` §5).
+  - `pub fn default_parsers() -> Vec<Box<dyn FindingParser>>`. Tasks 3–5
+    register their parsers here, in the order they should be tried.
+  - `pub fn findings_from_execution(execution: &CommandExecution, parsers: &[Box<dyn FindingParser>], scanner: &SecretScanner) -> Vec<Finding>`.
+    This is the only place outside the tests that calls `Finding::new` on
+    parser output. Task 7 calls it and then attaches `task_id`, `origin_ref`
+    and `file_hash`.
+  - `pub const GENERIC_DETAIL_LINES: usize = 40`.
+
+- [ ] **Step 1: Add `FindingSource::Command` and extend Task 1's test**
+
+  In `finding.rs`, add the variant after `LanguageServer`:
+
+  ```rust
+      /// One command's failure taken whole: nothing was parsed out of it.
+      /// Only the generic fallback produces this (`context.md` §8.1).
+      Command,
+  ```
+
+  Add the `as_str` arm `Self::Command => "command",`. Add `Command` to the
+  array in the existing
+  `tests::every_source_serialises_as_its_as_str`. Run
+  `cargo nextest run -p workspace-engine -E 'test(finding::tests)'`.
+  Expected: all 16 still pass.
+
+- [ ] **Step 2: Write the failing tests**
+
+  Append a second test module to `finding.rs`, after `mod tests`, so the
+  dispatch tests can be filtered on their own:
+
+  ```rust
+  #[cfg(test)]
+  mod dispatch_tests {
+      use super::*;
+      use crate::command_policy::CommandRisk;
+      use crate::command_runner::{CommandExecution, CommandTermination};
+      use crate::secret_scanner::SecretScanner;
+
+      fn execution(
+          command: &str,
+          termination: CommandTermination,
+          exit_code: Option<i32>,
+          stdout: &str,
+          stderr: &str,
+      ) -> CommandExecution {
+          CommandExecution {
+              id: "cmd_test".to_string(),
+              command: command.to_string(),
+              working_directory: "/repo".to_string(),
+              risk: CommandRisk::Low,
+              approved_by: None,
+              started_at_ms: 1,
+              completed_at_ms: 2,
+              exit_code,
+              termination,
+              stdout: stdout.to_string(),
+              stderr: stderr.to_string(),
+          }
+      }
+
+      fn failed(command: &str, stdout: &str, stderr: &str) -> CommandExecution {
+          execution(command, CommandTermination::Exited, Some(1), stdout, stderr)
+      }
+
+      fn passed(command: &str) -> CommandExecution {
+          execution(command, CommandTermination::Exited, Some(0), "ok\n", "")
+      }
+
+      fn draft(source: FindingSource, severity: Severity, summary: &str) -> FindingDraft {
+          FindingDraft {
+              source,
+              severity,
+              summary: summary.to_string(),
+              details: None,
+              range: None,
+              code: None,
+          }
+      }
+
+      /// Matches commands starting with `prefix` and returns fixed drafts.
+      struct Stub {
+          prefix: &'static str,
+          drafts: Vec<FindingDraft>,
+      }
+
+      impl FindingParser for Stub {
+          fn source(&self) -> FindingSource {
+              FindingSource::Test
+          }
+          fn matches(&self, command: &str) -> bool {
+              command.starts_with(self.prefix)
+          }
+          fn parse(&self, _execution: &CommandExecution) -> Vec<FindingDraft> {
+              self.drafts.clone()
+          }
+      }
+
+      /// Never matches, and fails the test if asked to parse.
+      struct NeverMatches;
+
+      impl FindingParser for NeverMatches {
+          fn source(&self) -> FindingSource {
+              FindingSource::Lint
+          }
+          fn matches(&self, _command: &str) -> bool {
+              false
+          }
+          fn parse(&self, _execution: &CommandExecution) -> Vec<FindingDraft> {
+              panic!("a parser that does not match was asked to parse")
+          }
+      }
+
+      fn stub(prefix: &'static str, drafts: Vec<FindingDraft>) -> Box<dyn FindingParser> {
+          Box::new(Stub { prefix, drafts })
+      }
+
+      fn run(execution: &CommandExecution, parsers: &[Box<dyn FindingParser>]) -> Vec<Finding> {
+          findings_from_execution(execution, parsers, &SecretScanner::default())
+      }
+
+      #[test]
+      fn a_failure_no_parser_matches_yields_exactly_one_generic_finding() {
+          let findings = run(&failed("pytest", "", "\n  first line  \nsecond line\n"), &[]);
+          assert_eq!(findings.len(), 1, "{findings:?}");
+          let finding = &findings[0];
+          assert_eq!(finding.source(), FindingSource::Command);
+          assert_eq!(finding.severity(), Severity::Error);
+          assert_eq!(finding.summary(), "pytest: first line");
+          assert_eq!(finding.range(), None, "the generic parser invented a location");
+          assert_eq!(finding.code(), None);
+      }
+
+      /// The rule proposal §5.3 calls "most likely to be omitted".
+      #[test]
+      fn a_matching_parser_that_extracts_nothing_falls_through_to_generic() {
+          let parsers = [stub("cargo test", vec![])];
+          let findings = run(&failed("cargo test", "", "something new\n"), &parsers);
+          assert_eq!(findings.len(), 1, "{findings:?}");
+          assert_eq!(findings[0].source(), FindingSource::Command);
+          assert_eq!(findings[0].summary(), "cargo test: something new");
+      }
+
+      #[test]
+      fn parsed_drafts_replace_the_generic_finding() {
+          let parsers = [stub(
+              "cargo test",
+              vec![
+                  draft(FindingSource::Test, Severity::Error, "a failed"),
+                  draft(FindingSource::Compiler, Severity::Error, "b failed"),
+              ],
+          )];
+          let findings = run(&failed("cargo test", "", "boom\n"), &parsers);
+          let summaries: Vec<_> = findings.iter().map(Finding::summary).collect();
+          assert_eq!(summaries, ["a failed", "b failed"]);
+          assert!(findings.iter().all(|f| f.source() != FindingSource::Command));
+      }
+
+      #[test]
+      fn the_first_matching_parser_wins() {
+          let parsers = [
+              stub("cargo", vec![draft(FindingSource::Compiler, Severity::Error, "first")]),
+              stub("cargo test", vec![draft(FindingSource::Test, Severity::Error, "second")]),
+          ];
+          let findings = run(&failed("cargo test", "", "x\n"), &parsers);
+          assert_eq!(findings.len(), 1);
+          assert_eq!(findings[0].summary(), "first");
+      }
+
+      #[test]
+      fn a_parser_that_does_not_match_is_never_asked() {
+          let parsers: [Box<dyn FindingParser>; 2] = [
+              Box::new(NeverMatches),
+              stub("npm", vec![draft(FindingSource::Lint, Severity::Error, "lint")]),
+          ];
+          let findings = run(&failed("npm run lint", "", "x\n"), &parsers);
+          assert_eq!(findings.len(), 1);
+          assert_eq!(findings[0].summary(), "lint");
+      }
+
+      #[test]
+      fn a_passing_execution_with_no_parser_yields_nothing() {
+          assert!(run(&passed("pytest"), &[]).is_empty());
+      }
+
+      #[test]
+      fn a_passing_execution_keeps_its_parsers_warnings() {
+          let parsers = [stub(
+              "cargo clippy",
+              vec![draft(FindingSource::Compiler, Severity::Warning, "unused import")],
+          )];
+          let findings = run(&passed("cargo clippy"), &parsers);
+          assert_eq!(findings.len(), 1);
+          assert_eq!(findings[0].severity(), Severity::Warning);
+      }
+
+      #[test]
+      fn a_passing_execution_whose_parser_finds_nothing_yields_nothing() {
+          let parsers = [stub("cargo test", vec![])];
+          assert!(run(&passed("cargo test"), &parsers).is_empty());
+      }
+
+      #[test]
+      fn a_timeout_is_a_failure_even_without_an_exit_code() {
+          let timed_out =
+              execution("cargo test", CommandTermination::TimedOut, None, "running 3 tests\n", "");
+          let findings = run(&timed_out, &[]);
+          assert_eq!(findings.len(), 1, "{findings:?}");
+          assert_eq!(findings[0].summary(), "cargo test timed out");
+          assert!(findings[0].details().unwrap().contains("running 3 tests"));
+      }
+
+      /// `Exited` with no code is a signal. It is not a zero, and it must never
+      /// be read as one (the same rule as `Evidence::CommandExit`).
+      #[test]
+      fn a_signal_kill_is_a_failure() {
+          let killed = execution("make check", CommandTermination::Exited, None, "", "");
+          let findings = run(&killed, &[]);
+          assert_eq!(findings.len(), 1, "{findings:?}");
+          assert_eq!(findings[0].summary(), "make check was killed by a signal");
+      }
+
+      /// `context.md` §8.2: a check the user stopped has no verdict to repair.
+      #[test]
+      fn a_cancelled_execution_gets_no_generic_finding() {
+          let cancelled =
+              execution("cargo test", CommandTermination::Cancelled, None, "", "Compiling x\n");
+          assert!(run(&cancelled, &[]).is_empty());
+          assert!(run(&cancelled, &[stub("cargo test", vec![])]).is_empty());
+      }
+
+      #[test]
+      fn a_cancelled_execution_keeps_what_its_parser_found() {
+          let cancelled = execution("cargo test", CommandTermination::Cancelled, None, "", "");
+          let parsers = [stub(
+              "cargo test",
+              vec![draft(FindingSource::Compiler, Severity::Error, "E0308")],
+          )];
+          let findings = run(&cancelled, &parsers);
+          assert_eq!(findings.len(), 1);
+          assert_eq!(findings[0].summary(), "E0308");
+      }
+
+      #[test]
+      fn the_generic_summary_falls_back_to_stdout_then_to_the_exit_code() {
+          let from_stdout = run(&failed("pytest", "\nFAILED test_x\n", "  \n"), &[]);
+          assert_eq!(from_stdout[0].summary(), "pytest: FAILED test_x");
+
+          let silent = execution("pytest", CommandTermination::Exited, Some(2), "", "");
+          let from_code = run(&silent, &[]);
+          assert_eq!(from_code[0].summary(), "pytest exited with code 2");
+          assert_eq!(from_code[0].details(), None);
+      }
+
+      #[test]
+      fn the_generic_details_keep_the_last_lines_of_each_stream() {
+          let stderr: String = (0..100).map(|n| format!("err {n:03}\n")).collect();
+          let findings = run(&failed("pytest", "out a\nout b\n", &stderr), &[]);
+          let details = findings[0].details().expect("details");
+          assert!(details.starts_with("stderr:\n"), "{details}");
+          assert!(details.contains("err 060"), "the tail was not kept");
+          assert!(details.contains("err 099"));
+          assert!(!details.contains("err 059"), "more than {GENERIC_DETAIL_LINES} lines kept");
+          assert!(details.contains("\n\nstdout:\nout a\nout b"), "{details}");
+      }
+
+      #[test]
+      fn an_empty_stream_is_left_out_of_the_generic_details() {
+          let findings = run(&failed("pytest", "only stdout\n", "   \n"), &[]);
+          assert_eq!(findings[0].details(), Some("stdout:\nonly stdout"));
+      }
+
+      /// Acceptance criterion: no unredacted secret in "a generic fallback".
+      /// The runner already redacts command output (`context.md` §6). This
+      /// test proves the dispatcher goes through `Finding::new` anyway.
+      #[test]
+      fn a_secret_in_failed_output_is_redacted_in_the_generic_finding() {
+          let key = "AKIAIOSFODNN7EXAMPLE";
+          let findings = run(&failed("deploy", "", &format!("bad key {key}\n")), &[]);
+          assert!(!findings[0].summary().contains(key), "{}", findings[0].summary());
+          assert!(!findings[0].details().unwrap().contains(key));
+      }
+  }
+  ```
+
+- [ ] **Step 3: Run the tests and confirm they fail**
+
+  Run: `cargo nextest run -p workspace-engine -E 'test(finding::dispatch_tests)'`
+  Expected: a compile failure, because `FindingParser` and
+  `findings_from_execution` are not defined.
+
+- [ ] **Step 4: Write the implementation**
+
+  Add `use crate::command_runner::{CommandExecution, CommandTermination};` to
+  the imports. Then put this after the `Finding` impl and before
+  `bound_summary`:
+
+  ```rust
+  /// Lines kept from each stream for a generic finding's details.
+  pub const GENERIC_DETAIL_LINES: usize = 40;
+
+  /// Turns one tool's output into drafts. Returns drafts, not findings, so that
+  /// redaction happens in `findings_from_execution` and nowhere else
+  /// (`context.md` §3). Severity mapping is documented on each parser (§5.2).
+  pub trait FindingParser {
+      /// The source this parser mostly produces. A parser may emit drafts of
+      /// another source; `cargo test` emits `Compiler` drafts for a compile
+      /// error (`context.md` §5).
+      fn source(&self) -> FindingSource;
+      /// Whether this parser recognises the output of `command`.
+      fn matches(&self, command: &str) -> bool;
+      /// Parse already-redacted output. Empty when nothing parsed, and must
+      /// never invent a location (§5.3).
+      fn parse(&self, execution: &CommandExecution) -> Vec<FindingDraft>;
+  }
+
+  /// The shipped parsers, in the order they are tried. Tasks 3–5 register
+  /// theirs here. The generic fallback is not in this list: it is applied by
+  /// `findings_from_execution` itself, so no caller can forget it.
+  pub fn default_parsers() -> Vec<Box<dyn FindingParser>> {
+      Vec::new()
+  }
+
+  /// Whether a run reached a verdict, and which. `context.md` §8.2 has the
+  /// table this encodes.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  enum Verdict {
+      Passed,
+      Failed,
+      /// Cancelled by the user before it finished.
+      Unfinished,
+  }
+
+  fn verdict(execution: &CommandExecution) -> Verdict {
+      match (execution.termination, execution.exit_code) {
+          (CommandTermination::Exited, Some(0)) => Verdict::Passed,
+          (CommandTermination::Exited, _) | (CommandTermination::TimedOut, _) => Verdict::Failed,
+          (CommandTermination::Cancelled, _) => Verdict::Unfinished,
+      }
+  }
+
+  /// The first parser that matches wins. A failed run whose parser found
+  /// nothing falls through to one generic finding, so a regex that stops
+  /// matching after a tool upgrade cannot swallow a failure (§5.3).
+  pub fn findings_from_execution(
+      execution: &CommandExecution,
+      parsers: &[Box<dyn FindingParser>],
+      scanner: &SecretScanner,
+  ) -> Vec<Finding> {
+      let mut drafts = parsers
+          .iter()
+          .find(|parser| parser.matches(&execution.command))
+          .map(|parser| parser.parse(execution))
+          .unwrap_or_default();
+      if drafts.is_empty() && verdict(execution) == Verdict::Failed {
+          drafts.push(generic_draft(execution));
+      }
+      drafts
+          .into_iter()
+          .map(|draft| Finding::new(draft, scanner))
+          .collect()
+  }
+
+  /// One finding for the whole failure, never claiming structure it did not
+  /// find: no range, no code (`context.md` §8.3).
+  fn generic_draft(execution: &CommandExecution) -> FindingDraft {
+      let command = execution.command.trim();
+      let summary = match (execution.termination, execution.exit_code) {
+          (CommandTermination::TimedOut, _) => format!("{command} timed out"),
+          (_, None) => format!("{command} was killed by a signal"),
+          (_, Some(code)) => first_non_empty_line(&execution.stderr)
+              .or_else(|| first_non_empty_line(&execution.stdout))
+              .map(|line| format!("{command}: {line}"))
+              .unwrap_or_else(|| format!("{command} exited with code {code}")),
+      };
+      FindingDraft {
+          source: FindingSource::Command,
+          severity: Severity::Error,
+          summary,
+          details: generic_details(execution),
+          range: None,
+          code: None,
+      }
+  }
+
+  fn generic_details(execution: &CommandExecution) -> Option<String> {
+      let sections: Vec<String> = [("stderr", &execution.stderr), ("stdout", &execution.stdout)]
+          .into_iter()
+          .filter(|(_, text)| !text.trim().is_empty())
+          .map(|(label, text)| format!("{label}:\n{}", last_lines(text, GENERIC_DETAIL_LINES)))
+          .collect();
+      (!sections.is_empty()).then(|| sections.join("\n\n"))
+  }
+
+  fn last_lines(text: &str, count: usize) -> String {
+      let lines: Vec<&str> = text.trim_end().lines().collect();
+      lines[lines.len().saturating_sub(count)..].join("\n")
+  }
+
+  fn first_non_empty_line(text: &str) -> Option<&str> {
+      text.lines().map(str::trim).find(|line| !line.is_empty())
+  }
+  ```
+
+  `bound_summary` already has an identical first-line search. Make it call
+  `first_non_empty_line` rather than keeping two copies. Task 1's
+  `summary_is_the_first_non_empty_line_trimmed` guards that refactor.
+
+  If a test and this sketch disagree, the test wins, because the tests come
+  from proposal §5.3 and `context.md` §8. Record any deviation in the progress
+  row.
+
+- [ ] **Step 5: Run the tests and confirm they pass**
+
+  Run: `cargo nextest run -p workspace-engine -E 'test(finding::tests) + test(finding::dispatch_tests)'`
+  Expected: 32 pass (16 + 16). Count them.
+
+- [ ] **Step 6: Mutation-test the dispatch rules**
+
+  Apply each change on its own, confirm the named test fails, then revert it:
+
+  1. Call `generic_draft` only when *no* parser matched, instead of when the
+     drafts are empty.
+     `a_matching_parser_that_extracts_nothing_falls_through_to_generic` must
+     fail, while `a_failure_no_parser_matches_…` still passes. This is the
+     fall-through, and the reason Task 2 exists.
+  2. Map `(Exited, None)` to `Verdict::Passed`.
+     `a_signal_kill_is_a_failure` must fail.
+  3. Map `Cancelled` to `Verdict::Failed`.
+     `a_cancelled_execution_gets_no_generic_finding` must fail.
+  4. Make `last_lines` keep the first `count` lines instead of the last.
+     `the_generic_details_keep_the_last_lines_of_each_stream` must fail.
+  5. Drop the `verdict(execution) == Verdict::Failed` condition.
+     `a_passing_execution_with_no_parser_yields_nothing` must fail.
+
+  Record all five results in the progress row.
+
+- [ ] **Step 7: Scoped checks**
+
+  ```bash
+  cargo fmt --all -- --check
+  cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
+  cargo nextest run -p workspace-engine -E 'test(finding::tests) + test(finding::dispatch_tests)'
+  typos docs/specs/22_findings_model_and_panel crates/workspace-engine/src/finding.rs
+  ```
+
+- [ ] **Step 8: Update this file's Task 2 row, then show the change and the
+  check results and ask before committing**
 
 ## Task 3: Rust diagnostics parser
 

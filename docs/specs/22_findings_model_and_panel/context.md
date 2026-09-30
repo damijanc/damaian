@@ -189,3 +189,75 @@ already emits it for the companion.
   (`21_task_plan_progress_and_budget/context.md` §3.6). `Evidence` is already
   `#[non_exhaustive]` for this. Task 7 adds the variant, because that is when
   finding ids first exist in the session log.
+
+## 8. Decisions made while planning Task 2 (2026-09-30)
+
+### 8.1 A generic finding needs a source of its own
+
+§5.3's table gives the generic parser a severity, a summary and details, but no
+source. None of the eight `FindingSource` variants fits a check Damaian does
+not understand. Calling a failed `pytest` `Test`, or a failed `make` `Compiler`,
+would be a guess from the command name, which is exactly what §5.2 rules out.
+§5.8 also promises that `TROUBLESHOOTING.md` will explain "how to tell a
+generic-fallback finding from a parsed one", and the type as built gives no way
+to tell.
+
+**Decision:** Task 2 adds `FindingSource::Command`, serialised as `"command"`:
+one command's failure taken as a whole, with nothing parsed out of it. Every
+generic finding has this source, and only generic findings have it. This
+includes a `cargo test` failure whose parser matched but extracted nothing:
+that finding really is unparsed, and the source says so. Adding the variant now
+costs nothing, because no finding has been persisted yet (Task 7). The panel
+(Task 10) groups by source, so the generic findings sit together, and each one
+names its command in its summary (§8.3).
+
+### 8.2 A cancelled check has no verdict, so it gets no generic finding
+
+The Task 2 outline and Global Constraints listed "a cancellation" among the
+failures that fall through to the generic parser. They should not have. A
+cancelled check was stopped by the user before it reached a verdict. A generic
+`Error` saying "`cargo test` was cancelled" would appear in the panel's default
+Open + Error view and could be selected for "Fix selected". That would ask the
+agent to repair something the user did on purpose.
+
+**Decision:** the dispatcher classifies each execution one way:
+
+| Execution | Verdict | Parser drafts | Generic fallback |
+|---|---|---|---|
+| `Exited`, `exit_code == Some(0)` | passed | kept (warnings) | never |
+| `Exited`, any other code, or `None` (killed by a signal) | failed | kept | when the drafts are empty |
+| `TimedOut` | failed | kept | when the drafts are empty |
+| `Cancelled` | none | kept | never |
+
+A cancelled run still keeps what its parser found. A compile error printed
+before the user pressed Stop is a real problem, and it has a real location. So
+"never lose a failure" still holds: a cancelled run had no failure to lose.
+Spec 23 reads `termination` directly when it needs to know that a run was cut
+short.
+
+### 8.3 The generic finding's text
+
+- **Summary.** When the process timed out, it is `"<command> timed out"`. When it
+  was killed by a signal, it is `"<command> was killed by a signal"`. Both
+  times, the output goes in `details`, because how it ended is the headline.
+  Otherwise the summary is `"<command>: <first non-empty stderr line>"`, then
+  stdout's first line when stderr is empty, then
+  `"<command> exited with code N"` when both are empty. The command is in the
+  summary because every generic finding shares one source, so the summary is
+  the only place a reader can see which check failed.
+- **Details.** The last 40 lines of stderr, then the last 40 of stdout. Each is
+  labelled, and an empty stream is left out. The tail is kept here, and
+  `Finding::new`'s bound keeps the head of that (§4). Together
+  that gives "a bounded tail" (§5.3), starting with stderr, where most tools
+  report failure.
+- **No range and no code.** Always. An exit code is not a diagnostic code, and
+  the panel reads the exit code from the summary.
+
+### 8.4 Where the parsers live
+
+Task 2 leaves the trait, the dispatcher and the generic fallback in
+`finding.rs`. Tasks 3–5 each add one file under
+`crates/workspace-engine/src/finding/` (`rust_diagnostics.rs`, `rust_test.rs`,
+`biome.rs`), declared from `finding.rs`, and register the parser in
+`default_parsers()`. That keeps `finding.rs` a single-screen type module and
+puts each parser's fixtures next to the parser they test.
