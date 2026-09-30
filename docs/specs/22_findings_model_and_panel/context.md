@@ -261,3 +261,71 @@ Task 2 leaves the trait, the dispatcher and the generic fallback in
 `biome.rs`), declared from `finding.rs`, and register the parser in
 `default_parsers()`. That keeps `finding.rs` a single-screen type module and
 puts each parser's fixtures next to the parser they test.
+
+## 9. What real rustc and clippy output looks like (Task 3, 2026-09-30)
+
+Captured with cargo 1.98.0 from a throwaway two-level workspace (a root
+`Cargo.toml` with one member under `crates/demo`). The Task 3 fixtures are
+these captures, with the absolute `Compiling` path replaced by `/repo`. What
+they showed, and what each finding means for the parser:
+
+- **Diagnostics are blocks separated by one blank line.** A block starts with
+  a column-0 header, `error[E0308]: msg`, `error: msg` or `warning: msg`. It
+  runs until the next blank line. Blocks contain no blank lines, even when they
+  have child notes.
+- **Child `note:` and `help:` lines sit at column 0 inside the block, and can
+  carry their own `-->`.** E0061's block carries `note: function defined here`
+  followed by `--> crates/demo/src/lib.rs:13:4`, which points at the function's
+  definition, not at the error. **Decision:** the location is the first `-->`
+  after the header and before any child header. A parser that takes "a `-->`
+  in the block" would send the user to the wrong line.
+- **The `-->` indent varies** with the width of the line numbers (` -->` and
+  `  -->`), so match it with leading whitespace. Snippet lines can also start
+  at column 0 (`13 | fn takes…`), so "starts with a space" does not mark a
+  continuation line.
+- **Paths are relative to the workspace root, even when cargo runs in a
+  member's directory.** `cd crates/demo && cargo check` still prints
+  `crates/demo/src/lib.rs`. So the parser emits the path as printed.
+  **Decision:** an absolute path, or one with a `..` component, gets
+  `range: None`. Examples are registry sources, the standard library under
+  `/rustc/<hash>/`, and a path dependency outside the workspace. Clicking
+  those would open something that is not the user's code. Task 7 still checks
+  every relative path against the repository root, because a workspace root
+  nested below the repository root would make these paths relative to the
+  wrong directory.
+- **Codes come from different places depending on the kind of diagnostic.**
+  - A compiler error has `[E0308]` in its header.
+  - A clippy lint has
+    `= help: for further information visit …/index.html#needless_return` on
+    **every** occurrence.
+  - The `= note: #[warn(clippy::needless_return)]` line appears only on a
+    lint's **first** occurrence, so it cannot be the source of the code (the
+    old outline said to use it).
+  - A rustc lint has only the first-occurrence note: `#[warn(unused_variables)]`,
+    or under `-D warnings`, `` `-D unused-variables` implied by `-D warnings` ``
+    with dashes. Later occurrences carry nothing.
+
+  **Decision:** take the bracket first, then the clippy URL (giving
+  `clippy::<name>`), then the attribute note, then the `-D` note (with dashes
+  turned into underscores). A later rustc-lint occurrence gets `code: None`.
+  That is honest, not a bug. Inventing the code from an earlier block's note
+  would be the cross-block guesswork §5.3 rules out.
+- **Source.** A diagnostic whose code starts `clippy::` is `Lint`. Everything
+  else is `Compiler`, including rustc's own lints like `unused_variables`,
+  because the compiler is what reported them.
+- **`-D warnings` turns every warning header into `error:`.** Severity follows
+  the header word as printed (§5.2: recorded, not normalised).
+- **Cargo's own summary lines use the same header shape and must be skipped.**
+  They are `` warning: `demo` (lib) generated 2 warnings ``,
+  `error: could not compile …`, and, from rustc run directly,
+  `error: aborting due to …` and `warning: N warnings emitted`. The trailing
+  `Some errors have detailed explanations` and `For more information…` lines
+  are not headers, so a header match ignores them.
+- **`CARGO_TERM_COLOR=always` wraps headers and `-->` in ANSI escapes**
+  (`\x1b[1m\x1b[91merror[E0308]\x1b[0m\x1b[1m: …`). The runner pipes output, so
+  cargo normally prints no colour. But a user's environment can force colour,
+  so the parser strips `\x1b[…m` sequences before matching.
+- **Diagnostics go to stderr.** The parser reads only `stderr`.
+- **A warnings-only build exits 0.** `findings_from_execution` keeps a passing
+  run's parsed drafts (Task 2), so a clean-exit `cargo clippy` still yields its
+  warnings.
