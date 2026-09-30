@@ -84,7 +84,7 @@ a spec's own header.
 
 Re-derived on 2026-09-25, when [#20](20_working_modes/proposal.md) was
 finished. **Five specs now have every dependency built:**
-[#22](22_findings_model_and_panel/proposal.md), [#31](31_permission_profiles.md),
+[#22](22_findings_model_and_panel/proposal.md), [#31](31_permission_profiles/proposal.md),
 [#50](50_model_initiated_clarification.md) — all three unblocked by #20 —
 plus [#56](56_provider_fallback_consent.md) and [#38](38_subagent_model.md)
 (which depends on nothing here, but is explicitly speculative — its own §1
@@ -117,6 +117,14 @@ ready set above is unchanged. What changes is scope, not order. #22's Task 6
 now converts #12's `WebDiagnosticDetails` into findings instead of adding its
 own browser structure, and #54 builds on #12's shipped screenshot artifact
 record. #22 is no longer waiting on anything from #12.
+
+Re-checked on 2026-09-30, when [#31](31_permission_profiles/proposal.md) was
+planned to run alongside #22. The ready set is unchanged. One correction to the
+pairing: #31's file references never name `chat.rs`, but enforcing
+`profile ∩ mode` does, because spec 20's permission check is called from it.
+So #31 and #22 are safe together **except #31's Task 5 against #22's Task 7**,
+the one task on each side that edits `chat.rs`. Each spec's `tasks.md` says so
+in its Global Constraints.
 
 **#22 and #26 are the keystones now that #20 has landed.** #22 is ready and
 sits in front of #23, #24, #32 and #35, and so, through #24, in front of #26;
@@ -222,7 +230,7 @@ is ready.
 | 28 | [28_memory_model_and_storage.md](28_memory_model_and_storage.md) | **Not started.** Roadmap Phase 3b WP1. The memory record and store, with a `project_key` resolved from the repository's root commit — because `repository_id` is a path hash and cannot give the sharing property the roadmap asks for. Memory refuses secrets rather than redacting them. |
 | 29 | [29_memory_creation_and_consent.md](29_memory_creation_and_consent.md) | **Not started.** Roadmap Phase 3b WP2. The consent gate: `MemoryProposal` and `MemoryEntry` are separate types with one conversion requiring a user confirmation, so unconfirmed persistence is unrepresentable. Instruction-shaped candidates from untrusted origins get no proposal at all. |
 | 30 | [30_memory_retrieval_and_lifecycle.md](30_memory_retrieval_and_lifecycle.md) | **Not started.** Roadmap Phase 3b WP4. Memory reaches the model only as a `ContextItem` in the lowest-priority category, is visible and removable in #27, and is marked stale by hash comparison against its evidence. Proven by prompt-injection evals, not design argument. |
-| 31 | [31_permission_profiles.md](31_permission_profiles.md) | **Not started.** Roadmap Phase 4 WP3. Its security subset shipped as #34, which closed the repository-config override and moved `command_allowlist` to user scope; what remains here is the profile machinery — the capability/preference partition as a general mechanism, effective-policy source attribution, and profile export/import. Specified before #32 because both #32 and #33 reference the profile they cannot widen. |
+| 31 | [31_permission_profiles/](31_permission_profiles/proposal.md) | **In progress.** Split into a folder and planned on 2026-09-30; see `tasks.md` for the nine-task breakdown. Roadmap Phase 4 WP3. Its security subset shipped as #34, which closed the repository-config override and moved `command_allowlist` to user scope; what remains here is the profile machinery — the capability/preference partition as a general mechanism, effective-policy source attribution, and profile export/import. Specified before #32 because both #32 and #33 reference the profile they cannot widen. |
 | 32 | [32_hooks.md](32_hooks.md) | **Not started.** Roadmap Phase 4 WP2. Nine lifecycle events, hooks as external programs returning a verdict — `deny`/`request_approval`/`warn`/`allow`, with no `approve`, so widening is unrepresentable. Mandatory is the default classification so a broken hook fails closed. |
 | 33 | [33_mcp_management_and_deferred_discovery.md](33_mcp_management_and_deferred_discovery.md) | **Not started.** Roadmap Phase 4 WP4. Every enabled server's full schema currently reaches every request, outside #26's accounting. Adds a search tool with on-demand schemas, per-tool enable, lazy startup, and treats a remote read-only claim as an assertion that cannot lower an approval requirement. |
 | 34 | [34_repository_config_trust_boundary.md](34_repository_config_trust_boundary.md) | **Done — implemented ahead of #14 onward.** Bug-driven, not a roadmap graduation. `apply_overlay` is scope-blind, so repository config overrides user config: a repo-set `shell` runs its own script for every approved command (verified), a repo-set `model_base_url` exfiltrates the API key and code with no approval, and a repo `command_allowlist` executes commands unprompted. Adds a scope-aware overlay, a forbidden-key list, restrict-only merges, and moves `Allow Always` to user scope keyed by repository. Security subset of #31, extracted so it need not wait for Phase 4. |
@@ -279,7 +287,7 @@ Two rules follow, and the second is the one worth enforcing:
 - **A dependency marked *not built* must be answered in the design.** Either the
   spec states what to do until it lands — as [#55](55_conversation_compaction.md)
   §5.1 does for the context budget, [#49](49_prompt_cache_accounting_and_reuse/proposal.md)
-  §5.3 for its prefix test, and [#31](31_permission_profiles.md) §7 for #34 — or
+  §5.3 for its prefix test, and [#31](31_permission_profiles/proposal.md) §7 for #34 — or
   it says plainly that the work is blocked. The pattern
   [#18](18_local_evaluation_harness/proposal.md) established is the model:
   ship the part you can, report the rest as `notApplicable` naming what will

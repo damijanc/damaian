@@ -7,7 +7,7 @@ Work Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#20](20_working_modes/proposal.md) (modes) — built;
 [#26](26_context_assembly.md) (the context budget schemas count against) —
-**not built**; [#31](31_permission_profiles.md) (the profile a server cannot
+**not built**; [#31](31_permission_profiles/proposal.md) (the profile a server cannot
 widen) — **not built**. Everything else named below is a cross-reference, not a
 prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.5 (model
@@ -19,7 +19,7 @@ adapter, tool calling), section 7.6 (tool and action orchestrator), section 7.8
 (the PID registry MCP servers are the primary client of),
 [`20_working_modes/proposal.md`](20_working_modes/proposal.md) (mode filters MCP tools),
 [`26_context_assembly.md`](26_context_assembly.md) (the context budget this
-protects), [`31_permission_profiles.md`](31_permission_profiles.md) (the profile
+protects), [`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) (the profile
 that governs external writes).
 
 ## 1. Motivation
@@ -60,7 +60,7 @@ itself favourably.
   `Config::active_mcp_servers` (`config.rs:475-488`) requires `mcp_enabled`, the
   server's own `enabled`, and membership of `mcp_server_allowlist` when
   non-empty. This narrowing pattern is the precedent
-  [spec 31](31_permission_profiles.md) §5.2 generalises.
+  [spec 31](31_permission_profiles/proposal.md) §5.2 generalises.
 - **`McpServerConfig`** (`config.rs:153-175`) carries `id`, `label`,
   `transport`, `command`, `args`, `env`, `url`, `auth_token_env`, `enabled`, and
   `require_approval`. Per-**tool** configuration does not exist.
@@ -175,7 +175,7 @@ safer (the model cannot try), and it is the same principle as
 [spec 20](20_working_modes/proposal.md) §5.2 layer 1 — withholding beats refusing.
 
 Resolution is an intersection, following
-[spec 31](31_permission_profiles.md) §5.2: a tool is offered only if MCP is
+[spec 31](31_permission_profiles/proposal.md) §5.2: a tool is offered only if MCP is
 enabled globally, the server is enabled and allowlisted, the tool is enabled, the
 profile permits it, and the mode permits it. Any layer can remove; none can add.
 
@@ -264,7 +264,7 @@ So:
   [spec 10](10_persistent_command_approval.md)'s exact-command rule.
 
 Requirement 7's "unless a user profile specifically allows them" is therefore a
-profile capability key ([spec 31](31_permission_profiles.md) §5.1), subject to
+profile capability key ([spec 31](31_permission_profiles/proposal.md) §5.1), subject to
 that spec's rule that repository config cannot widen it: a cloned repository
 cannot enable an MCP server, nor drop a tool's approval requirement.
 
@@ -354,7 +354,7 @@ authentication failure without exposing the token.
   allowlisted, tool enabled, profile, and mode. Any layer can remove a tool; no
   layer can add one — asserted per layer.
 - A repository config cannot enable an MCP server or clear a tool's approval
-  requirement ([spec 31](31_permission_profiles.md) §5.2).
+  requirement ([spec 31](31_permission_profiles/proposal.md) §5.2).
 - A session that uses no MCP tool starts no MCP server process.
 - `Unknown` health is distinguished from `Ready` in the UI and in the API.
 - A server in `Failed` is not retried automatically, its tools are not offered,

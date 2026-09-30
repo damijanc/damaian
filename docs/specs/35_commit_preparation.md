@@ -8,7 +8,7 @@ reference is a name rather than a link; this spec is self-contained.
 Depends on: [#16](16_session_checkpoints_and_rewind.md) (checkpoints) — built;
 [#22](22_findings_model_and_panel/proposal.md) (findings) — **not built**;
 [#23](23_verification_loop.md) (the verification loop) — **not built**;
-[#31](31_permission_profiles.md) (profiles) — **not built**. Everything else
+[#31](31_permission_profiles/proposal.md) (profiles) — **not built**. Everything else
 named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.7 (diff
 and patch engine), section 7.4 (command approval), section 7.10 (secret
@@ -21,7 +21,7 @@ warn-and-override mechanism §5.4 reuses),
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (a commit is a side-effecting action with an unknown-outcome window),
 [`23_verification_loop.md`](23_verification_loop.md) (check evidence),
-[`31_permission_profiles.md`](31_permission_profiles.md) and
+[`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) and
 [`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)
 (Git mutation is a capability), [`36_branch_and_worktree_delivery.md`](36_branch_and_worktree_delivery.md).
 
@@ -301,7 +301,7 @@ A commit is a Git mutation and therefore a capability, not a convenience:
   commit would remove the review step that requirement 1 exists to guarantee.
 - It is available only in Code mode ([spec 20](20_working_modes/proposal.md)) and only
   under a profile that permits Git mutation
-  ([spec 31](31_permission_profiles.md)). Ask, Plan, and Review cannot commit.
+  ([spec 31](31_permission_profiles/proposal.md)). Ask, Plan, and Review cannot commit.
 - Repository config cannot grant it
   ([spec 34](34_repository_config_trust_boundary.md)).
 - Every commit records path count, hunk count, message length, resulting SHA,

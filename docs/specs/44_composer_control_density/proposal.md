@@ -27,7 +27,7 @@ Related implementation specs:
 strip into the turn — this finishes the composer that spec left),
 [`../43_chrome_density_and_hierarchy/proposal.md`](../43_chrome_density_and_hierarchy/proposal.md)
 (the 24×24 control floor and the type scale this obeys),
-[`../31_permission_profiles.md`](../31_permission_profiles.md) (the working-mode
+[`../31_permission_profiles/proposal.md`](../31_permission_profiles/proposal.md) (the working-mode
 control the new action row leaves room for; not built here).
 
 **Not a roadmap graduation.** Fourth spec from the same usability review as

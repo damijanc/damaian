@@ -15,7 +15,7 @@ implementation specs:
 (checkpoint scoping when a worktree is in play),
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md),
 [`20_working_modes/proposal.md`](20_working_modes/proposal.md),
-[`31_permission_profiles.md`](31_permission_profiles.md) and
+[`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) and
 [`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)
 (Git mutation is a capability repository config cannot grant),
 [`35_commit_preparation.md`](35_commit_preparation.md) (produces the commits this
@@ -309,7 +309,7 @@ Every mutation here is a Git mutation and therefore a capability:
 - Code mode only ([spec 20](20_working_modes/proposal.md)); refused in Ask, Plan, and
   Review.
 - Permitted only under a profile allowing Git mutation
-  ([spec 31](31_permission_profiles.md)), which repository config cannot grant
+  ([spec 31](31_permission_profiles/proposal.md)), which repository config cannot grant
   ([spec 34](34_repository_config_trust_boundary.md)).
 - No `Allow Always` for any of them.
 - Each mutation is bracketed by
