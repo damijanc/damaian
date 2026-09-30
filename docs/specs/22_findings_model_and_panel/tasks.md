@@ -11,7 +11,7 @@ decisions it left open in [`context.md`](context.md)
 | Task | State | Notes |
 |---|---|---|
 | 1 · `Finding`, `FindingDraft`, and the redacting, bounding constructor | Done 2026-09-30 | `finding.rs` landed as sketched (rustfmt only), registered in `lib.rs`. Before the implementation the tests failed to compile (`E0432`). After it, `test(finding::tests)` passed 16/16. Each mutation failed its own test: (1) bound-then-redact failed `a_secret_straddling_…`; (2) no summary redaction failed `new_redacts_…`; (3) `<=`→`<` failed `a_summary_at_exactly_the_bound_…`; (4) a plain byte slice failed `details_are_bounded_on_a_char_boundary` by panicking. Privacy: a struct literal gives `E0451`, and a field read gives `E0616`. Probe these one at a time, because rustc reports `E0616` and stops before `E0451`, so a combined probe shows only one of them. Scoped fmt, clippy `-p workspace-engine` and typos are clean. |
-| 2 · Parser trait, dispatch with fall-through, generic parser | Not started | Planned in full on 2026-09-30. Adds `FindingSource::Command`, and a cancelled run gets no generic finding (`context.md` §8). |
+| 2 · Parser trait, dispatch with fall-through, generic parser | Done 2026-09-30 | Landed as sketched (rustfmt only): `FindingSource::Command`, `FindingParser`, `default_parsers()` (still empty), `findings_from_execution`, the generic fallback, and `GENERIC_DETAIL_LINES`. `bound_summary` now calls `first_non_empty_line`. Before the implementation the dispatch tests failed to compile (`E0405`/`E0425`). After it, `test(finding::tests) + test(finding::dispatch_tests)` passed 32/32. Each mutation failed its named test: (1) generic only when no parser matched failed only `a_matching_parser_that_extracts_nothing_falls_through_…`, while `a_failure_no_parser_matches_…` still passed; (2) `(Exited, None)`→`Passed` failed `a_signal_kill_is_a_failure`; (3) `Cancelled`→`Failed` failed `a_cancelled_execution_gets_no_generic_finding`; (4) head-not-tail `last_lines` failed `the_generic_details_keep_the_last_lines_…`; (5) dropping the verdict check failed `a_passing_execution_with_no_parser_yields_nothing`, plus the cancelled test and `a_passing_execution_whose_parser_finds_nothing_…`. Parser layout follows `context.md` §8.4: one file per parser under `src/finding/`. Scoped fmt, clippy `-p workspace-engine` and typos are clean. |
 | 3 · Rust diagnostics parser (`cargo build`/`check`/`clippy`) | Not started | |
 | 4 · Rust test parser (`cargo test`), delegating compile errors to Task 3 | Not started | |
 | 5 · Biome parser | Not started | |
@@ -730,7 +730,7 @@ format.
     and `file_hash`.
   - `pub const GENERIC_DETAIL_LINES: usize = 40`.
 
-- [ ] **Step 1: Add `FindingSource::Command` and extend Task 1's test**
+- [x] **Step 1: Add `FindingSource::Command` and extend Task 1's test**
 
   In `finding.rs`, add the variant after `LanguageServer`:
 
@@ -746,7 +746,7 @@ format.
   `cargo nextest run -p workspace-engine -E 'test(finding::tests)'`.
   Expected: all 16 still pass.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
   Append a second test module to `finding.rs`, after `mod tests`, so the
   dispatch tests can be filtered on their own:
@@ -1005,13 +1005,13 @@ format.
   }
   ```
 
-- [ ] **Step 3: Run the tests and confirm they fail**
+- [x] **Step 3: Run the tests and confirm they fail**
 
   Run: `cargo nextest run -p workspace-engine -E 'test(finding::dispatch_tests)'`
   Expected: a compile failure, because `FindingParser` and
   `findings_from_execution` are not defined.
 
-- [ ] **Step 4: Write the implementation**
+- [x] **Step 4: Write the implementation**
 
   Add `use crate::command_runner::{CommandExecution, CommandTermination};` to
   the imports. Then put this after the `Finding` impl and before
@@ -1132,12 +1132,12 @@ format.
   from proposal §5.3 and `context.md` §8. Record any deviation in the progress
   row.
 
-- [ ] **Step 5: Run the tests and confirm they pass**
+- [x] **Step 5: Run the tests and confirm they pass**
 
   Run: `cargo nextest run -p workspace-engine -E 'test(finding::tests) + test(finding::dispatch_tests)'`
   Expected: 32 pass (16 + 16). Count them.
 
-- [ ] **Step 6: Mutation-test the dispatch rules**
+- [x] **Step 6: Mutation-test the dispatch rules**
 
   Apply each change on its own, confirm the named test fails, then revert it:
 
@@ -1157,7 +1157,7 @@ format.
 
   Record all five results in the progress row.
 
-- [ ] **Step 7: Scoped checks**
+- [x] **Step 7: Scoped checks**
 
   ```bash
   cargo fmt --all -- --check
@@ -1166,7 +1166,7 @@ format.
   typos docs/specs/22_findings_model_and_panel crates/workspace-engine/src/finding.rs
   ```
 
-- [ ] **Step 8: Update this file's Task 2 row, then show the change and the
+- [x] **Step 8: Update this file's Task 2 row, then show the change and the
   check results and ask before committing**
 
 ## Task 3: Rust diagnostics parser
