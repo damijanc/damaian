@@ -11,7 +11,7 @@ decisions it left open in [`context.md`](context.md)
 | Task | State | Notes |
 |---|---|---|
 | 1 · The capability/preference partition, tied to spec 34's classes | Done 2026-09-30 | **Landed:** `ConfigKeyKind { Capability, Preference }` with `as_str`, and `overlay_field_kinds()` from the `classify_overlay_fields!` macro in `config.rs`, directly after `ConfigOverlay`: 34 capability and 7 preference fields, re-exported from `lib.rs`. New `tests/permission_profiles.rs` as planned, unchanged. No field had been added to `ConfigOverlay` since planning. No merge rule changed. **Tests:** `permission_profiles` 4/4 pass. `repository_config_trust` 47/47 pass, file unmodified. `cargo fmt --check`, `cargo clippy -p workspace-engine --all-targets --locked -D warnings` and `typos` clean. **Mutations (all reverted):** (1) `audit_retention_days => Capability` failed `the_preference_keys_are_exactly_spec_34s_free_keys` and the capability coverage assertion, as predicted. It also failed the coverage assertion in `every_preference_key_applies_from_repository_scope`: 3 of 4 tests failed. (2) `trusted` → `true` on the `restricted_patterns` `union_patterns` call failed only the capability test, with "restricted_patterns: the repository removed the user's entry". (3) `pub probe: Option<bool>` on `ConfigOverlay` broke the library build in three places: `apply_overlay_scoped` and `ConfigOverlay::to_policy_text` (E0027, "pattern does not mention field `probe`"), and the macro. **Deviation:** the macro's error reads "pattern requires `..` due to inaccessible fields", not "missing field `probe`". That is still a hard compile error at the macro, which is what criterion 8 needs. **Open:** `audit_retention_days` stays a preference, to match spec 34's Free block. Whether a clone should be able to shorten the audit trail is spec 34's question and is not reclassified here (`context.md` §2) |
-| 2 · The four profile capability keys | Not started | |
+| 2 · The four profile capability keys | Done 2026-09-30 | **Landed:** `allow_file_edits`, `command_access`, `allow_browser_diagnostics` and `allow_mutating_mcp_tools` on `Config` (defaults `true`/`All`/`true`/`true`) and on `ConfigOverlay`. `pub enum CommandAccess { None, ReadOnly, Local, All }` has `parse` (returning `Option`) and `as_str`, with `Ord` as the restriction order. The keys are parsed in `ConfigOverlay::set` and written by both `to_policy_text`s. Repository scope treats them as Restrict-only: the flags go through `restrict_only_flag(.., false)`, and `command_access` through the new `restrict_only_access` (narrower-or-equal applies, wider is recorded as `RestrictOnly`). They are classified `Capability`, so the partition now has 38 capability and 7 preference fields. `CommandAccess` is re-exported. **Tests:** `permission_profiles` 10/10 pass. There are 4 new weakening cases and 6 new tests, including a 7-row `command_access` step table covering equal, narrower and one-step-wider. `repository_config_trust` and `foundation` also pass, 215 in total across the three files. `cargo fmt --check`, `cargo clippy -p workspace-engine --all-targets --locked -D warnings` and `typos` are clean. `cargo check` of `desktop-shell`, `damaian-cli` and `eval-harness` passes. **Mutations (all reverted):** (1) `restrict_only_access` accepting any value failed the step table ("local then all") and the `command_access` weakening case. (2) `allow_file_edits` with `restrictive = true` failed the narrowing test and its weakening case. **Visible effect:** the desktop "Effective policy" text now lists the four keys at their defaults. Nothing else changes until Tasks 4–5 enforce them. **For Task 3:** a profile sets these through `apply_overlay_scoped`, so `ConfigScope::Profile` gets the same restrict-only merge for free once its trust `match` routes it there |
 | 3 · Profiles, `ConfigScope::Profile`, and per-repository selection | Not started | |
 | 4 · `command_access` enforced in `CommandPolicy` as a block | Not started | |
 | 5 · `profile ∩ mode` at every refusal point | Not started | **Touches `chat.rs`.** Do not run at the same time as spec 22 Task 7 (`context.md` §5) |
@@ -773,6 +773,22 @@ Tests: a repository can narrow each key and cannot widen it; each key
 round-trips through `to_policy_text` and `parse`; an unknown `command_access`
 value is `Unparsable` at repository scope and an error at user scope. Nothing
 enforces these keys yet. Tasks 4 and 5 do.
+
+- [x] **Step 1: Write the failing tests.** Add four weakening cases to
+  `weakening_cases()`, then six tests: defaults, repository narrowing, the
+  `command_access` step table, round-trip, parse/print/order, and unparsable
+  values.
+- [x] **Step 2: Confirm they fail.** They did not compile: no `CommandAccess`
+  and no fields on `Config`.
+- [x] **Step 3: Implement.** Add the fields and defaults, `CommandAccess`,
+  `set`, both `to_policy_text`s, both exhaustive destructures, the
+  restrict-only merges, `restrict_only_access`, the partition entries, and the
+  `lib.rs` re-export.
+- [x] **Step 4: Confirm they pass.**
+- [x] **Step 5: Mutation-test** the merge direction for `command_access` and
+  for one flag.
+- [x] **Step 6: Scoped checks,** plus `cargo check` of the dependent crates.
+- [x] **Step 7: Update this row, show the change, and ask before committing.**
 
 ## Task 3: Profiles, `ConfigScope::Profile`, and per-repository selection
 

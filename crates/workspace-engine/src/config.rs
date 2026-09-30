@@ -180,6 +180,13 @@ pub struct Config {
     pub require_approval_for_file_edits: bool,
     pub require_approval_for_risky_commands: bool,
     pub require_approval_for_all_commands: bool,
+    /// Profile capability keys (spec 31, `context.md` §3). Each defaults to
+    /// today's behaviour, so a user who sets none sees no change, and each
+    /// can only be turned down by repository config.
+    pub allow_file_edits: bool,
+    pub command_access: CommandAccess,
+    pub allow_browser_diagnostics: bool,
+    pub allow_mutating_mcp_tools: bool,
     pub block_generated_secrets: bool,
     pub audit_enabled: bool,
     pub audit_retention_days: u64,
@@ -621,6 +628,10 @@ impl Config {
             require_approval_for_file_edits,
             require_approval_for_risky_commands,
             require_approval_for_all_commands,
+            allow_file_edits,
+            command_access,
+            allow_browser_diagnostics,
+            allow_mutating_mcp_tools,
             block_generated_secrets,
             audit_enabled,
             audit_retention_days,
@@ -800,6 +811,46 @@ impl Config {
                 value,
                 true,
                 "require_approval_for_all_commands",
+                trusted,
+                &mut rejected,
+            );
+        }
+        // Profile capability keys: a repository may turn each down, never up.
+        if let Some(value) = allow_file_edits {
+            restrict_only_flag(
+                &mut self.allow_file_edits,
+                value,
+                false,
+                "allow_file_edits",
+                trusted,
+                &mut rejected,
+            );
+        }
+        if let Some(value) = command_access {
+            restrict_only_access(
+                &mut self.command_access,
+                value,
+                "command_access",
+                trusted,
+                &mut rejected,
+            );
+        }
+        if let Some(value) = allow_browser_diagnostics {
+            restrict_only_flag(
+                &mut self.allow_browser_diagnostics,
+                value,
+                false,
+                "allow_browser_diagnostics",
+                trusted,
+                &mut rejected,
+            );
+        }
+        if let Some(value) = allow_mutating_mcp_tools {
+            restrict_only_flag(
+                &mut self.allow_mutating_mcp_tools,
+                value,
+                false,
+                "allow_mutating_mcp_tools",
                 trusted,
                 &mut rejected,
             );
@@ -1480,6 +1531,22 @@ impl Config {
         );
         push_line(
             &mut output,
+            "allow_file_edits",
+            &self.allow_file_edits.to_string(),
+        );
+        push_line(&mut output, "command_access", self.command_access.as_str());
+        push_line(
+            &mut output,
+            "allow_browser_diagnostics",
+            &self.allow_browser_diagnostics.to_string(),
+        );
+        push_line(
+            &mut output,
+            "allow_mutating_mcp_tools",
+            &self.allow_mutating_mcp_tools.to_string(),
+        );
+        push_line(
+            &mut output,
             "block_generated_secrets",
             &self.block_generated_secrets.to_string(),
         );
@@ -1597,6 +1664,10 @@ impl Default for Config {
             require_approval_for_file_edits: true,
             require_approval_for_risky_commands: true,
             require_approval_for_all_commands: false,
+            allow_file_edits: true,
+            command_access: CommandAccess::All,
+            allow_browser_diagnostics: true,
+            allow_mutating_mcp_tools: true,
             block_generated_secrets: true,
             audit_enabled: true,
             audit_retention_days: 90,
@@ -1649,6 +1720,10 @@ pub struct ConfigOverlay {
     pub require_approval_for_file_edits: Option<bool>,
     pub require_approval_for_risky_commands: Option<bool>,
     pub require_approval_for_all_commands: Option<bool>,
+    pub allow_file_edits: Option<bool>,
+    pub command_access: Option<CommandAccess>,
+    pub allow_browser_diagnostics: Option<bool>,
+    pub allow_mutating_mcp_tools: Option<bool>,
     pub block_generated_secrets: Option<bool>,
     pub audit_enabled: Option<bool>,
     pub audit_retention_days: Option<u64>,
@@ -1671,6 +1746,41 @@ pub struct ConfigOverlay {
     pub mcp_enabled: Option<bool>,
     pub mcp_server_allowlist: Option<Vec<String>>,
     pub mcp_servers: Vec<McpServerConfigOverlay>,
+}
+
+/// Which commands a permission profile lets run at all, narrowest first, so
+/// `Ord` is the restriction order (spec 31, `context.md` §3). Nothing enforces
+/// it yet; spec 31 Task 4 blocks by it in `CommandPolicy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CommandAccess {
+    None,
+    /// What Plan mode already allows: low risk, no approval, read-only.
+    ReadOnly,
+    /// Everything except a command Damaian recognises as networked. A name
+    /// heuristic, not a sandbox (`context.md` §7).
+    Local,
+    All,
+}
+
+impl CommandAccess {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(CommandAccess::None),
+            "read_only" => Some(CommandAccess::ReadOnly),
+            "local" => Some(CommandAccess::Local),
+            "all" => Some(CommandAccess::All),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommandAccess::None => "none",
+            CommandAccess::ReadOnly => "read_only",
+            CommandAccess::Local => "local",
+            CommandAccess::All => "all",
+        }
+    }
 }
 
 /// Whether a config key can grant or remove the ability to read, write,
@@ -1726,6 +1836,10 @@ classify_overlay_fields! {
     require_approval_for_file_edits => Capability,
     require_approval_for_risky_commands => Capability,
     require_approval_for_all_commands => Capability,
+    allow_file_edits => Capability,
+    command_access => Capability,
+    allow_browser_diagnostics => Capability,
+    allow_mutating_mcp_tools => Capability,
     block_generated_secrets => Capability,
     audit_enabled => Capability,
     // Free at repository scope in spec 34, so a preference here. Whether a
@@ -1880,6 +1994,20 @@ impl ConfigOverlay {
             }
             "require_approval_for_all_commands" => {
                 self.require_approval_for_all_commands = Some(parse_bool(key, value)?)
+            }
+            "allow_file_edits" => self.allow_file_edits = Some(parse_bool(key, value)?),
+            "command_access" => {
+                self.command_access = Some(CommandAccess::parse(value).ok_or_else(|| {
+                    ClientError::InvalidInput(format!(
+                        "{key} must be none, read_only, local, or all"
+                    ))
+                })?)
+            }
+            "allow_browser_diagnostics" => {
+                self.allow_browser_diagnostics = Some(parse_bool(key, value)?)
+            }
+            "allow_mutating_mcp_tools" => {
+                self.allow_mutating_mcp_tools = Some(parse_bool(key, value)?)
             }
             "block_generated_secrets" => {
                 self.block_generated_secrets = Some(parse_bool(key, value)?)
@@ -2077,6 +2205,10 @@ impl ConfigOverlay {
             require_approval_for_file_edits,
             require_approval_for_risky_commands,
             require_approval_for_all_commands,
+            allow_file_edits,
+            command_access,
+            allow_browser_diagnostics,
+            allow_mutating_mcp_tools,
             block_generated_secrets,
             audit_enabled,
             audit_retention_days,
@@ -2170,6 +2302,18 @@ impl ConfigOverlay {
                 "require_approval_for_all_commands",
                 &value.to_string(),
             );
+        }
+        if let Some(value) = allow_file_edits {
+            push_line(&mut output, "allow_file_edits", &value.to_string());
+        }
+        if let Some(value) = command_access {
+            push_line(&mut output, "command_access", value.as_str());
+        }
+        if let Some(value) = allow_browser_diagnostics {
+            push_line(&mut output, "allow_browser_diagnostics", &value.to_string());
+        }
+        if let Some(value) = allow_mutating_mcp_tools {
+            push_line(&mut output, "allow_mutating_mcp_tools", &value.to_string());
         }
         if let Some(value) = block_generated_secrets {
             push_line(&mut output, "block_generated_secrets", &value.to_string());
@@ -2773,6 +2917,26 @@ fn restrict_only_flag(
             RepositoryKeyClass::RestrictOnly,
         ));
     }
+}
+
+/// [`CommandAccess`] has four levels rather than two, so it cannot use
+/// [`restrict_only_flag`]: an untrusted scope may move it toward
+/// `CommandAccess::None`, never toward `CommandAccess::All`.
+fn restrict_only_access(
+    current: &mut CommandAccess,
+    incoming: CommandAccess,
+    key: &str,
+    trusted: bool,
+    rejected: &mut Vec<RejectedConfigKey>,
+) {
+    if trusted || incoming <= *current {
+        *current = incoming;
+        return;
+    }
+    rejected.push(RejectedConfigKey::new(
+        key,
+        RepositoryKeyClass::RestrictOnly,
+    ));
 }
 
 /// An allowlist where empty means "no restriction". An untrusted scope may

@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    Config, ConfigKeyKind, RepositoryConfigReport, RepositoryKeyClass, overlay_field_kinds,
+    CommandAccess, Config, ConfigKeyKind, ConfigOverlay, RepositoryConfigReport,
+    RepositoryKeyClass, overlay_field_kinds,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -329,6 +330,31 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "mcp_server.helper.command=./tools/evil\n",
             Reported("mcp_server.helper.command"),
         ),
+        // Task 2: the four keys the profiles are built from (context.md §3).
+        case(
+            "allow_file_edits",
+            "allow_file_edits=false\n",
+            "allow_file_edits=true\n",
+            Reported("allow_file_edits"),
+        ),
+        case(
+            "command_access",
+            "command_access=none\n",
+            "command_access=all\n",
+            Reported("command_access"),
+        ),
+        case(
+            "allow_browser_diagnostics",
+            "allow_browser_diagnostics=false\n",
+            "allow_browser_diagnostics=true\n",
+            Reported("allow_browser_diagnostics"),
+        ),
+        case(
+            "allow_mutating_mcp_tools",
+            "allow_mutating_mcp_tools=false\n",
+            "allow_mutating_mcp_tools=true\n",
+            Reported("allow_mutating_mcp_tools"),
+        ),
     ]
 }
 
@@ -434,4 +460,122 @@ fn every_preference_key_applies_from_repository_scope() {
         );
         assert!((case.applied)(&config), "{}: not applied", case.field);
     }
+}
+
+// Task 2: the profile capability keys (context.md §3). Nothing enforces them
+// yet; these pin their parsing, defaults and merge direction.
+
+#[test]
+fn the_profile_keys_default_to_todays_behaviour() {
+    let config = Config::default();
+    assert!(config.allow_file_edits);
+    assert_eq!(config.command_access, CommandAccess::All);
+    assert!(config.allow_browser_diagnostics);
+    assert!(config.allow_mutating_mcp_tools);
+}
+
+#[test]
+fn a_repository_can_narrow_each_profile_key_without_a_refusal() {
+    let (config, report) = load(
+        "profile-keys-narrow",
+        "",
+        concat!(
+            "allow_file_edits=false\n",
+            "command_access=read_only\n",
+            "allow_browser_diagnostics=false\n",
+            "allow_mutating_mcp_tools=false\n",
+        ),
+    );
+
+    assert!(!config.allow_file_edits);
+    assert_eq!(config.command_access, CommandAccess::ReadOnly);
+    assert!(!config.allow_browser_diagnostics);
+    assert!(!config.allow_mutating_mcp_tools);
+    assert!(
+        report.rejected_keys.is_empty(),
+        "narrowing is not a refusal: {:?}",
+        report.rejected_keys
+    );
+}
+
+#[test]
+fn command_access_moves_only_toward_none_from_repository_scope() {
+    // (user, repository, resolved, refused)
+    let cases = [
+        ("all", "local", CommandAccess::Local, false),
+        ("local", "local", CommandAccess::Local, false),
+        ("local", "read_only", CommandAccess::ReadOnly, false),
+        ("read_only", "none", CommandAccess::None, false),
+        ("local", "all", CommandAccess::Local, true),
+        ("read_only", "local", CommandAccess::ReadOnly, true),
+        ("none", "read_only", CommandAccess::None, true),
+    ];
+    for (user, repository, resolved, refused) in cases {
+        let (config, report) = load(
+            "command-access-step",
+            &format!("command_access={user}\n"),
+            &format!("command_access={repository}\n"),
+        );
+        assert_eq!(config.command_access, resolved, "{user} then {repository}");
+        let was_refused = report
+            .rejected_keys
+            .iter()
+            .any(|r| r.key == "command_access" && r.class == RepositoryKeyClass::RestrictOnly);
+        assert_eq!(was_refused, refused, "{user} then {repository}");
+    }
+}
+
+#[test]
+fn the_profile_keys_round_trip_through_the_overlay_text() {
+    let text = concat!(
+        "allow_file_edits=false\n",
+        "command_access=local\n",
+        "allow_browser_diagnostics=false\n",
+        "allow_mutating_mcp_tools=false\n",
+    );
+    let overlay = ConfigOverlay::parse(text).unwrap();
+    let written = overlay.to_policy_text();
+    assert_eq!(
+        ConfigOverlay::parse(&written).unwrap(),
+        overlay,
+        "got: {written}"
+    );
+
+    let mut config = Config::default();
+    config.apply_overlay(overlay);
+    let policy = config.to_policy_text();
+    for line in text.lines() {
+        assert!(
+            policy.contains(line),
+            "effective policy lacks {line}: {policy}"
+        );
+    }
+}
+
+#[test]
+fn every_command_access_value_parses_and_prints_as_itself() {
+    for value in ["none", "read_only", "local", "all"] {
+        let access = CommandAccess::parse(value).unwrap();
+        assert_eq!(access.as_str(), value);
+    }
+    assert!(CommandAccess::parse("everything").is_none());
+    assert!(CommandAccess::None < CommandAccess::ReadOnly);
+    assert!(CommandAccess::ReadOnly < CommandAccess::Local);
+    assert!(CommandAccess::Local < CommandAccess::All);
+}
+
+#[test]
+fn an_unknown_command_access_value_is_skipped_in_repository_config_and_fatal_in_user_config() {
+    let (config, report) = load("command-access-typo", "", "command_access=everything\n");
+    assert_eq!(config.command_access, CommandAccess::All);
+    assert!(
+        report
+            .rejected_keys
+            .iter()
+            .any(|r| r.key == "command_access" && r.class == RepositoryKeyClass::Unparsable),
+        "{:?}",
+        report.rejected_keys
+    );
+
+    assert!(ConfigOverlay::parse("command_access=everything\n").is_err());
 }
