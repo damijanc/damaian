@@ -10,7 +10,7 @@ decisions it left open in [`context.md`](context.md)
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · The capability/preference partition, tied to spec 34's classes | Not started | Planned in full on 2026-09-30 |
+| 1 · The capability/preference partition, tied to spec 34's classes | Done 2026-09-30 | **Landed:** `ConfigKeyKind { Capability, Preference }` with `as_str`, and `overlay_field_kinds()` from the `classify_overlay_fields!` macro in `config.rs`, directly after `ConfigOverlay`: 34 capability and 7 preference fields, re-exported from `lib.rs`. New `tests/permission_profiles.rs` as planned, unchanged. No field had been added to `ConfigOverlay` since planning. No merge rule changed. **Tests:** `permission_profiles` 4/4 pass. `repository_config_trust` 47/47 pass, file unmodified. `cargo fmt --check`, `cargo clippy -p workspace-engine --all-targets --locked -D warnings` and `typos` clean. **Mutations (all reverted):** (1) `audit_retention_days => Capability` failed `the_preference_keys_are_exactly_spec_34s_free_keys` and the capability coverage assertion, as predicted. It also failed the coverage assertion in `every_preference_key_applies_from_repository_scope`: 3 of 4 tests failed. (2) `trusted` → `true` on the `restricted_patterns` `union_patterns` call failed only the capability test, with "restricted_patterns: the repository removed the user's entry". (3) `pub probe: Option<bool>` on `ConfigOverlay` broke the library build in three places: `apply_overlay_scoped` and `ConfigOverlay::to_policy_text` (E0027, "pattern does not mention field `probe`"), and the macro. **Deviation:** the macro's error reads "pattern requires `..` due to inaccessible fields", not "missing field `probe`". That is still a hard compile error at the macro, which is what criterion 8 needs. **Open:** `audit_retention_days` stays a preference, to match spec 34's Free block. Whether a clone should be able to shorten the audit trail is spec 34's question and is not reclassified here (`context.md` §2) |
 | 2 · The four profile capability keys | Not started | |
 | 3 · Profiles, `ConfigScope::Profile`, and per-repository selection | Not started | |
 | 4 · `command_access` enforced in `CommandPolicy` as a block | Not started | |
@@ -162,7 +162,7 @@ warning.
   - The test file `tests/permission_profiles.rs`, with its `load` helper, which
     later tasks extend.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
   Create `crates/workspace-engine/tests/permission_profiles.rs`:
 
@@ -596,14 +596,14 @@ warning.
   }
   ```
 
-- [ ] **Step 2: Run the tests and confirm they fail**
+- [x] **Step 2: Run the tests and confirm they fail**
 
   Run: `cargo nextest run -p workspace-engine --test permission_profiles`
 
   Expected: a compile error, because `ConfigKeyKind` and `overlay_field_kinds`
   are not in `workspace_engine`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
   In `crates/workspace-engine/src/config.rs`, directly after the
   `ConfigOverlay` struct definition (it ends near `:1674`), add:
@@ -699,7 +699,7 @@ warning.
   `overlay_field_kinds` to the `pub use config::{ … }` list (`lib.rs:56`),
   keeping it in `rustfmt` order.
 
-- [ ] **Step 4: Run the tests and confirm they pass**
+- [x] **Step 4: Run the tests and confirm they pass**
 
   Run: `cargo nextest run -p workspace-engine --test permission_profiles`
 
@@ -708,7 +708,7 @@ warning.
   `apply_overlay_scoped` for that field before changing either. Do not weaken
   the assertion to make it pass.
 
-- [ ] **Step 5: Mutation-test the load-bearing guarantees**
+- [x] **Step 5: Mutation-test the load-bearing guarantees**
 
   Do each one, confirm it fails as described, revert it, and record all three
   in the progress row:
@@ -725,14 +725,14 @@ warning.
      error in `classify_overlay_fields!` (missing field `probe` in the
      pattern) **and** in `apply_overlay_scoped`. That is acceptance criterion 8.
 
-- [ ] **Step 6: Confirm spec 34's floor is untouched**
+- [x] **Step 6: Confirm spec 34's floor is untouched**
 
   Run: `cargo nextest run -p workspace-engine --test repository_config_trust`
 
   Expected: all pass. The file is unmodified (`git diff --stat` shows it
   unchanged).
 
-- [ ] **Step 7: Scoped checks**
+- [x] **Step 7: Scoped checks**
 
   ```bash
   cargo fmt --all -- --check
@@ -740,7 +740,7 @@ warning.
   typos
   ```
 
-- [ ] **Step 8: Update this file's Task 1 row, then show the change and the
+- [x] **Step 8: Update this file's Task 1 row, then show the change and the
   check results and ask before committing**
 
   In the Notes, record what landed, the test count, the three mutations, and

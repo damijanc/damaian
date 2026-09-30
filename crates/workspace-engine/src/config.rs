@@ -1673,6 +1673,86 @@ pub struct ConfigOverlay {
     pub mcp_servers: Vec<McpServerConfigOverlay>,
 }
 
+/// Whether a config key can grant or remove the ability to read, write,
+/// execute, or reach the network (spec 31 §5.1). Derived from spec 34's
+/// repository classes by one rule: a key repository scope does not apply
+/// freely is a capability key (`docs/specs/31_permission_profiles/context.md`
+/// §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigKeyKind {
+    Capability,
+    Preference,
+}
+
+impl ConfigKeyKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConfigKeyKind::Capability => "capability",
+            ConfigKeyKind::Preference => "preference",
+        }
+    }
+}
+
+// Declares the partition once. The expansion destructures `ConfigOverlay`
+// exhaustively, deliberately without `..`, and builds the list from the same
+// names. So a new field fails to compile until it is classified, and the
+// list cannot leave out a field the destructure names.
+macro_rules! classify_overlay_fields {
+    ($($field:ident => $kind:ident,)+) => {
+        /// Every [`ConfigOverlay`] field, by field name, with its kind.
+        pub fn overlay_field_kinds() -> Vec<(&'static str, ConfigKeyKind)> {
+            let ConfigOverlay { $($field: _,)+ } = ConfigOverlay::default();
+            vec![$((stringify!($field), ConfigKeyKind::$kind),)+]
+        }
+    };
+}
+
+classify_overlay_fields! {
+    data_dir => Capability,
+    max_file_bytes => Preference,
+    max_read_lines => Capability,
+    max_list_entries => Capability,
+    max_search_matches => Capability,
+    max_match_line_chars => Capability,
+    max_command_output_bytes => Preference,
+    command_timeout_secs => Capability,
+    allowed_roots => Capability,
+    ignore_patterns => Capability,
+    restricted_patterns => Capability,
+    command_allowlist => Capability,
+    command_allowlist_by_repository => Capability,
+    command_blocklist => Capability,
+    secret_patterns => Capability,
+    require_approval_for_file_edits => Capability,
+    require_approval_for_risky_commands => Capability,
+    require_approval_for_all_commands => Capability,
+    block_generated_secrets => Capability,
+    audit_enabled => Capability,
+    // Free at repository scope in spec 34, so a preference here. Whether a
+    // clone should be able to shorten the audit trail is spec 34's
+    // question, left open (context.md §2).
+    audit_retention_days => Preference,
+    checkpoint_retention_days => Capability,
+    checkpoint_max_total_bytes => Capability,
+    checkpoint_census_max_paths => Capability,
+    enable_semantic_search => Preference,
+    agent_max_tool_rounds => Preference,
+    agent_web_debug_max_tool_rounds => Preference,
+    agent_tool_retry_limit => Preference,
+    agent_max_task_tokens => Capability,
+    agent_max_turn_messages => Capability,
+    shell => Capability,
+    model_provider => Capability,
+    model_name => Capability,
+    model_base_url => Capability,
+    model_api_key_env => Capability,
+    model_reasoning_level => Capability,
+    model_providers => Capability,
+    mcp_enabled => Capability,
+    mcp_server_allowlist => Capability,
+    mcp_servers => Capability,
+}
+
 impl ConfigOverlay {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let content = fs::read_to_string(path)?;
