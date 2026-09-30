@@ -10,7 +10,7 @@ decisions it left open in [`context.md`](context.md)
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · `Finding`, `FindingDraft`, and the redacting, bounding constructor | Not started | Planned in full on 2026-09-25 |
+| 1 · `Finding`, `FindingDraft`, and the redacting, bounding constructor | Done 2026-09-30 | `finding.rs` landed as sketched (rustfmt only), registered in `lib.rs`. Before the implementation the tests failed to compile (`E0432`). After it, `test(finding::tests)` passed 16/16. Each mutation failed its own test: (1) bound-then-redact failed `a_secret_straddling_…`; (2) no summary redaction failed `new_redacts_…`; (3) `<=`→`<` failed `a_summary_at_exactly_the_bound_…`; (4) a plain byte slice failed `details_are_bounded_on_a_char_boundary` by panicking. Privacy: a struct literal gives `E0451`, and a field read gives `E0616`. Probe these one at a time, because rustc reports `E0616` and stops before `E0451`, so a combined probe shows only one of them. Scoped fmt, clippy `-p workspace-engine` and typos are clean. |
 | 2 · Parser trait, dispatch with fall-through, generic parser | Not started | |
 | 3 · Rust diagnostics parser (`cargo build`/`check`/`clippy`) | Not started | |
 | 4 · Rust test parser (`cargo test`), delegating compile errors to Task 3 | Not started | |
@@ -164,12 +164,12 @@ after the fact, so this task starts at `pub`.
     `createdAtMs`, `startLine`, …) and snake_case enum values. Task 7
     persists exactly this shape, and Task 9 serves it.
 
-- [ ] **Step 1: Register the module**
+- [x] **Step 1: Register the module**
 
   In `crates/workspace-engine/src/lib.rs`, add `pub mod finding;` in
   alphabetical order, between `pub mod file_access;` and `pub mod git_service;`.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
   Create `crates/workspace-engine/src/finding.rs` containing only the test
   module, so that it fails to compile:
@@ -392,13 +392,13 @@ after the fact, so this task starts at `pub`.
   }
   ```
 
-- [ ] **Step 3: Run the tests and confirm they fail**
+- [x] **Step 3: Run the tests and confirm they fail**
 
   Run: `cargo nextest run -p workspace-engine -E 'test(finding::tests)'`
   Expected: a compile failure, because `FindingDraft`, `Finding`, and the rest
   are not defined.
 
-- [ ] **Step 4: Write the implementation**
+- [x] **Step 4: Write the implementation**
 
   Put this above the test module in `finding.rs`:
 
@@ -641,14 +641,14 @@ after the fact, so this task starts at `pub`.
   `proposal.md` §5.1/§5.6 and `context.md` §§1–4. Record any deviation in the
   progress row.
 
-- [ ] **Step 5: Run the tests and confirm they pass**
+- [x] **Step 5: Run the tests and confirm they pass**
 
   Run: `cargo nextest run -p workspace-engine -E 'test(finding::tests)'`
   Expected: all 16 pass. Count them. `test(finding)` would also match any
   other test whose name contains "finding", such as `secret_scanner`'s
   `SecretFinding` tests, so use the module path, as spec 20 Task 3 learned.
 
-- [ ] **Step 6: Mutation-test the load-bearing guarantees**
+- [x] **Step 6: Mutation-test the load-bearing guarantees**
 
   Apply each change on its own, confirm the named test fails, then revert it:
 
@@ -666,7 +666,7 @@ after the fact, so this task starts at `pub`.
 
   Record all four results in the progress row.
 
-- [ ] **Step 7: Confirm the privacy guarantee is real**
+- [x] **Step 7: Confirm the privacy guarantee is real**
 
   Temporarily add, in a scratch `#[test]` outside `finding.rs` (for example in
   `lib.rs`), a `finding::Finding { .. }` struct literal that names every field.
@@ -677,7 +677,7 @@ after the fact, so this task starts at `pub`.
   doctests, so the quality gate would never run it. Field privacy is the
   guard, and it is enforced every time the crate compiles.
 
-- [ ] **Step 8: Scoped checks**
+- [x] **Step 8: Scoped checks**
 
   ```bash
   cargo fmt --all -- --check
@@ -686,7 +686,7 @@ after the fact, so this task starts at `pub`.
   typos docs/specs/22_findings_model_and_panel crates/workspace-engine/src/finding.rs
   ```
 
-- [ ] **Step 9: Update this file's Task 1 row, then show the change and the
+- [x] **Step 9: Update this file's Task 1 row, then show the change and the
   check results and ask before committing**
 
 ---

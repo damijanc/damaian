@@ -12,6 +12,7 @@ pub mod edit;
 pub mod embeddings;
 pub mod error;
 pub mod file_access;
+pub mod finding;
 pub mod git_service;
 pub mod hash;
 pub mod ignore;
