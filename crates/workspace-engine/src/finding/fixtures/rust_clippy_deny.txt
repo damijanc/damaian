@@ -1,0 +1,54 @@
+    Checking demo v0.1.0 (/repo/crates/demo)
+error: unused variable: `unused`
+ --> crates/demo/src/lib.rs:2:9
+  |
+2 |     let unused = 5;
+  |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused`
+  |
+  = note: `-D unused-variables` implied by `-D warnings`
+  = help: to override `-D warnings` add `#[allow(unused_variables)]`
+
+error: unneeded `return` statement
+ --> crates/demo/src/lib.rs:3:5
+  |
+3 |     return 1;
+  |     ^^^^^^^^
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_return
+  = note: `-D clippy::needless-return` implied by `-D warnings`
+  = help: to override `-D warnings` add `#[allow(clippy::needless_return)]`
+help: remove `return`
+  |
+3 -     return 1;
+3 +     1
+  |
+
+error: unneeded `return` statement
+ --> crates/demo/src/lib.rs:7:5
+  |
+7 |     return v.len();
+  |     ^^^^^^^^^^^^^^
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#needless_return
+help: remove `return`
+  |
+7 -     return v.len();
+7 +     v.len()
+  |
+
+error: writing `&Vec` instead of `&[_]` involves a new object where a slice will do
+ --> crates/demo/src/lib.rs:6:15
+  |
+6 | pub fn two(v: &Vec<u32>) -> usize {
+  |               ^^^^^^^^^
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#ptr_arg
+  = note: `-D clippy::ptr-arg` implied by `-D warnings`
+  = help: to override `-D warnings` add `#[allow(clippy::ptr_arg)]`
+help: change this to
+  |
+6 - pub fn two(v: &Vec<u32>) -> usize {
+6 + pub fn two(v: &[u32]) -> usize {
+  |
+
+error: could not compile `demo` (lib) due to 4 previous errors

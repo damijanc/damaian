@@ -9,6 +9,8 @@ use crate::hash::{create_id, now_millis};
 use crate::secret_scanner::SecretScanner;
 use serde::{Deserialize, Serialize};
 
+mod rust_diagnostics;
+
 pub const MAX_SUMMARY_CHARS: usize = 240;
 pub const MAX_DETAILS_BYTES: usize = 4096;
 pub const DETAILS_TRUNCATION_MARKER: &str = "\n… (truncated)";
@@ -230,7 +232,7 @@ pub trait FindingParser {
 /// theirs here. The generic fallback is not in this list: it is applied by
 /// `findings_from_execution` itself, so no caller can forget it.
 pub fn default_parsers() -> Vec<Box<dyn FindingParser>> {
-    Vec::new()
+    vec![Box::new(rust_diagnostics::RustDiagnosticsParser)]
 }
 
 /// Whether a run reached a verdict, and which. `context.md` §8.2 has the

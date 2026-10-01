@@ -12,7 +12,7 @@ decisions it left open in [`context.md`](context.md)
 |---|---|---|
 | 1 · `Finding`, `FindingDraft`, and the redacting, bounding constructor | Done 2026-09-30 | `finding.rs` landed as sketched (rustfmt only), registered in `lib.rs`. Before the implementation the tests failed to compile (`E0432`). After it, `test(finding::tests)` passed 16/16. Each mutation failed its own test: (1) bound-then-redact failed `a_secret_straddling_…`; (2) no summary redaction failed `new_redacts_…`; (3) `<=`→`<` failed `a_summary_at_exactly_the_bound_…`; (4) a plain byte slice failed `details_are_bounded_on_a_char_boundary` by panicking. Privacy: a struct literal gives `E0451`, and a field read gives `E0616`. Probe these one at a time, because rustc reports `E0616` and stops before `E0451`, so a combined probe shows only one of them. Scoped fmt, clippy `-p workspace-engine` and typos are clean. |
 | 2 · Parser trait, dispatch with fall-through, generic parser | Done 2026-09-30 | Landed as sketched (rustfmt only): `FindingSource::Command`, `FindingParser`, `default_parsers()` (still empty), `findings_from_execution`, the generic fallback, and `GENERIC_DETAIL_LINES`. `bound_summary` now calls `first_non_empty_line`. Before the implementation the dispatch tests failed to compile (`E0405`/`E0425`). After it, `test(finding::tests) + test(finding::dispatch_tests)` passed 32/32. Each mutation failed its named test: (1) generic only when no parser matched failed only `a_matching_parser_that_extracts_nothing_falls_through_…`, while `a_failure_no_parser_matches_…` still passed; (2) `(Exited, None)`→`Passed` failed `a_signal_kill_is_a_failure`; (3) `Cancelled`→`Failed` failed `a_cancelled_execution_gets_no_generic_finding`; (4) head-not-tail `last_lines` failed `the_generic_details_keep_the_last_lines_…`; (5) dropping the verdict check failed `a_passing_execution_with_no_parser_yields_nothing`, plus the cancelled test and `a_passing_execution_whose_parser_finds_nothing_…`. Parser layout follows `context.md` §8.4: one file per parser under `src/finding/`. Scoped fmt, clippy `-p workspace-engine` and typos are clean. |
-| 3 · Rust diagnostics parser (`cargo build`/`check`/`clippy`) | Not started | Planned in full on 2026-09-30 against captured cargo 1.98.0 output (`context.md` §9). |
+| 3 · Rust diagnostics parser (`cargo build`/`check`/`clippy`) | Done 2026-10-01 | Planned on 2026-09-30 against captured cargo 1.98.0 output (`context.md` §9). The first session was lost after Step 1, and its fixtures were checked byte-identical before work resumed. `finding/rust_diagnostics.rs` landed as sketched, with only rustfmt changes. It is declared from `finding.rs`, and `RustDiagnosticsParser` is registered in `default_parsers()`. Before the implementation the tests failed to compile (`E0425` on `parse_rust_diagnostics`, `cargo_subcommand` and `RustDiagnosticsParser`). After it, `test(finding::)` passed 49/49 (16 + 16 + 17), and the Task 2 dispatch tests were unaffected. Mutations: (1) no `take_while` failed only `a_child_notes_location_is_not_borrowed_…`, as predicted. (2) The plan's two variants differ. The last `-->` *before a child header* fails nothing, because rustc prints exactly one `-->` per primary region (a secondary span in another file uses `:::`), so first and last are the same line. The last `-->` *in the whole block* failed `the_location_is_the_primary_one_…` with `13:4`, and also the no-primary-location test. (3) `is_cargo_summary` always `false` failed `cargo_summary_lines_are_not_findings`, plus `every_clippy_occurrence_…`, `default_parsers_turn_…` and `a_diagnostic_without_a_location_…`, whose counts include the summary lines. (4) No `CLIPPY_URL` branch failed `every_clippy_occurrence_gets_its_code_from_the_help_url`. (5) No `is_absolute` failed `a_location_outside_the_workspace_has_no_range`. (6) No ANSI strip failed `ansi_colour_codes_are_ignored`. (7) Ending a block only at a blank line failed nothing, as expected. The header check stays as defence against a runner that strips blank lines. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
 | 4 · Rust test parser (`cargo test`), delegating compile errors to Task 3 | Not started | |
 | 5 · Biome parser | Not started | |
 | 6 · Browser findings from spec 12's `WebDiagnosticDetails` | Not started | Re-scoped 2026-09-29 by spec 12's close-out: no `entries` field (`context.md` §7.1). |
@@ -1203,7 +1203,7 @@ outline:
   - `pub(super) struct RustDiagnosticsParser`, registered first in
     `default_parsers()`.
 
-- [ ] **Step 1: Commit the fixtures as files**
+- [x] **Step 1: Commit the fixtures as files**
 
   Create `crates/workspace-engine/src/finding/fixtures/` and write these three
   files **byte for byte**. They are cargo 1.98.0 captures from a workspace
@@ -1382,7 +1382,7 @@ error: could not compile `demo` (lib) due to 4 previous errors
   Each file is the text between its fences, verbatim. The fixture lines sit at
   column 0 here, exactly as cargo printed them.
 
-- [ ] **Step 2: Declare the module and write the failing tests**
+- [x] **Step 2: Declare the module and write the failing tests**
 
   In `finding.rs`, add `mod rust_diagnostics;` directly below the `use`
   lines. Then create `crates/workspace-engine/src/finding/rust_diagnostics.rs`
@@ -1642,13 +1642,13 @@ error: could not compile `demo` (lib) due to 4 previous errors
   }
   ```
 
-- [ ] **Step 3: Run the tests and confirm they fail**
+- [x] **Step 3: Run the tests and confirm they fail**
 
   Run: `cargo nextest run -p workspace-engine -E 'test(finding::rust_diagnostics)'`
   Expected: a compile failure, because `parse_rust_diagnostics`,
   `RustDiagnosticsParser` and `cargo_subcommand` are not defined.
 
-- [ ] **Step 4: Write the implementation**
+- [x] **Step 4: Write the implementation**
 
   Put this above the test module in `rust_diagnostics.rs`:
 
@@ -1830,7 +1830,7 @@ error: could not compile `demo` (lib) due to 4 previous errors
   compile as written, restructure them into a plain loop. Do not weaken a
   test to fit.
 
-- [ ] **Step 5: Run the tests and confirm they pass**
+- [x] **Step 5: Run the tests and confirm they pass**
 
   Run: `cargo nextest run -p workspace-engine -E 'test(finding::)'`
   Expected: 49 pass: 16 in `tests`, 16 in `dispatch_tests`, and 17 in
@@ -1838,7 +1838,7 @@ error: could not compile `demo` (lib) due to 4 previous errors
   explicit parser lists and never call `default_parsers()`, so registering a
   parser must not change their result. If one fails, that is a real signal.
 
-- [ ] **Step 6: Mutation-test the rules that came from real output**
+- [x] **Step 6: Mutation-test the rules that came from real output**
 
   Apply each change on its own, confirm the named test fails, then revert it:
 
@@ -1870,7 +1870,7 @@ error: could not compile `demo` (lib) due to 4 previous errors
   `-->`" and "first before a child" pick the same line. Only the synthetic
   no-primary-location test catches it.
 
-- [ ] **Step 7: Scoped checks**
+- [x] **Step 7: Scoped checks**
 
   ```bash
   cargo fmt --all -- --check
@@ -1883,7 +1883,7 @@ error: could not compile `demo` (lib) due to 4 previous errors
   the fixture directory to `_typos.toml`'s excludes with a comment saying why,
   rather than editing captured output.
 
-- [ ] **Step 8: Update this file's Task 3 row, then show the change and the
+- [x] **Step 8: Update this file's Task 3 row, then show the change and the
   check results and ask before committing**
 
 ## Task 4: Rust test parser
