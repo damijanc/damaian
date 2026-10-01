@@ -110,6 +110,8 @@ structural parser for exactly that output ships beside it.
 
 **Decision:** the Rust test parser (Task 4) runs the Rust diagnostics parser
 (Task 3) over the same output first, and uses its drafts when it returns any.
+**Corrected 2026-10-01 by §10.2:** it keeps both the diagnostics and the test
+failures, because a compiler warning and failing tests appear in the same run.
 The parser table's "Recognises" column stays as written. `matches` still
 recognises the commands the table lists, and `npm run lint:web` is added to the
 Biome row because this repository's own check needs it.
@@ -229,6 +231,10 @@ agent to repair something the user did on purpose.
 | `TimedOut` | failed | kept | when the drafts are empty |
 | `Cancelled` | none | kept | never |
 
+**Amended 2026-10-01 by §10.3:** "when the drafts are empty" became "when no
+draft is an `Error`". A failed run whose parser found only warnings also gets
+the generic finding.
+
 A cancelled run still keeps what its parser found. A compile error printed
 before the user pressed Stop is a real problem, and it has a real location. So
 "never lose a failure" still holds: a cancelled run had no failure to lose.
@@ -329,3 +335,162 @@ they showed, and what each finding means for the parser:
 - **A warnings-only build exits 0.** `findings_from_execution` keeps a passing
   run's parsed drafts (Task 2), so a clean-exit `cargo clippy` still yields its
   warnings.
+
+## 10. What real `cargo test` output looks like (Task 4, 2026-10-01)
+
+Captured with cargo 1.98.0 and cargo-nextest 0.9.144. The workspace had the
+same shape as §9's (`crates/demo`), plus an integration test
+(`crates/demo/tests/integration.rs`) and one failing doctest. The crash
+capture came from a separate one-package crate. The Task 4 fixtures are these
+captures, with two kinds of edit. The workspace path was replaced with
+`/repo`, and the doctest's per-user temporary directory with `/tmp/`. cargo's
+`Finished` line and rustdoc's `all doctests ran in …` line were dropped
+because they report timings. The `test result:` lines were kept. Their
+`finished in 0.00s` is a timing too, but the parser never reads it.
+
+| Capture | Command | Exit | stdout | stderr |
+|---|---|---|---|---|
+| Compile error | `cargo test` | 101 | empty | rustc diagnostics |
+| Failures | `cargo test --no-fail-fast` | 101 | three `failures:` blocks (lib, integration, doctest) | one warning, cargo's per-target lines |
+| Crash | `cargo test` (the test calls `abort()`) | 101 | `running 1 test` only | one warning, `Caused by: … (signal: 6, SIGABRT …)` |
+| Pass | `cargo test` | 0 | `test result: ok` | progress lines only |
+| nextest | `cargo nextest run` | 100 | empty | everything (see §10.5) |
+
+### 10.1 libtest's stdout
+
+- **Each test binary prints `failures:` twice.** The first one introduces the
+  `---- name stdout ----` sections. The second is followed by the failing
+  names, indented four spaces and **sorted by name**. Then comes
+  `test result: FAILED`. With `--no-fail-fast` there is one such block per
+  binary, doctests included. The default fail-fast run stops after the first
+  failing binary.
+- **Sections come in the order tests finished**, which changes from run to run.
+  Only the name list has a stable order, so findings follow the list.
+- **A section does not always end in a blank line.** A `#[should_panic]` test
+  that did not panic prints one `note:` line and then runs straight into the
+  next `---- … ----` header. **Decision:** a section ends at the next section
+  header or the next `failures:` line. It does not end at a blank line, and
+  captured test output can contain blank lines anyway.
+- **What each kind of failure prints**, inside its section:
+  - **A panic:** any captured stdout, then
+    `thread 'name' (9907617) panicked at crates/demo/src/lib.rs:27:9:`, then
+    the message on the next line. The bracketed thread id is new in this
+    toolchain. Earlier toolchains print the same line without it, so the
+    pattern accepts both.
+  - **`assert_eq!`:** the same, with the message
+    `` assertion `left == right` failed: two plus two `` followed by the
+    `left:` and `right:` lines.
+  - **`unwrap()` in library code:** `#[track_caller]` puts the location in
+    the library function the test called (`lib.rs:11:15`), not in the test.
+    That is where it panicked, so it is kept.
+  - **`#[should_panic]` that did not panic:**
+    `note: test did not panic as expected at crates/demo/src/lib.rs:42:8`,
+    which points at the test function's name. There is no `panicked at` line.
+  - **`#[should_panic(expected = …)]` with the wrong message:** a normal
+    `panicked at` line with the actual message (`underflow`), then
+    `note: panic did not contain expected string` and the two strings.
+  - **A test returning `Err`:** `Error: "config missing"`, with no location.
+  - **A doctest:** the name is `crates/demo/src/lib.rs - add (line 3)`. The
+    section says `Test executable failed (exit status: 101).`, then
+    `stderr:`, then a panic at an **absolute temporary path**
+    (`/tmp/rustdoctestVr99Wj/doctest_bundle_2024.rs:6:1` after scrubbing).
+- **`note: run with RUST_BACKTRACE=1 …`** appears once per process, under
+  whichever test panicked first. The parser ignores it.
+- **No colour on stdout.** `CARGO_TERM_COLOR=always` colours only cargo's
+  stderr, which `parse_rust_diagnostics` already strips. With output piped,
+  libtest printed no escapes even with `-- --color always`.
+- **`-q` keeps the sections.** **`-- --nocapture` moves panics to stderr**,
+  so sections are left only for the `#[should_panic]` notes. Matching a
+  stderr panic back to a test by its thread name is out of scope: those
+  failures get no range.
+
+**Decisions for each failure:**
+
+- **One `Test` draft of severity `Error` per listed name, with no code.**
+  libtest has no other level and no codes.
+- **The summary is `<name>: <message>`, or `<name> failed` when no message was
+  found.** The message is taken from the first of these that exists:
+  1. the `#[should_panic]` note (`test did not panic as expected at …` or
+     `panic did not contain expected string`), which explains the failure
+     better than the panic's own text;
+  2. the line after `panicked at`;
+  3. an `Error: …` line.
+- **The range** is the first `panicked at` or `did not panic … at` location,
+  passed through §9's absolute-or-`..` rule (Task 4 moves that rule into a
+  shared `workspace_range`). When that gives nothing, a doctest name gives
+  `path` and `line`, with no column. That location is the doc block, as
+  rustdoc printed it. A returned `Err` has no range.
+- **The details are the section**, header included, with trailing blank lines
+  trimmed. `Finding::new` applies the bound.
+- **A listed name with no section** (cut off by tail truncation, §6, or by
+  `--nocapture`) still becomes a finding: `<name> failed`, with no range and
+  no details.
+- **Each list reads only the sections printed since the previous list.**
+  Names repeat across binaries (two crates can both have `tests::adds`), and a
+  later binary's name must not take an earlier binary's location.
+
+### 10.2 cargo's stderr under `cargo test`, and why §5's "either" was wrong
+
+- A compile error looks exactly like §9's, with `(lib test)` in the
+  `could not compile` line. stdout is empty.
+- **cargo adds three header-shaped lines** that are summaries, not
+  diagnostics: `` error: test failed, to rerun pass `--lib` ``,
+  `` error: doctest failed, to rerun pass `--doc` ``, and
+  `error: 3 targets failed:`, which is followed by the indented target list.
+  Read as diagnostics, they would become `Compiler` errors that say nothing.
+  Task 4 adds them to `is_cargo_summary`.
+- **Warnings and failing tests appear in the same run.** In the failures
+  capture, stderr has an `unused_variables` warning and stdout has eight
+  failures. §5's "uses its drafts when it returns any" would report the
+  warning and drop all eight failures. **Decision:** `RustTestParser::parse`
+  returns both, with the diagnostics first.
+
+### 10.3 A warning must not stand in for a failure
+
+The crash capture has a warning on stderr, and then the test binary died
+from `SIGABRT` before it printed any list. The parser returns one `Warning`
+draft. Under §8.2's rule ("generic fallback when the drafts are empty"), that
+draft suppressed the generic finding, and a failed `cargo test` reported
+nothing but a warning. The same hole exists for any parser that reports
+warnings: a `cargo build` killed after printing a warning, or a Biome run
+that fails because of its warnings (Task 5).
+
+**Decision:** `findings_from_execution` falls through to the generic finding
+when a failed run produced **no draft of severity `Error`**, not only when it
+produced no drafts. The warnings are kept, and the generic finding comes after
+them. Passing and cancelled runs are unchanged. The crash's generic summary is
+`cargo test: Compiling crash v0.1.0 (/repo)`, which is cargo's first stderr
+line. That is weak, but it is honest, and the details' tail carries the
+`Caused by: … SIGABRT` lines. Improving it would mean parsing `Caused by:`,
+which no task requires.
+
+### 10.4 Paths
+
+Test locations follow §9: relative to the workspace root, even for an
+integration test (`crates/demo/tests/integration.rs:8:5`). A one-package
+crate prints `src/lib.rs`. Task 7 still resolves every relative path against
+the repository root.
+
+### 10.5 `cargo nextest run` is out of scope
+
+nextest writes everything to stderr, in a different shape. Each failing test
+is a `FAIL [ 0.013s] (1/8) demo tests::name` line. Under it come indented
+`stdout ───` and `stderr ───` blocks, each holding a whole one-test libtest
+run with a 4-space indent. At the end there is a `Summary` line, the `FAIL`
+lines repeated, and `error: test run failed`, with exit code 100. By default
+the first failure cancels the rest, so a run reports only part of the suite.
+
+**Decision:** Task 4 does not parse nextest output, and `RustTestParser` does
+not match `cargo nextest`. No shipped parser matches it, so a failed nextest
+run gets one generic finding, compile errors included. The reasons:
+
+- `detect_project_commands` proposes `cargo test` (`command_policy.rs:216-222`),
+  so Damaian never proposes nextest itself.
+- This repository's gate runs nextest from a developer's terminal or CI, not
+  through Damaian's validation.
+- nextest's shape needs its own parser. Bending this one to read indented
+  copies on another stream would make both harder to falsify.
+
+A later nextest parser could read the `FAIL` lines for names and the indented
+`panicked at` lines for locations. It would also need the dispatcher's
+generic fallback, which still applies, because of the fail-fast cancellation.
