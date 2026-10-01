@@ -1877,8 +1877,8 @@ pub struct ConfigOverlay {
 }
 
 /// Which commands a permission profile lets run at all, narrowest first, so
-/// `Ord` is the restriction order (spec 31, `context.md` §3). Nothing enforces
-/// it yet; spec 31 Task 4 blocks by it in `CommandPolicy`.
+/// `Ord` is the restriction order (spec 31, `context.md` §3). `CommandPolicy`
+/// enforces it as a block, so a stored proposal run by id is refused too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CommandAccess {
     None,

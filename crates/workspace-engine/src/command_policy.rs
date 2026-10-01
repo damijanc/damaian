@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{CommandAccess, Config};
 use crate::error::Result;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -31,6 +31,19 @@ pub struct CommandClassification {
     pub reasons: Vec<String>,
     pub expected_effects: String,
     pub may_use_network: bool,
+}
+
+impl CommandClassification {
+    /// What Plan and Review mode allow, and what `command_access=read_only`
+    /// allows: low risk, no approval, *and* read-only by its text. The third
+    /// check stops the allowlist, which also yields low risk with no approval,
+    /// from widening either one (spec 20 `context.md` §5). One function, so the
+    /// mode and the profile cannot drift apart.
+    pub(crate) fn is_read_only_without_approval(&self) -> bool {
+        self.risk == CommandRisk::Low
+            && !self.requires_approval
+            && is_low_risk_read_only(&self.command)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +82,19 @@ impl CommandPolicy {
             classification
                 .reasons
                 .push("Command references a path outside the selected repository".to_string());
+        }
+        // After the whole classification, so the block never has to invent a
+        // risk (spec 31 proposal §4) and sees the outside-root approval, the way
+        // Plan mode does. After the allowlist too: Allow Always cannot outrank
+        // a profile.
+        if !classification.blocked
+            && !command_access_permits(self.config.command_access, &classification)
+        {
+            classification.blocked = true;
+            classification.reasons.push(format!(
+                "Blocked by permission profile: command_access={}",
+                self.config.command_access.as_str()
+            ));
         }
         classification
     }
@@ -250,6 +276,18 @@ impl CommandPolicy {
 ///   would promise something the policy then refuses to honor.
 pub fn allow_always_eligible(config: &Config, command: &str, blocked: bool) -> bool {
     !blocked && !config.require_approval_for_all_commands && !contains_shell_control(command.trim())
+}
+
+/// Whether `command_access` lets this command run. `Local` judges the text,
+/// not `classification.may_use_network`, which the allowlist branch sets to
+/// `false`. It is a name heuristic, not a sandbox (spec 31 `context.md` §7).
+fn command_access_permits(access: CommandAccess, classification: &CommandClassification) -> bool {
+    match access {
+        CommandAccess::None => false,
+        CommandAccess::ReadOnly => classification.is_read_only_without_approval(),
+        CommandAccess::Local => !may_use_network(&classification.command),
+        CommandAccess::All => true,
+    }
 }
 
 fn configured_prefix_matches(patterns: &[String], command: &str) -> bool {

@@ -1,5 +1,5 @@
 use crate::chat::ToolAction;
-use crate::command_policy::{CommandClassification, CommandRisk, is_low_risk_read_only};
+use crate::command_policy::CommandClassification;
 use serde::{Deserialize, Serialize};
 
 /// A session's working mode. Bounds what the model can do this turn,
@@ -165,9 +165,7 @@ pub(crate) fn mode_permits(
                  classify the command before asking whether the mode \
                  permits it",
             );
-            let read_only_no_approval = classification.risk == CommandRisk::Low
-                && !classification.requires_approval
-                && is_low_risk_read_only(&classification.command);
+            let read_only_no_approval = classification.is_read_only_without_approval();
             match mode {
                 Ask => Permission::Refused {
                     blocked_by: Ask,

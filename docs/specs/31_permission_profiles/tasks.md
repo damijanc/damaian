@@ -13,7 +13,7 @@ decisions it left open in [`context.md`](context.md)
 | 1 · The capability/preference partition, tied to spec 34's classes | Done 2026-09-30 | **Landed:** `ConfigKeyKind { Capability, Preference }` with `as_str`, and `overlay_field_kinds()` from the `classify_overlay_fields!` macro in `config.rs`, directly after `ConfigOverlay`: 34 capability and 7 preference fields, re-exported from `lib.rs`. New `tests/permission_profiles.rs` as planned, unchanged. No field had been added to `ConfigOverlay` since planning. No merge rule changed. **Tests:** `permission_profiles` 4/4 pass. `repository_config_trust` 47/47 pass, file unmodified. `cargo fmt --check`, `cargo clippy -p workspace-engine --all-targets --locked -D warnings` and `typos` clean. **Mutations (all reverted):** (1) `audit_retention_days => Capability` failed `the_preference_keys_are_exactly_spec_34s_free_keys` and the capability coverage assertion, as predicted. It also failed the coverage assertion in `every_preference_key_applies_from_repository_scope`: 3 of 4 tests failed. (2) `trusted` → `true` on the `restricted_patterns` `union_patterns` call failed only the capability test, with "restricted_patterns: the repository removed the user's entry". (3) `pub probe: Option<bool>` on `ConfigOverlay` broke the library build in three places: `apply_overlay_scoped` and `ConfigOverlay::to_policy_text` (E0027, "pattern does not mention field `probe`"), and the macro. **Deviation:** the macro's error reads "pattern requires `..` due to inaccessible fields", not "missing field `probe`". That is still a hard compile error at the macro, which is what criterion 8 needs. **Open:** `audit_retention_days` stays a preference, to match spec 34's Free block. Whether a clone should be able to shorten the audit trail is spec 34's question and is not reclassified here (`context.md` §2) |
 | 2 · The four profile capability keys | Done 2026-09-30 | **Landed:** `allow_file_edits`, `command_access`, `allow_browser_diagnostics` and `allow_mutating_mcp_tools` on `Config` (defaults `true`/`All`/`true`/`true`) and on `ConfigOverlay`. `pub enum CommandAccess { None, ReadOnly, Local, All }` has `parse` (returning `Option`) and `as_str`, with `Ord` as the restriction order. The keys are parsed in `ConfigOverlay::set` and written by both `to_policy_text`s. Repository scope treats them as Restrict-only: the flags go through `restrict_only_flag(.., false)`, and `command_access` through the new `restrict_only_access` (narrower-or-equal applies, wider is recorded as `RestrictOnly`). They are classified `Capability`, so the partition now has 38 capability and 7 preference fields. `CommandAccess` is re-exported. **Tests:** `permission_profiles` 10/10 pass. There are 4 new weakening cases and 6 new tests, including a 7-row `command_access` step table covering equal, narrower and one-step-wider. `repository_config_trust` and `foundation` also pass, 215 in total across the three files. `cargo fmt --check`, `cargo clippy -p workspace-engine --all-targets --locked -D warnings` and `typos` are clean. `cargo check` of `desktop-shell`, `damaian-cli` and `eval-harness` passes. **Mutations (all reverted):** (1) `restrict_only_access` accepting any value failed the step table ("local then all") and the `command_access` weakening case. (2) `allow_file_edits` with `restrictive = true` failed the narrowing test and its weakening case. **Visible effect:** the desktop "Effective policy" text now lists the four keys at their defaults. Nothing else changes until Tasks 4–5 enforce them. **For Task 3:** a profile sets these through `apply_overlay_scoped`, so `ConfigScope::Profile` gets the same restrict-only merge for free once its trust `match` routes it there |
 | 3 · Profiles, `ConfigScope::Profile`, and per-repository selection | Done 2026-09-30 | **Landed:** new `profile.rs` with `ProfileId` (`parse`, `custom`, `as_str`, `custom_path`, `overlay` with §3's built-ins), `ProfileCapabilities`, `select_profile` and `review_profile_rejections`. `ConfigScope::Profile`, and the trust check is now an exhaustive `match`. `permission_profile_by_repository` is on `Config` and `ConfigOverlay` (`permission_profile.<repository_id>=<id>`), User-owned at repository scope and classified `Capability`, so the partition is 39/7. `load_scoped` applies the selection after admin, before the `Allow Always` fold. The report gains `permission_profile` and `profile_rejected_keys`, and `Config` derives `PartialEq`. CLI `profile-set <repo> <id>`, and `config-review` now lists profile refusals. **Tests:** `permission_profiles` 24/24: 14 new, plus one new weakening case. `repository_config_trust` 47/47, file unmodified. With `foundation`, 229 pass across the three files. `cargo fmt --check`, `cargo clippy -p workspace-engine -p damaian-cli --all-targets --locked -D warnings` and `typos` are clean. `cargo check -p desktop-shell -p eval-harness --all-targets` passes. A manual CLI run against a scratch `DAMAIAN_DATA_DIR` behaved as Step 7 describes. **Mutations (all reverted, all caught):** (1) Profile trusted failed the loosen test and the audit test. (2) Defaulting to Read-only with no selection failed 6, including `with_no_profile_selected…` and the Task 2 repository tests. (3) Profile before admin failed `admin_can_widen…`. (4) Preferences applied at profile scope failed the loosen and audit tests. (5) A profile allowed to define an MCP server failed the MCP test. (6) `lower_wins` always assigning failed the Offline private and loosen tests. (7) Profile refusals copied into `rejected_keys` failed the loosen and audit tests. (8) The review not remembering failed "audited twice". (9) The selection trusted at repository scope failed the repository-selects test, the loosen test and the Task 1 weakening case. **Deviations:** nine, listed under Task 3. The main ones: `overlay` also returns the parse refusals; a missing selected custom file fails the load instead of resolving as Full; a profile may not define an MCP server at all; lower-wins records nothing; refused preferences are classed `Forbidden`; the real repository id format is `repo_sha256:<9 hex>`. **Visible now:** a selection made with `profile-set` already applies in the desktop app, which loads through the same `load_scoped`. Safe local's `require_approval_for_file_edits=true`, and Offline private's `mcp_enabled=false` and 7-day retention, take effect today, because those keys were already enforced. The four Task 2 keys wait for Tasks 4–5. **For Task 4/5:** read `Config::profile_capabilities()`. `CommandAccess` arrives already narrowed by the profile. **For Task 7:** the desktop shell's `engine_for_repo` still calls only `RepositoryTrustStore::review`. It must also call `review_profile_rejections` (criterion 4 for hand-edited custom files). `POST /api/permission-profile` should call `select_profile` with config loaded **without** the repository (deviation 2). **For Task 8:** use `ProfileId::custom` for reserved-id refusal and `custom_path` for the file. The profile scope reports an *equal* value of a `restrict_only_limit` or `restrict_only_ceiling` key as refused, so import's "would loosen" list should compare with `>`, not reuse those refusals as is |
-| 4 · `command_access` enforced in `CommandPolicy` as a block | Not started | |
+| 4 · `command_access` enforced in `CommandPolicy` as a block | Done 2026-10-01 | **Landed:** `CommandPolicy::classify` ends with the `command_access` block. It sets `blocked: true` and appends `Blocked by permission profile: command_access=<level>`. It never changes risk, `requires_approval`, `may_use_network` or expected effects. It adds no second reason to a command that is already blocked, and it still blocks an allowlisted command. The new private `command_access_permits` decides each level. Plan mode's predicate moved into `CommandClassification::is_read_only_without_approval`, and `mode_permits` and `ReadOnly` both call it. The `CommandAccess` doc comment was updated. Not touched: `chat.rs`, `validation.rs`, `repository_config_trust.rs`. **Tests:** 4 new in `permission_profiles` (28/28): the 7-row × 4-level table, the invariance test (every field except `blocked`/`reasons` matches `All`, and three `All` values are pinned literally), `ls` under `require_approval_for_all_commands`, and run-by-id with a control. The run-by-id test uses a nonexistent shell, so a regression cannot run a real login shell. With `repository_config_trust` (47, file unmodified) and `foundation`, 233/233 pass. The `workspace-engine` lib tests pass, 271 run and 4 ignored. `cargo fmt --check`, `cargo clippy -p workspace-engine --all-targets --locked -D warnings` and `typos` are clean. `cargo check -p desktop-shell -p damaian-cli -p eval-harness --all-targets` passes. The deterministic eval tier was not run, because the default `All` changes nothing; Task 5 runs it. **Mutations (all reverted, all caught):** (1) `ReadOnly => true` failed the table. (2) `Local` reading the `may_use_network` field failed the table on the allowlisted `npm ci`. (3) The block also setting `risk = Blocked` failed the invariance test. (4) Removing the block failed the table and run-by-id. (5) Dropping `!requires_approval` from the shared predicate was caught at first only by `mode.rs`'s `plan_refuses_a_command_that_would_require_approval_even_if_low_risk`. The plan's `ls ../elsewhere` row could not see it, because the path escape also raises the risk to Medium. The `require_approval_for_all_commands` test was added, and now both tests fail. (6) Pushing the reason when already blocked failed the invariance test on `rm -rf /`. **Deviations:** six, listed under Task 4. (1) The block runs after the whole classification, not before the allowlist. (2) The predicate moved to `command_policy.rs`, a one-line `mode.rs` change. (3) `run_proposal` needed no change, because `CommandRunner::run` already re-classifies. (4) `Local` reads the command text, so it also blocks `npm test`/`npm run *` but not `cargo test`. (5) `read_only` blocks everything under `require_approval_for_all_commands`. (6) Invariance is checked against `All`. **For Task 5:** a profile-blocked command in the main loop currently takes the blocklist path: it is stored blocked and pauses with "local policy blocks this command". Approving it ends the resume with a `PolicyBlocked` turn error (`chat.rs:975`). `profile_permits` should refuse it before proposing. At resume, re-classify the stored command rather than trusting `proposal.blocked`, which predates a profile switch. **For Task 9:** the user guide must say that `local` blocks every `npm`/`pnpm`/`yarn` command, validation scripts included (deviation 4) |
 | 5 · `profile ∩ mode` at every refusal point | Not started | **Touches `chat.rs`.** Do not run at the same time as spec 22 Task 7 (`context.md` §5) |
 | 6 · Provenance: a source for every applied value | Not started | |
 | 7 · Attributed effective-policy view and profile picker | Not started | |
@@ -2007,28 +2007,370 @@ With no selection nothing is applied.
 §7, observation 10). **Files:** `command_policy.rs`, and
 `tests/permission_profiles.rs`.
 
-In `CommandPolicy::classify`, after the hard block and blocklist checks and
-before the allowlist, block a command the profile does not permit:
+**Also modified:** `mode.rs`, one line (deviation 2). **Not touched:**
+`chat.rs`, `validation.rs` (deviation 3), `repository_config_trust.rs`.
+
+`CommandPolicy` blocks a command the resolved `command_access` does not
+permit. Task 3 already narrows `command_access` by the profile before any
+engine is built, so the policy reads only `self.config.command_access`:
 
 - `None`: every command.
-- `ReadOnly`: anything that is not Low risk, needs approval, or fails
-  `is_low_risk_read_only`. Reuse the exact predicate Plan mode uses (read it
-  from `mode.rs`, do not copy it).
-- `Local`: anything `may_use_network` flags.
+- `ReadOnly`: anything Plan mode would refuse, meaning anything that is not
+  Low risk, needs approval, or fails `is_low_risk_read_only`. This is the
+  predicate `mode_permits` uses, moved so that both call one function
+  (deviation 2).
+- `Local`: anything `may_use_network(command)` flags, judged by the command
+  **text** (deviation 4).
 - `All`: nothing.
 
-The block sets `blocked: true` with a reason naming the profile key
-("blocked by permission profile: command_access=local"). It never changes
-`risk` or `requires_approval`. An allowlisted command is still blocked:
-Allow Always cannot outrank a profile.
+The block sets `blocked: true` and appends the reason
+`Blocked by permission profile: command_access=<level>`. It never changes
+`risk`, `requires_approval`, `may_use_network` or `expected_effects`. An
+allowlisted command is still blocked, because Allow Always cannot outrank a
+profile. A command that is already blocked (blocklist or hard block) gets no
+second reason.
 
-Tests:
-- The four levels against `cargo test`, `ls`, `git diff`, `curl example.com`,
-  `npm ci`, and an allowlisted `npm ci`.
-- A stored proposal created under `All` is refused by `run_proposal` after
-  the config narrows to `None`. That is the run-by-id path.
-- The risk and `requires_approval` of every sample command are identical
-  before and after this change. That test pins proposal §4.
+**Deviations from the outline, checked against the code on 2026-09-30:**
+
+1. **The block is applied in `classify`, after the whole classification, not
+   inside `classify_pattern` "before the allowlist".** `classify_pattern`
+   returns early from each branch with that branch's risk. An early `blocked`
+   return before the allowlist would have to invent a risk, which proposal §4
+   forbids. It would also run before the outside-root check in `classify` sets
+   `requires_approval`, so `ReadOnly` would let `ls ../elsewhere` through
+   although Plan mode refuses it. Applying the block after the full
+   classification keeps every other field exactly as it was and still blocks
+   allowlisted commands.
+2. **The Plan predicate moves to `command_policy.rs`.** The outline says
+   "read it from `mode.rs`, do not copy it". But in `mode.rs` it is an inline
+   expression inside `mode_permits` (`read_only_no_approval`), not a function,
+   and `command_policy.rs` cannot depend on `mode.rs` without inverting the
+   module order (`mode.rs` imports `command_policy`). So it becomes
+   `CommandClassification::is_read_only_without_approval`, and `mode_permits`
+   calls it. That is a one-line change in `mode.rs`, which Task 5 owns for
+   everything else. `the_permission_matrix_matches_the_spec_table` pins that
+   the mode behaviour is unchanged.
+3. **`run_proposal` needs no change.** `context.md` §7 says a stored proposal
+   run by id must be re-classified. It already is: `run_proposal` calls
+   `CommandRunner::run`, which classifies the command again with its own
+   `CommandPolicy` (`command_runner.rs:194`) and returns
+   `ClientError::PolicyBlocked` on `blocked` (`:215`). The desktop shell and
+   CLI build that policy from the current config for each request. The stored
+   `proposal.blocked` flag is stale, but the runner does not rely on it.
+   Task 4 pins this with a test and does not add a second check.
+4. **`Local` reads `may_use_network` on the command text, not the
+   classification's `may_use_network` field.** The allowlist and read-only
+   branches hard-code the field to `false`, and so does the validation
+   branch for `npm test`. Reading the field would let Allow Always of
+   `npm ci` pass `local`, which is the exact escape the outline forbids. As a
+   result, `local` also blocks `npm test` and `npm run build`, but not
+   `cargo test` or `pytest`, because `npm` is on the name list
+   (`context.md` §7). Task 9's user guide must say this.
+5. **`command_access=read_only` blocks everything when
+   `require_approval_for_all_commands=true`.** Every classification then
+   needs approval, which is also why Plan mode refuses every command under
+   that setting. This is inherited, not new.
+6. **The invariance test compares each level with `All`, not "before and
+   after this change".** A test cannot run the old code. With the same
+   config, `All` is the old code: it never blocks. The test compares every
+   field except `blocked` and `reasons` across the four levels, and pins
+   literal values under `All` for three commands.
+
+**Interfaces:**
+- Consumes `Config::command_access` and `CommandAccess` (Task 2). Nothing in
+  `config.rs` changes except the `CommandAccess` doc comment, which currently
+  says nothing enforces it.
+- Produces:
+  - `pub(crate) fn CommandClassification::is_read_only_without_approval(&self) -> bool`
+    in `command_policy.rs`, used by `mode_permits` and the `ReadOnly` level.
+  - `fn command_access_permits(CommandAccess, &CommandClassification) -> bool`,
+    which is private.
+  - The reason text `Blocked by permission profile: command_access=<level>`.
+    Task 5's refusal wording may quote it.
+- **For Task 5:** a profile-blocked command in the main loop currently takes
+  the existing blocked path. The proposal is stored with `blocked: true`, and
+  the turn pauses with `command_proposal_response`'s "local policy blocks this
+  command" (`chat.rs:2198`). Approving it makes `run_proposal` fail with
+  `PolicyBlocked`, which the resume branch propagates as a turn error
+  (`chat.rs:975`, `?`). That is the same as a blocklisted command today.
+  Task 5's `profile_permits` refuses a `blocked` command before proposing, so
+  it becomes a clean profile refusal. Task 5 must also re-classify the stored
+  proposal at resume and not trust `proposal.blocked`, because the stored flag
+  predates any profile switch (`context.md` §6).
+
+- [x] **Step 1: Write the failing tests**
+
+  Append to `crates/workspace-engine/tests/permission_profiles.rs`, and add
+  `CancelToken`, `ClientError`, `CommandClassification`, `CommandPolicy`,
+  `CommandRisk` and `WorkspaceEngine` to its `workspace_engine` import:
+
+  ```rust
+  // Task 4: `command_access` is enforced in `CommandPolicy` as a block
+  // (`context.md` §7), so every execution path sees it, including a stored
+  // proposal run by id.
+
+  const ACCESS_LEVELS: [CommandAccess; 4] = [
+      CommandAccess::None,
+      CommandAccess::ReadOnly,
+      CommandAccess::Local,
+      CommandAccess::All,
+  ];
+
+  fn classify_under(access: CommandAccess, command: &str, allowlisted: bool) -> CommandClassification {
+      let config = Config {
+          command_access: access,
+          command_allowlist: if allowlisted { vec![command.to_string()] } else { Vec::new() },
+          ..Config::default()
+      };
+      CommandPolicy::new(config).classify(command, Path::new("/Users/example/project"))
+  }
+
+  /// (command, allowlisted, blocked under [none, read_only, local, all]).
+  const ACCESS_TABLE: &[(&str, bool, [bool; 4])] = &[
+      ("cargo test", false, [true, true, false, false]),
+      ("ls", false, [true, false, false, false]),
+      ("git diff", false, [true, false, false, false]),
+      // Plan mode refuses this because the path escape needs approval.
+      ("ls ../elsewhere", false, [true, true, false, false]),
+      ("curl example.com", false, [true, true, true, false]),
+      ("npm ci", false, [true, true, true, false]),
+      // Allow Always cannot outrank a profile, at any level.
+      ("npm ci", true, [true, true, true, false]),
+  ];
+
+  #[test]
+  fn each_command_access_level_blocks_exactly_its_row() {
+      for (command, allowlisted, expected) in ACCESS_TABLE {
+          for (access, blocked) in ACCESS_LEVELS.iter().zip(expected) {
+              let classification = classify_under(*access, command, *allowlisted);
+              assert_eq!(
+                  classification.blocked,
+                  *blocked,
+                  "{command} (allowlisted: {allowlisted}) under command_access={}",
+                  access.as_str()
+              );
+              let reason = format!(
+                  "Blocked by permission profile: command_access={}",
+                  access.as_str()
+              );
+              assert_eq!(
+                  classification.reasons.contains(&reason),
+                  *blocked,
+                  "{command} under {}: {:?}",
+                  access.as_str(),
+                  classification.reasons
+              );
+          }
+      }
+  }
+
+  /// Proposal §4: a profile may block a command, never reclassify it.
+  #[test]
+  fn a_command_access_block_changes_nothing_but_blocked_and_reasons() {
+      let samples = ACCESS_TABLE
+          .iter()
+          .map(|(command, allowlisted, _)| (*command, *allowlisted))
+          .chain([("rm -rf /", false), ("git push", false)]);
+      for (command, allowlisted) in samples {
+          let all = classify_under(CommandAccess::All, command, allowlisted);
+          for access in ACCESS_LEVELS {
+              let narrowed = classify_under(access, command, allowlisted);
+              let context = format!("{command} under {}", access.as_str());
+              assert_eq!(narrowed.command, all.command, "{context}");
+              assert_eq!(narrowed.risk, all.risk, "{context}");
+              assert_eq!(narrowed.requires_approval, all.requires_approval, "{context}");
+              assert_eq!(narrowed.may_use_network, all.may_use_network, "{context}");
+              assert_eq!(narrowed.expected_effects, all.expected_effects, "{context}");
+              if all.blocked {
+                  // Already blocked by local policy: no second reason.
+                  assert_eq!(narrowed.reasons, all.reasons, "{context}");
+              } else {
+                  assert!(narrowed.reasons.starts_with(&all.reasons), "{context}");
+              }
+          }
+      }
+
+      // `All` is today's classifier, so pin it literally too.
+      let curl = classify_under(CommandAccess::All, "curl example.com", false);
+      assert_eq!(
+          (curl.risk, curl.requires_approval, curl.blocked),
+          (CommandRisk::High, true, false)
+      );
+      let ls = classify_under(CommandAccess::All, "ls", false);
+      assert_eq!(
+          (ls.risk, ls.requires_approval, ls.blocked),
+          (CommandRisk::Low, false, false)
+      );
+      let allowlisted = classify_under(CommandAccess::All, "npm ci", true);
+      assert_eq!(
+          (allowlisted.risk, allowlisted.requires_approval, allowlisted.blocked),
+          (CommandRisk::Low, false, false)
+      );
+  }
+
+  /// `context.md` §7, observation 10: a proposal stored while commands were
+  /// allowed must not run by id after the profile narrows. The shell is a path
+  /// that does not exist, so if the block ever fails, the spawn fails with a
+  /// different error instead of running a real login shell.
+  #[test]
+  fn a_proposal_stored_under_all_is_refused_by_id_once_command_access_narrows() {
+      let root = temp_dir("run-by-id");
+      let data_dir = root.join(".damaian");
+      let engine = |access| {
+          WorkspaceEngine::new(Config {
+              data_dir: data_dir.clone(),
+              command_access: access,
+              enable_index_watcher: false,
+              shell: "/nonexistent/damaian-profile-test-shell".to_string(),
+              ..Config::default()
+          })
+      };
+      let proposal = engine(CommandAccess::All)
+          .validation_orchestrator
+          .propose_command(&root, "ls", "list the checkout")
+          .unwrap();
+      assert!(!proposal.blocked);
+
+      let run = |access| {
+          let mut on_output = |_line: &str| {};
+          engine(access).validation_orchestrator.run_proposal(
+              &proposal.id,
+              true,
+              "tester",
+              None,
+              &CancelToken::new(),
+              &mut on_output,
+          )
+      };
+      let narrowed = run(CommandAccess::None);
+      assert!(
+          matches!(narrowed, Err(ClientError::PolicyBlocked(_))),
+          "{narrowed:?}"
+      );
+      // Control: under `All` the same id gets past policy and fails only at
+      // the missing shell, so the refusal above is the profile's.
+      let control = run(CommandAccess::All);
+      assert!(
+          control.is_err() && !matches!(control, Err(ClientError::PolicyBlocked(_))),
+          "{control:?}"
+      );
+
+      let _ = fs::remove_dir_all(&root);
+  }
+  ```
+
+- [x] **Step 2: Run them and confirm they fail for the right reason**
+
+  ```bash
+  cargo nextest run -p workspace-engine --test permission_profiles -E 'test(command_access) | test(by_id)'
+  ```
+
+  Expected: `each_command_access_level_blocks_exactly_its_row` fails on its
+  first `None` row, because nothing blocks yet. The run-by-id test fails
+  because `run_proposal` under `None` reaches the missing shell instead of
+  `PolicyBlocked`. The invariance test passes before the change, since
+  nothing blocks. It is a regression guard, and the mutations in Step 5 make
+  it fail.
+
+- [x] **Step 3: Implement**
+
+  In `command_policy.rs`, import `CommandAccess` and add:
+
+  ```rust
+  impl CommandClassification {
+      /// What Plan and Review mode allow, and what `command_access=read_only`
+      /// allows: low risk, no approval, *and* read-only by its text. The
+      /// third check stops the allowlist, which also yields low risk with no
+      /// approval, from widening either one (spec 20 `context.md` §5). One
+      /// function, so the mode and the profile cannot drift apart.
+      pub(crate) fn is_read_only_without_approval(&self) -> bool {
+          self.risk == CommandRisk::Low
+              && !self.requires_approval
+              && is_low_risk_read_only(&self.command)
+      }
+  }
+  ```
+
+  At the end of `CommandPolicy::classify`, before returning:
+
+  ```rust
+  // After the whole classification, so the block never has to invent a risk
+  // (proposal §4) and sees the outside-root approval, the way Plan mode does.
+  // After the allowlist too: Allow Always cannot outrank a profile.
+  if !classification.blocked
+      && !command_access_permits(self.config.command_access, &classification)
+  {
+      classification.blocked = true;
+      classification.reasons.push(format!(
+          "Blocked by permission profile: command_access={}",
+          self.config.command_access.as_str()
+      ));
+  }
+  ```
+
+  ```rust
+  /// Whether `command_access` lets this command run. `Local` judges the text,
+  /// not `classification.may_use_network`, which the allowlist branch sets to
+  /// `false`. It is a name heuristic, not a sandbox (spec 31 `context.md` §7).
+  fn command_access_permits(access: CommandAccess, classification: &CommandClassification) -> bool {
+      match access {
+          CommandAccess::None => false,
+          CommandAccess::ReadOnly => classification.is_read_only_without_approval(),
+          CommandAccess::Local => !may_use_network(&classification.command),
+          CommandAccess::All => true,
+      }
+  }
+  ```
+
+  In `mode.rs`, replace the inline `read_only_no_approval` expression with
+  `classification.is_read_only_without_approval()`, and drop the imports that
+  are now unused. Update the `CommandAccess` doc comment in `config.rs`: it is
+  now enforced in `CommandPolicy`.
+
+- [x] **Step 4: Run the scoped tests**
+
+  ```bash
+  cargo nextest run -p workspace-engine --test permission_profiles --test repository_config_trust --test foundation
+  cargo nextest run -p workspace-engine --lib -E 'test(mode::) | test(command_policy::) | test(validation::) | test(chat::)'
+  ```
+
+  Expected: all pass, and `repository_config_trust.rs` is unmodified
+  (`git diff --stat` shows no change to it).
+
+- [x] **Step 5: Falsify** (revert each one)
+
+  1. `ReadOnly => true`: the table fails on `cargo test` under `read_only`.
+  2. `Local => !classification.may_use_network`: the table fails on the
+     allowlisted `npm ci` under `local`.
+  3. The block also sets `classification.risk = CommandRisk::Blocked`: the
+     invariance test fails.
+  4. Remove the block: the table and the run-by-id test fail.
+  5. Drop `!self.requires_approval` from the shared predicate. The plan
+     predicted that the table would fail on `ls ../elsewhere`. **It did not:**
+     the path escape also raises that command's risk to Medium, so `risk == Low`
+     still refused it, and only `mode.rs`'s
+     `plan_refuses_a_command_that_would_require_approval_even_if_low_risk`
+     failed. The test
+     `read_only_access_blocks_a_low_risk_command_that_needs_approval` was added
+     during implementation (`ls` with `require_approval_for_all_commands=true`
+     stays Low risk). With it, this mutation fails both tests, which shows that
+     the mode and the profile share one predicate.
+  6. Push the reason even when already blocked: the invariance test fails on
+     `rm -rf /`.
+
+- [x] **Step 6: Scoped checks**
+
+  ```bash
+  cargo fmt --all -- --check
+  cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
+  typos
+  cargo check -p desktop-shell -p damaian-cli -p eval-harness --all-targets
+  ```
+
+- [x] **Step 7: Update this file's progress row, show the change and the
+  check results, and ask before committing**
+
+  Suggested subject: `Block commands the permission profile does not allow`.
 
 ## Task 5: `profile ∩ mode` at every refusal point
 

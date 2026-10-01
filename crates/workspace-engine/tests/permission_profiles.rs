@@ -15,10 +15,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, CommandAccess, Config, ConfigKeyKind, ConfigOverlay, ConfigScope,
-    ProfileCapabilities, ProfileId, RepositoryConfigReport, RepositoryKeyClass,
-    RepositoryTrustStore, SecretScanner, overlay_field_kinds, repository_id_for_root,
-    review_profile_rejections, select_profile,
+    AuditLog, CancelToken, ClientError, CommandAccess, CommandClassification, CommandPolicy,
+    CommandRisk, Config, ConfigKeyKind, ConfigOverlay, ConfigScope, ProfileCapabilities, ProfileId,
+    RepositoryConfigReport, RepositoryKeyClass, RepositoryTrustStore, SecretScanner,
+    WorkspaceEngine, overlay_field_kinds, repository_id_for_root, review_profile_rejections,
+    select_profile,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1235,4 +1236,198 @@ fn selecting_a_profile_writes_user_config_and_audits_the_change() {
     assert!(events.contains("\"to\":\"safe_local\""), "{events}");
 
     fixture.cleanup();
+}
+
+// Task 4: `command_access` is enforced in `CommandPolicy` as a block
+// (`context.md` §7), so every execution path sees it, including a stored
+// proposal run by id.
+
+const ACCESS_LEVELS: [CommandAccess; 4] = [
+    CommandAccess::None,
+    CommandAccess::ReadOnly,
+    CommandAccess::Local,
+    CommandAccess::All,
+];
+
+fn classify_under(
+    access: CommandAccess,
+    command: &str,
+    allowlisted: bool,
+) -> CommandClassification {
+    let config = Config {
+        command_access: access,
+        command_allowlist: if allowlisted {
+            vec![command.to_string()]
+        } else {
+            Vec::new()
+        },
+        ..Config::default()
+    };
+    CommandPolicy::new(config).classify(command, Path::new("/Users/example/project"))
+}
+
+/// (command, allowlisted, blocked under [none, read_only, local, all]).
+const ACCESS_TABLE: &[(&str, bool, [bool; 4])] = &[
+    ("cargo test", false, [true, true, false, false]),
+    ("ls", false, [true, false, false, false]),
+    ("git diff", false, [true, false, false, false]),
+    // Plan mode refuses this because the path escape needs approval.
+    ("ls ../elsewhere", false, [true, true, false, false]),
+    ("curl example.com", false, [true, true, true, false]),
+    ("npm ci", false, [true, true, true, false]),
+    // Allow Always cannot outrank a profile, at any level.
+    ("npm ci", true, [true, true, true, false]),
+];
+
+#[test]
+fn each_command_access_level_blocks_exactly_its_row() {
+    for (command, allowlisted, expected) in ACCESS_TABLE {
+        for (access, blocked) in ACCESS_LEVELS.iter().zip(expected) {
+            let classification = classify_under(*access, command, *allowlisted);
+            assert_eq!(
+                classification.blocked,
+                *blocked,
+                "{command} (allowlisted: {allowlisted}) under command_access={}",
+                access.as_str()
+            );
+            let reason = format!(
+                "Blocked by permission profile: command_access={}",
+                access.as_str()
+            );
+            assert_eq!(
+                classification.reasons.contains(&reason),
+                *blocked,
+                "{command} under {}: {:?}",
+                access.as_str(),
+                classification.reasons
+            );
+        }
+    }
+}
+
+/// `read_only` is Plan mode's predicate, approval check included: when every
+/// command needs approval, `ls` stays Low risk but is blocked, exactly as Plan
+/// refuses it. `ls ../elsewhere` above cannot show this, because the path
+/// escape also raises its risk to Medium.
+#[test]
+fn read_only_access_blocks_a_low_risk_command_that_needs_approval() {
+    let policy = |access| {
+        CommandPolicy::new(Config {
+            command_access: access,
+            require_approval_for_all_commands: true,
+            ..Config::default()
+        })
+    };
+    let root = Path::new("/Users/example/project");
+    let read_only = policy(CommandAccess::ReadOnly).classify("ls", root);
+    assert_eq!(
+        (
+            read_only.risk,
+            read_only.requires_approval,
+            read_only.blocked
+        ),
+        (CommandRisk::Low, true, true)
+    );
+    assert!(!policy(CommandAccess::Local).classify("ls", root).blocked);
+}
+
+/// Proposal §4: a profile may block a command, never reclassify it.
+#[test]
+fn a_command_access_block_changes_nothing_but_blocked_and_reasons() {
+    let samples = ACCESS_TABLE
+        .iter()
+        .map(|(command, allowlisted, _)| (*command, *allowlisted))
+        .chain([("rm -rf /", false), ("git push", false)]);
+    for (command, allowlisted) in samples {
+        let all = classify_under(CommandAccess::All, command, allowlisted);
+        for access in ACCESS_LEVELS {
+            let narrowed = classify_under(access, command, allowlisted);
+            let context = format!("{command} under {}", access.as_str());
+            assert_eq!(narrowed.command, all.command, "{context}");
+            assert_eq!(narrowed.risk, all.risk, "{context}");
+            assert_eq!(
+                narrowed.requires_approval, all.requires_approval,
+                "{context}"
+            );
+            assert_eq!(narrowed.may_use_network, all.may_use_network, "{context}");
+            assert_eq!(narrowed.expected_effects, all.expected_effects, "{context}");
+            if all.blocked {
+                // Already blocked by local policy: no second reason.
+                assert_eq!(narrowed.reasons, all.reasons, "{context}");
+            } else {
+                assert!(narrowed.reasons.starts_with(&all.reasons), "{context}");
+            }
+        }
+    }
+
+    // `All` is today's classifier, so pin it literally too.
+    let curl = classify_under(CommandAccess::All, "curl example.com", false);
+    assert_eq!(
+        (curl.risk, curl.requires_approval, curl.blocked),
+        (CommandRisk::High, true, false)
+    );
+    let ls = classify_under(CommandAccess::All, "ls", false);
+    assert_eq!(
+        (ls.risk, ls.requires_approval, ls.blocked),
+        (CommandRisk::Low, false, false)
+    );
+    let allowlisted = classify_under(CommandAccess::All, "npm ci", true);
+    assert_eq!(
+        (
+            allowlisted.risk,
+            allowlisted.requires_approval,
+            allowlisted.blocked
+        ),
+        (CommandRisk::Low, false, false)
+    );
+}
+
+/// `context.md` §7, observation 10: a proposal stored while commands were
+/// allowed must not run by id after the profile narrows. The shell is a path
+/// that does not exist, so if the block ever fails, the spawn fails with a
+/// different error instead of running a real login shell.
+#[test]
+fn a_proposal_stored_under_all_is_refused_by_id_once_command_access_narrows() {
+    let root = temp_dir("run-by-id");
+    let data_dir = root.join(".damaian");
+    let engine = |access| {
+        WorkspaceEngine::new(Config {
+            data_dir: data_dir.clone(),
+            command_access: access,
+            enable_index_watcher: false,
+            shell: "/nonexistent/damaian-profile-test-shell".to_string(),
+            ..Config::default()
+        })
+    };
+    let proposal = engine(CommandAccess::All)
+        .validation_orchestrator
+        .propose_command(&root, "ls", "list the checkout")
+        .unwrap();
+    assert!(!proposal.blocked);
+
+    let run = |access| {
+        let mut on_output = |_line: &str| {};
+        engine(access).validation_orchestrator.run_proposal(
+            &proposal.id,
+            true,
+            "tester",
+            None,
+            &CancelToken::new(),
+            &mut on_output,
+        )
+    };
+    let narrowed = run(CommandAccess::None);
+    assert!(
+        matches!(narrowed, Err(ClientError::PolicyBlocked(_))),
+        "{narrowed:?}"
+    );
+    // Control: under `All` the same id gets past policy and fails only at
+    // the missing shell, so the refusal above is the profile's.
+    let control = run(CommandAccess::All);
+    assert!(
+        control.is_err() && !matches!(control, Err(ClientError::PolicyBlocked(_))),
+        "{control:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
 }
