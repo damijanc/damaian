@@ -12,7 +12,7 @@ use regex::Regex;
 use std::path::{Component, Path};
 use std::sync::LazyLock;
 
-fn regex(pattern: &str) -> Regex {
+pub(super) fn regex(pattern: &str) -> Regex {
     Regex::new(pattern).expect("a valid built-in pattern")
 }
 
@@ -27,6 +27,7 @@ static DENY_FLAG: LazyLock<Regex> = LazyLock::new(|| regex(r"`-D ([a-z0-9_:-]+)`
 static GENERATED: LazyLock<Regex> =
     LazyLock::new(|| regex(r"^`[^`]+` \([^)]*\) generated \d+ warnings?"));
 static EMITTED: LazyLock<Regex> = LazyLock::new(|| regex(r"^\d+ warnings? emitted"));
+static TARGETS_FAILED: LazyLock<Regex> = LazyLock::new(|| regex(r"^\d+ targets? failed"));
 static ANSI: LazyLock<Regex> = LazyLock::new(|| regex(r"\x1b\[[0-9;]*m"));
 
 pub(super) struct RustDiagnosticsParser;
@@ -112,6 +113,9 @@ fn is_cargo_summary(message: &str) -> bool {
     message.starts_with("could not compile ")
         || message.starts_with("aborting due to ")
         || message.starts_with("build failed")
+        || message.starts_with("test failed, to rerun pass ")
+        || message.starts_with("doctest failed, to rerun pass ")
+        || TARGETS_FAILED.is_match(message)
         || GENERATED.is_match(message)
         || EMITTED.is_match(message)
 }
@@ -123,7 +127,13 @@ fn primary_location(block: &[&str]) -> Option<SourceRange> {
         .iter()
         .take_while(|line| !CHILD_HEADER.is_match(line))
         .find_map(|line| LOCATION.captures(line))?;
-    let path = &captures[1];
+    workspace_range(&captures[1], &captures[2], Some(&captures[3]))
+}
+
+/// A printed `path:line[:column]` as a range, or `None` when the path is
+/// absolute or climbs out with `..`: registry sources, the standard library,
+/// a doctest's temporary file (`context.md` §9, §10).
+pub(super) fn workspace_range(path: &str, line: &str, column: Option<&str>) -> Option<SourceRange> {
     let outside = Path::new(path).is_absolute()
         || Path::new(path)
             .components()
@@ -133,8 +143,8 @@ fn primary_location(block: &[&str]) -> Option<SourceRange> {
     }
     Some(SourceRange {
         path: path.to_string(),
-        start_line: captures[2].parse().ok()?,
-        start_column: captures[3].parse().ok(),
+        start_line: line.parse().ok()?,
+        start_column: column.and_then(|column| column.parse().ok()),
         end_line: None,
         end_column: None,
     })

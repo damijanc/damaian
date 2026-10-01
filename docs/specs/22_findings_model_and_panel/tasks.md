@@ -13,7 +13,7 @@ decisions it left open in [`context.md`](context.md)
 | 1 · `Finding`, `FindingDraft`, and the redacting, bounding constructor | Done 2026-09-30 | `finding.rs` landed as sketched (rustfmt only), registered in `lib.rs`. Before the implementation the tests failed to compile (`E0432`). After it, `test(finding::tests)` passed 16/16. Each mutation failed its own test: (1) bound-then-redact failed `a_secret_straddling_…`; (2) no summary redaction failed `new_redacts_…`; (3) `<=`→`<` failed `a_summary_at_exactly_the_bound_…`; (4) a plain byte slice failed `details_are_bounded_on_a_char_boundary` by panicking. Privacy: a struct literal gives `E0451`, and a field read gives `E0616`. Probe these one at a time, because rustc reports `E0616` and stops before `E0451`, so a combined probe shows only one of them. Scoped fmt, clippy `-p workspace-engine` and typos are clean. |
 | 2 · Parser trait, dispatch with fall-through, generic parser | Done 2026-09-30 | Landed as sketched (rustfmt only): `FindingSource::Command`, `FindingParser`, `default_parsers()` (still empty), `findings_from_execution`, the generic fallback, and `GENERIC_DETAIL_LINES`. `bound_summary` now calls `first_non_empty_line`. Before the implementation the dispatch tests failed to compile (`E0405`/`E0425`). After it, `test(finding::tests) + test(finding::dispatch_tests)` passed 32/32. Each mutation failed its named test: (1) generic only when no parser matched failed only `a_matching_parser_that_extracts_nothing_falls_through_…`, while `a_failure_no_parser_matches_…` still passed; (2) `(Exited, None)`→`Passed` failed `a_signal_kill_is_a_failure`; (3) `Cancelled`→`Failed` failed `a_cancelled_execution_gets_no_generic_finding`; (4) head-not-tail `last_lines` failed `the_generic_details_keep_the_last_lines_…`; (5) dropping the verdict check failed `a_passing_execution_with_no_parser_yields_nothing`, plus the cancelled test and `a_passing_execution_whose_parser_finds_nothing_…`. Parser layout follows `context.md` §8.4: one file per parser under `src/finding/`. Scoped fmt, clippy `-p workspace-engine` and typos are clean. |
 | 3 · Rust diagnostics parser (`cargo build`/`check`/`clippy`) | Done 2026-10-01 | Planned on 2026-09-30 against captured cargo 1.98.0 output (`context.md` §9). The first session was lost after Step 1, and its fixtures were checked byte-identical before work resumed. `finding/rust_diagnostics.rs` landed as sketched, with only rustfmt changes. It is declared from `finding.rs`, and `RustDiagnosticsParser` is registered in `default_parsers()`. Before the implementation the tests failed to compile (`E0425` on `parse_rust_diagnostics`, `cargo_subcommand` and `RustDiagnosticsParser`). After it, `test(finding::)` passed 49/49 (16 + 16 + 17), and the Task 2 dispatch tests were unaffected. Mutations: (1) no `take_while` failed only `a_child_notes_location_is_not_borrowed_…`, as predicted. (2) The plan's two variants differ. The last `-->` *before a child header* fails nothing, because rustc prints exactly one `-->` per primary region (a secondary span in another file uses `:::`), so first and last are the same line. The last `-->` *in the whole block* failed `the_location_is_the_primary_one_…` with `13:4`, and also the no-primary-location test. (3) `is_cargo_summary` always `false` failed `cargo_summary_lines_are_not_findings`, plus `every_clippy_occurrence_…`, `default_parsers_turn_…` and `a_diagnostic_without_a_location_…`, whose counts include the summary lines. (4) No `CLIPPY_URL` branch failed `every_clippy_occurrence_gets_its_code_from_the_help_url`. (5) No `is_absolute` failed `a_location_outside_the_workspace_has_no_range`. (6) No ANSI strip failed `ansi_colour_codes_are_ignored`. (7) Ending a block only at a blank line failed nothing, as expected. The header check stays as defence against a runner that strips blank lines. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
-| 4 · Rust test parser (`cargo test`), delegating compile errors to Task 3 | Planned in full | Planned on 2026-10-01 against captured cargo 1.98.0 `cargo test` output (`context.md` §10). The captures changed two earlier decisions. The parser returns the diagnostics **and** the test failures, because a warning and failing tests appear in the same run (§10.2 corrects §5). The dispatcher falls through to the generic finding when a failed run has no `Error` draft: a test binary that crashed after a warning otherwise reported only the warning (§10.3 amends §8.2). `cargo nextest run` is out of scope, and a failed nextest run gets one generic finding (§10.5). The sketch passed 71/71 in a scratch crate, and all ten mutations failed the tests the plan names. |
+| 4 · Rust test parser (`cargo test`), delegating compile errors to Task 3 | Done 2026-10-01 | Planned on 2026-10-01 against captured cargo 1.98.0 `cargo test` output (`context.md` §10). The captures changed two earlier decisions. The parser returns the diagnostics **and** the test failures, because a warning and failing tests appear in the same run (§10.2 corrects §5). The dispatcher falls through to the generic finding when a failed run has no `Error` draft: a test binary that crashed after a warning otherwise reported only the warning (§10.3 amends §8.2). `cargo nextest run` is out of scope, and a failed nextest run gets one generic finding (§10.5). Landed as sketched, with only rustfmt changes. The fixtures were extracted from this file's line ranges, so they are byte-identical to the plan. `finding/rust_test.rs` is new. `rust_diagnostics.rs` gained the three summary clauses and `workspace_range`, and its `regex` is now `pub(super)`. `finding.rs` registers `RustTestParser` second and falls through on "no `Error` draft". Before the implementation the tests failed to compile (`E0425`, `E0433`, `E0422`). After it, `test(finding::)` passed 71/71 (16 + 17 + 17 + 21), with Task 3's tests unchanged. Mutations: 1, 2, 3, 5, 6, 7, 8, 9 and 10 failed exactly the tests the plan names. Mutation 4 (end a section at a blank line) failed **9**, not 8. The extra one is `a_panic_line_without_a_thread_id_still_has_its_location`, because its inline stdout also has a blank line straight after the section header. Mutation 9 spares that test because its panic line has no thread id. So the plan's "the same eight as mutation 4" is one test short, not a defect. Each mutation took about 9 minutes when run without `--lib`, because every edit to the library relinks all 21 integration-test binaries. Use `cargo nextest run -p workspace-engine --lib -E 'test(finding::)'` for mutation loops. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
 | 5 · Biome parser | Not started | |
 | 6 · Browser findings from spec 12's `WebDiagnosticDetails` | Not started | Re-scoped 2026-09-29 by spec 12's close-out: no `entries` field (`context.md` §7.1). |
 | 7 · Recording, persistence, staleness, `Evidence::Findings` | Not started | |
@@ -1929,7 +1929,7 @@ its findings change earlier decisions:
     a generic finding (§10.3). A Biome run that fails because of its warnings
     therefore shows both.
 
-- [ ] **Step 1: Commit the fixtures as files**
+- [x] **Step 1: Commit the fixtures as files**
 
   Write these four files into `crates/workspace-engine/src/finding/fixtures/`
   **byte for byte**. They are cargo 1.98.0 captures, scrubbed as `context.md`
@@ -2106,7 +2106,7 @@ Caused by:
   process didn't exit successfully: `/repo/target/debug/deps/crash-46156d6990275a20` (signal: 6, SIGABRT: process abort signal)
   ````
 
-- [ ] **Step 2: Declare the module and write the failing tests**
+- [x] **Step 2: Declare the module and write the failing tests**
 
   In `finding.rs`, add `mod rust_test;` directly below
   `mod rust_diagnostics;`. In `finding.rs`'s `dispatch_tests`, add this test
@@ -2503,7 +2503,7 @@ Caused by:
   }
   ```
 
-- [ ] **Step 3: Run the tests and confirm they fail**
+- [x] **Step 3: Run the tests and confirm they fail**
 
   Run: `cargo nextest run -p workspace-engine -E 'test(finding::)'`
   Expected: a compile failure. `RustTestParser`, `parse_test_failures`,
@@ -2512,7 +2512,7 @@ Caused by:
   `E0425`, `E0433` and `E0422`. The new dispatch test compiles, but the crate
   does not, so its failure is shown by mutation 2 in Step 6 instead.
 
-- [ ] **Step 4: Write the implementation**
+- [x] **Step 4: Write the implementation**
 
   In `rust_diagnostics.rs`, make three changes.
 
@@ -2762,7 +2762,7 @@ Caused by:
   wins, because the tests come from the captured fixtures. Record any
   deviation in the progress row. Do not weaken a test to fit.
 
-- [ ] **Step 5: Run the tests and confirm they pass**
+- [x] **Step 5: Run the tests and confirm they pass**
 
   Run: `cargo nextest run -p workspace-engine -E 'test(finding::)'`
   Expected: 71 pass. That is 16 in `tests`, 17 in `dispatch_tests` (16 plus
@@ -2773,7 +2773,7 @@ Caused by:
   build fixtures contains the three new summary lines, so their counts do not
   change.
 
-- [ ] **Step 6: Mutation-test the rules that came from real output**
+- [x] **Step 6: Mutation-test the rules that came from real output**
 
   Apply each change on its own, confirm the named tests fail, then revert it.
   **Revert by undoing the edit, not by copying a saved file back.** A copy
@@ -2820,7 +2820,7 @@ Caused by:
   happens in the progress row. A different set of failures is a signal: work
   out why before moving on.
 
-- [ ] **Step 7: Scoped checks**
+- [x] **Step 7: Scoped checks**
 
   ```bash
   cargo fmt --all -- --check
@@ -2833,7 +2833,7 @@ Caused by:
   not ours. Add the fixture directory to `_typos.toml`'s excludes with a
   comment saying why, rather than editing captured output.
 
-- [ ] **Step 8: Update this file's Task 4 row, then show the change and the
+- [x] **Step 8: Update this file's Task 4 row, then show the change and the
   check results and ask before committing**
 
 ## Task 5: Biome parser

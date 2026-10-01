@@ -10,6 +10,7 @@ use crate::secret_scanner::SecretScanner;
 use serde::{Deserialize, Serialize};
 
 mod rust_diagnostics;
+mod rust_test;
 
 pub const MAX_SUMMARY_CHARS: usize = 240;
 pub const MAX_DETAILS_BYTES: usize = 4096;
@@ -232,7 +233,10 @@ pub trait FindingParser {
 /// theirs here. The generic fallback is not in this list: it is applied by
 /// `findings_from_execution` itself, so no caller can forget it.
 pub fn default_parsers() -> Vec<Box<dyn FindingParser>> {
-    vec![Box::new(rust_diagnostics::RustDiagnosticsParser)]
+    vec![
+        Box::new(rust_diagnostics::RustDiagnosticsParser),
+        Box::new(rust_test::RustTestParser),
+    ]
 }
 
 /// Whether a run reached a verdict, and which. `context.md` §8.2 has the
@@ -253,9 +257,10 @@ fn verdict(execution: &CommandExecution) -> Verdict {
     }
 }
 
-/// The first parser that matches wins. A failed run whose parser found
-/// nothing falls through to one generic finding, so a regex that stops
-/// matching after a tool upgrade cannot swallow a failure (§5.3).
+/// The first parser that matches wins. A failed run whose parser found no
+/// error falls through to one generic finding, so a regex that stops
+/// matching after a tool upgrade cannot swallow a failure (§5.3). Warnings
+/// alone do not explain a failure (`context.md` §10).
 pub fn findings_from_execution(
     execution: &CommandExecution,
     parsers: &[Box<dyn FindingParser>],
@@ -266,7 +271,8 @@ pub fn findings_from_execution(
         .find(|parser| parser.matches(&execution.command))
         .map(|parser| parser.parse(execution))
         .unwrap_or_default();
-    if drafts.is_empty() && verdict(execution) == Verdict::Failed {
+    let explained = drafts.iter().any(|draft| draft.severity == Severity::Error);
+    if !explained && verdict(execution) == Verdict::Failed {
         drafts.push(generic_draft(execution));
     }
     drafts
@@ -744,6 +750,19 @@ mod dispatch_tests {
         let findings = run(&failed("npm run lint", "", "x\n"), &parsers);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].summary(), "lint");
+    }
+
+    /// `context.md` §10: a crashed `cargo test` after a compiler warning.
+    #[test]
+    fn a_failure_whose_parser_found_only_warnings_also_gets_the_generic_finding() {
+        let parsers = [stub(
+            "cargo test",
+            vec![draft(FindingSource::Compiler, Severity::Warning, "unused")],
+        )];
+        let findings = run(&failed("cargo test", "", "SIGABRT\n"), &parsers);
+        let sources: Vec<_> = findings.iter().map(Finding::source).collect();
+        assert_eq!(sources, [FindingSource::Compiler, FindingSource::Command]);
+        assert_eq!(findings[1].summary(), "cargo test: SIGABRT");
     }
 
     #[test]

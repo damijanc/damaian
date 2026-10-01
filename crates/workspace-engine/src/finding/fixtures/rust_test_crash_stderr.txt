@@ -1,0 +1,15 @@
+   Compiling crash v0.1.0 (/repo)
+warning: unused variable: `unused`
+ --> src/lib.rs:5:13
+  |
+5 |         let unused = 1;
+  |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_unused`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `crash` (lib test) generated 1 warning (run `cargo fix --lib -p crash --tests` to apply 1 suggestion)
+     Running unittests src/lib.rs (target/debug/deps/crash-46156d6990275a20)
+error: test failed, to rerun pass `--lib`
+
+Caused by:
+  process didn't exit successfully: `/repo/target/debug/deps/crash-46156d6990275a20` (signal: 6, SIGABRT: process abort signal)

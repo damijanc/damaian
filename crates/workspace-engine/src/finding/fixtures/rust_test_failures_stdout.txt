@@ -1,0 +1,96 @@
+
+running 7 tests
+test tests::adds ... ok
+test tests::returns_err ... FAILED
+test tests::should_have_panicked - should panic ... FAILED
+test tests::panicked_with_the_wrong_message - should panic ... FAILED
+test tests::assert_eq_fails ... FAILED
+test tests::panics_with_message ... FAILED
+test tests::unwrap_in_library_code ... FAILED
+
+failures:
+
+---- tests::returns_err stdout ----
+Error: "config missing"
+
+---- tests::should_have_panicked stdout ----
+note: test did not panic as expected at crates/demo/src/lib.rs:42:8
+---- tests::panicked_with_the_wrong_message stdout ----
+
+thread 'tests::panicked_with_the_wrong_message' (9907643) panicked at crates/demo/src/lib.rs:49:9:
+underflow
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+note: panic did not contain expected string
+      panic message: "underflow"
+ expected substring: "overflow"
+---- tests::assert_eq_fails stdout ----
+
+thread 'tests::assert_eq_fails' (9907642) panicked at crates/demo/src/lib.rs:32:9:
+assertion `left == right` failed: two plus two
+  left: 4
+ right: 5
+
+---- tests::panics_with_message stdout ----
+preparing the widget
+
+thread 'tests::panics_with_message' (9907644) panicked at crates/demo/src/lib.rs:27:9:
+the widget was not ready
+
+---- tests::unwrap_in_library_code stdout ----
+
+thread 'tests::unwrap_in_library_code' (9907647) panicked at crates/demo/src/lib.rs:11:15:
+called `Result::unwrap()` on an `Err` value: ParseIntError { kind: InvalidDigit }
+
+
+failures:
+    tests::assert_eq_fails
+    tests::panicked_with_the_wrong_message
+    tests::panics_with_message
+    tests::returns_err
+    tests::should_have_panicked
+    tests::unwrap_in_library_code
+
+test result: FAILED. 1 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+test integration_passes ... ok
+test integration_fails ... FAILED
+
+failures:
+
+---- integration_fails stdout ----
+
+thread 'integration_fails' (9907650) panicked at crates/demo/tests/integration.rs:8:5:
+sum too small
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    integration_fails
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test crates/demo/src/lib.rs - add (line 3) ... FAILED
+
+failures:
+
+---- crates/demo/src/lib.rs - add (line 3) stdout ----
+Test executable failed (exit status: 101).
+
+stderr:
+
+thread 'main' (9907728) panicked at /tmp/rustdoctestVr99Wj/doctest_bundle_2024.rs:6:1:
+assertion `left == right` failed
+  left: 2
+ right: 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+
+failures:
+    crates/demo/src/lib.rs - add (line 3)
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
