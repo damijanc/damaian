@@ -566,3 +566,99 @@ scratch root, so nothing needed scrubbing. What the captures showed:
   `npm run lint` failure yields no Biome drafts, so it gets one generic
   finding, which is exactly what it would get with no parser. No shipped
   parser is displaced.
+
+## 12. Browser findings: decisions made while planning Task 6 (2026-10-02)
+
+Task 6 converts spec 12's `WebDiagnosticRecord` into findings (§7.1). That
+record already exists for every diagnostic run, is redacted, and carries `id`,
+`task_id`, `tool`, `url` and the `report`. The test fixture is spec 12's
+`COMPANION_REPORT` (`web_diagnostics.rs` tests), which is trimmed from a real
+companion `inspect_page` result. It is extended with one console warning and
+one scenario step. Reading the code turned up five things the outline did not
+settle.
+
+### 12.1 Failed scenario steps are problems too
+
+`WebDiagnosticDetails::problem_count` counts failed scenario steps, and the
+model is told about them ("1 failed step"). §7.1's list (page errors, console
+entries, failed requests) leaves them out. A step that fails, for example
+`click #start` with "Timeout 5000ms exceeded", is something the user may well
+want fixed. Leaving it out would make the panel disagree with what the model
+was told.
+
+None of the browser sources fits. A step failure is neither console output nor
+network traffic. **Decision:** Task 6 adds `FindingSource::BrowserScenario`
+(`"browser_scenario"`). Nothing is persisted until Task 7, so adding a variant
+is still free, as it was for `Command` (§8.1).
+
+### 12.2 Sources, severities and text
+
+| Report value | Source | Severity | Summary | Details | Code |
+|---|---|---|---|---|---|
+| `page_errors[i]` | `BrowserConsole` | `Error` | the error's first line | the whole string | none |
+| `console[i]`, `is_problem()`, level `error`/`assert` | `BrowserConsole` | `Error` | `text` | spec 12's console line, e.g. `console error: … (url:line:col)` | none |
+| `console[i]`, level `warning`/`warn` | `BrowserConsole` | `Warning` | `text` | as above | none |
+| `failed_requests[i]` | `BrowserNetwork` | `Error` | spec 12's line, e.g. `failed request: GET … → 404 Not Found` | none | the HTTP status (`"404"`), or else a `net::ERR_…` failure |
+| `steps[i]`, `!success` | `BrowserScenario` | `Error` | spec 12's line, e.g. `step 2 click failed: …` | none | none |
+
+A page error is `BrowserConsole` because an uncaught exception is reported to
+the console. Severity follows the browser's own level (§5.2). spec 12's model
+lines are reused by widening three private `model_item` helpers to
+`pub(crate)`, so the panel and the model text cannot drift apart. A `log` or
+`info` console line is not a problem (`is_problem`), so it yields no finding.
+
+### 12.3 A served URL becomes a range only when exactly one repository file matches
+
+A console location is a **served** URL (`http://localhost:5001/js/app.js`).
+Nothing in the report says which repository file was served. **Decision:**
+
+- Only a loopback `http(s)` URL is considered. Spec 12's `is_loopback_url` is
+  widened to `pub(crate)` for this. A script from a CDN whose path happens to
+  match a repository file would otherwise open the wrong file. `file://`,
+  `webpack://` and extension URLs get no range either.
+- The URL's path, without its leading `/`, query or fragment, is matched
+  against the repository's file list. A match is a file whose path is equal to
+  it or ends with `/` followed by it. So `js/app.js` matches `static/js/app.js`.
+  A path with a `..` component, or one ending in `/`, is not used.
+- Paths under `node_modules` never match.
+- **Exactly one match** becomes the range. Zero matches leave `range: None`;
+  that is a bundle such as `/assets/index-3f9a.js`, or a file the index does
+  not hold. Two or more matches also leave `range: None`. That is the case of
+  `dist/app.js` next to `src/app.js`, where picking one would be the guess
+  §5.3 forbids.
+- The function takes the file list as a parameter, `&[&str]` of
+  repository-relative paths, so it stays pure. Task 7 passes the paths in
+  `RepositoryIndex.files` (`indexer.rs`). The line and column are spec 12's,
+  already 1-based. A location with no line gets no range.
+- Percent-encoded paths are not decoded. Such a path matches nothing, so it
+  gets no range, never a wrong one.
+
+### 12.4 A runner that failed gets one generic finding, under the same rule as commands
+
+`tool_failed()` is true when the call itself failed: MCP `is_error`, or the
+companion's `"error": true`. **Decision:** apply §10.3's rule. When the tool
+failed and no `Error`-severity browser finding came out of the report, add one
+generic finding. Its summary is `"<tool> <url> failed: <message>"`, where the
+message is `details.tool_error` or else the first non-empty line of `text`.
+Its details are `text`, which `Finding::new` bounds. Its source is `Command`,
+whose meaning §8.1 broadens from "a command's failure taken whole" to "a
+check's failure taken whole, nothing parsed out of it". That keeps "only
+generic findings have this source" true. Renaming the variant was considered
+and rejected: it is persisted from Task 7 onward, and the panel picks its own
+label.
+
+A non-companion runner that did **not** fail has `details: None` and yields
+**no** findings. Its text is prose, and parsing prose is the option §5.4
+rejected. A diagnostic that ran and found nothing also yields none.
+
+### 12.5 Where the code lives, and what it takes
+
+The code goes in `crates/workspace-engine/src/finding/browser.rs`, beside the
+parsers (§8.4). It is not a `FindingParser`, because there is no command to
+match. It exports
+`findings_from_web_record(record: &WebDiagnosticRecord, repository_files: &[&str], scanner: &SecretScanner) -> Vec<Finding>`,
+re-exported from `finding.rs`. Its findings carry no `task_id` or
+`origin_ref`. Task 7 attaches `record.task_id` and `record.id`, the same as it
+does for commands. The record is already redacted, and `Finding::new` redacts
+again (§6). The seeded-secret acceptance criterion for "browser output" is
+asserted through this function.

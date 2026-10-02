@@ -15,7 +15,7 @@ decisions it left open in [`context.md`](context.md)
 | 3 · Rust diagnostics parser (`cargo build`/`check`/`clippy`) | Done 2026-10-01 | Planned on 2026-09-30 against captured cargo 1.98.0 output (`context.md` §9). The first session was lost after Step 1, and its fixtures were checked byte-identical before work resumed. `finding/rust_diagnostics.rs` landed as sketched, with only rustfmt changes. It is declared from `finding.rs`, and `RustDiagnosticsParser` is registered in `default_parsers()`. Before the implementation the tests failed to compile (`E0425` on `parse_rust_diagnostics`, `cargo_subcommand` and `RustDiagnosticsParser`). After it, `test(finding::)` passed 49/49 (16 + 16 + 17), and the Task 2 dispatch tests were unaffected. Mutations: (1) no `take_while` failed only `a_child_notes_location_is_not_borrowed_…`, as predicted. (2) The plan's two variants differ. The last `-->` *before a child header* fails nothing, because rustc prints exactly one `-->` per primary region (a secondary span in another file uses `:::`), so first and last are the same line. The last `-->` *in the whole block* failed `the_location_is_the_primary_one_…` with `13:4`, and also the no-primary-location test. (3) `is_cargo_summary` always `false` failed `cargo_summary_lines_are_not_findings`, plus `every_clippy_occurrence_…`, `default_parsers_turn_…` and `a_diagnostic_without_a_location_…`, whose counts include the summary lines. (4) No `CLIPPY_URL` branch failed `every_clippy_occurrence_gets_its_code_from_the_help_url`. (5) No `is_absolute` failed `a_location_outside_the_workspace_has_no_range`. (6) No ANSI strip failed `ansi_colour_codes_are_ignored`. (7) Ending a block only at a blank line failed nothing, as expected. The header check stays as defence against a runner that strips blank lines. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
 | 4 · Rust test parser (`cargo test`), delegating compile errors to Task 3 | Done 2026-10-01 | Planned on 2026-10-01 against captured cargo 1.98.0 `cargo test` output (`context.md` §10). The captures changed two earlier decisions. The parser returns the diagnostics **and** the test failures, because a warning and failing tests appear in the same run (§10.2 corrects §5). The dispatcher falls through to the generic finding when a failed run has no `Error` draft: a test binary that crashed after a warning otherwise reported only the warning (§10.3 amends §8.2). `cargo nextest run` is out of scope, and a failed nextest run gets one generic finding (§10.5). Landed as sketched, with only rustfmt changes. The fixtures were extracted from this file's line ranges, so they are byte-identical to the plan. `finding/rust_test.rs` is new. `rust_diagnostics.rs` gained the three summary clauses and `workspace_range`, and its `regex` is now `pub(super)`. `finding.rs` registers `RustTestParser` second and falls through on "no `Error` draft". Before the implementation the tests failed to compile (`E0425`, `E0433`, `E0422`). After it, `test(finding::)` passed 71/71 (16 + 17 + 17 + 21), with Task 3's tests unchanged. Mutations: 1, 2, 3, 5, 6, 7, 8, 9 and 10 failed exactly the tests the plan names. Mutation 4 (end a section at a blank line) failed **9**, not 8. The extra one is `a_panic_line_without_a_thread_id_still_has_its_location`, because its inline stdout also has a blank line straight after the section header. Mutation 9 spares that test because its panic line has no thread id. So the plan's "the same eight as mutation 4" is one test short, not a defect. Each mutation took about 9 minutes when run without `--lib`, because every edit to the library relinks all 21 integration-test binaries. Use `cargo nextest run -p workspace-engine --lib -E 'test(finding::)'` for mutation loops. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
 | 5 · Biome parser | Done 2026-10-02 | Planned in full on 2026-10-01 against captured Biome 2.5.7 output (`context.md` §11). Landed as sketched, with only rustfmt changes. The fixtures were extracted from this file's line ranges, so they are byte-identical to the plan, and `grep -c '^  $'` on the check stderr prints 28. `finding/biome.rs` is new. `finding.rs` declares `mod biome;` and registers `BiomeParser` third. Before the implementation the tests failed to compile (`E0425` on `parse_biome`/`BiomeParser`, plus `E0433`). After it, `test(finding::)` passed 89/89 (71 unchanged + 18). All eight mutations failed their named test. (1) Ending a block at a whitespace-only line failed 10 tests, `details_run_past_…` among them: the empty line after each header ends the block before its marker, so every summary falls back to the category. (2) A greedy path failed 5, including `a_lint_error_keeps_…`. (3) No OSC 8 alternative failed only `forced_colour_output_parses_the_same`. (4) Plain-only markers failed `colour_markers_map_like_plain_ones` and the forced-colour test. (5) Non-error→`Warning` failed `an_info_marker_is_info`, `a_passing_run_keeps_its_info` and the colour-marker test. (6) No `HIDDEN` check failed only `hidden_diagnostics_become_one_info_draft`. (7) Any `npm run` script failed only `does_not_match_other_commands`. (8) Skipping marker-less blocks failed only `a_block_without_a_marker_is_kept_…`. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
-| 6 · Browser findings from spec 12's `WebDiagnosticDetails` | Not started | Re-scoped 2026-09-29 by spec 12's close-out: no `entries` field (`context.md` §7.1). |
+| 6 · Browser findings from spec 12's `WebDiagnosticDetails` | Not started | Re-scoped on 2026-09-29 by spec 12's close-out: no `entries` field (`context.md` §7.1). Planned in full on 2026-10-02 (`context.md` §12). It adds `FindingSource::BrowserScenario`, and a served URL maps to a file only when it is loopback and exactly one file matches. The plan was checked by applying it verbatim to a `git archive HEAD` copy. There, `test(finding::) + test(web_diagnostics::)` passed 121/121 (107 `finding::`, which is 89 + 18). Clippy `-p workspace-engine` was clean, and rustfmt only rewrapped lines in the new code. Mutations 1 (no `node_modules` exclusion) and 2 (first candidate wins) each failed only their named test. |
 | 7 · Recording, persistence, staleness, `Evidence::Findings` | Not started | |
 | 8 · Dismissal and the scoped repair request | Not started | |
 | 9 · Shell API | Not started | |
@@ -3493,30 +3493,608 @@ scripts/check-spec-status.mjs:136:7 lint/style/useTemplate  FIXABLE  ━━━�
 - [x] **Step 8: Update this file's Task 5 row, then show the change and the
   check results and ask before committing**
 
-## Task 6: Browser findings
+## Task 6: Browser findings from spec 12's `WebDiagnosticRecord`
 
-**Files:** `web_diagnostics.rs`. **Updated 2026-09-29 by spec 12's
-close-out:** read `context.md` §7.1 first.
+**Requirements:** 1 (browser console and network sources), 2, 4, and these
+acceptance criteria:
 
-Spec 12 already types the browser evidence as
-`WebDiagnosticReport.details: Option<WebDiagnosticDetails>`. **Do not add
-`WebDiagnosticEntry`, `WebEntryKind` or `WebDiagnosticReport.entries`.**
-Findings come from `details`:
+- "a browser console error … normalise[s] into `Finding`";
+- "a browser diagnostic with structured entries produces one finding per
+  entry; one with `is_error: true` and no entries produces a single generic
+  finding";
+- "a browser source location outside the repository is dropped";
+- the seeded secret in "browser output".
 
-- each of `page_errors`;
-- each `console` entry for which `WebConsoleEntry::is_problem()` is true,
-  whose `location` becomes a `SourceRange` when it resolves inside the
-  repository;
-- each of `failed_requests`.
+**Files:** create `crates/workspace-engine/src/finding/browser.rs`. Modify
+`finding.rs` to declare the module, re-export the function and add
+`FindingSource::BrowserScenario`. Modify `web_diagnostics.rs` for
+**visibility only**: four private functions become `pub(crate)`. Planned in
+full on 2026-10-02.
 
-A report with `details: None` and `tool_failed()` true yields one generic
-finding. A location that does not resolve to a path inside the repository root
-is dropped to `range: None`: a served URL no rule maps, a bundled URL,
-`node_modules`, or an absolute path outside the root. The report is already
-redacted where the engine records it, but `Finding::new` still redacts
-(`context.md` §6). Proposal §7's question about `entries` is answered in
-`context.md` §7.1: they were never added, because spec 12 supplied
-`WebDiagnosticDetails` instead.
+**Read `context.md` §7.1 and §12 first.** §12 settles five things the outline
+left open:
+
+- failed scenario steps are findings, under a new `BrowserScenario` source;
+- the source/severity/text table;
+- how a served URL maps to a file: loopback only, exactly one match;
+- the tool-failure rule;
+- where the code lives.
+
+This task does **not** add `WebDiagnosticEntry`, `WebEntryKind` or
+`WebDiagnosticReport.entries` (§7.1). It does not record findings anywhere;
+that is Task 7.
+
+**Interfaces:**
+- Consumes:
+  - `Finding::new`, `FindingDraft`, `FindingSource`, `Severity` and
+    `SourceRange`, plus the private `first_non_empty_line` (`finding.rs`).
+  - `WebDiagnosticRecord`, `WebDiagnosticReport::from_text` /
+    `tool_failed`, and `WebConsoleEntry::is_problem` (`web_diagnostics.rs`).
+- Produces:
+  - `FindingSource::BrowserScenario`, serialised as `"browser_scenario"`.
+  - `pub fn findings_from_web_record(record: &WebDiagnosticRecord, repository_files: &[&str], scanner: &SecretScanner) -> Vec<Finding>`,
+    re-exported as `crate::finding::findings_from_web_record`.
+    `repository_files` holds repository-relative paths. Task 7 passes
+    `RepositoryIndex.files`' paths, and attaches `record.task_id` and
+    `record.id` (`context.md` §12.5).
+  - The `Command` variant's doc comment is broadened, per §12.4. The variant
+    itself is not renamed.
+  - `pub(crate)` on `WebConsoleEntry::model_item`,
+    `WebFailedRequest::model_item`, `WebScenarioStep::model_item` and
+    `is_loopback_url`. Bodies are unchanged.
+
+- [ ] **Step 1: Add the source variant, broaden `Command`'s doc, widen
+  visibility**
+
+  In `finding.rs`, add after `Command`:
+
+  ```rust
+      /// A failed scenario step, such as a click that timed out
+      /// (`context.md` §12.1).
+      BrowserScenario,
+  ```
+
+  Add the `as_str` arm `Self::BrowserScenario => "browser_scenario",`. Add
+  `BrowserScenario` to the array in `tests::every_source_serialises_as_its_as_str`.
+  Replace `Command`'s doc comment with:
+
+  ```rust
+      /// A check's failure taken whole, nothing parsed out of it: a command
+      /// (`context.md` §8.1) or a browser diagnostic whose runner failed
+      /// (§12.4). Only the generic fallbacks produce this.
+  ```
+
+  In `web_diagnostics.rs`, change `fn model_item` to `pub(crate) fn model_item`
+  in the three `impl` blocks (`WebConsoleEntry`, `WebFailedRequest`,
+  `WebScenarioStep`), and `fn is_loopback_url` to `pub(crate) fn is_loopback_url`.
+  Change nothing else in that file. Run
+  `cargo nextest run -p workspace-engine -E 'test(finding::) + test(web_diagnostics::)'`.
+  Every test still passes.
+
+- [ ] **Step 2: Declare the module and write the failing tests**
+
+  In `finding.rs`, add `mod browser;` above `mod biome;`, and
+  `pub use browser::findings_from_web_record;` below the `mod` lines. Create
+  `crates/workspace-engine/src/finding/browser.rs` containing only the test
+  module:
+
+  ```rust
+  #[cfg(test)]
+  mod tests {
+      use super::*;
+      use crate::web_diagnostics::WebDiagnosticReport;
+
+      /// spec 12's `COMPANION_REPORT` (`web_diagnostics.rs` tests), which is
+      /// trimmed from a real companion `inspect_page` result. One console
+      /// warning from another origin is added (`context.md` §12).
+      const INSPECT_REPORT: &str = r#"{
+        "success": false, "diagnostic_ok": false, "run_id": "20260925-1",
+        "url": "http://localhost:5001/", "final_url": "http://localhost:5001/",
+        "title": "Snake Game", "status": 200,
+        "page_errors": ["ReferenceError: Cannot access 'game' before initialization"],
+        "console": [
+          {"type": "error", "text": "Failed to load resource: 404",
+           "location": {"url": "http://localhost:5001/js/app.js", "lineNumber": 41, "columnNumber": 7}},
+          {"type": "log", "text": "booting"},
+          {"type": "warning", "text": "Deprecated API used",
+           "location": {"url": "https://cdn.example.com/js/app.js", "lineNumber": 0, "columnNumber": 0}}
+        ],
+        "failed_requests": [
+          {"kind": "response", "url": "http://localhost:5001/api/me", "method": "GET",
+           "resource_type": "fetch", "status": 404, "status_text": "Not Found"},
+          {"kind": "requestfailed", "url": "http://localhost:5001/ws", "method": "GET",
+           "resource_type": "websocket", "failure": "net::ERR_CONNECTION_REFUSED"}
+        ],
+        "dom_summary": {"forms": 1, "buttons": ["Log in", "Register"], "fields": [],
+          "status_text": "", "visible_text_excerpt": "Snake Log in Register Score: 0"},
+        "artifacts": [],
+        "text_report": "ignored by Damaian"
+      }"#;
+
+      /// The repository's file list (`context.md` §12.3). The `node_modules`
+      /// copy would make `js/app.js` ambiguous if it were not excluded.
+      const FILES: &[&str] = &[
+          "static/js/app.js",
+          "static/index.html",
+          "server.py",
+          "node_modules/lib/js/app.js",
+      ];
+
+      fn record(tool: &str, text: &str, is_error: bool) -> WebDiagnosticRecord {
+          WebDiagnosticRecord {
+              id: "webdiagrec_1".to_string(),
+              task_id: "task_1".to_string(),
+              tool: tool.to_string(),
+              url: "http://localhost:5001/".to_string(),
+              recorded_at_ms: 1,
+              report: WebDiagnosticReport::from_text(text, is_error),
+          }
+      }
+
+      fn findings_in(text: &str, is_error: bool, files: &[&str]) -> Vec<Finding> {
+          findings_from_web_record(
+              &record("inspect_web_page", text, is_error),
+              files,
+              &SecretScanner::default(),
+          )
+      }
+
+      fn findings(text: &str, is_error: bool) -> Vec<Finding> {
+          findings_in(text, is_error, FILES)
+      }
+
+      fn console_error_at(url: &str, line: Option<u32>) -> String {
+          let line = line.map_or(String::new(), |line| format!(r#", "lineNumber": {}"#, line - 1));
+          format!(
+              r#"{{"final_url": "http://localhost:3000/", "console": [
+                {{"type": "error", "text": "boom", "location": {{"url": "{url}"{line}}}}}]}}"#
+          )
+      }
+
+      #[test]
+      fn an_inspection_yields_one_finding_per_problem_in_report_order() {
+          let found = findings(INSPECT_REPORT, false);
+          let shape: Vec<_> = found.iter().map(|f| (f.source(), f.severity())).collect();
+          assert_eq!(
+              shape,
+              [
+                  (FindingSource::BrowserConsole, Severity::Error),
+                  (FindingSource::BrowserConsole, Severity::Error),
+                  (FindingSource::BrowserConsole, Severity::Warning),
+                  (FindingSource::BrowserNetwork, Severity::Error),
+                  (FindingSource::BrowserNetwork, Severity::Error),
+              ],
+              "{found:#?}"
+          );
+          assert!(found.iter().all(|f| f.task_id().is_none() && f.origin_ref().is_none()));
+      }
+
+      #[test]
+      fn a_page_error_is_a_console_error_without_a_location() {
+          let page_error = &findings(INSPECT_REPORT, false)[0];
+          assert_eq!(
+              page_error.summary(),
+              "ReferenceError: Cannot access 'game' before initialization"
+          );
+          assert_eq!(page_error.range(), None);
+      }
+
+      /// The served `/js/app.js` is `static/js/app.js`. The `node_modules`
+      /// copy is excluded, so there is exactly one match. Spec 12 stored the
+      /// line and column 1-based (41/7 → 42/8).
+      #[test]
+      fn a_console_error_at_a_served_url_maps_to_the_one_repository_file() {
+          let console_error = &findings(INSPECT_REPORT, false)[1];
+          assert_eq!(console_error.summary(), "Failed to load resource: 404");
+          assert_eq!(
+              console_error.range(),
+              Some(&SourceRange {
+                  path: "static/js/app.js".to_string(),
+                  start_line: 42,
+                  start_column: Some(8),
+                  end_line: None,
+                  end_column: None,
+              })
+          );
+          assert_eq!(
+              console_error.details(),
+              Some("console error: Failed to load resource: 404 (http://localhost:5001/js/app.js:42:8)")
+          );
+      }
+
+      #[test]
+      fn a_console_location_on_another_origin_has_no_range() {
+          let warning = &findings(INSPECT_REPORT, false)[2];
+          assert_eq!(warning.summary(), "Deprecated API used");
+          assert_eq!(warning.range(), None, "a CDN script was mapped to a repository file");
+      }
+
+      #[test]
+      fn a_log_line_is_not_a_finding() {
+          assert!(findings(INSPECT_REPORT, false).iter().all(|f| f.summary() != "booting"));
+      }
+
+      #[test]
+      fn failed_requests_carry_their_status_or_network_error_as_code() {
+          let found = findings(INSPECT_REPORT, false);
+          assert_eq!(
+              found[3].summary(),
+              "failed request: GET http://localhost:5001/api/me → 404 Not Found"
+          );
+          assert_eq!(found[3].code(), Some("404"));
+          assert_eq!(found[4].code(), Some("net::ERR_CONNECTION_REFUSED"));
+          assert_eq!(found[3].range(), None);
+      }
+
+      /// `context.md` §12.1: the model is told about failed steps, so the
+      /// panel must show them.
+      #[test]
+      fn a_failed_scenario_step_is_a_browser_scenario_error() {
+          let scenario = r##"{"final_url": "http://localhost:5001/", "results": [
+            {"step": 1, "action": "goto", "success": true},
+            {"step": 2, "action": "click", "selector": "#start", "success": false,
+             "error": "Timeout 5000ms exceeded"}]}"##;
+          let found = findings_from_web_record(
+              &record("run_web_scenario", scenario, false),
+              FILES,
+              &SecretScanner::default(),
+          );
+          assert_eq!(found.len(), 1, "{found:?}");
+          assert_eq!(found[0].source(), FindingSource::BrowserScenario);
+          assert_eq!(found[0].severity(), Severity::Error);
+          assert_eq!(found[0].summary(), "step 2 click failed: Timeout 5000ms exceeded");
+      }
+
+      /// spec 12's own companion-error shape (`web_diagnostics.rs` tests).
+      #[test]
+      fn a_runner_that_failed_yields_one_generic_finding() {
+          let failed = r#"{"error": true, "success": false, "message": "Timeout 30000ms exceeded",
+              "final_url": "http://localhost:5001/"}"#;
+          let found = findings(failed, false);
+          assert_eq!(found.len(), 1, "{found:?}");
+          assert_eq!(found[0].source(), FindingSource::Command);
+          assert_eq!(found[0].severity(), Severity::Error);
+          assert_eq!(
+              found[0].summary(),
+              "inspect_web_page http://localhost:5001/ failed: Timeout 30000ms exceeded"
+          );
+          assert_eq!(found[0].range(), None);
+      }
+
+      #[test]
+      fn a_non_companion_runner_failure_yields_one_generic_finding_from_its_text() {
+          let found = findings("\nBrowser could not start\nstack…\n", true);
+          assert_eq!(found.len(), 1, "{found:?}");
+          assert_eq!(found[0].source(), FindingSource::Command);
+          assert_eq!(
+              found[0].summary(),
+              "inspect_web_page http://localhost:5001/ failed: Browser could not start"
+          );
+      }
+
+      /// §12.4: prose from another runner is not parsed.
+      #[test]
+      fn a_non_companion_runner_that_succeeded_yields_nothing() {
+          assert!(findings("The page loaded and looked fine.", false).is_empty());
+      }
+
+      #[test]
+      fn a_clean_inspection_yields_nothing() {
+          let clean = r#"{"final_url": "http://localhost:5001/", "page_errors": [],
+              "console": [{"type": "log", "text": "ready"}], "failed_requests": []}"#;
+          assert!(findings(clean, false).is_empty());
+      }
+
+      /// §10.3's rule: the generic finding is added only when nothing else
+      /// explains the failure.
+      #[test]
+      fn a_tool_failure_is_not_doubled_when_the_report_already_explains_it() {
+          let found = findings(INSPECT_REPORT, true);
+          assert_eq!(found.len(), 5, "{found:?}");
+          assert!(found.iter().all(|f| f.source() != FindingSource::Command));
+      }
+
+      #[test]
+      fn an_ambiguous_served_path_has_no_range() {
+          let found = findings_in(
+              &console_error_at("http://localhost:3000/app.js", Some(3)),
+              false,
+              &["dist/app.js", "src/app.js"],
+          );
+          assert_eq!(found.len(), 1);
+          assert_eq!(found[0].range(), None, "one of two candidates was guessed");
+      }
+
+      #[test]
+      fn an_exact_path_match_counts() {
+          let found = findings_in(
+              &console_error_at("http://127.0.0.1:3000/app.js", Some(3)),
+              false,
+              &["app.js", "README.md"],
+          );
+          assert_eq!(found[0].range().map(|r| (r.path.as_str(), r.start_line)), Some(("app.js", 3)));
+      }
+
+      #[test]
+      fn a_bundled_url_with_no_repository_file_has_no_range() {
+          let found = findings(&console_error_at("http://localhost:5001/assets/index-3f9a.js", Some(1)), false);
+          assert_eq!(found[0].range(), None);
+      }
+
+      #[test]
+      fn a_location_without_a_line_has_no_range() {
+          let found = findings(&console_error_at("http://localhost:5001/js/app.js", None), false);
+          assert_eq!(found.len(), 1);
+          assert_eq!(found[0].range(), None);
+      }
+
+      #[test]
+      fn served_path_accepts_only_loopback_http_file_paths() {
+          assert_eq!(served_path("http://localhost:5001/js/app.js?v=3#top"), Some("js/app.js"));
+          assert_eq!(served_path("http://127.0.0.1/app.js"), Some("app.js"));
+          assert_eq!(served_path("http://[::1]:8080/a/b.js"), Some("a/b.js"));
+          for url in [
+              "https://cdn.example.com/js/app.js",
+              "file:///repo/static/js/app.js",
+              "webpack:///./src/app.js",
+              "http://localhost:5001/",
+              "http://localhost:5001",
+              "http://localhost:5001/static/",
+              "http://localhost:5001/../etc/passwd",
+          ] {
+              assert_eq!(served_path(url), None, "{url}");
+          }
+      }
+
+      /// Acceptance criterion: no unredacted secret from "browser output".
+      /// The record is built **without** `redacted()`, so only `Finding::new`
+      /// stands between the key and the finding.
+      #[test]
+      fn a_secret_in_browser_output_is_redacted() {
+          let key = "AKIAIOSFODNN7EXAMPLE";
+          let report = format!(
+              r#"{{"final_url": "http://localhost:5001/", "page_errors": ["bad key {key}"],
+                  "console": [{{"type": "error", "text": "token {key}"}}],
+                  "failed_requests": [{{"url": "http://localhost:5001/api?key={key}", "method": "GET", "status": 401}}]}}"#
+          );
+          let found = findings(&report, false);
+          assert_eq!(found.len(), 3, "{found:?}");
+          for finding in &found {
+              assert!(!finding.summary().contains(key), "{}", finding.summary());
+              assert!(!finding.details().unwrap_or_default().contains(key));
+          }
+      }
+  }
+  ```
+
+- [ ] **Step 3: Run the tests and confirm they fail**
+
+  Run: `cargo nextest run -p workspace-engine -E 'test(finding::browser)'`
+  Expected: a compile failure, because `findings_from_web_record` and
+  `served_path` are not defined.
+
+- [ ] **Step 4: Write the implementation**
+
+  Put this above the test module in `browser.rs`:
+
+  ```rust
+  //! Browser findings from a recorded diagnostic (spec 22 Task 6).
+  //!
+  //! Not a `FindingParser`: a browser diagnostic is spec 12's typed report,
+  //! not command output to match. Sources and severities are the browser's
+  //! own (proposal §5.2; the table is `context.md` §12.2):
+  //! - a page error is `BrowserConsole`/`Error`;
+  //! - a console `error` or `assert` is `BrowserConsole`/`Error`, and a
+  //!   `warning` is `BrowserConsole`/`Warning`;
+  //! - a failed request is `BrowserNetwork`/`Error`;
+  //! - a failed scenario step is `BrowserScenario`/`Error`.
+  //!
+  //! A runner that failed, with nothing else to explain it, is one `Command`
+  //! finding (§12.4).
+
+  use super::{Finding, FindingDraft, FindingSource, Severity, SourceRange, first_non_empty_line};
+  use crate::secret_scanner::SecretScanner;
+  use crate::web_diagnostics::{WebDiagnosticRecord, WebSourceLocation, is_loopback_url};
+  use std::path::{Component, Path};
+
+  /// Findings for one diagnostic run. `repository_files` holds
+  /// repository-relative paths, against which a served URL is matched
+  /// (§12.3). Task 7 attaches `task_id` and `origin_ref`.
+  pub fn findings_from_web_record(
+      record: &WebDiagnosticRecord,
+      repository_files: &[&str],
+      scanner: &SecretScanner,
+  ) -> Vec<Finding> {
+      let report = &record.report;
+      let mut drafts = Vec::new();
+      if let Some(details) = &report.details {
+          for error in &details.page_errors {
+              drafts.push(draft(
+                  FindingSource::BrowserConsole,
+                  Severity::Error,
+                  error.clone(),
+                  Some(error.clone()),
+              ));
+          }
+          for entry in details.console.iter().filter(|entry| entry.is_problem()) {
+              let level = entry.level.to_ascii_lowercase();
+              let severity = if matches!(level.as_str(), "error" | "assert") {
+                  Severity::Error
+              } else {
+                  Severity::Warning
+              };
+              let mut console = draft(
+                  FindingSource::BrowserConsole,
+                  severity,
+                  entry.text.clone(),
+                  Some(entry.model_item()),
+              );
+              console.range = entry
+                  .location
+                  .as_ref()
+                  .and_then(|location| repository_range(location, repository_files));
+              drafts.push(console);
+          }
+          for request in &details.failed_requests {
+              let mut network = draft(
+                  FindingSource::BrowserNetwork,
+                  Severity::Error,
+                  request.model_item(),
+                  None,
+              );
+              network.code = request.status.map(|status| status.to_string()).or_else(|| {
+                  request
+                      .failure
+                      .clone()
+                      .filter(|failure| failure.starts_with("net::"))
+              });
+              drafts.push(network);
+          }
+          for step in details.steps.iter().filter(|step| !step.success) {
+              drafts.push(draft(
+                  FindingSource::BrowserScenario,
+                  Severity::Error,
+                  step.model_item(),
+                  None,
+              ));
+          }
+      }
+
+      let explained = drafts.iter().any(|draft| draft.severity == Severity::Error);
+      if report.tool_failed() && !explained {
+          let message = report
+              .details
+              .as_ref()
+              .and_then(|details| details.tool_error.as_deref())
+              .or_else(|| first_non_empty_line(&report.text))
+              .unwrap_or("no message");
+          drafts.push(draft(
+              FindingSource::Command,
+              Severity::Error,
+              format!("{} {} failed: {message}", record.tool, record.url),
+              Some(report.text.clone()),
+          ));
+      }
+
+      drafts
+          .into_iter()
+          .map(|draft| Finding::new(draft, scanner))
+          .collect()
+  }
+
+  fn draft(
+      source: FindingSource,
+      severity: Severity,
+      summary: String,
+      details: Option<String>,
+  ) -> FindingDraft {
+      FindingDraft {
+          source,
+          severity,
+          summary,
+          details,
+          range: None,
+          code: None,
+      }
+  }
+
+  /// A range only when the served path matches exactly one repository file
+  /// outside `node_modules`. Two candidates are not a choice to make (§12.3).
+  fn repository_range(location: &WebSourceLocation, files: &[&str]) -> Option<SourceRange> {
+      let line = location.line?;
+      let path = served_path(&location.url)?;
+      let suffix = format!("/{path}");
+      let mut candidates = files.iter().copied().filter(|file| {
+          (*file == path || file.ends_with(&suffix))
+              && !Path::new(file)
+                  .components()
+                  .any(|part| part.as_os_str() == "node_modules")
+      });
+      let file = candidates.next()?;
+      if candidates.next().is_some() {
+          return None;
+      }
+      Some(SourceRange {
+          path: file.to_string(),
+          start_line: line,
+          start_column: location.column,
+          end_line: None,
+          end_column: None,
+      })
+  }
+
+  /// The path of a loopback `http(s)` URL, without its leading `/`, query or
+  /// fragment. `None` for any other URL, a directory, or a `..` path.
+  fn served_path(url: &str) -> Option<&str> {
+      if !is_loopback_url(url) {
+          return None;
+      }
+      let (_, rest) = url.trim().split_once("://")?;
+      let (_, path) = rest.split_once('/')?;
+      let path = path.split(['?', '#']).next().unwrap_or_default();
+      let unusable = path.is_empty()
+          || path.ends_with('/')
+          || Path::new(path)
+              .components()
+              .any(|part| part == Component::ParentDir);
+      (!unusable).then_some(path)
+  }
+  ```
+
+  If a test and this sketch disagree, the test wins, because the tests come
+  from spec 12's real-derived fixture and `context.md` §12. Record any
+  deviation in the progress row.
+
+- [ ] **Step 5: Run the tests and confirm they pass**
+
+  Run: `cargo nextest run -p workspace-engine -E 'test(finding::) + test(web_diagnostics::)'`
+  Expected: every `finding::` test passes. That is 89 from Tasks 1–5, all
+  unchanged except `every_source_serialises_as_its_as_str`, which now
+  includes `BrowserScenario`, plus 18 in `browser::tests`. Every spec 12
+  `web_diagnostics::` test is unchanged. Count both.
+
+- [ ] **Step 6: Mutation-test the decisions in §12**
+
+  Apply each change on its own, confirm the named test fails, then revert it:
+
+  1. Remove the `node_modules` exclusion.
+     `a_console_error_at_a_served_url_maps_to_…` must fail: two candidates,
+     so no range.
+  2. Take the first candidate instead of refusing a second.
+     `an_ambiguous_served_path_has_no_range` must fail.
+  3. Drop the `is_loopback_url` check from `served_path`.
+     `a_console_location_on_another_origin_has_no_range` and
+     `served_path_accepts_only_loopback_…` must fail.
+  4. Remove the `!explained` condition.
+     `a_tool_failure_is_not_doubled_…` must fail.
+  5. Skip failed steps.
+     `a_failed_scenario_step_is_a_browser_scenario_error` must fail.
+  6. Treat every problem console level as `Error`.
+     `an_inspection_yields_one_finding_per_problem_…` must fail on the
+     warning.
+  There is no redaction mutation for this task. Fields are private, so the
+  only way to get a `Finding` is `Finding::new`, which always redacts, and
+  Task 1 mutation-tested that. `a_secret_in_browser_output_is_redacted`
+  proves that the browser path goes through it, starting from an unredacted
+  record.
+
+  Record results 1–6 in the progress row.
+
+- [ ] **Step 7: Scoped checks**
+
+  Run `cargo fmt --all` first. The sketch is not rustfmt-shaped, and when
+  this plan was checked, rustfmt rewrapped lines in `browser.rs` and the
+  `finding.rs` test array. Those are the only changes it made.
+
+  ```bash
+  cargo fmt --all -- --check
+  cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
+  cargo nextest run -p workspace-engine -E 'test(finding::) + test(web_diagnostics::)'
+  typos docs/specs/22_findings_model_and_panel crates/workspace-engine/src/finding.rs crates/workspace-engine/src/finding crates/workspace-engine/src/web_diagnostics.rs
+  ```
+
+- [ ] **Step 8: Update this file's Task 6 row, then show the change and the
+  check results and ask before committing**
 
 ## Task 7: Recording, persistence, staleness, `Evidence::Findings`
 
