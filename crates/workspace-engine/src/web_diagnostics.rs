@@ -469,7 +469,7 @@ impl WebConsoleEntry {
 
     /// `console error: text (url:line:column)`, leaving out location parts
     /// the browser did not report.
-    fn model_item(&self) -> String {
+    pub(crate) fn model_item(&self) -> String {
         let mut item = format!("console {}: {}", self.level, self.text);
         if let Some(location) = &self.location {
             item.push_str(" (");
@@ -507,7 +507,7 @@ impl WebSourceLocation {
 impl WebFailedRequest {
     /// `failed request: GET url → 404 Not Found` for a response,
     /// `… → net::ERR_…` for a request that never completed.
-    fn model_item(&self) -> String {
+    pub(crate) fn model_item(&self) -> String {
         let target = match &self.method {
             Some(method) => format!("{method} {}", self.url),
             None => self.url.clone(),
@@ -555,7 +555,7 @@ impl WebDomSummary {
 }
 
 impl WebScenarioStep {
-    fn model_item(&self) -> String {
+    pub(crate) fn model_item(&self) -> String {
         let mut item = format!("step {} {} failed", self.step, self.action);
         if let Some(error) = &self.error {
             item.push_str(": ");
@@ -663,7 +663,7 @@ fn scheme_and_host(url: &str) -> Option<(&str, &str)> {
     (!host_port.is_empty()).then_some((scheme, host_port))
 }
 
-fn is_loopback_url(url: &str) -> bool {
+pub(crate) fn is_loopback_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     let Some((scheme, host_port)) = scheme_and_host(&lower) else {
         return false;

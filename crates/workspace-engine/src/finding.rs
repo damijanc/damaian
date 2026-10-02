@@ -10,8 +10,11 @@ use crate::secret_scanner::SecretScanner;
 use serde::{Deserialize, Serialize};
 
 mod biome;
+mod browser;
 mod rust_diagnostics;
 mod rust_test;
+
+pub use browser::findings_from_web_record;
 
 pub const MAX_SUMMARY_CHARS: usize = 240;
 pub const MAX_DETAILS_BYTES: usize = 4096;
@@ -29,9 +32,13 @@ pub enum FindingSource {
     CodeReview,
     /// Phase 3. Declared now so adding it is not a schema change.
     LanguageServer,
-    /// One command's failure taken whole: nothing was parsed out of it.
-    /// Only the generic fallback produces this (`context.md` §8.1).
+    /// A check's failure taken whole, nothing parsed out of it: a command
+    /// (`context.md` §8.1) or a browser diagnostic whose runner failed
+    /// (§12.4). Only the generic fallbacks produce this.
     Command,
+    /// A failed scenario step, such as a click that timed out
+    /// (`context.md` §12.1).
+    BrowserScenario,
 }
 
 impl FindingSource {
@@ -47,6 +54,7 @@ impl FindingSource {
             Self::CodeReview => "code_review",
             Self::LanguageServer => "language_server",
             Self::Command => "command",
+            Self::BrowserScenario => "browser_scenario",
         }
     }
 }
@@ -567,6 +575,7 @@ mod tests {
             CodeReview,
             LanguageServer,
             Command,
+            BrowserScenario,
         ] {
             assert_eq!(
                 serde_json::to_value(source).unwrap(),

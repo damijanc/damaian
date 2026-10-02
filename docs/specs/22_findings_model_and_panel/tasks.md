@@ -15,7 +15,7 @@ decisions it left open in [`context.md`](context.md)
 | 3 · Rust diagnostics parser (`cargo build`/`check`/`clippy`) | Done 2026-10-01 | Planned on 2026-09-30 against captured cargo 1.98.0 output (`context.md` §9). The first session was lost after Step 1, and its fixtures were checked byte-identical before work resumed. `finding/rust_diagnostics.rs` landed as sketched, with only rustfmt changes. It is declared from `finding.rs`, and `RustDiagnosticsParser` is registered in `default_parsers()`. Before the implementation the tests failed to compile (`E0425` on `parse_rust_diagnostics`, `cargo_subcommand` and `RustDiagnosticsParser`). After it, `test(finding::)` passed 49/49 (16 + 16 + 17), and the Task 2 dispatch tests were unaffected. Mutations: (1) no `take_while` failed only `a_child_notes_location_is_not_borrowed_…`, as predicted. (2) The plan's two variants differ. The last `-->` *before a child header* fails nothing, because rustc prints exactly one `-->` per primary region (a secondary span in another file uses `:::`), so first and last are the same line. The last `-->` *in the whole block* failed `the_location_is_the_primary_one_…` with `13:4`, and also the no-primary-location test. (3) `is_cargo_summary` always `false` failed `cargo_summary_lines_are_not_findings`, plus `every_clippy_occurrence_…`, `default_parsers_turn_…` and `a_diagnostic_without_a_location_…`, whose counts include the summary lines. (4) No `CLIPPY_URL` branch failed `every_clippy_occurrence_gets_its_code_from_the_help_url`. (5) No `is_absolute` failed `a_location_outside_the_workspace_has_no_range`. (6) No ANSI strip failed `ansi_colour_codes_are_ignored`. (7) Ending a block only at a blank line failed nothing, as expected. The header check stays as defence against a runner that strips blank lines. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
 | 4 · Rust test parser (`cargo test`), delegating compile errors to Task 3 | Done 2026-10-01 | Planned on 2026-10-01 against captured cargo 1.98.0 `cargo test` output (`context.md` §10). The captures changed two earlier decisions. The parser returns the diagnostics **and** the test failures, because a warning and failing tests appear in the same run (§10.2 corrects §5). The dispatcher falls through to the generic finding when a failed run has no `Error` draft: a test binary that crashed after a warning otherwise reported only the warning (§10.3 amends §8.2). `cargo nextest run` is out of scope, and a failed nextest run gets one generic finding (§10.5). Landed as sketched, with only rustfmt changes. The fixtures were extracted from this file's line ranges, so they are byte-identical to the plan. `finding/rust_test.rs` is new. `rust_diagnostics.rs` gained the three summary clauses and `workspace_range`, and its `regex` is now `pub(super)`. `finding.rs` registers `RustTestParser` second and falls through on "no `Error` draft". Before the implementation the tests failed to compile (`E0425`, `E0433`, `E0422`). After it, `test(finding::)` passed 71/71 (16 + 17 + 17 + 21), with Task 3's tests unchanged. Mutations: 1, 2, 3, 5, 6, 7, 8, 9 and 10 failed exactly the tests the plan names. Mutation 4 (end a section at a blank line) failed **9**, not 8. The extra one is `a_panic_line_without_a_thread_id_still_has_its_location`, because its inline stdout also has a blank line straight after the section header. Mutation 9 spares that test because its panic line has no thread id. So the plan's "the same eight as mutation 4" is one test short, not a defect. Each mutation took about 9 minutes when run without `--lib`, because every edit to the library relinks all 21 integration-test binaries. Use `cargo nextest run -p workspace-engine --lib -E 'test(finding::)'` for mutation loops. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
 | 5 · Biome parser | Done 2026-10-02 | Planned in full on 2026-10-01 against captured Biome 2.5.7 output (`context.md` §11). Landed as sketched, with only rustfmt changes. The fixtures were extracted from this file's line ranges, so they are byte-identical to the plan, and `grep -c '^  $'` on the check stderr prints 28. `finding/biome.rs` is new. `finding.rs` declares `mod biome;` and registers `BiomeParser` third. Before the implementation the tests failed to compile (`E0425` on `parse_biome`/`BiomeParser`, plus `E0433`). After it, `test(finding::)` passed 89/89 (71 unchanged + 18). All eight mutations failed their named test. (1) Ending a block at a whitespace-only line failed 10 tests, `details_run_past_…` among them: the empty line after each header ends the block before its marker, so every summary falls back to the category. (2) A greedy path failed 5, including `a_lint_error_keeps_…`. (3) No OSC 8 alternative failed only `forced_colour_output_parses_the_same`. (4) Plain-only markers failed `colour_markers_map_like_plain_ones` and the forced-colour test. (5) Non-error→`Warning` failed `an_info_marker_is_info`, `a_passing_run_keeps_its_info` and the colour-marker test. (6) No `HIDDEN` check failed only `hidden_diagnostics_become_one_info_draft`. (7) Any `npm run` script failed only `does_not_match_other_commands`. (8) Skipping marker-less blocks failed only `a_block_without_a_marker_is_kept_…`. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
-| 6 · Browser findings from spec 12's `WebDiagnosticDetails` | Not started | Re-scoped on 2026-09-29 by spec 12's close-out: no `entries` field (`context.md` §7.1). Planned in full on 2026-10-02 (`context.md` §12). It adds `FindingSource::BrowserScenario`, and a served URL maps to a file only when it is loopback and exactly one file matches. The plan was checked by applying it verbatim to a `git archive HEAD` copy. There, `test(finding::) + test(web_diagnostics::)` passed 121/121 (107 `finding::`, which is 89 + 18). Clippy `-p workspace-engine` was clean, and rustfmt only rewrapped lines in the new code. Mutations 1 (no `node_modules` exclusion) and 2 (first candidate wins) each failed only their named test. |
+| 6 · Browser findings from spec 12's `WebDiagnosticDetails` | Done 2026-10-02 | Re-scoped on 2026-09-29 by spec 12's close-out, so there is no `entries` field (`context.md` §7.1). Planned in full on 2026-10-02 (`context.md` §12). Landed as sketched, with only rustfmt changes. `browser.rs` was extracted from this file's line ranges, so before formatting it was byte-identical to the plan. rustfmt rewrapped lines in `browser.rs` and sorted `mod browser;` below `mod biome;`, not above it as Step 2 says. It did not touch the `finding.rs` test array, contrary to Step 7's note. `finding/browser.rs` is new. `finding.rs` adds `FindingSource::BrowserScenario` (`"browser_scenario"`), broadens `Command`'s doc and re-exports `findings_from_web_record`. In `web_diagnostics.rs`, the three `model_item`s and `is_loopback_url` became `pub(crate)`, and nothing else changed. Steps 1 and 2 were applied together, so Step 1's separate test run was skipped. Before the implementation the tests failed to compile (`E0425` on `findings_from_web_record`/`served_path`, `E0432` on the re-export). After it, `test(finding::) + test(web_diagnostics::)` passed 121/121: 107 `finding::` (89 + 18 `browser::tests`), and the `web_diagnostics::` tests were unchanged. All six mutations failed only their named tests. (1) No `node_modules` exclusion failed only `a_console_error_at_a_served_url_maps_to_…`. (2) First candidate wins failed only `an_ambiguous_served_path_has_no_range`. (3) No `is_loopback_url` failed `a_console_location_on_another_origin_has_no_range` and `served_path_accepts_only_loopback_…`. (4) No `!explained` failed only `a_tool_failure_is_not_doubled_…`. (5) Skipping failed steps failed only `a_failed_scenario_step_is_a_browser_scenario_error`. (6) Every problem level as `Error` failed only `an_inspection_yields_one_finding_per_problem_…`. Scoped fmt, clippy `-p workspace-engine`, `test(finding::) + test(web_diagnostics::)` and typos are clean. |
 | 7 · Recording, persistence, staleness, `Evidence::Findings` | Not started | |
 | 8 · Dismissal and the scoped repair request | Not started | |
 | 9 · Shell API | Not started | |
@@ -3543,7 +3543,7 @@ that is Task 7.
     `WebFailedRequest::model_item`, `WebScenarioStep::model_item` and
     `is_loopback_url`. Bodies are unchanged.
 
-- [ ] **Step 1: Add the source variant, broaden `Command`'s doc, widen
+- [x] **Step 1: Add the source variant, broaden `Command`'s doc, widen
   visibility**
 
   In `finding.rs`, add after `Command`:
@@ -3571,7 +3571,7 @@ that is Task 7.
   `cargo nextest run -p workspace-engine -E 'test(finding::) + test(web_diagnostics::)'`.
   Every test still passes.
 
-- [ ] **Step 2: Declare the module and write the failing tests**
+- [x] **Step 2: Declare the module and write the failing tests**
 
   In `finding.rs`, add `mod browser;` above `mod biome;`, and
   `pub use browser::findings_from_web_record;` below the `mod` lines. Create
@@ -3867,13 +3867,13 @@ that is Task 7.
   }
   ```
 
-- [ ] **Step 3: Run the tests and confirm they fail**
+- [x] **Step 3: Run the tests and confirm they fail**
 
   Run: `cargo nextest run -p workspace-engine -E 'test(finding::browser)'`
   Expected: a compile failure, because `findings_from_web_record` and
   `served_path` are not defined.
 
-- [ ] **Step 4: Write the implementation**
+- [x] **Step 4: Write the implementation**
 
   Put this above the test module in `browser.rs`:
 
@@ -4045,7 +4045,7 @@ that is Task 7.
   from spec 12's real-derived fixture and `context.md` §12. Record any
   deviation in the progress row.
 
-- [ ] **Step 5: Run the tests and confirm they pass**
+- [x] **Step 5: Run the tests and confirm they pass**
 
   Run: `cargo nextest run -p workspace-engine -E 'test(finding::) + test(web_diagnostics::)'`
   Expected: every `finding::` test passes. That is 89 from Tasks 1–5, all
@@ -4053,7 +4053,7 @@ that is Task 7.
   includes `BrowserScenario`, plus 18 in `browser::tests`. Every spec 12
   `web_diagnostics::` test is unchanged. Count both.
 
-- [ ] **Step 6: Mutation-test the decisions in §12**
+- [x] **Step 6: Mutation-test the decisions in §12**
 
   Apply each change on its own, confirm the named test fails, then revert it:
 
@@ -4080,7 +4080,7 @@ that is Task 7.
 
   Record results 1–6 in the progress row.
 
-- [ ] **Step 7: Scoped checks**
+- [x] **Step 7: Scoped checks**
 
   Run `cargo fmt --all` first. The sketch is not rustfmt-shaped, and when
   this plan was checked, rustfmt rewrapped lines in `browser.rs` and the
@@ -4093,7 +4093,7 @@ that is Task 7.
   typos docs/specs/22_findings_model_and_panel crates/workspace-engine/src/finding.rs crates/workspace-engine/src/finding crates/workspace-engine/src/web_diagnostics.rs
   ```
 
-- [ ] **Step 8: Update this file's Task 6 row, then show the change and the
+- [x] **Step 8: Update this file's Task 6 row, then show the change and the
   check results and ask before committing**
 
 ## Task 7: Recording, persistence, staleness, `Evidence::Findings`
