@@ -1,0 +1,21 @@
+scripts/check-spec-status.mjs:136:7 lint/style/useTemplate  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  i Template literals are preferred over string concatenation.
+  
+    134 │ console.error(
+    135 │   problems.length === 1
+  > 136 │     ? "Spec status check " + label + ": 1 dependency line disagrees with the spec it names.\n"
+        │       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    137 │     : `Spec status check ${label}: ${problems.length} dependency lines disagree with the specs they name.\n`,
+    138 │ );
+  
+  i Unsafe fix: Use a template literal.
+  
+    134 134 │   console.error(
+    135 135 │     problems.length === 1
+    136     │ - ····?·"Spec·status·check·"·+·label·+·":·1·dependency·line·disagrees·with·the·spec·it·names.\n"
+        136 │ + ····?·`Spec·status·check·${label}:·1·dependency·line·disagrees·with·the·spec·it·names.\n`
+    137 137 │       : `Spec status check ${label}: ${problems.length} dependency lines disagree with the specs they name.\n`,
+    138 138 │   );
+  
+

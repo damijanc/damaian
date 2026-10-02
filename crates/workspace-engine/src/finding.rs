@@ -9,6 +9,7 @@ use crate::hash::{create_id, now_millis};
 use crate::secret_scanner::SecretScanner;
 use serde::{Deserialize, Serialize};
 
+mod biome;
 mod rust_diagnostics;
 mod rust_test;
 
@@ -236,6 +237,7 @@ pub fn default_parsers() -> Vec<Box<dyn FindingParser>> {
     vec![
         Box::new(rust_diagnostics::RustDiagnosticsParser),
         Box::new(rust_test::RustTestParser),
+        Box::new(biome::BiomeParser),
     ]
 }
 

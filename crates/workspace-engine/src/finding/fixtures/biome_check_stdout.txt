@@ -1,0 +1,7 @@
+
+> fix@0.0.0 lint:web
+> biome check
+
+Checked 5 files in 59ms. No fixes applied.
+Found 6 errors.
+Found 2 warnings.

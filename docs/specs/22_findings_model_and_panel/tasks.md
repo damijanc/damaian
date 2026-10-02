@@ -14,7 +14,7 @@ decisions it left open in [`context.md`](context.md)
 | 2 · Parser trait, dispatch with fall-through, generic parser | Done 2026-09-30 | Landed as sketched (rustfmt only): `FindingSource::Command`, `FindingParser`, `default_parsers()` (still empty), `findings_from_execution`, the generic fallback, and `GENERIC_DETAIL_LINES`. `bound_summary` now calls `first_non_empty_line`. Before the implementation the dispatch tests failed to compile (`E0405`/`E0425`). After it, `test(finding::tests) + test(finding::dispatch_tests)` passed 32/32. Each mutation failed its named test: (1) generic only when no parser matched failed only `a_matching_parser_that_extracts_nothing_falls_through_…`, while `a_failure_no_parser_matches_…` still passed; (2) `(Exited, None)`→`Passed` failed `a_signal_kill_is_a_failure`; (3) `Cancelled`→`Failed` failed `a_cancelled_execution_gets_no_generic_finding`; (4) head-not-tail `last_lines` failed `the_generic_details_keep_the_last_lines_…`; (5) dropping the verdict check failed `a_passing_execution_with_no_parser_yields_nothing`, plus the cancelled test and `a_passing_execution_whose_parser_finds_nothing_…`. Parser layout follows `context.md` §8.4: one file per parser under `src/finding/`. Scoped fmt, clippy `-p workspace-engine` and typos are clean. |
 | 3 · Rust diagnostics parser (`cargo build`/`check`/`clippy`) | Done 2026-10-01 | Planned on 2026-09-30 against captured cargo 1.98.0 output (`context.md` §9). The first session was lost after Step 1, and its fixtures were checked byte-identical before work resumed. `finding/rust_diagnostics.rs` landed as sketched, with only rustfmt changes. It is declared from `finding.rs`, and `RustDiagnosticsParser` is registered in `default_parsers()`. Before the implementation the tests failed to compile (`E0425` on `parse_rust_diagnostics`, `cargo_subcommand` and `RustDiagnosticsParser`). After it, `test(finding::)` passed 49/49 (16 + 16 + 17), and the Task 2 dispatch tests were unaffected. Mutations: (1) no `take_while` failed only `a_child_notes_location_is_not_borrowed_…`, as predicted. (2) The plan's two variants differ. The last `-->` *before a child header* fails nothing, because rustc prints exactly one `-->` per primary region (a secondary span in another file uses `:::`), so first and last are the same line. The last `-->` *in the whole block* failed `the_location_is_the_primary_one_…` with `13:4`, and also the no-primary-location test. (3) `is_cargo_summary` always `false` failed `cargo_summary_lines_are_not_findings`, plus `every_clippy_occurrence_…`, `default_parsers_turn_…` and `a_diagnostic_without_a_location_…`, whose counts include the summary lines. (4) No `CLIPPY_URL` branch failed `every_clippy_occurrence_gets_its_code_from_the_help_url`. (5) No `is_absolute` failed `a_location_outside_the_workspace_has_no_range`. (6) No ANSI strip failed `ansi_colour_codes_are_ignored`. (7) Ending a block only at a blank line failed nothing, as expected. The header check stays as defence against a runner that strips blank lines. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
 | 4 · Rust test parser (`cargo test`), delegating compile errors to Task 3 | Done 2026-10-01 | Planned on 2026-10-01 against captured cargo 1.98.0 `cargo test` output (`context.md` §10). The captures changed two earlier decisions. The parser returns the diagnostics **and** the test failures, because a warning and failing tests appear in the same run (§10.2 corrects §5). The dispatcher falls through to the generic finding when a failed run has no `Error` draft: a test binary that crashed after a warning otherwise reported only the warning (§10.3 amends §8.2). `cargo nextest run` is out of scope, and a failed nextest run gets one generic finding (§10.5). Landed as sketched, with only rustfmt changes. The fixtures were extracted from this file's line ranges, so they are byte-identical to the plan. `finding/rust_test.rs` is new. `rust_diagnostics.rs` gained the three summary clauses and `workspace_range`, and its `regex` is now `pub(super)`. `finding.rs` registers `RustTestParser` second and falls through on "no `Error` draft". Before the implementation the tests failed to compile (`E0425`, `E0433`, `E0422`). After it, `test(finding::)` passed 71/71 (16 + 17 + 17 + 21), with Task 3's tests unchanged. Mutations: 1, 2, 3, 5, 6, 7, 8, 9 and 10 failed exactly the tests the plan names. Mutation 4 (end a section at a blank line) failed **9**, not 8. The extra one is `a_panic_line_without_a_thread_id_still_has_its_location`, because its inline stdout also has a blank line straight after the section header. Mutation 9 spares that test because its panic line has no thread id. So the plan's "the same eight as mutation 4" is one test short, not a defect. Each mutation took about 9 minutes when run without `--lib`, because every edit to the library relinks all 21 integration-test binaries. Use `cargo nextest run -p workspace-engine --lib -E 'test(finding::)'` for mutation loops. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
-| 5 · Biome parser | Not started | |
+| 5 · Biome parser | Done 2026-10-02 | Planned in full on 2026-10-01 against captured Biome 2.5.7 output (`context.md` §11). Landed as sketched, with only rustfmt changes. The fixtures were extracted from this file's line ranges, so they are byte-identical to the plan, and `grep -c '^  $'` on the check stderr prints 28. `finding/biome.rs` is new. `finding.rs` declares `mod biome;` and registers `BiomeParser` third. Before the implementation the tests failed to compile (`E0425` on `parse_biome`/`BiomeParser`, plus `E0433`). After it, `test(finding::)` passed 89/89 (71 unchanged + 18). All eight mutations failed their named test. (1) Ending a block at a whitespace-only line failed 10 tests, `details_run_past_…` among them: the empty line after each header ends the block before its marker, so every summary falls back to the category. (2) A greedy path failed 5, including `a_lint_error_keeps_…`. (3) No OSC 8 alternative failed only `forced_colour_output_parses_the_same`. (4) Plain-only markers failed `colour_markers_map_like_plain_ones` and the forced-colour test. (5) Non-error→`Warning` failed `an_info_marker_is_info`, `a_passing_run_keeps_its_info` and the colour-marker test. (6) No `HIDDEN` check failed only `hidden_diagnostics_become_one_info_draft`. (7) Any `npm run` script failed only `does_not_match_other_commands`. (8) Skipping marker-less blocks failed only `a_block_without_a_marker_is_kept_…`. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
 | 6 · Browser findings from spec 12's `WebDiagnosticDetails` | Not started | Re-scoped 2026-09-29 by spec 12's close-out: no `entries` field (`context.md` §7.1). |
 | 7 · Recording, persistence, staleness, `Evidence::Findings` | Not started | |
 | 8 · Dismissal and the scoped repair request | Not started | |
@@ -2838,10 +2838,660 @@ Caused by:
 
 ## Task 5: Biome parser
 
-Recognises `biome check`, `npm run lint:web`, and `npm run lint` when the
-script is Biome. Extracts path, line, column, rule name (`lint/…` →
-`code`), and severity. Fixture: real `npm run lint:web` output from this
-repository with a lint error seeded into a scratch copy.
+**Requirements:** 1 (lint source), 2, and the acceptance criteria "a … lint
+error … normalise[s] into `Finding` with correct source, severity, and …
+file and range" and "no parser produces a `range` for output that contained
+no location". **Files:** create
+`crates/workspace-engine/src/finding/biome.rs` and three fixture files under
+`crates/workspace-engine/src/finding/fixtures/`. Modify `finding.rs` only to
+declare the module and register the parser. Planned in full on 2026-10-01.
+
+**Read `context.md` §11 first.** It records what real Biome 2.5.7 output looks
+like, and each rule below comes from it. Three of those rules differ from how
+the Rust parsers (§9, §10) work:
+
+- a block ends at the next `━━━` line, not at a blank line, because Biome
+  blocks contain whitespace-only lines;
+- severity comes from a marker character, not a header word;
+- a hidden-diagnostics count is read from **stdout**.
+
+**Interfaces:**
+- Consumes: `FindingParser`, `FindingDraft`, `FindingSource`, `Severity`,
+  `default_parsers` and `findings_from_execution` (`finding.rs`). Also
+  `regex` and `workspace_range(path, line, column: Option<&str>)`, which are
+  `pub(super)` in `finding/rust_diagnostics.rs` (Tasks 3–4), and
+  `CommandExecution`.
+- Produces:
+  - `pub(super) struct BiomeParser`, registered **third** in
+    `default_parsers()`, after `RustTestParser`. No command matches both
+    the Rust parsers and this one, so the order does not matter for
+    correctness. Appending simply leaves the existing order untouched.
+  - `pub(super) fn parse_biome(stderr: &str, stdout: &str) -> Vec<FindingDraft>`.
+  No later task depends on this module's other items.
+
+- [x] **Step 1: Commit the fixtures as files**
+
+  Write these three files under `crates/workspace-engine/src/finding/fixtures/`
+  **byte for byte**. Each file is the text between its fences, verbatim,
+  followed by one newline. The stdout capture starts with an empty line, and
+  both stderr captures end with one. Those empty lines are Biome's and npm's,
+  and they are part of the fixtures. Several lines in `biome_check_stderr.txt` and
+  `biome_info_stderr.txt` consist of exactly two spaces. Those are Biome's,
+  and the parser's block rule depends on them (`context.md` §11), so do not
+  let an editor strip trailing whitespace. After writing, check with
+  `grep -c '^  $' crates/workspace-engine/src/finding/fixtures/biome_check_stderr.txt`.
+  It must print **28**.
+
+  `biome_check_stderr.txt` is `npm run lint:web` on the seeded scratch tree,
+  stderr. It exits 1.
+
+  ````text
+crates/desktop-shell/static/app.js:2:9 lint/correctness/noUnusedVariables  FIXABLE  ━━━━━━━━━━━━━━━━
+
+  ! This variable unused is unused.
+  
+    1 │ function load(value) {
+  > 2 │   const unused = 1;
+      │         ^^^^^^
+    3 │   if (value == null) {
+    4 │     return 0;
+  
+  i Unused variables are often the result of typos, incomplete refactors, or other sources of bugs.
+  
+  i Unsafe fix: If this is intentional, prepend unused with an underscore.
+  
+     1  1 │   function load(value) {
+     2    │ - ··const·unused·=·1;
+        2 │ + ··const·_unused·=·1;
+     3  3 │     if (value == null) {
+     4  4 │       return 0;
+  
+
+scripts/parse.mjs:1:7 lint/correctness/noUnusedVariables  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! This variable broken is unused.
+  
+  > 1 │ const broken = (;
+      │       ^^^^^^
+    2 │ 
+  
+  i Unused variables are often the result of typos, incomplete refactors, or other sources of bugs.
+  
+  i Unsafe fix: If this is intentional, prepend broken with an underscore.
+  
+    1   │ - const·broken·=·(;
+      1 │ + const·_broken·=·(;
+    2 2 │   
+  
+
+crates/desktop-shell/static/app.js:6:3 lint/suspicious/noDebugger  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × This is an unexpected use of the debugger statement.
+  
+    4 │     return 0;
+    5 │   }
+  > 6 │   debugger;
+      │   ^^^^^^^^^
+    7 │   return value;
+    8 │ }
+  
+  i Unsafe fix: Remove debugger statement
+  
+     4 4 │       return 0;
+     5 5 │     }
+     6   │ - ··debugger;
+     7 6 │     return value;
+     8 7 │   }
+  
+
+crates/desktop-shell/static/styles.css:1:18 lint/suspicious/noDuplicateProperties ━━━━━━━━━━━━━━━━━━
+
+  × Duplicate properties can lead to unexpected behavior and may override previous declarations unintentionally.
+  
+  > 1 │ .a { color: red; color: blue; }
+      │                  ^^^^^
+    2 │ 
+  
+  i color is already defined here.
+  
+  > 1 │ .a { color: red; color: blue; }
+      │      ^^^^^
+    2 │ 
+  
+  i Remove or rename the duplicate property to ensure consistent styling.
+  
+
+crates/desktop-shell/static/styles.css format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+    1   │ - .a·{·color:·red;·color:·blue;·}
+      1 │ + .a·{
+      2 │ + ··color:·red;
+      3 │ + ··color:·blue;
+      4 │ + }
+    2 5 │   
+  
+
+scripts/format.mjs format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+    1   │ - export·const·x·=·{a:1,
+    2   │ - ·b:2}
+      1 │ + export·const·x·=·{·a:·1,·b:·2·};
+    3 2 │   
+  
+
+scripts/parse.mjs:1:17 parse ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × expected `)` but instead found `;`
+  
+  > 1 │ const broken = (;
+      │                 ^
+    2 │ 
+  
+  i Remove ;
+  
+
+scripts/parse.mjs format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Code formatting aborted due to parsing errors. To format code with errors, enable the 'formatter.formatWithErrors' option.
+  
+
+check ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Some errors were emitted while running checks.
+  
+
+  ````
+
+  `biome_check_stdout.txt` is the same run's stdout, including `npm run`'s
+  banner.
+
+  ````text
+
+> fix@0.0.0 lint:web
+> biome check
+
+Checked 5 files in 59ms. No fixes applied.
+Found 6 errors.
+Found 2 warnings.
+  ````
+
+  `biome_info_stderr.txt` is `npm run lint:web` on this repository at the
+  time of planning, stderr. It exits 0, with one `info`.
+
+  ````text
+scripts/check-spec-status.mjs:136:7 lint/style/useTemplate  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  i Template literals are preferred over string concatenation.
+  
+    134 │ console.error(
+    135 │   problems.length === 1
+  > 136 │     ? "Spec status check " + label + ": 1 dependency line disagrees with the spec it names.\n"
+        │       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    137 │     : `Spec status check ${label}: ${problems.length} dependency lines disagree with the specs they name.\n`,
+    138 │ );
+  
+  i Unsafe fix: Use a template literal.
+  
+    134 134 │   console.error(
+    135 135 │     problems.length === 1
+    136     │ - ····?·"Spec·status·check·"·+·label·+·":·1·dependency·line·disagrees·with·the·spec·it·names.\n"
+        136 │ + ····?·`Spec·status·check·${label}:·1·dependency·line·disagrees·with·the·spec·it·names.\n`
+    137 137 │       : `Spec status check ${label}: ${problems.length} dependency lines disagree with the specs they name.\n`,
+    138 138 │   );
+  
+
+  ````
+
+- [x] **Step 2: Declare the module and write the failing tests**
+
+  In `finding.rs`, add `mod biome;` above `mod rust_diagnostics;`. Then create
+  `crates/workspace-engine/src/finding/biome.rs` containing only the test
+  module:
+
+  ```rust
+  #[cfg(test)]
+  mod tests {
+      use super::*;
+      use crate::command_policy::CommandRisk;
+      use crate::command_runner::{CommandExecution, CommandTermination};
+      use crate::finding::{SourceRange, default_parsers, findings_from_execution};
+      use crate::secret_scanner::SecretScanner;
+
+      const CHECK_STDERR: &str = include_str!("fixtures/biome_check_stderr.txt");
+      const CHECK_STDOUT: &str = include_str!("fixtures/biome_check_stdout.txt");
+      const INFO_STDERR: &str = include_str!("fixtures/biome_info_stderr.txt");
+
+      fn range(path: &str, line: u32, column: u32) -> Option<SourceRange> {
+          Some(SourceRange {
+              path: path.to_string(),
+              start_line: line,
+              start_column: Some(column),
+              end_line: None,
+              end_column: None,
+          })
+      }
+
+      fn execution(command: &str, exit_code: i32, stdout: &str, stderr: &str) -> CommandExecution {
+          CommandExecution {
+              id: "cmd_test".to_string(),
+              command: command.to_string(),
+              working_directory: "/repo".to_string(),
+              risk: CommandRisk::Low,
+              approved_by: None,
+              started_at_ms: 1,
+              completed_at_ms: 2,
+              exit_code: Some(exit_code),
+              termination: CommandTermination::Exited,
+              stdout: stdout.to_string(),
+              stderr: stderr.to_string(),
+          }
+      }
+
+      fn check() -> Vec<FindingDraft> {
+          parse_biome(CHECK_STDERR, CHECK_STDOUT)
+      }
+
+      #[test]
+      fn a_lint_error_keeps_its_rule_location_and_message() {
+          let drafts = check();
+          let debugger = &drafts[2];
+          assert_eq!(debugger.source, FindingSource::Lint);
+          assert_eq!(debugger.severity, Severity::Error);
+          assert_eq!(debugger.code.as_deref(), Some("lint/suspicious/noDebugger"));
+          assert_eq!(debugger.summary, "This is an unexpected use of the debugger statement.");
+          assert_eq!(debugger.range, range("crates/desktop-shell/static/app.js", 6, 3));
+      }
+
+      #[test]
+      fn a_warning_marker_is_a_warning() {
+          let unused = &check()[0];
+          assert_eq!(unused.severity, Severity::Warning);
+          assert_eq!(unused.code.as_deref(), Some("lint/correctness/noUnusedVariables"));
+          assert_eq!(unused.summary, "This variable unused is unused.");
+          assert_eq!(unused.range, range("crates/desktop-shell/static/app.js", 2, 9));
+      }
+
+      /// This repository's own output at planning time (`context.md` §11).
+      #[test]
+      fn an_info_marker_is_info() {
+          let drafts = parse_biome(INFO_STDERR, "");
+          assert_eq!(drafts.len(), 1, "{drafts:?}");
+          assert_eq!(drafts[0].severity, Severity::Info);
+          assert_eq!(drafts[0].code.as_deref(), Some("lint/style/useTemplate"));
+          assert_eq!(drafts[0].range, range("scripts/check-spec-status.mjs", 136, 7));
+      }
+
+      /// Biome's own stdout says "Found 6 errors. Found 2 warnings." The
+      /// marker mapping must agree with it (`context.md` §11).
+      #[test]
+      fn one_draft_per_diagnostic_agreeing_with_biomes_own_count() {
+          let drafts = check();
+          let errors = drafts.iter().filter(|d| d.severity == Severity::Error).count();
+          let warnings = drafts.iter().filter(|d| d.severity == Severity::Warning).count();
+          assert_eq!((drafts.len(), errors, warnings), (8, 6, 2), "{drafts:#?}");
+          assert!(CHECK_STDOUT.contains("Found 6 errors.") && CHECK_STDOUT.contains("Found 2 warnings."));
+      }
+
+      #[test]
+      fn a_format_diagnostic_has_no_range() {
+          let drafts = check();
+          let styles = &drafts[4];
+          assert_eq!(styles.code.as_deref(), Some("format"));
+          assert_eq!(styles.severity, Severity::Error);
+          assert_eq!(styles.summary, "Formatter would have printed the following content:");
+          assert_eq!(styles.range, None, "a location was invented for a whole-file diff");
+      }
+
+      #[test]
+      fn a_parse_error_keeps_its_location() {
+          let parse = &check()[6];
+          assert_eq!(parse.code.as_deref(), Some("parse"));
+          assert_eq!(parse.summary, "expected `)` but instead found `;`");
+          assert_eq!(parse.range, range("scripts/parse.mjs", 1, 17));
+      }
+
+      #[test]
+      fn the_closing_check_block_is_not_a_finding() {
+          assert!(
+              check().iter().all(|d| !d.summary.contains("Some errors were emitted")),
+              "the run summary became a finding"
+          );
+      }
+
+      /// Biome blocks contain whitespace-only lines, so a block must run to
+      /// the next `━━━` header (`context.md` §11).
+      #[test]
+      fn details_run_past_whitespace_only_lines_to_the_next_header() {
+          let drafts = check();
+          let details = drafts[0].details.as_deref().expect("details");
+          assert!(details.starts_with("crates/desktop-shell/static/app.js:2:9 "), "{details}");
+          assert!(details.contains("const·_unused·=·1;"), "the fix was cut off: {details}");
+          assert!(!details.contains("scripts/parse.mjs"), "the next block leaked in: {details}");
+          assert!(!details.ends_with(' ') && !details.ends_with('\n'), "{details:?}");
+      }
+
+      #[test]
+      fn hidden_diagnostics_become_one_info_draft() {
+          let stdout = "The number of diagnostics exceeds the limit allowed. Use --max-diagnostics to increase it.\nDiagnostics not shown: 9.\nChecked 27 files in 4ms. No fixes applied.\nFound 28 errors.\n";
+          let drafts = parse_biome(INFO_STDERR, stdout);
+          assert_eq!(drafts.len(), 2, "{drafts:?}");
+          let hidden = &drafts[1];
+          assert_eq!(hidden.severity, Severity::Info);
+          assert!(hidden.summary.contains('9'), "{}", hidden.summary);
+          assert_eq!(hidden.range, None);
+      }
+
+      /// Captured with `--colors=force` (`context.md` §11): CSI colours, an
+      /// OSC 8 hyperlink around the category, and `⚠` for the warning marker.
+      #[test]
+      fn forced_colour_output_parses_the_same() {
+          let stderr = "\x1b[0mcrates/desktop-shell/static/app.js\x1b[0m\x1b[0m:\x1b[0m\x1b[0m2\x1b[0m\x1b[0m:\x1b[0m\x1b[0m9\x1b[0m\x1b[0m \x1b[0m\x1b[0m\x1b]8;;https://biomejs.dev/linter/rules/no-unused-variables\x1b\\lint/correctness/noUnusedVariables\x1b]8;;\x1b\\\x1b[0m\x1b[0m \x1b[0m\x1b[0m\x1b[30m\x1b[47m FIXABLE \x1b[0m\x1b[0m \x1b[0m\x1b[0m━━━━━━━━━━━━━━━━\x1b[0m\x1b[0m\n\n\x1b[0m\x1b[0m  \x1b[0m\x1b[0m\x1b[1m\x1b[33m⚠\x1b[0m\x1b[0m \x1b[0m\x1b[0m\x1b[33mThis variable \x1b[0m\x1b[0m\x1b[1m\x1b[33munused\x1b[0m\x1b[0m\x1b[33m is unused.\x1b[0m\x1b[0m\n";
+          let drafts = parse_biome(stderr, "");
+          assert_eq!(drafts.len(), 1, "{drafts:?}");
+          assert_eq!(drafts[0].severity, Severity::Warning);
+          assert_eq!(drafts[0].summary, "This variable unused is unused.");
+          assert_eq!(drafts[0].code.as_deref(), Some("lint/correctness/noUnusedVariables"));
+          assert_eq!(drafts[0].range, range("crates/desktop-shell/static/app.js", 2, 9));
+      }
+
+      #[test]
+      fn colour_markers_map_like_plain_ones() {
+          for (marker, severity) in [("✖", Severity::Error), ("⚠", Severity::Warning), ("ℹ", Severity::Info)] {
+              let stderr = format!("a.js:1:1 lint/x/y ━━━━━━\n\n  {marker} message\n");
+              assert_eq!(parse_biome(&stderr, "")[0].severity, severity, "{marker}");
+          }
+      }
+
+      #[test]
+      fn an_absolute_path_has_no_range() {
+          let stderr = "/tmp/elsewhere/app.js:1:1 lint/suspicious/noDebugger ━━━━━━\n\n  × debugger\n";
+          let drafts = parse_biome(stderr, "");
+          assert_eq!(drafts.len(), 1);
+          assert_eq!(drafts[0].range, None);
+      }
+
+      #[test]
+      fn a_block_without_a_marker_is_kept_as_an_error_named_by_its_category() {
+          let stderr = "a.js:3:1 lint/x/y ━━━━━━\n\n    3 │ code\n";
+          let drafts = parse_biome(stderr, "");
+          assert_eq!(drafts.len(), 1, "a printed diagnostic was dropped");
+          assert_eq!(drafts[0].severity, Severity::Error);
+          assert_eq!(drafts[0].summary, "lint/x/y");
+      }
+
+      #[test]
+      fn matches_biome_invocations_and_npm_lint_scripts() {
+          let parser = BiomeParser;
+          for command in [
+              "biome check",
+              "npx biome check --write",
+              "./node_modules/.bin/biome lint scripts",
+              "biome ci",
+              "biome format .",
+              "npm run lint:web",
+              "npm run lint",
+              "pnpm run lint:js",
+              "yarn run lint",
+          ] {
+              assert!(parser.matches(command), "{command}");
+          }
+      }
+
+      #[test]
+      fn does_not_match_other_commands() {
+          let parser = BiomeParser;
+          for command in [
+              "npm test",
+              "npm run build",
+              "npm run lint-staged",
+              "biome --version",
+              "cargo clippy",
+              "eslint .",
+          ] {
+              assert!(!parser.matches(command), "{command}");
+          }
+      }
+
+      /// Registration, end to end through the dispatcher.
+      #[test]
+      fn default_parsers_turn_a_failed_lint_run_into_parsed_findings() {
+          let findings = findings_from_execution(
+              &execution("npm run lint:web", 1, CHECK_STDOUT, CHECK_STDERR),
+              &default_parsers(),
+              &SecretScanner::default(),
+          );
+          assert_eq!(findings.len(), 8, "{findings:?}");
+          assert!(findings.iter().all(|f| f.source() == FindingSource::Lint));
+      }
+
+      /// `context.md` §11: `npm run lint` may not be Biome at all. Output this
+      /// parser cannot read must fall through, exactly as with no parser.
+      #[test]
+      fn a_failed_lint_script_that_is_not_biome_falls_through_to_generic() {
+          let findings = findings_from_execution(
+              &execution("npm run lint", 1, "", "sh: eslint: command not found\n"),
+              &default_parsers(),
+              &SecretScanner::default(),
+          );
+          assert_eq!(findings.len(), 1, "{findings:?}");
+          assert_eq!(findings[0].source(), FindingSource::Command);
+      }
+
+      #[test]
+      fn a_passing_run_keeps_its_info() {
+          let findings = findings_from_execution(
+              &execution("npm run lint:web", 0, "", INFO_STDERR),
+              &default_parsers(),
+              &SecretScanner::default(),
+          );
+          assert_eq!(findings.len(), 1, "{findings:?}");
+          assert_eq!(findings[0].severity(), Severity::Info);
+      }
+  }
+  ```
+
+- [x] **Step 3: Run the tests and confirm they fail**
+
+  Run: `cargo nextest run -p workspace-engine -E 'test(finding::biome)'`
+  Expected: a compile failure, because `parse_biome` and `BiomeParser` are not
+  defined.
+
+- [x] **Step 4: Write the implementation**
+
+  Put this above the test module in `biome.rs`:
+
+  ```rust
+  //! Biome diagnostics: `biome check` / `lint` / `ci` / `format`, and
+  //! `npm run lint*` (spec 22 Task 5).
+  //!
+  //! Severity is Biome's marker on a diagnostic's first message line. `×`
+  //! (`✖` under forced colour) is `Error`, `!` (`⚠`) is `Warning`, and `i`
+  //! (`ℹ`) is `Info`. That mapping agrees with Biome's own "Found N errors"
+  //! count (proposal §5.2). Every Biome finding is `Lint`, `format` and `parse`
+  //! included. The code is the full category, such as
+  //! `lint/suspicious/noDebugger`. Every rule here comes from real output
+  //! recorded in `docs/specs/22_findings_model_and_panel/context.md` §11.
+
+  use super::rust_diagnostics::{regex, workspace_range};
+  use super::{FindingDraft, FindingParser, FindingSource, Severity};
+  use crate::command_runner::CommandExecution;
+  use regex::Regex;
+  use std::sync::LazyLock;
+
+  /// Any line ending in a `━━━` rule. A Biome block runs from its header to
+  /// the next of these, because blocks contain whitespace-only lines.
+  static ANY_HEADER: LazyLock<Regex> = LazyLock::new(|| regex(r"^\S.*━{3,}\s*$"));
+  /// `path[:line:col] category [FIXABLE] ━━━`. The path is lazy so it cannot
+  /// swallow the `:line:col`.
+  static DIAGNOSTIC: LazyLock<Regex> = LazyLock::new(|| {
+      regex(r"^(\S+?)(?::(\d+):(\d+))? ([A-Za-z][A-Za-z0-9/_-]*)(?:\s+FIXABLE)?\s+━{3,}\s*$")
+  });
+  static MARKER: LazyLock<Regex> = LazyLock::new(|| regex(r"^  ([×✖!⚠iℹ]) (.+)$"));
+  static HIDDEN: LazyLock<Regex> = LazyLock::new(|| regex(r"Diagnostics not shown: (\d+)\."));
+  /// CSI colour codes and OSC 8 hyperlinks, both present under `--colors=force`.
+  static ESCAPES: LazyLock<Regex> =
+      LazyLock::new(|| regex(r"\x1b\[[0-9;]*m|\x1b\]8;;[^\x1b]*\x1b\\"));
+
+  pub(super) struct BiomeParser;
+
+  impl FindingParser for BiomeParser {
+      fn source(&self) -> FindingSource {
+          FindingSource::Lint
+      }
+
+      /// A `biome` subcommand, or an `npm`/`pnpm`/`yarn run lint[:…]` script.
+      /// A lint script may not be Biome. If it is not, `parse` finds nothing
+      /// and the run falls through to its generic finding (`context.md` §11).
+      fn matches(&self, command: &str) -> bool {
+          let tokens: Vec<&str> = command.split_whitespace().collect();
+          let biome = tokens.windows(2).any(|pair| {
+              (pair[0] == "biome" || pair[0].ends_with("/biome"))
+                  && matches!(pair[1], "check" | "lint" | "ci" | "format")
+          });
+          let lint_script = tokens.windows(3).any(|words| {
+              matches!(words[0], "npm" | "pnpm" | "yarn")
+                  && words[1] == "run"
+                  && (words[2] == "lint" || words[2].starts_with("lint:"))
+          });
+          biome || lint_script
+      }
+
+      fn parse(&self, execution: &CommandExecution) -> Vec<FindingDraft> {
+          parse_biome(&execution.stderr, &execution.stdout)
+      }
+  }
+
+  /// Diagnostics from stderr, plus one `Info` draft when stdout says Biome
+  /// hid some above its display cap (`context.md` §11).
+  pub(super) fn parse_biome(stderr: &str, stdout: &str) -> Vec<FindingDraft> {
+      let clean = ESCAPES.replace_all(stderr, "");
+      let lines: Vec<&str> = clean.lines().collect();
+      let mut drafts = Vec::new();
+      for (index, line) in lines.iter().enumerate() {
+          let Some(header) = DIAGNOSTIC.captures(line) else {
+              continue;
+          };
+          let end = lines[index + 1..]
+              .iter()
+              .position(|line| ANY_HEADER.is_match(line))
+              .map_or(lines.len(), |offset| index + 1 + offset);
+          let block = &lines[index..end];
+          let kept = block
+              .iter()
+              .rposition(|line| !line.trim().is_empty())
+              .map_or(1, |last| last + 1);
+          let block = &block[..kept];
+
+          let category = &header[4];
+          let (severity, summary) = block[1..]
+              .iter()
+              .find_map(|line| MARKER.captures(line))
+              .map(|marker| (severity_of(&marker[1]), marker[2].trim().to_string()))
+              .unwrap_or_else(|| (Severity::Error, category.to_string()));
+          let range = header.get(2).and_then(|line| {
+              workspace_range(&header[1], line.as_str(), header.get(3).map(|c| c.as_str()))
+          });
+          drafts.push(FindingDraft {
+              source: FindingSource::Lint,
+              severity,
+              summary,
+              details: Some(block.join("\n")),
+              range,
+              code: Some(category.to_string()),
+          });
+      }
+
+      let stdout = ESCAPES.replace_all(stdout, "");
+      if let Some(hidden) = HIDDEN.captures(&stdout) {
+          drafts.push(FindingDraft {
+              source: FindingSource::Lint,
+              severity: Severity::Info,
+              summary: format!(
+                  "Biome did not show {} more diagnostics; rerun with --max-diagnostics to see them",
+                  &hidden[1]
+              ),
+              details: None,
+              range: None,
+              code: None,
+          });
+      }
+      drafts
+  }
+
+  fn severity_of(marker: &str) -> Severity {
+      match marker {
+          "×" | "✖" => Severity::Error,
+          "!" | "⚠" => Severity::Warning,
+          _ => Severity::Info,
+      }
+  }
+  ```
+
+  In `finding.rs`, register the parser last:
+
+  ```rust
+  pub fn default_parsers() -> Vec<Box<dyn FindingParser>> {
+      vec![
+          Box::new(rust_diagnostics::RustDiagnosticsParser),
+          Box::new(rust_test::RustTestParser),
+          Box::new(biome::BiomeParser),
+      ]
+  }
+  ```
+
+  If a test and this sketch disagree, the test wins, because the tests come
+  from the captured fixtures. Record any deviation in the progress row.
+
+- [x] **Step 5: Run the tests and confirm they pass**
+
+  Run: `cargo nextest run -p workspace-engine -E 'test(finding::)'`
+  Expected: 89 pass. That is 71 from Tasks 1–4, all unchanged, plus 18 in
+  `biome::tests`. Count them.
+
+- [x] **Step 6: Mutation-test the rules that came from real output**
+
+  Apply each change on its own, confirm the named test fails, then revert it:
+
+  1. End a block at the first whitespace-only line, as the Rust parsers do.
+     `details_run_past_whitespace_only_lines_to_the_next_header` must fail.
+  2. Make the path greedy (`(\S+)` instead of `(\S+?)`).
+     `a_lint_error_keeps_its_rule_location_and_message` must fail. The path
+     swallows `:6:3`, and the range becomes `None`.
+  3. Drop the OSC 8 alternative from `ESCAPES`.
+     `forced_colour_output_parses_the_same` must fail, because the header
+     no longer matches.
+  4. Map only `×`, `!` and `i` in `severity_of`.
+     `colour_markers_map_like_plain_ones` must fail on `✖` or `⚠`.
+  5. Map every non-error marker to `Warning`.
+     `an_info_marker_is_info` must fail.
+  6. Remove the `HIDDEN` stdout check.
+     `hidden_diagnostics_become_one_info_draft` must fail.
+  7. Match any `npm run` script.
+     `does_not_match_other_commands` must fail on `npm run build`.
+  8. Drop the `unwrap_or_else` fallback and skip a block with no marker.
+     `a_block_without_a_marker_is_kept_…` must fail.
+
+  Record all eight results in the progress row.
+
+- [x] **Step 7: Scoped checks**
+
+  ```bash
+  cargo fmt --all -- --check
+  cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
+  cargo nextest run -p workspace-engine -E 'test(finding::)'
+  typos docs/specs/22_findings_model_and_panel crates/workspace-engine/src/finding.rs crates/workspace-engine/src/finding
+  ```
+
+  If `typos` flags a word inside a fixture, it is Biome's text, not ours.
+  Follow Task 3's rule: exclude the fixture directory in `_typos.toml`, with a
+  comment, rather than editing captured output.
+
+- [x] **Step 8: Update this file's Task 5 row, then show the change and the
+  check results and ask before committing**
 
 ## Task 6: Browser findings
 

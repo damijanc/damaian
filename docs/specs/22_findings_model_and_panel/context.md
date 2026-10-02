@@ -494,3 +494,75 @@ run gets one generic finding, compile errors included. The reasons:
 A later nextest parser could read the `FAIL` lines for names and the indented
 `panicked at` lines for locations. It would also need the dispatcher's
 generic fallback, which still applies, because of the fail-fast cancellation.
+
+## 11. What real Biome output looks like (Task 5, 2026-10-01)
+
+Captured with Biome 2.5.7, which is this repository's pinned version. There
+are three captures:
+
+1. `npm run lint:web` on this repository as it is. It exits 0 with one
+   `info` diagnostic, the `useTemplate` one in `scripts/check-spec-status.mjs`
+   that spec 20's notes mention.
+2. `npm run lint:web` on a scratch copy of this repository's `biome.json`,
+   with seeded problems: an unused variable, a `debugger`, a duplicate CSS
+   property, two unformatted files and a syntax error. It exits 1.
+3. The same tree with 25 more seeded files, to see what Biome does above its
+   default cap of 20 diagnostics.
+
+The fixtures are captures 1 and 2. Capture 2's paths are relative to the
+scratch root, so nothing needed scrubbing. What the captures showed:
+
+- **Diagnostics go to stderr. The summary goes to stdout.** That summary is
+  `Checked 5 files …`, `Found 6 errors.` and `Found 2 warnings.`. `npm run`
+  adds only its `> name@version script` banner to stdout. On failure it adds
+  nothing to stderr. The seeded stderr is byte-identical whether Biome runs
+  through `npm run` or directly.
+- **A header is `path:line:col category [FIXABLE] ━━━…`**, for example
+  `crates/desktop-shell/static/app.js:6:3 lint/suspicious/noDebugger  FIXABLE  ━━━`.
+  The category is the rule's full name, and becomes `code`. A `format`
+  diagnostic has **no location**:
+  `crates/desktop-shell/static/styles.css format ━━━`. Its body is a diff of
+  the whole file, so `range` is `None` and the summary is Biome's own
+  "Formatter would have printed the following content:". A `parse`
+  diagnostic has a location: `scripts/parse.mjs:1:17 parse ━━━`.
+- **Blocks contain lines that are only whitespace** (`"  "`). Unlike rustc's
+  blocks (§9), Biome's can't end at a blank line. **Decision:** a block runs
+  from its header to the next line that ends in a `━━━` rule. Trailing
+  whitespace-only lines are trimmed from its details.
+- **Severity is the marker on the block's first message line.** That is
+  `  × ` for an error, `  ! ` for a warning, and `  i ` for info. Later `i`
+  lines in the same block are hints, not more findings. Biome's
+  "Found 6 errors / 2 warnings" agrees with these markers, so the mapping is
+  Biome's own, not a judgement (§5.2). A block with no marker line is
+  recorded as `Error` with the category as its summary. A header only appears
+  for a problem, and dropping it would lose a failure.
+- **The run ends with a `check ━━━` block,** "Some errors were emitted while
+  running checks". It is a header with no path and no category, so the
+  diagnostic header pattern does not match it. It still ends the previous
+  block, which is why block ends use the broader "any `━━━` line" rule.
+- **Every Biome finding is `Lint`.** That includes `format` and `parse`,
+  because Biome reported them as a check, not a compiler.
+- **Above 20 diagnostics, Biome stops printing them.** It reports
+  `The number of diagnostics exceeds the limit allowed. Use --max-diagnostics
+  to increase it.` and `Diagnostics not shown: 9.`, **on stdout**. The
+  `Found 28 errors` count still includes the hidden ones. **Decision:** the
+  parser adds one `Info` draft naming the hidden count. Otherwise nine real
+  failures would vanish without trace, which is the loss §5.3's fall-through
+  exists to prevent. It is `Info`, not `Error`, because Biome does not say what
+  the hidden diagnostics were. The shown errors already make the run's
+  failure addressable.
+- **Paths are relative to the directory Biome ran in,** which is the
+  repository root for `npm run`. An absolute path gets no range, through the
+  same `workspace_range` that Tasks 3 and 4 use. Task 7 resolves the rest.
+- **Forced colour (`--colors=force`) changes more than rustc's colour does
+  (§9).** Besides CSI colour codes, it wraps the category in an OSC 8
+  hyperlink (`\x1b]8;;https://biomejs.dev/…\x1b\\`). It also swaps the
+  markers for `✖`, `⚠` and `ℹ`. The runner pipes output, so neither normally
+  appears. The parser strips both escape forms and accepts both marker sets.
+- **Matching.** The parser matches a `biome` invocation (`check`, `lint`,
+  `ci` or `format`), and `npm`/`pnpm`/`yarn run lint` or `run lint:*`. It
+  cannot read `package.json` to learn whether a lint script really runs Biome.
+  Matching by name is safe because of the fall-through: an ESLint
+  `npm run lint` failure yields no Biome drafts, so it gets one generic
+  finding, which is exactly what it would get with no parser. No shipped
+  parser is displaced.
