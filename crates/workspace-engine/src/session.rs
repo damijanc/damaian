@@ -1386,6 +1386,68 @@ impl SessionStore {
         Ok(records)
     }
 
+    /// Appends one finding (spec 22 §5.7). A `Finding` is redacted by
+    /// construction, so this store writes it as given.
+    pub fn record_finding(
+        &self,
+        session_id: &str,
+        finding: &crate::finding::Finding,
+    ) -> Result<()> {
+        let payload = serde_json::to_string(finding).map_err(|error| {
+            crate::error::ClientError::Io(format!("finding serialization: {error}"))
+        })?;
+        self.append_session_event(session_id, "finding_recorded", &payload)
+    }
+
+    /// Records the user's decision about a finding. `Stale` is derived on
+    /// read and never stored, and an id this session never recorded is
+    /// refused before anything is appended (spec 22 `context.md` §13.2).
+    pub fn set_finding_status(
+        &self,
+        session_id: &str,
+        finding_id: &str,
+        status: crate::finding::FindingStatus,
+    ) -> Result<()> {
+        if status == crate::finding::FindingStatus::Stale {
+            return Err(crate::error::ClientError::InvalidInput(
+                "a finding becomes stale when its file changes; it cannot be set stale".to_string(),
+            ));
+        }
+        let content = fs::read_to_string(self.session_log_path(session_id)).unwrap_or_default();
+        if !replay_findings(&content)
+            .iter()
+            .any(|finding| finding.id() == finding_id)
+        {
+            return Err(crate::error::ClientError::InvalidInput(format!(
+                "no finding {finding_id} in session {session_id}"
+            )));
+        }
+        let payload = serde_json::json!({ "findingId": finding_id, "status": status }).to_string();
+        self.append_session_event(session_id, "finding_status_changed", &payload)
+    }
+
+    /// Every finding in the session, in record order, with the newest status
+    /// applied and `Stale` derived against `repository_root` (spec 22
+    /// `context.md` §1, §13.2). Only an `Open` finding is checked.
+    pub fn read_findings(
+        &self,
+        session_id: &str,
+        repository_root: &Path,
+    ) -> Result<Vec<crate::finding::Finding>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(Vec::new());
+        };
+        let mut findings = replay_findings(&content);
+        for finding in &mut findings {
+            if finding.status() == crate::finding::FindingStatus::Open
+                && finding_is_stale(finding, repository_root)
+            {
+                finding.set_status(crate::finding::FindingStatus::Stale);
+            }
+        }
+        Ok(findings)
+    }
+
     /// Records that the user reviewed this task's plan and let the work go
     /// ahead. Spec 21 §5.5.
     ///
@@ -2038,6 +2100,53 @@ fn active_events(content: &str) -> Vec<SessionEvent> {
         .collect()
 }
 
+/// Findings as recorded, with their newest status change applied. Staleness
+/// is not derived here, so `set_finding_status` can use this to check that
+/// an id exists.
+fn replay_findings(content: &str) -> Vec<crate::finding::Finding> {
+    let mut findings: Vec<crate::finding::Finding> = Vec::new();
+    for event in active_events(content) {
+        match event.event_type.as_str() {
+            "finding_recorded" => {
+                if let Ok(finding) =
+                    serde_json::from_value::<crate::finding::Finding>(event.payload)
+                    && !findings.iter().any(|known| known.id() == finding.id())
+                {
+                    findings.push(finding);
+                }
+            }
+            "finding_status_changed" => {
+                let id = event
+                    .payload
+                    .get("findingId")
+                    .and_then(serde_json::Value::as_str);
+                let status = event.payload.get("status").cloned().and_then(|status| {
+                    serde_json::from_value::<crate::finding::FindingStatus>(status).ok()
+                });
+                if let (Some(id), Some(status)) = (id, status)
+                    && let Some(finding) = findings.iter_mut().find(|finding| finding.id() == id)
+                {
+                    finding.set_status(status);
+                }
+            }
+            _ => {}
+        }
+    }
+    findings
+}
+
+/// Stale only when a hash was recorded and the file now differs or is
+/// gone. No range or no hash means it cannot be judged (`context.md` §1).
+fn finding_is_stale(finding: &crate::finding::Finding, repository_root: &Path) -> bool {
+    let (Some(range), Some(recorded)) = (finding.range(), finding.file_hash()) else {
+        return false;
+    };
+    match crate::hash::file_hash(repository_root.join(&range.path)) {
+        Ok(current) => current != recorded,
+        Err(_) => true,
+    }
+}
+
 fn parse_session_log(content: &str) -> Option<Session> {
     let (events, _) = parsed_events(content);
     events
@@ -2350,5 +2459,312 @@ mod tests {
         let store = SessionStore::new(temp_data_dir("missing"));
 
         assert_eq!(store.session_mode("never_created"), SessionMode::Code);
+    }
+
+    use crate::finding::{
+        Finding, FindingDraft, FindingSource, FindingStatus, Severity, SourceRange,
+    };
+
+    fn repo_with(name: &str, file: &str, content: &str) -> PathBuf {
+        let root = temp_data_dir(&format!("findings-repo-{name}"));
+        fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
+        fs::write(root.join(file), content).unwrap();
+        root
+    }
+
+    fn finding(summary: &str, range: Option<&str>) -> Finding {
+        Finding::new(
+            FindingDraft {
+                source: FindingSource::Compiler,
+                severity: Severity::Error,
+                summary: summary.to_string(),
+                details: None,
+                range: range.map(|path| SourceRange {
+                    path: path.to_string(),
+                    start_line: 1,
+                    start_column: None,
+                    end_line: None,
+                    end_column: None,
+                }),
+                code: None,
+            },
+            &SecretScanner::default(),
+        )
+    }
+
+    /// A finding on `file` with the file's current hash, as Task 8 records it.
+    fn hashed_finding(root: &Path, file: &str) -> Finding {
+        finding("mismatched types", Some(file))
+            .with_file_hash(crate::hash::file_hash(root.join(file)).unwrap())
+    }
+
+    fn store_and_session(name: &str) -> (SessionStore, Session) {
+        let store = SessionStore::new(temp_data_dir(&format!("findings-{name}")));
+        let session = store.create_session("repo_1", "Findings").unwrap();
+        (store, session)
+    }
+
+    #[test]
+    fn a_session_without_findings_reads_empty() {
+        let (store, session) = store_and_session("empty");
+        assert!(
+            store
+                .read_findings(&session.id, Path::new("/nonexistent"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_recorded_finding_reads_back_unchanged() {
+        let (store, session) = store_and_session("round-trip");
+        let recorded = finding("it broke", None)
+            .with_task_id("task_1")
+            .with_origin_ref("cmd_1");
+        store.record_finding(&session.id, &recorded).unwrap();
+        let read = store
+            .read_findings(&session.id, Path::new("/nonexistent"))
+            .unwrap();
+        assert_eq!(read, vec![recorded]);
+    }
+
+    #[test]
+    fn findings_read_back_in_record_order() {
+        let (store, session) = store_and_session("order");
+        for summary in ["first", "second", "third"] {
+            store
+                .record_finding(&session.id, &finding(summary, None))
+                .unwrap();
+        }
+        let read = store
+            .read_findings(&session.id, Path::new("/nonexistent"))
+            .unwrap();
+        let summaries: Vec<_> = read.iter().map(Finding::summary).collect();
+        assert_eq!(summaries, ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn the_newest_status_change_wins() {
+        let (store, session) = store_and_session("newest");
+        let recorded = finding("x", None);
+        store.record_finding(&session.id, &recorded).unwrap();
+        let status = |store: &SessionStore| {
+            store
+                .read_findings(&session.id, Path::new("/nonexistent"))
+                .unwrap()[0]
+                .status()
+        };
+        store
+            .set_finding_status(&session.id, recorded.id(), FindingStatus::Dismissed)
+            .unwrap();
+        assert_eq!(status(&store), FindingStatus::Dismissed);
+        store
+            .set_finding_status(&session.id, recorded.id(), FindingStatus::Fixed)
+            .unwrap();
+        assert_eq!(status(&store), FindingStatus::Fixed);
+        store
+            .set_finding_status(&session.id, recorded.id(), FindingStatus::Open)
+            .unwrap();
+        assert_eq!(status(&store), FindingStatus::Open);
+    }
+
+    /// Acceptance criterion: findings survive a restart with their statuses.
+    #[test]
+    fn findings_and_their_statuses_survive_a_new_store_over_the_same_data_dir() {
+        let data_dir = temp_data_dir("findings-restart");
+        let first = SessionStore::new(&data_dir);
+        let session = first.create_session("repo_1", "Before restart").unwrap();
+        let kept = finding("kept", None);
+        let dismissed = finding("dismissed", None);
+        first.record_finding(&session.id, &kept).unwrap();
+        first.record_finding(&session.id, &dismissed).unwrap();
+        first
+            .set_finding_status(&session.id, dismissed.id(), FindingStatus::Dismissed)
+            .unwrap();
+        drop(first);
+
+        let second = SessionStore::new(&data_dir);
+        let read = second
+            .read_findings(&session.id, Path::new("/nonexistent"))
+            .unwrap();
+        let statuses: Vec<_> = read.iter().map(|f| (f.summary(), f.status())).collect();
+        assert_eq!(
+            statuses,
+            [
+                ("kept", FindingStatus::Open),
+                ("dismissed", FindingStatus::Dismissed)
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unchanged_file_keeps_its_finding_open() {
+        let root = repo_with("unchanged", "src/lib.rs", "fn a() {}\n");
+        let (store, session) = store_and_session("unchanged");
+        store
+            .record_finding(&session.id, &hashed_finding(&root, "src/lib.rs"))
+            .unwrap();
+        assert_eq!(
+            store.read_findings(&session.id, &root).unwrap()[0].status(),
+            FindingStatus::Open
+        );
+    }
+
+    /// Acceptance criterion, and `context.md` §1.
+    #[test]
+    fn a_changed_file_makes_its_finding_stale() {
+        let root = repo_with("changed", "src/lib.rs", "fn a() {}\n");
+        let (store, session) = store_and_session("changed");
+        store
+            .record_finding(&session.id, &hashed_finding(&root, "src/lib.rs"))
+            .unwrap();
+        fs::write(root.join("src/lib.rs"), "fn a() { 1 }\n").unwrap();
+        assert_eq!(
+            store.read_findings(&session.id, &root).unwrap()[0].status(),
+            FindingStatus::Stale
+        );
+    }
+
+    #[test]
+    fn a_deleted_file_makes_its_finding_stale() {
+        let root = repo_with("deleted", "src/lib.rs", "fn a() {}\n");
+        let (store, session) = store_and_session("deleted");
+        store
+            .record_finding(&session.id, &hashed_finding(&root, "src/lib.rs"))
+            .unwrap();
+        fs::remove_file(root.join("src/lib.rs")).unwrap();
+        assert_eq!(
+            store.read_findings(&session.id, &root).unwrap()[0].status(),
+            FindingStatus::Stale
+        );
+    }
+
+    /// §13.2: derived, not stored. Reverting the file brings the finding back.
+    #[test]
+    fn staleness_is_derived_on_read_so_a_reverted_file_reopens_its_finding() {
+        let root = repo_with("reverted", "src/lib.rs", "fn a() {}\n");
+        let (store, session) = store_and_session("reverted");
+        store
+            .record_finding(&session.id, &hashed_finding(&root, "src/lib.rs"))
+            .unwrap();
+        fs::write(root.join("src/lib.rs"), "changed\n").unwrap();
+        assert_eq!(
+            store.read_findings(&session.id, &root).unwrap()[0].status(),
+            FindingStatus::Stale
+        );
+        fs::write(root.join("src/lib.rs"), "fn a() {}\n").unwrap();
+        assert_eq!(
+            store.read_findings(&session.id, &root).unwrap()[0].status(),
+            FindingStatus::Open
+        );
+    }
+
+    /// `context.md` §1: no recorded hash means staleness cannot be judged.
+    #[test]
+    fn a_finding_without_a_recorded_hash_is_never_stale() {
+        let root = repo_with("no-hash", "src/lib.rs", "fn a() {}\n");
+        let (store, session) = store_and_session("no-hash");
+        store
+            .record_finding(&session.id, &finding("x", Some("src/lib.rs")))
+            .unwrap();
+        fs::write(root.join("src/lib.rs"), "changed\n").unwrap();
+        assert_eq!(
+            store.read_findings(&session.id, &root).unwrap()[0].status(),
+            FindingStatus::Open
+        );
+    }
+
+    /// §13.2: the user's decision is not overwritten by a hash.
+    #[test]
+    fn a_dismissed_finding_is_not_re_marked_stale() {
+        let root = repo_with("dismissed", "src/lib.rs", "fn a() {}\n");
+        let (store, session) = store_and_session("dismissed");
+        let recorded = hashed_finding(&root, "src/lib.rs");
+        store.record_finding(&session.id, &recorded).unwrap();
+        store
+            .set_finding_status(&session.id, recorded.id(), FindingStatus::Dismissed)
+            .unwrap();
+        fs::write(root.join("src/lib.rs"), "changed\n").unwrap();
+        assert_eq!(
+            store.read_findings(&session.id, &root).unwrap()[0].status(),
+            FindingStatus::Dismissed
+        );
+    }
+
+    #[test]
+    fn setting_stale_directly_is_refused_and_appends_nothing() {
+        let (store, session) = store_and_session("set-stale");
+        let recorded = finding("x", None);
+        store.record_finding(&session.id, &recorded).unwrap();
+        let before = store.latest_event_seq(&session.id).unwrap();
+        assert!(
+            store
+                .set_finding_status(&session.id, recorded.id(), FindingStatus::Stale)
+                .is_err()
+        );
+        assert_eq!(store.latest_event_seq(&session.id).unwrap(), before);
+    }
+
+    #[test]
+    fn a_status_change_for_an_unknown_finding_is_refused_and_appends_nothing() {
+        let (store, session) = store_and_session("unknown");
+        let before = store.latest_event_seq(&session.id).unwrap();
+        assert!(
+            store
+                .set_finding_status(
+                    &session.id,
+                    "finding_never_recorded",
+                    FindingStatus::Dismissed
+                )
+                .is_err()
+        );
+        assert_eq!(store.latest_event_seq(&session.id).unwrap(), before);
+    }
+
+    /// §13.2: findings follow `active_events`, as plans and diagnostics do.
+    #[test]
+    fn a_rewind_takes_the_findings_recorded_after_its_point() {
+        let (store, session) = store_and_session("rewind");
+        store
+            .record_finding(&session.id, &finding("before", None))
+            .unwrap();
+        let point = store.latest_event_seq(&session.id).unwrap();
+        store
+            .record_finding(&session.id, &finding("after", None))
+            .unwrap();
+        store.rewind_conversation(&session.id, point).unwrap();
+        let read = store
+            .read_findings(&session.id, Path::new("/nonexistent"))
+            .unwrap();
+        let summaries: Vec<_> = read.iter().map(Finding::summary).collect();
+        assert_eq!(summaries, ["before"]);
+    }
+
+    /// The §5.7 log shape, readable by hand.
+    #[test]
+    fn the_log_carries_both_event_kinds_in_their_documented_shape() {
+        let (store, session) = store_and_session("shape");
+        let recorded = finding("x", None);
+        store.record_finding(&session.id, &recorded).unwrap();
+        store
+            .set_finding_status(&session.id, recorded.id(), FindingStatus::Dismissed)
+            .unwrap();
+        let log = fs::read_to_string(store.session_log_path(&session.id)).unwrap();
+        let lines: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let recorded_event = lines
+            .iter()
+            .find(|event| event["eventType"] == "finding_recorded")
+            .expect("finding_recorded");
+        assert_eq!(recorded_event["payload"]["id"], recorded.id());
+        assert_eq!(recorded_event["payload"]["source"], "compiler");
+        let changed = lines
+            .iter()
+            .find(|event| event["eventType"] == "finding_status_changed")
+            .expect("finding_status_changed");
+        assert_eq!(changed["payload"]["findingId"], recorded.id());
+        assert_eq!(changed["payload"]["status"], "dismissed");
     }
 }

@@ -521,7 +521,7 @@ mod tests {
         assert_eq!(finding.summary(), before.summary());
     }
 
-    /// The persisted and served shape (Tasks 7 and 9 depend on it).
+    /// The persisted and served shape (Tasks 7 and 10 depend on it).
     #[test]
     fn json_uses_camel_case_keys_and_snake_case_enum_values() {
         let finding = Finding::new(

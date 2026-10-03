@@ -515,6 +515,47 @@ fn a_non_zero_exit_blocks_the_step() {
     );
 }
 
+fn findings(failing: usize) -> Evidence {
+    Evidence::Findings {
+        refs: vec!["finding_1".to_string(), "finding_2".to_string()],
+        failing,
+    }
+}
+
+/// spec 22 `context.md` §13.3: a step that set out to find problems is not
+/// blocked for finding them. The exit code decides.
+#[test]
+fn findings_evidence_alone_does_not_block_a_step() {
+    assert_eq!(status_from_evidence(&[findings(2)]), StepStatus::Completed);
+}
+
+#[test]
+fn a_failing_exit_still_blocks_beside_its_findings() {
+    assert_eq!(
+        status_from_evidence(&[command_exit(Some(1)), findings(2)]),
+        StepStatus::Blocked
+    );
+}
+
+#[test]
+fn findings_evidence_serialises_with_its_kind_and_round_trips() {
+    let evidence = findings(1);
+    let value = serde_json::to_value(&evidence).unwrap();
+    assert_eq!(value["kind"], "findings");
+    assert_eq!(value["refs"][1], "finding_2");
+    assert_eq!(value["failing"], 1);
+    assert_eq!(serde_json::from_value::<Evidence>(value).unwrap(), evidence);
+}
+
+#[test]
+fn findings_as_the_newest_evidence_mean_validating() {
+    let mut plan = TaskPlan::new("task_1", 0);
+    let mut open = step("step_1", StepStatus::InProgress);
+    open.evidence = vec![findings(0)];
+    plan.steps.push(open);
+    assert_eq!(plan.phase(false), TaskPhase::Validating);
+}
+
 #[test]
 fn an_absent_exit_code_blocks_the_step() {
     // The `unwrap_or(0)` failure mode, asserted directly per §6. A killed or

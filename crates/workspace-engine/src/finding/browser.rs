@@ -19,7 +19,7 @@ use std::path::{Component, Path};
 
 /// Findings for one diagnostic run. `repository_files` holds
 /// repository-relative paths, against which a served URL is matched
-/// (§12.3). Task 7 attaches `task_id` and `origin_ref`.
+/// (§12.3). Task 8 attaches `task_id` and `origin_ref`.
 pub fn findings_from_web_record(
     record: &WebDiagnosticRecord,
     repository_files: &[&str],

@@ -61,9 +61,9 @@ pub struct PatchedFile {
 /// is the breadcrumb, and the exit code is the evidence. See `context.md` §3.5
 /// before normalising the value away in favour of the reference.
 ///
-/// `#[non_exhaustive]` because `Findings` joins this enum when spec 22 exists
-/// to produce the finding ids it would hold (`context.md` §3.6), and that must
-/// not be a breaking change for the shell.
+/// `#[non_exhaustive]` so a new kind is not a breaking change for the shell.
+/// `Findings` joined this way once spec 22 produced the finding ids it holds
+/// (`context.md` §3.6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 #[non_exhaustive]
@@ -87,6 +87,12 @@ pub enum Evidence {
     /// and deliberately still evidence: it says the step looked at a known
     /// version of a known file rather than at nothing.
     FileRead { path: String, hash: String },
+    /// The findings a check produced (spec 22): ids into the session log,
+    /// and how many were `Error` at the time. Recorded beside the
+    /// `CommandExit` it explains. It never decides the step's status, because
+    /// the exit code does, and a step that set out to find problems must not be
+    /// blocked for finding them (spec 22 `context.md` §13.3).
+    Findings { refs: Vec<String>, failing: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,10 +163,14 @@ pub fn status_from_evidence(evidence: &[Evidence]) -> StepStatus {
         // let `None` fall through as success, which is the same defect as an
         // `unwrap_or(0)` wearing different clothes.
         Evidence::CommandExit { exit_code, .. } => *exit_code != Some(0),
-        // Neither has a failure mode to encode: a patch that did not apply
-        // returns an error and produces no evidence, and a file that could not
-        // be read produces none either.
-        Evidence::PatchApplied { .. } | Evidence::FileRead { .. } => false,
+        // Neither of the first two has a failure mode to encode: a patch that
+        // did not apply returns an error and produces no evidence, and a file
+        // that could not be read produces none either. Findings link a step to
+        // what a check found, but the exit code beside them decides (spec 22
+        // `context.md` §13.3).
+        Evidence::PatchApplied { .. } | Evidence::FileRead { .. } | Evidence::Findings { .. } => {
+            false
+        }
     });
     if blocked {
         StepStatus::Blocked
@@ -258,7 +268,7 @@ impl TaskPlan {
             .flat_map(|step| step.evidence.iter())
             .next_back()
         {
-            Some(Evidence::CommandExit { .. }) => TaskPhase::Validating,
+            Some(Evidence::CommandExit { .. } | Evidence::Findings { .. }) => TaskPhase::Validating,
             Some(Evidence::PatchApplied { .. }) => TaskPhase::Editing,
             Some(Evidence::FileRead { .. }) | None => TaskPhase::Understanding,
         }
