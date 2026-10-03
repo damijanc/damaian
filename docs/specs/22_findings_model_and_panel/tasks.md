@@ -16,11 +16,12 @@ decisions it left open in [`context.md`](context.md)
 | 4 · Rust test parser (`cargo test`), delegating compile errors to Task 3 | Done 2026-10-01 | Planned on 2026-10-01 against captured cargo 1.98.0 `cargo test` output (`context.md` §10). The captures changed two earlier decisions. The parser returns the diagnostics **and** the test failures, because a warning and failing tests appear in the same run (§10.2 corrects §5). The dispatcher falls through to the generic finding when a failed run has no `Error` draft: a test binary that crashed after a warning otherwise reported only the warning (§10.3 amends §8.2). `cargo nextest run` is out of scope, and a failed nextest run gets one generic finding (§10.5). Landed as sketched, with only rustfmt changes. The fixtures were extracted from this file's line ranges, so they are byte-identical to the plan. `finding/rust_test.rs` is new. `rust_diagnostics.rs` gained the three summary clauses and `workspace_range`, and its `regex` is now `pub(super)`. `finding.rs` registers `RustTestParser` second and falls through on "no `Error` draft". Before the implementation the tests failed to compile (`E0425`, `E0433`, `E0422`). After it, `test(finding::)` passed 71/71 (16 + 17 + 17 + 21), with Task 3's tests unchanged. Mutations: 1, 2, 3, 5, 6, 7, 8, 9 and 10 failed exactly the tests the plan names. Mutation 4 (end a section at a blank line) failed **9**, not 8. The extra one is `a_panic_line_without_a_thread_id_still_has_its_location`, because its inline stdout also has a blank line straight after the section header. Mutation 9 spares that test because its panic line has no thread id. So the plan's "the same eight as mutation 4" is one test short, not a defect. Each mutation took about 9 minutes when run without `--lib`, because every edit to the library relinks all 21 integration-test binaries. Use `cargo nextest run -p workspace-engine --lib -E 'test(finding::)'` for mutation loops. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
 | 5 · Biome parser | Done 2026-10-02 | Planned in full on 2026-10-01 against captured Biome 2.5.7 output (`context.md` §11). Landed as sketched, with only rustfmt changes. The fixtures were extracted from this file's line ranges, so they are byte-identical to the plan, and `grep -c '^  $'` on the check stderr prints 28. `finding/biome.rs` is new. `finding.rs` declares `mod biome;` and registers `BiomeParser` third. Before the implementation the tests failed to compile (`E0425` on `parse_biome`/`BiomeParser`, plus `E0433`). After it, `test(finding::)` passed 89/89 (71 unchanged + 18). All eight mutations failed their named test. (1) Ending a block at a whitespace-only line failed 10 tests, `details_run_past_…` among them: the empty line after each header ends the block before its marker, so every summary falls back to the category. (2) A greedy path failed 5, including `a_lint_error_keeps_…`. (3) No OSC 8 alternative failed only `forced_colour_output_parses_the_same`. (4) Plain-only markers failed `colour_markers_map_like_plain_ones` and the forced-colour test. (5) Non-error→`Warning` failed `an_info_marker_is_info`, `a_passing_run_keeps_its_info` and the colour-marker test. (6) No `HIDDEN` check failed only `hidden_diagnostics_become_one_info_draft`. (7) Any `npm run` script failed only `does_not_match_other_commands`. (8) Skipping marker-less blocks failed only `a_block_without_a_marker_is_kept_…`. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
 | 6 · Browser findings from spec 12's `WebDiagnosticDetails` | Done 2026-10-02 | Re-scoped on 2026-09-29 by spec 12's close-out, so there is no `entries` field (`context.md` §7.1). Planned in full on 2026-10-02 (`context.md` §12). Landed as sketched, with only rustfmt changes. `browser.rs` was extracted from this file's line ranges, so before formatting it was byte-identical to the plan. rustfmt rewrapped lines in `browser.rs` and sorted `mod browser;` below `mod biome;`, not above it as Step 2 says. It did not touch the `finding.rs` test array, contrary to Step 7's note. `finding/browser.rs` is new. `finding.rs` adds `FindingSource::BrowserScenario` (`"browser_scenario"`), broadens `Command`'s doc and re-exports `findings_from_web_record`. In `web_diagnostics.rs`, the three `model_item`s and `is_loopback_url` became `pub(crate)`, and nothing else changed. Steps 1 and 2 were applied together, so Step 1's separate test run was skipped. Before the implementation the tests failed to compile (`E0425` on `findings_from_web_record`/`served_path`, `E0432` on the re-export). After it, `test(finding::) + test(web_diagnostics::)` passed 121/121: 107 `finding::` (89 + 18 `browser::tests`), and the `web_diagnostics::` tests were unchanged. All six mutations failed only their named tests. (1) No `node_modules` exclusion failed only `a_console_error_at_a_served_url_maps_to_…`. (2) First candidate wins failed only `an_ambiguous_served_path_has_no_range`. (3) No `is_loopback_url` failed `a_console_location_on_another_origin_has_no_range` and `served_path_accepts_only_loopback_…`. (4) No `!explained` failed only `a_tool_failure_is_not_doubled_…`. (5) Skipping failed steps failed only `a_failed_scenario_step_is_a_browser_scenario_error`. (6) Every problem level as `Error` failed only `an_inspection_yields_one_finding_per_problem_…`. Scoped fmt, clippy `-p workspace-engine`, `test(finding::) + test(web_diagnostics::)` and typos are clean. |
-| 7 · Recording, persistence, staleness, `Evidence::Findings` | Not started | |
-| 8 · Dismissal and the scoped repair request | Not started | |
-| 9 · Shell API | Not started | |
-| 10 · Findings panel | Not started | |
-| 11 · Docs, acceptance criteria, close the spec | Not started | |
+| 7 · Persistence, derived status, `Evidence::Findings` | Not started | Split on 2026-10-02 from the old "Recording, persistence, staleness" task (`context.md` §13.1), and planned in full. |
+| 8 · Record findings where checks run (`chat.rs`) | Not started | New on 2026-10-02 from that split; outline only. Its facts are in `context.md` §13.4. |
+| 9 · Dismissal and the scoped repair request | Not started | |
+| 10 · Shell API | Not started | |
+| 11 · Findings panel | Not started | |
+| 12 · Docs, acceptance criteria, close the spec | Not started | |
 
 **Goal:** One structured, redacted, addressable `Finding` type shared by every
 check source, with parsers that degrade to one honest generic finding rather
@@ -35,7 +36,7 @@ turns drafts into findings, so redaction happens at exactly one point
 (`context.md` §3). Recording attaches the task, origin and file hash, then
 appends to the spec 17 session log. A replay reader derives status, including
 `Stale`, from that log (Task 7). The shell and panel are thin views over the
-reader (Tasks 9–10).
+reader (Tasks 10–11).
 
 **Tech Stack:** Rust 2024, `serde`, and `regex` (all already dependencies of
 `workspace-engine`, so nothing new is added). The panel is vanilla JS in
@@ -71,12 +72,12 @@ Every task's requirements implicitly include this section.
   a history of tests that passed without testing anything (spec 47 §7.2,
   spec 21's error rate).
 - **Scope per-task checks; run the full seven-command gate from `AGENTS.md`
-  once, in Task 11.** `cargo nextest run --workspace` takes about 5 minutes
+  once, in Task 12.** `cargo nextest run --workspace` takes about 5 minutes
   locally, and `cargo clippy --workspace --all-targets` takes up to 18
   minutes cold.
 - **`chat.rs` is contended.** See `docs/specs/README.md` "What to build next"
-  → Parallel work. Tasks 1–6 and 8 do not touch it. Task 7 may, where a check
-  runs inside a turn. Check that section before running Task 7 alongside
+  → Parallel work. Tasks 1–7 and 9 do not touch it. Task 8 does, where a check
+  runs inside a turn. Check that section before running Task 8 alongside
   another spec.
 - **Never `git commit` unasked.** Each task ends by showing the change and the
   scoped check results, then asking. When asked, write one subject line with no
@@ -92,10 +93,10 @@ Every task's requirements implicitly include this section.
 | `crates/workspace-engine/src/web_diagnostics.rs` | Findings from a report's `WebDiagnosticDetails`, which spec 12 already defines (Task 6) |
 | `crates/workspace-engine/src/session.rs` | `finding_recorded` and `finding_status_changed` events, and `read_findings` (Task 7) |
 | `crates/workspace-engine/src/plan.rs` | `Evidence::Findings` (Task 7, closing spec 21's deferral) |
-| `crates/workspace-engine/src/validation.rs` (and `chat.rs` if needed) | The recording call sites (Task 7) |
-| `crates/desktop-shell/src/lib.rs` | Findings endpoints (Task 9) |
-| `crates/desktop-shell/static/app.js`, `styles.css` | The panel (Task 10) |
-| `docs/USER_GUIDE.md`, `docs/TROUBLESHOOTING.md` | §5.8 (Task 11) |
+| `crates/workspace-engine/src/validation.rs` (and `chat.rs` if needed) | The recording call sites (Task 8) |
+| `crates/desktop-shell/src/lib.rs` | Findings endpoints (Task 10) |
+| `crates/desktop-shell/static/app.js`, `styles.css` | The panel (Task 11) |
+| `docs/USER_GUIDE.md`, `docs/TROUBLESHOOTING.md` | §5.8 (Task 12) |
 
 ## Interface reference
 
@@ -111,7 +112,7 @@ Every task's requirements implicitly include this section.
   (`command_runner.rs:16-32`). The output is already tail-truncated and
   redacted (`context.md` §6).
 - `CommandRunRecord { proposal_id, execution, stdout_ref, .. }`
-  (`validation.rs:30`). This is where Task 7 gets `origin_ref`.
+  (`validation.rs:30`). This is where Task 8 gets `origin_ref`.
 - `WebDiagnosticReport { text, artifacts, is_error }`
   (`web_diagnostics.rs:83`), which Task 6 extends.
 - `SessionStore::create_plan` / `append_plan` (`session.rs:1112`, and the
@@ -134,7 +135,7 @@ changes to any other module. Because the module is `pub` and the items are
 `pub(crate)`.
 
 **Why `pub` and not `pub(crate)`:** `desktop-shell` is a separate crate and
-reads findings in Task 9. Spec 20 Task 8 had to widen `pub(crate)` items
+reads findings in Task 10. Spec 20 Task 8 had to widen `pub(crate)` items
 after the fact, so this task starts at `pub`.
 
 **Interfaces:**
@@ -164,7 +165,7 @@ after the fact, so this task starts at `pub`.
     `pub const DETAILS_TRUNCATION_MARKER: &str = "\n… (truncated)"`.
   - The JSON shape: camelCase keys (`taskId`, `originRef`, `fileHash`,
     `createdAtMs`, `startLine`, …) and snake_case enum values. Task 7
-    persists exactly this shape, and Task 9 serves it.
+    persists exactly this shape, and Task 10 serves it.
 
 - [x] **Step 1: Register the module**
 
@@ -330,7 +331,7 @@ after the fact, so this task starts at `pub`.
           assert_eq!(finding.summary(), before.summary());
       }
 
-      /// The persisted and served shape (Tasks 7 and 9 depend on it).
+      /// The persisted and served shape (Tasks 7 and 10 depend on it).
       #[test]
       fn json_uses_camel_case_keys_and_snake_case_enum_values() {
           let finding = Finding::new(
@@ -727,7 +728,7 @@ format.
     register their parsers here, in the order they should be tried.
   - `pub fn findings_from_execution(execution: &CommandExecution, parsers: &[Box<dyn FindingParser>], scanner: &SecretScanner) -> Vec<Finding>`.
     This is the only place outside the tests that calls `Finding::new` on
-    parser output. Task 7 calls it and then attaches `task_id`, `origin_ref`
+    parser output. Task 8 calls it and then attaches `task_id`, `origin_ref`
     and `file_hash`.
   - `pub const GENERIC_DETAIL_LINES: usize = 40`.
 
@@ -3522,7 +3523,7 @@ left open:
 
 This task does **not** add `WebDiagnosticEntry`, `WebEntryKind` or
 `WebDiagnosticReport.entries` (§7.1). It does not record findings anywhere;
-that is Task 7.
+that is Task 8.
 
 **Interfaces:**
 - Consumes:
@@ -3534,7 +3535,7 @@ that is Task 7.
   - `FindingSource::BrowserScenario`, serialised as `"browser_scenario"`.
   - `pub fn findings_from_web_record(record: &WebDiagnosticRecord, repository_files: &[&str], scanner: &SecretScanner) -> Vec<Finding>`,
     re-exported as `crate::finding::findings_from_web_record`.
-    `repository_files` holds repository-relative paths. Task 7 passes
+    `repository_files` holds repository-relative paths. Task 8 passes
     `RepositoryIndex.files`' paths, and attaches `record.task_id` and
     `record.id` (`context.md` §12.5).
   - The `Command` variant's doc comment is broadened, per §12.4. The variant
@@ -3899,7 +3900,7 @@ that is Task 7.
 
   /// Findings for one diagnostic run. `repository_files` holds
   /// repository-relative paths, against which a served URL is matched
-  /// (§12.3). Task 7 attaches `task_id` and `origin_ref`.
+  /// (§12.3). Task 8 attaches `task_id` and `origin_ref`.
   pub fn findings_from_web_record(
       record: &WebDiagnosticRecord,
       repository_files: &[&str],
@@ -4096,21 +4097,569 @@ that is Task 7.
 - [x] **Step 8: Update this file's Task 6 row, then show the change and the
   check results and ask before committing**
 
-## Task 7: Recording, persistence, staleness, `Evidence::Findings`
+## Task 7: Persistence, derived status, `Evidence::Findings`
 
-**Files:** `session.rs`, `plan.rs`, `validation.rs`, and possibly `chat.rs`.
+**Requirements:** 3 (dismissal's storage), and the acceptance criteria
+"findings survive a restart with their statuses intact" and "a finding
+becomes `Stale` when its file's hash no longer matches the hash recorded at
+creation". **Files:** modify `crates/workspace-engine/src/session.rs` (three
+methods, two private helpers, and tests in its existing `mod tests`),
+`crates/workspace-engine/src/plan.rs` (one variant, two match arms), and
+`crates/workspace-engine/tests/plan.rs` (tests). It also updates two code
+comments, in `finding.rs` and `finding/browser.rs`, whose task numbers the
+2026-10-02 split shifted. Planned in full on 2026-10-02.
 
-`SessionStore::record_finding(session_id, &Finding)` appends
-`finding_recorded`, and `set_finding_status(session_id, finding_id, status)`
-appends `finding_status_changed`. `read_findings(session_id, root) -> Vec<Finding>`
-replays them, with the newest status winning, then computes `Stale` from
-`file_hash` (`context.md` §1). A dismissed or fixed finding is not re-marked
-stale. The recording call site sets `task_id`, `origin_ref` (the execution
-id), and `file_hash`. Add `Evidence::Findings { refs, failing }` to close
-spec 21 `context.md` §3.6, and update that spec's deferral note. Acceptance:
-findings survive a restart with their statuses intact.
+**Read `context.md` §1, §13.2 and §13.3 first.**
+- §13.1 explains why this task no longer records anything: recording is the
+  new Task 8.
+- §13.2 fixes the log format. `Stale` is never stored, only `Open` is checked
+  for staleness, an unknown id is refused, and reads use `active_events`.
+- §13.3 says `Evidence::Findings` links a step to findings but never decides
+  its status.
 
-## Task 8: Dismissal and the scoped repair request
+This task does **not** touch `chat.rs`. Nothing calls `record_finding` outside
+the tests until Task 8. The methods are `pub` on a `pub` type, so
+`clippy -D warnings` raises no dead-code warning.
+
+**Interfaces:**
+- Consumes: `Finding`, `FindingDraft`, `FindingSource`, `FindingStatus`,
+  `Severity`, `SourceRange`, `Finding::with_file_hash` and `set_status`
+  (`finding.rs`). Also `hash::file_hash`. From `session.rs`:
+  `append_session_event`, `session_log_path`, `active_events`, and
+  `SessionEvent { event_type, payload: serde_json::Value }`.
+- Produces, and Tasks 8–11 rely on these names:
+  - `SessionStore::record_finding(&self, session_id: &str, finding: &Finding) -> Result<()>`
+  - `SessionStore::set_finding_status(&self, session_id: &str, finding_id: &str, status: FindingStatus) -> Result<()>`.
+    `Err(InvalidInput)` for `Stale`, or for an id the session never recorded.
+  - `SessionStore::read_findings(&self, session_id: &str, repository_root: &Path) -> Result<Vec<Finding>>`,
+    in record order, with the newest status applied and `Stale` derived.
+  - The events `finding_recorded` (payload: the `Finding`) and
+    `finding_status_changed` (payload: `{"findingId", "status"}`).
+  - `Evidence::Findings { refs: Vec<String>, failing: usize }`, serialised
+    as `{"kind":"findings","refs":[…],"failing":N}`.
+
+- [ ] **Step 1: Update the two shifted comments**
+
+  In `finding.rs`, the test doc comment
+  `/// The persisted and served shape (Tasks 7 and 9 depend on it).` becomes
+  `(Tasks 7 and 10 depend on it)`. In `finding/browser.rs`, the doc line
+  `/// (§12.3). Task 7 attaches `task_id` and `origin_ref`.` becomes
+  `Task 8 attaches`. Change nothing else in either file.
+
+- [ ] **Step 2: Write the failing session tests**
+
+  Add these to the **end** of the existing `#[cfg(test)] mod tests` in
+  `session.rs`, which already has `temp_data_dir`:
+
+  ```rust
+      use crate::finding::{
+          Finding, FindingDraft, FindingSource, FindingStatus, Severity, SourceRange,
+      };
+
+      fn repo_with(name: &str, file: &str, content: &str) -> PathBuf {
+          let root = temp_data_dir(&format!("findings-repo-{name}"));
+          fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
+          fs::write(root.join(file), content).unwrap();
+          root
+      }
+
+      fn finding(summary: &str, range: Option<&str>) -> Finding {
+          Finding::new(
+              FindingDraft {
+                  source: FindingSource::Compiler,
+                  severity: Severity::Error,
+                  summary: summary.to_string(),
+                  details: None,
+                  range: range.map(|path| SourceRange {
+                      path: path.to_string(),
+                      start_line: 1,
+                      start_column: None,
+                      end_line: None,
+                      end_column: None,
+                  }),
+                  code: None,
+              },
+              &SecretScanner::default(),
+          )
+      }
+
+      /// A finding on `file` with the file's current hash, as Task 8 records it.
+      fn hashed_finding(root: &Path, file: &str) -> Finding {
+          finding("mismatched types", Some(file))
+              .with_file_hash(crate::hash::file_hash(root.join(file)).unwrap())
+      }
+
+      fn store_and_session(name: &str) -> (SessionStore, Session) {
+          let store = SessionStore::new(temp_data_dir(&format!("findings-{name}")));
+          let session = store.create_session("repo_1", "Findings").unwrap();
+          (store, session)
+      }
+
+      #[test]
+      fn a_session_without_findings_reads_empty() {
+          let (store, session) = store_and_session("empty");
+          assert!(store.read_findings(&session.id, Path::new("/nonexistent")).unwrap().is_empty());
+      }
+
+      #[test]
+      fn a_recorded_finding_reads_back_unchanged() {
+          let (store, session) = store_and_session("round-trip");
+          let recorded = finding("it broke", None).with_task_id("task_1").with_origin_ref("cmd_1");
+          store.record_finding(&session.id, &recorded).unwrap();
+          let read = store.read_findings(&session.id, Path::new("/nonexistent")).unwrap();
+          assert_eq!(read, vec![recorded]);
+      }
+
+      #[test]
+      fn findings_read_back_in_record_order() {
+          let (store, session) = store_and_session("order");
+          for summary in ["first", "second", "third"] {
+              store.record_finding(&session.id, &finding(summary, None)).unwrap();
+          }
+          let read = store.read_findings(&session.id, Path::new("/nonexistent")).unwrap();
+          let summaries: Vec<_> = read.iter().map(Finding::summary).collect();
+          assert_eq!(summaries, ["first", "second", "third"]);
+      }
+
+      #[test]
+      fn the_newest_status_change_wins() {
+          let (store, session) = store_and_session("newest");
+          let recorded = finding("x", None);
+          store.record_finding(&session.id, &recorded).unwrap();
+          let status = |store: &SessionStore| {
+              store.read_findings(&session.id, Path::new("/nonexistent")).unwrap()[0].status()
+          };
+          store.set_finding_status(&session.id, recorded.id(), FindingStatus::Dismissed).unwrap();
+          assert_eq!(status(&store), FindingStatus::Dismissed);
+          store.set_finding_status(&session.id, recorded.id(), FindingStatus::Fixed).unwrap();
+          assert_eq!(status(&store), FindingStatus::Fixed);
+          store.set_finding_status(&session.id, recorded.id(), FindingStatus::Open).unwrap();
+          assert_eq!(status(&store), FindingStatus::Open);
+      }
+
+      /// Acceptance criterion: findings survive a restart with their statuses.
+      #[test]
+      fn findings_and_their_statuses_survive_a_new_store_over_the_same_data_dir() {
+          let data_dir = temp_data_dir("findings-restart");
+          let first = SessionStore::new(&data_dir);
+          let session = first.create_session("repo_1", "Before restart").unwrap();
+          let kept = finding("kept", None);
+          let dismissed = finding("dismissed", None);
+          first.record_finding(&session.id, &kept).unwrap();
+          first.record_finding(&session.id, &dismissed).unwrap();
+          first.set_finding_status(&session.id, dismissed.id(), FindingStatus::Dismissed).unwrap();
+          drop(first);
+
+          let second = SessionStore::new(&data_dir);
+          let read = second.read_findings(&session.id, Path::new("/nonexistent")).unwrap();
+          let statuses: Vec<_> = read.iter().map(|f| (f.summary(), f.status())).collect();
+          assert_eq!(
+              statuses,
+              [("kept", FindingStatus::Open), ("dismissed", FindingStatus::Dismissed)]
+          );
+      }
+
+      #[test]
+      fn an_unchanged_file_keeps_its_finding_open() {
+          let root = repo_with("unchanged", "src/lib.rs", "fn a() {}\n");
+          let (store, session) = store_and_session("unchanged");
+          store.record_finding(&session.id, &hashed_finding(&root, "src/lib.rs")).unwrap();
+          assert_eq!(store.read_findings(&session.id, &root).unwrap()[0].status(), FindingStatus::Open);
+      }
+
+      /// Acceptance criterion, and `context.md` §1.
+      #[test]
+      fn a_changed_file_makes_its_finding_stale() {
+          let root = repo_with("changed", "src/lib.rs", "fn a() {}\n");
+          let (store, session) = store_and_session("changed");
+          store.record_finding(&session.id, &hashed_finding(&root, "src/lib.rs")).unwrap();
+          fs::write(root.join("src/lib.rs"), "fn a() { 1 }\n").unwrap();
+          assert_eq!(store.read_findings(&session.id, &root).unwrap()[0].status(), FindingStatus::Stale);
+      }
+
+      #[test]
+      fn a_deleted_file_makes_its_finding_stale() {
+          let root = repo_with("deleted", "src/lib.rs", "fn a() {}\n");
+          let (store, session) = store_and_session("deleted");
+          store.record_finding(&session.id, &hashed_finding(&root, "src/lib.rs")).unwrap();
+          fs::remove_file(root.join("src/lib.rs")).unwrap();
+          assert_eq!(store.read_findings(&session.id, &root).unwrap()[0].status(), FindingStatus::Stale);
+      }
+
+      /// §13.2: derived, not stored. Reverting the file brings the finding back.
+      #[test]
+      fn staleness_is_derived_on_read_so_a_reverted_file_reopens_its_finding() {
+          let root = repo_with("reverted", "src/lib.rs", "fn a() {}\n");
+          let (store, session) = store_and_session("reverted");
+          store.record_finding(&session.id, &hashed_finding(&root, "src/lib.rs")).unwrap();
+          fs::write(root.join("src/lib.rs"), "changed\n").unwrap();
+          assert_eq!(store.read_findings(&session.id, &root).unwrap()[0].status(), FindingStatus::Stale);
+          fs::write(root.join("src/lib.rs"), "fn a() {}\n").unwrap();
+          assert_eq!(store.read_findings(&session.id, &root).unwrap()[0].status(), FindingStatus::Open);
+      }
+
+      /// `context.md` §1: no recorded hash means staleness cannot be judged.
+      #[test]
+      fn a_finding_without_a_recorded_hash_is_never_stale() {
+          let root = repo_with("no-hash", "src/lib.rs", "fn a() {}\n");
+          let (store, session) = store_and_session("no-hash");
+          store.record_finding(&session.id, &finding("x", Some("src/lib.rs"))).unwrap();
+          fs::write(root.join("src/lib.rs"), "changed\n").unwrap();
+          assert_eq!(store.read_findings(&session.id, &root).unwrap()[0].status(), FindingStatus::Open);
+      }
+
+      /// §13.2: the user's decision is not overwritten by a hash.
+      #[test]
+      fn a_dismissed_finding_is_not_re_marked_stale() {
+          let root = repo_with("dismissed", "src/lib.rs", "fn a() {}\n");
+          let (store, session) = store_and_session("dismissed");
+          let recorded = hashed_finding(&root, "src/lib.rs");
+          store.record_finding(&session.id, &recorded).unwrap();
+          store.set_finding_status(&session.id, recorded.id(), FindingStatus::Dismissed).unwrap();
+          fs::write(root.join("src/lib.rs"), "changed\n").unwrap();
+          assert_eq!(
+              store.read_findings(&session.id, &root).unwrap()[0].status(),
+              FindingStatus::Dismissed
+          );
+      }
+
+      #[test]
+      fn setting_stale_directly_is_refused_and_appends_nothing() {
+          let (store, session) = store_and_session("set-stale");
+          let recorded = finding("x", None);
+          store.record_finding(&session.id, &recorded).unwrap();
+          let before = store.latest_event_seq(&session.id).unwrap();
+          assert!(store.set_finding_status(&session.id, recorded.id(), FindingStatus::Stale).is_err());
+          assert_eq!(store.latest_event_seq(&session.id).unwrap(), before);
+      }
+
+      #[test]
+      fn a_status_change_for_an_unknown_finding_is_refused_and_appends_nothing() {
+          let (store, session) = store_and_session("unknown");
+          let before = store.latest_event_seq(&session.id).unwrap();
+          assert!(store
+              .set_finding_status(&session.id, "finding_never_recorded", FindingStatus::Dismissed)
+              .is_err());
+          assert_eq!(store.latest_event_seq(&session.id).unwrap(), before);
+      }
+
+      /// §13.2: findings follow `active_events`, as plans and diagnostics do.
+      #[test]
+      fn a_rewind_takes_the_findings_recorded_after_its_point() {
+          let (store, session) = store_and_session("rewind");
+          store.record_finding(&session.id, &finding("before", None)).unwrap();
+          let point = store.latest_event_seq(&session.id).unwrap();
+          store.record_finding(&session.id, &finding("after", None)).unwrap();
+          store.rewind_conversation(&session.id, point).unwrap();
+          let read = store.read_findings(&session.id, Path::new("/nonexistent")).unwrap();
+          let summaries: Vec<_> = read.iter().map(Finding::summary).collect();
+          assert_eq!(summaries, ["before"]);
+      }
+
+      /// The §5.7 log shape, readable by hand.
+      #[test]
+      fn the_log_carries_both_event_kinds_in_their_documented_shape() {
+          let (store, session) = store_and_session("shape");
+          let recorded = finding("x", None);
+          store.record_finding(&session.id, &recorded).unwrap();
+          store.set_finding_status(&session.id, recorded.id(), FindingStatus::Dismissed).unwrap();
+          let log = fs::read_to_string(store.session_log_path(&session.id)).unwrap();
+          let lines: Vec<serde_json::Value> = log
+              .lines()
+              .map(|line| serde_json::from_str(line).unwrap())
+              .collect();
+          let recorded_event = lines
+              .iter()
+              .find(|event| event["eventType"] == "finding_recorded")
+              .expect("finding_recorded");
+          assert_eq!(recorded_event["payload"]["id"], recorded.id());
+          assert_eq!(recorded_event["payload"]["source"], "compiler");
+          let changed = lines
+              .iter()
+              .find(|event| event["eventType"] == "finding_status_changed")
+              .expect("finding_status_changed");
+          assert_eq!(changed["payload"]["findingId"], recorded.id());
+          assert_eq!(changed["payload"]["status"], "dismissed");
+      }
+  ```
+
+  If `fs`, `Path` or `Session` are not already in scope in that test module
+  through `use super::*;`, import them. `session.rs` imports `std::fs` and
+  `std::path::{Path, PathBuf}` at the top, and defines `Session`.
+
+- [ ] **Step 3: Write the failing plan tests**
+
+  Append to `crates/workspace-engine/tests/plan.rs`, after
+  `a_non_zero_exit_blocks_the_step`:
+
+  ```rust
+  fn findings(failing: usize) -> Evidence {
+      Evidence::Findings {
+          refs: vec!["finding_1".to_string(), "finding_2".to_string()],
+          failing,
+      }
+  }
+
+  /// spec 22 `context.md` §13.3: a step that set out to find problems is not
+  /// blocked for finding them. The exit code decides.
+  #[test]
+  fn findings_evidence_alone_does_not_block_a_step() {
+      assert_eq!(status_from_evidence(&[findings(2)]), StepStatus::Completed);
+  }
+
+  #[test]
+  fn a_failing_exit_still_blocks_beside_its_findings() {
+      assert_eq!(
+          status_from_evidence(&[command_exit(Some(1)), findings(2)]),
+          StepStatus::Blocked
+      );
+  }
+
+  #[test]
+  fn findings_evidence_serialises_with_its_kind_and_round_trips() {
+      let evidence = findings(1);
+      let value = serde_json::to_value(&evidence).unwrap();
+      assert_eq!(value["kind"], "findings");
+      assert_eq!(value["refs"][1], "finding_2");
+      assert_eq!(value["failing"], 1);
+      assert_eq!(serde_json::from_value::<Evidence>(value).unwrap(), evidence);
+  }
+
+  #[test]
+  fn findings_as_the_newest_evidence_mean_validating() {
+      let mut plan = TaskPlan::new("task_1", 0);
+      let mut open = step("step_1", StepStatus::InProgress);
+      open.evidence = vec![findings(0)];
+      plan.steps.push(open);
+      assert_eq!(plan.phase(false), TaskPhase::Validating);
+  }
+  ```
+
+  `serde_json` is already a dev-dependency of the integration tests. If it is
+  not, the compiler says so; use the crate's `serde_json` dependency as the
+  other integration tests do.
+
+- [ ] **Step 4: Run the tests and confirm they fail**
+
+  Run: `cargo nextest run -p workspace-engine -E 'test(session::tests) + binary(plan)'`
+  Expected: compile failures. `record_finding`, `set_finding_status` and
+  `read_findings` are not defined, and `Evidence::Findings` does not exist.
+
+- [ ] **Step 5: Write the implementation**
+
+  In `plan.rs`, add the variant at the end of `Evidence`:
+
+  ```rust
+      /// The findings a check produced (spec 22): ids into the session log,
+      /// and how many were `Error` at the time. Recorded beside the
+      /// `CommandExit` it explains. It never decides the step's status, because
+      /// the exit code does, and a step that set out to find problems must not be
+      /// blocked for finding them (spec 22 `context.md` §13.3).
+      Findings { refs: Vec<String>, failing: usize },
+  ```
+
+  In `status_from_evidence`, make the second arm
+  `Evidence::PatchApplied { .. } | Evidence::FileRead { .. } | Evidence::Findings { .. } => false,`.
+  In `TaskPlan::phase`, make the first arm
+  `Some(Evidence::CommandExit { .. } | Evidence::Findings { .. }) => TaskPhase::Validating,`.
+  The enum already has `#[serde(tag = "kind", rename_all = "camelCase")]`, so
+  the variant serialises as `"findings"`. Its fields are single words, so no
+  per-variant `rename_all` is needed.
+
+  In `session.rs`, add after `read_session_web_diagnostics`:
+
+  ```rust
+      /// Appends one finding (spec 22 §5.7). A `Finding` is redacted by
+      /// construction, so this store writes it as given.
+      pub fn record_finding(&self, session_id: &str, finding: &crate::finding::Finding) -> Result<()> {
+          let payload = serde_json::to_string(finding).map_err(|error| {
+              crate::error::ClientError::Io(format!("finding serialization: {error}"))
+          })?;
+          self.append_session_event(session_id, "finding_recorded", &payload)
+      }
+
+      /// Records the user's decision about a finding. `Stale` is derived on
+      /// read and never stored, and an id this session never recorded is
+      /// refused before anything is appended (spec 22 `context.md` §13.2).
+      pub fn set_finding_status(
+          &self,
+          session_id: &str,
+          finding_id: &str,
+          status: crate::finding::FindingStatus,
+      ) -> Result<()> {
+          if status == crate::finding::FindingStatus::Stale {
+              return Err(crate::error::ClientError::InvalidInput(
+                  "a finding becomes stale when its file changes; it cannot be set stale"
+                      .to_string(),
+              ));
+          }
+          let content = fs::read_to_string(self.session_log_path(session_id)).unwrap_or_default();
+          if !replay_findings(&content).iter().any(|finding| finding.id() == finding_id) {
+              return Err(crate::error::ClientError::InvalidInput(format!(
+                  "no finding {finding_id} in session {session_id}"
+              )));
+          }
+          let payload = serde_json::json!({ "findingId": finding_id, "status": status }).to_string();
+          self.append_session_event(session_id, "finding_status_changed", &payload)
+      }
+
+      /// Every finding in the session, in record order, with the newest status
+      /// applied and `Stale` derived against `repository_root` (spec 22
+      /// `context.md` §1, §13.2). Only an `Open` finding is checked.
+      pub fn read_findings(
+          &self,
+          session_id: &str,
+          repository_root: &Path,
+      ) -> Result<Vec<crate::finding::Finding>> {
+          let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+              return Ok(Vec::new());
+          };
+          let mut findings = replay_findings(&content);
+          for finding in &mut findings {
+              if finding.status() == crate::finding::FindingStatus::Open
+                  && finding_is_stale(finding, repository_root)
+              {
+                  finding.set_status(crate::finding::FindingStatus::Stale);
+              }
+          }
+          Ok(findings)
+      }
+  ```
+
+  Then add these free functions next to `active_events`:
+
+  ```rust
+  /// Findings as recorded, with their newest status change applied. Staleness
+  /// is not derived here, so `set_finding_status` can use this to check that
+  /// an id exists.
+  fn replay_findings(content: &str) -> Vec<crate::finding::Finding> {
+      let mut findings: Vec<crate::finding::Finding> = Vec::new();
+      for event in active_events(content) {
+          match event.event_type.as_str() {
+              "finding_recorded" => {
+                  if let Ok(finding) =
+                      serde_json::from_value::<crate::finding::Finding>(event.payload)
+                      && !findings.iter().any(|known| known.id() == finding.id())
+                  {
+                      findings.push(finding);
+                  }
+              }
+              "finding_status_changed" => {
+                  let id = event.payload.get("findingId").and_then(serde_json::Value::as_str);
+                  let status = event.payload.get("status").cloned().and_then(|status| {
+                      serde_json::from_value::<crate::finding::FindingStatus>(status).ok()
+                  });
+                  if let (Some(id), Some(status)) = (id, status)
+                      && let Some(finding) = findings.iter_mut().find(|finding| finding.id() == id)
+                  {
+                      finding.set_status(status);
+                  }
+              }
+              _ => {}
+          }
+      }
+      findings
+  }
+
+  /// Stale only when a hash was recorded and the file now differs or is
+  /// gone. No range or no hash means it cannot be judged (`context.md` §1).
+  fn finding_is_stale(finding: &crate::finding::Finding, repository_root: &Path) -> bool {
+      let (Some(range), Some(recorded)) = (finding.range(), finding.file_hash()) else {
+          return false;
+      };
+      match crate::hash::file_hash(repository_root.join(&range.path)) {
+          Ok(current) => current != recorded,
+          Err(_) => true,
+      }
+  }
+  ```
+
+  If the `let`-chains do not compile as written, nest them as plain `if let`s.
+  The crate is edition 2024, and `chat.rs` already uses `&& let Some(…)`. Do
+  not weaken a test to fit.
+
+- [ ] **Step 6: Run the tests and confirm they pass**
+
+  Run: `cargo nextest run -p workspace-engine -E 'test(session::tests) + binary(plan) + test(finding::)'`
+  Expected: the 15 new session tests and 4 new plan tests pass. All
+  existing `session::tests`, `tests/plan.rs` and `finding::` tests are
+  unchanged. Count the new ones.
+
+- [ ] **Step 7: Mutation-test the §13 decisions**
+
+  Apply each change on its own, confirm the named test fails, then revert it:
+
+  1. Check every status for staleness, not only `Open`.
+     `a_dismissed_finding_is_not_re_marked_stale` must fail.
+  2. Treat a missing hash as stale.
+     `a_finding_without_a_recorded_hash_is_never_stale` must fail.
+  3. Treat a missing file as not stale (`Err(_) => false`).
+     `a_deleted_file_makes_its_finding_stale` must fail.
+  4. Remove the `Stale` refusal.
+     `setting_stale_directly_is_refused_and_appends_nothing` must fail.
+  5. Remove the unknown-id check.
+     `a_status_change_for_an_unknown_finding_is_refused_…` must fail.
+  6. Use `parsed_events(content).0` instead of `active_events(content)`.
+     `a_rewind_takes_the_findings_recorded_after_its_point` must fail.
+  7. Make `Evidence::Findings { failing, .. } => *failing > 0` in
+     `status_from_evidence`.
+     `findings_evidence_alone_does_not_block_a_step` must fail.
+
+  Record all seven results in the progress row.
+
+- [ ] **Step 8: Scoped checks**
+
+  Run `cargo fmt --all` first. Then:
+
+  ```bash
+  cargo fmt --all -- --check
+  cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
+  cargo nextest run -p workspace-engine -E 'test(session::tests) + binary(plan) + test(finding::)'
+  typos docs/specs/22_findings_model_and_panel crates/workspace-engine/src/session.rs crates/workspace-engine/src/plan.rs crates/workspace-engine/tests/plan.rs
+  ```
+
+  `Evidence` is `#[non_exhaustive]` and the shell matches it only through JSON
+  (`describeEvidence` in `app.js`, which falls back to "recorded"), so no other
+  crate needs a change. If clippy reports a non-exhaustive match somewhere in
+  `workspace-engine`, add the arm the §13.3 rule implies and record it.
+
+- [ ] **Step 9: Update this file's Task 7 row, then show the change and the
+  check results and ask before committing**
+
+## Task 8: Record findings where checks run
+
+**Requirements:** 1, 2, 4, and the "full output remains reachable through
+`origin_ref`" criterion. **Files:** `chat.rs`, `finding.rs` (one builder),
+and `app.js` (`describeEvidence` only). Facts from `context.md` §13.4:
+
+- **Commands.** At `chat.rs:975` and `chat.rs:2260`, after `run_proposal`,
+  call `findings_from_execution(&record.execution, &default_parsers(), &self.scanner)`.
+  For each finding:
+  - keep the range only if `repository_root.join(path)` is a file. Otherwise
+    drop it, with a new `Finding` builder that removes the range and adds no
+    free text;
+  - take `file_hash` at the same moment;
+  - attach `task.id` and `origin_ref = record.execution.id`;
+  - call `record_finding`.
+- **Evidence.** In the loop, push `Evidence::Findings { refs, failing }` next
+  to the command's `CommandExit` evidence (`chat.rs:~2717`), where `failing`
+  is the number of `Error` findings.
+- **Browser.** In `run_and_record_web_diagnostic`, after
+  `append_web_diagnostic`, call `findings_from_web_record`. Build the file list
+  with `tree_walk::walk` only when the report has a console entry with a
+  location. Attach `record.task_id` and `record.id`, and record them.
+- **The standalone branch.** `/api/run-command` records nothing, because it
+  has no session (`context.md` §13.4). Record that as a known gap.
+- **Shell wording.** `describeEvidence` gains a `findings` wording.
+
+Recording is best-effort only where the rest of that path is. A failure to
+append a finding fails the call, like `append_web_diagnostic` does. Read the
+"What to build next" → Parallel work section before starting, because this
+task holds `chat.rs`.
+
+*(Expand into full TDD steps before starting this task.)*
+
+## Task 9: Dismissal and the scoped repair request
 
 **Files:** `finding.rs`, `session.rs`.
 
@@ -4120,7 +4669,7 @@ carries the findings' summary, range, and code, never raw output (§5.5). It
 renders to the model-facing prompt text. Test: dismissing a finding does not
 suppress a new finding for the same problem from a later check.
 
-## Task 9: Shell API
+## Task 10: Shell API
 
 **Files:** `crates/desktop-shell/src/lib.rs`.
 
@@ -4129,7 +4678,7 @@ suppress a new finding for the same problem from a later check.
 panel sends as a chat message. Follow spec 20 Task 8's `serve_for_test`
 pattern for the HTTP tests.
 
-## Task 10: Findings panel
+## Task 11: Findings panel
 
 **Files:** `app.js`, `styles.css`, read against `docs/UI_STYLE_GUIDE.md`.
 
@@ -4141,7 +4690,7 @@ findings are shown but not selectable, with the reason stated. Verify in the
 browser against the ignored `serves_the_ui_for_manual_inspection` harness on
 port 4899, never on 4765.
 
-## Task 11: Docs, acceptance criteria, close the spec
+## Task 12: Docs, acceptance criteria, close the spec
 
 `USER_GUIDE.md` and `TROUBLESHOOTING.md` per §5.8. Walk every acceptance
 criterion into `proposal.md` §7, including the seeded-secret criterion across

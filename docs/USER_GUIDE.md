@@ -235,7 +235,7 @@ A rewind never rewrites history you can audit. The conversation moves back by ap
 
 ## Search and Export
 
-The search box at the top of the conversation finds text across the sessions of the current working folder. Type and matches appear live, each with the session title and a short snippet. Choosing one opens that session and scrolls to the matching message. Search is a plain text search — it is not code search and it is not semantic — and it defaults to the current folder, because a session from another folder can contain that folder's file contents. Search only ever reads the session log; it never changes a session.
+The search button in the top bar opens a search box that finds text across the sessions of the current working folder; Escape, the button again, or a click elsewhere closes it. Type and matches appear live, each with the session title and a short snippet. Choosing one opens that session and scrolls to the matching message. Search is a plain text search — it is not code search and it is not semantic — and it defaults to the current folder, because a session from another folder can contain that folder's file contents. Search only ever reads the session log; it never changes a session.
 
 Each session in the folder list has an export button (↓) that saves the conversation as Markdown. Exports contain the title, the time range, the conversation in order, what each task came to, the plan steps and their evidence, and token and cost totals.
 

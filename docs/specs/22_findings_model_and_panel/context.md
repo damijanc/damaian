@@ -25,7 +25,7 @@ the finding was recorded.
 - A finding whose file no longer exists is `Stale`.
 
 Parsers never compute the hash. They see only a `CommandExecution`, not the
-repository. The call site that turns an execution into findings (Task 7) hashes
+repository. The call site that turns an execution into findings (Task 8) hashes
 the file, the same way it attaches `task_id` and `origin_ref`. So `Finding::new`
 stays pure and needs no filesystem.
 
@@ -177,7 +177,7 @@ runner that is not the companion always has `details: None`.
 That answers proposal §7's open question. `entries` was never added. Spec 12
 supplied the structure itself, as `WebDiagnosticDetails`, and the runner
 already emits it for the companion.
-- Spec 05 is Done, and its navigation is what the panel reuses (Task 10).
+- Spec 05 is Done, and its navigation is what the panel reuses (Task 11).
 - `CommandExecution` is at `command_runner.rs:16-32`, not `11-22`. It has since
   gained `termination: CommandTermination`. The generic parser (Task 2) should
   use it: a timed-out command is a failure with no exit code, and "exited
@@ -210,7 +210,7 @@ generic finding has this source, and only generic findings have it. This
 includes a `cargo test` failure whose parser matched but extracted nothing:
 that finding really is unparsed, and the source says so. Adding the variant now
 costs nothing, because no finding has been persisted yet (Task 7). The panel
-(Task 10) groups by source, so the generic findings sit together, and each one
+(Task 11) groups by source, so the generic findings sit together, and each one
 names its command in its summary (§8.3).
 
 ### 8.2 A cancelled check has no verdict, so it gets no generic finding
@@ -295,7 +295,7 @@ they showed, and what each finding means for the parser:
   **Decision:** an absolute path, or one with a `..` component, gets
   `range: None`. Examples are registry sources, the standard library under
   `/rustc/<hash>/`, and a path dependency outside the workspace. Clicking
-  those would open something that is not the user's code. Task 7 still checks
+  those would open something that is not the user's code. Task 8 still checks
   every relative path against the repository root, because a workspace root
   nested below the repository root would make these paths relative to the
   wrong directory.
@@ -468,7 +468,7 @@ which no task requires.
 
 Test locations follow §9: relative to the workspace root, even for an
 integration test (`crates/demo/tests/integration.rs:8:5`). A one-package
-crate prints `src/lib.rs`. Task 7 still resolves every relative path against
+crate prints `src/lib.rs`. Task 8 still resolves every relative path against
 the repository root.
 
 ### 10.5 `cargo nextest run` is out of scope
@@ -553,7 +553,7 @@ scratch root, so nothing needed scrubbing. What the captures showed:
   failure addressable.
 - **Paths are relative to the directory Biome ran in,** which is the
   repository root for `npm run`. An absolute path gets no range, through the
-  same `workspace_range` that Tasks 3 and 4 use. Task 7 resolves the rest.
+  same `workspace_range` that Tasks 3 and 4 use. Task 8 resolves the rest.
 - **Forced colour (`--colors=force`) changes more than rustc's colour does
   (§9).** Besides CSI colour codes, it wraps the category in an OSC 8
   hyperlink (`\x1b]8;;https://biomejs.dev/…\x1b\\`). It also swaps the
@@ -627,7 +627,7 @@ Nothing in the report says which repository file was served. **Decision:**
   `dist/app.js` next to `src/app.js`, where picking one would be the guess
   §5.3 forbids.
 - The function takes the file list as a parameter, `&[&str]` of
-  repository-relative paths, so it stays pure. Task 7 passes the paths in
+  repository-relative paths, so it stays pure. Task 8 passes the paths in
   `RepositoryIndex.files` (`indexer.rs`). The line and column are spec 12's,
   already 1-based. A location with no line gets no range.
 - Percent-encoded paths are not decoded. Such a path matches nothing, so it
@@ -658,7 +658,83 @@ parsers (§8.4). It is not a `FindingParser`, because there is no command to
 match. It exports
 `findings_from_web_record(record: &WebDiagnosticRecord, repository_files: &[&str], scanner: &SecretScanner) -> Vec<Finding>`,
 re-exported from `finding.rs`. Its findings carry no `task_id` or
-`origin_ref`. Task 7 attaches `record.task_id` and `record.id`, the same as it
+`origin_ref`. Task 8 attaches `record.task_id` and `record.id`, the same as it
 does for commands. The record is already redacted, and `Finding::new` redacts
 again (§6). The seeded-secret acceptance criterion for "browser output" is
 asserted through this function.
+
+## 13. Persistence and recording: decisions made while planning Task 7 (2026-10-02)
+
+### 13.1 The old Task 7 was two tasks
+
+The outline bundled persisting findings (`session.rs`, `plan.rs`) with
+recording them where checks run (`chat.rs`'s two command sites and its one
+diagnostic site). These can be reviewed apart: a reviewer could accept the
+log format and reject the wiring. They also differ on the contended file,
+because only the wiring touches `chat.rs`. **Decision:** Task 7 is persistence,
+derived status and `Evidence::Findings`. The new Task 8 is recording. The old
+Tasks 8–11 became 9–12, and every forward reference was retargeted on
+2026-10-02.
+
+### 13.2 The log format, and what is never stored
+
+- `finding_recorded` carries the serialised `Finding` (Task 1's camelCase
+  shape) as its payload, the same way `web_diagnostic_recorded` carries its
+  record. The finding is already redacted by construction (§2), so the store
+  writes it as given.
+- `finding_status_changed` carries `{"findingId": …, "status": …}`, with the
+  status in snake_case, as in §5.7.
+- **`Stale` is never stored.** It is derived on read from `file_hash`
+  (§1), so a reverted file brings its finding back to `Open` with no event.
+  `set_finding_status(…, Stale)` is refused. A stored `Stale` would outlive
+  the change that caused it.
+- **Only `Open` is checked for staleness.** A finding the user dismissed or
+  marked fixed keeps that status even if its file changes. The user's
+  decision is not overwritten by a hash.
+- A status change for an id the session never recorded is refused before
+  anything is appended. That follows spec 20 Task 8's rule for unknown
+  sessions.
+- Reads use `active_events`, as plans and web diagnostics do (spec 16), so a
+  rewind takes the findings recorded after its point with it. Every reader of
+  this log has that consequence, and findings stay consistent with the plans
+  that cite them.
+- A second `finding_recorded` with an id already seen is ignored. Ids come
+  from `create_id`, so this only guards a replayed or hand-edited log.
+
+### 13.3 `Evidence::Findings` links, but does not decide
+
+Spec 21's table says a non-zero `CommandExit` blocks the step "and the failure
+becomes a finding". **Decision:** `Evidence::Findings { refs, failing }` is
+recorded beside the `CommandExit` it explains. It plays no part in
+`status_from_evidence`, because the exit code already decides. A browser
+diagnostic has no exit code, so letting `failing > 0` block would block a step
+like "look at the console errors" for doing exactly what it set out to do. In
+`TaskPlan::phase` it counts as `Validating`, like `CommandExit`. Attaching it
+to the open step is Task 8, because that is where the finding ids exist. Until
+then, the shell's `describeEvidence` shows it as "recorded", its existing
+fallback for unknown kinds. Task 8 adds wording for it.
+
+### 13.4 Facts Task 8 needs, checked on 2026-10-02
+
+- **Command sites with a session and task:** `chat.rs:975` (resume after an
+  approval) and `chat.rs:2260` (a sandbox auto-run inside a turn). Both have
+  the `CommandRunRecord` in hand. `/api/run-command`'s standalone branch
+  (`desktop-shell/src/lib.rs:1084`) runs with `task_id: None` and no session,
+  so it records no findings. That is a known gap, recorded rather than closed
+  here.
+- **`origin_ref` is the execution id.** The full stored output is at
+  `<data dir>/commands/output/<execution id>/{stdout,stderr}.log`
+  (`validation.rs:64-90`).
+- **The browser site:** one helper, `run_and_record_web_diagnostic`
+  (`chat.rs:~548`), runs and records every diagnostic for both dispatch paths.
+  It holds the `WebDiagnosticRecord`.
+- **`chat.rs` holds no `RepositoryIndex`.** That corrects §12.5, which assumed
+  Task 8 could pass `RepositoryIndex.files`. Task 8 builds the file list with
+  `tree_walk::walk` (it respects `.gitignore`), and only when a report has a
+  console entry with a location, so a diagnostic without one costs nothing.
+- **Ranges are checked at recording.** A parser's relative path is kept only if
+  `repository_root.join(path)` is a file. Otherwise the range is dropped,
+  which needs a `Finding` builder that removes it and adds no free text. The
+  file hash is taken at the same moment.
+- **Evidence attachment** is `step_evidence.push(...)` beside
+  `evidence_for(...)` (`chat.rs:~2717`).
