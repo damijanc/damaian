@@ -127,6 +127,8 @@ central loop.
    transcript stays readable afterwards.
 3. Summary boundaries and their format version are recorded in the session.
 4. Compaction runs on an explicit user action, and automatically at a threshold.
+   The user can switch the automatic half off. Manual compaction remains, and
+   switching it off never makes the loss of older messages silent again.
 5. **A pending approval is never replaced by a summary.** A `CommandProposal` or
    `ProposedPatch` awaiting a decision is data, not narrative.
 6. A model never writes a field the engine can compute. Where the session log
@@ -320,6 +322,67 @@ long task made the ceiling arrive sooner, which is precisely backwards. It is
 recorded against the session, visibly, so it is never free — only never
 self-defeating.
 
+**The off switch.** `conversation_auto_compact` is a boolean config key,
+default `true`. When it is `false`, no summarisation call is ever made unless
+the user asks for one. That is the whole point of the key: an automatic call is
+a billed request the user did not ask for at that moment. §5.5's
+announcement makes the call visible. This key lets a user who watches cost
+choose not to make it at all. Manual compaction is unaffected.
+
+Off does **not** mean "the old behaviour". Once the conversation passes the
+recency window and no active summary covers the older messages, those messages
+are still left out of the request, as they are today. But the omission is
+stated twice:
+
+- **to the model**, as one delimited line naming how many earlier messages were
+  not sent and that the full transcript still holds them. This is the same shape
+  as the elision notice [spec 47](47_agent_working_capability/proposal.md)'s
+  `bounded_messages` adds within a turn;
+- **to the user**, as the §5.9 boundary marker in its uncompacted form: it
+  names how many messages the model no longer sees and offers manual compaction
+  from the marker itself.
+
+Without this, the key would be a switch back to the defect §1 describes, and
+§5.9's anti-requirement would hold only while a default stayed unchanged.
+
+**Repository config cannot set it.** `conversation_auto_compact` is
+**Forbidden** under [spec 34](34_repository_config_trust_boundary.md)'s
+classification, beside `model_name` and the other keys that decide model
+traffic. Neither direction is restrictive. A repository that turns it on spends
+the user's money on calls the user switched off. A repository that turns it off
+lowers what the model sees in the user's sessions to suit the repository's
+author. The key belongs to the person paying and accountable for the session.
+Spec 34's classification table is a list of shipped keys, so this key's row is
+added there when the key ships, not before.
+
+**Where the user finds it.** A setting that exists only as a line in a config
+file is not one most users will find. The key therefore also gets a control in
+**Settings › General**, in its own `Conversation` section above
+`User configuration`. Today that page holds only the raw config editor and the
+effective policy. The control is a checkbox using the existing `.field-checkbox`
+pattern, the same one MCP server settings use. It needs no new control style:
+
+```
+☑ Compact long conversations automatically
+  Summarises older messages when a conversation outgrows the model's context.
+  Each summary is a model call billed to your provider. Off: older messages are
+  left out of the request and marked in the transcript, and you can still
+  compact by hand.
+```
+
+- **It writes user scope only**, through the existing `POST /api/config-set`
+  with the default scope, which `desktop_settings_config_path` already limits to
+  the user config. No new endpoint is added. The Forbidden classification above
+  means a repository value would be ignored anyway. The control must not offer a
+  repository scope that looks as if it works.
+- **Its state is read from the effective config**, not from the raw file, so an
+  absent key shows as checked (the default).
+- **It saves on change, then reloads the `User configuration` editor.** If it
+  did not reload, the editor would still show the old file, and the next `Save`
+  there would quietly write the old value back.
+- **The editor stays authoritative for everything else.** This control is a way
+  to reach one key, not the start of a settings form that replaces the editor.
+
 ### 5.6 A summary is data
 
 Requirement 7, following
@@ -383,6 +446,9 @@ Requirement 3, and the reason a user trusts this at all.
   does not depend on it and carries this requirement on its own until it lands.
 - Manual compaction reports what it did. Automatic compaction is announced in
   the turn it precedes, not silently.
+- With automatic compaction switched off (§5.5), the boundary marker still
+  appears where the model's view begins. It states that the older messages were
+  not sent and were not summarised.
 
 The anti-requirement is the current behaviour: a user must never again be in a
 position where the model has lost something and nothing on screen says so.
@@ -390,8 +456,10 @@ position where the model has lost something and nothing on screen says so.
 ### 5.10 Documentation
 
 `docs/USER_GUIDE.md`: what compaction is, when it happens, that the full
-transcript is kept and how to read it, and that rewinding past a compaction
-restores the whole conversation. `docs/TROUBLESHOOTING.md`: what to do when the
+transcript is kept and how to read it, that rewinding past a compaction
+restores the whole conversation, and how to switch automatic compaction off from
+Settings › General (or `conversation_auto_compact` in the user config) and what
+changes when it is off. `docs/TROUBLESHOOTING.md`: what to do when the
 agent appears to have forgotten a constraint — how to check whether it was
 compacted and how to restate it.
 
@@ -422,6 +490,17 @@ compacted and how to restate it.
   compaction event with a `seq` inside a turn's action span.
 - The summarisation call appears in spec 19's accounting and does not reduce the
   turn's remaining spec 21 ceiling.
+- With `conversation_auto_compact = false`, a session past the threshold makes
+  no summarisation call. The assembled request carries the elision notice, the
+  transcript shows the uncompacted boundary marker, and manual compaction still
+  works — asserted together, so "off" cannot pass while silently dropping
+  messages.
+- `conversation_auto_compact` set in repository config is ignored and reported
+  as a rejected Forbidden key, whichever value it carries.
+- Settings › General shows the checkbox, checked when the key is absent.
+  Unchecking it writes `conversation_auto_compact=false` to the user config only,
+  and reloads the `User configuration` editor so the editor shows the new value
+  — checked in the browser against the running shell, not only by unit test.
 - The transcript shows an expandable boundary marker, and the inspector shows the
   summary with provenance.
 - Two compactions in one session compound correctly: the second summarises the
