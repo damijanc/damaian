@@ -513,7 +513,7 @@ button:disabled {
   width: 100%;
   min-height: 32px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 26px;
+  grid-template-columns: minmax(0, 1fr) 26px 26px;
   align-items: center;
   gap: 2px;
   border-radius: 9px;
@@ -795,6 +795,12 @@ button:disabled {
   border-radius: 10px;
   background: var(--panel, #ffffff);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.12);
+}
+
+/* The `display: flex` above is an author declaration, so it beats the UA
+   `[hidden]` rule; without this the panel can never be closed. */
+.session-search-panel[hidden] {
+  display: none;
 }
 
 .session-search-panel input {

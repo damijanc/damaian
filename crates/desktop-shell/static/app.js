@@ -6115,6 +6115,15 @@ $("attach-add-file-btn").addEventListener("click", async () => {
 
 document.addEventListener("click", (event) => {
   if (!$("composer-attach-menu").contains(event.target)) closeAttachMenu();
+  const searchPanel = $("session-search-panel");
+  if (
+    !searchPanel.hidden &&
+    !searchPanel.contains(event.target) &&
+    !$("session-search-btn").contains(event.target)
+  ) {
+    searchPanel.hidden = true;
+    $("session-search-btn").setAttribute("aria-expanded", "false");
+  }
 });
 
 $("open-vscode-btn").addEventListener("click", async () => {
