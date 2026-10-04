@@ -4756,6 +4756,7 @@ mod tests {
         let (diagnosed_session, expected_card_header) =
             recorded_web_diagnostic_session(&engine, &repository_id, &data_dir);
         let legacy_session = legacy_web_diagnostic_session(&engine, &repository_id, &data_dir);
+        let findings_session = findings_to_review_session(&engine, &repository_id, &repo);
 
         let options = ShellOptions {
             port: 4899,
@@ -4770,6 +4771,7 @@ mod tests {
         println!("  recorded web diagnostic session = {diagnosed_session}");
         println!("    card header should read: {expected_card_header}");
         println!("  legacy web diagnostic session (regex thumbnails) = {legacy_session}");
+        println!("  findings session (toggle should read \"Findings 2\") = {findings_session}");
         println!("  data_dir = {}", data_dir.display());
         run_server(options).expect("serve the UI");
     }
@@ -4890,6 +4892,129 @@ mod tests {
             .update_task_status(&task, workspace_engine::TaskStatus::Complete, None)
             .unwrap();
         (session.id, header)
+    }
+
+    /// The findings panel's fixture (spec 22 Task 11): two open errors, one
+    /// ranged and one not, an open warning, a stale lint finding and a
+    /// dismissed test failure, across four sources. Returns the session id.
+    fn findings_to_review_session(
+        engine: &WorkspaceEngine,
+        repository_id: &str,
+        repo: &std::path::Path,
+    ) -> String {
+        let store = &engine.session_store;
+        let session = store
+            .create_session(repository_id, "Findings to review")
+            .unwrap();
+        let task = store
+            .create_task(&session.id, "check the upload client", "mock", "mock")
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                Some(&task.id),
+                "user",
+                "check the upload client",
+            )
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                Some(&task.id),
+                "assistant",
+                "`cargo check` and `npm test` both failed; the findings panel lists what they reported.",
+            )
+            .unwrap();
+
+        let range = |path: &str, line: u32, column: u32| SourceRange {
+            path: path.to_string(),
+            start_line: line,
+            start_column: Some(column),
+            end_line: None,
+            end_column: None,
+        };
+        let hashed = |path: &str| workspace_engine::hash::file_hash(repo.join(path)).unwrap();
+        let record = |draft: FindingDraft, file_hash: Option<String>| {
+            let mut finding = Finding::new(draft, &engine.scanner).with_task_id(&task.id);
+            if let Some(file_hash) = file_hash {
+                finding = finding.with_file_hash(file_hash);
+            }
+            store.record_finding(&session.id, &finding).unwrap();
+            finding.id().to_string()
+        };
+
+        record(
+            FindingDraft {
+                source: FindingSource::Compiler,
+                severity: Severity::Error,
+                summary: "mismatched types".to_string(),
+                details: Some(
+                    "error[E0308]: mismatched types\n --> upload.rs:3:5\n  |\n3 |     with_retry(send)\n  |     ^^^^^^^^^^^^^^^^ expected `Result<(), Error>`, found `()`"
+                        .to_string(),
+                ),
+                range: Some(range("upload.rs", 3, 5)),
+                code: Some("E0308".to_string()),
+            },
+            Some(hashed("upload.rs")),
+        );
+        record(
+            FindingDraft {
+                source: FindingSource::Command,
+                severity: Severity::Error,
+                summary: "npm test: 1 failing".to_string(),
+                details: None,
+                range: None,
+                code: None,
+            },
+            None,
+        );
+        record(
+            FindingDraft {
+                source: FindingSource::Compiler,
+                severity: Severity::Warning,
+                summary: "unused variable: `retries`".to_string(),
+                details: None,
+                range: Some(range("upload.rs", 7, 9)),
+                code: Some("unused_variables".to_string()),
+            },
+            Some(hashed("upload.rs")),
+        );
+        // A hash no file has, so the finding derives stale on every read.
+        record(
+            FindingDraft {
+                source: FindingSource::Lint,
+                severity: Severity::Warning,
+                summary: "unneeded `return` statement".to_string(),
+                details: None,
+                range: Some(range("retry.rs", 2, 5)),
+                code: Some("clippy::needless_return".to_string()),
+            },
+            Some("sha256:0".to_string()),
+        );
+        let dismissed = record(
+            FindingDraft {
+                source: FindingSource::Test,
+                severity: Severity::Error,
+                summary: "tests::retries_three_times failed".to_string(),
+                details: None,
+                range: Some(range("retry.rs", 10, 1)),
+                code: None,
+            },
+            Some(hashed("retry.rs")),
+        );
+        store
+            .set_finding_status(
+                &session.id,
+                &dismissed,
+                workspace_engine::finding::FindingStatus::Dismissed,
+            )
+            .unwrap();
+
+        // Finished, so the crash recovery sweep leaves the turn alone.
+        store
+            .update_task_status(&task, workspace_engine::TaskStatus::Complete, None)
+            .unwrap();
+        session.id
     }
 
     /// A session from before spec 12 Task 3: no recorded diagnostic, only a

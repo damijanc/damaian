@@ -86,6 +86,16 @@
             </select>
             <span id="chat-status" class="status-badge">Idle</span>
             <button
+              id="findings-toggle-btn"
+              class="topbar-button"
+              type="button"
+              aria-controls="findings-panel"
+              aria-expanded="false"
+              hidden
+            >
+              Findings
+            </button>
+            <button
               id="session-search-btn"
               class="topbar-button search-button"
               type="button"
@@ -148,6 +158,41 @@
         </div>
 
         <section id="chat-log" class="chat-log" aria-live="polite"></section>
+
+        <section id="findings-panel" class="findings-panel" aria-label="Findings" hidden>
+          <div class="findings-header">
+            <strong>Findings</strong>
+            <span id="findings-count" class="findings-count"></span>
+            <select
+              id="findings-severity-filter"
+              class="mode-select"
+              aria-label="Severity filter"
+            >
+              <option value="error" selected>Errors</option>
+              <option value="warning">Errors and warnings</option>
+              <option value="all">All severities</option>
+            </select>
+            <select id="findings-status-filter" class="mode-select" aria-label="Status filter">
+              <option value="open" selected>Open</option>
+              <option value="open_stale">Open and stale</option>
+              <option value="all">All statuses</option>
+            </select>
+            <button
+              id="findings-close-btn"
+              class="btn-icon"
+              type="button"
+              aria-label="Hide findings"
+            >
+              ×
+            </button>
+          </div>
+          <div id="findings-list" class="findings-list"></div>
+          <div class="findings-footer">
+            <button id="findings-fix-btn" class="btn-primary btn-sm" type="button" disabled>
+              Fix selected
+            </button>
+          </div>
+        </section>
 
         <footer class="composer">
           <div class="prompt-box">

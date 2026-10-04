@@ -586,7 +586,7 @@ button:disabled {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  grid-template-rows: auto minmax(0, 1fr) auto auto auto;
   background: var(--surface);
 }
 
@@ -1163,7 +1163,8 @@ button:disabled {
 
 /* In-text file references the server renderer verified against the repo.
    Styled as inline links; the inline-code variant keeps monospace. */
-.message-body .file-reference {
+.message-body .file-reference,
+.findings-panel .file-reference {
   border: 0;
   background: transparent;
   color: var(--accent);
@@ -1179,7 +1180,8 @@ button:disabled {
   font-size: 12px;
 }
 
-.message-body .file-reference:hover {
+.message-body .file-reference:hover,
+.findings-panel .file-reference:hover {
   opacity: 0.8;
 }
 
@@ -1305,6 +1307,177 @@ button:disabled {
 .context-chip button:hover {
   background: var(--line);
   color: var(--ink);
+}
+
+/* The findings dock (spec 22 Task 11): session-scoped, between the chat log
+   and the composer, hidden until opened. Modelled on the terminal dock. */
+.findings-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  max-height: min(320px, 36vh);
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+  padding: 10px clamp(18px, 5vw, 72px);
+  font-size: 12px;
+}
+
+.findings-panel[hidden] {
+  display: none;
+}
+
+.findings-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.findings-header .btn-icon {
+  margin-left: auto;
+}
+
+.findings-count {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.findings-list {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+.findings-group {
+  display: grid;
+  gap: 4px;
+}
+
+.findings-group-title {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.findings-file-path {
+  overflow: hidden;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+
+.finding-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 8px;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+}
+
+.finding-row:not([data-status="open"]) .finding-summary {
+  color: var(--muted);
+}
+
+/* The base `input` rule is sized for text fields (full width, 9px padding).
+   A checkbox takes none of that, and its box is held at the 24px hit-target
+   floor (guide §3); WebKit draws the native glyph centred inside it. */
+.finding-select {
+  width: 24px;
+  height: 24px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+.finding-body {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.finding-headline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+}
+
+.finding-severity {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.finding-severity-error {
+  color: var(--danger);
+}
+
+.finding-severity-warning {
+  color: var(--warn);
+}
+
+.finding-severity-info {
+  color: var(--muted);
+}
+
+.finding-code {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* A standalone link here, not inline text, so it keeps the hit-target floor. */
+.findings-panel .finding-location {
+  justify-self: start;
+  max-width: 100%;
+  min-height: 24px;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.finding-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.finding-details {
+  max-height: 160px;
+  overflow: auto;
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--surface-soft);
+  /* Base `pre` is light text for the dark `--code` background. */
+  color: var(--ink);
+  font-size: 11px;
+  white-space: pre-wrap;
+}
+
+.finding-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+
+.findings-footer {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.findings-empty {
+  margin: 0;
+  color: var(--muted);
 }
 
 .terminal-panel {

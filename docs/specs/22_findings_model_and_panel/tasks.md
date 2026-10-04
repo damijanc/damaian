@@ -20,7 +20,7 @@ decisions it left open in [`context.md`](context.md)
 | 8 · Record findings where checks run (`chat.rs`) | Done 2026-10-04 | New on 2026-10-02 from the Task 7 split, and planned in full on 2026-10-04 (`context.md` §13.4, §14). Landed as sketched, with only rustfmt changes, in a separate worktree, with no other spec editing `chat.rs`. `tests/finding_recording.rs` was extracted from this file's line ranges. `workspace_engine::hash` and `::web_diagnostics` resolved as written, so no re-export was needed. The `chat.rs` line numbers in Step 5 still matched. `command_findings` assigned inside the arm passed borrowck, so `ActionOutcome` is unchanged. Two deviations, both cosmetic. The `use` is a top-level `crate::finding::{…}` import, and `record_command_findings` takes `&CommandExecution` through the file's existing import. The `command_findings` declaration also gained a two-line comment saying why it is a local. `repository_files` uses `config.ignore_patterns` as planned. `Config::default()` already fills it with the defaults that `indexer.rs` falls back to, so nothing is lost. Before the implementation: as Step 4 predicts, four `finding_recording` tests and the changed `plan_turn` assertion failed at runtime, each on "nothing recorded" after its setup passed. The approved test had got past its approval assertion. `a_passing_sandbox_command_records_nothing` passed. After: the Step 7 selection passed 250/250 (5 `finding_recording`, 19 `plan_turn`, 51 `plan`, 107 `finding::`, 23 `session::tests`, 45 `chat::`). All six mutations failed exactly their named tests, with `binary(finding_recording) + binary(plan_turn)`. (1) No sandbox recording failed `a_failed_sandbox_command_…`, `the_failed_step_carries_…` and the `plan_turn` assertion, because no findings means no evidence. (2) No approval recording failed only `an_approved_command_…`, on `[]`. (3) No `record_web_findings` failed only `a_browser_console_error_…`, on `[]`. (4) `None => finding` (keep every range) failed only `an_approved_command_…`, on "src/gone.rs is not in the repository". (5) No `command_findings.take()` push failed `the_failed_step_carries_…` and the `plan_turn` assertion. (6) An empty file list failed only `a_browser_console_error_…`, on the missing range. **Environment, not code:** in mutation 1's run, `an_approved_command_…` also failed. Its `./cargo check` reported `timed out` after 600.28s. It passed in under a second in every other run, and mutation 1 does not touch that path. The next run's `--list` of the relinked test binary sat at `_dyld_start + 0` for about 5 minutes while `XprotectService` was busy. So macOS XProtect can hold a newly written executable at launch, and this test writes one (`./cargo`) on every run. The test is unchanged, and this is recorded as an observation. Scoped fmt, clippy `-p workspace-engine`, `node --check`, `lint:web` and typos are clean. `lint:web`'s one info is pre-existing, in `scripts/check-spec-status.mjs`. The eval harness deterministic tier passed 16/16. Metrics match `evals/baseline.json` except tokens, 101950 against 101963 (not investigated), and latency, median 57 against 44 ms and p90 128 against 109 ms, measured while XProtect was loading the machine. The baseline was not regenerated. |
 | 9 · Dismissal and the scoped repair request | Done 2026-10-04 | Planned in full on 2026-10-04 (`context.md` §15). Only `Open` findings are repaired; stale, dismissed, fixed and unknown ids are each excluded with a reason. Landed as sketched. `repair.rs` was extracted from this file's line ranges and is byte-identical to `rustfmt` of the sketch, apart from one deviation: clippy 1.98's `cloned_ref_to_slice_refs` rejected four single-element `&[x.clone()]` arguments in the unit tests, so they are now `std::slice::from_ref(&x)`. `finding.rs` declares `mod repair;` after `mod browser;` and re-exports `Exclusion`, `ExclusionReason` and `RepairRequest`. `finding_recording.rs` gains the imports, `ask_in` and the two tests. No other file changed. Before the implementation the tests failed to compile (`E0432` on the re-export, then `E0433`/`E0425`/`E0422` on the missing types). After it, `test(finding::) + binary(finding_recording)` passed 123/123: 107 `finding::` unchanged, 9 `repair::tests`, and 7 `finding_recording` (5 unchanged + 2 new). All six mutations failed their named tests. Mutations 1, 3–6 ran with `--lib -E 'test(finding::repair)'`. (1) Keeping `Stale` failed `a_stale_finding_is_excluded_…`, plus `nothing_left_to_repair_…`, the exact-render test and `the_request_serialises_…`. (2) Keeping `Dismissed` failed `dismissed_and_fixed_findings_are_excluded_…` (unit) and `dismissing_a_finding_does_not_suppress_…` (integration). (3) Iterating `selected_ids` failed `open_findings_are_kept_in_session_order`, and also `a_duplicate_selection_is_counted_once`, because a repeated id is kept twice. (4) Dropping unknown ids failed `an_unknown_id_is_excluded_…` and the duplicate test. (5) Removing `noted`, the unknown loop's only dedup, failed only the duplicate test. (6) Rendering when only exclusions remain failed only `nothing_left_to_repair_renders_nothing`. **Environment, not code:** a run over the whole `-p workspace-engine` relinks all 21 integration binaries. Mutation 2's first attempt, scoped that way, was killed at 30 minutes with no output, behind XProtect launch scans (see Task 8's row). Rerun with `--lib` and `--test finding_recording`, it took 105 s wall-clock against 14 s of CPU. Step 5 and Step 7's test runs used the same `--lib --test finding_recording` targets with the plan's filter. That selects the same 123 tests without relinking binaries the filter never runs. Scoped fmt, clippy `-p workspace-engine` and typos are clean. |
 | 10 · Shell API | Done 2026-10-04 | Planned in full on 2026-10-04 (`context.md` §16). Implemented in its own worktree, because spec 31 work on `main` left `workspace-engine` not compiling. `FindingStatus::parse` landed as sketched. Before it, the test failed to compile (`E0599`). After it, `finding::tests` passed 17/17. The shell tests compiled first time, as written in the plan. Before the routes, all six failed on the catch-all `{"error":"not found"}`, as Step 4 predicts. **Deviation 1: the routes are functions, not inline arms.** Written inline as sketched, every request a `desktop-shell --lib` test served aborted with `fatal runtime error: stack overflow`. That included spec 20's unchanged session-mode tests. Every arm's locals share `handle_connection`'s frame, and each findings arm holds a `WorkspaceEngine` by value. The nine tests passed with `RUST_MIN_STACK=16777216`, and at `HEAD`, without the arms, the session-mode tests passed with the default stack. The desktop app runs the server on a default `thread::spawn` thread (`desktop-app/src/main.rs`), so a debug build of the app would have aborted on every request. The arms now call `handle_findings`, `handle_finding_status` and `handle_findings_repair`, as `handle_ask_stream` already does, with the sketched bodies. A comment above them says why. **Deviation 2: the GET test is stronger.** Mutation 5 (root `Path::new("")`) first survived. The test's working directory, `crates/desktop-shell`, has its own `src/lib.rs`, and a missing or different file reads as stale, so the only ranged finding was stale under any root. The test now also records a finding on an untouched `src/kept.rs` and expects `open`. After the change, the Step 6 selection passed 9/9 (6 new + 3 session-mode), the whole `desktop-shell --lib` suite passed 86/86 (4 ignored), and `finding::` passed 117/117 (107 + 9 repair + 1 new). Mutations, run with `--lib -E 'test(findings) + test(finding_status)'`: (1) No `session_in_repository` in GET failed only `findings_endpoints_refuse_…`. (2) Defaulting an unknown status to `Dismissed` failed only `post_finding_status_rejects_…`. (3) Overwriting the status in `read_findings`' JSON, with no `set_finding_status`, failed `post_finding_status_dismisses_…` on the reread (`"open"` vs `"dismissed"`). It also failed the reject test, because nothing refuses `stale` any more. (4) `""` for a `None` prompt failed only `post_findings_repair_with_nothing_open_…`. (5) After the test fix, the root `""` failed only `get_findings_…`, on `"stale"` vs `"open"`. Scoped fmt, clippy `-p desktop-shell -p workspace-engine --all-targets`, the scoped tests and typos are clean. The stack headroom is recorded as a local observation for a decision beyond this spec. |
-| 11 · Findings panel | Not started | Planned in full on 2026-10-04 (`context.md` §17). It is a session dock, hidden until the session has findings. "Fix selected" bypasses `looksLikeEditRequest`, which would otherwise turn the repair into a one-shot patch proposal. Locations reuse spec 05's `wireFileReferences`. The panel JS was checked before handover: `node --check` passes, and Biome reports no lint problems, only line-wrapping. Nothing was run in a browser; Step 7's walk-through is the implementer's. |
+| 11 · Findings panel | Done 2026-10-04 | Planned in full on 2026-10-04 (`context.md` §17). Implemented in its own worktree. The markup, the panel JS, the `agentic` bypass and the harness seed landed as sketched. Biome needed no reformatting. The five listeners sit with the other top-level wiring, before `$("session-search-btn")`, as Step 4 allows. **Deviations.** (1) `clearChat` calls a new `clearFindings()`, so there is no separate refresh on `loadSession`'s empty branch. Every `clearChat` caller means "no conversation": a new, deleted or unselected session, or a repository with none. Without this, the last session's findings stayed in the panel after a new session started, and "Fix selected" would have posted an empty `session_id`. (2) `refreshFindings()` also runs after the *stopped*-turn `loadSessions` in `sendChatPrompt`, because a check can record findings before the user stops the turn. (3) Base `pre` is light text (`#e6edf3`) for the dark `--code` background, so `.finding-details` sets `color: var(--ink)`. Without that, the expanded details were near-white on `--surface-soft`. (4) The base `input` rule sizes text fields (`width: 100%`, 9px padding). A new `.finding-select` rule resets that and holds the checkbox at 24×24 (guide §3), which Step 2 anticipates. A `.findings-panel .finding-location` rule gives the standalone location a 24px min-height and truncates it on one line. (5) The seed qualifies `workspace_engine::finding::FindingStatus`, because the test module does not import it. The E0308 seed carries a rustc-shaped `details` block. (6) The specimen lifts the panel's `max-height` inline, with a note, so both rows show. **Step 7, in the browser pane against the harness on 4899** (PID 36468, stopped by PID): (1) the "Add retry…" session: toggle and panel hidden. (2) "Findings to review": the toggle reads **Findings 2**, with `aria-expanded="false"`. (3) A real click opens it. It shows "Showing 2 of 5" and two rows, `mismatched types` under **Compiler (1)** and `npm test: 1 failing` under **Unparsed checks (1)**. (4) Both filters on "All": 5 rows. The stale `needless_return` row has a disabled checkbox, the re-run note and Dismiss. The dismissed test row has a disabled checkbox, "Dismissed." and Restore. (5) The E0308 location's dataset is `{path: "upload.rs", line: "3", col: "5"}`. It was not clicked. (6) Details starts hidden at 0px. One click expands it to 97px with the seeded text in `rgb(31, 36, 40)` on `rgb(251, 251, 250)`, and a second click collapses it. (7) A real click on Dismiss for E0308: it leaves the default view and the toggle reads **Findings 1**. After a page reload and reopening the session, it is still `dismissed`. Restore under "All" brings it back as `open`, and the toggle reads **Findings 2**. (8) A real click selects `npm test: 1 failing`, then on **Fix selected (1)**. The user bubble starts "Fix the 1 finding below, which checks reported in this session…". The network log shows `POST /api/findings-repair` then `POST /api/ask-stream`, with no `/api/propose-edit`. The turn ended "Failed" (no model key), and the button returned to a disabled "Fix selected". (9) Real Tab presses from the severity filter visit the status filter, ×, then per row the checkbox, location, Details, Dismiss/Restore, in reading order, then the composer. Disabled checkboxes and the disabled Fix button are skipped. Every stop computes a focus ring. Measured: checkbox 24×24, location 24px, Details 24px, Dismiss 29px, filters 30px, × 26×31px, panel 276px. (10) The console log is empty. The specimen was checked over a throwaway `python3 -m http.server`, because the pane renders a `file://` page as a snapshot without `style.css`. Checks: `node --check`, `lint:web` (only the pre-existing info in `scripts/check-spec-status.mjs`), `cargo fmt --check`, clippy `-p desktop-shell --all-targets` and the Step 9 `typos` paths are clean. `cargo nextest run -p desktop-shell --lib` passed 86/86 (4 skipped). There is no JS test suite, so the walk-through is the verification. No mutation testing applies. |
 | 12 · Docs, acceptance criteria, close the spec | Not started | |
 
 **Goal:** One structured, redacted, addressable `Finding` type shared by every
@@ -6377,7 +6377,7 @@ a bare `-p`, for the XProtect reason in Tasks 8–10.
     `findings-fix-btn` and `findings-close-btn`, which the specimen and
     Task 12's docs refer to.
 
-- [ ] **Step 1: Markup**
+- [x] **Step 1: Markup**
 
   In `static/index.html`, inside `.thread-actions`, add this directly before
   `#session-search-btn`:
@@ -6437,7 +6437,7 @@ a bare `-p`, for the XProtect reason in Tasks 8–10.
   Match the file's existing indentation. Biome checks only JS and CSS, so
   `index.html` is not linted, but keep it tidy.
 
-- [ ] **Step 2: Styles**
+- [x] **Step 2: Styles**
 
   In `static/style.css`:
 
@@ -6604,7 +6604,7 @@ a bare `-p`, for the XProtect reason in Tasks 8–10.
   checkbox or select rules give these elements a size below 24×24px (§3),
   fix that in this task.
 
-- [ ] **Step 3: The `agentic` option on `sendChatPrompt`**
+- [x] **Step 3: The `agentic` option on `sendChatPrompt`**
 
   In `sendChatPrompt` (`app.js:~6296`), change
 
@@ -6624,7 +6624,7 @@ a bare `-p`, for the XProtect reason in Tasks 8–10.
 
   Nothing else in `sendChatPrompt` changes.
 
-- [ ] **Step 4: The panel code**
+- [x] **Step 4: The panel code**
 
   Add this block to `app.js`, after `renderWebDiagnosticCard` and its helpers:
 
@@ -6914,7 +6914,7 @@ a bare `-p`, for the XProtect reason in Tasks 8–10.
   as here, check that its `hidden` toggle still works once appended. It sets
   `panel.hidden` on the element itself, so it should.
 
-- [ ] **Step 5: Refresh points**
+- [x] **Step 5: Refresh points**
 
   Add `await refreshFindings();`:
 
@@ -6931,7 +6931,7 @@ a bare `-p`, for the XProtect reason in Tasks 8–10.
   `setComposerBusy`, so "Fix selected" disables while a turn runs and
   re-enables after it. Add the one call inside `setComposerBusy` itself.
 
-- [ ] **Step 6: Seed the inspection harness**
+- [x] **Step 6: Seed the inspection harness**
 
   In `crates/desktop-shell/src/lib.rs`'s test module, add a function next to
   `recorded_web_diagnostic_session`, following its shape: create the session
@@ -6952,7 +6952,7 @@ a bare `-p`, for the XProtect reason in Tasks 8–10.
   finding names, that does not matter: staleness compares hashes, and
   navigation is not clicked.
 
-- [ ] **Step 7: Verify in the browser**
+- [x] **Step 7: Verify in the browser**
 
   Rebuild and start the harness:
 
@@ -6993,14 +6993,14 @@ a bare `-p`, for the XProtect reason in Tasks 8–10.
 
   Stop the harness by its PID, never by name (`AGENTS.md` Traps).
 
-- [ ] **Step 8: Specimen**
+- [x] **Step 8: Specimen**
 
   Add a findings-panel specimen to `docs/ui-style-guide.html`, next to the
   existing card specimens. Include a group title, one open row with a location
   and Details, one stale row with its note, and the footer's primary action.
   Guide §9 requires this in the same commit.
 
-- [ ] **Step 9: Scoped checks**
+- [x] **Step 9: Scoped checks**
 
   ```bash
   node --check crates/desktop-shell/static/app.js
@@ -7015,7 +7015,7 @@ a bare `-p`, for the XProtect reason in Tasks 8–10.
   `scripts/check-spec-status.mjs`. That is not this task's. Run
   `npm run lint:web:fix` for formatting only, and review its diff.
 
-- [ ] **Step 10: Update this file's Task 11 row with the Step 7 results, then
+- [x] **Step 10: Update this file's Task 11 row with the Step 7 results, then
   show the change and the check results and ask before committing**
 
 ## Task 12: Docs, acceptance criteria, close the spec
