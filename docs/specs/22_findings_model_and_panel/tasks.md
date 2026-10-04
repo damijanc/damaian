@@ -17,7 +17,7 @@ decisions it left open in [`context.md`](context.md)
 | 5 · Biome parser | Done 2026-10-02 | Planned in full on 2026-10-01 against captured Biome 2.5.7 output (`context.md` §11). Landed as sketched, with only rustfmt changes. The fixtures were extracted from this file's line ranges, so they are byte-identical to the plan, and `grep -c '^  $'` on the check stderr prints 28. `finding/biome.rs` is new. `finding.rs` declares `mod biome;` and registers `BiomeParser` third. Before the implementation the tests failed to compile (`E0425` on `parse_biome`/`BiomeParser`, plus `E0433`). After it, `test(finding::)` passed 89/89 (71 unchanged + 18). All eight mutations failed their named test. (1) Ending a block at a whitespace-only line failed 10 tests, `details_run_past_…` among them: the empty line after each header ends the block before its marker, so every summary falls back to the category. (2) A greedy path failed 5, including `a_lint_error_keeps_…`. (3) No OSC 8 alternative failed only `forced_colour_output_parses_the_same`. (4) Plain-only markers failed `colour_markers_map_like_plain_ones` and the forced-colour test. (5) Non-error→`Warning` failed `an_info_marker_is_info`, `a_passing_run_keeps_its_info` and the colour-marker test. (6) No `HIDDEN` check failed only `hidden_diagnostics_become_one_info_draft`. (7) Any `npm run` script failed only `does_not_match_other_commands`. (8) Skipping marker-less blocks failed only `a_block_without_a_marker_is_kept_…`. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
 | 6 · Browser findings from spec 12's `WebDiagnosticDetails` | Done 2026-10-02 | Re-scoped on 2026-09-29 by spec 12's close-out, so there is no `entries` field (`context.md` §7.1). Planned in full on 2026-10-02 (`context.md` §12). Landed as sketched, with only rustfmt changes. `browser.rs` was extracted from this file's line ranges, so before formatting it was byte-identical to the plan. rustfmt rewrapped lines in `browser.rs` and sorted `mod browser;` below `mod biome;`, not above it as Step 2 says. It did not touch the `finding.rs` test array, contrary to Step 7's note. `finding/browser.rs` is new. `finding.rs` adds `FindingSource::BrowserScenario` (`"browser_scenario"`), broadens `Command`'s doc and re-exports `findings_from_web_record`. In `web_diagnostics.rs`, the three `model_item`s and `is_loopback_url` became `pub(crate)`, and nothing else changed. Steps 1 and 2 were applied together, so Step 1's separate test run was skipped. Before the implementation the tests failed to compile (`E0425` on `findings_from_web_record`/`served_path`, `E0432` on the re-export). After it, `test(finding::) + test(web_diagnostics::)` passed 121/121: 107 `finding::` (89 + 18 `browser::tests`), and the `web_diagnostics::` tests were unchanged. All six mutations failed only their named tests. (1) No `node_modules` exclusion failed only `a_console_error_at_a_served_url_maps_to_…`. (2) First candidate wins failed only `an_ambiguous_served_path_has_no_range`. (3) No `is_loopback_url` failed `a_console_location_on_another_origin_has_no_range` and `served_path_accepts_only_loopback_…`. (4) No `!explained` failed only `a_tool_failure_is_not_doubled_…`. (5) Skipping failed steps failed only `a_failed_scenario_step_is_a_browser_scenario_error`. (6) Every problem level as `Error` failed only `an_inspection_yields_one_finding_per_problem_…`. Scoped fmt, clippy `-p workspace-engine`, `test(finding::) + test(web_diagnostics::)` and typos are clean. |
 | 7 · Persistence, derived status, `Evidence::Findings` | Done 2026-10-03 | Split on 2026-10-02 from the old "Recording, persistence, staleness" task (`context.md` §13.1) and planned in full. Landed as sketched, with only rustfmt changes. The tests and implementation were extracted from this file's line ranges. `session.rs` gains `record_finding`, `set_finding_status` and `read_findings` after `read_session_web_diagnostics`, and the free functions `replay_findings` and `finding_is_stale` before `parse_session_log`. The `let`-chains compiled as written. `plan.rs` gains `Evidence::Findings` and its two match arms. rustfmt turned the `status_from_evidence` arm into a block. Two comments in `plan.rs` were reworded beyond the plan because the new variant made them stale: the `#[non_exhaustive]` note, which said `Findings` "joins this enum when spec 22 exists", and the "Neither has a failure mode" comment, which now covers three variants. Step 1's two task-number comments were updated. Before the implementation, the session tests failed to compile (`E0599` on all three methods). After it, `test(session::tests) + binary(plan) + test(finding::)` passed 181/181. That includes the 15 new session tests (`session::tests` is now 23) and the 4 new plan tests (`binary(plan)` is now 51). All seven mutations failed only their named test. Mutations 1–6 ran with `--lib -E 'test(session::tests)'`, and 7 ran with `binary(plan)`. (1) Checking every status failed `a_dismissed_finding_is_not_re_marked_stale`. (2) Missing hash as stale failed `a_finding_without_a_recorded_hash_is_never_stale`. (3) `Err(_) => false` failed `a_deleted_file_makes_its_finding_stale`. (4) No `Stale` refusal failed `setting_stale_directly_is_refused_…`. (5) No unknown-id check failed `a_status_change_for_an_unknown_finding_…`. (6) `parsed_events(content).0` failed `a_rewind_takes_the_findings_…`. (7) `*failing > 0` failed `findings_evidence_alone_does_not_block_a_step`. No other crate needed a change. Scoped fmt, clippy `-p workspace-engine`, the scoped tests and typos are clean. |
-| 8 · Record findings where checks run (`chat.rs`) | Not started | New on 2026-10-02 from that split; outline only. Its facts are in `context.md` §13.4. |
+| 8 · Record findings where checks run (`chat.rs`) | Not started | New on 2026-10-02 from the Task 7 split, and planned in full on 2026-10-04 (`context.md` §13.4, §14). |
 | 9 · Dismissal and the scoped repair request | Not started | |
 | 10 · Shell API | Not started | |
 | 11 · Findings panel | Not started | |
@@ -4628,36 +4628,605 @@ the tests until Task 8. The methods are `pub` on a `pub` type, so
 
 ## Task 8: Record findings where checks run
 
-**Requirements:** 1, 2, 4, and the "full output remains reachable through
-`origin_ref`" criterion. **Files:** `chat.rs`, `finding.rs` (one builder),
-and `app.js` (`describeEvidence` only). Facts from `context.md` §13.4:
+**Requirements:** 1, 2, 4, and these acceptance criteria:
+- "a failing test, a lint error, and a browser console error all normalise
+  into `Finding`", end to end through a turn;
+- "`details` is bounded, and full output remains reachable through
+  `origin_ref`".
 
-- **Commands.** At `chat.rs:975` and `chat.rs:2260`, after `run_proposal`,
-  call `findings_from_execution(&record.execution, &default_parsers(), &self.scanner)`.
-  For each finding:
-  - keep the range only if `repository_root.join(path)` is a file. Otherwise
-    drop it, with a new `Finding` builder that removes the range and adds no
-    free text;
-  - take `file_hash` at the same moment;
-  - attach `task.id` and `origin_ref = record.execution.id`;
-  - call `record_finding`.
-- **Evidence.** In the loop, push `Evidence::Findings { refs, failing }` next
-  to the command's `CommandExit` evidence (`chat.rs:~2717`), where `failing`
-  is the number of `Error` findings.
-- **Browser.** In `run_and_record_web_diagnostic`, after
-  `append_web_diagnostic`, call `findings_from_web_record`. Build the file list
-  with `tree_walk::walk` only when the report has a console entry with a
-  location. Attach `record.task_id` and `record.id`, and record them.
-- **The standalone branch.** `/api/run-command` records nothing, because it
-  has no session (`context.md` §13.4). Record that as a known gap.
-- **Shell wording.** `describeEvidence` gains a `findings` wording.
+**Files:**
+- **Create:** `crates/workspace-engine/tests/finding_recording.rs`.
+- **Modify:**
+  - `crates/workspace-engine/src/chat.rs`: three helpers, two free functions,
+    the two command sites, the evidence site, and the diagnostic helper's
+    signature;
+  - `crates/workspace-engine/src/finding.rs`: `without_range`;
+  - `crates/workspace-engine/tests/plan_turn.rs`: one assertion;
+  - `crates/desktop-shell/static/app.js`: `describeEvidence` only.
 
-Recording is best-effort only where the rest of that path is. A failure to
-append a finding fails the call, like `append_web_diagnostic` does. Read the
-"What to build next" → Parallel work section before starting, because this
-task holds `chat.rs`.
+Planned in full on 2026-10-04.
 
-*(Expand into full TDD steps before starting this task.)*
+**Read `context.md` §13.4 and §14 first.** They fix:
+- which sites record findings;
+- why the resume path records findings but attaches no evidence;
+- why evidence travels in a per-call local;
+- why browser findings attach no evidence;
+- the one existing assertion this task changes on purpose.
+
+**This task holds `chat.rs`.** Read `docs/specs/README.md` "What to build
+next" → Parallel work before starting, and do not run it alongside another
+spec that edits `chat.rs`.
+
+**Interfaces:**
+- Consumes:
+  - `findings_from_execution`, `default_parsers` and `findings_from_web_record`
+    (`crate::finding`);
+  - `Finding::with_task_id`, `with_origin_ref` and `with_file_hash`;
+  - `SessionStore::record_finding` (Task 7);
+  - `Evidence::Findings` (Task 7);
+  - `hash::file_hash`;
+  - `ignore::parse_ignore_patterns` and `tree_walk::walk`.
+- Produces:
+  - `Finding::without_range(self) -> Self`.
+  - Findings appended to the session log for every command that runs inside a
+    turn (sandbox or approved) and for every recorded browser diagnostic, each
+    carrying `task_id` and `origin_ref`:
+    - for a command, `origin_ref` is the execution id, and its output is at
+      `<data dir>/commands/output/<id>/`;
+    - for a browser diagnostic, it is the `WebDiagnosticRecord` id.
+  - `Evidence::Findings { refs, failing }` on the open plan step, after the
+    `CommandExit` of a sandbox command that produced findings.
+  - A `findings` wording in `describeEvidence`.
+
+- [ ] **Step 1: Add `Finding::without_range`**
+
+  In `finding.rs`, after `with_file_hash`:
+
+  ```rust
+      /// Removes the range. Recording drops a parser's range when it does not
+      /// name a file in the repository (`context.md` §13.4). It adds no text,
+      /// so the redaction guarantee is unaffected.
+      pub fn without_range(mut self) -> Self {
+          self.range = None;
+          self
+      }
+  ```
+
+- [ ] **Step 2: Write the failing integration tests**
+
+  Create `crates/workspace-engine/tests/finding_recording.rs`:
+
+  ```rust
+  //! Findings recorded where checks run: spec 22 Task 8, `context.md` §13.4
+  //! and §14. Every test drives a real turn through the public API.
+
+  use std::fs;
+  use std::os::unix::fs::PermissionsExt;
+  use std::path::{Path, PathBuf};
+  use std::sync::atomic::{AtomicU64, Ordering};
+  use std::time::{SystemTime, UNIX_EPOCH};
+
+  use workspace_engine::finding::{Finding, FindingSource, FindingStatus};
+  use workspace_engine::plan::Evidence;
+  use workspace_engine::web_diagnostics::{
+      WebDiagnosticCall, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
+  };
+  use workspace_engine::{
+      CancelToken, ChatTurnResult, Config, MockModelAdapter, ModelAdapter, ToolCall, TurnProgress,
+      TurnSink, WorkspaceEngine,
+  };
+
+  static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+  fn temp_repo(name: &str) -> PathBuf {
+      let now = SystemTime::now()
+          .duration_since(UNIX_EPOCH)
+          .expect("clock should work")
+          .as_nanos();
+      let repo = std::env::temp_dir().join(format!(
+          "damaian-finding-recording-{name}-{now}-{}",
+          COUNTER.fetch_add(1, Ordering::Relaxed)
+      ));
+      fs::create_dir_all(repo.join("src")).expect("repository should be created");
+      fs::write(repo.join("src/a.rs"), "fn main() {}\n").expect("a source file");
+      repo
+  }
+
+  fn engine_for(repo: &Path) -> WorkspaceEngine {
+      WorkspaceEngine::new(Config {
+          data_dir: repo.join(".damaian"),
+          // Throwaway repository: a watcher would only cost FSEvents registration.
+          enable_index_watcher: false,
+          ..Config::default()
+      })
+  }
+
+  fn sink_parts() -> (CancelToken, impl FnMut(&str), impl FnMut(TurnProgress)) {
+      (CancelToken::new(), |_token: &str| {}, |_event: TurnProgress| {})
+  }
+
+  fn ask(
+      engine: &WorkspaceEngine,
+      repo: &Path,
+      prompt: &str,
+      adapter: &mut dyn ModelAdapter,
+  ) -> ChatTurnResult {
+      let (cancel, mut on_token, mut on_progress) = sink_parts();
+      let mut sink = TurnSink {
+          on_token: &mut on_token,
+          on_progress: &mut on_progress,
+          cancel: &cancel,
+      };
+      engine
+          .chat_orchestrator
+          .ask_with_session(repo, prompt, &[], None, adapter, &mut sink)
+          .expect("the turn should run")
+  }
+
+  fn approve(
+      engine: &WorkspaceEngine,
+      proposal_id: &str,
+      adapter: &mut dyn ModelAdapter,
+  ) -> ChatTurnResult {
+      let (cancel, mut on_token, mut on_progress) = sink_parts();
+      let mut sink = TurnSink {
+          on_token: &mut on_token,
+          on_progress: &mut on_progress,
+          cancel: &cancel,
+      };
+      engine
+          .chat_orchestrator
+          .resume_after_command_decision(proposal_id, true, "tester", adapter, &mut sink)
+          .expect("the resumed turn should run")
+  }
+
+  fn call(name: &str, arguments_json: &str) -> ToolCall {
+      ToolCall {
+          id: format!("call_{name}"),
+          name: name.to_string(),
+          arguments_json: arguments_json.to_string(),
+      }
+  }
+
+  /// Scripted tool-call rounds, then a plain answer so the loop ends.
+  fn scripted(rounds: Vec<Vec<ToolCall>>) -> MockModelAdapter {
+      let mut responses: Vec<String> = rounds.iter().map(|_| String::new()).collect();
+      let mut calls = rounds;
+      responses.push("Done.".to_string());
+      calls.push(Vec::new());
+      MockModelAdapter::new_sequence_with_tool_calls(responses, calls)
+  }
+
+  fn findings(engine: &WorkspaceEngine, repo: &Path, session_id: &str) -> Vec<Finding> {
+      engine
+          .session_store
+          .read_findings(session_id, repo)
+          .expect("findings should read")
+  }
+
+  /// A failed sandbox command becomes one generic finding (`ls` has no
+  /// parser). It carries its task and an `origin_ref` under which the full
+  /// stored output lives (`context.md` §13.4).
+  #[test]
+  fn a_failed_sandbox_command_is_recorded_with_its_task_and_reachable_output() {
+      let repo = temp_repo("sandbox-failed");
+      let engine = engine_for(&repo);
+      let mut adapter = scripted(vec![vec![call(
+          "run_command",
+          r#"{"command":"ls no-such-directory","reason":"List it"}"#,
+      )]]);
+
+      let result = ask(&engine, &repo, "List the folder", &mut adapter);
+      let recorded = findings(&engine, &repo, &result.session.id);
+
+      assert_eq!(recorded.len(), 1, "{recorded:?}");
+      let finding = &recorded[0];
+      assert_eq!(finding.source(), FindingSource::Command);
+      assert!(finding.summary().starts_with("ls no-such-directory: "), "{}", finding.summary());
+      assert_eq!(finding.task_id(), Some(result.task.id.as_str()));
+      let origin = finding.origin_ref().expect("an origin");
+      assert!(origin.starts_with("cmd_"), "{origin}");
+      let stderr = repo.join(".damaian/commands/output").join(origin).join("stderr.log");
+      let stored = fs::read_to_string(&stderr).expect("the full output is where origin_ref points");
+      assert!(stored.contains("no-such-directory"), "{stored}");
+  }
+
+  #[test]
+  fn a_passing_sandbox_command_records_nothing() {
+      let repo = temp_repo("sandbox-passed");
+      let engine = engine_for(&repo);
+      let mut adapter =
+          scripted(vec![vec![call("run_command", r#"{"command":"ls src","reason":"List"}"#)]]);
+
+      let result = ask(&engine, &repo, "List the source", &mut adapter);
+      assert!(findings(&engine, &repo, &result.session.id).is_empty());
+  }
+
+  /// §14: the step holds the exit and, after it, the findings it produced.
+  #[test]
+  fn the_failed_step_carries_findings_evidence_after_its_exit() {
+      let repo = temp_repo("evidence");
+      let engine = engine_for(&repo);
+      let mut adapter = scripted(vec![
+          vec![call(
+              "propose_plan",
+              r#"{"steps":[{"title":"Check the folder"},{"title":"Report"}]}"#,
+          )],
+          vec![call(
+              "run_command",
+              r#"{"command":"ls no-such-directory","reason":"List it"}"#,
+          )],
+          vec![call("complete_step", "{}")],
+      ]);
+
+      let result = ask(&engine, &repo, "Check the folder", &mut adapter);
+      let recorded = findings(&engine, &repo, &result.session.id);
+      let plan = engine
+          .session_store
+          .read_task_plan(&result.session.id, &result.task.id)
+          .unwrap()
+          .expect("the turn proposed a plan");
+
+      match plan.steps[0].evidence.as_slice() {
+          [Evidence::CommandExit { exit_code, .. }, Evidence::Findings { refs, failing }] => {
+              assert_ne!(*exit_code, Some(0));
+              assert_eq!(refs, &vec![recorded[0].id().to_string()]);
+              assert_eq!(*failing, 1);
+          }
+          other => panic!("expected an exit then its findings, got {other:?}"),
+      }
+  }
+
+  /// A repository script named `./cargo` prints rustc-shaped errors, so the
+  /// real Rust diagnostics parser reads it (`context.md` §14).
+  const FAKE_CARGO: &str = "#!/bin/sh\ncat >&2 <<'EOF'\nerror[E0308]: mismatched types\n --> src/a.rs:1:1\n  |\n\nerror[E0425]: cannot find value `x` in this scope\n --> src/gone.rs:2:3\n  |\n\nerror: could not compile `demo` (lib) due to 2 previous errors\nEOF\nexit 101\n";
+
+  /// The approval path records too. A range is kept only when it names a file
+  /// in the repository, and is hashed then (`context.md` §13.4). Changing that
+  /// file then makes the finding stale (Task 7).
+  #[test]
+  fn an_approved_command_records_findings_with_checked_and_hashed_ranges() {
+      let repo = temp_repo("approved");
+      fs::write(repo.join("cargo"), FAKE_CARGO).unwrap();
+      fs::set_permissions(repo.join("cargo"), fs::Permissions::from_mode(0o755)).unwrap();
+      let engine = engine_for(&repo);
+      let mut adapter = scripted(vec![vec![call(
+          "run_command",
+          r#"{"command":"./cargo check","reason":"Check it"}"#,
+      )]]);
+
+      let stopped = ask(&engine, &repo, "Check the crate", &mut adapter);
+      let proposal = stopped.command_proposal.expect("an unknown executable needs approval");
+      assert!(proposal.requires_approval && !proposal.blocked, "{proposal:?}");
+      approve(&engine, &proposal.id, &mut scripted(vec![]));
+
+      let recorded = findings(&engine, &repo, &stopped.session.id);
+      assert_eq!(recorded.len(), 2, "{recorded:?}");
+      let (kept, dropped) = (&recorded[0], &recorded[1]);
+      assert_eq!(kept.code(), Some("E0308"));
+      assert_eq!(kept.range().map(|range| range.path.as_str()), Some("src/a.rs"));
+      assert_eq!(
+          kept.file_hash(),
+          Some(workspace_engine::hash::file_hash(repo.join("src/a.rs")).unwrap().as_str())
+      );
+      assert_eq!(dropped.code(), Some("E0425"));
+      assert_eq!(dropped.range(), None, "src/gone.rs is not in the repository");
+      assert_eq!(dropped.file_hash(), None);
+      for finding in &recorded {
+          assert_eq!(finding.task_id(), Some(stopped.task.id.as_str()));
+          assert!(finding.origin_ref().is_some_and(|origin| origin.starts_with("cmd_")));
+      }
+
+      fs::write(repo.join("src/a.rs"), "fn main() { changed() }\n").unwrap();
+      let after = findings(&engine, &repo, &stopped.session.id);
+      assert_eq!(after[0].status(), FindingStatus::Stale);
+      assert_eq!(after[1].status(), FindingStatus::Open, "no range, so no staleness");
+  }
+
+  const CONSOLE_REPORT: &str = r#"{"final_url": "http://localhost:5001/", "console": [
+    {"type": "error", "text": "Uncaught TypeError: game is undefined",
+     "location": {"url": "http://localhost:5001/js/app.js", "lineNumber": 41, "columnNumber": 7}}]}"#;
+
+  struct ConsoleErrorRunner;
+
+  impl WebDiagnosticsRunner for ConsoleErrorRunner {
+      fn inspect(&self, _call: &WebDiagnosticCall) -> workspace_engine::Result<WebDiagnosticReport> {
+          Ok(WebDiagnosticReport::from_text(CONSOLE_REPORT, false))
+      }
+
+      fn run_scenario(&self, call: &WebDiagnosticCall) -> workspace_engine::Result<WebDiagnosticReport> {
+          self.inspect(call)
+      }
+  }
+
+  /// A browser console error is recorded with its served URL mapped to the
+  /// one repository file (`context.md` §12.3), hashed, and tied to the
+  /// diagnostic record that produced it.
+  #[test]
+  fn a_browser_console_error_is_recorded_with_its_mapped_range_and_record() {
+      let repo = temp_repo("browser");
+      fs::create_dir_all(repo.join("static/js")).unwrap();
+      fs::write(repo.join("static/js/app.js"), "let game;\n").unwrap();
+      let mut engine = engine_for(&repo);
+      engine
+          .chat_orchestrator
+          .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(ConsoleErrorRunner));
+      let mut adapter = scripted(vec![vec![call(
+          "inspect_web_page",
+          r#"{"url":"http://localhost:5001/"}"#,
+      )]]);
+
+      let result = ask(&engine, &repo, "Why is the game broken?", &mut adapter);
+      let recorded = findings(&engine, &repo, &result.session.id);
+
+      assert_eq!(recorded.len(), 1, "{recorded:?}");
+      let finding = &recorded[0];
+      assert_eq!(finding.source(), FindingSource::BrowserConsole);
+      let range = finding.range().expect("the served URL maps to one file");
+      assert_eq!((range.path.as_str(), range.start_line), ("static/js/app.js", 42));
+      assert_eq!(
+          finding.file_hash(),
+          Some(workspace_engine::hash::file_hash(repo.join("static/js/app.js")).unwrap().as_str())
+      );
+      assert_eq!(finding.task_id(), Some(result.task.id.as_str()));
+      assert!(finding.origin_ref().is_some_and(|origin| origin.starts_with("webdiagrec_")));
+  }
+  ```
+
+  If `workspace_engine::hash` or `workspace_engine::web_diagnostics` is not
+  reachable as written, use the crate's re-exports from `lib.rs` instead, and
+  record which. Both modules are `pub mod`.
+
+- [ ] **Step 3: Change the one existing assertion**
+
+  In `tests/plan_turn.rs`, `a_step_whose_command_failed_is_blocked_however_the_model_describes_it`,
+  replace
+
+  ```rust
+      assert_eq!(plan.steps[0].evidence.len(), 1, "the exit is recorded");
+  ```
+
+  with
+
+  ```rust
+      // The exit is recorded, and since spec 22 Task 8, so are the findings
+      // the failed command produced (spec 22 `context.md` §14).
+      assert!(
+          matches!(
+              plan.steps[0].evidence.as_slice(),
+              [Evidence::CommandExit { .. }, Evidence::Findings { .. }]
+          ),
+          "{:?}",
+          plan.steps[0].evidence
+      );
+  ```
+
+- [ ] **Step 4: Run the tests and confirm they fail**
+
+  Run: `cargo nextest run -p workspace-engine -E 'binary(finding_recording) + binary(plan_turn)'`
+  Expected: `binary(finding_recording)` fails four tests at runtime: every one
+  except `a_passing_sandbox_command_records_nothing`, which passes before and
+  after as a guard. The changed `plan_turn` assertion also fails. Nothing records
+  findings yet, so the plan has no `Findings` entry. `without_range` is not
+  used by any test, so Step 1 does not affect this.
+
+- [ ] **Step 5: Write the implementation in `chat.rs`**
+
+  Add these `use`s, or the paths inline, matching the file's style:
+  `crate::finding::{Finding, Severity, default_parsers, findings_from_execution, findings_from_web_record}`.
+
+  Add these methods to `impl ChatOrchestrator`, next to
+  `record_command_effects`:
+
+  ```rust
+      /// Turns a finished command into findings and appends them to the
+      /// session (spec 22 `context.md` §13.4). Returns the evidence linking the
+      /// open step to them, or `None` when the run found nothing.
+      fn record_command_findings(
+          &self,
+          repository_root: &Path,
+          session_id: &str,
+          task_id: &str,
+          execution: &crate::command_runner::CommandExecution,
+      ) -> Result<Option<crate::plan::Evidence>> {
+          let findings = findings_from_execution(execution, &default_parsers(), &self.scanner);
+          self.record_findings(repository_root, session_id, task_id, &execution.id, findings)
+      }
+
+      /// A recorded browser diagnostic's findings. The repository is walked
+      /// only when a console problem has a location to map (§14).
+      fn record_web_findings(
+          &self,
+          repository_root: &Path,
+          session_id: &str,
+          record: &WebDiagnosticRecord,
+      ) -> Result<()> {
+          let files = if has_located_console_problem(&record.report) {
+              repository_files(repository_root, &self.config.ignore_patterns)
+          } else {
+              Vec::new()
+          };
+          let files: Vec<&str> = files.iter().map(String::as_str).collect();
+          let findings = findings_from_web_record(record, &files, &self.scanner);
+          self.record_findings(repository_root, session_id, &record.task_id, &record.id, findings)
+              .map(|_| ())
+      }
+
+      /// Keeps a range only when it names a file in the repository, hashing
+      /// the file then. Attaches the task and origin, and appends each finding
+      /// (`context.md` §13.4).
+      fn record_findings(
+          &self,
+          repository_root: &Path,
+          session_id: &str,
+          task_id: &str,
+          origin_ref: &str,
+          findings: Vec<Finding>,
+      ) -> Result<Option<crate::plan::Evidence>> {
+          let mut refs = Vec::new();
+          let mut failing = 0;
+          for finding in findings {
+              let mut finding = finding.with_task_id(task_id).with_origin_ref(origin_ref);
+              if let Some(path) = finding.range().map(|range| repository_root.join(&range.path)) {
+                  finding = match path
+                      .is_file()
+                      .then(|| crate::hash::file_hash(&path).ok())
+                      .flatten()
+                  {
+                      Some(hash) => finding.with_file_hash(hash),
+                      None => finding.without_range(),
+                  };
+              }
+              if finding.severity() == Severity::Error {
+                  failing += 1;
+              }
+              self.session_store.record_finding(session_id, &finding)?;
+              refs.push(finding.id().to_string());
+          }
+          Ok((!refs.is_empty()).then_some(crate::plan::Evidence::Findings { refs, failing }))
+      }
+  ```
+
+  Add these free functions next to `sandbox_command_context`:
+
+  ```rust
+  /// Whether a report has a console problem with a location, the only thing
+  /// that needs the repository's file list (spec 22 `context.md` §14).
+  fn has_located_console_problem(report: &WebDiagnosticReport) -> bool {
+      report.details.as_ref().is_some_and(|details| {
+          details
+              .console
+              .iter()
+              .any(|entry| entry.is_problem() && entry.location.is_some())
+      })
+  }
+
+  /// Repository-relative file paths under the configured ignore rules, walked
+  /// the way the indexer walks (`indexer.rs`).
+  fn repository_files(repository_root: &Path, ignore_patterns: &[String]) -> Vec<String> {
+      let rules = crate::ignore::parse_ignore_patterns(ignore_patterns, "");
+      let mut files = Vec::new();
+      let _ = crate::tree_walk::walk(repository_root, repository_root, "", &rules, &mut |event| {
+          if let crate::tree_walk::WalkEvent::File(file) = event {
+              files.push(file.relative_path.clone());
+          }
+          Ok(())
+      });
+      files
+  }
+  ```
+
+  Then wire the sites:
+
+  1. **Sandbox command** (`chat.rs:~2260`, the `ToolAction::Command` arm after
+     the approval check). At the top of the per-call loop body, before the
+     `let (assistant_summary, tool_result_text, action_outcome) = …` binding
+     (`chat.rs:~2163`), declare
+     `let mut command_findings: Option<crate::plan::Evidence> = None;`.
+     Directly after `let record = self.validation_orchestrator.run_proposal(…)?;`,
+     add
+     `command_findings = self.record_command_findings(repository_root, &session.id, &task.id, &record.execution)?;`.
+  2. **Evidence site** (`chat.rs:~2717`). Directly after the
+     `if plan.is_some() && let Some(evidence) = evidence_for(…) { step_evidence.push(evidence); }`
+     block, add:
+
+     ```rust
+                  // After the exit it explains (spec 22 `context.md` §14).
+                  if plan.is_some()
+                      && let Some(findings) = command_findings.take()
+                  {
+                      step_evidence.push(findings);
+                  }
+     ```
+  3. **Approved command** (`chat.rs:~975`, in
+     `resume_after_command_decision_with_options`). Directly after
+     `let record = self.validation_orchestrator.run_proposal(…)?;`, add:
+
+     ```rust
+                  // Recorded, but no evidence: this path attaches no
+                  // `CommandExit` either (spec 22 `context.md` §14).
+                  self.record_command_findings(
+                      &repository_root,
+                      &pending.session.id,
+                      &pending.task.id,
+                      &record.execution,
+                  )?;
+     ```
+  4. **Browser diagnostics.** `run_and_record_web_diagnostic(&self, call, sink)`
+     becomes `run_and_record_web_diagnostic(&self, repository_root: &Path, call, sink)`.
+     Directly after `self.session_store.append_web_diagnostic(session_id, &record)?;`,
+     add `self.record_web_findings(repository_root, session_id, &record)?;`.
+     Pass `&repository_root` at the resume caller (`chat.rs:~874`), and
+     `repository_root` at the turn caller (`chat.rs:~2596`).
+
+  If borrowck objects to assigning `command_findings` inside the arm, carry
+  it the same way the arm already carries `exit_code`. Do not change
+  `ActionOutcome` (§14). Record the deviation.
+
+- [ ] **Step 6: Wording in the shell**
+
+  In `crates/desktop-shell/static/app.js`, `describeEvidence`, add before the
+  final `return "recorded";`:
+
+  ```js
+    if (entry.kind === "findings") {
+      const failing = Number.isInteger(entry.failing) ? entry.failing : 0;
+      const total = Array.isArray(entry.refs) ? entry.refs.length : 0;
+      return failing > 0
+        ? `the check reported ${failing} failing finding${failing === 1 ? "" : "s"}`
+        : `the check reported ${total} finding${total === 1 ? "" : "s"}, none failing`;
+    }
+  ```
+
+- [ ] **Step 7: Run the tests and confirm they pass**
+
+  Run: `cargo nextest run -p workspace-engine -E 'binary(finding_recording) + binary(plan_turn) + binary(plan) + test(finding::) + test(session::tests) + test(chat::)'`
+  Expected: all 5 `finding_recording` tests pass, and every other selected
+  test passes. The only existing assertion that changed is Step 3's. Count
+  the totals.
+
+- [ ] **Step 8: Mutation-test the wiring**
+
+  Apply each change on its own, confirm the named test fails, then revert it:
+
+  1. Remove the recording call at the sandbox site.
+     `a_failed_sandbox_command_is_recorded_…` must fail.
+  2. Remove it at the approval site.
+     `an_approved_command_records_findings_…` must fail.
+  3. Remove `record_web_findings` from the browser helper.
+     `a_browser_console_error_is_recorded_…` must fail.
+  4. Keep every range, without the `is_file` check.
+     `an_approved_command_…` must fail on `src/gone.rs`.
+  5. Skip the `command_findings.take()` push.
+     `the_failed_step_carries_findings_evidence_after_its_exit` and the
+     changed `plan_turn` assertion must fail.
+  6. Pass an empty file list to `findings_from_web_record`.
+     `a_browser_console_error_…` must fail on the missing range.
+
+  Record all six results in the progress row.
+
+- [ ] **Step 9: Scoped checks**
+
+  Run `cargo fmt --all` first. Then:
+
+  ```bash
+  cargo fmt --all -- --check
+  cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
+  cargo nextest run -p workspace-engine -E 'binary(finding_recording) + binary(plan_turn) + binary(plan) + test(finding::) + test(session::tests) + test(chat::)'
+  node --check crates/desktop-shell/static/app.js
+  npm run lint:web
+  typos docs/specs/22_findings_model_and_panel crates/workspace-engine/src/chat.rs crates/workspace-engine/src/finding.rs crates/workspace-engine/tests/finding_recording.rs crates/workspace-engine/tests/plan_turn.rs crates/desktop-shell/static/app.js
+  ```
+
+  Then run the eval harness's deterministic tier, which `AGENTS.md` asks for
+  after tool-dispatch changes:
+  `cargo run -p eval-harness -- run --tier deterministic`. Its scenarios now
+  record findings for failed commands. Check that every scenario still
+  passes, and record any metric that moved. Do **not** regenerate
+  `evals/baseline.json` in this task.
+
+- [ ] **Step 10: Update this file's Task 8 row, then show the change and the
+  check results and ask before committing**
 
 ## Task 9: Dismissal and the scoped repair request
 

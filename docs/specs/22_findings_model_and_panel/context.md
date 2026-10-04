@@ -738,3 +738,42 @@ fallback for unknown kinds. Task 8 adds wording for it.
   file hash is taken at the same moment.
 - **Evidence attachment** is `step_evidence.push(...)` beside
   `evidence_for(...)` (`chat.rs:~2717`).
+
+## 14. Decisions made while planning Task 8 (2026-10-04)
+
+- **The approval-resume path records findings but attaches no evidence.**
+  `resume_after_command_decision_with_options` (`chat.rs:~975`) runs the
+  approved command with no action marker and attaches no `CommandExit` to the
+  plan today, a gap that predates this spec. Attaching only
+  `Evidence::Findings` there would give a step findings with no exit behind
+  them, so the resume path records findings and nothing else. The sandbox
+  path (`chat.rs:~2260`) attaches both.
+- **Evidence is carried out of the command arm in a per-call local**
+  (`command_findings`), not by widening `ActionOutcome::CommandExit`.
+  Commands are never batched (`action_is_batchable_read_only`), so the
+  per-call loop is sequential. A local touches one arm and the evidence site,
+  while widening the variant would touch every match on it, including spec 21's
+  `evidence_for` tests. A run that produced no findings attaches no
+  `Findings` evidence, so a passing `ls src` keeps exactly one evidence entry.
+- **Browser findings attach no plan evidence.** A browser diagnostic produces
+  no `CommandExit` for them to sit beside (§13.3), and linking them would be a
+  new rule that no requirement asks for. Spec 23 can add it when its loop needs
+  it.
+- **`run_and_record_web_diagnostic` gains a `repository_root` parameter.**
+  Both callers have it in scope (`chat.rs:~874`, `~2596`). The file list is
+  built with `parse_ignore_patterns(&self.config.ignore_patterns, "")` and
+  `tree_walk::walk`, as the indexer does (`indexer.rs:~165`), and only when a
+  problem console entry has a location.
+- **`Finding::without_range`** is the one builder this task adds. It removes
+  the range and adds no text, so §2's guarantee holds.
+- **One existing assertion changes on purpose.**
+  `tests/plan_turn.rs`'s `a_step_whose_command_failed_is_blocked…` asserts
+  `evidence.len() == 1`. Its `ls no-such-directory` now also yields a generic
+  finding, and therefore a second, `Findings` entry. The assertion becomes
+  "a `CommandExit` and a `Findings`", which states what the step holds rather
+  than a count.
+- **The tests drive real turns through the public API,** in a new
+  `tests/finding_recording.rs`. For the approval path, a repository script
+  named `./cargo` stands in for cargo. `cargo_subcommand` accepts a path ending
+  in `/cargo`, so the real Rust diagnostics parser reads its scripted
+  rustc-shaped stderr without a real build.
