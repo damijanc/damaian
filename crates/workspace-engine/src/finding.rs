@@ -11,10 +11,12 @@ use serde::{Deserialize, Serialize};
 
 mod biome;
 mod browser;
+mod repair;
 mod rust_diagnostics;
 mod rust_test;
 
 pub use browser::findings_from_web_record;
+pub use repair::{Exclusion, ExclusionReason, RepairRequest};
 
 pub const MAX_SUMMARY_CHARS: usize = 240;
 pub const MAX_DETAILS_BYTES: usize = 4096;

@@ -7,14 +7,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use workspace_engine::finding::{Finding, FindingSource, FindingStatus};
+use workspace_engine::finding::{
+    Exclusion, ExclusionReason, Finding, FindingDraft, FindingSource, FindingStatus, RepairRequest,
+    Severity, SourceRange,
+};
 use workspace_engine::plan::Evidence;
 use workspace_engine::web_diagnostics::{
     WebDiagnosticCall, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
 };
 use workspace_engine::{
-    CancelToken, ChatTurnResult, Config, MockModelAdapter, ModelAdapter, ToolCall, TurnProgress,
-    TurnSink, WorkspaceEngine,
+    CancelToken, ChatTurnResult, Config, MockModelAdapter, ModelAdapter, SecretScanner, ToolCall,
+    TurnProgress, TurnSink, WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -65,6 +68,26 @@ fn ask(
     engine
         .chat_orchestrator
         .ask_with_session(repo, prompt, &[], None, adapter, &mut sink)
+        .expect("the turn should run")
+}
+
+/// [`ask`], continuing an existing session.
+fn ask_in(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    session_id: &str,
+    prompt: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let (cancel, mut on_token, mut on_progress) = sink_parts();
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+    };
+    engine
+        .chat_orchestrator
+        .ask_with_session(repo, prompt, &[], Some(session_id), adapter, &mut sink)
         .expect("the turn should run")
 }
 
@@ -325,4 +348,109 @@ fn a_browser_console_error_is_recorded_with_its_mapped_range_and_record() {
             .origin_ref()
             .is_some_and(|origin| origin.starts_with("webdiagrec_"))
     );
+}
+
+/// Acceptance criterion and proposal §5.5: dismissal is not suppression. The
+/// same failure from a later check is a new, open finding.
+#[test]
+fn dismissing_a_finding_does_not_suppress_the_same_problem_from_a_later_check() {
+    let repo = temp_repo("dismiss");
+    let engine = engine_for(&repo);
+    let failing = || {
+        scripted(vec![vec![call(
+            "run_command",
+            r#"{"command":"ls no-such-directory","reason":"List it"}"#,
+        )]])
+    };
+
+    let first = ask(&engine, &repo, "List the folder", &mut failing());
+    let dismissed = findings(&engine, &repo, &first.session.id)[0].clone();
+    engine
+        .session_store
+        .set_finding_status(&first.session.id, dismissed.id(), FindingStatus::Dismissed)
+        .unwrap();
+    ask_in(
+        &engine,
+        &repo,
+        &first.session.id,
+        "List it again",
+        &mut failing(),
+    );
+
+    let all = findings(&engine, &repo, &first.session.id);
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert_eq!(all[0].status(), FindingStatus::Dismissed);
+    assert_eq!(
+        all[1].status(),
+        FindingStatus::Open,
+        "the later check is not suppressed"
+    );
+    assert_eq!(
+        all[1].summary(),
+        dismissed.summary(),
+        "it is the same problem"
+    );
+    assert_ne!(all[1].id(), dismissed.id());
+
+    let request =
+        RepairRequest::select(&all, &[dismissed.id().to_string(), all[1].id().to_string()]);
+    assert_eq!(
+        request.findings.iter().map(Finding::id).collect::<Vec<_>>(),
+        [all[1].id()]
+    );
+    assert_eq!(
+        request.excluded,
+        [Exclusion {
+            finding_id: dismissed.id().to_string(),
+            reason: ExclusionReason::Dismissed
+        }]
+    );
+}
+
+/// "Current ranges" (§5.5): a request built after an edit excludes the
+/// finding the edit made stale, whatever the panel last showed.
+#[test]
+fn a_finding_made_stale_by_an_edit_is_excluded_when_the_request_is_built() {
+    let repo = temp_repo("stale-request");
+    let engine = engine_for(&repo);
+    let session = engine
+        .session_store
+        .create_session("repo_1", "Stale")
+        .unwrap();
+    let recorded = Finding::new(
+        FindingDraft {
+            source: FindingSource::Compiler,
+            severity: Severity::Error,
+            summary: "mismatched types".to_string(),
+            details: None,
+            range: Some(SourceRange {
+                path: "src/a.rs".to_string(),
+                start_line: 1,
+                start_column: Some(1),
+                end_line: None,
+                end_column: None,
+            }),
+            code: Some("E0308".to_string()),
+        },
+        &SecretScanner::default(),
+    )
+    .with_file_hash(workspace_engine::hash::file_hash(repo.join("src/a.rs")).unwrap());
+    engine
+        .session_store
+        .record_finding(&session.id, &recorded)
+        .unwrap();
+
+    fs::write(repo.join("src/a.rs"), "fn main() { edited() }\n").unwrap();
+    let all = findings(&engine, &repo, &session.id);
+    let request = RepairRequest::select(&all, &[recorded.id().to_string()]);
+
+    assert!(request.is_empty());
+    assert_eq!(
+        request.excluded,
+        [Exclusion {
+            finding_id: recorded.id().to_string(),
+            reason: ExclusionReason::Stale
+        }]
+    );
+    assert_eq!(request.render(), None);
 }

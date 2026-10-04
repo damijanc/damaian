@@ -777,3 +777,44 @@ fallback for unknown kinds. Task 8 adds wording for it.
   named `./cargo` stands in for cargo. `cargo_subcommand` accepts a path ending
   in `/cargo`, so the real Rust diagnostics parser reads its scripted
   rustc-shaped stderr without a real build.
+
+## 15. The repair request: decisions made while planning Task 9 (2026-10-04)
+
+Proposal §5.5 asks for "a scoped repair request carrying the selected finding
+IDs and their current ranges", which excludes stale findings with a note and
+carries findings, not raw output. The outline left the following open.
+
+- **Only `Open` findings are repaired. Everything else in the selection is
+  excluded with its reason.** §5.5 names `Stale`. `Dismissed` and `Fixed` are
+  excluded too: asking the agent to fix something the user waved away, or
+  already marked done, contradicts the user's own decision. An id that is not
+  in the session's findings is excluded as `unknown`, because a rewind removes
+  findings (§13.2). The panel may also hold a selection made before a reload.
+  An exclusion is never dropped without a note. That is §5.5's "excluded with a
+  note, not silently".
+- **The selection is resolved against `read_findings`, so "current" means at
+  the moment the request is built.** A file edited since the panel was drawn
+  makes its finding stale, and the request excludes it even if the panel still
+  showed it as open. That is the case §5.5 exists for.
+- **The request holds whole `Finding` values**, not a new `RepairItem` type
+  (the outline's name). A finding is already redacted and bounded (§2, §4),
+  and its fields are what the agent needs. A second type would be a copy that
+  could drift. The items appear in **session order**, not selection order, so
+  the same selection always renders the same text.
+- **`details` are included, but raw output never is.** `details` is a
+  finding's own bounded, redacted excerpt (at most 4096 bytes, §4). For a
+  compiler error, that is the diagnostic block with the expected and found
+  types, which the agent needs. The full output stays behind `origin_ref`,
+  and the rendered request names the finding id rather than inlining the log.
+- **`render()` returns `None` when nothing is left to repair,** even if there
+  are exclusions. A prompt that says "fix nothing" is not worth sending. The
+  caller (Task 10) shows the exclusions instead.
+- **The rendered text names every finding by id,** so the reply and spec 23's
+  loop can refer back to it. It also tells the agent to change only what the
+  findings need. Its exact wording is pinned by one test.
+- **Code lives in `finding/repair.rs`**, re-exported from `finding.rs`. It is
+  pure: it takes `&[Finding]` and the selected ids, with no store or
+  filesystem.
+- **Dismissal is not suppression** (§5.5). That holds by construction: a later
+  check mints new ids. It is still pinned end to end, through two real turns in
+  one session.

@@ -18,7 +18,7 @@ decisions it left open in [`context.md`](context.md)
 | 6 · Browser findings from spec 12's `WebDiagnosticDetails` | Done 2026-10-02 | Re-scoped on 2026-09-29 by spec 12's close-out, so there is no `entries` field (`context.md` §7.1). Planned in full on 2026-10-02 (`context.md` §12). Landed as sketched, with only rustfmt changes. `browser.rs` was extracted from this file's line ranges, so before formatting it was byte-identical to the plan. rustfmt rewrapped lines in `browser.rs` and sorted `mod browser;` below `mod biome;`, not above it as Step 2 says. It did not touch the `finding.rs` test array, contrary to Step 7's note. `finding/browser.rs` is new. `finding.rs` adds `FindingSource::BrowserScenario` (`"browser_scenario"`), broadens `Command`'s doc and re-exports `findings_from_web_record`. In `web_diagnostics.rs`, the three `model_item`s and `is_loopback_url` became `pub(crate)`, and nothing else changed. Steps 1 and 2 were applied together, so Step 1's separate test run was skipped. Before the implementation the tests failed to compile (`E0425` on `findings_from_web_record`/`served_path`, `E0432` on the re-export). After it, `test(finding::) + test(web_diagnostics::)` passed 121/121: 107 `finding::` (89 + 18 `browser::tests`), and the `web_diagnostics::` tests were unchanged. All six mutations failed only their named tests. (1) No `node_modules` exclusion failed only `a_console_error_at_a_served_url_maps_to_…`. (2) First candidate wins failed only `an_ambiguous_served_path_has_no_range`. (3) No `is_loopback_url` failed `a_console_location_on_another_origin_has_no_range` and `served_path_accepts_only_loopback_…`. (4) No `!explained` failed only `a_tool_failure_is_not_doubled_…`. (5) Skipping failed steps failed only `a_failed_scenario_step_is_a_browser_scenario_error`. (6) Every problem level as `Error` failed only `an_inspection_yields_one_finding_per_problem_…`. Scoped fmt, clippy `-p workspace-engine`, `test(finding::) + test(web_diagnostics::)` and typos are clean. |
 | 7 · Persistence, derived status, `Evidence::Findings` | Done 2026-10-03 | Split on 2026-10-02 from the old "Recording, persistence, staleness" task (`context.md` §13.1) and planned in full. Landed as sketched, with only rustfmt changes. The tests and implementation were extracted from this file's line ranges. `session.rs` gains `record_finding`, `set_finding_status` and `read_findings` after `read_session_web_diagnostics`, and the free functions `replay_findings` and `finding_is_stale` before `parse_session_log`. The `let`-chains compiled as written. `plan.rs` gains `Evidence::Findings` and its two match arms. rustfmt turned the `status_from_evidence` arm into a block. Two comments in `plan.rs` were reworded beyond the plan because the new variant made them stale: the `#[non_exhaustive]` note, which said `Findings` "joins this enum when spec 22 exists", and the "Neither has a failure mode" comment, which now covers three variants. Step 1's two task-number comments were updated. Before the implementation, the session tests failed to compile (`E0599` on all three methods). After it, `test(session::tests) + binary(plan) + test(finding::)` passed 181/181. That includes the 15 new session tests (`session::tests` is now 23) and the 4 new plan tests (`binary(plan)` is now 51). All seven mutations failed only their named test. Mutations 1–6 ran with `--lib -E 'test(session::tests)'`, and 7 ran with `binary(plan)`. (1) Checking every status failed `a_dismissed_finding_is_not_re_marked_stale`. (2) Missing hash as stale failed `a_finding_without_a_recorded_hash_is_never_stale`. (3) `Err(_) => false` failed `a_deleted_file_makes_its_finding_stale`. (4) No `Stale` refusal failed `setting_stale_directly_is_refused_…`. (5) No unknown-id check failed `a_status_change_for_an_unknown_finding_…`. (6) `parsed_events(content).0` failed `a_rewind_takes_the_findings_…`. (7) `*failing > 0` failed `findings_evidence_alone_does_not_block_a_step`. No other crate needed a change. Scoped fmt, clippy `-p workspace-engine`, the scoped tests and typos are clean. |
 | 8 · Record findings where checks run (`chat.rs`) | Done 2026-10-04 | New on 2026-10-02 from the Task 7 split, and planned in full on 2026-10-04 (`context.md` §13.4, §14). Landed as sketched, with only rustfmt changes, in a separate worktree, with no other spec editing `chat.rs`. `tests/finding_recording.rs` was extracted from this file's line ranges. `workspace_engine::hash` and `::web_diagnostics` resolved as written, so no re-export was needed. The `chat.rs` line numbers in Step 5 still matched. `command_findings` assigned inside the arm passed borrowck, so `ActionOutcome` is unchanged. Two deviations, both cosmetic. The `use` is a top-level `crate::finding::{…}` import, and `record_command_findings` takes `&CommandExecution` through the file's existing import. The `command_findings` declaration also gained a two-line comment saying why it is a local. `repository_files` uses `config.ignore_patterns` as planned. `Config::default()` already fills it with the defaults that `indexer.rs` falls back to, so nothing is lost. Before the implementation: as Step 4 predicts, four `finding_recording` tests and the changed `plan_turn` assertion failed at runtime, each on "nothing recorded" after its setup passed. The approved test had got past its approval assertion. `a_passing_sandbox_command_records_nothing` passed. After: the Step 7 selection passed 250/250 (5 `finding_recording`, 19 `plan_turn`, 51 `plan`, 107 `finding::`, 23 `session::tests`, 45 `chat::`). All six mutations failed exactly their named tests, with `binary(finding_recording) + binary(plan_turn)`. (1) No sandbox recording failed `a_failed_sandbox_command_…`, `the_failed_step_carries_…` and the `plan_turn` assertion, because no findings means no evidence. (2) No approval recording failed only `an_approved_command_…`, on `[]`. (3) No `record_web_findings` failed only `a_browser_console_error_…`, on `[]`. (4) `None => finding` (keep every range) failed only `an_approved_command_…`, on "src/gone.rs is not in the repository". (5) No `command_findings.take()` push failed `the_failed_step_carries_…` and the `plan_turn` assertion. (6) An empty file list failed only `a_browser_console_error_…`, on the missing range. **Environment, not code:** in mutation 1's run, `an_approved_command_…` also failed. Its `./cargo check` reported `timed out` after 600.28s. It passed in under a second in every other run, and mutation 1 does not touch that path. The next run's `--list` of the relinked test binary sat at `_dyld_start + 0` for about 5 minutes while `XprotectService` was busy. So macOS XProtect can hold a newly written executable at launch, and this test writes one (`./cargo`) on every run. The test is unchanged, and this is recorded as an observation. Scoped fmt, clippy `-p workspace-engine`, `node --check`, `lint:web` and typos are clean. `lint:web`'s one info is pre-existing, in `scripts/check-spec-status.mjs`. The eval harness deterministic tier passed 16/16. Metrics match `evals/baseline.json` except tokens, 101950 against 101963 (not investigated), and latency, median 57 against 44 ms and p90 128 against 109 ms, measured while XProtect was loading the machine. The baseline was not regenerated. |
-| 9 · Dismissal and the scoped repair request | Not started | |
+| 9 · Dismissal and the scoped repair request | Done 2026-10-04 | Planned in full on 2026-10-04 (`context.md` §15). Only `Open` findings are repaired; stale, dismissed, fixed and unknown ids are each excluded with a reason. Landed as sketched. `repair.rs` was extracted from this file's line ranges and is byte-identical to `rustfmt` of the sketch, apart from one deviation: clippy 1.98's `cloned_ref_to_slice_refs` rejected four single-element `&[x.clone()]` arguments in the unit tests, so they are now `std::slice::from_ref(&x)`. `finding.rs` declares `mod repair;` after `mod browser;` and re-exports `Exclusion`, `ExclusionReason` and `RepairRequest`. `finding_recording.rs` gains the imports, `ask_in` and the two tests. No other file changed. Before the implementation the tests failed to compile (`E0432` on the re-export, then `E0433`/`E0425`/`E0422` on the missing types). After it, `test(finding::) + binary(finding_recording)` passed 123/123: 107 `finding::` unchanged, 9 `repair::tests`, and 7 `finding_recording` (5 unchanged + 2 new). All six mutations failed their named tests. Mutations 1, 3–6 ran with `--lib -E 'test(finding::repair)'`. (1) Keeping `Stale` failed `a_stale_finding_is_excluded_…`, plus `nothing_left_to_repair_…`, the exact-render test and `the_request_serialises_…`. (2) Keeping `Dismissed` failed `dismissed_and_fixed_findings_are_excluded_…` (unit) and `dismissing_a_finding_does_not_suppress_…` (integration). (3) Iterating `selected_ids` failed `open_findings_are_kept_in_session_order`, and also `a_duplicate_selection_is_counted_once`, because a repeated id is kept twice. (4) Dropping unknown ids failed `an_unknown_id_is_excluded_…` and the duplicate test. (5) Removing `noted`, the unknown loop's only dedup, failed only the duplicate test. (6) Rendering when only exclusions remain failed only `nothing_left_to_repair_renders_nothing`. **Environment, not code:** a run over the whole `-p workspace-engine` relinks all 21 integration binaries. Mutation 2's first attempt, scoped that way, was killed at 30 minutes with no output, behind XProtect launch scans (see Task 8's row). Rerun with `--lib` and `--test finding_recording`, it took 105 s wall-clock against 14 s of CPU. Step 5 and Step 7's test runs used the same `--lib --test finding_recording` targets with the plan's filter. That selects the same 123 tests without relinking binaries the filter never runs. Scoped fmt, clippy `-p workspace-engine` and typos are clean. |
 | 10 · Shell API | Not started | |
 | 11 · Findings panel | Not started | |
 | 12 · Docs, acceptance criteria, close the spec | Not started | |
@@ -5230,13 +5230,598 @@ spec that edits `chat.rs`.
 
 ## Task 9: Dismissal and the scoped repair request
 
-**Files:** `finding.rs`, `session.rs`.
+**Requirements:** 3 (dismissal, and asking the agent to fix a selected
+subset), and these acceptance criteria:
+- "selecting findings and asking for a fix produces a scoped repair request
+  carrying finding IDs, excluding stale findings with a note";
+- "dismissing a finding does not suppress the same problem found by a later
+  check".
 
-`RepairRequest { findings: Vec<RepairItem>, excluded_stale: Vec<String> }`,
-built from selected ids. Stale findings are excluded with a note. The request
-carries the findings' summary, range, and code, never raw output (§5.5). It
-renders to the model-facing prompt text. Test: dismissing a finding does not
-suppress a new finding for the same problem from a later check.
+**Files:** create `crates/workspace-engine/src/finding/repair.rs`. Modify
+`finding.rs` (declare the module and re-export it) and
+`crates/workspace-engine/tests/finding_recording.rs` (two tests and one
+helper). Planned in full on 2026-10-04.
+
+**Read `context.md` §15 first.** It decides:
+- only `Open` findings are repaired; stale, dismissed, fixed and unknown ids
+  are each excluded with a reason;
+- the request holds whole `Finding`s in session order;
+- `details` are included, but raw output is not;
+- `render()` returns `None` when nothing is left to repair.
+
+Dismissal itself is Task 7's `set_finding_status`. This task adds no new
+storage. It does not touch `chat.rs` or the shell. Task 10 serves the
+request, and Task 11 sends it as a chat message.
+
+**Interfaces:**
+- Consumes: `Finding` and its getters, `FindingStatus`, `Severity`, and
+  `FindingSource::as_str` (`finding.rs`). Also `SessionStore::read_findings`
+  and `set_finding_status` (Task 7).
+- Produces, re-exported as `crate::finding::{RepairRequest, Exclusion, ExclusionReason}`:
+  - `pub enum ExclusionReason { Stale, Dismissed, Fixed, Unknown }`, serialised
+    snake_case, with `pub fn explanation(self) -> &'static str`.
+  - `pub struct Exclusion { pub finding_id: String, pub reason: ExclusionReason }`
+    (camelCase).
+  - `pub struct RepairRequest { pub findings: Vec<Finding>, pub excluded: Vec<Exclusion> }`
+    (camelCase), with:
+    - `pub fn select(findings: &[Finding], selected_ids: &[String]) -> Self`;
+    - `pub fn is_empty(&self) -> bool`;
+    - `pub fn render(&self) -> Option<String>`.
+  - Task 10 serialises `RepairRequest` as its response, and returns
+    `render()` as the text the panel sends.
+
+- [x] **Step 1: Declare the module and write the failing unit tests**
+
+  In `finding.rs`, add `mod repair;` after `mod browser;`, and
+  `pub use repair::{Exclusion, ExclusionReason, RepairRequest};` after the
+  existing `pub use`. Create `crates/workspace-engine/src/finding/repair.rs`
+  containing only the test module:
+
+  ```rust
+  #[cfg(test)]
+  mod tests {
+      use super::*;
+      use crate::finding::{FindingDraft, FindingSource, SourceRange};
+      use crate::secret_scanner::SecretScanner;
+
+      fn finding(
+          source: FindingSource,
+          summary: &str,
+          range: Option<(&str, u32, Option<u32>)>,
+          code: Option<&str>,
+          details: Option<&str>,
+          status: FindingStatus,
+      ) -> Finding {
+          let mut finding = Finding::new(
+              FindingDraft {
+                  source,
+                  severity: Severity::Error,
+                  summary: summary.to_string(),
+                  details: details.map(str::to_string),
+                  range: range.map(|(path, line, column)| SourceRange {
+                      path: path.to_string(),
+                      start_line: line,
+                      start_column: column,
+                      end_line: None,
+                      end_column: None,
+                  }),
+                  code: code.map(str::to_string),
+              },
+              &SecretScanner::default(),
+          );
+          finding.set_status(status);
+          finding
+      }
+
+      fn open(summary: &str) -> Finding {
+          finding(FindingSource::Command, summary, None, None, None, FindingStatus::Open)
+      }
+
+      fn with_status(summary: &str, status: FindingStatus) -> Finding {
+          finding(FindingSource::Command, summary, None, None, None, status)
+      }
+
+      fn ids(findings: &[&Finding]) -> Vec<String> {
+          findings.iter().map(|finding| finding.id().to_string()).collect()
+      }
+
+      /// Session order, not selection order, so a selection always renders
+      /// the same text (`context.md` §15).
+      #[test]
+      fn open_findings_are_kept_in_session_order() {
+          let (a, b, c) = (open("a"), open("b"), open("c"));
+          let session = [a.clone(), b.clone(), c.clone()];
+          let request = RepairRequest::select(&session, &ids(&[&c, &a]));
+          let kept: Vec<_> = request.findings.iter().map(Finding::summary).collect();
+          assert_eq!(kept, ["a", "c"]);
+          assert!(request.excluded.is_empty());
+      }
+
+      /// Proposal §5.5: excluded with a note, not silently included.
+      #[test]
+      fn a_stale_finding_is_excluded_with_its_reason() {
+          let stale = with_status("moved", FindingStatus::Stale);
+          let fresh = open("fresh");
+          let request =
+              RepairRequest::select(&[stale.clone(), fresh.clone()], &ids(&[&stale, &fresh]));
+          assert_eq!(
+              request.findings.iter().map(Finding::id).collect::<Vec<_>>(),
+              [fresh.id()]
+          );
+          assert_eq!(
+              request.excluded,
+              [Exclusion { finding_id: stale.id().to_string(), reason: ExclusionReason::Stale }]
+          );
+      }
+
+      #[test]
+      fn dismissed_and_fixed_findings_are_excluded_with_their_reasons() {
+          let dismissed = with_status("waved away", FindingStatus::Dismissed);
+          let fixed = with_status("done", FindingStatus::Fixed);
+          let request = RepairRequest::select(
+              &[dismissed.clone(), fixed.clone()],
+              &ids(&[&dismissed, &fixed]),
+          );
+          assert!(request.is_empty());
+          let reasons: Vec<_> = request.excluded.iter().map(|e| e.reason).collect();
+          assert_eq!(reasons, [ExclusionReason::Dismissed, ExclusionReason::Fixed]);
+      }
+
+      /// A rewind removes findings, and the panel may hold an old selection.
+      #[test]
+      fn an_unknown_id_is_excluded_as_unknown_never_dropped() {
+          let known = open("known");
+          let request = RepairRequest::select(
+              &[known.clone()],
+              &[known.id().to_string(), "finding_gone".to_string()],
+          );
+          assert_eq!(request.findings.len(), 1);
+          assert_eq!(
+              request.excluded,
+              [Exclusion {
+                  finding_id: "finding_gone".to_string(),
+                  reason: ExclusionReason::Unknown,
+              }]
+          );
+      }
+
+      #[test]
+      fn a_duplicate_selection_is_counted_once() {
+          let known = open("known");
+          let gone = "finding_gone".to_string();
+          let request = RepairRequest::select(
+              &[known.clone()],
+              &[known.id().to_string(), known.id().to_string(), gone.clone(), gone],
+          );
+          assert_eq!(request.findings.len(), 1);
+          assert_eq!(request.excluded.len(), 1);
+      }
+
+      #[test]
+      fn nothing_left_to_repair_renders_nothing() {
+          let stale = with_status("moved", FindingStatus::Stale);
+          let request = RepairRequest::select(&[stale.clone()], &ids(&[&stale]));
+          assert!(request.is_empty());
+          assert_eq!(request.render(), None, "a prompt that fixes nothing is not sent");
+          assert_eq!(RepairRequest::select(&[], &[]).render(), None);
+      }
+
+      /// The exact text (`context.md` §15): each finding by id, with its
+      /// location and code where it has them, and its details indented.
+      /// Exclusions are listed with their reason.
+      #[test]
+      fn the_rendered_request_names_each_finding_and_lists_what_was_left_out() {
+          let compiler = finding(
+              FindingSource::Compiler,
+              "mismatched types",
+              Some(("src/a.rs", 8, Some(18))),
+              Some("E0308"),
+              Some("error[E0308]: mismatched types\n --> src/a.rs:8:18\n\n  |"),
+              FindingStatus::Open,
+          );
+          let command = open("pytest: FAILED test_x");
+          let stale = with_status("moved", FindingStatus::Stale);
+          let request = RepairRequest::select(
+              &[compiler.clone(), command.clone(), stale.clone()],
+              &ids(&[&compiler, &command, &stale]),
+          );
+
+          let expected = [
+              "Fix the 2 findings below, which checks reported in this session. Change only what \
+               each one needs, and say which you fixed by its id."
+                  .to_string(),
+              String::new(),
+              format!(
+                  "1. compiler error E0308 at src/a.rs:8:18: mismatched types (finding {})",
+                  compiler.id()
+              ),
+              "   error[E0308]: mismatched types".to_string(),
+              "    --> src/a.rs:8:18".to_string(),
+              String::new(),
+              "     |".to_string(),
+              format!("2. command error: pytest: FAILED test_x (finding {})", command.id()),
+              String::new(),
+              "Left out of this request:".to_string(),
+              format!(
+                  "- {}: stale: its file changed after the check ran, so its location may be \
+                   wrong. Re-run the check for a current finding.",
+                  stale.id()
+              ),
+          ]
+          .join("\n");
+          assert_eq!(request.render().as_deref(), Some(expected.as_str()));
+      }
+
+      #[test]
+      fn a_line_without_a_column_renders_without_one() {
+          let finding = finding(
+              FindingSource::Test,
+              "tests::adds failed",
+              Some(("src/lib.rs", 12, None)),
+              None,
+              None,
+              FindingStatus::Open,
+          );
+          let text = RepairRequest::select(&[finding.clone()], &ids(&[&finding]))
+              .render()
+              .unwrap();
+          assert!(text.contains("1. test error at src/lib.rs:12: tests::adds failed"), "{text}");
+      }
+
+      /// Task 10 serves this shape.
+      #[test]
+      fn the_request_serialises_for_the_shell() {
+          let kept = open("kept");
+          let stale = with_status("moved", FindingStatus::Stale);
+          let request = RepairRequest::select(&[kept.clone(), stale.clone()], &ids(&[&kept, &stale]));
+          let value = serde_json::to_value(&request).unwrap();
+          assert_eq!(value["findings"][0]["id"], kept.id());
+          assert_eq!(value["excluded"][0]["findingId"], stale.id());
+          assert_eq!(value["excluded"][0]["reason"], "stale");
+      }
+  }
+  ```
+
+  The expected text is built line by line, so its indentation is exactly what
+  `render` produces. Each detail line is indented three spaces on top of its
+  own leading whitespace, so ` --> …` becomes `    --> …` and `  |` becomes
+  `     |`. The blank detail line becomes an empty line, with no trailing
+  whitespace.
+
+- [x] **Step 2: Write the failing integration tests**
+
+  In `crates/workspace-engine/tests/finding_recording.rs`:
+
+  - Add `FindingDraft`, `Exclusion`, `ExclusionReason`, `RepairRequest`,
+    `Severity` and `SourceRange` to the `workspace_engine::finding` import,
+    and `SecretScanner` to the `workspace_engine` import.
+  - Add this helper after `ask`:
+
+  ```rust
+  /// [`ask`], continuing an existing session.
+  fn ask_in(
+      engine: &WorkspaceEngine,
+      repo: &Path,
+      session_id: &str,
+      prompt: &str,
+      adapter: &mut dyn ModelAdapter,
+  ) -> ChatTurnResult {
+      let (cancel, mut on_token, mut on_progress) = sink_parts();
+      let mut sink = TurnSink {
+          on_token: &mut on_token,
+          on_progress: &mut on_progress,
+          cancel: &cancel,
+      };
+      engine
+          .chat_orchestrator
+          .ask_with_session(repo, prompt, &[], Some(session_id), adapter, &mut sink)
+          .expect("the turn should run")
+  }
+  ```
+
+  Then append the two tests:
+
+  ```rust
+  /// Acceptance criterion and proposal §5.5: dismissal is not suppression. The
+  /// same failure from a later check is a new, open finding.
+  #[test]
+  fn dismissing_a_finding_does_not_suppress_the_same_problem_from_a_later_check() {
+      let repo = temp_repo("dismiss");
+      let engine = engine_for(&repo);
+      let failing = || {
+          scripted(vec![vec![call(
+              "run_command",
+              r#"{"command":"ls no-such-directory","reason":"List it"}"#,
+          )]])
+      };
+
+      let first = ask(&engine, &repo, "List the folder", &mut failing());
+      let dismissed = findings(&engine, &repo, &first.session.id)[0].clone();
+      engine
+          .session_store
+          .set_finding_status(&first.session.id, dismissed.id(), FindingStatus::Dismissed)
+          .unwrap();
+      ask_in(&engine, &repo, &first.session.id, "List it again", &mut failing());
+
+      let all = findings(&engine, &repo, &first.session.id);
+      assert_eq!(all.len(), 2, "{all:?}");
+      assert_eq!(all[0].status(), FindingStatus::Dismissed);
+      assert_eq!(all[1].status(), FindingStatus::Open, "the later check is not suppressed");
+      assert_eq!(all[1].summary(), dismissed.summary(), "it is the same problem");
+      assert_ne!(all[1].id(), dismissed.id());
+
+      let request = RepairRequest::select(
+          &all,
+          &[dismissed.id().to_string(), all[1].id().to_string()],
+      );
+      assert_eq!(request.findings.iter().map(Finding::id).collect::<Vec<_>>(), [all[1].id()]);
+      assert_eq!(
+          request.excluded,
+          [Exclusion { finding_id: dismissed.id().to_string(), reason: ExclusionReason::Dismissed }]
+      );
+  }
+
+  /// "Current ranges" (§5.5): a request built after an edit excludes the
+  /// finding the edit made stale, whatever the panel last showed.
+  #[test]
+  fn a_finding_made_stale_by_an_edit_is_excluded_when_the_request_is_built() {
+      let repo = temp_repo("stale-request");
+      let engine = engine_for(&repo);
+      let session = engine.session_store.create_session("repo_1", "Stale").unwrap();
+      let recorded = Finding::new(
+          FindingDraft {
+              source: FindingSource::Compiler,
+              severity: Severity::Error,
+              summary: "mismatched types".to_string(),
+              details: None,
+              range: Some(SourceRange {
+                  path: "src/a.rs".to_string(),
+                  start_line: 1,
+                  start_column: Some(1),
+                  end_line: None,
+                  end_column: None,
+              }),
+              code: Some("E0308".to_string()),
+          },
+          &SecretScanner::default(),
+      )
+      .with_file_hash(workspace_engine::hash::file_hash(repo.join("src/a.rs")).unwrap());
+      engine.session_store.record_finding(&session.id, &recorded).unwrap();
+
+      fs::write(repo.join("src/a.rs"), "fn main() { edited() }\n").unwrap();
+      let all = findings(&engine, &repo, &session.id);
+      let request = RepairRequest::select(&all, &[recorded.id().to_string()]);
+
+      assert!(request.is_empty());
+      assert_eq!(
+          request.excluded,
+          [Exclusion { finding_id: recorded.id().to_string(), reason: ExclusionReason::Stale }]
+      );
+      assert_eq!(request.render(), None);
+  }
+  ```
+
+- [x] **Step 3: Run the tests and confirm they fail**
+
+  Run: `cargo nextest run -p workspace-engine -E 'test(finding::repair) + binary(finding_recording)'`
+  Expected: compile failures, because `RepairRequest`, `Exclusion` and
+  `ExclusionReason` are not defined.
+
+- [x] **Step 4: Write the implementation**
+
+  Put this above the test module in `repair.rs`:
+
+  ```rust
+  //! The scoped repair request (spec 22 Task 9, proposal §5.5).
+  //!
+  //! The user selects findings and asks the agent to fix them. Only `Open`
+  //! findings are kept. Every other selected id is excluded with its reason,
+  //! never silently, and the agent gets the findings, not the logs behind them
+  //! (`docs/specs/22_findings_model_and_panel/context.md` §15).
+
+  use super::{Finding, FindingStatus, Severity};
+  use serde::Serialize;
+
+  #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+  #[serde(rename_all = "snake_case")]
+  pub enum ExclusionReason {
+      /// Its file changed after the check ran, so its range may be wrong.
+      Stale,
+      Dismissed,
+      Fixed,
+      /// Not a finding in this session, for example after a rewind.
+      Unknown,
+  }
+
+  impl ExclusionReason {
+      /// The note the rendered request gives for leaving a finding out.
+      pub fn explanation(self) -> &'static str {
+          match self {
+              Self::Stale => {
+                  "stale: its file changed after the check ran, so its location may be wrong. \
+                   Re-run the check for a current finding."
+              }
+              Self::Dismissed => "dismissed by the user.",
+              Self::Fixed => "already marked fixed.",
+              Self::Unknown => "not a finding in this session.",
+          }
+      }
+  }
+
+  #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+  #[serde(rename_all = "camelCase")]
+  pub struct Exclusion {
+      pub finding_id: String,
+      pub reason: ExclusionReason,
+  }
+
+  #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+  #[serde(rename_all = "camelCase")]
+  pub struct RepairRequest {
+      /// Open findings, in session order.
+      pub findings: Vec<Finding>,
+      pub excluded: Vec<Exclusion>,
+  }
+
+  impl RepairRequest {
+      /// Resolves `selected_ids` against `findings`, which should come from
+      /// `SessionStore::read_findings` so that staleness is current at the
+      /// moment of asking.
+      pub fn select(findings: &[Finding], selected_ids: &[String]) -> Self {
+          let mut kept = Vec::new();
+          let mut excluded = Vec::new();
+          for finding in findings
+              .iter()
+              .filter(|finding| selected_ids.iter().any(|id| id == finding.id()))
+          {
+              let reason = match finding.status() {
+                  FindingStatus::Open => {
+                      kept.push(finding.clone());
+                      continue;
+                  }
+                  FindingStatus::Stale => ExclusionReason::Stale,
+                  FindingStatus::Dismissed => ExclusionReason::Dismissed,
+                  FindingStatus::Fixed => ExclusionReason::Fixed,
+              };
+              excluded.push(Exclusion {
+                  finding_id: finding.id().to_string(),
+                  reason,
+              });
+          }
+          for id in selected_ids {
+              let known = findings.iter().any(|finding| finding.id() == id.as_str());
+              let noted = excluded.iter().any(|exclusion| exclusion.finding_id == *id);
+              if !known && !noted {
+                  excluded.push(Exclusion {
+                      finding_id: id.clone(),
+                      reason: ExclusionReason::Unknown,
+                  });
+              }
+          }
+          Self {
+              findings: kept,
+              excluded,
+          }
+      }
+
+      /// True when nothing is left to repair.
+      pub fn is_empty(&self) -> bool {
+          self.findings.is_empty()
+      }
+
+      /// The model-facing request, or `None` when nothing is left to repair.
+      pub fn render(&self) -> Option<String> {
+          if self.findings.is_empty() {
+              return None;
+          }
+          let count = self.findings.len();
+          let mut lines = vec![
+              format!(
+                  "Fix the {count} finding{} below, which checks reported in this session. \
+                   Change only what each one needs, and say which you fixed by its id.",
+                  if count == 1 { "" } else { "s" }
+              ),
+              String::new(),
+          ];
+          for (index, finding) in self.findings.iter().enumerate() {
+              lines.push(format!(
+                  "{}. {} (finding {})",
+                  index + 1,
+                  headline(finding),
+                  finding.id()
+              ));
+              for line in finding.details().into_iter().flat_map(str::lines) {
+                  lines.push(if line.is_empty() {
+                      String::new()
+                  } else {
+                      format!("   {line}")
+                  });
+              }
+          }
+          if !self.excluded.is_empty() {
+              lines.push(String::new());
+              lines.push("Left out of this request:".to_string());
+              for exclusion in &self.excluded {
+                  lines.push(format!(
+                      "- {}: {}",
+                      exclusion.finding_id,
+                      exclusion.reason.explanation()
+                  ));
+              }
+          }
+          Some(lines.join("\n"))
+      }
+  }
+
+  /// `compiler error E0308 at src/a.rs:8:18: mismatched types`, leaving out
+  /// the parts a finding does not have.
+  fn headline(finding: &Finding) -> String {
+      let severity = match finding.severity() {
+          Severity::Error => "error",
+          Severity::Warning => "warning",
+          Severity::Info => "info",
+      };
+      let mut text = format!("{} {severity}", finding.source().as_str());
+      if let Some(code) = finding.code() {
+          text.push(' ');
+          text.push_str(code);
+      }
+      if let Some(range) = finding.range() {
+          text.push_str(&format!(" at {}:{}", range.path, range.start_line));
+          if let Some(column) = range.start_column {
+              text.push_str(&format!(":{column}"));
+          }
+      }
+      format!("{text}: {}", finding.summary())
+  }
+  ```
+
+  If a test and this sketch disagree, the tests win, because they come from
+  §5.5 and `context.md` §15. If the exact-render test fails only on
+  whitespace, compare the two strings line by line before changing either.
+  Record any deviation in the progress row.
+
+- [x] **Step 5: Run the tests and confirm they pass**
+
+  Run: `cargo nextest run -p workspace-engine -E 'test(finding::) + binary(finding_recording)'`
+  Expected: the 9 `repair::tests` tests and both new `finding_recording` tests
+  pass. Every other `finding::` and `finding_recording` test is unchanged.
+  Count them.
+
+- [x] **Step 6: Mutation-test the §15 rules**
+
+  Apply each change on its own, confirm the named test fails, then revert it:
+
+  1. Keep `Stale` findings.
+     `a_stale_finding_is_excluded_with_its_reason` must fail.
+  2. Keep `Dismissed` findings.
+     `dismissed_and_fixed_findings_are_excluded_…` and
+     `dismissing_a_finding_does_not_suppress_…` must fail.
+  3. Iterate `selected_ids` for the kept list instead of `findings`.
+     `open_findings_are_kept_in_session_order` must fail.
+  4. Drop unknown ids without an exclusion.
+     `an_unknown_id_is_excluded_as_unknown_never_dropped` must fail.
+  5. Remove the `noted` check.
+     `a_duplicate_selection_is_counted_once` must fail, unless the unknown
+     loop also dedups. Make the mutation the loop's only dedup.
+  6. Render when only exclusions remain.
+     `nothing_left_to_repair_renders_nothing` must fail.
+
+  Record all six results in the progress row.
+
+- [x] **Step 7: Scoped checks**
+
+  Run `cargo fmt --all` first. Then:
+
+  ```bash
+  cargo fmt --all -- --check
+  cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
+  cargo nextest run -p workspace-engine -E 'test(finding::) + binary(finding_recording)'
+  typos docs/specs/22_findings_model_and_panel crates/workspace-engine/src/finding.rs crates/workspace-engine/src/finding crates/workspace-engine/tests/finding_recording.rs
+  ```
+
+- [x] **Step 8: Update this file's Task 9 row, then show the change and the
+  check results and ask before committing**
 
 ## Task 10: Shell API
 
