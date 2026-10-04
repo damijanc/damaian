@@ -10,6 +10,9 @@ use crate::context_manager::ContextManager;
 use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes};
 use crate::error::{ClientError, Result};
 use crate::file_access::{FileAccessController, LineRange, ReadWindow};
+use crate::finding::{
+    Finding, Severity, default_parsers, findings_from_execution, findings_from_web_record,
+};
 use crate::git_service::{GitService, GitStatus};
 use crate::hash::{create_id, now_millis};
 use crate::indexer::{ProjectIndexer, SearchResult};
@@ -550,6 +553,7 @@ impl ChatOrchestrator {
     /// through here, so neither can forget to persist or redact.
     fn run_and_record_web_diagnostic(
         &self,
+        repository_root: &Path,
         call: &WebDiagnosticCall,
         sink: &mut TurnSink<'_>,
     ) -> Result<(String, bool)> {
@@ -574,6 +578,7 @@ impl ChatOrchestrator {
             };
             self.session_store
                 .append_web_diagnostic(session_id, &record)?;
+            self.record_web_findings(repository_root, session_id, &record)?;
             sink.web_diagnostic(record);
         }
         Ok((self.format_web_diagnostic_result(report), failed))
@@ -882,7 +887,8 @@ impl ChatOrchestrator {
             let content = if refused {
                 refusal_message(permission)
             } else if approved {
-                self.run_and_record_web_diagnostic(&call, sink)?.0
+                self.run_and_record_web_diagnostic(&repository_root, &call, sink)?
+                    .0
             } else {
                 format!(
                     "The user declined to run `{}` against `{}`. Do not request the same browser diagnostic again; answer using what you already know, noting the limitation if it matters.",
@@ -992,6 +998,14 @@ impl ChatOrchestrator {
                     Some(&pending.task.id),
                     cancel,
                     &mut on_output,
+                )?;
+                // Recorded, but no evidence: this path attaches no
+                // `CommandExit` either (spec 22 `context.md` §14).
+                self.record_command_findings(
+                    &repository_root,
+                    &pending.session.id,
+                    &pending.task.id,
+                    &record.execution,
                 )?;
                 self.record_command_effects(
                     &repository_root,
@@ -1276,6 +1290,88 @@ impl ChatOrchestrator {
         let _ = self
             .checkpoint_store
             .set_pending_approvals(&manifest, pending_approvals);
+    }
+
+    /// Turns a finished command into findings and appends them to the
+    /// session (spec 22 `context.md` §13.4). Returns the evidence linking the
+    /// open step to them, or `None` when the run found nothing.
+    fn record_command_findings(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        task_id: &str,
+        execution: &CommandExecution,
+    ) -> Result<Option<crate::plan::Evidence>> {
+        let findings = findings_from_execution(execution, &default_parsers(), &self.scanner);
+        self.record_findings(
+            repository_root,
+            session_id,
+            task_id,
+            &execution.id,
+            findings,
+        )
+    }
+
+    /// A recorded browser diagnostic's findings. The repository is walked
+    /// only when a console problem has a location to map (§14).
+    fn record_web_findings(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        record: &WebDiagnosticRecord,
+    ) -> Result<()> {
+        let files = if has_located_console_problem(&record.report) {
+            repository_files(repository_root, &self.config.ignore_patterns)
+        } else {
+            Vec::new()
+        };
+        let files: Vec<&str> = files.iter().map(String::as_str).collect();
+        let findings = findings_from_web_record(record, &files, &self.scanner);
+        self.record_findings(
+            repository_root,
+            session_id,
+            &record.task_id,
+            &record.id,
+            findings,
+        )
+        .map(|_| ())
+    }
+
+    /// Keeps a range only when it names a file in the repository, hashing
+    /// the file then. Attaches the task and origin, and appends each finding
+    /// (`context.md` §13.4).
+    fn record_findings(
+        &self,
+        repository_root: &Path,
+        session_id: &str,
+        task_id: &str,
+        origin_ref: &str,
+        findings: Vec<Finding>,
+    ) -> Result<Option<crate::plan::Evidence>> {
+        let mut refs = Vec::new();
+        let mut failing = 0;
+        for finding in findings {
+            let mut finding = finding.with_task_id(task_id).with_origin_ref(origin_ref);
+            if let Some(path) = finding
+                .range()
+                .map(|range| repository_root.join(&range.path))
+            {
+                finding = match path
+                    .is_file()
+                    .then(|| crate::hash::file_hash(&path).ok())
+                    .flatten()
+                {
+                    Some(hash) => finding.with_file_hash(hash),
+                    None => finding.without_range(),
+                };
+            }
+            if finding.severity() == Severity::Error {
+                failing += 1;
+            }
+            self.session_store.record_finding(session_id, &finding)?;
+            refs.push(finding.id().to_string());
+        }
+        Ok((!refs.is_empty()).then_some(crate::plan::Evidence::Findings { refs, failing }))
     }
 
     /// Adds what an approved command changed to the turn's checkpoint.
@@ -2180,6 +2276,10 @@ impl ChatOrchestrator {
                 // by construction. Spec 21 requirement 6 reads a step's status from
                 // this value, so it has to be the tool's answer, not the
                 // dispatcher's.
+                //
+                // A sandbox command's findings leave its arm through this local
+                // rather than through `ActionOutcome` (spec 22 `context.md` §14).
+                let mut command_findings: Option<crate::plan::Evidence> = None;
                 let (assistant_summary, tool_result_text, action_outcome) = if !permission
                     .is_allowed()
                 {
@@ -2284,6 +2384,12 @@ impl ChatOrchestrator {
                                 Some(&task.id),
                                 cancel,
                                 &mut on_output,
+                            )?;
+                            command_findings = self.record_command_findings(
+                                repository_root,
+                                &session.id,
+                                &task.id,
+                                &record.execution,
                             )?;
                             let command_context = sandbox_command_context(&record.execution);
                             // The exit code is in hand right here, one statement before
@@ -2612,8 +2718,11 @@ impl ChatOrchestrator {
                             } else {
                                 // A page that throws is not a failed call
                                 // (spec 12 `context.md` §3.2).
-                                let (content, failed) =
-                                    self.run_and_record_web_diagnostic(&call, sink)?;
+                                let (content, failed) = self.run_and_record_web_diagnostic(
+                                    repository_root,
+                                    &call,
+                                    sink,
+                                )?;
                                 if failed {
                                     *failed_browser_calls.entry(signature).or_insert(0) += 1;
                                 }
@@ -2737,6 +2846,12 @@ impl ChatOrchestrator {
                     && let Some(evidence) = evidence_for(&action_outcome, action_marker.id())
                 {
                     step_evidence.push(evidence);
+                }
+                // After the exit it explains (spec 22 `context.md` §14).
+                if plan.is_some()
+                    && let Some(findings) = command_findings.take()
+                {
+                    step_evidence.push(findings);
                 }
                 // One finish per dispatch, on the tool's own answer. A command goes
                 // through `finish_command_action` so the outcome is derived from
@@ -4605,6 +4720,31 @@ fn tool_call_summary(command_request: &CommandRequest) -> String {
         "Ran `{}` — {}",
         command_request.command, command_request.reason
     )
+}
+
+/// Whether a report has a console problem with a location, the only thing
+/// that needs the repository's file list (spec 22 `context.md` §14).
+fn has_located_console_problem(report: &WebDiagnosticReport) -> bool {
+    report.details.as_ref().is_some_and(|details| {
+        details
+            .console
+            .iter()
+            .any(|entry| entry.is_problem() && entry.location.is_some())
+    })
+}
+
+/// Repository-relative file paths under the configured ignore rules, walked
+/// the way the indexer walks (`indexer.rs`).
+fn repository_files(repository_root: &Path, ignore_patterns: &[String]) -> Vec<String> {
+    let rules = crate::ignore::parse_ignore_patterns(ignore_patterns, "");
+    let mut files = Vec::new();
+    let _ = crate::tree_walk::walk(repository_root, repository_root, "", &rules, &mut |event| {
+        if let crate::tree_walk::WalkEvent::File(file) = event {
+            files.push(file.relative_path.clone());
+        }
+        Ok(())
+    });
+    files
 }
 
 fn sandbox_command_context(execution: &CommandExecution) -> String {
