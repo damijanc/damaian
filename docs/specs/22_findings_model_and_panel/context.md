@@ -856,3 +856,65 @@ carries findings, not raw output. The outline left the following open.
 - **The tests are inline in `lib.rs`'s test module.** They use spec 20 Task 8's
   `serve_for_test` and `send_for_test`, and `isolated_data_dir`, which points
   every engine in the test binary at a throwaway data directory.
+
+## 17. The findings panel: decisions made while planning Task 11 (2026-10-04)
+
+Read against `docs/UI_STYLE_GUIDE.md` and the shell as it stands. File and
+line references are `crates/desktop-shell/static/…`.
+
+- **The panel is a session dock, hidden until opened, not a per-turn card.**
+  The guide's §1 puts per-turn information in the turn. But findings outlive
+  their turn: a dismissal or a "Fix selected" spans checks from several turns,
+  and proposal §5.5's grouping and filters are session-wide. It is modelled on
+  the terminal dock (`#terminal-panel`): a `section#findings-panel` between
+  `#chat-log` and the composer, hidden by default, with a `.topbar-button`
+  toggle in `.thread-actions`. The toggle itself is hidden while the session
+  has no findings, so the chrome earns its pixels (§1) only when there is
+  something to show. Its label carries the count of open errors, following
+  §7's "the label carries a count". `.conversation`'s `grid-template-rows`
+  gains a row for it.
+- **"Fix selected" must bypass the edit heuristic.** `sendChatPrompt`
+  (`app.js:~6296`) sends any prompt that `looksLikeEditRequest` (`~6217`)
+  matches to the one-shot `/api/propose-edit` patch flow. The repair prompt
+  starts "Fix the …" and its items say "error", so it would match, and the
+  repair would lose the agentic turn that reads, edits and re-runs. **Decision:**
+  `sendChatPrompt` takes an `agentic: true` option that skips the heuristic,
+  and only the panel passes it. Typed prompts are unchanged.
+- **Navigation reuses spec 05.** A location renders as
+  `<button class="file-reference" data-path data-line data-col>`, the element
+  `/api/render-markdown` emits, and is wired by the existing
+  `wireFileReferences(container, repo)` (`app.js:~3193`). That posts to
+  `/api/open-vscode-file`, whose parameter is `col`, not `column`. The
+  `.file-reference` CSS is scoped to `.message-body` (`style.css:~1166`), so its
+  selector is widened to the panel rather than copied.
+- **Filters are two `<select>`s styled with the existing `.mode-select`.**
+  Severity is "Errors" (the default), "Errors and warnings", or "All". Status
+  is "Open" (the default), "Open and stale", or "All". The defaults are §5.5's
+  Open + Error.
+- **Stale, dismissed and fixed rows are shown when the filter includes them,
+  but are not selectable.** Their checkbox is disabled, and a note says why.
+  The stale note says to re-run the check, which is what makes the finding
+  current again (§13.2). A dismissed row offers "Restore" (status `open`). An
+  open or stale row offers "Dismiss". There is no "Mark fixed" control: no
+  requirement asks for one, and it would be one more control on every row.
+- **One primary action** (§3): "Fix selected (n)", disabled with no selection
+  or while a turn runs. Dismiss and Restore are `.btn-sm .btn-quiet`. Details
+  use `createDisclosure("Details", pre)` (§7), collapsed.
+- **Every string goes in through `textContent`.** Summaries, details and paths
+  come from tool output. They are redacted, which does not make them safe as
+  HTML.
+- **Refresh points:** after `renderMessages` in `loadSession` (which covers
+  opening, switching and clearing a session), and after each
+  `loadSessions(currentSessionId, false)` that ends a turn. Those are the live
+  turn (`~6402`), the command-approval resume (`~5889`, and its detached path
+  `~5824`), and the plan-review resume (`~5324`). There is no findings SSE
+  event, and none is added: a turn's findings exist by the time its `done`
+  event arrives.
+- **Verification is by hand, in a browser.** There is no JS test suite (guide
+  §9). The ignored `serves_the_ui_for_manual_inspection` harness gains a
+  seeded "Findings to review" session: open, stale, dismissed, ranged,
+  unranged, several sources. The checks run against port 4899, never 4765.
+  The guide's §9 also requires a specimen in `docs/ui-style-guide.html` in the
+  same commit. Clicking a location runs `code --goto` and opens VS Code, so the
+  browser check asserts the element's `data-*` attributes rather than
+  clicking it.

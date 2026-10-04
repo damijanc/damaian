@@ -20,7 +20,7 @@ decisions it left open in [`context.md`](context.md)
 | 8 · Record findings where checks run (`chat.rs`) | Done 2026-10-04 | New on 2026-10-02 from the Task 7 split, and planned in full on 2026-10-04 (`context.md` §13.4, §14). Landed as sketched, with only rustfmt changes, in a separate worktree, with no other spec editing `chat.rs`. `tests/finding_recording.rs` was extracted from this file's line ranges. `workspace_engine::hash` and `::web_diagnostics` resolved as written, so no re-export was needed. The `chat.rs` line numbers in Step 5 still matched. `command_findings` assigned inside the arm passed borrowck, so `ActionOutcome` is unchanged. Two deviations, both cosmetic. The `use` is a top-level `crate::finding::{…}` import, and `record_command_findings` takes `&CommandExecution` through the file's existing import. The `command_findings` declaration also gained a two-line comment saying why it is a local. `repository_files` uses `config.ignore_patterns` as planned. `Config::default()` already fills it with the defaults that `indexer.rs` falls back to, so nothing is lost. Before the implementation: as Step 4 predicts, four `finding_recording` tests and the changed `plan_turn` assertion failed at runtime, each on "nothing recorded" after its setup passed. The approved test had got past its approval assertion. `a_passing_sandbox_command_records_nothing` passed. After: the Step 7 selection passed 250/250 (5 `finding_recording`, 19 `plan_turn`, 51 `plan`, 107 `finding::`, 23 `session::tests`, 45 `chat::`). All six mutations failed exactly their named tests, with `binary(finding_recording) + binary(plan_turn)`. (1) No sandbox recording failed `a_failed_sandbox_command_…`, `the_failed_step_carries_…` and the `plan_turn` assertion, because no findings means no evidence. (2) No approval recording failed only `an_approved_command_…`, on `[]`. (3) No `record_web_findings` failed only `a_browser_console_error_…`, on `[]`. (4) `None => finding` (keep every range) failed only `an_approved_command_…`, on "src/gone.rs is not in the repository". (5) No `command_findings.take()` push failed `the_failed_step_carries_…` and the `plan_turn` assertion. (6) An empty file list failed only `a_browser_console_error_…`, on the missing range. **Environment, not code:** in mutation 1's run, `an_approved_command_…` also failed. Its `./cargo check` reported `timed out` after 600.28s. It passed in under a second in every other run, and mutation 1 does not touch that path. The next run's `--list` of the relinked test binary sat at `_dyld_start + 0` for about 5 minutes while `XprotectService` was busy. So macOS XProtect can hold a newly written executable at launch, and this test writes one (`./cargo`) on every run. The test is unchanged, and this is recorded as an observation. Scoped fmt, clippy `-p workspace-engine`, `node --check`, `lint:web` and typos are clean. `lint:web`'s one info is pre-existing, in `scripts/check-spec-status.mjs`. The eval harness deterministic tier passed 16/16. Metrics match `evals/baseline.json` except tokens, 101950 against 101963 (not investigated), and latency, median 57 against 44 ms and p90 128 against 109 ms, measured while XProtect was loading the machine. The baseline was not regenerated. |
 | 9 · Dismissal and the scoped repair request | Done 2026-10-04 | Planned in full on 2026-10-04 (`context.md` §15). Only `Open` findings are repaired; stale, dismissed, fixed and unknown ids are each excluded with a reason. Landed as sketched. `repair.rs` was extracted from this file's line ranges and is byte-identical to `rustfmt` of the sketch, apart from one deviation: clippy 1.98's `cloned_ref_to_slice_refs` rejected four single-element `&[x.clone()]` arguments in the unit tests, so they are now `std::slice::from_ref(&x)`. `finding.rs` declares `mod repair;` after `mod browser;` and re-exports `Exclusion`, `ExclusionReason` and `RepairRequest`. `finding_recording.rs` gains the imports, `ask_in` and the two tests. No other file changed. Before the implementation the tests failed to compile (`E0432` on the re-export, then `E0433`/`E0425`/`E0422` on the missing types). After it, `test(finding::) + binary(finding_recording)` passed 123/123: 107 `finding::` unchanged, 9 `repair::tests`, and 7 `finding_recording` (5 unchanged + 2 new). All six mutations failed their named tests. Mutations 1, 3–6 ran with `--lib -E 'test(finding::repair)'`. (1) Keeping `Stale` failed `a_stale_finding_is_excluded_…`, plus `nothing_left_to_repair_…`, the exact-render test and `the_request_serialises_…`. (2) Keeping `Dismissed` failed `dismissed_and_fixed_findings_are_excluded_…` (unit) and `dismissing_a_finding_does_not_suppress_…` (integration). (3) Iterating `selected_ids` failed `open_findings_are_kept_in_session_order`, and also `a_duplicate_selection_is_counted_once`, because a repeated id is kept twice. (4) Dropping unknown ids failed `an_unknown_id_is_excluded_…` and the duplicate test. (5) Removing `noted`, the unknown loop's only dedup, failed only the duplicate test. (6) Rendering when only exclusions remain failed only `nothing_left_to_repair_renders_nothing`. **Environment, not code:** a run over the whole `-p workspace-engine` relinks all 21 integration binaries. Mutation 2's first attempt, scoped that way, was killed at 30 minutes with no output, behind XProtect launch scans (see Task 8's row). Rerun with `--lib` and `--test finding_recording`, it took 105 s wall-clock against 14 s of CPU. Step 5 and Step 7's test runs used the same `--lib --test finding_recording` targets with the plan's filter. That selects the same 123 tests without relinking binaries the filter never runs. Scoped fmt, clippy `-p workspace-engine` and typos are clean. |
 | 10 · Shell API | Done 2026-10-04 | Planned in full on 2026-10-04 (`context.md` §16). Implemented in its own worktree, because spec 31 work on `main` left `workspace-engine` not compiling. `FindingStatus::parse` landed as sketched. Before it, the test failed to compile (`E0599`). After it, `finding::tests` passed 17/17. The shell tests compiled first time, as written in the plan. Before the routes, all six failed on the catch-all `{"error":"not found"}`, as Step 4 predicts. **Deviation 1: the routes are functions, not inline arms.** Written inline as sketched, every request a `desktop-shell --lib` test served aborted with `fatal runtime error: stack overflow`. That included spec 20's unchanged session-mode tests. Every arm's locals share `handle_connection`'s frame, and each findings arm holds a `WorkspaceEngine` by value. The nine tests passed with `RUST_MIN_STACK=16777216`, and at `HEAD`, without the arms, the session-mode tests passed with the default stack. The desktop app runs the server on a default `thread::spawn` thread (`desktop-app/src/main.rs`), so a debug build of the app would have aborted on every request. The arms now call `handle_findings`, `handle_finding_status` and `handle_findings_repair`, as `handle_ask_stream` already does, with the sketched bodies. A comment above them says why. **Deviation 2: the GET test is stronger.** Mutation 5 (root `Path::new("")`) first survived. The test's working directory, `crates/desktop-shell`, has its own `src/lib.rs`, and a missing or different file reads as stale, so the only ranged finding was stale under any root. The test now also records a finding on an untouched `src/kept.rs` and expects `open`. After the change, the Step 6 selection passed 9/9 (6 new + 3 session-mode), the whole `desktop-shell --lib` suite passed 86/86 (4 ignored), and `finding::` passed 117/117 (107 + 9 repair + 1 new). Mutations, run with `--lib -E 'test(findings) + test(finding_status)'`: (1) No `session_in_repository` in GET failed only `findings_endpoints_refuse_…`. (2) Defaulting an unknown status to `Dismissed` failed only `post_finding_status_rejects_…`. (3) Overwriting the status in `read_findings`' JSON, with no `set_finding_status`, failed `post_finding_status_dismisses_…` on the reread (`"open"` vs `"dismissed"`). It also failed the reject test, because nothing refuses `stale` any more. (4) `""` for a `None` prompt failed only `post_findings_repair_with_nothing_open_…`. (5) After the test fix, the root `""` failed only `get_findings_…`, on `"stale"` vs `"open"`. Scoped fmt, clippy `-p desktop-shell -p workspace-engine --all-targets`, the scoped tests and typos are clean. The stack headroom is recorded as a local observation for a decision beyond this spec. |
-| 11 · Findings panel | Not started | |
+| 11 · Findings panel | Not started | Planned in full on 2026-10-04 (`context.md` §17). It is a session dock, hidden until the session has findings. "Fix selected" bypasses `looksLikeEditRequest`, which would otherwise turn the repair into a one-shot patch proposal. Locations reuse spec 05's `wireFileReferences`. The panel JS was checked before handover: `node --check` passes, and Biome reports no lint problems, only line-wrapping. Nothing was run in a browser; Step 7's walk-through is the implementer's. |
 | 12 · Docs, acceptance criteria, close the spec | Not started | |
 
 **Goal:** One structured, redacted, addressable `Finding` type shared by every
@@ -95,7 +95,7 @@ Every task's requirements implicitly include this section.
 | `crates/workspace-engine/src/plan.rs` | `Evidence::Findings` (Task 7, closing spec 21's deferral) |
 | `crates/workspace-engine/src/validation.rs` (and `chat.rs` if needed) | The recording call sites (Task 8) |
 | `crates/desktop-shell/src/lib.rs` | Findings endpoints (Task 10) |
-| `crates/desktop-shell/static/app.js`, `styles.css` | The panel (Task 11) |
+| `crates/desktop-shell/static/app.js`, `style.css`, `index.html` | The panel (Task 11) |
 | `docs/USER_GUIDE.md`, `docs/TROUBLESHOOTING.md` | §5.8 (Task 12) |
 
 ## Interface reference
@@ -6322,15 +6322,701 @@ whose tests are inline, that means `--lib`.
 
 ## Task 11: Findings panel
 
-**Files:** `app.js`, `styles.css`, read against `docs/UI_STYLE_GUIDE.md`.
+**Requirements:** 3 (grouping, filtering, navigation, dismissal, asking for a
+fix) and 5 (navigation through spec 05). It also meets the acceptance criterion
+"clicking a finding with a range opens the referenced file and line through
+the existing spec 05 mechanism".
 
-Group by source, then by file. Filter by severity and status. The default
-view is Open plus Error. A finding with a range renders through spec 05's
-existing clickable-reference mechanism, with no new navigation path. Each
-finding has a dismiss control, and there is a "Fix selected" action. Stale
-findings are shown but not selectable, with the reason stated. Verify in the
-browser against the ignored `serves_the_ui_for_manual_inspection` harness on
-port 4899, never on 4765.
+**Files:** all under `crates/desktop-shell/`, except the last.
+- `static/index.html`: the toggle and the panel.
+- `static/app.js`: the panel code, an `agentic` option on `sendChatPrompt`,
+  and the refresh calls.
+- `static/style.css`: note the singular name. The panel styles, one widened
+  selector, and the `.conversation` grid row.
+- `src/lib.rs`: a seeded session in the ignored inspection harness.
+- `docs/ui-style-guide.html`: a specimen, as the guide's §9 requires.
+
+Planned in full on 2026-10-04.
+
+**Read `context.md` §17 and `docs/UI_STYLE_GUIDE.md` (§1–§9) first.** §17
+decides:
+- the session dock, rather than a per-turn card, and its hidden-until-useful
+  toggle;
+- the `agentic` bypass of `looksLikeEditRequest`, without which "Fix
+  selected" becomes a one-shot patch proposal;
+- spec 05 reuse through `wireFileReferences`;
+- the filters and their defaults;
+- which rows are selectable;
+- the refresh points;
+- why the browser check does not click a location.
+
+The backend is Task 10: `GET /api/findings`, `POST /api/finding-status` and
+`POST /api/findings-repair`, all taking `repo` and `session_id`.
+
+**There is no JS test suite** (guide §9). This task is verified by
+`node --check`, `npm run lint:web`, and a recorded browser walk-through
+against the inspection harness (Step 7). Static assets are embedded with
+`include_str!`, so the harness must be rebuilt after every asset edit.
+Rebuild with `cargo test -p desktop-shell --lib --no-run`. Use `--lib`, never
+a bare `-p`, for the XProtect reason in Tasks 8–10.
+
+**Interfaces:**
+- Consumes:
+  - the three Task 10 endpoints;
+  - `api`, `form`, `repo`, `requireRepo`, `currentSessionId`, `toast` and
+    `chatSubmitting`;
+  - `createDisclosure(label, panel)`, which returns the trigger;
+  - `wireFileReferences(container, repo)`;
+  - `sendChatPrompt(options)` and `loadSession` (`app.js`).
+- Produces:
+  - `sendChatPrompt({ prompt, restorePrompt: false, agentic: true })`, which
+    skips `looksLikeEditRequest`;
+  - `refreshFindings()`;
+  - the DOM ids `findings-toggle-btn`, `findings-panel`, `findings-count`,
+    `findings-severity-filter`, `findings-status-filter`, `findings-list`,
+    `findings-fix-btn` and `findings-close-btn`, which the specimen and
+    Task 12's docs refer to.
+
+- [ ] **Step 1: Markup**
+
+  In `static/index.html`, inside `.thread-actions`, add this directly before
+  `#session-search-btn`:
+
+  ```html
+              <button
+                id="findings-toggle-btn"
+                class="topbar-button"
+                type="button"
+                aria-controls="findings-panel"
+                aria-expanded="false"
+                hidden
+              >
+                Findings
+              </button>
+  ```
+
+  Between `section#chat-log` and `footer.composer`, add:
+
+  ```html
+          <section id="findings-panel" class="findings-panel" aria-label="Findings" hidden>
+            <div class="findings-header">
+              <strong>Findings</strong>
+              <span id="findings-count" class="findings-count"></span>
+              <select
+                id="findings-severity-filter"
+                class="mode-select"
+                aria-label="Severity filter"
+              >
+                <option value="error" selected>Errors</option>
+                <option value="warning">Errors and warnings</option>
+                <option value="all">All severities</option>
+              </select>
+              <select id="findings-status-filter" class="mode-select" aria-label="Status filter">
+                <option value="open" selected>Open</option>
+                <option value="open_stale">Open and stale</option>
+                <option value="all">All statuses</option>
+              </select>
+              <button
+                id="findings-close-btn"
+                class="btn-icon"
+                type="button"
+                aria-label="Hide findings"
+              >
+                ×
+              </button>
+            </div>
+            <div id="findings-list" class="findings-list"></div>
+            <div class="findings-footer">
+              <button id="findings-fix-btn" class="btn-primary btn-sm" type="button" disabled>
+                Fix selected
+              </button>
+            </div>
+          </section>
+  ```
+
+  Match the file's existing indentation. Biome checks only JS and CSS, so
+  `index.html` is not linted, but keep it tidy.
+
+- [ ] **Step 2: Styles**
+
+  In `static/style.css`:
+
+  - `.conversation`'s `grid-template-rows` becomes
+    `auto minmax(0, 1fr) auto auto auto`, adding a row for the panel between
+    the chat log and the composer. Check that the composer and the terminal
+    still sit in the right rows. Every in-flow child of `.conversation` takes
+    the next row, while the absolutely positioned overlay and search panel
+    take none.
+  - Widen `.message-body .file-reference` (`~1166`) and its related rules to
+    `.message-body .file-reference, .findings-panel .file-reference`. Do not
+    copy the rules.
+  - Add the panel rules. Every value is a token or a §6 spacing step:
+
+  ```css
+  .findings-panel {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    gap: 8px;
+    max-height: min(320px, 36vh);
+    border-top: 1px solid var(--line);
+    background: var(--surface);
+    padding: 10px clamp(18px, 5vw, 72px);
+    font-size: 12px;
+  }
+
+  .findings-panel[hidden] {
+    display: none;
+  }
+
+  .findings-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 10px;
+  }
+
+  .findings-header .btn-icon {
+    margin-left: auto;
+  }
+
+  .findings-count {
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  .findings-list {
+    min-height: 0;
+    overflow: auto;
+    display: grid;
+    align-content: start;
+    gap: 10px;
+  }
+
+  .findings-group {
+    display: grid;
+    gap: 4px;
+  }
+
+  .findings-group-title {
+    margin: 0;
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .findings-file-path {
+    overflow: hidden;
+    color: var(--muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl;
+    text-align: left;
+  }
+
+  .finding-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 4px 8px;
+    padding: 6px 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .finding-row:not([data-status="open"]) .finding-summary {
+    color: var(--muted);
+  }
+
+  .finding-body {
+    display: grid;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .finding-headline {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 8px;
+  }
+
+  .finding-severity {
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .finding-severity-error {
+    color: var(--danger);
+  }
+
+  .finding-severity-warning {
+    color: var(--warn);
+  }
+
+  .finding-severity-info {
+    color: var(--muted);
+  }
+
+  .finding-code {
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  .finding-note {
+    margin: 0;
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  .finding-details {
+    max-height: 160px;
+    overflow: auto;
+    margin: 0;
+    padding: 6px 8px;
+    border-radius: 8px;
+    background: var(--surface-soft);
+    font-size: 11px;
+    white-space: pre-wrap;
+  }
+
+  .finding-footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 12px;
+  }
+
+  .findings-footer {
+    display: flex;
+    justify-content: flex-end;
+  }
+
+  .findings-empty {
+    margin: 0;
+    color: var(--muted);
+  }
+  ```
+
+  The `direction: rtl` left-truncation copies `.context-file` (`~2375`), the
+  guide's §8 answer for path lists: the filename survives. If the guide's
+  checkbox or select rules give these elements a size below 24×24px (§3),
+  fix that in this task.
+
+- [ ] **Step 3: The `agentic` option on `sendChatPrompt`**
+
+  In `sendChatPrompt` (`app.js:~6296`), change
+
+  ```js
+      if (looksLikeEditRequest(prompt)) {
+  ```
+
+  to
+
+  ```js
+      // A scoped repair from the findings panel needs the agentic turn, which
+      // reads, edits and re-runs. Its text ("Fix the 2 findings… error…") would
+      // otherwise match the edit heuristic and go to the one-shot patch flow
+      // (spec 22 `context.md` §17).
+      if (!options.agentic && looksLikeEditRequest(prompt)) {
+  ```
+
+  Nothing else in `sendChatPrompt` changes.
+
+- [ ] **Step 4: The panel code**
+
+  Add this block to `app.js`, after `renderWebDiagnosticCard` and its helpers:
+
+  ```js
+  // The findings panel (spec 22 Task 11). It is session-scoped: what the
+  // session's checks found, for the user to open, dismiss, or hand back to the
+  // agent as a scoped repair (spec 22 §5.5, `context.md` §17). Every string came
+  // from tool output, so all of it goes in through `textContent`.
+  const FINDING_SOURCE_LABELS = {
+    compiler: "Compiler",
+    test: "Tests",
+    lint: "Lint",
+    security: "Security",
+    browser_console: "Browser console",
+    browser_network: "Network",
+    browser_scenario: "Browser scenario",
+    code_review: "Code review",
+    language_server: "Language server",
+    command: "Unparsed checks",
+  };
+
+  const FINDING_STATUS_NOTES = {
+    stale: "Its file changed after the check ran. Re-run the check to repair it.",
+    dismissed: "Dismissed.",
+    fixed: "Marked fixed.",
+  };
+
+  let sessionFindings = [];
+  const findingsSelection = new Set();
+  let findingsPanelOpen = false;
+
+  async function refreshFindings() {
+    const sessionId = currentSessionId;
+    const repoPath = repo();
+    if (!sessionId || !repoPath) {
+      sessionFindings = [];
+    } else {
+      try {
+        const payload = await api(
+          `/api/findings?repo=${encodeURIComponent(repoPath)}&session_id=${encodeURIComponent(sessionId)}`,
+        );
+        // A session switched while this was in flight owns the panel now.
+        if (sessionId !== currentSessionId) return;
+        sessionFindings = payload.findings || [];
+      } catch (error) {
+        sessionFindings = [];
+        toast(`Findings could not be loaded: ${error.message}`);
+      }
+    }
+    for (const id of [...findingsSelection]) {
+      const stillOpen = sessionFindings.some((finding) => finding.id === id && finding.status === "open");
+      if (!stillOpen) findingsSelection.delete(id);
+    }
+    renderFindingsPanel();
+  }
+
+  function findingVisible(finding) {
+    const severity = $("findings-severity-filter").value;
+    const status = $("findings-status-filter").value;
+    const severityShown =
+      severity === "all" ||
+      (severity === "warning" ? finding.severity !== "info" : finding.severity === "error");
+    const statusShown =
+      status === "all" ||
+      (status === "open_stale"
+        ? finding.status === "open" || finding.status === "stale"
+        : finding.status === "open");
+    return severityShown && statusShown;
+  }
+
+  /** Groups in first-appearance order, so session order survives grouping. */
+  function groupFindings(findings, key) {
+    const groups = new Map();
+    for (const finding of findings) {
+      const value = key(finding);
+      if (!groups.has(value)) groups.set(value, []);
+      groups.get(value).push(finding);
+    }
+    return groups;
+  }
+
+  function renderFindingsPanel() {
+    const toggle = $("findings-toggle-btn");
+    const panel = $("findings-panel");
+    const openErrors = sessionFindings.filter(
+      (finding) => finding.status === "open" && finding.severity === "error",
+    ).length;
+    toggle.hidden = sessionFindings.length === 0;
+    toggle.textContent = openErrors > 0 ? `Findings ${openErrors}` : "Findings";
+    panel.hidden = !findingsPanelOpen || sessionFindings.length === 0;
+    toggle.setAttribute("aria-expanded", String(!panel.hidden));
+    if (panel.hidden) return;
+
+    const visible = sessionFindings.filter(findingVisible);
+    $("findings-count").textContent = `Showing ${visible.length} of ${sessionFindings.length}`;
+    const list = $("findings-list");
+    list.replaceChildren();
+    if (!visible.length) {
+      const empty = document.createElement("p");
+      empty.className = "findings-empty";
+      empty.textContent = "Nothing matches these filters.";
+      list.append(empty);
+    }
+    for (const [source, bySource] of groupFindings(visible, (finding) => finding.source)) {
+      const group = document.createElement("section");
+      group.className = "findings-group";
+      const title = document.createElement("h3");
+      title.className = "findings-group-title";
+      title.textContent = `${FINDING_SOURCE_LABELS[source] || source} (${bySource.length})`;
+      group.append(title);
+      for (const [path, byFile] of groupFindings(bySource, (finding) => finding.range?.path || "")) {
+        const file = document.createElement("div");
+        file.className = "findings-file";
+        const label = document.createElement("div");
+        label.className = "findings-file-path";
+        label.textContent = path || "No location";
+        if (path) label.title = path;
+        file.append(label, ...byFile.map(findingRow));
+        group.append(file);
+      }
+      list.append(group);
+    }
+    wireFileReferences(list, repo());
+
+    const fix = $("findings-fix-btn");
+    fix.disabled = findingsSelection.size === 0 || chatSubmitting;
+    fix.textContent = findingsSelection.size
+      ? `Fix selected (${findingsSelection.size})`
+      : "Fix selected";
+  }
+
+  function findingRow(finding) {
+    const row = document.createElement("div");
+    row.className = "finding-row";
+    row.dataset.findingId = finding.id;
+    row.dataset.status = finding.status;
+
+    const select = document.createElement("input");
+    select.type = "checkbox";
+    select.className = "finding-select";
+    select.checked = findingsSelection.has(finding.id);
+    // Only an open finding can be repaired (spec 22 `context.md` §15).
+    select.disabled = finding.status !== "open";
+    select.setAttribute("aria-label", `Select: ${finding.summary}`);
+    select.addEventListener("change", () => {
+      if (select.checked) findingsSelection.add(finding.id);
+      else findingsSelection.delete(finding.id);
+      renderFindingsPanel();
+    });
+
+    const body = document.createElement("div");
+    body.className = "finding-body";
+    const headline = document.createElement("div");
+    headline.className = "finding-headline";
+    const severity = document.createElement("span");
+    severity.className = `finding-severity finding-severity-${finding.severity}`;
+    severity.textContent = finding.severity;
+    const summary = document.createElement("span");
+    summary.className = "finding-summary";
+    summary.textContent = finding.summary;
+    headline.append(severity, summary);
+    if (finding.code) {
+      const code = document.createElement("code");
+      code.className = "finding-code";
+      code.textContent = finding.code;
+      headline.append(code);
+    }
+    body.append(headline);
+
+    if (finding.range) {
+      // The element spec 05's `/api/render-markdown` emits, wired by
+      // `wireFileReferences`: no second navigation path (§5.5).
+      const { path, startLine, startColumn } = finding.range;
+      const location = document.createElement("button");
+      location.type = "button";
+      location.className = "file-reference finding-location";
+      location.dataset.path = path;
+      location.dataset.line = String(startLine);
+      if (startColumn) location.dataset.col = String(startColumn);
+      location.textContent = `${path}:${startLine}${startColumn ? `:${startColumn}` : ""}`;
+      location.title = location.textContent;
+      body.append(location);
+    }
+
+    const note = FINDING_STATUS_NOTES[finding.status];
+    if (note) {
+      const text = document.createElement("p");
+      text.className = "finding-note";
+      text.textContent = note;
+      body.append(text);
+    }
+
+    const footer = document.createElement("div");
+    footer.className = "finding-footer";
+    let details = null;
+    if (finding.details) {
+      details = document.createElement("pre");
+      details.className = "finding-details";
+      details.textContent = finding.details;
+      footer.append(createDisclosure("Details", details));
+    }
+    const action =
+      finding.status === "dismissed"
+        ? { label: "Restore", status: "open" }
+        : finding.status === "fixed"
+          ? null
+          : { label: "Dismiss", status: "dismissed" };
+    if (action) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "btn-sm btn-quiet";
+      button.textContent = action.label;
+      button.addEventListener("click", () => setFindingStatus(finding.id, action.status));
+      footer.append(button);
+    }
+    // §7: the expanded content sits above the footer it is paired with.
+    if (details) body.append(details);
+    if (footer.childElementCount) body.append(footer);
+
+    row.append(select, body);
+    return row;
+  }
+
+  async function setFindingStatus(findingId, status) {
+    try {
+      const payload = await api(
+        "/api/finding-status",
+        form({ repo: requireRepo(), session_id: currentSessionId, finding_id: findingId, status }),
+      );
+      sessionFindings = payload.findings || [];
+      findingsSelection.delete(findingId);
+      renderFindingsPanel();
+    } catch (error) {
+      toast(error.message);
+    }
+  }
+
+  async function fixSelectedFindings() {
+    if (chatSubmitting) {
+      toast("A turn is already running");
+      return;
+    }
+    const ids = [...findingsSelection];
+    if (!ids.length) return;
+    try {
+      const payload = await api(
+        "/api/findings-repair",
+        form({ repo: requireRepo(), session_id: currentSessionId, finding_ids: ids.join(",") }),
+      );
+      const excluded = payload.request?.excluded || [];
+      if (excluded.length) {
+        toast(`Left out ${excluded.length}: ${excluded.map((entry) => entry.reason).join(", ")}`);
+      }
+      // Nothing left to repair: the server built no prompt (§15). Redraw, so
+      // the panel shows why.
+      if (!payload.prompt) {
+        await refreshFindings();
+        return;
+      }
+      findingsSelection.clear();
+      renderFindingsPanel();
+      await sendChatPrompt({ prompt: payload.prompt, restorePrompt: false, agentic: true });
+    } catch (error) {
+      toast(error.message);
+    }
+  }
+
+  $("findings-toggle-btn").addEventListener("click", () => {
+    findingsPanelOpen = !findingsPanelOpen;
+    renderFindingsPanel();
+  });
+  $("findings-close-btn").addEventListener("click", () => {
+    findingsPanelOpen = false;
+    renderFindingsPanel();
+    $("findings-toggle-btn").focus();
+  });
+  $("findings-severity-filter").addEventListener("change", renderFindingsPanel);
+  $("findings-status-filter").addEventListener("change", renderFindingsPanel);
+  $("findings-fix-btn").addEventListener("click", () => void fixSelectedFindings());
+  ```
+
+  If the file declares its top-level `$(…).addEventListener` wiring in one
+  place, for example beside `$("terminal-toggle-btn")` at `~6145`, move the
+  five listeners there and keep the functions where they are.
+
+  If `createDisclosure` is called before the `details` element is in the DOM,
+  as here, check that its `hidden` toggle still works once appended. It sets
+  `panel.hidden` on the element itself, so it should.
+
+- [ ] **Step 5: Refresh points**
+
+  Add `await refreshFindings();`:
+
+  1. in `loadSession`, directly after `renderMessages(payload.messages, payload.tasks || [])`.
+     Also add it on the empty-session branch that calls `clearChat()`, so
+     switching to no session empties the panel;
+  2. in `sendChatPrompt`'s success path, directly after
+     `await loadSessions(currentSessionId, false);` (`~6402`);
+  3. after the same call in the command-approval resume (`~5889`) and its
+     detached path (`~5824`);
+  4. after the same call in the plan-review resume (`~5324`).
+
+  Also call `renderFindingsPanel()` wherever `chatSubmitting` changes through
+  `setComposerBusy`, so "Fix selected" disables while a turn runs and
+  re-enables after it. Add the one call inside `setComposerBusy` itself.
+
+- [ ] **Step 6: Seed the inspection harness**
+
+  In `crates/desktop-shell/src/lib.rs`'s test module, add a function next to
+  `recorded_web_diagnostic_session`, following its shape: create the session
+  and task, mark the task `Complete` so the recovery sweep ignores it, and
+  return the session id. Seed five findings, each through `Finding::new` (the
+  only constructor):
+
+  | Source | Severity | Summary | Range | Status |
+  |---|---|---|---|---|
+  | `Compiler` | Error | `mismatched types` (code `E0308`), with details | `upload.rs:3:5`, hashed from the real file | open |
+  | `Command` | Error | `npm test: 1 failing` | none | open |
+  | `Compiler` | Warning | `unused variable: \`retries\`` (code `unused_variables`) | `upload.rs:7:9`, hashed | open |
+  | `Lint` | Warning | `unneeded \`return\` statement` (code `clippy::needless_return`) | `retry.rs:2:5`, with `with_file_hash("sha256:0")` | derives **stale** |
+  | `Test` | Error | `tests::retries_three_times failed` | `retry.rs:10:1`, hashed | **dismissed** through `set_finding_status` |
+
+  Call it from `serves_the_ui_for_manual_inspection`, and print the session id
+  with the others. If `upload.rs` or `retry.rs` is shorter than the line a
+  finding names, that does not matter: staleness compares hashes, and
+  navigation is not clicked.
+
+- [ ] **Step 7: Verify in the browser**
+
+  Rebuild and start the harness:
+
+  ```bash
+  cargo test -p desktop-shell --lib -- --ignored --nocapture serves_the_ui
+  ```
+
+  Open `http://127.0.0.1:4899`. In the console, run
+  `apiToken = "damaian-ui-inspection-token"; setRepository("<printed repo>", false);`.
+  Never use port 4765. Walk through the following, and record each result in
+  the progress row:
+
+  1. A seeded session without findings: `#findings-toggle-btn` is hidden.
+  2. "Findings to review": the toggle reads **Findings 2** (two open errors).
+  3. Open the panel. The defaults show 2 rows (`E0308` and `npm test: 1 failing`)
+     under **Compiler** and **Unparsed checks**, with the count reading
+     "Showing 2 of 5".
+  4. Set both filters to "All". There are 5 rows. The stale `needless_return`
+     row's checkbox is disabled, with the re-run note. The dismissed test row
+     shows "Restore" and a disabled checkbox.
+  5. The `E0308` location button has `data-path="upload.rs"`, `data-line="3"`
+     and `data-col="5"`. Assert it with
+     `document.querySelector('[data-finding-id] .finding-location').dataset`.
+     Do not click it, because it launches VS Code.
+  6. "Details" expands and collapses, and its text is the seeded details.
+  7. Dismiss `E0308`. It leaves the default view, and the toggle reads
+     **Findings 1**. Reload the page and reopen the session. It is still
+     dismissed. Restore it under "All", and it returns.
+  8. Select `npm test: 1 failing`, then "Fix selected (1)". A user bubble
+     appears whose text starts "Fix the 1 finding below". In the Network
+     panel, the request went to **`/api/ask-stream`, not
+     `/api/propose-edit`**: the `agentic` bypass worked. The turn then fails
+     for lack of a model key, which is expected in the harness.
+  9. Tab through the panel. Focus visits the filters, the close button, the
+     checkboxes, the locations, the Details triggers, Dismiss/Restore and Fix
+     selected, in reading order, with the focus ring visible.
+  10. There are no console errors.
+
+  Stop the harness by its PID, never by name (`AGENTS.md` Traps).
+
+- [ ] **Step 8: Specimen**
+
+  Add a findings-panel specimen to `docs/ui-style-guide.html`, next to the
+  existing card specimens. Include a group title, one open row with a location
+  and Details, one stale row with its note, and the footer's primary action.
+  Guide §9 requires this in the same commit.
+
+- [ ] **Step 9: Scoped checks**
+
+  ```bash
+  node --check crates/desktop-shell/static/app.js
+  npm run lint:web
+  cargo fmt --all -- --check
+  cargo clippy -p desktop-shell --all-targets --locked -- -D warnings
+  cargo nextest run -p desktop-shell --lib
+  typos docs/specs/22_findings_model_and_panel crates/desktop-shell/static docs/ui-style-guide.html crates/desktop-shell/src/lib.rs
+  ```
+
+  `npm run lint:web` may report the one existing info in
+  `scripts/check-spec-status.mjs`. That is not this task's. Run
+  `npm run lint:web:fix` for formatting only, and review its diff.
+
+- [ ] **Step 10: Update this file's Task 11 row with the Step 7 results, then
+  show the change and the check results and ask before committing**
 
 ## Task 12: Docs, acceptance criteria, close the spec
 
