@@ -2991,6 +2991,9 @@ function clearSessionList() {
 function clearChat() {
   $("chat-log").innerHTML = "";
   sessionHasRecordedDiagnostics = false;
+  // Every caller means "no conversation": a new, deleted or unselected
+  // session. The findings belong to the conversation that just left.
+  clearFindings();
   setChatStatus("Idle");
 }
 
@@ -4852,6 +4855,277 @@ function renderWebDiagnosticCard(message, record) {
   }
 }
 
+// The findings panel (spec 22 Task 11). It is session-scoped: what the
+// session's checks found, for the user to open, dismiss, or hand back to the
+// agent as a scoped repair (spec 22 §5.5, `context.md` §17). Every string came
+// from tool output, so all of it goes in through `textContent`.
+const FINDING_SOURCE_LABELS = {
+  compiler: "Compiler",
+  test: "Tests",
+  lint: "Lint",
+  security: "Security",
+  browser_console: "Browser console",
+  browser_network: "Network",
+  browser_scenario: "Browser scenario",
+  code_review: "Code review",
+  language_server: "Language server",
+  command: "Unparsed checks",
+};
+
+const FINDING_STATUS_NOTES = {
+  stale: "Its file changed after the check ran. Re-run the check to repair it.",
+  dismissed: "Dismissed.",
+  fixed: "Marked fixed.",
+};
+
+let sessionFindings = [];
+const findingsSelection = new Set();
+let findingsPanelOpen = false;
+
+async function refreshFindings() {
+  const sessionId = currentSessionId;
+  const repoPath = repo();
+  if (!sessionId || !repoPath) {
+    sessionFindings = [];
+  } else {
+    try {
+      const payload = await api(
+        `/api/findings?repo=${encodeURIComponent(repoPath)}&session_id=${encodeURIComponent(sessionId)}`,
+      );
+      // A session switched while this was in flight owns the panel now.
+      if (sessionId !== currentSessionId) return;
+      sessionFindings = payload.findings || [];
+    } catch (error) {
+      sessionFindings = [];
+      toast(`Findings could not be loaded: ${error.message}`);
+    }
+  }
+  for (const id of [...findingsSelection]) {
+    const stillOpen = sessionFindings.some(
+      (finding) => finding.id === id && finding.status === "open",
+    );
+    if (!stillOpen) findingsSelection.delete(id);
+  }
+  renderFindingsPanel();
+}
+
+function clearFindings() {
+  sessionFindings = [];
+  findingsSelection.clear();
+  renderFindingsPanel();
+}
+
+function findingVisible(finding) {
+  const severity = $("findings-severity-filter").value;
+  const status = $("findings-status-filter").value;
+  const severityShown =
+    severity === "all" ||
+    (severity === "warning" ? finding.severity !== "info" : finding.severity === "error");
+  const statusShown =
+    status === "all" ||
+    (status === "open_stale"
+      ? finding.status === "open" || finding.status === "stale"
+      : finding.status === "open");
+  return severityShown && statusShown;
+}
+
+/** Groups in first-appearance order, so session order survives grouping. */
+function groupFindings(findings, key) {
+  const groups = new Map();
+  for (const finding of findings) {
+    const value = key(finding);
+    if (!groups.has(value)) groups.set(value, []);
+    groups.get(value).push(finding);
+  }
+  return groups;
+}
+
+function renderFindingsPanel() {
+  const toggle = $("findings-toggle-btn");
+  const panel = $("findings-panel");
+  const openErrors = sessionFindings.filter(
+    (finding) => finding.status === "open" && finding.severity === "error",
+  ).length;
+  toggle.hidden = sessionFindings.length === 0;
+  toggle.textContent = openErrors > 0 ? `Findings ${openErrors}` : "Findings";
+  panel.hidden = !findingsPanelOpen || sessionFindings.length === 0;
+  toggle.setAttribute("aria-expanded", String(!panel.hidden));
+  if (panel.hidden) return;
+
+  const visible = sessionFindings.filter(findingVisible);
+  $("findings-count").textContent = `Showing ${visible.length} of ${sessionFindings.length}`;
+  const list = $("findings-list");
+  list.replaceChildren();
+  if (!visible.length) {
+    const empty = document.createElement("p");
+    empty.className = "findings-empty";
+    empty.textContent = "Nothing matches these filters.";
+    list.append(empty);
+  }
+  for (const [source, bySource] of groupFindings(visible, (finding) => finding.source)) {
+    const group = document.createElement("section");
+    group.className = "findings-group";
+    const title = document.createElement("h3");
+    title.className = "findings-group-title";
+    title.textContent = `${FINDING_SOURCE_LABELS[source] || source} (${bySource.length})`;
+    group.append(title);
+    for (const [path, byFile] of groupFindings(bySource, (finding) => finding.range?.path || "")) {
+      const file = document.createElement("div");
+      file.className = "findings-file";
+      const label = document.createElement("div");
+      label.className = "findings-file-path";
+      label.textContent = path || "No location";
+      if (path) label.title = path;
+      file.append(label, ...byFile.map(findingRow));
+      group.append(file);
+    }
+    list.append(group);
+  }
+  wireFileReferences(list, repo());
+
+  const fix = $("findings-fix-btn");
+  fix.disabled = findingsSelection.size === 0 || chatSubmitting;
+  fix.textContent = findingsSelection.size
+    ? `Fix selected (${findingsSelection.size})`
+    : "Fix selected";
+}
+
+function findingRow(finding) {
+  const row = document.createElement("div");
+  row.className = "finding-row";
+  row.dataset.findingId = finding.id;
+  row.dataset.status = finding.status;
+
+  const select = document.createElement("input");
+  select.type = "checkbox";
+  select.className = "finding-select";
+  select.checked = findingsSelection.has(finding.id);
+  // Only an open finding can be repaired (spec 22 `context.md` §15).
+  select.disabled = finding.status !== "open";
+  select.setAttribute("aria-label", `Select: ${finding.summary}`);
+  select.addEventListener("change", () => {
+    if (select.checked) findingsSelection.add(finding.id);
+    else findingsSelection.delete(finding.id);
+    renderFindingsPanel();
+  });
+
+  const body = document.createElement("div");
+  body.className = "finding-body";
+  const headline = document.createElement("div");
+  headline.className = "finding-headline";
+  const severity = document.createElement("span");
+  severity.className = `finding-severity finding-severity-${finding.severity}`;
+  severity.textContent = finding.severity;
+  const summary = document.createElement("span");
+  summary.className = "finding-summary";
+  summary.textContent = finding.summary;
+  headline.append(severity, summary);
+  if (finding.code) {
+    const code = document.createElement("code");
+    code.className = "finding-code";
+    code.textContent = finding.code;
+    headline.append(code);
+  }
+  body.append(headline);
+
+  if (finding.range) {
+    // The element spec 05's `/api/render-markdown` emits, wired by
+    // `wireFileReferences`: no second navigation path (§5.5).
+    const { path, startLine, startColumn } = finding.range;
+    const location = document.createElement("button");
+    location.type = "button";
+    location.className = "file-reference finding-location";
+    location.dataset.path = path;
+    location.dataset.line = String(startLine);
+    if (startColumn) location.dataset.col = String(startColumn);
+    location.textContent = `${path}:${startLine}${startColumn ? `:${startColumn}` : ""}`;
+    location.title = location.textContent;
+    body.append(location);
+  }
+
+  const note = FINDING_STATUS_NOTES[finding.status];
+  if (note) {
+    const text = document.createElement("p");
+    text.className = "finding-note";
+    text.textContent = note;
+    body.append(text);
+  }
+
+  const footer = document.createElement("div");
+  footer.className = "finding-footer";
+  let details = null;
+  if (finding.details) {
+    details = document.createElement("pre");
+    details.className = "finding-details";
+    details.textContent = finding.details;
+    footer.append(createDisclosure("Details", details));
+  }
+  const action =
+    finding.status === "dismissed"
+      ? { label: "Restore", status: "open" }
+      : finding.status === "fixed"
+        ? null
+        : { label: "Dismiss", status: "dismissed" };
+  if (action) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn-sm btn-quiet";
+    button.textContent = action.label;
+    button.addEventListener("click", () => setFindingStatus(finding.id, action.status));
+    footer.append(button);
+  }
+  // §7: the expanded content sits above the footer it is paired with.
+  if (details) body.append(details);
+  if (footer.childElementCount) body.append(footer);
+
+  row.append(select, body);
+  return row;
+}
+
+async function setFindingStatus(findingId, status) {
+  try {
+    const payload = await api(
+      "/api/finding-status",
+      form({ repo: requireRepo(), session_id: currentSessionId, finding_id: findingId, status }),
+    );
+    sessionFindings = payload.findings || [];
+    findingsSelection.delete(findingId);
+    renderFindingsPanel();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function fixSelectedFindings() {
+  if (chatSubmitting) {
+    toast("A turn is already running");
+    return;
+  }
+  const ids = [...findingsSelection];
+  if (!ids.length) return;
+  try {
+    const payload = await api(
+      "/api/findings-repair",
+      form({ repo: requireRepo(), session_id: currentSessionId, finding_ids: ids.join(",") }),
+    );
+    const excluded = payload.request?.excluded || [];
+    if (excluded.length) {
+      toast(`Left out ${excluded.length}: ${excluded.map((entry) => entry.reason).join(", ")}`);
+    }
+    // Nothing left to repair: the server built no prompt (§15). Redraw, so
+    // the panel shows why.
+    if (!payload.prompt) {
+      await refreshFindings();
+      return;
+    }
+    findingsSelection.clear();
+    renderFindingsPanel();
+    await sendChatPrompt({ prompt: payload.prompt, restorePrompt: false, agentic: true });
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
 function renderProjectList() {
   const list = $("project-list");
   list.innerHTML = "";
@@ -5559,6 +5833,7 @@ function createPlanReview(proposal, proposalRepo) {
         : "Plan approved — see the assistant's answer above."
       : "Plan declined — see the assistant's answer above.";
     await loadSessions(currentSessionId, false);
+    await refreshFindings();
   }
 
   approveButton.addEventListener("click", async () => {
@@ -6059,6 +6334,7 @@ function createCommandApprovalPreview(
         : "Command rejected. The turn that proposed it ended with the crash, so nothing continues.";
       if (onResolved) await onResolved(approved);
       await loadSessions(currentSessionId, false);
+      await refreshFindings();
       return;
     }
 
@@ -6124,6 +6400,7 @@ function createCommandApprovalPreview(
         : "Command approved — see the assistant's answer above.";
     }
     await loadSessions(currentSessionId, false);
+    await refreshFindings();
   }
 
   // Re-enable after a failure so the user can retry or pick a different
@@ -6219,6 +6496,7 @@ async function loadSession(sessionId) {
   loadPinnedContextFiles(currentSessionId);
   await loadSessionCheckpoints(currentSessionId);
   renderMessages(payload.messages, payload.tasks || []);
+  await refreshFindings();
   // After the conversation, because `renderMessages` clears the log and the
   // cards sit above what it renders.
   await renderRecoveryPrompts(currentSessionId);
@@ -6383,6 +6661,19 @@ $("terminal-toggle-btn").addEventListener("click", () => {
   setTerminalOpen(!terminalOpen);
 });
 
+$("findings-toggle-btn").addEventListener("click", () => {
+  findingsPanelOpen = !findingsPanelOpen;
+  renderFindingsPanel();
+});
+$("findings-close-btn").addEventListener("click", () => {
+  findingsPanelOpen = false;
+  renderFindingsPanel();
+  $("findings-toggle-btn").focus();
+});
+$("findings-severity-filter").addEventListener("change", renderFindingsPanel);
+$("findings-status-filter").addEventListener("change", renderFindingsPanel);
+$("findings-fix-btn").addEventListener("click", () => void fixSelectedFindings());
+
 $("session-search-btn").addEventListener("click", () => {
   toggleSessionSearch();
 });
@@ -6518,6 +6809,8 @@ function setComposerBusy(busy) {
   button.setAttribute("aria-label", busy ? "Stop generating" : "Send message");
   // Deliberately left enabled while busy: it is the Stop control now.
   button.disabled = false;
+  // "Fix selected" follows `chatSubmitting`, which callers set before this.
+  renderFindingsPanel();
 }
 
 // Sizes the composer to its content. The floor and the cap both live in CSS
@@ -6564,7 +6857,11 @@ async function sendChatPrompt(options = {}) {
     // the log above, and leaving it in the box makes it look unsent.
     $("chat-prompt").value = "";
     autoGrowPrompt();
-    if (looksLikeEditRequest(prompt)) {
+    // A scoped repair from the findings panel needs the agentic turn, which
+    // reads, edits and re-runs. Its text ("Fix the 2 findings… error…") would
+    // otherwise match the edit heuristic and go to the one-shot patch flow
+    // (spec 22 `context.md` §17).
+    if (!options.agentic && looksLikeEditRequest(prompt)) {
       await proposePatchFromChat(prompt, assistantMessage);
       dismissContextChips();
       return;
@@ -6648,6 +6945,7 @@ async function sendChatPrompt(options = {}) {
     );
     if (checkpoint) markMessageRewindable(userMessage, checkpoint);
     await loadSessions(currentSessionId, false);
+    await refreshFindings();
   } catch (error) {
     // A stop is not a failure. Without this every Stop would toast "Failed"
     // and write an error into the bubble the user just chose to keep.
@@ -6656,6 +6954,7 @@ async function sendChatPrompt(options = {}) {
       setChatStatus("Stopped", "warn");
       if (restoreSubmittedPrompt) restorePrompt(prompt);
       await loadSessions(currentSessionId, false);
+      await refreshFindings();
     } else {
       if (indicator) indicator.finish("failed");
       setChatStatus("Failed", "error");

@@ -641,6 +641,109 @@
     </section>
 
     <section class="sg-section">
+      <h2>Findings panel</h2>
+      <p class="sg-hint">
+        A session dock between the chat log and the composer, opened from a
+        <em>Findings n</em> toggle that is hidden while the session has none (spec 22). Grouped by
+        source, then file; file paths truncate from the left. Only an open finding can be
+        selected. A stale one keeps a disabled checkbox and says why. One filled action,
+        <em>Fix selected (n)</em>; Dismiss and Restore are quiet. In the app the panel is capped at
+        <code>min(320px, 36vh)</code> and its list scrolls; the cap is lifted here so both rows show.
+      </p>
+      <div class="sg-card" style="padding: 0; overflow: hidden">
+        <section class="findings-panel" aria-label="Findings" style="max-height: none">
+          <div class="findings-header">
+            <strong>Findings</strong>
+            <span class="findings-count">Showing 2 of 5</span>
+            <select class="mode-select" aria-label="Severity filter">
+              <option>Errors and warnings</option>
+            </select>
+            <select class="mode-select" aria-label="Status filter">
+              <option>Open and stale</option>
+            </select>
+            <button class="btn-icon" type="button" aria-label="Hide findings">×</button>
+          </div>
+          <div class="findings-list">
+            <section class="findings-group">
+              <h3 class="findings-group-title">Compiler (1)</h3>
+              <div class="findings-file">
+                <div class="findings-file-path" title="crates/core/src/upload.rs">
+                  crates/core/src/upload.rs
+                </div>
+                <div class="finding-row" data-status="open">
+                  <input
+                    type="checkbox"
+                    class="finding-select"
+                    aria-label="Select: mismatched types"
+                    checked
+                  />
+                  <div class="finding-body">
+                    <div class="finding-headline">
+                      <span class="finding-severity finding-severity-error">error</span>
+                      <span class="finding-summary">mismatched types</span>
+                      <code class="finding-code">E0308</code>
+                    </div>
+                    <button type="button" class="file-reference finding-location">
+                      crates/core/src/upload.rs:3:5
+                    </button>
+                    <pre class="finding-details">
+error[E0308]: mismatched types
+ --> crates/core/src/upload.rs:3:5
+  |
+3 |     with_retry(send)
+  |     ^^^^^^^^^^^^^^^^ expected `Result&lt;(), Error&gt;`, found `()`</pre
+                    >
+                    <div class="finding-footer">
+                      <button type="button" class="disclosure" aria-expanded="true">
+                        <span class="disclosure-caret" aria-hidden="true"></span> Details
+                      </button>
+                      <button type="button" class="btn-sm btn-quiet">Dismiss</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+            <section class="findings-group">
+              <h3 class="findings-group-title">Lint (1)</h3>
+              <div class="findings-file">
+                <div class="findings-file-path" title="crates/net/src/retry.rs">
+                  crates/net/src/retry.rs
+                </div>
+                <div class="finding-row" data-status="stale">
+                  <input
+                    type="checkbox"
+                    class="finding-select"
+                    aria-label="Select: unneeded return statement"
+                    disabled
+                  />
+                  <div class="finding-body">
+                    <div class="finding-headline">
+                      <span class="finding-severity finding-severity-warning">warning</span>
+                      <span class="finding-summary">unneeded `return` statement</span>
+                      <code class="finding-code">clippy::needless_return</code>
+                    </div>
+                    <button type="button" class="file-reference finding-location">
+                      crates/net/src/retry.rs:2:5
+                    </button>
+                    <p class="finding-note">
+                      Its file changed after the check ran. Re-run the check to repair it.
+                    </p>
+                    <div class="finding-footer">
+                      <button type="button" class="btn-sm btn-quiet">Dismiss</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+          <div class="findings-footer">
+            <button class="btn-primary btn-sm" type="button">Fix selected (1)</button>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <section class="sg-section">
       <h2>Disclosure</h2>
       <p class="sg-hint">
         One implementation, two callers. Collapsed by default and never remembered; the label
