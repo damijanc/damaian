@@ -818,3 +818,41 @@ carries findings, not raw output. The outline left the following open.
 - **Dismissal is not suppression** (§5.5). That holds by construction: a later
   check mints new ids. It is still pinned end to end, through two real turns in
   one session.
+
+## 16. The shell API: decisions made while planning Task 10 (2026-10-04)
+
+- **Three endpoints, following `desktop-shell`'s existing conventions**
+  (`crates/desktop-shell/src/lib.rs`): `GET` reads its parameters from the query
+  string, `POST` takes `application/x-www-form-urlencoded`, and responses are
+  JSON. The `session_id`/`repo` parameter names follow `/api/checkpoints`,
+  and the reject-never-default rule follows spec 20's `/api/session-mode`.
+  - `GET /api/findings?repo=…&session_id=…` returns `{"findings":[…]}`.
+  - `POST /api/finding-status` (`repo`, `session_id`, `finding_id`,
+    `status`) returns the refreshed `{"findings":[…]}`, so the panel redraws
+    from what was stored.
+  - `POST /api/findings-repair` (`repo`, `session_id`, `finding_ids`) returns
+    `{"request": RepairRequest, "prompt": string | null}`.
+- **Every endpoint takes `repo`.** `read_findings` derives `Stale` against the
+  repository's files (§13.2), and a session stores only a `repository_id`. The
+  shell already resolves a root that way for checkpoints and rewind
+  (`engine_for_repo` plus `repository_id_for_path`). **A session whose
+  `repository_id` does not match `repo` is refused.** Reading it against
+  another checkout would mark findings stale or open on the wrong files.
+- **`finding_ids` is one comma-separated form field.** `parse_form` keeps a
+  single value per key, and ids from `create_id` never contain a comma.
+  Blank entries are ignored.
+- **The status string is parsed by a new `FindingStatus::parse`**, which
+  follows `SessionMode::parse` (spec 20 Task 8 chose inherent `parse` over
+  `FromStr`). It accepts all four serialised forms, `stale` included, so that
+  `set_finding_status` stays the single place that refuses `stale` (§13.2). An
+  unknown string is an error and is never defaulted.
+- **The repair endpoint marks nothing.** It builds the request from
+  `read_findings` at that moment, so it is current (§15), and returns
+  `render()`. The panel (Task 11) sends that prompt through the existing chat
+  path. When `render()` is `None`, `prompt` is JSON `null`, and the panel
+  shows the exclusions instead.
+- **Errors use the shell's one error path:** `Err(String)`, which `run_server`
+  answers as a 500 with `{"error": …}`. There is no 4xx path (spec 20 Task 8).
+- **The tests are inline in `lib.rs`'s test module.** They use spec 20 Task 8's
+  `serve_for_test` and `send_for_test`, and `isolated_data_dir`, which points
+  every engine in the test binary at a throwaway data directory.

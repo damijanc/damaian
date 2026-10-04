@@ -19,7 +19,7 @@ decisions it left open in [`context.md`](context.md)
 | 7 · Persistence, derived status, `Evidence::Findings` | Done 2026-10-03 | Split on 2026-10-02 from the old "Recording, persistence, staleness" task (`context.md` §13.1) and planned in full. Landed as sketched, with only rustfmt changes. The tests and implementation were extracted from this file's line ranges. `session.rs` gains `record_finding`, `set_finding_status` and `read_findings` after `read_session_web_diagnostics`, and the free functions `replay_findings` and `finding_is_stale` before `parse_session_log`. The `let`-chains compiled as written. `plan.rs` gains `Evidence::Findings` and its two match arms. rustfmt turned the `status_from_evidence` arm into a block. Two comments in `plan.rs` were reworded beyond the plan because the new variant made them stale: the `#[non_exhaustive]` note, which said `Findings` "joins this enum when spec 22 exists", and the "Neither has a failure mode" comment, which now covers three variants. Step 1's two task-number comments were updated. Before the implementation, the session tests failed to compile (`E0599` on all three methods). After it, `test(session::tests) + binary(plan) + test(finding::)` passed 181/181. That includes the 15 new session tests (`session::tests` is now 23) and the 4 new plan tests (`binary(plan)` is now 51). All seven mutations failed only their named test. Mutations 1–6 ran with `--lib -E 'test(session::tests)'`, and 7 ran with `binary(plan)`. (1) Checking every status failed `a_dismissed_finding_is_not_re_marked_stale`. (2) Missing hash as stale failed `a_finding_without_a_recorded_hash_is_never_stale`. (3) `Err(_) => false` failed `a_deleted_file_makes_its_finding_stale`. (4) No `Stale` refusal failed `setting_stale_directly_is_refused_…`. (5) No unknown-id check failed `a_status_change_for_an_unknown_finding_…`. (6) `parsed_events(content).0` failed `a_rewind_takes_the_findings_…`. (7) `*failing > 0` failed `findings_evidence_alone_does_not_block_a_step`. No other crate needed a change. Scoped fmt, clippy `-p workspace-engine`, the scoped tests and typos are clean. |
 | 8 · Record findings where checks run (`chat.rs`) | Done 2026-10-04 | New on 2026-10-02 from the Task 7 split, and planned in full on 2026-10-04 (`context.md` §13.4, §14). Landed as sketched, with only rustfmt changes, in a separate worktree, with no other spec editing `chat.rs`. `tests/finding_recording.rs` was extracted from this file's line ranges. `workspace_engine::hash` and `::web_diagnostics` resolved as written, so no re-export was needed. The `chat.rs` line numbers in Step 5 still matched. `command_findings` assigned inside the arm passed borrowck, so `ActionOutcome` is unchanged. Two deviations, both cosmetic. The `use` is a top-level `crate::finding::{…}` import, and `record_command_findings` takes `&CommandExecution` through the file's existing import. The `command_findings` declaration also gained a two-line comment saying why it is a local. `repository_files` uses `config.ignore_patterns` as planned. `Config::default()` already fills it with the defaults that `indexer.rs` falls back to, so nothing is lost. Before the implementation: as Step 4 predicts, four `finding_recording` tests and the changed `plan_turn` assertion failed at runtime, each on "nothing recorded" after its setup passed. The approved test had got past its approval assertion. `a_passing_sandbox_command_records_nothing` passed. After: the Step 7 selection passed 250/250 (5 `finding_recording`, 19 `plan_turn`, 51 `plan`, 107 `finding::`, 23 `session::tests`, 45 `chat::`). All six mutations failed exactly their named tests, with `binary(finding_recording) + binary(plan_turn)`. (1) No sandbox recording failed `a_failed_sandbox_command_…`, `the_failed_step_carries_…` and the `plan_turn` assertion, because no findings means no evidence. (2) No approval recording failed only `an_approved_command_…`, on `[]`. (3) No `record_web_findings` failed only `a_browser_console_error_…`, on `[]`. (4) `None => finding` (keep every range) failed only `an_approved_command_…`, on "src/gone.rs is not in the repository". (5) No `command_findings.take()` push failed `the_failed_step_carries_…` and the `plan_turn` assertion. (6) An empty file list failed only `a_browser_console_error_…`, on the missing range. **Environment, not code:** in mutation 1's run, `an_approved_command_…` also failed. Its `./cargo check` reported `timed out` after 600.28s. It passed in under a second in every other run, and mutation 1 does not touch that path. The next run's `--list` of the relinked test binary sat at `_dyld_start + 0` for about 5 minutes while `XprotectService` was busy. So macOS XProtect can hold a newly written executable at launch, and this test writes one (`./cargo`) on every run. The test is unchanged, and this is recorded as an observation. Scoped fmt, clippy `-p workspace-engine`, `node --check`, `lint:web` and typos are clean. `lint:web`'s one info is pre-existing, in `scripts/check-spec-status.mjs`. The eval harness deterministic tier passed 16/16. Metrics match `evals/baseline.json` except tokens, 101950 against 101963 (not investigated), and latency, median 57 against 44 ms and p90 128 against 109 ms, measured while XProtect was loading the machine. The baseline was not regenerated. |
 | 9 · Dismissal and the scoped repair request | Done 2026-10-04 | Planned in full on 2026-10-04 (`context.md` §15). Only `Open` findings are repaired; stale, dismissed, fixed and unknown ids are each excluded with a reason. Landed as sketched. `repair.rs` was extracted from this file's line ranges and is byte-identical to `rustfmt` of the sketch, apart from one deviation: clippy 1.98's `cloned_ref_to_slice_refs` rejected four single-element `&[x.clone()]` arguments in the unit tests, so they are now `std::slice::from_ref(&x)`. `finding.rs` declares `mod repair;` after `mod browser;` and re-exports `Exclusion`, `ExclusionReason` and `RepairRequest`. `finding_recording.rs` gains the imports, `ask_in` and the two tests. No other file changed. Before the implementation the tests failed to compile (`E0432` on the re-export, then `E0433`/`E0425`/`E0422` on the missing types). After it, `test(finding::) + binary(finding_recording)` passed 123/123: 107 `finding::` unchanged, 9 `repair::tests`, and 7 `finding_recording` (5 unchanged + 2 new). All six mutations failed their named tests. Mutations 1, 3–6 ran with `--lib -E 'test(finding::repair)'`. (1) Keeping `Stale` failed `a_stale_finding_is_excluded_…`, plus `nothing_left_to_repair_…`, the exact-render test and `the_request_serialises_…`. (2) Keeping `Dismissed` failed `dismissed_and_fixed_findings_are_excluded_…` (unit) and `dismissing_a_finding_does_not_suppress_…` (integration). (3) Iterating `selected_ids` failed `open_findings_are_kept_in_session_order`, and also `a_duplicate_selection_is_counted_once`, because a repeated id is kept twice. (4) Dropping unknown ids failed `an_unknown_id_is_excluded_…` and the duplicate test. (5) Removing `noted`, the unknown loop's only dedup, failed only the duplicate test. (6) Rendering when only exclusions remain failed only `nothing_left_to_repair_renders_nothing`. **Environment, not code:** a run over the whole `-p workspace-engine` relinks all 21 integration binaries. Mutation 2's first attempt, scoped that way, was killed at 30 minutes with no output, behind XProtect launch scans (see Task 8's row). Rerun with `--lib` and `--test finding_recording`, it took 105 s wall-clock against 14 s of CPU. Step 5 and Step 7's test runs used the same `--lib --test finding_recording` targets with the plan's filter. That selects the same 123 tests without relinking binaries the filter never runs. Scoped fmt, clippy `-p workspace-engine` and typos are clean. |
-| 10 · Shell API | Not started | |
+| 10 · Shell API | Not started | Planned in full on 2026-10-04 (`context.md` §16). Three endpoints. Each takes `repo`, because staleness is derived against the repository's files, and refuses a session from another repository. `FindingStatus::parse` accepts `stale`, so the store stays the one place that refuses it. The plan was **not** compiled before handover: `desktop-shell` needs the shared `target/`, and a run there waits behind XProtect scans (see Tasks 8 and 9). The implementer's test-first steps are the first compile. |
 | 11 · Findings panel | Not started | |
 | 12 · Docs, acceptance criteria, close the spec | Not started | |
 
@@ -5825,12 +5825,500 @@ request, and Task 11 sends it as a chat message.
 
 ## Task 10: Shell API
 
-**Files:** `crates/desktop-shell/src/lib.rs`.
+**Requirements:** 3 (listing, dismissal, and asking for a fix, over the wire).
+**Files:**
+- `crates/desktop-shell/src/lib.rs`: three routes, two helpers, and tests in
+  its existing `mod tests`;
+- `crates/workspace-engine/src/finding.rs`: `FindingStatus::parse` and one
+  unit test.
 
-`GET /api/findings?sessionId=`, `POST /api/finding-status` (dismiss), and
-`POST /api/findings-repair`, which returns the rendered request that the
-panel sends as a chat message. Follow spec 20 Task 8's `serve_for_test`
-pattern for the HTTP tests.
+Planned in full on 2026-10-04.
+
+**Read `context.md` §16 first.** It fixes:
+- the three endpoints and their shapes;
+- why every endpoint takes `repo` and refuses a session from another
+  repository;
+- the comma-separated `finding_ids`;
+- why `FindingStatus::parse` accepts `stale`, so the store stays the one
+  place that refuses it.
+
+This task adds no UI. That is Task 11.
+
+**Test runs on this machine.** Use `--lib` and `--test`, never a bare
+`-p <crate>`. A run that relinks every integration binary waits behind
+XProtect launch scans (Task 8's and Task 9's rows). For `desktop-shell`,
+whose tests are inline, that means `--lib`.
+
+**Interfaces:**
+- Consumes:
+  - `SessionStore::read_findings`, `set_finding_status` and `read_session`;
+  - `RepairRequest::select` / `render`;
+  - `engine_for_repo`, `required_param`, `required_form`, `parse_form`,
+    `write_response` and `escape_json` (`lib.rs`);
+  - `indexer.repository_id_for_path`.
+- Produces, for Task 11:
+  - `GET /api/findings?repo=&session_id=` returns `{"findings":[Finding…]}`,
+    in record order and with derived `status`.
+  - `POST /api/finding-status`, with form fields `repo`, `session_id`,
+    `finding_id` and `status` (`open`|`dismissed`|`fixed`), returns the
+    refreshed `{"findings":[…]}`.
+  - `POST /api/findings-repair`, with form fields `repo`, `session_id` and
+    `finding_ids` (comma-separated), returns
+    `{"request":{"findings":[…],"excluded":[{"findingId","reason"}]},"prompt":string|null}`.
+  - `FindingStatus::parse(&str) -> Option<FindingStatus>`.
+
+- [x] **Step 1: Write the failing `FindingStatus::parse` test**
+
+  Append to `finding.rs`'s `mod tests`:
+
+  ```rust
+      /// The shell's status parser (`context.md` §16). It accepts `stale`, so
+      /// `set_finding_status` stays the one place that refuses it.
+      #[test]
+      fn finding_status_parses_its_serialised_forms_only() {
+          use FindingStatus::*;
+          for status in [Open, Dismissed, Fixed, Stale] {
+              let text = serde_json::to_value(status).unwrap();
+              assert_eq!(FindingStatus::parse(text.as_str().unwrap()), Some(status));
+          }
+          for text in ["sideways", "Open", "", " open"] {
+              assert_eq!(FindingStatus::parse(text), None, "{text:?}");
+          }
+      }
+  ```
+
+- [x] **Step 2: Implement `FindingStatus::parse`**
+
+  After `enum FindingStatus` in `finding.rs`:
+
+  ```rust
+  impl FindingStatus {
+      /// The serialised form back to a status. Exact and case-sensitive, like
+      /// `SessionMode::parse`. An unknown string is `None`, never a default.
+      pub fn parse(value: &str) -> Option<Self> {
+          match value {
+              "open" => Some(Self::Open),
+              "dismissed" => Some(Self::Dismissed),
+              "fixed" => Some(Self::Fixed),
+              "stale" => Some(Self::Stale),
+              _ => None,
+          }
+      }
+  }
+  ```
+
+  Run: `cargo nextest run -p workspace-engine --lib -E 'test(finding::tests)'`
+  Expected: all `finding::tests` pass, including the new one.
+
+- [x] **Step 3: Write the failing shell tests**
+
+  In `crates/desktop-shell/src/lib.rs`'s `mod tests`, add to the
+  `workspace_engine` import list:
+  `finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange}` and
+  `SecretScanner`. Then add these helpers and tests after
+  `post_session_mode_rejects_an_unknown_mode_string`:
+
+  ```rust
+      /// A repository with one source file, an engine for it, and a session
+      /// that belongs to it.
+      fn findings_fixture(name: &str) -> (PathBuf, WorkspaceEngine, String) {
+          isolated_data_dir();
+          let repo = std::env::temp_dir().join(format!(
+              "damaian-shell-findings-{name}-{}",
+              SystemTime::now()
+                  .duration_since(UNIX_EPOCH)
+                  .unwrap()
+                  .as_nanos()
+          ));
+          fs::create_dir_all(repo.join("src")).expect("repository");
+          fs::write(repo.join("src/lib.rs"), "fn a() {}\n").expect("source file");
+          let engine = engine_for_repo(repo.to_str().unwrap()).expect("engine");
+          let repository_id = engine
+              .indexer
+              .repository_id_for_path(&repo)
+              .expect("repository id");
+          let session_id = engine
+              .session_store
+              .create_session(&repository_id, "Findings")
+              .expect("session")
+              .id;
+          (repo, engine, session_id)
+      }
+
+      /// Records a finding. With a path, it is ranged and hashed the way
+      /// recording does it (spec 22 Task 8), so editing the file makes it stale.
+      fn record_finding_for_test(
+          engine: &WorkspaceEngine,
+          repo: &std::path::Path,
+          session_id: &str,
+          summary: &str,
+          path: Option<&str>,
+      ) -> String {
+          let mut finding = Finding::new(
+              FindingDraft {
+                  source: FindingSource::Compiler,
+                  severity: Severity::Error,
+                  summary: summary.to_string(),
+                  details: None,
+                  range: path.map(|path| SourceRange {
+                      path: path.to_string(),
+                      start_line: 1,
+                      start_column: None,
+                      end_line: None,
+                      end_column: None,
+                  }),
+                  code: None,
+              },
+              &SecretScanner::default(),
+          );
+          if let Some(path) = path {
+              finding = finding
+                  .with_file_hash(workspace_engine::hash::file_hash(repo.join(path)).unwrap());
+          }
+          engine
+              .session_store
+              .record_finding(session_id, &finding)
+              .expect("record finding");
+          finding.id().to_string()
+      }
+
+      fn get_findings_for_test(
+          port: u16,
+          token: &str,
+          repo: &std::path::Path,
+          session_id: &str,
+      ) -> String {
+          send_for_test(
+              port,
+              format!(
+                  "GET /api/findings?repo={}&session_id={session_id} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-damaian-api-token: {token}\r\nconnection: close\r\n\r\n",
+                  repo.display()
+              ),
+          )
+      }
+
+      fn post_form_for_test(port: u16, token: &str, path: &str, body: &str) -> String {
+          send_for_test(
+              port,
+              format!(
+                  "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/x-www-form-urlencoded\r\nx-damaian-api-token: {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                  body.len()
+              ),
+          )
+      }
+
+      fn json_of(response: &str) -> serde_json::Value {
+          let body = response.split("\r\n\r\n").nth(1).expect("a body");
+          serde_json::from_str(body).expect("JSON body")
+      }
+
+      fn status_of(json: &serde_json::Value, id: &str) -> String {
+          json["findings"]
+              .as_array()
+              .expect("findings")
+              .iter()
+              .find(|finding| finding["id"] == id)
+              .unwrap_or_else(|| panic!("{id} missing from {json}"))["status"]
+              .as_str()
+              .unwrap()
+              .to_string()
+      }
+
+      /// Staleness is derived against `repo`'s files (spec 22 `context.md`
+      /// §16), so an edit shows up in the next GET.
+      #[test]
+      fn get_findings_returns_them_with_staleness_derived_against_the_repository() {
+          let (repo, engine, session_id) = findings_fixture("get");
+          let unranged = record_finding_for_test(&engine, &repo, &session_id, "no file", None);
+          let ranged =
+              record_finding_for_test(&engine, &repo, &session_id, "on a file", Some("src/lib.rs"));
+          fs::write(repo.join("src/lib.rs"), "fn a() { edited() }\n").unwrap();
+          let (port, token) = serve_for_test();
+
+          let response = get_findings_for_test(port, &token, &repo, &session_id);
+
+          assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+          let json = json_of(&response);
+          assert_eq!(json["findings"][0]["id"], unranged.as_str(), "record order");
+          assert_eq!(status_of(&json, &unranged), "open");
+          assert_eq!(status_of(&json, &ranged), "stale");
+      }
+
+      /// §16: reading a session against another checkout would judge
+      /// staleness on the wrong files.
+      #[test]
+      fn findings_endpoints_refuse_a_session_from_another_repository() {
+          let (repo, engine, _) = findings_fixture("other-repo");
+          let foreign = engine
+              .session_store
+              .create_session("repo_somewhere_else", "Foreign")
+              .unwrap()
+              .id;
+          let (port, token) = serve_for_test();
+
+          let response = get_findings_for_test(port, &token, &repo, &foreign);
+          assert!(!response.starts_with("HTTP/1.1 200"), "{response}");
+          assert!(response.contains("another repository"), "{response}");
+
+          let body = format!("repo={}&session_id={foreign}&finding_ids=x", repo.display());
+          let repair = post_form_for_test(port, &token, "/api/findings-repair", &body);
+          assert!(!repair.starts_with("HTTP/1.1 200"), "{repair}");
+      }
+
+      /// The follow-up GET proves the write persisted. An endpoint that only
+      /// echoed the request would pass the first assertion.
+      #[test]
+      fn post_finding_status_dismisses_and_a_later_get_shows_it() {
+          let (repo, engine, session_id) = findings_fixture("dismiss");
+          let id = record_finding_for_test(&engine, &repo, &session_id, "waved away", None);
+          let (port, token) = serve_for_test();
+
+          let body = format!(
+              "repo={}&session_id={session_id}&finding_id={id}&status=dismissed",
+              repo.display()
+          );
+          let changed = post_form_for_test(port, &token, "/api/finding-status", &body);
+          assert!(changed.starts_with("HTTP/1.1 200"), "{changed}");
+          assert_eq!(status_of(&json_of(&changed), &id), "dismissed");
+
+          let reread = get_findings_for_test(port, &token, &repo, &session_id);
+          assert_eq!(status_of(&json_of(&reread), &id), "dismissed");
+      }
+
+      /// Rejected, never defaulted (`/api/session-mode`'s rule), and `stale`
+      /// is refused by the store (spec 22 `context.md` §13.2).
+      #[test]
+      fn post_finding_status_rejects_an_unknown_status_and_refuses_stale() {
+          let (repo, engine, session_id) = findings_fixture("reject");
+          let id = record_finding_for_test(&engine, &repo, &session_id, "x", None);
+          let (port, token) = serve_for_test();
+
+          for status in ["sideways", "stale"] {
+              let body = format!(
+                  "repo={}&session_id={session_id}&finding_id={id}&status={status}",
+                  repo.display()
+              );
+              let rejected = post_form_for_test(port, &token, "/api/finding-status", &body);
+              assert!(!rejected.starts_with("HTTP/1.1 200"), "{status}: {rejected}");
+          }
+          let reread = get_findings_for_test(port, &token, &repo, &session_id);
+          assert_eq!(status_of(&json_of(&reread), &id), "open");
+      }
+
+      #[test]
+      fn post_findings_repair_returns_the_request_and_its_prompt() {
+          let (repo, engine, session_id) = findings_fixture("repair");
+          let open = record_finding_for_test(&engine, &repo, &session_id, "fix me", None);
+          let stale =
+              record_finding_for_test(&engine, &repo, &session_id, "moved", Some("src/lib.rs"));
+          fs::write(repo.join("src/lib.rs"), "fn a() { edited() }\n").unwrap();
+          let (port, token) = serve_for_test();
+
+          let body = format!(
+              "repo={}&session_id={session_id}&finding_ids={open},{stale}",
+              repo.display()
+          );
+          let response = post_form_for_test(port, &token, "/api/findings-repair", &body);
+
+          assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+          let json = json_of(&response);
+          assert_eq!(json["request"]["findings"][0]["id"], open.as_str());
+          assert_eq!(json["request"]["findings"].as_array().unwrap().len(), 1);
+          assert_eq!(json["request"]["excluded"][0]["findingId"], stale.as_str());
+          assert_eq!(json["request"]["excluded"][0]["reason"], "stale");
+          let prompt = json["prompt"].as_str().expect("a prompt");
+          assert!(prompt.contains(&format!("(finding {open})")), "{prompt}");
+          assert!(prompt.contains(&format!("- {stale}: stale")), "{prompt}");
+      }
+
+      /// spec 22 `context.md` §15: a prompt that fixes nothing is not sent.
+      #[test]
+      fn post_findings_repair_with_nothing_open_returns_a_null_prompt() {
+          let (repo, engine, session_id) = findings_fixture("repair-empty");
+          let id = record_finding_for_test(&engine, &repo, &session_id, "done", None);
+          engine
+              .session_store
+              .set_finding_status(&session_id, &id, workspace_engine::finding::FindingStatus::Fixed)
+              .unwrap();
+          let (port, token) = serve_for_test();
+
+          let body = format!("repo={}&session_id={session_id}&finding_ids={id}", repo.display());
+          let response = post_form_for_test(port, &token, "/api/findings-repair", &body);
+
+          assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+          let json = json_of(&response);
+          assert!(json["prompt"].is_null(), "{json}");
+          assert_eq!(json["request"]["excluded"][0]["reason"], "fixed");
+      }
+  ```
+
+  A repository path from `temp_dir()` holds only path-safe characters, so the
+  tests put it in the query and form unencoded. If the shell's `percent_decode`
+  ever rejects that, encode it in `get_findings_for_test` /
+  `post_form_for_test`.
+
+- [x] **Step 4: Run the tests and confirm they fail**
+
+  Run: `cargo nextest run -p desktop-shell --lib -E 'test(findings) + test(finding_status)'`
+  Expected: the six shell tests fail at runtime. The routes do not exist, so
+  each request gets the shell's catch-all `404 {"error":"not found"}` and the
+  `200` assertions fail. In the refusal test, the "another repository"
+  message is missing.
+
+- [x] **Step 5: Implement the routes**
+
+  Add `use workspace_engine::finding::{FindingStatus, RepairRequest};` near the
+  other `workspace_engine` imports at the top of `lib.rs`. Add these routes to
+  the request `match`, after `("POST", "/api/session-mode")`:
+
+  ```rust
+          // Spec 22 Task 10. Every findings route takes `repo`, because
+          // staleness is derived against the repository's files, and refuses
+          // a session from another repository (spec 22 `context.md` §16).
+          ("GET", "/api/findings") => {
+              let repo = required_param(&request, "repo")?;
+              let session_id = required_param(&request, "session_id")?;
+              let engine = engine_for_repo(&repo)?;
+              session_in_repository(&engine, &repo, &session_id)?;
+              let body = findings_json(&engine, &repo, &session_id)?;
+              write_response(stream, &request, 200, "application/json", &body)
+          }
+          ("POST", "/api/finding-status") => {
+              let form = parse_form(&request.body);
+              let repo = required_form(&form, "repo")?;
+              let session_id = required_form(&form, "session_id")?;
+              let finding_id = required_form(&form, "finding_id")?;
+              let requested = required_form(&form, "status")?;
+              // Rejected, never defaulted, as for `/api/session-mode`. `stale`
+              // parses, and the store refuses it (spec 22 `context.md` §13.2).
+              let status = FindingStatus::parse(&requested).ok_or_else(|| {
+                  format!("Unknown finding status: {requested}. Expected open, dismissed, or fixed.")
+              })?;
+              let engine = engine_for_repo(&repo)?;
+              session_in_repository(&engine, &repo, &session_id)?;
+              engine
+                  .session_store
+                  .set_finding_status(&session_id, &finding_id, status)
+                  .map_err(|error| error.to_string())?;
+              let body = findings_json(&engine, &repo, &session_id)?;
+              write_response(stream, &request, 200, "application/json", &body)
+          }
+          ("POST", "/api/findings-repair") => {
+              let form = parse_form(&request.body);
+              let repo = required_form(&form, "repo")?;
+              let session_id = required_form(&form, "session_id")?;
+              let selected: Vec<String> = required_form(&form, "finding_ids")?
+                  .split(',')
+                  .map(str::trim)
+                  .filter(|id| !id.is_empty())
+                  .map(str::to_string)
+                  .collect();
+              let engine = engine_for_repo(&repo)?;
+              session_in_repository(&engine, &repo, &session_id)?;
+              // Built from the findings as they are now, so an edit since the
+              // panel was drawn still makes its finding stale (§15).
+              let findings = engine
+                  .session_store
+                  .read_findings(&session_id, Path::new(&repo))
+                  .map_err(|error| error.to_string())?;
+              let repair = RepairRequest::select(&findings, &selected);
+              let repair_json = serde_json::to_string(&repair).map_err(|error| error.to_string())?;
+              let prompt = repair.render().map_or_else(
+                  || "null".to_string(),
+                  |text| format!("\"{}\"", escape_json(&text)),
+              );
+              write_response(
+                  stream,
+                  &request,
+                  200,
+                  "application/json",
+                  &format!("{{\"request\":{repair_json},\"prompt\":{prompt}}}"),
+              )
+          }
+  ```
+
+  Add these helpers next to `session_json`:
+
+  ```rust
+  /// The session, when it exists and belongs to `repo`. A finding's staleness
+  /// is judged against `repo`'s files, so a session from another checkout must
+  /// not be read against this one (spec 22 `context.md` §16).
+  fn session_in_repository(
+      engine: &WorkspaceEngine,
+      repo: &str,
+      session_id: &str,
+  ) -> Result<Session, String> {
+      let session = engine
+          .session_store
+          .read_session(session_id)
+          .map_err(|error| error.to_string())?
+          .ok_or_else(|| format!("Unknown session: {session_id}"))?;
+      let repository_id = engine
+          .indexer
+          .repository_id_for_path(repo)
+          .map_err(|error| error.to_string())?;
+      if session.repository_id != repository_id {
+          return Err(format!("Session {session_id} belongs to another repository"));
+      }
+      Ok(session)
+  }
+
+  /// `{"findings":[…]}` in record order, with status derived against `repo`.
+  fn findings_json(engine: &WorkspaceEngine, repo: &str, session_id: &str) -> Result<String, String> {
+      let findings = engine
+          .session_store
+          .read_findings(session_id, Path::new(repo))
+          .map_err(|error| error.to_string())?;
+      let findings = serde_json::to_string(&findings).map_err(|error| error.to_string())?;
+      Ok(format!("{{\"findings\":{findings}}}"))
+  }
+  ```
+
+  `escape_json` (`lib.rs`) escapes quotes, backslashes, `\n`, `\r`, `\t` and
+  every other control character, so the rendered prompt's newlines and
+  summary text are safe in the JSON string.
+
+- [ ] **Step 6: Run the tests and confirm they pass**
+
+  Run: `cargo nextest run -p desktop-shell --lib -E 'test(findings) + test(finding_status) + test(session_mode) + test(session_json)'`
+  and `cargo nextest run -p workspace-engine --lib -E 'test(finding::)'`.
+  Expected: the six new shell tests and the new `finding::tests` test pass,
+  and spec 20 Task 8's session-mode tests are unchanged. Count them.
+
+- [ ] **Step 7: Mutation-test the endpoints**
+
+  Apply each change on its own, confirm the named test fails, then revert it:
+
+  1. Skip `session_in_repository` in `GET /api/findings`.
+     `findings_endpoints_refuse_a_session_from_another_repository` must fail.
+  2. Make an unknown status default to `Dismissed`.
+     `post_finding_status_rejects_an_unknown_status_…` must fail on
+     `sideways`.
+  3. Return the request's status without calling `set_finding_status`, by
+     building the JSON from `read_findings` with the status overwritten.
+     `post_finding_status_dismisses_and_a_later_get_shows_it` must fail on the
+     reread.
+  4. Always return a string `prompt`, using `""` for `None`.
+     `post_findings_repair_with_nothing_open_…` must fail.
+  5. Pass `Path::new("")` as the root in `findings_json`.
+     `get_findings_returns_them_with_staleness_…` must fail.
+
+  Record all five results in the progress row.
+
+- [ ] **Step 8: Scoped checks**
+
+  Run `cargo fmt --all` first. Then:
+
+  ```bash
+  cargo fmt --all -- --check
+  cargo clippy -p desktop-shell -p workspace-engine --all-targets --locked -- -D warnings
+  cargo nextest run -p desktop-shell --lib -E 'test(findings) + test(finding_status) + test(session_mode) + test(session_json)'
+  cargo nextest run -p workspace-engine --lib -E 'test(finding::)'
+  typos docs/specs/22_findings_model_and_panel crates/desktop-shell/src/lib.rs crates/workspace-engine/src/finding.rs
+  ```
+
+- [ ] **Step 9: Update this file's Task 10 row, then show the change and the
+  check results and ask before committing**
 
 ## Task 11: Findings panel
 
