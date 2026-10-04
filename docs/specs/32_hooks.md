@@ -7,7 +7,7 @@ Work Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#17](17_durable_task_state_and_crash_recovery/proposal.md)
 (durable state) — built; [#22](22_findings_model_and_panel/proposal.md) (hook findings)
-— **not built**; [#31](31_permission_profiles.md) (the profile hooks cannot
+— **not built**; [#31](31_permission_profiles/proposal.md) (the profile hooks cannot
 widen) — **not built**. Everything else named below is a cross-reference, not a
 prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
@@ -21,7 +21,7 @@ specs: [`10_persistent_command_approval.md`](10_persistent_command_approval.md),
 [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md),
 [`22_findings_model_and_panel/proposal.md`](22_findings_model_and_panel/proposal.md) (hooks return
 `Finding`s), [`23_verification_loop.md`](23_verification_loop.md),
-[`31_permission_profiles.md`](31_permission_profiles.md) (the profile a hook
+[`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) (the profile a hook
 cannot widen).
 
 ## 1. Motivation
@@ -75,7 +75,7 @@ be the phase's required work rather than its risky work.
 - **`AuditLog::record`** (`audit.rs:42`) redacts every field on the way in and is
   the mechanism to reuse rather than extend.
 - **Config layering and its scope trust boundary** are defined in
-  [spec 31](31_permission_profiles.md) §5.2-5.3. Hook configuration is subject to
+  [spec 31](31_permission_profiles/proposal.md) §5.2-5.3. Hook configuration is subject to
   it.
 - **The output truncation and redaction path** for command output already exists
   and is what hook output should reuse.
@@ -294,11 +294,11 @@ permission — is audited as a widening attempt, per the roadmap's acceptance
 criterion, and treated as malformed output under §5.5.
 
 Hook configuration is capability configuration, so it lives under
-[spec 31](31_permission_profiles.md) §5.1's capability keys: a repository cannot
+[spec 31](31_permission_profiles/proposal.md) §5.1's capability keys: a repository cannot
 add a hook that the user has not reviewed, and it cannot disable a user's hook.
 A repository *can* add a hook once reviewed — which is a useful thing for a
 repository to ship, and is exactly why the review gate in
-[spec 31](31_permission_profiles.md) §5.3 is itemised rather than global.
+[spec 31](31_permission_profiles/proposal.md) §5.3 is itemised rather than global.
 
 ### 5.9 Output bounding and redaction
 

@@ -18,7 +18,7 @@ changes where its allowlist entries are stored),
 [`20_working_modes/proposal.md`](20_working_modes/proposal.md) (repository content is untrusted for
 capability — this extends the same rule to repository *config*),
 [`13_docker_command_support.md`](13_docker_command_support.md),
-[`31_permission_profiles.md`](31_permission_profiles.md) (this spec is the
+[`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) (this spec is the
 security subset of its requirement 4, extracted so it need not wait for
 Phase 4; §5.3 of that spec is superseded by §5.4 here).
 See also [`SECURITY.md`](../../SECURITY.md).
@@ -87,7 +87,7 @@ establish that repository *content* is untrusted with respect to capability —
 `AGENTS.md` cannot widen a mode. Repository *config* is the same threat model
 with a different filename, and it is trusted.
 
-[Spec 31](31_permission_profiles.md) fixes this as part of Phase 4's permission
+[Spec 31](31_permission_profiles/proposal.md) fixes this as part of Phase 4's permission
 profiles. Phase 4 is five phases out. This spec extracts the security subset so
 it can ship on its own, without the profile machinery.
 
@@ -146,11 +146,11 @@ it can ship on its own, without the profile machinery.
 
 - Permission profiles, the capability/preference partition as a general
   mechanism, the effective-policy source attribution, and profile export/import
-  — all [spec 31](31_permission_profiles.md), Phase 4. This spec is the security
+  — all [spec 31](31_permission_profiles/proposal.md), Phase 4. This spec is the security
   subset only.
 - A repository-config review UI. §5.3 rejects unsafe keys outright rather than
   offering them for approval; the itemised review flow is
-  [spec 31](31_permission_profiles.md).
+  [spec 31](31_permission_profiles/proposal.md).
 - Changing risk classification, the blocklist, or shell-control detection in
   `command_policy.rs`.
 - Changing what `AGENTS.md` can do — already correct.
@@ -267,7 +267,7 @@ repository use case, so an override would exist only to be socially engineered.
 
 This is the part that closes vector 3 without breaking
 [spec 10](10_persistent_command_approval.md), and it **supersedes
-[spec 31](31_permission_profiles.md) §5.3's** content-hash-tracking approach for
+[spec 31](31_permission_profiles/proposal.md) §5.3's** content-hash-tracking approach for
 this key.
 
 An `Allow Always` decision is *the user's* decision about a repository. It

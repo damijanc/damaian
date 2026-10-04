@@ -17,7 +17,7 @@ use crate::git_service::{GitService, GitStatus};
 use crate::hash::{create_id, now_millis};
 use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
-use crate::mode::{Permission, SessionMode, mode_permits, refusal_message};
+use crate::mode::{Permission, SessionMode, permits, refusal_message};
 use crate::model::{
     ModelAdapter, ModelMessage, ModelRequest, ModelRun, TokenUsage, ToolCall, ToolDefinition,
     model_request_json,
@@ -831,6 +831,9 @@ impl ChatOrchestrator {
         // since. Read once, for whichever branch below runs; a decline needs
         // no check, since nothing is about to happen either way.
         let mode = self.session_store.session_mode(&pending.session.id);
+        // The profile is captured the same way: this engine loaded config for
+        // this request, so it is the selection now (spec 31 `context.md` §6).
+        let capabilities = self.config.profile_capabilities();
 
         // Three kinds of paused action resume through here: a browser
         // diagnostic, an MCP tool call, or the original shell-command path.
@@ -839,14 +842,22 @@ impl ChatOrchestrator {
         {
             let call = web_call.call.clone();
             let summary = web_diagnostic_summary(&call);
-            let permission =
-                mode_permits(mode, &ToolAction::WebDiagnostic(call.clone()), None, None);
+            let permission = permits(
+                mode,
+                &capabilities,
+                &ToolAction::WebDiagnostic(call.clone()),
+                None,
+                None,
+            );
             let refused = approved && !permission.is_allowed();
             // A refused approval grants nothing, including session-wide
-            // consent: that consent governs diagnostics within a mode that
-            // allows them, and this one does not.
+            // consent: that consent governs diagnostics within a mode and
+            // profile that allow them, and this one does not.
             let decision = if refused {
-                "refused_by_mode"
+                match permission {
+                    Permission::RefusedByProfile { .. } => "refused_by_profile",
+                    _ => "refused_by_mode",
+                }
             } else if approved
                 && decision_options.allow_browser_diagnostics_for_session
                 && call.targets_loopback()
@@ -893,8 +904,9 @@ impl ChatOrchestrator {
                 // A fresh runtime has fetched no tool lists, and the read-only
                 // hint lives in them; without this every hint reads as `None`.
                 mcp.tool_definitions();
-                let permission = mode_permits(
+                let permission = permits(
                     mode,
+                    &capabilities,
                     &ToolAction::McpCall {
                         server_id: mcp_call.server_id.clone(),
                         tool_name: mcp_call.tool_name.clone(),
@@ -935,28 +947,29 @@ impl ChatOrchestrator {
                 command: proposal.command.clone(),
                 reason: proposal.reason.clone(),
             };
-            // The stored proposal is what `run_proposal` would execute, so its
-            // own classification is what the mode is asked about.
-            let permission = mode_permits(
+            // The stored command is what `run_proposal` would execute, classified
+            // again under the current config, because the stored fields predate
+            // any profile or config change since (spec 31 Task 5, deviation 5).
+            let classification = self
+                .validation_orchestrator
+                .classify_command(Path::new(&proposal.working_directory), &proposal.command);
+            let permission = permits(
                 mode,
+                &capabilities,
                 &ToolAction::Command(command_request.clone()),
-                Some(&CommandClassification {
-                    command: proposal.command.clone(),
-                    risk: proposal.risk,
-                    blocked: proposal.blocked,
-                    requires_approval: proposal.requires_approval,
-                    reasons: proposal.reasons.clone(),
-                    expected_effects: proposal.expected_effects.clone(),
-                    may_use_network: proposal.may_use_network,
-                }),
+                Some(&classification),
                 None,
             );
             let content = if approved && !permission.is_allowed() {
                 // Marked rejected like a decline, so a later run of this id by
                 // `/api/run-command` shows up as a violation (`context.md` §9).
                 // The audit event still says `actor: user`; `rejectedBy` does not.
+                let rejected_by = match permission {
+                    Permission::RefusedByProfile { .. } => "profile_policy",
+                    _ => "mode_policy",
+                };
                 self.validation_orchestrator
-                    .reject_proposal(proposal_id, "mode_policy")?;
+                    .reject_proposal(proposal_id, rejected_by)?;
                 refusal_message(permission)
             } else if approved {
                 // The census has to be taken before the command runs: once it
@@ -1489,21 +1502,26 @@ impl ChatOrchestrator {
         // withholding any part of it here would be the second copy of the
         // matrix the Global Constraints forbid.
         let mode = self.session_store.session_mode(&session.id);
+        // The profile's capabilities are captured with it: this engine loaded
+        // config when the turn began (spec 31 `context.md` §6).
+        let capabilities = self.config.profile_capabilities();
         let native_tools = self.config.supports_native_tools().then(|| {
-            // `mode_permits` decides per `ToolAction` variant, so each
-            // definition is asked about a placeholder action of its kind —
-            // only the variant matters for every class except `run_command`
-            // and MCP, which get their own context below.
-            let permits = |action: &ToolAction| mode_permits(mode, action, None, None).is_allowed();
+            // `permits` decides per `ToolAction` variant, so each definition
+            // is asked about a placeholder action of its kind — only the
+            // variant matters for every class except `run_command` and MCP,
+            // which get their own context below.
+            let offered =
+                |action: &ToolAction| permits(mode, &capabilities, action, None, None).is_allowed();
 
             // Whether the `run_command` *definition* is offered cannot depend
             // on one specific command, only on whether *any* command could pass
-            // in this mode, so ask about the most permissive classification
-            // there is. Going through `mode_permits` rather than hand-coding
-            // `mode != Ask` keeps the matrix in one place even though the two
-            // happen to agree today. The text must be genuinely read-only, not
-            // empty: `mode_permits` checks the command itself, not just its
-            // risk, so an allowlist cannot widen a mode.
+            // in this mode and profile, so ask about the most permissive
+            // classification there is. Going through `permits` rather than
+            // hand-coding `mode != Ask` keeps the matrix in one place, and
+            // `command_access=none` withholds the tool the same way. The text
+            // must be genuinely read-only, not empty: the matrix checks the
+            // command itself, not just its risk, so an allowlist cannot widen
+            // a mode.
             let permissive_command = CommandClassification {
                 command: "pwd".to_string(),
                 risk: CommandRisk::Low,
@@ -1513,8 +1531,9 @@ impl ChatOrchestrator {
                 expected_effects: String::new(),
                 may_use_network: false,
             };
-            let run_command_permitted = mode_permits(
+            let run_command_permitted = permits(
                 mode,
+                &capabilities,
                 &ToolAction::Command(CommandRequest {
                     command: String::new(),
                     reason: String::new(),
@@ -1528,56 +1547,56 @@ impl ChatOrchestrator {
             if run_command_permitted {
                 tools.push(run_command_tool_definition());
             }
-            if permits(&ToolAction::ProposePatch(GeneratedEdit {
+            if offered(&ToolAction::ProposePatch(GeneratedEdit {
                 summary: String::new(),
                 changes: Vec::new(),
             })) {
                 tools.push(propose_patch_tool_definition());
             }
-            if permits(&ToolAction::ProposePlan(Vec::new())) {
+            if offered(&ToolAction::ProposePlan(Vec::new())) {
                 tools.push(propose_plan_tool_definition());
                 tools.push(complete_step_tool_definition());
             }
-            if permits(&ToolAction::ReadFile {
+            if offered(&ToolAction::ReadFile {
                 path: String::new(),
                 range: None,
             }) {
                 tools.push(read_file_tool_definition());
             }
-            if permits(&ToolAction::ListDirectory {
+            if offered(&ToolAction::ListDirectory {
                 dir: None,
                 depth: None,
             }) {
                 tools.push(list_directory_tool_definition());
             }
-            if permits(&ToolAction::SearchContent {
+            if offered(&ToolAction::SearchContent {
                 pattern: String::new(),
                 path_glob: None,
                 max_matches: None,
             }) {
                 tools.push(search_content_tool_definition());
             }
-            if permits(&ToolAction::EditFile {
+            if offered(&ToolAction::EditFile {
                 summary: String::new(),
                 edits: Vec::new(),
             }) {
                 tools.push(edit_file_tool_definition());
             }
-            if permits(&ToolAction::SearchCodebase {
+            if offered(&ToolAction::SearchCodebase {
                 query: String::new(),
                 semantic: false,
                 limit: 0,
             }) {
                 tools.push(search_codebase_tool_definition());
             }
-            if permits(&ToolAction::ReadGitStatus) {
+            if offered(&ToolAction::ReadGitStatus) {
                 tools.push(read_git_status_tool_definition());
             }
-            if permits(&ToolAction::ReadGitDiff { staged: false }) {
+            if offered(&ToolAction::ReadGitDiff { staged: false }) {
                 tools.push(read_git_diff_tool_definition());
             }
             if self.web_diagnostics_runner.is_some()
-                && permits(&ToolAction::WebDiagnostic(WebDiagnosticCall {
+                && offered(&ToolAction::WebDiagnostic(WebDiagnosticCall {
                     kind: WebDiagnosticKind::Inspect,
                     url: String::new(),
                     arguments_json: "{}".to_string(),
@@ -1601,8 +1620,9 @@ impl ChatOrchestrator {
                     return false;
                 }
                 let hint = mcp.tool_read_only_hint(&server_id, &tool_name);
-                mode_permits(
+                permits(
                     mode,
+                    &capabilities,
                     &ToolAction::McpCall {
                         server_id,
                         tool_name,
@@ -3123,7 +3143,7 @@ impl ChatOrchestrator {
     }
 
     /// Asks the permission matrix about one dispatched action, supplying the
-    /// context only two classes need (`mode_permits`'s own contract): a
+    /// context only two classes need (`permits`'s own contract): a
     /// command's classification — the same classifier `propose_command` runs,
     /// without storing a proposal — and an MCP tool's read-only hint, from the
     /// tool lists Layer 1 already fetched this turn.
@@ -3149,7 +3169,13 @@ impl ChatOrchestrator {
             } => mcp.tool_read_only_hint(server_id, tool_name),
             _ => None,
         };
-        mode_permits(mode, action, classification.as_ref(), read_only_hint)
+        permits(
+            mode,
+            &self.config.profile_capabilities(),
+            action,
+            classification.as_ref(),
+            read_only_hint,
+        )
     }
 
     /// Dispatch one of the read-only tools. Shared by the sequential path (a
@@ -5166,8 +5192,8 @@ mod evidence_tests {
 
 /// Layer 1 of spec 20's working modes (`docs/specs/20_working_modes`): the
 /// tool list `run_agentic_turn` builds for the model is filtered through
-/// `mode_permits`, so a mode's capability bound is structural rather than a
-/// prompt request. These drive a real turn and inspect the `tools` actually
+/// `permits` (mode, then profile), so a mode's capability bound is structural
+/// rather than a prompt request. These drive a real turn and inspect the `tools` actually
 /// sent to the adapter — the same seam spec 49 Task 8 used for its
 /// prefix-stability assertions.
 #[cfg(test)]
@@ -6603,6 +6629,80 @@ done
         assert!(!marker.exists(), "the MCP call reached the server");
         let results = tool_results(&engine, &session);
         assert_refused(results.last().unwrap(), "Ask", "Code");
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    /// An engine over the same data directory as `engine`, with `narrow`
+    /// applied to its config: a new desktop request after the profile changed.
+    fn narrowed(engine: &WorkspaceEngine, narrow: impl FnOnce(&mut Config)) -> WorkspaceEngine {
+        let mut config = engine.config.clone();
+        narrow(&mut config);
+        WorkspaceEngine::new(config)
+    }
+
+    // Spec 31 Task 5: the web-diagnostic resume point also asks the profile.
+    #[test]
+    fn a_web_diagnostic_approved_after_the_profile_turned_diagnostics_off_is_refused_at_resume() {
+        let repo = temp_repo("resume-web-profile");
+        let (engine, calls) = engine_with_web_runner(&repo);
+        let session = session_in(&engine, &repo, SessionMode::Code);
+        let mut adapter = calls_then_answer(vec![call(
+            "call_1",
+            "run_web_scenario",
+            r##"{"url":"http://localhost:5001/","actions":[{"action":"click","selector":"#go"}]}"##,
+        )]);
+        let proposal = turn(&engine, &repo, &session, &mut adapter)
+            .command_proposal
+            .expect("a scenario needs approval in Code");
+
+        let mut after_switch = narrowed(&engine, |config| config.allow_browser_diagnostics = false);
+        after_switch
+            .chat_orchestrator
+            .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(CountingWebRunner {
+                calls: calls.clone(),
+            }));
+        let mut after = MockModelAdapter::new("Understood.");
+        resume(&after_switch, &proposal.id, &mut after);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the diagnostic ran");
+        let results = tool_results(&engine, &session);
+        assert!(
+            results
+                .last()
+                .unwrap()
+                .contains("(allow_browser_diagnostics=false)"),
+            "{results:?}"
+        );
+        assert!(audit_log(&repo).contains("refused_by_profile"));
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    // Spec 31 Task 5: the MCP resume point also asks the profile.
+    #[test]
+    fn an_mcp_call_approved_after_the_profile_turned_mutating_tools_off_is_refused_at_resume() {
+        let repo = temp_repo("resume-mcp-profile");
+        let (engine, marker) = engine_with_mcp(&repo, true);
+        let session = session_in(&engine, &repo, SessionMode::Code);
+        let mut adapter = calls_then_answer(vec![call("call_1", "mcp__fake__echo", "{}")]);
+        let proposal = turn(&engine, &repo, &session, &mut adapter)
+            .command_proposal
+            .expect("the server requires approval");
+
+        let after_switch = narrowed(&engine, |config| config.allow_mutating_mcp_tools = false);
+        let mut after = MockModelAdapter::new("Understood.");
+        resume(&after_switch, &proposal.id, &mut after);
+
+        assert!(!marker.exists(), "the MCP call reached the server");
+        let results = tool_results(&engine, &session);
+        assert!(
+            results
+                .last()
+                .unwrap()
+                .contains("(allow_mutating_mcp_tools=false)"),
+            "{results:?}"
+        );
 
         fs::remove_dir_all(repo).unwrap();
     }

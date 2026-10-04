@@ -27,6 +27,7 @@ pub mod patch_engine;
 pub mod path_policy;
 pub mod plan;
 pub mod process_registry;
+pub mod profile;
 pub mod recovery;
 mod render;
 pub mod repository_trust;
@@ -55,11 +56,11 @@ pub use command_policy::{
 };
 pub use command_runner::{CommandExecution, CommandRunOptions, CommandRunner, CommandTermination};
 pub use config::{
-    Config, ConfigOverlay, ConfigScope, CostEstimate, DEFAULT_CONTEXT_TOKEN_BUDGET,
-    McpServerConfig, McpServerConfigOverlay, McpTransport, ModelProviderConfig,
-    ModelProviderConfigOverlay, RejectedConfigKey, RepositoryConfigReport, RepositoryKeyClass,
-    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
-    parse_mcp_transport,
+    CommandAccess, Config, ConfigKeyKind, ConfigOverlay, ConfigScope, CostEstimate,
+    DEFAULT_CONTEXT_TOKEN_BUDGET, McpServerConfig, McpServerConfigOverlay, McpTransport,
+    ModelProviderConfig, ModelProviderConfigOverlay, RejectedConfigKey, RepositoryConfigReport,
+    RepositoryKeyClass, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, overlay_field_kinds, parse_mcp_transport,
 };
 pub use context_manager::{ContextItem, ContextManager, ContextPlan};
 pub use data_schema::{
@@ -99,6 +100,9 @@ pub use plan::{
 pub use process_registry::{
     ProcessIdentity, ProcessKind, ProcessRegistry, RegisteredProcess, RegistrationHandle,
     SweepDecision, SweepReport, SweepScope,
+};
+pub use profile::{
+    ProfileCapabilities, ProfileId, ProfileSelection, review_profile_rejections, select_profile,
 };
 pub use recovery::{
     ReattachedApproval, RecoveredTask, abandon, classify_all, classify_session, headline,

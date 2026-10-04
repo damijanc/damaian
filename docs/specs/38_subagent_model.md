@@ -14,7 +14,7 @@ Related implementation specs:
 (task state, action markers, and the PID registry),
 [`18_local_evaluation_harness/`](18_local_evaluation_harness/proposal.md)
 (measures the readiness gates), [`20_working_modes/proposal.md`](20_working_modes/proposal.md) and
-[`31_permission_profiles.md`](31_permission_profiles.md) (the boundary a
+[`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) (the boundary a
 subagent inherits and cannot widen),
 [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md),
 [`22_findings_model_and_panel/proposal.md`](22_findings_model_and_panel/proposal.md),
@@ -95,9 +95,9 @@ Nothing in this phase exists, deliberately. What it builds on:
   mode in [spec 20](20_working_modes/proposal.md) §5.2 — the same place a subagent's
   narrower list is built.
 - **Mode and profile are the capability boundary**
-  ([spec 20](20_working_modes/proposal.md), [spec 31](31_permission_profiles.md)), with
+  ([spec 20](20_working_modes/proposal.md), [spec 31](31_permission_profiles/proposal.md)), with
   the effective capability defined as `profile ∩ mode`
-  ([spec 31](31_permission_profiles.md) §5.6).
+  ([spec 31](31_permission_profiles/proposal.md) §5.6).
 - **The PID registry exists** for spawned children —
   [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7 — covering MCP
   stdio servers, the `curl` model child, PTY sessions, and (per later specs)

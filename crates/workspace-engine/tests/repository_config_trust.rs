@@ -684,6 +684,33 @@ fn allow_always_keeps_the_users_machine_wide_allowlist() {
 }
 
 #[test]
+fn allow_always_keeps_the_users_other_settings() {
+    // Allow Always rewrites user.conf, so anything the overlay serializer
+    // leaves out is silently erased by a click on an unrelated button.
+    let fixture = fixture(
+        "allow-always-keeps-settings",
+        "command_timeout_secs=90\nagent_max_turn_messages=12\n",
+        "",
+    );
+    let engine = WorkspaceEngine::new(fixture.load());
+    let proposal = engine
+        .validation_orchestrator
+        .propose_command(&fixture.root, "git push", "Publish the branch")
+        .unwrap();
+    engine
+        .validation_orchestrator
+        .allow_command_always(&proposal.id, "tester")
+        .unwrap();
+
+    let config = fixture.load();
+
+    assert_eq!(config.command_timeout_secs, 90);
+    assert_eq!(config.agent_max_turn_messages, 12);
+
+    fixture.cleanup();
+}
+
+#[test]
 fn allow_always_is_idempotent() {
     let fixture = fixture("allow-always-repeat", "", "");
     let engine = WorkspaceEngine::new(fixture.base());

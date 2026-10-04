@@ -18,7 +18,7 @@ bespoke API client),
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (`unknown_external_outcome` — the central mechanism here),
 [`23_verification_loop.md`](23_verification_loop.md) (the check evidence the PR
-body quotes), [`31_permission_profiles.md`](31_permission_profiles.md),
+body quotes), [`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md),
 [`33_mcp_management_and_deferred_discovery.md`](33_mcp_management_and_deferred_discovery.md)
 (per-tool approval, and the rule that a remote read-only claim is an assertion),
 [`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md),
@@ -317,7 +317,7 @@ a path that should already be clean, which is the right place for one.
 - Code mode only ([spec 20](20_working_modes/proposal.md)). Ask, Plan, and Review cannot
   push or publish.
 - Permitted only under a profile allowing remote writes
-  ([spec 31](31_permission_profiles.md)), which repository config cannot grant
+  ([spec 31](31_permission_profiles/proposal.md)), which repository config cannot grant
   ([spec 34](34_repository_config_trust_boundary.md)). A cloned repository cannot
   enable pushing.
 - The MCP server and the specific PR-creation tool must both be enabled by the

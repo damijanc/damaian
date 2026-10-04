@@ -4,9 +4,9 @@ use std::path::Path;
 use workspace_engine::{
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, CommandProposal, CommandRisk, Config, ConfigOverlay,
     ConfigScope, CurlModelTransport, DataSchemaOutcome, MockModelAdapter, OpenAICompatibleAdapter,
-    ProcessRegistry, ReadWindow, SearchResult, WorkspaceEngine, command_approval_prompt,
+    ProcessRegistry, ProfileId, ReadWindow, SearchResult, WorkspaceEngine, command_approval_prompt,
     ensure_data_dir_schema, parse_hunk_selection, patch_diff_text, patch_hunk_summary,
-    render_markdown_to_ansi,
+    render_markdown_to_ansi, review_profile_rejections, select_profile,
 };
 
 fn usage() -> &'static str {
@@ -26,6 +26,7 @@ fn usage() -> &'static str {
   damaian config-set user <key> <value>
   damaian config-set repo <repo> <key> <value>
   damaian config-set admin <key> <value>
+  damaian profile-set <repo> <read_only|safe_local|full|offline_private|custom-name>
   damaian propose-command <repo> <command>
   damaian propose-validations <repo>
   damaian run-command <proposal-id> --approve [--always]
@@ -223,6 +224,11 @@ fn run() -> workspace_engine::Result<()> {
         "config-review" => {
             let repo = require_arg(&args, 1, "<repo>")?;
             print!("{}", repository_config_review(repo)?);
+        }
+        "profile-set" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let profile = require_arg(&args, 2, "<profile>")?;
+            print!("{}", set_permission_profile(repo, profile)?);
         }
         "config-allowlist-keep" => {
             let repo = require_arg(&args, 1, "<repo>")?;
@@ -616,7 +622,40 @@ fn repository_config_review(repo: &str) -> workspace_engine::Result<String> {
         }
         None => output.push_str("no repository allowlist entries are awaiting a decision\n"),
     }
+    // Kept apart from the repository's refusals above: these are keys the
+    // user's own selected profile carried and could not apply.
+    if let Some(profile) = &report.permission_profile {
+        let fresh = review_profile_rejections(&engine.config.data_dir, &report, &engine.audit_log)?;
+        for rejected in &fresh {
+            output.push_str(&format!(
+                "profile {} could not apply {} ({})\n",
+                profile.as_str(),
+                rejected.key,
+                rejected.class.as_str()
+            ));
+        }
+    }
     Ok(output)
+}
+
+/// Selects the permission profile for one checkout, in user config, and audits
+/// the change. Config is loaded without the repository so a checkout whose
+/// selected custom profile file has gone missing can still be switched.
+fn set_permission_profile(repo: &str, profile: &str) -> workspace_engine::Result<String> {
+    let id = ProfileId::parse(profile)?;
+    let config = Config::load_for_repository(None)?;
+    let engine = WorkspaceEngine::new(config.clone());
+    let selection = select_profile(&config, Path::new(repo), id, &engine.audit_log)?;
+    Ok(format!(
+        "permission profile for {} ({}) is now {} (was {})\n",
+        repo,
+        selection.repository_id,
+        selection.selected.as_str(),
+        selection
+            .previous
+            .as_ref()
+            .map_or("none", ProfileId::as_str)
+    ))
 }
 
 /// Answers the migration question: the named commands move to user config

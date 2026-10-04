@@ -5,7 +5,7 @@ Order: 52 of 53
 Plan: `docs/PLAN/04_phase_4_customization_and_extensibility.md`, Phase 4,
 Work Package 6 (Could). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#31](31_permission_profiles.md) (the profile the exposed set
+Depends on: [#31](31_permission_profiles/proposal.md) (the profile the exposed set
 narrows) — **not built**; [#33](33_mcp_management_and_deferred_discovery.md)
 (the MCP runtime) — **not built**. Everything else named below is a
 cross-reference, not a prerequisite.
@@ -14,7 +14,7 @@ Related implementation specs:
 and types this reuses),
 [`33_mcp_management_and_deferred_discovery.md`](33_mcp_management_and_deferred_discovery.md)
 (client-side management; the mirror-image rules in §5.4 come from it),
-[`31_permission_profiles.md`](31_permission_profiles.md) (the profile a server
+[`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) (the profile a server
 process narrows and can never widen),
 [`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)
 (the scope rules that decide who chooses the repository),
@@ -62,7 +62,7 @@ a read-only feature and Could-tier rather than a larger one.
    its tools.
 2. The repository a server process operates on is fixed at launch by whoever
    launched it. A connected client can never choose, change, or widen it.
-3. Exposed capability is derived by narrowing a [spec 31](31_permission_profiles.md)
+3. Exposed capability is derived by narrowing a [spec 31](31_permission_profiles/proposal.md)
    profile. No tool requiring approval is exposed, and a profile change can only
    remove tools from the set, never add one.
 4. Every call passes through the same path policy, redaction and audit as the

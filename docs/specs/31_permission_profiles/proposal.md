@@ -1,27 +1,33 @@
 # Feature Spec: Permission Profiles
 
-Status: Not started
+Status: In progress. Split into a folder and planned on 2026-09-30. Design
+unchanged from the original flat spec. Corrections where it no longer matches
+the code are in [`context.md`](context.md), not inlined here, the way specs 20
+and 22 kept theirs. The most important ones: [spec 34](../34_repository_config_trust_boundary.md)
+has already built most of §5.2, the profiles in §5.5 need capability keys that
+do not exist yet, and enforcing §5.6 touches `chat.rs`. Read `context.md` before
+starting any task in [`tasks.md`](tasks.md).
 Order: 31 of 33
 Plan: `docs/PLAN/04_phase_4_customization_and_extensibility.md`, Phase 4,
 Work Package 3 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#20](20_working_modes/proposal.md) (the mode a profile is narrowed by) —
+Depends on: [#20](../20_working_modes/proposal.md) (the mode a profile is narrowed by) —
 built. Everything else named below is a cross-reference, not a
 prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
 and secret policy), section 7.4 (command approval), section 7.8 (risk
 classification and approval). Related implementation specs:
-[`10_persistent_command_approval.md`](10_persistent_command_approval.md) (wrote
+[`10_persistent_command_approval.md`](../10_persistent_command_approval.md) (wrote
 `command_allowlist` to repository config — §1 explains why that mattered here;
-[spec 34](34_repository_config_trust_boundary.md) has since moved it to user
+[spec 34](../34_repository_config_trust_boundary.md) has since moved it to user
 config, and §1's live defect is closed),
-[`11_agents_md_support.md`](11_agents_md_support.md) (repository content is
+[`11_agents_md_support.md`](../11_agents_md_support.md) (repository content is
 untrusted),
-[`13_docker_command_support.md`](13_docker_command_support.md),
-[`20_working_modes/proposal.md`](20_working_modes/proposal.md) (mode narrows a profile; the
+[`13_docker_command_support.md`](../13_docker_command_support.md),
+[`20_working_modes/proposal.md`](../20_working_modes/proposal.md) (mode narrows a profile; the
 permission matrix this extends),
-[`32_hooks.md`](32_hooks.md) and
-[`33_mcp_management_and_deferred_discovery.md`](33_mcp_management_and_deferred_discovery.md)
+[`32_hooks.md`](../32_hooks.md) and
+[`33_mcp_management_and_deferred_discovery.md`](../33_mcp_management_and_deferred_discovery.md)
 (both reference "the effective profile" this spec defines).
 
 Implementation order note: the roadmap lists this as WP3, after WP2 (hooks).
@@ -60,7 +66,7 @@ single unchained command is still enough — `npm install` runs postinstall
 scripts, `make` runs a Makefile the repository controls, `curl -o` writes a file.
 
 This is inconsistent with the product's own stance elsewhere.
-[Spec 11](11_agents_md_support.md) and [spec 20](20_working_modes/proposal.md) §5.5 both
+[Spec 11](../11_agents_md_support.md) and [spec 20](../20_working_modes/proposal.md) §5.5 both
 establish that repository content is untrusted with respect to capability;
 `AGENTS.md` cannot widen a mode. Repository *config* is treated as trusted, and
 it is the same threat model with a different filename.
@@ -70,7 +76,7 @@ user-level deny" — is therefore not a new feature layered on a sound base. It 
 a fix.
 
 **That fix has been extracted into
-[spec 34](34_repository_config_trust_boundary.md), to be implemented ahead of
+[spec 34](../34_repository_config_trust_boundary.md), to be implemented ahead of
 this phase.** Investigating the weakness found two vectors worse than the
 `command_allowlist` one — a repository-set `shell` executing its own script for
 every approved command, and a repository-set `model_base_url` exfiltrating the
@@ -110,7 +116,7 @@ system can read the resolved state.
   is honoured.
 - **Repository config is a real file that travels with a clone**, at
   `<repo>/.damaian/config.conf` (`Config::repository_config_path`,
-  `config.rs:251-256`), and [spec 10](10_persistent_command_approval.md) writes
+  `config.rs:251-256`), and [spec 10](../10_persistent_command_approval.md) writes
   to it deliberately.
 - **Policy values are flat and spread across two modules.**
   `command_policy.rs` enforces `command_allowlist`, `command_blocklist`, and the
@@ -126,7 +132,7 @@ system can read the resolved state.
   (`config.rs:475-488`) requires the global switch, the server's own `enabled`,
   **and** membership of `mcp_server_allowlist` when that list is non-empty — an
   intersection rather than a last-writer-wins override.
-- **Mode exists as a capability boundary** ([spec 20](20_working_modes/proposal.md)) with
+- **Mode exists as a capability boundary** ([spec 20](../20_working_modes/proposal.md)) with
   a permission matrix as its primary artifact.
 
 ## 3. Requirements
@@ -137,7 +143,7 @@ system can read the resolved state.
    from.
 3. More specific deny rules override allow rules. Deny always wins.
 4. **Repository configuration cannot weaken a user-level deny.**
-5. Mode ([spec 20](20_working_modes/proposal.md)) narrows a profile and can never widen
+5. Mode ([spec 20](../20_working_modes/proposal.md)) narrows a profile and can never widen
    one. The effective capability is the intersection.
 6. Profile changes affect new actions, not actions already executing.
 7. Sanitized profile configuration can be exported and imported.
@@ -146,13 +152,13 @@ system can read the resolved state.
 
 - Organization-wide or remotely managed policy — Phase 6 WP6. `admin.conf`
   remains a local file.
-- Per-tool MCP permissions — [spec 33](33_mcp_management_and_deferred_discovery.md).
-- Hook permissions — [spec 32](32_hooks.md).
+- Per-tool MCP permissions — [spec 33](../33_mcp_management_and_deferred_discovery.md).
+- Hook permissions — [spec 32](../32_hooks.md).
 - Replacing modes. Mode and profile are different axes: a profile is what the
   installation permits, mode is what this session is doing.
   §5.6 defines the intersection.
 - Adding pattern-matching to `command_allowlist`. It stays exact-command, per
-  [spec 10](10_persistent_command_approval.md); a profile must not introduce
+  [spec 10](../10_persistent_command_approval.md); a profile must not introduce
   globbing by the back door.
 - Changing risk classification in `command_policy.rs`.
 - A migration that discards existing repository config. §5.4 handles existing
@@ -174,8 +180,8 @@ reach the network:
 `require_approval_for_risky_commands`, `require_approval_for_all_commands`,
 `mcp_enabled`, `mcp_server_allowlist`, per-server `enabled` and
 `require_approval`, `data_dir`, and every profile field added by
-[spec 32](32_hooks.md) or
-[spec 33](33_mcp_management_and_deferred_discovery.md).
+[spec 32](../32_hooks.md) or
+[spec 33](../33_mcp_management_and_deferred_discovery.md).
 
 **Preference keys** — everything else: `max_file_bytes`,
 `max_command_output_bytes`, `agent_max_tool_rounds`, model selection, UI
@@ -204,8 +210,8 @@ lower:
 | `require_approval_for_*` | **Logical OR** | A scope may turn approval on, never off |
 | `mcp_enabled`, per-server `enabled` | **Logical AND** | A repository may disable a server, never enable one |
 | `mcp_server_allowlist` | **Intersection** when both non-empty | Matches `active_mcp_servers` (`config.rs:475`) |
-| `command_allowlist` | **Never taken from repo scope** — [spec 34](34_repository_config_trust_boundary.md) §5.4 | An allowlist entry bypasses approval |
-| `shell`, `data_dir`, `model_*`, `secret_patterns`, `audit_enabled`, `block_generated_secrets` | **Repo value ignored entirely** — [spec 34](34_repository_config_trust_boundary.md) §5.1 | Redirect execution, model traffic, credentials, redaction, or the audit trail |
+| `command_allowlist` | **Never taken from repo scope** — [spec 34](../34_repository_config_trust_boundary.md) §5.4 | An allowlist entry bypasses approval |
+| `shell`, `data_dir`, `model_*`, `secret_patterns`, `audit_enabled`, `block_generated_secrets` | **Repo value ignored entirely** — [spec 34](../34_repository_config_trust_boundary.md) §5.1 | Redirect execution, model traffic, credentials, redaction, or the audit trail |
 
 Admin remains applied last and **may both widen and narrow**. That is the
 existing behaviour and the correct one: `admin.conf` is a local file owned by
@@ -220,7 +226,7 @@ later scope can remove an earlier scope's restriction except admin.
 
 ### 5.3 The trust boundary comes from spec 34
 
-Superseded, and **now shipped**. [Spec 34](34_repository_config_trust_boundary.md)
+Superseded, and **now shipped**. [Spec 34](../34_repository_config_trust_boundary.md)
 owns the repository config trust boundary and implemented it ahead of this
 phase: the scope-aware
 overlay (§5.1 there), the forbidden-key list, the restrict-only merges, and the
@@ -241,7 +247,7 @@ partition applied to every future config field, and the source attribution in
 
 ### 5.4 Existing repository config
 
-Owned by [spec 34](34_repository_config_trust_boundary.md) §5.5, which migrates
+Owned by [spec 34](../34_repository_config_trust_boundary.md) §5.5, which migrates
 existing `command_allowlist` entries into user config through a one-time itemised
 prompt and leaves every repository file untouched. By the time this work package
 is implemented, that migration has already run.
@@ -275,11 +281,11 @@ effective capability = profile ∩ mode
 ```
 
 The profile says what this installation permits; the mode
-([spec 20](20_working_modes/proposal.md)) says what this session is doing. Ask mode under
+([spec 20](../20_working_modes/proposal.md)) says what this session is doing. Ask mode under
 `Full repository development` cannot edit files; Code mode under `Read-only`
 cannot either. Neither can widen the other.
 
-[Spec 20](20_working_modes/proposal.md)'s permission matrix gains the profile dimension,
+[Spec 20](../20_working_modes/proposal.md)'s permission matrix gains the profile dimension,
 and the matrix test extends rather than duplicates — that matrix is named as
 that work package's primary artifact, and this one adds an axis to it.
 
@@ -315,12 +321,12 @@ closed.
 ### 5.8 Profile changes mid-session
 
 Requirement 6. A profile change takes effect for the next action, not the
-executing one — the same rule [spec 20](20_working_modes/proposal.md) §5.4 applies to
+executing one — the same rule [spec 20](../20_working_modes/proposal.md) §5.4 applies to
 mode, where a turn captures its mode at start.
 
 An action already running to completion under the old profile is not aborted:
 interrupting a patch application or a command mid-flight creates exactly the
-unknown-outcome state [spec 17](17_durable_task_state_and_crash_recovery/proposal.md)
+unknown-outcome state [spec 17](../17_durable_task_state_and_crash_recovery/proposal.md)
 exists to avoid. The next action is evaluated under the new profile.
 
 ### 5.9 Export and import
@@ -346,12 +352,12 @@ secret, command, path, and key boundaries.
 
 ## 6. Acceptance Criteria
 
-- The trust-boundary criteria are [spec 34](34_repository_config_trust_boundary.md)'s
+- The trust-boundary criteria are [spec 34](../34_repository_config_trust_boundary.md)'s
   and are not restated here. This work package must not regress them: its
   matrix test runs with a hostile fixture repository present, so a profile that
   reintroduced a weakenable path would fail.
 - The capability/preference partition covers every `ConfigOverlay` field, and the
-  classification agrees with [spec 34](34_repository_config_trust_boundary.md)
+  classification agrees with [spec 34](../34_repository_config_trust_boundary.md)
   §5.1 for every field that spec classifies — asserted by test, so the two
   cannot drift.
 - Repository config that only *adds* restrictions applies immediately with no
@@ -366,7 +372,7 @@ secret, command, path, and key boundaries.
 - Adding a new config field without classifying it as capability or preference
   fails to compile.
 - The permission matrix passes across every profile crossed with every tool
-  class, extending [spec 20](20_working_modes/proposal.md)'s matrix rather than
+  class, extending [spec 20](../20_working_modes/proposal.md)'s matrix rather than
   duplicating it.
 - `profile ∩ mode` holds in both directions: Ask mode under the most permissive
   profile cannot edit; Code mode under Read-only cannot edit.
@@ -377,7 +383,7 @@ secret, command, path, and key boundaries.
 - `command_allowlist` remains exact-command; no profile introduces pattern
   matching.
 - Every quality-gate command from `AGENTS.md` passes, and the
-  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no increase
+  [spec 18](../18_local_evaluation_harness/proposal.md) baseline shows no increase
   in approval-policy violations.
 
 ## 7. Implementation Notes
@@ -385,7 +391,7 @@ secret, command, path, and key boundaries.
 To be completed during implementation.
 
 The §1 finding was extracted into
-[spec 34](34_repository_config_trust_boundary.md) and is implemented ahead of this
+[spec 34](../34_repository_config_trust_boundary.md) and is implemented ahead of this
 phase, so this work package starts from a codebase where the trust boundary
 already holds. Confirm that before starting: if spec 34 has not landed, the
 matrix test here will pass while the underlying weakness remains, which is the
