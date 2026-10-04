@@ -217,6 +217,40 @@ fn the_failed_step_carries_findings_evidence_after_its_exit() {
     }
 }
 
+/// A fake token; `ghp_` matches the default generic-token rule.
+const SECRET: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// Proposal §6: no finding persists an unredacted secret. The secret is in
+/// the command line, so it reaches the generic finding's summary and its
+/// stderr tail. The stored `finding_recorded` event holds neither.
+#[test]
+fn a_secret_in_a_failed_command_is_not_in_the_recorded_finding() {
+    let repo = temp_repo("secret");
+    let engine = engine_for(&repo);
+    let mut adapter = scripted(vec![vec![call(
+        "run_command",
+        &format!(r#"{{"command":"ls {SECRET}","reason":"List it"}}"#),
+    )]]);
+
+    let result = ask(&engine, &repo, "List it", &mut adapter);
+    let recorded = findings(&engine, &repo, &result.session.id);
+
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].source(), FindingSource::Command);
+    assert!(!format!("{:?}", recorded[0]).contains(SECRET));
+    let log = fs::read_to_string(
+        repo.join(".damaian/sessions")
+            .join(format!("{}.jsonl", result.session.id)),
+    )
+    .expect("the session log");
+    let stored: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains(r#""eventType":"finding_recorded""#))
+        .collect();
+    assert_eq!(stored.len(), 1, "{log}");
+    assert!(!stored[0].contains(SECRET), "{}", stored[0]);
+}
+
 /// A repository script named `./cargo` prints rustc-shaped errors, so the
 /// real Rust diagnostics parser reads it (`context.md` §14).
 const FAKE_CARGO: &str = "#!/bin/sh\ncat >&2 <<'EOF'\nerror[E0308]: mismatched types\n --> src/a.rs:1:1\n  |\n\nerror[E0425]: cannot find value `x` in this scope\n --> src/gone.rs:2:3\n  |\n\nerror: could not compile `demo` (lib) due to 2 previous errors\nEOF\nexit 101\n";

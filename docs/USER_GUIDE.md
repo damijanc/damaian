@@ -526,6 +526,83 @@ header, any screenshots, and a **Diagnostic output** disclosure with the raw
 result (see
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md#browser-diagnostics)).
 
+## Findings
+
+A **finding** is one problem a check reported: a compiler error at a file and
+line, a failing test, a lint rule, a browser console error or failed request,
+or a whole check that failed in a way Damaian could not take apart. Findings
+come from the checks the assistant runs during a conversation and from its
+browser diagnostics. They belong to the session.
+
+### The Findings panel
+
+A **Findings** button appears in the conversation's top bar once the session
+has any findings. Its label counts the open errors, for example
+**Findings 2**. Click it to open the panel above the composer.
+
+The panel groups findings by source (Compiler, Tests, Lint, Browser console,
+Network, Browser scenario, Unparsed checks), then by file. Two filters choose
+what is shown:
+
+- **Severity:** Errors (the default), Errors and warnings, or All severities.
+- **Status:** Open (the default), Open and stale, or All statuses.
+
+The default is open errors, because a panel that opens on forty warnings is a
+panel you close. "Showing 2 of 5" tells you how much the filters hide.
+
+Each row shows the summary, the location when the tool reported one, and a
+collapsed **Details** with the tool's own excerpt. Click the location to open
+the file at that line, the same way a file reference in a reply does. A
+finding whose tool gave no location has none. Damaian does not guess one.
+
+### Dismiss and Restore
+
+**Dismiss** hides a finding you have decided not to act on. It stays in the
+session, and **Restore** (under the *All statuses* filter) brings it back.
+Dismissing is not suppression: if a later check reports the same problem, it
+is a new finding and it appears again.
+
+### Fix selected
+
+Tick the findings you want repaired and press **Fix selected**. The assistant
+gets a request naming exactly those findings, with their locations and
+excerpts, not the raw tool log, and runs an ordinary turn that can read, edit
+and re-run the check.
+
+Only **open** findings are sent. A stale, dismissed or fixed finding in the
+selection is left out, and a note says how many were left out and why. If
+nothing is left, nothing is sent.
+
+### What stale means
+
+A finding records a fingerprint of its file when the check ran. If the file
+has changed since, the finding is **stale**: the line it points at may no
+longer hold the problem, or may hold different code. A stale finding cannot be
+selected for a fix, because repairing against a location that has moved is
+how an edit lands on the wrong lines. Re-run the check to get current
+findings. If the file is changed back, the finding is open again.
+
+A finding without a location, or whose file could not be read when it was
+recorded, never goes stale.
+
+### Known limits
+
+- **Commands you run outside a conversation record no findings.** Only the
+  checks the assistant runs inside a turn, including ones you approved, are
+  recorded.
+- **Some checks are not taken apart.** `cargo build`, `check`, `clippy` and
+  `test`, Biome (`npm run lint:web` and similar), and browser diagnostics are
+  parsed into individual findings. `cargo nextest` and any other check give one
+  **Unparsed checks** finding per failed run, with the end of its output in
+  Details.
+- **A browser location opens a file only when exactly one file matches.** A
+  bundled script, a file served from another origin, or a path that matches
+  two files in your repository is shown without a location.
+
+Where a finding's full output lives, and how to read findings from the
+session log, is in
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#findings).
+
 ## Capping What One Turn May Spend
 
 `agent_max_task_tokens` stops a turn once it has spent that many tokens, rather

@@ -5878,6 +5878,10 @@ mod mode_refusal_tests {
             .unwrap();
         assert_eq!(stored[&result.task.id], vec![record.clone()]);
         assert!(!format!("{record:?}").contains(WEB_SECRET));
+        // The page error is also recorded as a finding (spec 22 Task 8), so
+        // the whole-log check below covers persisted browser findings too.
+        let findings = engine.session_store.read_findings(&session, &repo).unwrap();
+        assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(!session_log(&repo, &session).contains(WEB_SECRET));
 
         fs::remove_dir_all(repo).unwrap();

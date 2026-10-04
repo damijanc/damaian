@@ -372,7 +372,8 @@ Event types: `session_created`, `session_renamed`, `task_created`,
 `task_status_updated`, `message_appended`, `action_started`, `action_finished`,
 `browser_diagnostics_approval_updated`, `conversation_rewound`, `plan_created`,
 `plan_revised`, `plan_resumed`, `plan_step_updated`, `plan_approved`,
-`session_mode_set`, `web_diagnostic_recorded`.
+`session_mode_set`, `web_diagnostic_recorded`, `finding_recorded`,
+`finding_status_changed`.
 
 Every event carries a monotonic `seq`. Events written before that field existed
 are numbered by line order on read, which is their append order, so old
@@ -449,7 +450,7 @@ jq -r 'select(.eventType=="plan_step_updated") | "\(.payload.step.id) \(.payload
 ```
 
 A step's `evidence` array is what Damaian itself observed, never what the model
-claimed. Three kinds:
+claimed. Four kinds:
 
 - `{"kind":"commandExit","markerId":…,"exitCode":0}` — a command ran. **A
   missing `exitCode` is not a zero**: the process was killed or signalled and
@@ -458,6 +459,10 @@ claimed. Three kinds:
   a patch landed. `appliedHash` is what was actually written, which differs
   from the proposal's hash when the user accepted only some hunks.
 - `{"kind":"fileRead","path":…,"hash":…}` — a file was read.
+- `{"kind":"findings","refs":[…],"failing":2}` — the findings a check produced
+  (see [Findings](#findings)), recorded beside the `commandExit` it explains.
+  `failing` counts the `error` ones. It never decides the step's status; the
+  exit code does.
 
 `markerId` ties evidence back to the `action_started` / `action_finished` pair
 for that call, so you can find the command's stored output under
@@ -526,6 +531,62 @@ Known quirks:
   to run …"). A loopback inspection runs without approval, so for that call
   they are not written anywhere. That matters when a report is missing its
   screenshot or DOM summary, because the model may have turned `capture` off.
+
+### Findings
+
+A check the assistant runs inside a turn (a sandbox command, or one you
+approved) and every browser diagnostic turn their failures into findings,
+which the **Findings** panel shows. A command run from outside a conversation
+(`/api/run-command` with no session) records none.
+
+**Parsed structurally:**
+
+| Check | Source |
+|-------|--------|
+| `cargo build`, `cargo check`, `cargo clippy` | `compiler`, or `lint` for `clippy::` lints |
+| `cargo test` (its compile errors too) | `test`, plus `compiler` for compile errors |
+| `biome check`/`lint`/`ci`/`format`, `npm`/`pnpm`/`yarn run lint` and `run lint:*` | `lint` |
+| browser diagnostics with the companion's typed report | `browser_console`, `browser_network`, `browser_scenario` |
+
+**Everything else falls back to one generic finding per failed run**,
+including `cargo nextest run`, an ESLint `npm run lint`, and a parsed check
+whose parser found no error in output that failed. **How to tell:** source
+`command`, shown in the panel as **Unparsed checks**, is the generic fallback
+and nothing else is. Its summary names the command and its first output line,
+and its details are the last 40 lines of stderr then stdout. A cancelled check
+gets no generic finding, because it never reached a verdict.
+
+**Where full output lives.** A finding's `details` is a bounded excerpt (at
+most 4096 bytes, redacted). For a command, `originRef` is the execution id,
+and the stored output is
+`<data dir>/commands/output/<originRef>/stdout.log` and `stderr.log`. That is
+the runner's tail-truncated, redacted output, the most Damaian keeps. For a
+browser finding, `originRef` is the `web_diagnostic_recorded` record's `id`.
+
+**The two events.** `finding_recorded` carries the whole finding as its
+payload (camelCase: `id`, `source`, `severity`, `summary`, `details`, `range`,
+`taskId`, `originRef`, `status`, `code`, `fileHash`, `createdAtMs`).
+`finding_status_changed` carries `{findingId, status}` when the user dismisses
+or restores one.
+
+```bash
+jq -c 'select(.eventType=="finding_recorded" or .eventType=="finding_status_changed") | {seq, timestampMs, eventType, id: (.payload.id // .payload.findingId), source: .payload.source, status: .payload.status, summary: .payload.summary}' "$SESSION_FILE"
+```
+
+**`stale` is never in the log.** It is derived on read: an `open` finding
+whose `fileHash` no longer matches its file, or whose file is gone, reads as
+`stale`. Reverting the file makes it `open` again, with no event. A dismissed
+or fixed finding keeps its status whatever happens to the file, and a finding
+with no `fileHash` is never stale. Setting `stale` through
+`/api/finding-status` is refused. Reads use the same active-event window as
+plans, so a rewind takes the findings recorded after its point with it.
+
+**A location is missing.** A finding gets a `range` only when the tool printed
+one, it is relative and inside the repository, and the file exists when the
+finding is recorded. An absolute path (the standard library, a registry
+crate) or a `..` path is dropped. A browser console location maps to a file
+only for a loopback URL whose path matches exactly one repository file outside
+`node_modules`. Percent-encoded paths are not decoded and never match.
 
 ### A turn stopped early: which budget ran out
 

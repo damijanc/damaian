@@ -183,6 +183,9 @@ favour of the reference should read this paragraph first.
   that can only ever be empty. It is **deferred** — added when spec 22 lands,
   with the enum marked `#[non_exhaustive]` so adding it later is not a breaking
   change for the shell.
+  **Closed 2026-10-04:** spec 22 added the variant in its Task 7 and attaches
+  it in Task 8, beside the `CommandExit` it explains. It is informational and
+  never decides status (spec 22 `context.md` §13.3).
 - **The spec-23 acceptance criterion** — "the end-to-end fixture from
   [spec 23](../23_verification_loop.md) exercises a plan through to a completion
   report" — is unsatisfiable: spec 23 is Not started. It is **restated** against

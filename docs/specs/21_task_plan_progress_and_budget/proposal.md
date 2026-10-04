@@ -189,6 +189,12 @@ Every variant references something Damaian observed itself. There is no
 > `Findings` is deferred until [spec 22](../22_findings_model_and_panel/proposal.md)
 > exists to produce the ids it holds; the enum is `#[non_exhaustive]` so adding
 > it later breaks nothing.
+>
+> **Closed 2026-10-04 by [spec 22](../22_findings_model_and_panel/proposal.md).**
+> `Evidence::Findings { refs, failing }` was added by spec 22's Task 7 and is
+> attached by its Task 8, beside the `CommandExit` it explains. It is
+> informational and never decides a step's status: the exit code does (spec 22
+> `context.md` §13.3). The deferral above is kept as history.
 
 The status rule:
 
@@ -416,6 +422,12 @@ It also makes `TaskPhase::Understanding` a derived answer rather than only the
 | `read_git_status`, `read_git_diff` | none | worth revisiting: both observe real state and could carry a hash |
 | `mcp_call`, `web_diagnostic` | none | the outcome is a remote system's, and §4 rules out probing to find out what it did |
 | spec 22 findings | `Evidence::Findings` | **not implemented** — spec 22 does not exist to produce the ids it would hold |
+
+> **2026-10-04:** the last row is no longer true. Spec 22 built
+> `Evidence::Findings` (its Task 7) and attaches it from a failed sandbox
+> command (Task 8). It links a step to the findings its check produced and
+> never decides the step's status (spec 22 `context.md` §13.3). The row is
+> kept as history.
 
 `Evidence` is `#[non_exhaustive]` and `status_from_evidence`'s match is
 exhaustive in-crate, so adding a variant is a compile error at the one place

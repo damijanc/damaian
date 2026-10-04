@@ -8,7 +8,7 @@ reference is a name rather than a link; this spec is self-contained.
 Depends on: [#18](18_local_evaluation_harness/proposal.md) (the harness) —
 built; [#21](21_task_plan_progress_and_budget/proposal.md) (plan state) —
 built; [#22](22_findings_model_and_panel/proposal.md) (the finding type it repairs) —
-**not built**. Everything else named below is a cross-reference, not a
+built. Everything else named below is a cross-reference, not a
 prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 (command approval), section 7.6 (tool and action orchestrator), section 11 (error

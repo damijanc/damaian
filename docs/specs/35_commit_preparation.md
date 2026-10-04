@@ -6,7 +6,7 @@ Plan: `docs/PLAN/05_phase_5_delivery_workflows.md`, Phase 5, Work
 Package 1 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#16](16_session_checkpoints_and_rewind.md) (checkpoints) — built;
-[#22](22_findings_model_and_panel/proposal.md) (findings) — **not built**;
+[#22](22_findings_model_and_panel/proposal.md) (findings) — built;
 [#23](23_verification_loop.md) (the verification loop) — **not built**;
 [#31](31_permission_profiles/proposal.md) (profiles) — **not built**. Everything else
 named below is a cross-reference, not a prerequisite.

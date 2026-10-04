@@ -4,7 +4,7 @@
 
 **Implements:** [`proposal.md`](proposal.md) in full · corrections and the
 decisions it left open in [`context.md`](context.md)
-**Started:** 2026-09-25 — **Done:** —
+**Started:** 2026-09-25 — **Done:** 2026-10-04
 
 ## Progress
 
@@ -21,7 +21,7 @@ decisions it left open in [`context.md`](context.md)
 | 9 · Dismissal and the scoped repair request | Done 2026-10-04 | Planned in full on 2026-10-04 (`context.md` §15). Only `Open` findings are repaired; stale, dismissed, fixed and unknown ids are each excluded with a reason. Landed as sketched. `repair.rs` was extracted from this file's line ranges and is byte-identical to `rustfmt` of the sketch, apart from one deviation: clippy 1.98's `cloned_ref_to_slice_refs` rejected four single-element `&[x.clone()]` arguments in the unit tests, so they are now `std::slice::from_ref(&x)`. `finding.rs` declares `mod repair;` after `mod browser;` and re-exports `Exclusion`, `ExclusionReason` and `RepairRequest`. `finding_recording.rs` gains the imports, `ask_in` and the two tests. No other file changed. Before the implementation the tests failed to compile (`E0432` on the re-export, then `E0433`/`E0425`/`E0422` on the missing types). After it, `test(finding::) + binary(finding_recording)` passed 123/123: 107 `finding::` unchanged, 9 `repair::tests`, and 7 `finding_recording` (5 unchanged + 2 new). All six mutations failed their named tests. Mutations 1, 3–6 ran with `--lib -E 'test(finding::repair)'`. (1) Keeping `Stale` failed `a_stale_finding_is_excluded_…`, plus `nothing_left_to_repair_…`, the exact-render test and `the_request_serialises_…`. (2) Keeping `Dismissed` failed `dismissed_and_fixed_findings_are_excluded_…` (unit) and `dismissing_a_finding_does_not_suppress_…` (integration). (3) Iterating `selected_ids` failed `open_findings_are_kept_in_session_order`, and also `a_duplicate_selection_is_counted_once`, because a repeated id is kept twice. (4) Dropping unknown ids failed `an_unknown_id_is_excluded_…` and the duplicate test. (5) Removing `noted`, the unknown loop's only dedup, failed only the duplicate test. (6) Rendering when only exclusions remain failed only `nothing_left_to_repair_renders_nothing`. **Environment, not code:** a run over the whole `-p workspace-engine` relinks all 21 integration binaries. Mutation 2's first attempt, scoped that way, was killed at 30 minutes with no output, behind XProtect launch scans (see Task 8's row). Rerun with `--lib` and `--test finding_recording`, it took 105 s wall-clock against 14 s of CPU. Step 5 and Step 7's test runs used the same `--lib --test finding_recording` targets with the plan's filter. That selects the same 123 tests without relinking binaries the filter never runs. Scoped fmt, clippy `-p workspace-engine` and typos are clean. |
 | 10 · Shell API | Done 2026-10-04 | Planned in full on 2026-10-04 (`context.md` §16). Implemented in its own worktree, because spec 31 work on `main` left `workspace-engine` not compiling. `FindingStatus::parse` landed as sketched. Before it, the test failed to compile (`E0599`). After it, `finding::tests` passed 17/17. The shell tests compiled first time, as written in the plan. Before the routes, all six failed on the catch-all `{"error":"not found"}`, as Step 4 predicts. **Deviation 1: the routes are functions, not inline arms.** Written inline as sketched, every request a `desktop-shell --lib` test served aborted with `fatal runtime error: stack overflow`. That included spec 20's unchanged session-mode tests. Every arm's locals share `handle_connection`'s frame, and each findings arm holds a `WorkspaceEngine` by value. The nine tests passed with `RUST_MIN_STACK=16777216`, and at `HEAD`, without the arms, the session-mode tests passed with the default stack. The desktop app runs the server on a default `thread::spawn` thread (`desktop-app/src/main.rs`), so a debug build of the app would have aborted on every request. The arms now call `handle_findings`, `handle_finding_status` and `handle_findings_repair`, as `handle_ask_stream` already does, with the sketched bodies. A comment above them says why. **Deviation 2: the GET test is stronger.** Mutation 5 (root `Path::new("")`) first survived. The test's working directory, `crates/desktop-shell`, has its own `src/lib.rs`, and a missing or different file reads as stale, so the only ranged finding was stale under any root. The test now also records a finding on an untouched `src/kept.rs` and expects `open`. After the change, the Step 6 selection passed 9/9 (6 new + 3 session-mode), the whole `desktop-shell --lib` suite passed 86/86 (4 ignored), and `finding::` passed 117/117 (107 + 9 repair + 1 new). Mutations, run with `--lib -E 'test(findings) + test(finding_status)'`: (1) No `session_in_repository` in GET failed only `findings_endpoints_refuse_…`. (2) Defaulting an unknown status to `Dismissed` failed only `post_finding_status_rejects_…`. (3) Overwriting the status in `read_findings`' JSON, with no `set_finding_status`, failed `post_finding_status_dismisses_…` on the reread (`"open"` vs `"dismissed"`). It also failed the reject test, because nothing refuses `stale` any more. (4) `""` for a `None` prompt failed only `post_findings_repair_with_nothing_open_…`. (5) After the test fix, the root `""` failed only `get_findings_…`, on `"stale"` vs `"open"`. Scoped fmt, clippy `-p desktop-shell -p workspace-engine --all-targets`, the scoped tests and typos are clean. The stack headroom is recorded as a local observation for a decision beyond this spec. |
 | 11 · Findings panel | Done 2026-10-04 | Planned in full on 2026-10-04 (`context.md` §17). Implemented in its own worktree. The markup, the panel JS, the `agentic` bypass and the harness seed landed as sketched. Biome needed no reformatting. The five listeners sit with the other top-level wiring, before `$("session-search-btn")`, as Step 4 allows. **Deviations.** (1) `clearChat` calls a new `clearFindings()`, so there is no separate refresh on `loadSession`'s empty branch. Every `clearChat` caller means "no conversation": a new, deleted or unselected session, or a repository with none. Without this, the last session's findings stayed in the panel after a new session started, and "Fix selected" would have posted an empty `session_id`. (2) `refreshFindings()` also runs after the *stopped*-turn `loadSessions` in `sendChatPrompt`, because a check can record findings before the user stops the turn. (3) Base `pre` is light text (`#e6edf3`) for the dark `--code` background, so `.finding-details` sets `color: var(--ink)`. Without that, the expanded details were near-white on `--surface-soft`. (4) The base `input` rule sizes text fields (`width: 100%`, 9px padding). A new `.finding-select` rule resets that and holds the checkbox at 24×24 (guide §3), which Step 2 anticipates. A `.findings-panel .finding-location` rule gives the standalone location a 24px min-height and truncates it on one line. (5) The seed qualifies `workspace_engine::finding::FindingStatus`, because the test module does not import it. The E0308 seed carries a rustc-shaped `details` block. (6) The specimen lifts the panel's `max-height` inline, with a note, so both rows show. **Step 7, in the browser pane against the harness on 4899** (PID 36468, stopped by PID): (1) the "Add retry…" session: toggle and panel hidden. (2) "Findings to review": the toggle reads **Findings 2**, with `aria-expanded="false"`. (3) A real click opens it. It shows "Showing 2 of 5" and two rows, `mismatched types` under **Compiler (1)** and `npm test: 1 failing` under **Unparsed checks (1)**. (4) Both filters on "All": 5 rows. The stale `needless_return` row has a disabled checkbox, the re-run note and Dismiss. The dismissed test row has a disabled checkbox, "Dismissed." and Restore. (5) The E0308 location's dataset is `{path: "upload.rs", line: "3", col: "5"}`. It was not clicked. (6) Details starts hidden at 0px. One click expands it to 97px with the seeded text in `rgb(31, 36, 40)` on `rgb(251, 251, 250)`, and a second click collapses it. (7) A real click on Dismiss for E0308: it leaves the default view and the toggle reads **Findings 1**. After a page reload and reopening the session, it is still `dismissed`. Restore under "All" brings it back as `open`, and the toggle reads **Findings 2**. (8) A real click selects `npm test: 1 failing`, then on **Fix selected (1)**. The user bubble starts "Fix the 1 finding below, which checks reported in this session…". The network log shows `POST /api/findings-repair` then `POST /api/ask-stream`, with no `/api/propose-edit`. The turn ended "Failed" (no model key), and the button returned to a disabled "Fix selected". (9) Real Tab presses from the severity filter visit the status filter, ×, then per row the checkbox, location, Details, Dismiss/Restore, in reading order, then the composer. Disabled checkboxes and the disabled Fix button are skipped. Every stop computes a focus ring. Measured: checkbox 24×24, location 24px, Details 24px, Dismiss 29px, filters 30px, × 26×31px, panel 276px. (10) The console log is empty. The specimen was checked over a throwaway `python3 -m http.server`, because the pane renders a `file://` page as a snapshot without `style.css`. Checks: `node --check`, `lint:web` (only the pre-existing info in `scripts/check-spec-status.mjs`), `cargo fmt --check`, clippy `-p desktop-shell --all-targets` and the Step 9 `typos` paths are clean. `cargo nextest run -p desktop-shell --lib` passed 86/86 (4 skipped). There is no JS test suite, so the walk-through is the verification. No mutation testing applies. |
-| 12 · Docs, acceptance criteria, close the spec | Not started | |
+| 12 · Docs, acceptance criteria, close the spec | Done 2026-10-04 | Planned in full on 2026-10-04. `USER_GUIDE.md` gains a **Findings** section after Browser Diagnostics. `TROUBLESHOOTING.md` gains a **Findings** section with the parsed-versus-generic table, where full output lives, the two events and a `jq` line. It also adds both events to the session-log list, and `findings` as a fourth step-evidence kind. `proposal.md` §7 answers both questions, with a §7.2 criterion table and §7.3's known gaps. Every cited test was checked with `cargo nextest list`. **Code change:** the seeded-secret criterion had no test that read a *persisted* finding. `finding_recording::a_secret_in_a_failed_command_is_not_in_the_recorded_finding` is new: a secret in the command line reaches the generic summary, and the stored `finding_recorded` line lacks it. Spec 12's `a_web_diagnostic_is_recorded_redacted_and_streamed` now asserts that its page error was recorded as a finding, so its whole-log check covers browser findings. Both passed (9/9 with `binary(finding_recording)`, 187 s wall against 8 s CPU). They were not mutation-tested. **Generic share:** 2 of 8 captured failing runs fell through (a crashed test binary, `cargo nextest`). The eval tier recorded 8 findings, all generic `ls` from `failed_validation_retry`, so it does not measure parsed tools. Spec 21's three deferral notes are dated as closed. #23, #24, #26, #32 and #35 now say #22 is built. "What to build next" promotes #23 and #24, and #24 → #26 is the keystone. The CHANGELOG `Next` bullet is gone. `OBSERVATIONS.md` gains #27 (standalone `/api/run-command`) and #28 (approval-resume evidence). XProtect (#25) and the stack frame (#26) were already there. **Eval tier:** 16/16 pass. Metrics match `evals/baseline.json` except tokens (101950 against 101963, as in Task 8) and latency (median 62 against 44 ms, p90 133 against 109 ms). The baseline was not regenerated. **Gate at commit time:** `cargo fmt --check`, `node --check`, `lint:web` (the pre-existing info only), `typos` and `cargo deny check` pass, and `specs:check` reports 57 specs agreeing. The user asked to commit while workspace clippy and the whole-workspace `cargo nextest run` were still running locally, and to verify them on CI. Step 8 stays unticked until those two pass. |
 
 **Goal:** One structured, redacted, addressable `Finding` type shared by every
 check source, with parsers that degrade to one honest generic finding rather
@@ -7020,11 +7020,221 @@ a bare `-p`, for the XProtect reason in Tasks 8–10.
 
 ## Task 12: Docs, acceptance criteria, close the spec
 
-`USER_GUIDE.md` and `TROUBLESHOOTING.md` per §5.8. Walk every acceptance
-criterion into `proposal.md` §7, including the seeded-secret criterion across
-command output, browser output, and the generic fallback. Record the share of
-real failures that fell through to the generic parser. Then work through the
-AGENTS.md "When a spec becomes Done" checklist: `Depends on:` lines in #23,
-#24, #26, #32, and #35; re-deriving "What to build next"; the CHANGELOG
-`Unreleased` entry; and `npm run specs:check`. Finish with the full
-seven-command gate.
+**Requirements:** proposal §5.8 (documentation), §6 (every acceptance
+criterion), and §7 (implementation notes), and the `AGENTS.md` "When a spec
+becomes Done" checklist. Planned in full on 2026-10-04.
+
+**This is the final integration task.** `AGENTS.md` lets it read broadly:
+- the whole `proposal.md`;
+- every `context.md` section;
+- every progress row in this file;
+- the final code.
+
+Its job is to judge the finished repository, not to inherit assumptions from
+Tasks 1–11. It changes code only where an acceptance criterion turns out to
+lack a test. Record any such change, as spec 20 Task 10 did for its two
+missing tests.
+
+**Files:**
+- `docs/USER_GUIDE.md` and `docs/TROUBLESHOOTING.md`;
+- this spec's `proposal.md` (Status, §7) and `tasks.md` (header, row 12);
+- `docs/specs/README.md` (row 22 and "What to build next");
+- `CHANGELOG.md` (the `Next` row);
+- the `Depends on:` lines of `#23`, `#24`, `#26`, `#32` and `#35`;
+- spec 21's three deferral notes;
+- `docs/PLAN/OBSERVATIONS.md` (local, not committed);
+- tests only if Step 2 finds a gap.
+
+**Test runs.** Scoped runs use `--lib` and `--test` (the XProtect note in
+Tasks 8–10). The full gate in Step 8 is the one place that runs the whole
+workspace. Expect it to relink every integration binary and wait behind
+XProtect launch scans. Run it in the background and wait for it. Do not kill
+it as hung on a timer, and record its wall-clock time.
+
+- [x] **Step 1: Documentation (proposal §5.8)**
+
+  `docs/USER_GUIDE.md` gets a **Findings** section after "Browser
+  Diagnostics", covering:
+  - what a finding is;
+  - the **Findings** toggle, which appears only when the session has findings
+    and counts open errors;
+  - the panel's grouping (by source, then by file) and its two filters, with
+    their default of open errors;
+  - opening a location (spec 05's link, which opens VS Code at the line);
+  - Dismiss and Restore, and that dismissing is not suppression: a later
+    check reports the same problem again;
+  - **Fix selected**: only open findings are sent, and stale, dismissed and
+    fixed ones are left out with a note;
+  - what **stale** means (the file changed after the check ran) and why a
+    stale finding is not repaired (re-run the check);
+  - known limits:
+    - commands run from outside a conversation record no findings
+      (`context.md` §13.4);
+    - `cargo nextest` and every check without a parser produce one "unparsed
+      check" finding per failure (§10.5, §8.1);
+    - a browser location maps to a file only when exactly one file matches
+      (§12.3).
+
+  `docs/TROUBLESHOOTING.md` gets a **Findings** section, covering:
+  - which checks are parsed structurally: `cargo build`/`check`/`clippy`,
+    `cargo test`, Biome (`biome …`, `npm run lint*`), and the browser companion;
+  - which fall back to a generic finding, and **how to tell**: source
+    `command`, shown as "Unparsed checks", is the generic fallback and nothing
+    else;
+  - where full output lives: `<data dir>/commands/output/<originRef>/stdout.log`
+    and `stderr.log`; for a browser finding, `originRef` is the diagnostic
+    record id;
+  - the two session-log events, `finding_recorded` and
+    `finding_status_changed`, with a `jq` line in the style of spec 20's
+    `session_mode_set` example. Events carry `timestampMs`;
+  - that `Stale` is derived on read and never stored (§13.2).
+
+  Add both events to TROUBLESHOOTING's session-log event list, wherever spec
+  20 added `session_mode_set`.
+
+- [x] **Step 2: Walk every acceptance criterion into `proposal.md` §7**
+
+  Write a §7.x table of criterion, evidence and verdict. For each row,
+  **check that the cited test exists** with
+  `cargo nextest list -p <crate> --lib` or `--test <name>`. Then fill in the
+  evidence. The mapping below is the starting point, not a substitute for that
+  check:
+
+  | Criterion | Evidence to cite (verify each) |
+  |---|---|
+  | A failing test, a lint error and a browser console error normalise with source, severity and, where reported, range | Task 4's `rust_test` tests, `biome::tests::a_lint_error_keeps_its_rule_location_and_message`, `browser::tests::a_console_error_at_a_served_url_maps_to_the_one_repository_file`, and end to end in `finding_recording` |
+  | A check with no parser yields exactly one generic finding | `dispatch_tests::a_failure_no_parser_matches_yields_exactly_one_generic_finding` |
+  | A recognising parser that extracts nothing falls through | `dispatch_tests::a_matching_parser_that_extracts_nothing_falls_through_to_generic`, plus each parser's own fall-through test (Tasks 3–5) |
+  | No range for output with no location | the generic finding's `range: None`, `rust_diagnostics::…a_diagnostic_without_a_location_has_no_range`, `biome::…a_format_diagnostic_has_no_range`, and the browser page error |
+  | Browser: one finding per entry, and a tool failure with no entries gives one generic finding | `browser::tests::an_inspection_yields_one_finding_per_problem_in_report_order`, `a_runner_that_failed_yields_one_generic_finding`, and `a_non_companion_runner_failure_…`. **Restate the criterion** against `WebDiagnosticDetails`, because `entries` was never built (§7.1) |
+  | An out-of-repository browser location is dropped | `browser::tests::a_console_location_on_another_origin_has_no_range`, `an_ambiguous_served_path_has_no_range` and `a_bundled_url_…`, plus recording's `is_file` check (`finding_recording::an_approved_command_…`) |
+  | Clicking a ranged finding opens the file through spec 05 | Task 11's row, Step 7 (5): the element and its `data-path/line/col`, wired by spec 05's `wireFileReferences`. It was **not clicked**, because that launches VS Code, so record it as met by reuse and verified by attribute |
+  | Fix selected produces a scoped request with ids, excluding stale with a note | `repair::tests::*`, `finding_recording::a_finding_made_stale_by_an_edit_is_excluded_…`, the shell's `post_findings_repair_returns_the_request_and_its_prompt`, and Task 11's Step 7 (8) |
+  | Stale when the file hash no longer matches | `session::tests::a_changed_file_makes_its_finding_stale` (and `…deleted…`, `…reverted…`), and `finding_recording::an_approved_command_…` |
+  | No finding displays, persists or transmits an unredacted secret (command output, browser output, generic fallback) | `finding::tests::new_redacts_…` and `…straddling…`, `dispatch_tests::a_secret_in_failed_output_is_redacted_in_the_generic_finding`, and `browser::tests::a_secret_in_browser_output_is_redacted`. **Persistence:** check whether spec 12's `a_web_diagnostic_is_recorded_redacted_and_streamed` (`chat.rs`), which asserts that the whole session log lacks its secret, now also covers the findings Task 8 records from that run. If it does, cite it. If it does not, add one end-to-end test that reads the session log after a recorded secret-bearing finding |
+  | `details` bounded, and full output reachable through `origin_ref` | `finding::tests` bound tests, and `finding_recording::a_failed_sandbox_command_is_recorded_with_its_task_and_reachable_output` |
+  | Findings survive a restart with statuses intact | `session::tests::findings_and_their_statuses_survive_a_new_store_over_the_same_data_dir` |
+  | Dismissing does not suppress a later check's finding | `finding_recording::dismissing_a_finding_does_not_suppress_the_same_problem_from_a_later_check` |
+  | Every quality-gate command passes | Step 8 |
+
+  Then answer §7's two questions:
+  1. **Which parsers shipped, and what share of real failures fell through to
+     the generic parser.** The parsers are Rust diagnostics, Rust test, Biome
+     and browser. Measure the share if the evidence exists:
+     - the eval deterministic tier (Step 7), if its data dirs survive the run,
+       by counting `finding_recorded` events by `source`;
+     - otherwise, the failures actually seen while building, which are the
+       captured fixtures and the `ls`/`./cargo` runs.
+
+     Say plainly which of the two the number rests on. A small sample is still
+     the answer, as long as it says it is small.
+  2. **`entries`:** answered by §7.1. Spec 12 supplied `WebDiagnosticDetails`,
+     and `entries` was never added.
+
+  Also list the known gaps, each pointing at its `context.md` section:
+  - the standalone `/api/run-command` records no findings (§13.4);
+  - the approval-resume path attaches no plan evidence, which predates this
+    spec (§14);
+  - `cargo nextest` gets a generic finding (§10.5);
+  - percent-encoded served paths never map (§12.3);
+  - Task 10's stack-frame finding: arms that hold a `WorkspaceEngine` must be
+    functions.
+
+- [x] **Step 3: Spec 21's deferral, now closed**
+
+  Spec 21 still says `Evidence::Findings` is deferred or not implemented, in
+  three places:
+  - `21_task_plan_progress_and_budget/proposal.md:~189` (the deferral note);
+  - `proposal.md:~418` (the table row "**not implemented**");
+  - `context.md:~180-185`.
+
+  Add a dated note to each, in the style of spec 12's "superseded" notes in
+  this spec: built by spec 22 Task 7, attached by Task 8, informational and
+  never deciding status (spec 22 `context.md` §13.3). Keep the original text
+  as history. Leave `21/tasks.md`'s progress records alone, because they are
+  history.
+
+- [x] **Step 4: `Depends on:` lines**
+
+  Flip #22 to "built" in each dependent's header:
+  - `23_verification_loop.md`, around line 10;
+  - `24_repository_map_and_monorepo_boundaries.md`, around line 9;
+  - `26_context_assembly.md`, around line 9;
+  - `32_hooks.md`, around lines 8–9. Change only the #22 clause; #31's status
+    is spec 31's to update;
+  - `35_commit_preparation.md`, around line 9.
+
+  Find any others with
+  `grep -rn "22_findings_model_and_panel" docs/specs/*.md docs/specs/*/proposal.md`,
+  and read each hit's `Depends on:` paragraph. Not every mention is a
+  dependency.
+
+- [x] **Step 5: "What to build next"**
+
+  Re-derive `docs/specs/README.md`'s section from the `Depends on:` lines, as
+  its own preamble says. Take #22 out of the ready set and the keystone
+  wording, and promote every spec whose last unmet dependency was #22. Check
+  #23, #24, #32 and #35 against their *other* dependencies. Spec 31 may be
+  finished or in flight, so read its current status rather than assuming
+  either. Add a dated "Re-derived on …, when #22 was finished" paragraph, as
+  #20's and #12's close-outs did. Update the dependency diagram if a line
+  changes.
+
+- [x] **Step 6: Status records and the changelog**
+
+  All four records must agree (`AGENTS.md`):
+  - `proposal.md`'s `Status:` becomes Done with the date, plus a one-line
+    summary;
+  - README row 22 becomes **Done** with a summary in the style of row 21's.
+    Name the planning corrections that changed the design: the `file_hash`
+    field, private fields, drafts, redact-then-bound, `FindingSource::Command`
+    and `BrowserScenario`, the split of Task 7, and the `agentic` bypass;
+  - this file's header becomes `**Started:** 2026-09-25 — **Done:** <date>`;
+  - row 12 records what landed.
+
+  In `CHANGELOG.md`, remove the first bullet of the `Next` row ("Turn failing
+  tests, compiler errors, lint warnings and browser console errors into one
+  kind of addressable finding…"). Do not add a release row; the release
+  pipeline writes those.
+
+  Add these to `docs/PLAN/OBSERVATIONS.md`, following that file's own rules
+  for an entry:
+  - the standalone `/api/run-command` gap (§13.4);
+  - the approval-resume evidence gap (§14);
+  - Task 10's `handle_connection` stack-frame finding, unless the shell now
+    guards it;
+  - the XProtect test-run latency that Tasks 8–10 measured, with its
+    evidence. That file is local and not committed, so do not link it from
+    committed docs.
+
+- [x] **Step 7: Eval harness**
+
+  ```bash
+  cargo run -p eval-harness -- run --tier deterministic
+  ```
+
+  Every scenario must pass. Compare the metrics with `evals/baseline.json`.
+  Task 8's run matched except tokens (101950 against 101963) and wall-clock
+  latency. Record any metric that moved and why. Do not regenerate the baseline
+  unless a scenario or the harness changed, which nothing in this spec did.
+
+- [ ] **Step 8: The full seven-command gate**
+
+  ```bash
+  cargo fmt --all -- --check
+  cargo clippy --workspace --all-targets --locked -- -D warnings
+  cargo nextest run --workspace --locked
+  node --check crates/desktop-shell/static/app.js
+  npm run lint:web
+  typos
+  cargo deny check
+  ```
+
+  Also run `npm run specs:check` and read its output. All seven must pass
+  before the spec is called Done. Record the counts and wall-clock times. If
+  a test fails only in the full run, note whether it is a known flake, for
+  example `OBSERVATIONS.md` #13's temp-dir race in `eval-harness`. Rerun it
+  alone before calling it one.
+
+- [ ] **Step 9: Show the change and the gate results, and ask before
+  committing**

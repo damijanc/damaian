@@ -1,7 +1,10 @@
 # Feature Spec: Findings Model and Panel
 
-Status: In progress. Split into a folder and planned on 2026-09-25. Design
-unchanged from the original flat spec; corrections where it no longer matches
+Status: Done 2026-10-04. One redacted, addressable `Finding` type, four
+parsers with a generic fallback, findings persisted in the session log, and a
+panel to open, dismiss or ask for a fix of a selected subset; §7 records what
+was built and what was left out. Split into a folder and planned on
+2026-09-25. Design unchanged from the original flat spec; corrections where it no longer matches
 the code — most importantly, §5.1's `Finding` has no field for the hash its own
 staleness rule compares against, and its public fields contradict §5.6's
 "no code path can create an unredacted finding" — are in
@@ -371,11 +374,108 @@ generic-fallback finding from a parsed one, and where full output lives.
 
 ## 7. Implementation Notes
 
-To be completed during implementation. Record:
+Built in twelve tasks between 2026-09-25 and 2026-10-04.
+[`tasks.md`](tasks.md)'s Progress table has the per-task detail, including the
+mutation runs. [`context.md`](context.md) has every correction to §§1–6. This
+section is the summary.
 
-- Which parsers were shipped, and the share of real failures during testing that
-  fell through to the generic parser. A high share is not a failure of this spec,
-  but it tells the next person where to add a parser.
-- Whether `WebDiagnosticReport.entries` was added in coordination with
-  [spec 12](../12_web_app_troubleshooting/proposal.md), or whether that spec had already
-  closed and the text-parsing fallback was used instead.
+The two questions this section was asked to answer:
+
+- **Which parsers shipped, and how many real failures fell through.** Four
+  shipped: Rust diagnostics (`cargo build`/`check`/`clippy`), Rust test
+  (`cargo test`, which runs the diagnostics parser over the same output
+  first), Biome (`biome …` and `npm`/`pnpm`/`yarn run lint`/`lint:*`), and
+  browser findings from spec 12's `WebDiagnosticDetails`. They sit beside the
+  generic fallback, whose source is `Command` (`context.md` §8.1). The share
+  rests on **the failures captured while building**, not on the eval tier.
+  Task 12's deterministic run recorded eight findings, all generic, all from
+  `failed_validation_retry`'s eight `ls no-such-directory` rounds. `ls` has no
+  parser and none was intended, so the tier says nothing about how often a
+  parsed tool falls through (§7.3). The captured sample is small. Of eight real failing runs from tools in scope, **two fell through
+  (25%)**:
+  - **parsed:** a `cargo build` with errors, `cargo clippy -D warnings`, a
+    `cargo test` that failed to compile, a `cargo test --no-fail-fast` with
+    eight failures across lib, integration and doctest, a failing Biome run
+    (`npm run lint:web` on seeded problems), and spec 12's companion report;
+  - **generic:** a `cargo test` whose binary died of `SIGABRT` after a warning
+    (§10.3), and `cargo nextest run` (§10.5).
+
+  Task 8's `ls no-such-directory` is a third generic finding, but `ls` has no
+  parser and none was intended. The next parser worth adding is **nextest**,
+  because this repository's own gate uses it. `context.md` §10.5 sketches what
+  it would read.
+- **`WebDiagnosticReport.entries`** was never added. Spec 12 closed first, on
+  2026-09-29, and its close-out built the structure as
+  `WebDiagnosticReport.details: Option<WebDiagnosticDetails>`. Findings come
+  from `details`. The text-parsing fallback §5.4 rejected was not used either
+  (`context.md` §7.1, §12).
+
+### 7.1 Where each part lives
+
+- **The type:** `crates/workspace-engine/src/finding.rs`. Every field is
+  private. `Finding::new(draft, &scanner)` is the only constructor, and it
+  redacts, then bounds: 240 characters of summary, 4096 bytes of details.
+  Builders attach the task, the origin and the file hash, and
+  `without_range` drops a range. None of them takes free text (`context.md`
+  §§1–4).
+- **Parsers** return `FindingDraft`s, never `Finding`s. One dispatcher,
+  `findings_from_execution`, turns drafts into findings. It falls through to
+  the generic finding when a failed run has no `Error` draft (§10.3), and
+  never for a cancelled run (§8.2). Each parser has its own file under
+  `src/finding/`, with captured fixtures.
+- **Browser:** `finding/browser.rs`, `findings_from_web_record`. A served URL
+  maps to a range only when exactly one repository file matches (§12.3).
+- **Persistence:** `SessionStore::record_finding`, `set_finding_status` and
+  `read_findings` (`session.rs`), in two events, `finding_recorded` and
+  `finding_status_changed`. `Stale` is derived on read and never stored.
+- **Recording:** `chat.rs`, at the sandbox auto-run, the approval resume and
+  `run_and_record_web_diagnostic`. A range survives only if it names a file in
+  the repository, and the file is hashed at that moment. The sandbox path
+  attaches `Evidence::Findings` beside its `CommandExit`.
+- **Repair:** `finding/repair.rs`, `RepairRequest`. Only `Open` findings are
+  kept. Stale, dismissed, fixed and unknown ids are excluded, each with its
+  reason (§15).
+- **Shell:** `GET /api/findings`, `POST /api/finding-status` and
+  `POST /api/findings-repair` (§16). **Panel:** `#findings-panel` in the web
+  UI, with "Fix selected" sent as an agentic turn that bypasses the
+  edit-request heuristic (§17).
+
+### 7.2 Acceptance criteria (§6), each with its evidence
+
+Every test named below was checked to exist with `cargo nextest list` on
+2026-10-04.
+
+| Criterion | Evidence | Verdict |
+|---|---|---|
+| A failing test, a lint error and a browser console error normalise with source, severity and, where reported, range | `finding::rust_test::tests::a_panic_takes_its_location_and_message`, `a_failure_in_an_integration_test_binary_is_found_too`; `finding::biome::tests::a_lint_error_keeps_its_rule_location_and_message`; `finding::browser::tests::a_console_error_at_a_served_url_maps_to_the_one_repository_file`. End to end: `finding_recording::a_browser_console_error_is_recorded_with_its_mapped_range_and_record` and `an_approved_command_records_findings_with_checked_and_hashed_ranges` | Met |
+| A check with no parser yields exactly one generic finding, never zero | `finding::dispatch_tests::a_failure_no_parser_matches_yields_exactly_one_generic_finding`, `a_timeout_is_a_failure_even_without_an_exit_code`, `a_signal_kill_is_a_failure`; end to end, `finding_recording::a_failed_sandbox_command_is_recorded_with_its_task_and_reachable_output` | Met |
+| A parser that recognises a command but extracts nothing falls through | `finding::dispatch_tests::a_matching_parser_that_extracts_nothing_falls_through_to_generic`, `a_failure_whose_parser_found_only_warnings_also_gets_the_generic_finding`, and each parser's own: `rust_diagnostics::tests::a_failed_build_this_parser_cannot_read_falls_through_to_generic`, `rust_test::tests::a_failed_cargo_test_this_parser_cannot_read_falls_through_to_generic`, `a_crashed_test_binary_with_a_warning_still_gets_the_generic_finding`, `biome::tests::a_failed_lint_script_that_is_not_biome_falls_through_to_generic` | Met |
+| No range for output with no location | the generic finding's `range` in `a_failure_no_parser_matches_…`; `rust_diagnostics::tests::a_diagnostic_without_a_location_has_no_range`; `biome::tests::a_format_diagnostic_has_no_range`; `browser::tests::a_page_error_is_a_console_error_without_a_location`; `rust_test::tests::a_failure_whose_section_was_cut_off_keeps_its_name_and_no_range` | Met |
+| Browser: one finding per entry; a failed tool with nothing to convert gives one generic finding | Restated against `WebDiagnosticDetails`, because `entries` was never built (`context.md` §7.1): `browser::tests::an_inspection_yields_one_finding_per_problem_in_report_order`, `a_runner_that_failed_yields_one_generic_finding`, `a_non_companion_runner_failure_yields_one_generic_finding_from_its_text` | Met, as restated |
+| A browser location outside the repository is dropped | `browser::tests::a_console_location_on_another_origin_has_no_range`, `an_ambiguous_served_path_has_no_range`, `a_bundled_url_with_no_repository_file_has_no_range`; recording's file check in `finding_recording::an_approved_command_…` (`src/gone.rs` loses its range) | Met |
+| Clicking a ranged finding opens the file through spec 05 | Task 11's browser walk-through, item (5): the location is spec 05's `button.file-reference` with `data-path`, `data-line` and `data-col`, wired by the existing `wireFileReferences`. It was **not clicked**, because that launches VS Code. There is no JS test suite | Met by reuse, verified by attribute |
+| Fix selected produces a scoped request with ids, excluding stale with a note | `finding::repair::tests::*` (9 tests), `finding_recording::a_finding_made_stale_by_an_edit_is_excluded_when_the_request_is_built`, the shell's `post_findings_repair_returns_the_request_and_its_prompt`, and Task 11's walk-through, item (8) | Met |
+| Stale when the file hash no longer matches | `session::tests::a_changed_file_makes_its_finding_stale`, `a_deleted_file_makes_its_finding_stale`, `staleness_is_derived_on_read_so_a_reverted_file_reopens_its_finding`; end to end in `finding_recording::an_approved_command_…` | Met |
+| No finding displays, persists or transmits an unredacted secret: command output, browser output, generic fallback | **Construction:** `finding::tests::new_redacts_a_secret_in_summary_and_details`, `a_secret_straddling_the_details_bound_is_redacted_not_cut`. **Generic fallback:** `dispatch_tests::a_secret_in_failed_output_is_redacted_in_the_generic_finding`. **Browser:** `browser::tests::a_secret_in_browser_output_is_redacted`. **Persistence, added by Task 12:** `finding_recording::a_secret_in_a_failed_command_is_not_in_the_recorded_finding` reads the stored `finding_recorded` line for a command whose secret reaches the generic summary. Spec 12's `chat::…::a_web_diagnostic_is_recorded_redacted_and_streamed` now asserts that its page error was recorded as a finding, so its whole-log check covers persisted browser findings. **Transmission:** the repair prompt renders from these findings, and nothing else | Met |
+| `details` bounded; full output reachable through `origin_ref` | `finding::tests::details_are_bounded_on_a_char_boundary`, `details_within_the_bound_are_kept_verbatim`; `finding_recording::a_failed_sandbox_command_is_recorded_with_its_task_and_reachable_output` reads `stderr.log` under `origin_ref` | Met |
+| Findings survive a restart with their statuses intact | `session::tests::findings_and_their_statuses_survive_a_new_store_over_the_same_data_dir` | Met |
+| Dismissing does not suppress a later check's finding | `finding_recording::dismissing_a_finding_does_not_suppress_the_same_problem_from_a_later_check` | Met |
+| Every quality-gate command passes | [`tasks.md`](tasks.md), Task 12's row | See that row |
+
+### 7.3 Known gaps, named rather than implied
+
+- **A command run outside a conversation records no findings.** The
+  standalone `/api/run-command` has no session or task (`context.md` §13.4).
+- **The approval-resume path attaches no plan evidence.** It records findings
+  but attaches neither `CommandExit` nor `Findings`. The missing `CommandExit`
+  predates this spec (§14).
+- **`cargo nextest run` gets one generic finding**, compile errors included
+  (§10.5).
+- **Percent-encoded served paths never map to a file** (§12.3).
+- **The eval harness has no scenario whose failing check has a parser.** Its
+  one failing check is `ls`, so it cannot measure the generic share for parsed
+  tools. That is why §7's share rests on captured failures.
+- **Shell routes that hold a `WorkspaceEngine` must be functions,** not
+  inline arms of `handle_connection`. Inline, their locals share one frame,
+  and a debug build overflowed the default thread stack (Task 10, deviation
+  1). Nothing in the shell enforces this. A comment above the arms says why.
