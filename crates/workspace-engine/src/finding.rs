@@ -167,6 +167,14 @@ impl Finding {
         self
     }
 
+    /// Removes the range. Recording drops a parser's range when it does not
+    /// name a file in the repository (`context.md` §13.4). It adds no text,
+    /// so the redaction guarantee is unaffected.
+    pub fn without_range(mut self) -> Self {
+        self.range = None;
+        self
+    }
+
     pub fn set_status(&mut self, status: FindingStatus) {
         self.status = status;
     }
