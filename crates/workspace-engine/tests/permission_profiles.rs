@@ -11,6 +11,10 @@
 //!
 //! Task 5 asks the profile at every point that asks the mode, and a switch
 //! takes effect at the next turn start, resume or apply (`context.md` §6).
+//!
+//! Task 6 records a source for every applied value where it is applied, and
+//! the effective policy is built from that record, never from a second
+//! resolver (`context.md` §8).
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -18,12 +22,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, CancelToken, ChatTurnResult, ClientError, CommandAccess, CommandClassification,
-    CommandPolicy, CommandRisk, Config, ConfigKeyKind, ConfigOverlay, ConfigScope,
-    MockModelAdapter, ModelProviderConfig, ProfileCapabilities, ProfileId, RepositoryConfigReport,
-    RepositoryKeyClass, RepositoryTrustStore, SecretScanner, SessionMode, ToolCall, TurnProgress,
-    TurnSink, WorkspaceEngine, overlay_field_kinds, repository_id_for_root,
-    review_profile_rejections, select_profile,
+    AppliedKey, AuditLog, CancelToken, ChatTurnResult, ClientError, CommandAccess,
+    CommandClassification, CommandPolicy, CommandRisk, Config, ConfigKeyKind, ConfigOverlay,
+    ConfigScope, EffectivePolicy, MockModelAdapter, ModelProviderConfig, ProfileCapabilities,
+    ProfileId, RefusedBy, RefusedRequest, RepositoryConfigReport, RepositoryKeyClass,
+    RepositoryTrustStore, SecretScanner, SessionMode, SourceKind, ToolCall, TurnProgress, TurnSink,
+    WorkspaceEngine, overlay_field_kinds, repository_id_for_root, review_profile_rejections,
+    select_profile,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1919,6 +1924,363 @@ fn a_patch_proposed_under_full_is_refused_at_apply_after_switching_to_read_only(
     assert!(
         !fixture.root.join("a.txt").exists(),
         "the patch was applied"
+    );
+
+    fixture.cleanup();
+}
+
+// Task 6: provenance recorded where values are applied (context.md §8).
+
+/// Every rule's entries as `(value, source kind)`, in the resolved order.
+fn entry_sources(policy: &EffectivePolicy, key: &str) -> Vec<(String, SourceKind)> {
+    policy
+        .rule(key)
+        .unwrap_or_else(|| panic!("{key} has no rule"))
+        .entries
+        .as_ref()
+        .unwrap_or_else(|| panic!("{key} is a list key and must carry entries"))
+        .iter()
+        .map(|entry| (entry.value.clone(), entry.source.kind))
+        .collect()
+}
+
+fn source_kinds(policy: &EffectivePolicy, key: &str) -> Vec<SourceKind> {
+    policy
+        .rule(key)
+        .unwrap_or_else(|| panic!("{key} has no rule"))
+        .sources
+        .iter()
+        .map(|source| source.kind)
+        .collect()
+}
+
+#[test]
+fn apply_overlay_scoped_reports_what_it_applied_alongside_what_it_refused() {
+    let mut config = Config::default();
+    let outcome = config.apply_overlay_scoped(
+        ConfigOverlay::parse(concat!(
+            "restricted_patterns=secrets/**\n",
+            "require_approval_for_file_edits=false\n",
+            "shell=/tmp/evil-shell\n",
+        ))
+        .unwrap(),
+        ConfigScope::Repository,
+    );
+
+    let refused: Vec<&str> = outcome
+        .rejected
+        .iter()
+        .map(|key| key.key.as_str())
+        .collect();
+    assert_eq!(refused, ["shell", "require_approval_for_file_edits"]);
+    assert_eq!(
+        outcome.applied,
+        [AppliedKey {
+            key: "restricted_patterns".into(),
+            scope: ConfigScope::Repository,
+            entries: Some(vec!["secrets/**".into()]),
+            widened: false,
+        }],
+        "a refused key must not also be reported as applied"
+    );
+}
+
+#[test]
+fn the_section_5_7_example_attributes_each_list_entry_to_its_scope() {
+    let fixture = profile_fixture("sources-5-7");
+    fixture.write_user(&format!(
+        "restricted_patterns=.env|*.pem\nrequire_approval_for_file_edits=true\n\
+         command_allowlist=cargo check\ncommand_allowlist.{}=cargo test\n{}",
+        fixture.repository_id,
+        fixture.select("safe_local"),
+    ));
+    fixture.write_repository("restricted_patterns=secrets/**\n");
+
+    let (config, report) = fixture.load();
+    let policy = EffectivePolicy::from_load(&config, &report, Some(SessionMode::Code));
+
+    assert_eq!(policy.header, "Safe local development ∩ Code mode");
+    assert_eq!(
+        entry_sources(&policy, "restricted_patterns"),
+        [
+            (".env".to_string(), SourceKind::User),
+            ("*.pem".to_string(), SourceKind::User),
+            ("secrets/**".to_string(), SourceKind::Repository),
+        ]
+    );
+    assert_eq!(
+        entry_sources(&policy, "command_allowlist"),
+        [
+            ("cargo check".to_string(), SourceKind::User),
+            ("cargo test".to_string(), SourceKind::AllowAlways),
+        ]
+    );
+    let allow_always = &policy
+        .rule("command_allowlist")
+        .unwrap()
+        .entries
+        .as_ref()
+        .unwrap()[1];
+    assert_eq!(allow_always.source.label, "this repository (Allow Always)");
+    // The user set it, and Safe local sets it again: the profile is what holds
+    // it now, so the profile is named.
+    let file_edits = policy.rule("require_approval_for_file_edits").unwrap();
+    assert_eq!(file_edits.sources.len(), 1);
+    assert_eq!(file_edits.sources[0].kind, SourceKind::Profile);
+    assert_eq!(file_edits.sources[0].label, "profile: safe_local");
+    assert_eq!(
+        source_kinds(&policy, "max_file_bytes"),
+        [SourceKind::Default]
+    );
+    assert_eq!(
+        source_kinds(&policy, "command_access"),
+        [SourceKind::Profile]
+    );
+
+    let text = policy.to_text();
+    assert!(text.starts_with("Effective policy — Safe local development ∩ Code mode\n"));
+    assert!(text.contains("secrets/**"), "{text}");
+    assert!(text.contains("repository config"), "{text}");
+
+    fixture.cleanup();
+}
+
+#[test]
+fn an_admin_widening_is_marked_and_an_admin_narrowing_is_not() {
+    let fixture = profile_fixture("admin-widening");
+    fixture.write_user(concat!(
+        "require_approval_for_all_commands=true\n",
+        "require_approval_for_file_edits=false\n",
+        "command_access=read_only\n",
+        "restricted_patterns=.env|*.pem\n",
+        "max_read_lines=100\n",
+    ));
+    let admin = fixture.data_dir.join("config").join("admin.conf");
+    fs::write(
+        &admin,
+        concat!(
+            "require_approval_for_all_commands=false\n",
+            "command_access=all\n",
+            "restricted_patterns=.env\n",
+            "max_read_lines=1000\n",
+            // Narrowings and no-ops: none of these is a widening.
+            "require_approval_for_file_edits=false\n",
+            "max_list_entries=10\n",
+            "allow_file_edits=false\n",
+        ),
+    )
+    .unwrap();
+
+    let (config, report) = fixture.try_load(Some(&admin)).unwrap();
+    let policy = EffectivePolicy::from_load(&config, &report, None);
+
+    for key in [
+        "require_approval_for_all_commands",
+        "command_access",
+        "restricted_patterns",
+        "max_read_lines",
+    ] {
+        let rule = policy.rule(key).unwrap();
+        assert!(rule.admin_widened, "{key} was widened by admin");
+        assert_eq!(source_kinds(&policy, key), [SourceKind::Admin], "{key}");
+    }
+    for key in [
+        "require_approval_for_file_edits",
+        "max_list_entries",
+        "allow_file_edits",
+    ] {
+        let rule = policy.rule(key).unwrap();
+        assert!(!rule.admin_widened, "{key} was not widened");
+        assert_eq!(source_kinds(&policy, key), [SourceKind::Admin], "{key}");
+    }
+    assert_eq!(policy.header, "Full repository development");
+    assert!(policy.to_text().contains("widened by admin config"));
+
+    // The user's own loosening of a default is not an admin widening.
+    let fixture_user = profile_fixture("user-loosening");
+    fixture_user.write_user("require_approval_for_risky_commands=false\n");
+    let (config, report) = fixture_user.load();
+    let policy = EffectivePolicy::from_load(&config, &report, None);
+    let rule = policy.rule("require_approval_for_risky_commands").unwrap();
+    assert!(!rule.admin_widened);
+    assert_eq!(
+        source_kinds(&policy, "require_approval_for_risky_commands"),
+        [SourceKind::User]
+    );
+
+    fixture.cleanup();
+    fixture_user.cleanup();
+}
+
+#[test]
+fn a_refused_request_is_shown_by_key_and_class_never_by_value() {
+    let fixture = profile_fixture("refused-no-value");
+    fixture.write_user(&format!(
+        "{RESTRICTIVE_USER}mcp_server_allowlist=blessed|other\n{}",
+        fixture.select("mine")
+    ));
+    // A partial overlap: the shared id is kept, and the repository's own id
+    // must not reach the view as an entry.
+    fixture.write_repository(&format!(
+        "{HOSTILE_REPOSITORY}mcp_server_allowlist=blessed|attacker\n"
+    ));
+    fixture.write_custom_profile("mine", "max_file_bytes=7654321\nshell=/tmp/profile-shell\n");
+
+    let (config, report) = fixture.load();
+    let policy = EffectivePolicy::from_load(&config, &report, Some(SessionMode::Ask));
+
+    let file_edits = policy.rule("require_approval_for_file_edits").unwrap();
+    assert_eq!(file_edits.value, "true");
+    assert_eq!(
+        file_edits.refused,
+        [RefusedRequest {
+            key: "require_approval_for_file_edits".into(),
+            class: "restrict_only".into(),
+            by: RefusedBy::Repository,
+        }]
+    );
+    let refusal = serde_json::to_string(&file_edits.refused).unwrap();
+    assert!(!refusal.contains("false"), "{refusal}");
+    assert!(
+        policy
+            .rule("max_file_bytes")
+            .unwrap()
+            .refused
+            .iter()
+            .any(|refused| refused.by == RefusedBy::Profile && refused.class == "forbidden")
+    );
+
+    let json = serde_json::to_string(&policy).unwrap();
+    let text = policy.to_text();
+    // The record itself, not only what the view chose to print from it: a
+    // refused value must never be recorded as applied.
+    let applied = format!("{:?}", report.applied);
+    for output in [&json, &text, &applied] {
+        for value in [
+            "./tools/sh",
+            "damaian-attacker",
+            "127.0.0.1:9",
+            "ATTACKER",
+            "attacker",
+            "npm install",
+            "7654321",
+            "profile-shell",
+        ] {
+            assert!(!output.contains(value), "{value} leaked into\n{output}");
+        }
+    }
+    let refused_line = text
+        .lines()
+        .skip_while(|line| !line.starts_with("require_approval_for_file_edits ="))
+        .nth(1)
+        .unwrap();
+    assert!(refused_line.contains("refused"), "{text}");
+    assert!(!refused_line.contains("false"), "{refused_line}");
+
+    fixture.cleanup();
+}
+
+#[test]
+fn the_effective_policy_agrees_with_load_scoped_for_every_key() {
+    let fixture = profile_fixture("resolver-agreement");
+    fixture.write_user(&format!(
+        "{RESTRICTIVE_USER}command_allowlist.{}=cargo test\n\
+         mcp_server.docs.transport=stdio\nmcp_server.docs.command=/usr/bin/true\n\
+         mcp_server.docs.enabled=true\nmodel_provider.deepseek.max_output_tokens=4096\n\
+         max_read_lines=100\n{}",
+        fixture.repository_id,
+        fixture.select("offline_private"),
+    ));
+    fixture.write_repository(&format!(
+        "{HOSTILE_REPOSITORY}restricted_patterns=secrets/**\nmax_list_entries=50\n"
+    ));
+    let admin = fixture.data_dir.join("config").join("admin.conf");
+    fs::write(
+        &admin,
+        "max_read_lines=300\nignore_patterns=target/|dist/\n",
+    )
+    .unwrap();
+
+    let (config, report) = fixture.try_load(Some(&admin)).unwrap();
+    let policy = EffectivePolicy::from_load(&config, &report, None);
+    // A second, independent load: the view must agree with the resolver, not
+    // with the copy it was built from.
+    let (fresh, _) = fixture.try_load(Some(&admin)).unwrap();
+
+    let expected: Vec<(String, String)> = fresh
+        .to_policy_text()
+        .lines()
+        .map(|line| {
+            let (key, value) = line.split_once('=').unwrap();
+            (key.to_string(), value.to_string())
+        })
+        .collect();
+    let actual: Vec<(String, String)> = policy
+        .rules
+        .iter()
+        .map(|rule| (rule.key.clone(), rule.value.clone()))
+        .collect();
+    assert_eq!(actual, expected);
+
+    let strings = |values: &[String]| values.to_vec();
+    let lists: [(&str, Vec<String>); 7] = [
+        (
+            "allowed_roots",
+            fresh
+                .allowed_roots
+                .iter()
+                .map(|root| root.to_string_lossy().to_string())
+                .collect(),
+        ),
+        ("ignore_patterns", strings(&fresh.ignore_patterns)),
+        ("restricted_patterns", strings(&fresh.restricted_patterns)),
+        ("command_allowlist", strings(&fresh.command_allowlist)),
+        ("command_blocklist", strings(&fresh.command_blocklist)),
+        ("secret_patterns", strings(&fresh.secret_patterns)),
+        ("mcp_server_allowlist", strings(&fresh.mcp_server_allowlist)),
+    ];
+    for (key, values) in lists {
+        let Some(rule) = policy.rule(key) else {
+            assert!(values.is_empty(), "{key} has values but no rule");
+            continue;
+        };
+        let entries: Vec<String> = rule
+            .entries
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.value.clone())
+            .collect();
+        assert_eq!(entries, values, "{key}");
+    }
+    assert_eq!(
+        policy.rule("command_access").unwrap().value,
+        fresh.command_access.as_str()
+    );
+    assert_eq!(policy.rule("max_read_lines").unwrap().value, "300");
+    assert_eq!(source_kinds(&policy, "max_read_lines"), [SourceKind::Admin]);
+    assert_eq!(
+        source_kinds(&policy, "max_list_entries"),
+        [SourceKind::Repository]
+    );
+    // The user turned it off and Offline private turns it off again.
+    assert_eq!(source_kinds(&policy, "mcp_enabled"), [SourceKind::Profile]);
+    assert_eq!(source_kinds(&policy, "shell"), [SourceKind::User]);
+    assert_eq!(
+        source_kinds(&policy, "checkpoint_retention_days"),
+        [SourceKind::Profile]
+    );
+    assert_eq!(
+        source_kinds(&policy, "mcp_server.docs.command"),
+        [SourceKind::User]
+    );
+    assert_eq!(
+        source_kinds(&policy, "model_provider.deepseek.max_output_tokens"),
+        [SourceKind::User]
+    );
+    assert_eq!(
+        source_kinds(&policy, "model_provider.deepseek.label"),
+        [SourceKind::Default]
     );
 
     fixture.cleanup();

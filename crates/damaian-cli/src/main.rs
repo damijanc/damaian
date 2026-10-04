@@ -3,10 +3,10 @@ use std::io::IsTerminal;
 use std::path::Path;
 use workspace_engine::{
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, CommandProposal, CommandRisk, Config, ConfigOverlay,
-    ConfigScope, CurlModelTransport, DataSchemaOutcome, MockModelAdapter, OpenAICompatibleAdapter,
-    ProcessRegistry, ProfileId, ReadWindow, SearchResult, WorkspaceEngine, command_approval_prompt,
-    ensure_data_dir_schema, parse_hunk_selection, patch_diff_text, patch_hunk_summary,
-    render_markdown_to_ansi, review_profile_rejections, select_profile,
+    ConfigScope, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, MockModelAdapter,
+    OpenAICompatibleAdapter, ProcessRegistry, ProfileId, ReadWindow, SearchResult, WorkspaceEngine,
+    command_approval_prompt, ensure_data_dir_schema, parse_hunk_selection, patch_diff_text,
+    patch_hunk_summary, render_markdown_to_ansi, review_profile_rejections, select_profile,
 };
 
 fn usage() -> &'static str {
@@ -20,7 +20,7 @@ fn usage() -> &'static str {
   damaian git-diff <repo>
   damaian detect-commands <repo>
   damaian classify-command <command>
-  damaian config-show [repo]
+  damaian config-show [--sources] [repo]
   damaian config-review <repo>
   damaian config-allowlist-keep <repo> [command...]
   damaian config-set user <key> <value>
@@ -214,12 +214,15 @@ fn run() -> workspace_engine::Result<()> {
             );
         }
         "config-show" => {
-            let config = if let Some(repo) = args.get(1) {
-                Config::load_for_repository(Some(Path::new(repo)))?
+            // `--sources` attributes every rule (spec 31, proposal §5.7). The
+            // CLI has no session, so the header names the profile alone.
+            let sources = args.get(1).is_some_and(|arg| arg == "--sources");
+            let repo = args.get(if sources { 2 } else { 1 }).map(Path::new);
+            if sources {
+                print!("{}", EffectivePolicy::resolve(repo, None)?.to_text());
             } else {
-                Config::load_for_repository(None)?
-            };
-            print!("{}", config.to_policy_text());
+                print!("{}", Config::load_for_repository(repo)?.to_policy_text());
+            }
         }
         "config-review" => {
             let repo = require_arg(&args, 1, "<repo>")?;
@@ -688,7 +691,9 @@ fn repository_scope_refusals(
     let mut probe = Config::load_for_repository(Some(Path::new(repo)))?;
     let mut single = ConfigOverlay::default();
     single.set(key, value)?;
-    Ok(probe.apply_overlay_scoped(single, ConfigScope::Repository))
+    Ok(probe
+        .apply_overlay_scoped(single, ConfigScope::Repository)
+        .rejected)
 }
 
 fn set_config_value(args: &[String]) -> workspace_engine::Result<()> {

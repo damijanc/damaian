@@ -9,6 +9,7 @@ pub mod context_manager;
 pub mod data_schema;
 pub mod diff;
 pub mod edit;
+pub mod effective_policy;
 pub mod embeddings;
 pub mod error;
 pub mod file_access;
@@ -56,10 +57,10 @@ pub use command_policy::{
 };
 pub use command_runner::{CommandExecution, CommandRunOptions, CommandRunner, CommandTermination};
 pub use config::{
-    CommandAccess, Config, ConfigKeyKind, ConfigOverlay, ConfigScope, CostEstimate,
+    AppliedKey, CommandAccess, Config, ConfigKeyKind, ConfigOverlay, ConfigScope, CostEstimate,
     DEFAULT_CONTEXT_TOKEN_BUDGET, McpServerConfig, McpServerConfigOverlay, McpTransport,
-    ModelProviderConfig, ModelProviderConfigOverlay, RejectedConfigKey, RepositoryConfigReport,
-    RepositoryKeyClass, normalize_mcp_server_id, normalize_model_provider,
+    ModelProviderConfig, ModelProviderConfigOverlay, OverlayOutcome, RejectedConfigKey,
+    RepositoryConfigReport, RepositoryKeyClass, normalize_mcp_server_id, normalize_model_provider,
     normalize_model_reasoning_level, overlay_field_kinds, parse_mcp_transport,
 };
 pub use context_manager::{ContextItem, ContextManager, ContextPlan};
@@ -70,6 +71,9 @@ pub use diff::{DiffLine, Hunk, create_unified_diff, diff_file, reconstruct_conte
 pub use edit::{
     EditOrchestrator, EditProposalResult, GeneratedEdit, PatchStore, parse_generated_edit,
     patch_diff_text, patch_hunk_summary,
+};
+pub use effective_policy::{
+    EffectivePolicy, PolicyEntry, PolicyRule, PolicySource, RefusedBy, RefusedRequest, SourceKind,
 };
 pub use error::{ClientError, ProviderRefusal, Result};
 pub use file_access::{FileAccessController, FileRead, LineRange, ReadWindow};

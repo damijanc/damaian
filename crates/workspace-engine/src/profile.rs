@@ -72,6 +72,18 @@ impl ProfileId {
         }
     }
 
+    /// The name a person reads, as `context.md` §3 names the built-ins. A
+    /// custom profile is shown by its own name.
+    pub fn label(&self) -> &str {
+        match self {
+            ProfileId::ReadOnly => "Read-only",
+            ProfileId::SafeLocal => "Safe local development",
+            ProfileId::Full => "Full repository development",
+            ProfileId::OfflinePrivate => "Offline private",
+            ProfileId::Custom(name) => name,
+        }
+    }
+
     /// Where a custom profile's file lives; `None` for a built-in. The name is
     /// checked again here because `Custom` can be built without [`Self::parse`],
     /// and it becomes a path segment.

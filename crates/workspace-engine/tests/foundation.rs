@@ -5745,10 +5745,12 @@ fn a_repository_may_lower_a_token_ceiling_but_not_raise_it() {
         ..Config::default()
     };
 
-    let rejected = config.apply_overlay_scoped(
-        ConfigOverlay::parse("agent_max_task_tokens=200000\n").unwrap(),
-        ConfigScope::Repository,
-    );
+    let rejected = config
+        .apply_overlay_scoped(
+            ConfigOverlay::parse("agent_max_task_tokens=200000\n").unwrap(),
+            ConfigScope::Repository,
+        )
+        .rejected;
 
     assert_eq!(config.agent_max_task_tokens, Some(50_000));
     assert!(

@@ -15,7 +15,7 @@ decisions it left open in [`context.md`](context.md)
 | 3 · Profiles, `ConfigScope::Profile`, and per-repository selection | Done 2026-09-30 | **Landed:** new `profile.rs` with `ProfileId` (`parse`, `custom`, `as_str`, `custom_path`, `overlay` with §3's built-ins), `ProfileCapabilities`, `select_profile` and `review_profile_rejections`. `ConfigScope::Profile`, and the trust check is now an exhaustive `match`. `permission_profile_by_repository` is on `Config` and `ConfigOverlay` (`permission_profile.<repository_id>=<id>`), User-owned at repository scope and classified `Capability`, so the partition is 39/7. `load_scoped` applies the selection after admin, before the `Allow Always` fold. The report gains `permission_profile` and `profile_rejected_keys`, and `Config` derives `PartialEq`. CLI `profile-set <repo> <id>`, and `config-review` now lists profile refusals. **Tests:** `permission_profiles` 24/24: 14 new, plus one new weakening case. `repository_config_trust` 47/47, file unmodified. With `foundation`, 229 pass across the three files. `cargo fmt --check`, `cargo clippy -p workspace-engine -p damaian-cli --all-targets --locked -D warnings` and `typos` are clean. `cargo check -p desktop-shell -p eval-harness --all-targets` passes. A manual CLI run against a scratch `DAMAIAN_DATA_DIR` behaved as Step 7 describes. **Mutations (all reverted, all caught):** (1) Profile trusted failed the loosen test and the audit test. (2) Defaulting to Read-only with no selection failed 6, including `with_no_profile_selected…` and the Task 2 repository tests. (3) Profile before admin failed `admin_can_widen…`. (4) Preferences applied at profile scope failed the loosen and audit tests. (5) A profile allowed to define an MCP server failed the MCP test. (6) `lower_wins` always assigning failed the Offline private and loosen tests. (7) Profile refusals copied into `rejected_keys` failed the loosen and audit tests. (8) The review not remembering failed "audited twice". (9) The selection trusted at repository scope failed the repository-selects test, the loosen test and the Task 1 weakening case. **Deviations:** nine, listed under Task 3. The main ones: `overlay` also returns the parse refusals; a missing selected custom file fails the load instead of resolving as Full; a profile may not define an MCP server at all; lower-wins records nothing; refused preferences are classed `Forbidden`; the real repository id format is `repo_sha256:<9 hex>`. **Visible now:** a selection made with `profile-set` already applies in the desktop app, which loads through the same `load_scoped`. Safe local's `require_approval_for_file_edits=true`, and Offline private's `mcp_enabled=false` and 7-day retention, take effect today, because those keys were already enforced. The four Task 2 keys wait for Tasks 4–5. **For Task 4/5:** read `Config::profile_capabilities()`. `CommandAccess` arrives already narrowed by the profile. **For Task 7:** the desktop shell's `engine_for_repo` still calls only `RepositoryTrustStore::review`. It must also call `review_profile_rejections` (criterion 4 for hand-edited custom files). `POST /api/permission-profile` should call `select_profile` with config loaded **without** the repository (deviation 2). **For Task 8:** use `ProfileId::custom` for reserved-id refusal and `custom_path` for the file. The profile scope reports an *equal* value of a `restrict_only_limit` or `restrict_only_ceiling` key as refused, so import's "would loosen" list should compare with `>`, not reuse those refusals as is |
 | 4 · `command_access` enforced in `CommandPolicy` as a block | Done 2026-10-01 | **Landed:** `CommandPolicy::classify` ends with the `command_access` block. It sets `blocked: true` and appends `Blocked by permission profile: command_access=<level>`. It never changes risk, `requires_approval`, `may_use_network` or expected effects. It adds no second reason to a command that is already blocked, and it still blocks an allowlisted command. The new private `command_access_permits` decides each level. Plan mode's predicate moved into `CommandClassification::is_read_only_without_approval`, and `mode_permits` and `ReadOnly` both call it. The `CommandAccess` doc comment was updated. Not touched: `chat.rs`, `validation.rs`, `repository_config_trust.rs`. **Tests:** 4 new in `permission_profiles` (28/28): the 7-row × 4-level table, the invariance test (every field except `blocked`/`reasons` matches `All`, and three `All` values are pinned literally), `ls` under `require_approval_for_all_commands`, and run-by-id with a control. The run-by-id test uses a nonexistent shell, so a regression cannot run a real login shell. With `repository_config_trust` (47, file unmodified) and `foundation`, 233/233 pass. The `workspace-engine` lib tests pass, 271 run and 4 ignored. `cargo fmt --check`, `cargo clippy -p workspace-engine --all-targets --locked -D warnings` and `typos` are clean. `cargo check -p desktop-shell -p damaian-cli -p eval-harness --all-targets` passes. The deterministic eval tier was not run, because the default `All` changes nothing; Task 5 runs it. **Mutations (all reverted, all caught):** (1) `ReadOnly => true` failed the table. (2) `Local` reading the `may_use_network` field failed the table on the allowlisted `npm ci`. (3) The block also setting `risk = Blocked` failed the invariance test. (4) Removing the block failed the table and run-by-id. (5) Dropping `!requires_approval` from the shared predicate was caught at first only by `mode.rs`'s `plan_refuses_a_command_that_would_require_approval_even_if_low_risk`. The plan's `ls ../elsewhere` row could not see it, because the path escape also raises the risk to Medium. The `require_approval_for_all_commands` test was added, and now both tests fail. (6) Pushing the reason when already blocked failed the invariance test on `rm -rf /`. **Deviations:** six, listed under Task 4. (1) The block runs after the whole classification, not before the allowlist. (2) The predicate moved to `command_policy.rs`, a one-line `mode.rs` change. (3) `run_proposal` needed no change, because `CommandRunner::run` already re-classifies. (4) `Local` reads the command text, so it also blocks `npm test`/`npm run *` but not `cargo test`. (5) `read_only` blocks everything under `require_approval_for_all_commands`. (6) Invariance is checked against `All`. **For Task 5:** a profile-blocked command in the main loop currently takes the blocklist path: it is stored blocked and pauses with "local policy blocks this command". Approving it ends the resume with a `PolicyBlocked` turn error (`chat.rs:975`). `profile_permits` should refuse it before proposing. At resume, re-classify the stored command rather than trusting `proposal.blocked`, which predates a profile switch. **For Task 9:** the user guide must say that `local` blocks every `npm`/`pnpm`/`yarn` command, validation scripts included (deviation 4) |
 | 5 · `profile ∩ mode` at every refusal point | Done 2026-10-04 | Expanded into full steps on 2026-10-04. Every call site was re-located: `context.md` §5's line numbers still held, except that `edit.rs` calls the patch gate twice at apply (`:573`, `:574`). It was planned on the old base while spec 22 Task 8 was being written in its own worktree, and implemented after that task merged to main (`00173ee`). **This branch is not rebased onto it.** Task 8 also edits `chat.rs` next to the web-diagnostic and command resume branches and the imports, so the merge back will need those few hunks resolved. **Landed:** `mode.rs` gains `ProfileLimit`, `Permission::RefusedByProfile { limit }`, `profile_permits` and `permits` (mode first, first refusal wins), and the profile case of `refusal_message`: `Refused: the permission profile does not allow this (<key>=<value>). Switching mode will not allow it.` `command_access_permits` is now `pub(crate)`. Every `mode_permits` call in `chat.rs` now calls `permits`: the tool list, where the closure is renamed `offered`; `action_permission`; and the three resume branches. The command resume re-classifies the stored command. A profile refusal is rejected as `profile_policy`, and a profile-refused web diagnostic is audited as `refused_by_profile`. `edit.rs`'s gate is now `refuse_unless_mode_and_profile_permit_patches`, and it asks the profile even with no session. `the_permission_matrix_matches_the_spec_table` is now one table: 17 tool-class rows × 4 modes × the 4 built-in profiles, from their real overlays. The Full column must equal `mode_permits` exactly. **Tests:** new in `mode.rs`: the matrix (rewritten) and 2 message tests, 18/18. Two in `chat.rs`'s `mode_refusal_tests`: the web and MCP resume points. Ten in `permission_profiles.rs` (36 pass, 1 ignored): the two criterion 10 cases with exact wording, the profile-blocked command refused before any proposal, the next turn, the resume refusal, the violation pairing, sessionless propose and apply. The in-flight test is `#[ignore]` because it uses the real login shell. It passes when run by hand. `repository_config_trust` 47/47, file unmodified. The three integration files total 241. The whole `workspace-engine` crate: 868 passed, 19 skipped. The deterministic eval tier: 16/16 scenarios pass and `approval_policy_violations` is 0. The other metrics were not compared with a run on the base commit. `cargo fmt --check`, `cargo clippy -p workspace-engine --all-targets --locked -D warnings` and `typos` are clean. `cargo check -p desktop-shell -p damaian-cli -p eval-harness --all-targets` passes. **Mutations (all reverted, all caught):** (1) `permits` = mode alone failed 8. The edit tests did not fail, which the plan had predicted they would: the sessionless path calls `profile_permits` directly. (2) Profile first failed the matrix. (3) `blocked` instead of `command_access_permits` failed the matrix, `code_under_read_only…` and `the_next_turn…`. (4) The tool list with mode alone failed `code_under_read_only…`. (5) The command resume with Full's capabilities failed the resume and violation tests. Spec 20's `a_mode_refused_proposal_that_is_later_run_by_id…` also failed once in that parallel run, but passes under the same mutation in isolation and 5/5 unmutated. That one failure is unexplained, probably its real login shell under load. (6) The web and MCP resumes with Full's capabilities each failed their `chat.rs` test. (7) The early return on an empty session failed only the sessionless propose test. Apply goes through `propose_edit`'s own session. (8) Mode wording for the profile case failed 4. (9) The in-flight test, falsified by switching before the resume engine is built, failed on "never started". As first planned, with the switch before the thread, it was not caught, because the test reused the turn's engine. The test now builds its own resume engine. **Deviations:** ten, listed under Task 5. (1) A new `RefusedByProfile` variant. (2) The refusal names `key=value`, not the profile. (3) The mode is named when both refuse. (4) `command_access_permits` is shared, and `blocked` is not read, so a blocklisted command keeps its card. (5) The resume re-classifies the stored command for both axes. (6) Sessionless patches are profile-checked. (7) Read-only still offers `propose_plan` and `complete_step`. (8) The web and MCP resume tests are in `chat.rs`. (9) The shell is `/usr/bin/true`: this Mac stalls exec of any freshly written executable, so a script cannot stand in. (10) Audit wording. **For Task 6/7:** a refusal shows the resolved `key=value` and never the scope that set it. The attributed view must show all five keys, including `mcp_enabled`. If the view needs the strings, make `ProfileLimit::setting` `pub(crate)` rather than copying it. **For Task 9:** the user guide should give the two refusal strings, deviation 3 (Ask under Read-only names the mode first) and deviation 7 |
-| 6 · Provenance: a source for every applied value | Not started | |
+| 6 · Provenance: a source for every applied value | Done 2026-10-04 | Expanded into full steps on 2026-10-04, after checking every `apply_overlay_scoped` caller, each merge helper and `apply_repository_allowlist` against the code. **Landed:** `apply_overlay_scoped` returns `OverlayOutcome { rejected, applied: Vec<AppliedKey> }`. `AppliedKey { key, scope, entries, widened }` is recorded at every application. The seven list keys carry the entries the scope holds. MCP servers and model providers are recorded per field. The helpers report what they applied: `union_patterns`, `intersect_allowlist` → `Option<(entries, loosened)>`; the flag, access, limit and ceiling helpers → `Option<loosened>`; `lower_wins` → `bool`; `upsert_mcp_server_from_repository` → its fields. `widened` is set only at admin scope. `RepositoryConfigReport` gains `applied` and `allow_always_entries`, and `apply_repository_allowlist` returns what it added. New `effective_policy.rs`: `EffectivePolicy::{resolve, from_load, rule, to_text}`, with `PolicyRule`, `PolicyEntry`, `PolicySource`, `SourceKind`, `RefusedRequest` and `RefusedBy`, all re-exported. Its rules are the lines of `to_policy_text`, so the view and the text cannot disagree. Added `ProfileId::label`. CLI `config-show --sources [repo]`. Callers: `damaian-cli` and one `foundation.rs` test read `.rejected`. The rest ignore the result unchanged. The refusal order is unchanged. Not touched: `chat.rs`, the web UI, `repository_config_trust.rs`. **Tests:** 5 new in `permission_profiles`: the outcome API, §5.7's per-entry example with Allow Always and a profile, admin widening against narrowing and user loosening, a refusal by key and class with no value in the JSON, the text or `report.applied`, and resolver agreement against an independent `load_scoped`. The file passes 41, with 1 ignored. The three integration files total 246, all passing. `repository_config_trust` is 47/47 and the file is unmodified. `foundation`'s FSEvents watcher test timed out once under parallel load and passed on rerun. The `mode::`, `config::` and `profile::` lib tests pass, 18/18. `cargo fmt --check`, `cargo clippy -p workspace-engine -p damaian-cli --all-targets --locked -D warnings` and `typos` are clean. `cargo check -p desktop-shell -p damaian-cli -p eval-harness --all-targets` passes. A manual `config-show --sources` against a scratch data dir showed the per-entry sources, the profile attribution, the admin widening and the refusals. The refused `shell` value was absent. **Mutations (8, all reverted, all caught in the end):** (1) the untrusted union recording nothing failed 2 tests. (2) `widened` at every trusted scope was **not caught at first**, because `from_load` re-checked the scope. It now reads `widened` alone, and the mutation fails. (3) The flag ignoring the current value failed the admin test. (4) Values rendered from defaults failed agreement. (5) A narrowed allowlist recording `incoming` was **not caught at first**, because the view prints entries from `Config`. The test now scans `report.applied`, and the mutation fails. (6) Dropping the Allow Always record failed §5.7; the first version of this mutation did not compile and was redone. (7) First applier wins failed 3. (8) The limit never loosening failed the admin test. A restore with `shutil.move` kept the backup's older mtime, so cargo reused a mutated build once. Touch the sources after restoring. **Deviations:** ten, listed under Task 6. (1) Provenance travels on the report, and `load_scoped`'s signature is unchanged. (2) Allow Always is a report field, not a scope. (3) A source is the last scope whose value holds, so an untrusted scope that sets the restrictive value takes the attribution. (4) Forbidden and User-owned keys have no direction, so an admin value there is attributed but never marked widened (open for Task 9's review). (5) Limit and ceiling widen on a strict `>`. (6) `resolve(Option<&Path>, Option<SessionMode>)`, plus `from_load`. (7) Keys the text omits while unset have no rule, and their refusals go to `otherRefused`. (8) Repository allowlist entries awaiting migration are not in the view. (9) Attribution per field for MCP and providers. (10) `ProfileId::label`. **For Task 7:** serve `EffectivePolicy::from_load` (or `resolve`) as JSON. The exact shape is under Task 6, "The `EffectivePolicy` JSON shape". It is camelCase: `header`, `profile`, `profileLabel`, `profileSelected`, `mode`, and `rules[] { key, value, sources[] { kind, label }, entries[] | null, adminWidened, refused[] { key, class, by } }`, plus `otherRefused[]`. `kind` is one of `default`, `user`, `repository`, `admin`, `profile` or `allowAlways`, and `by` is `repository` or `profile`. The view describes the loaded config. The chat's per-request provider override (`config_for_repo_with_provider`) is not reflected. Pending allowlist entries come from the existing migration notice, not from this structure |
 | 7 · Attributed effective-policy view and profile picker | Not started | |
 | 8 · Sanitized export and import | Not started | |
 | 9 · Docs, acceptance criteria, second-person review, close the spec | Not started | |
@@ -3420,39 +3420,659 @@ calls `PatchEngine::apply_patch`.
 ## Task 6: Provenance: a source for every applied value
 
 **Requirements:** 2 and §5.7 (the data), and acceptance criterion 5. **Files:**
-`config.rs`, new `effective_policy.rs`, `lib.rs`, `damaian-cli/src/main.rs`,
-and `tests/permission_profiles.rs`.
+modify `crates/workspace-engine/src/config.rs`, `profile.rs`, `lib.rs`,
+`crates/damaian-cli/src/main.rs` and `crates/workspace-engine/tests/foundation.rs`
+(one caller). Create `crates/workspace-engine/src/effective_policy.rs`. Extend
+`tests/permission_profiles.rs`.
 
-`apply_overlay_scoped` returns an `OverlayOutcome { rejected: Vec<RejectedConfigKey>, applied: Vec<AppliedKey> }`.
-Every existing caller keeps its behaviour by reading `.rejected`.
-`AppliedKey { key, scope, entries: Option<Vec<String>>, widened: bool }`:
+Expanded from the outline on 2026-10-04, after checking it against the code.
+`context.md` §8 decides the shape: provenance is recorded **where values are
+applied**, in `apply_overlay_scoped` and its merge helpers, never by a second
+resolver. A refused request shows key and class, never the value. Not touched:
+`chat.rs`, the web UI (Task 7), and `repository_config_trust.rs`.
 
-- List keys record the entries each scope contributed.
-- `widened` is set when an admin value loosened what the earlier scopes
-  resolved, by the same direction rules the restrict-only helpers use.
+**What the outline was checked against:**
 
-`load_scoped` keeps the outcomes in order, plus a `Default` source for
-untouched keys. `EffectivePolicy::resolve(repository_root) -> Result<EffectivePolicy>`
-builds, per key:
+- **Callers of `apply_overlay_scoped`, all crates.** `config.rs`: the four
+  scopes in `load_scoped`, and `apply_overlay`, which ignores the result.
+  `damaian-cli/src/main.rs` `repository_scope_refusals` returns the refusals.
+  `mode.rs`'s matrix test, and `permission_profiles.rs`'s
+  `resolve_without_profiles`, ignore the result. `foundation.rs`
+  `a_repository_cannot_raise_the_users_ceiling` binds it as `rejected`.
+  `desktop-shell` and `eval-harness` call only `apply_overlay`, whose
+  signature does not change.
+- **The merge helpers.** `scoped` keys are Forbidden or User-owned and have no
+  restrict-only direction. `union_patterns`, `restrict_only_flag`,
+  `restrict_only_access`, `intersect_allowlist`, `restrict_only_limit` and
+  `restrict_only_ceiling` each have one, and each now reports what it applied
+  and whether a trusted scope moved in the direction an untrusted one is
+  refused. `preference` and `lower_wins` report whether their value now holds.
+  `upsert_mcp_server_from_repository` reports the fields it applied.
+- **`apply_repository_allowlist`** is not a `ConfigScope`. It now returns the
+  entries it added, which `load_scoped` keeps, so they can be attributed
+  "this repository (Allow Always)".
 
-- the resolved value;
-- its sources, as scope names, "profile: <id>", or "this repository (Allow
-  Always)";
-- the refused requests from the repository and the profile, by key and
-  class, never by value.
+**Interfaces:**
+- Consumes: `Config::load_scoped`, `Config::to_policy_text`,
+  `RepositoryConfigReport { rejected_keys, permission_profile, profile_rejected_keys }`,
+  `RepositoryKeyClass::as_str`, `SessionMode::{as_str, label}`.
+- Produces, re-exported from `lib.rs`:
+  - `pub struct AppliedKey { pub key: String, pub scope: ConfigScope, pub entries: Option<Vec<String>>, pub widened: bool }`.
+    `key` is the `to_policy_text` name, so MCP servers and model providers
+    are recorded per field: `mcp_server.<id>.<field>`,
+    `model_provider.<id>.<field>`. `entries` is `Some` for the seven list keys.
+  - `pub struct OverlayOutcome { pub rejected: Vec<RejectedConfigKey>, pub applied: Vec<AppliedKey> }`,
+    returned by `Config::apply_overlay_scoped`. Every caller that read the
+    `Vec` now reads `.rejected`.
+  - `RepositoryConfigReport` gains `pub applied: Vec<AppliedKey>` (user,
+    repository, admin, profile, in order) and
+    `pub allow_always_entries: Vec<String>`.
+  - `Config::apply_repository_allowlist(&mut self, &Path) -> Vec<String>`:
+    the entries it added.
+  - `ProfileId::label(&self) -> &str`: "Read-only", "Safe local
+    development", "Full repository development", "Offline private", or the
+    custom name. Task 7's picker reuses it.
+  - `effective_policy.rs`: `EffectivePolicy`, `PolicyRule`, `PolicyEntry`,
+    `PolicySource`, `SourceKind`, `RefusedRequest`, `RefusedBy`, with
+    `EffectivePolicy::resolve(Option<&Path>, Option<SessionMode>) -> Result<Self>`,
+    `EffectivePolicy::from_load(&Config, &RepositoryConfigReport, Option<SessionMode>) -> Self`,
+    `rule(&self, key) -> Option<&PolicyRule>` and `to_text(&self) -> String`.
+  - CLI `damaian config-show --sources [repo]`.
 
-The header is "`<profile> ∩ <mode>`" when a mode is given.
+**The attribution rules:**
 
-CLI: `damaian config-show --sources [repo]` prints it.
+- A key's source is **the last scope whose value it holds**. A trusted scope
+  holds what it set. An untrusted scope (repository, profile) holds a value it
+  set in the restrictive direction, including one equal to what was already
+  there, because that value would now survive the user loosening their own
+  config. So Safe local's `require_approval_for_file_edits=true` is attributed
+  to the profile even when user config also says `true`.
+- A list entry's source is the last scope that held that entry. A trusted
+  scope replaces the list and holds all of it. An untrusted one holds what it
+  listed. `intersect_allowlist` reports only the ids that survived, never the
+  ones it refused. After every overlay, Allow Always entries are attributed
+  to "this repository (Allow Always)", but only those the fold actually added.
+- `widened` is set only at admin scope, and only where the merge has a
+  direction: a flag moved off its restrictive value, `command_access` raised,
+  a pattern removed from a union list, an id added to or the restriction
+  removed from `mcp_server_allowlist`, a limit or ceiling raised (strictly),
+  or an MCP server enabled or its approval gate cleared.
+- A key no overlay applied is `default`.
 
-Tests:
-- The §5.7 example's shape: `.env` from user config and `secrets/**` from
-  the repository on the same key.
-- An admin widening marked as one.
-- A refused repository `require_approval_for_file_edits=false` shown as
-  refused, with the string `false` absent from the refusal.
-- A resolver-agreement test: every value in `EffectivePolicy` equals the
-  `Config` from `load_scoped`.
+**The `EffectivePolicy` JSON shape Task 7 serves** (serde, camelCase):
+
+```json
+{
+  "header": "Safe local development ∩ Code mode",
+  "profile": "safe_local",
+  "profileLabel": "Safe local development",
+  "profileSelected": true,
+  "mode": "code",
+  "rules": [
+    {
+      "key": "restricted_patterns",
+      "value": ".env|*.pem|secrets/**",
+      "sources": [
+        { "kind": "user", "label": "user config" },
+        { "kind": "repository", "label": "repository config" }
+      ],
+      "entries": [
+        { "value": ".env", "source": { "kind": "user", "label": "user config" } },
+        { "value": "*.pem", "source": { "kind": "user", "label": "user config" } },
+        { "value": "secrets/**", "source": { "kind": "repository", "label": "repository config" } }
+      ],
+      "adminWidened": false,
+      "refused": []
+    },
+    {
+      "key": "require_approval_for_file_edits",
+      "value": "true",
+      "sources": [{ "kind": "profile", "label": "profile: safe_local" }],
+      "entries": null,
+      "adminWidened": false,
+      "refused": [
+        { "key": "require_approval_for_file_edits", "class": "restrict_only", "by": "repository" }
+      ]
+    }
+  ],
+  "otherRefused": [
+    { "key": "model_provider.openai", "class": "forbidden", "by": "repository" }
+  ]
+}
+```
+
+- `rules` has one rule per line of `Config::to_policy_text()`, in that order,
+  so the view and the plain text never disagree. `value` is that line's
+  value. A list key's `value` is `|`-joined, and `entries` holds the items.
+- `sources[].kind` is one of `default`, `user`, `repository`, `admin`,
+  `profile` or `allowAlways`. A scalar has exactly one source. A list has the
+  distinct sources of its entries, in entry order.
+- `entries` is non-null only for `allowed_roots`, `ignore_patterns`,
+  `restricted_patterns`, `command_allowlist`, `command_blocklist`,
+  `secret_patterns` and `mcp_server_allowlist`.
+- `refused[].by` is `repository` or `profile`. `class` is
+  `RepositoryKeyClass::as_str`. No refused value is in the structure.
+- `mode` is `null`, and `header` is the profile label alone, when no mode is
+  given.
+
+- [x] **Step 1: Write the failing tests**
+
+  Append to `crates/workspace-engine/tests/permission_profiles.rs`, and add
+  `AppliedKey`, `EffectivePolicy`, `RefusedBy`, `RefusedRequest` and
+  `SourceKind` to its imports:
+
+  ```rust
+  // Task 6: provenance recorded where values are applied (context.md §8).
+
+  /// Every rule's entries as `(value, source kind)`, in the resolved order.
+  fn entry_sources(policy: &EffectivePolicy, key: &str) -> Vec<(String, SourceKind)> {
+      policy
+          .rule(key)
+          .unwrap_or_else(|| panic!("{key} has no rule"))
+          .entries
+          .as_ref()
+          .unwrap_or_else(|| panic!("{key} is a list key and must carry entries"))
+          .iter()
+          .map(|entry| (entry.value.clone(), entry.source.kind))
+          .collect()
+  }
+
+  fn source_kinds(policy: &EffectivePolicy, key: &str) -> Vec<SourceKind> {
+      policy
+          .rule(key)
+          .unwrap_or_else(|| panic!("{key} has no rule"))
+          .sources
+          .iter()
+          .map(|source| source.kind)
+          .collect()
+  }
+
+  #[test]
+  fn apply_overlay_scoped_reports_what_it_applied_alongside_what_it_refused() {
+      let mut config = Config::default();
+      let outcome = config.apply_overlay_scoped(
+          ConfigOverlay::parse(concat!(
+              "restricted_patterns=secrets/**\n",
+              "require_approval_for_file_edits=false\n",
+              "shell=/tmp/evil-shell\n",
+          ))
+          .unwrap(),
+          ConfigScope::Repository,
+      );
+
+      let refused: Vec<&str> = outcome
+          .rejected
+          .iter()
+          .map(|key| key.key.as_str())
+          .collect();
+      assert_eq!(refused, ["shell", "require_approval_for_file_edits"]);
+      assert_eq!(
+          outcome.applied,
+          [AppliedKey {
+              key: "restricted_patterns".into(),
+              scope: ConfigScope::Repository,
+              entries: Some(vec!["secrets/**".into()]),
+              widened: false,
+          }],
+          "a refused key must not also be reported as applied"
+      );
+  }
+
+  #[test]
+  fn the_section_5_7_example_attributes_each_list_entry_to_its_scope() {
+      let fixture = profile_fixture("sources-5-7");
+      fixture.write_user(&format!(
+          "restricted_patterns=.env|*.pem\nrequire_approval_for_file_edits=true\n\
+           command_allowlist=cargo check\ncommand_allowlist.{}=cargo test\n{}",
+          fixture.repository_id,
+          fixture.select("safe_local"),
+      ));
+      fixture.write_repository("restricted_patterns=secrets/**\n");
+
+      let (config, report) = fixture.load();
+      let policy = EffectivePolicy::from_load(&config, &report, Some(SessionMode::Code));
+
+      assert_eq!(policy.header, "Safe local development ∩ Code mode");
+      assert_eq!(
+          entry_sources(&policy, "restricted_patterns"),
+          [
+              (".env".to_string(), SourceKind::User),
+              ("*.pem".to_string(), SourceKind::User),
+              ("secrets/**".to_string(), SourceKind::Repository),
+          ]
+      );
+      assert_eq!(
+          entry_sources(&policy, "command_allowlist"),
+          [
+              ("cargo check".to_string(), SourceKind::User),
+              ("cargo test".to_string(), SourceKind::AllowAlways),
+          ]
+      );
+      let allow_always = &policy
+          .rule("command_allowlist")
+          .unwrap()
+          .entries
+          .as_ref()
+          .unwrap()[1];
+      assert_eq!(allow_always.source.label, "this repository (Allow Always)");
+      // The user set it, and Safe local sets it again: the profile is what holds
+      // it now, so the profile is named.
+      let file_edits = policy.rule("require_approval_for_file_edits").unwrap();
+      assert_eq!(file_edits.sources.len(), 1);
+      assert_eq!(file_edits.sources[0].kind, SourceKind::Profile);
+      assert_eq!(file_edits.sources[0].label, "profile: safe_local");
+      assert_eq!(
+          source_kinds(&policy, "max_file_bytes"),
+          [SourceKind::Default]
+      );
+      assert_eq!(
+          source_kinds(&policy, "command_access"),
+          [SourceKind::Profile]
+      );
+
+      let text = policy.to_text();
+      assert!(text.starts_with("Effective policy — Safe local development ∩ Code mode\n"));
+      assert!(text.contains("secrets/**"), "{text}");
+      assert!(text.contains("repository config"), "{text}");
+
+      fixture.cleanup();
+  }
+
+  #[test]
+  fn an_admin_widening_is_marked_and_an_admin_narrowing_is_not() {
+      let fixture = profile_fixture("admin-widening");
+      fixture.write_user(concat!(
+          "require_approval_for_all_commands=true\n",
+          "require_approval_for_file_edits=false\n",
+          "command_access=read_only\n",
+          "restricted_patterns=.env|*.pem\n",
+          "max_read_lines=100\n",
+      ));
+      let admin = fixture.data_dir.join("config").join("admin.conf");
+      fs::write(
+          &admin,
+          concat!(
+              "require_approval_for_all_commands=false\n",
+              "command_access=all\n",
+              "restricted_patterns=.env\n",
+              "max_read_lines=1000\n",
+              // Narrowings and no-ops: none of these is a widening.
+              "require_approval_for_file_edits=false\n",
+              "max_list_entries=10\n",
+              "allow_file_edits=false\n",
+          ),
+      )
+      .unwrap();
+
+      let (config, report) = fixture.try_load(Some(&admin)).unwrap();
+      let policy = EffectivePolicy::from_load(&config, &report, None);
+
+      for key in [
+          "require_approval_for_all_commands",
+          "command_access",
+          "restricted_patterns",
+          "max_read_lines",
+      ] {
+          let rule = policy.rule(key).unwrap();
+          assert!(rule.admin_widened, "{key} was widened by admin");
+          assert_eq!(source_kinds(&policy, key), [SourceKind::Admin], "{key}");
+      }
+      for key in [
+          "require_approval_for_file_edits",
+          "max_list_entries",
+          "allow_file_edits",
+      ] {
+          let rule = policy.rule(key).unwrap();
+          assert!(!rule.admin_widened, "{key} was not widened");
+          assert_eq!(source_kinds(&policy, key), [SourceKind::Admin], "{key}");
+      }
+      assert_eq!(policy.header, "Full repository development");
+      assert!(policy.to_text().contains("widened by admin config"));
+
+      // The user's own loosening of a default is not an admin widening.
+      let fixture_user = profile_fixture("user-loosening");
+      fixture_user.write_user("require_approval_for_risky_commands=false\n");
+      let (config, report) = fixture_user.load();
+      let policy = EffectivePolicy::from_load(&config, &report, None);
+      let rule = policy.rule("require_approval_for_risky_commands").unwrap();
+      assert!(!rule.admin_widened);
+      assert_eq!(
+          source_kinds(&policy, "require_approval_for_risky_commands"),
+          [SourceKind::User]
+      );
+
+      fixture.cleanup();
+      fixture_user.cleanup();
+  }
+
+  #[test]
+  fn a_refused_request_is_shown_by_key_and_class_never_by_value() {
+      let fixture = profile_fixture("refused-no-value");
+      fixture.write_user(&format!(
+          "{RESTRICTIVE_USER}mcp_server_allowlist=blessed|other\n{}",
+          fixture.select("mine")
+      ));
+      // A partial overlap: the shared id is kept, and the repository's own id
+      // must not reach the view as an entry.
+      fixture.write_repository(&format!(
+          "{HOSTILE_REPOSITORY}mcp_server_allowlist=blessed|attacker\n"
+      ));
+      fixture.write_custom_profile("mine", "max_file_bytes=7654321\nshell=/tmp/profile-shell\n");
+
+      let (config, report) = fixture.load();
+      let policy = EffectivePolicy::from_load(&config, &report, Some(SessionMode::Ask));
+
+      let file_edits = policy.rule("require_approval_for_file_edits").unwrap();
+      assert_eq!(file_edits.value, "true");
+      assert_eq!(
+          file_edits.refused,
+          [RefusedRequest {
+              key: "require_approval_for_file_edits".into(),
+              class: "restrict_only".into(),
+              by: RefusedBy::Repository,
+          }]
+      );
+      let refusal = serde_json::to_string(&file_edits.refused).unwrap();
+      assert!(!refusal.contains("false"), "{refusal}");
+      assert!(
+          policy
+              .rule("max_file_bytes")
+              .unwrap()
+              .refused
+              .iter()
+              .any(|refused| refused.by == RefusedBy::Profile && refused.class == "forbidden")
+      );
+
+      let json = serde_json::to_string(&policy).unwrap();
+      let text = policy.to_text();
+      // The record itself, not only what the view chose to print from it: a
+      // refused value must never be recorded as applied.
+      let applied = format!("{:?}", report.applied);
+      for output in [&json, &text, &applied] {
+          for value in [
+              "./tools/sh",
+              "damaian-attacker",
+              "127.0.0.1:9",
+              "ATTACKER",
+              "attacker",
+              "npm install",
+              "7654321",
+              "profile-shell",
+          ] {
+              assert!(!output.contains(value), "{value} leaked into\n{output}");
+          }
+      }
+      let refused_line = text
+          .lines()
+          .skip_while(|line| !line.starts_with("require_approval_for_file_edits ="))
+          .nth(1)
+          .unwrap();
+      assert!(refused_line.contains("refused"), "{text}");
+      assert!(!refused_line.contains("false"), "{refused_line}");
+
+      fixture.cleanup();
+  }
+
+  #[test]
+  fn the_effective_policy_agrees_with_load_scoped_for_every_key() {
+      let fixture = profile_fixture("resolver-agreement");
+      fixture.write_user(&format!(
+          "{RESTRICTIVE_USER}command_allowlist.{}=cargo test\n\
+           mcp_server.docs.transport=stdio\nmcp_server.docs.command=/usr/bin/true\n\
+           mcp_server.docs.enabled=true\nmodel_provider.deepseek.max_output_tokens=4096\n\
+           max_read_lines=100\n{}",
+          fixture.repository_id,
+          fixture.select("offline_private"),
+      ));
+      fixture.write_repository(&format!(
+          "{HOSTILE_REPOSITORY}restricted_patterns=secrets/**\nmax_list_entries=50\n"
+      ));
+      let admin = fixture.data_dir.join("config").join("admin.conf");
+      fs::write(
+          &admin,
+          "max_read_lines=300\nignore_patterns=target/|dist/\n",
+      )
+      .unwrap();
+
+      let (config, report) = fixture.try_load(Some(&admin)).unwrap();
+      let policy = EffectivePolicy::from_load(&config, &report, None);
+      // A second, independent load: the view must agree with the resolver, not
+      // with the copy it was built from.
+      let (fresh, _) = fixture.try_load(Some(&admin)).unwrap();
+
+      let expected: Vec<(String, String)> = fresh
+          .to_policy_text()
+          .lines()
+          .map(|line| {
+              let (key, value) = line.split_once('=').unwrap();
+              (key.to_string(), value.to_string())
+          })
+          .collect();
+      let actual: Vec<(String, String)> = policy
+          .rules
+          .iter()
+          .map(|rule| (rule.key.clone(), rule.value.clone()))
+          .collect();
+      assert_eq!(actual, expected);
+
+      let strings = |values: &[String]| values.to_vec();
+      let lists: [(&str, Vec<String>); 7] = [
+          (
+              "allowed_roots",
+              fresh
+                  .allowed_roots
+                  .iter()
+                  .map(|root| root.to_string_lossy().to_string())
+                  .collect(),
+          ),
+          ("ignore_patterns", strings(&fresh.ignore_patterns)),
+          ("restricted_patterns", strings(&fresh.restricted_patterns)),
+          ("command_allowlist", strings(&fresh.command_allowlist)),
+          ("command_blocklist", strings(&fresh.command_blocklist)),
+          ("secret_patterns", strings(&fresh.secret_patterns)),
+          ("mcp_server_allowlist", strings(&fresh.mcp_server_allowlist)),
+      ];
+      for (key, values) in lists {
+          let Some(rule) = policy.rule(key) else {
+              assert!(values.is_empty(), "{key} has values but no rule");
+              continue;
+          };
+          let entries: Vec<String> = rule
+              .entries
+              .as_ref()
+              .unwrap()
+              .iter()
+              .map(|entry| entry.value.clone())
+              .collect();
+          assert_eq!(entries, values, "{key}");
+      }
+      assert_eq!(
+          policy.rule("command_access").unwrap().value,
+          fresh.command_access.as_str()
+      );
+      assert_eq!(policy.rule("max_read_lines").unwrap().value, "300");
+      assert_eq!(source_kinds(&policy, "max_read_lines"), [SourceKind::Admin]);
+      assert_eq!(
+          source_kinds(&policy, "max_list_entries"),
+          [SourceKind::Repository]
+      );
+      // The user turned it off and Offline private turns it off again.
+      assert_eq!(source_kinds(&policy, "mcp_enabled"), [SourceKind::Profile]);
+      assert_eq!(source_kinds(&policy, "shell"), [SourceKind::User]);
+      assert_eq!(
+          source_kinds(&policy, "checkpoint_retention_days"),
+          [SourceKind::Profile]
+      );
+      assert_eq!(
+          source_kinds(&policy, "mcp_server.docs.command"),
+          [SourceKind::User]
+      );
+      assert_eq!(
+          source_kinds(&policy, "model_provider.deepseek.max_output_tokens"),
+          [SourceKind::User]
+      );
+      assert_eq!(
+          source_kinds(&policy, "model_provider.deepseek.label"),
+          [SourceKind::Default]
+      );
+
+      fixture.cleanup();
+  }
+  ```
+
+- [x] **Step 2: Run them and watch them fail**
+
+  ```bash
+  cargo nextest run -p workspace-engine --test permission_profiles
+  ```
+
+  Expected: the test target does not compile. The five names are unresolved,
+  and `.rejected`/`.applied` do not exist on `Vec<RejectedConfigKey>`.
+
+- [x] **Step 3: Record what each merge applied**
+
+  In `config.rs`:
+  1. Add `AppliedKey` and `OverlayOutcome` after `RejectedConfigKey`.
+     `OverlayOutcome::record(scope, key, entries, loosened)` is private, and
+     sets `widened = loosened && scope == ConfigScope::Admin`.
+  2. `apply_overlay_scoped` returns `OverlayOutcome`. Collect the refusals in
+     a local `Vec`, so a helper can hold it while `outcome.record` runs, and
+     move it into `outcome.rejected` at the end. Record after every
+     application, in the order the keys are applied today. **Keep the order
+     of the refusals.** `command_access` stays between `allow_file_edits` and
+     `allow_browser_diagnostics`, so `report.rejected_keys` does not reorder.
+  3. The helpers return what they applied:
+     - `union_patterns -> Option<(Vec<String>, bool)>`: trusted gives
+       `(incoming, removed_any)`; untrusted gives `(incoming, false)`, or
+       `None` when it listed nothing.
+     - `restrict_only_flag`, `restrict_only_access`, `restrict_only_limit` and
+       `restrict_only_ceiling -> Option<bool>`: `Some(loosened)` when applied,
+       `None` when refused or a no-op. Limit and ceiling widen only on `>`,
+       and the untrusted refusal stays `>=`.
+     - `intersect_allowlist -> Option<(Vec<String>, bool)>`: after a
+       narrowing, it returns the retained list, never `incoming`.
+     - `lower_wins -> bool`: whether the profile's value holds.
+     - `upsert_mcp_server_from_repository -> Vec<&'static str>`: the narrowed
+       overlay's present fields.
+  4. Add `present_fields` to `ModelProviderConfigOverlay` and
+     `McpServerConfigOverlay`, as exhaustive destructures, so a new field
+     cannot go unattributed.
+  5. When `model_provider` is applied, also record `model_name`,
+     `model_base_url` and `model_api_key_env` for that scope, if
+     `apply_model_provider_defaults` changed them.
+  6. `load_scoped` extends `report.applied` from each scope's outcome and sets
+     `report.allow_always_entries` from `apply_repository_allowlist`.
+  7. Update the callers: `damaian-cli` `repository_scope_refusals` and
+     `foundation.rs` read `.rejected`.
+
+- [x] **Step 4: Build `EffectivePolicy`**
+
+  Create `effective_policy.rs` with the types above. `from_load`:
+  - walks `config.to_policy_text()` line by line;
+  - takes each scalar's source from the last `AppliedKey` with that key;
+  - takes each list entry's source from the last `AppliedKey` whose entries
+    contain it, then from `allow_always_entries` for `command_allowlist`;
+  - sets `adminWidened` from any admin record with `widened`;
+  - attaches the repository and profile refusals to the rule with that key,
+    and puts the rest in `otherRefused`.
+
+  `resolve` is `load_for_repository_reporting` followed by `from_load`.
+  `to_text` prints `key = value    [sources]`, then
+  `(widened by admin config)`, a `refused: <by> asked to set <key> (<class>)`
+  line per refusal, and the entries when a list has more than one source.
+  Register the module and re-export from `lib.rs`. Add `ProfileId::label`.
+
+- [x] **Step 5: CLI**
+
+  `config-show --sources [repo]` prints `EffectivePolicy::resolve(repo, None)?.to_text()`.
+  Without the flag, the output is unchanged. Update `usage()`.
+
+- [x] **Step 6: Run the scoped tests**
+
+  ```bash
+  cargo nextest run -p workspace-engine --test permission_profiles --test repository_config_trust --test foundation
+  ```
+
+  Expected: all pass. `repository_config_trust.rs` is unmodified.
+
+- [x] **Step 7: Falsify** (revert each one)
+
+  Each was run against the five new tests, with the source restored after
+  every run.
+  1. `union_patterns` untrusted returns `None`: the outcome test and the §5.7
+     test fail (`secrets/**` loses its source).
+  2. `record` sets `widened = loosened` at every trusted scope. **At first
+     not caught**, because `from_load` also checked `scope == Admin`, so the
+     rule lived in two places. `from_load` now reads `widened` alone, and the
+     mutation fails the admin test's user-loosening control.
+  3. The flag's `loosens` ignores the current value: the admin test fails on
+     `require_approval_for_file_edits=false` over an equal user value.
+  4. `from_load` renders `Config::default().to_policy_text()`: the agreement
+     test fails.
+  5. A narrowed `mcp_server_allowlist` records `incoming`. **At first not
+     caught**, because the view takes entries from `Config`, so the refused
+     id was recorded but never printed. The refusal test now also scans
+     `report.applied`, and fails on `attacker`.
+  6. The Allow Always result is dropped in `load_scoped`: the §5.7 test fails
+     (`cargo test` becomes `default`). The first version of this mutation did
+     not compile, and was replaced.
+  7. The first applier wins instead of the last: the §5.7 test, the admin
+     test and the agreement test fail.
+  8. `restrict_only_limit` never loosens: the admin test fails on
+     `max_read_lines`.
+
+- [x] **Step 8: Scoped checks**
+
+  ```bash
+  cargo fmt --all -- --check
+  cargo clippy -p workspace-engine -p damaian-cli --all-targets --locked -- -D warnings
+  typos
+  cargo check -p desktop-shell -p damaian-cli -p eval-harness --all-targets
+  ```
+
+  Then a manual `damaian config-show --sources <repo>` against a scratch
+  `DAMAIAN_DATA_DIR` and `DAMAIAN_ADMIN_CONFIG`.
+
+- [x] **Step 9: Update this file's progress row, show the change and the
+  check results, and ask before committing**
+
+  Suggested subject: `Attribute every effective policy rule to its source`.
+
+**Deviations from the outline:**
+
+1. The provenance travels on `RepositoryConfigReport` (`applied`,
+   `allow_always_entries`). `load_scoped` keeps its signature, so no caller of
+   it changes.
+2. Allow Always is not a `ConfigScope`, so it is not an `AppliedKey`.
+   `apply_repository_allowlist` returns what it added. An entry user config
+   already listed stays attributed to user config.
+3. The source rule is "the last scope whose value holds". An untrusted scope
+   that sets the restrictive value, or relists an entry, takes the
+   attribution, because its value is the one that survives a user loosening.
+   The outline said "the entries each scope contributed". A union now reports
+   every entry it listed, not only the new ones.
+4. `widened` is defined only where a restrict-only direction exists. An admin
+   value for a Forbidden or User-owned key (`audit_enabled`,
+   `block_generated_secrets`, `allowed_roots`, `secret_patterns`,
+   `command_allowlist`, …) is attributed to admin, but never marked a
+   widening. Whether criterion 5 needs more is a Task 9 question for the
+   second-person review.
+5. A limit or ceiling widens on `>`. The untrusted refusal of an equal value
+   (`>=`) is unchanged.
+6. `resolve` takes `Option<&Path>` and an optional mode. `from_load` exists
+   because `resolve` reads `DAMAIAN_DATA_DIR`, which tests cannot set per
+   test.
+7. Rules are `to_policy_text`'s lines. So `agent_max_task_tokens` and
+   `mcp_server_allowlist` have no rule while unset, exactly as the text omits
+   them, and a refusal of a key with no rule goes to `otherRefused`.
+8. The repository `command_allowlist` entries awaiting spec 34's migration,
+   shown as "NOT APPLIED, pending your review" in §5.7's example, are **not**
+   in `EffectivePolicy`, because they are refused values. They appear only as
+   a `user_owned` refusal. `context.md` §8's one exception stays with the
+   existing migration notice, which Task 7 can show beside the table.
+9. MCP servers and model providers are attributed per field. Choosing a
+   `model_provider` also attributes the three fields its defaults changed.
+10. `ProfileId::label` was added here rather than in Task 7, for the header.
 
 ## Task 7: Attributed effective-policy view and profile picker
 
