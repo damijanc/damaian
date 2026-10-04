@@ -37,14 +37,6 @@ pre {
     monospace;
 }
 
-/* The Effective policy block is empty until the user loads a config, and a
-   collapsed empty box reads as a rendering fault. This floor used to sit on
-   base `pre`, where it reached every `pre` in the app and had to be undone
-   again by `.message-body pre`. It belongs on the one element that wants it. */
-#config-output {
-  min-height: 180px;
-}
-
 body {
   margin: 0;
   min-height: 100vh;
@@ -2291,6 +2283,82 @@ button:disabled {
 
 .provider-config-panel textarea {
   min-height: 82px;
+}
+
+/* Settings › General's attributed effective policy (spec 31 Task 7). A long
+   policy scrolls inside its cap rather than stretching the page. */
+.policy-header {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.policy-table-wrap {
+  max-height: 480px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.policy-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.policy-table th {
+  position: sticky;
+  top: 0;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-weight: 600;
+  text-align: left;
+}
+
+.policy-table th,
+.policy-table td {
+  border-bottom: 1px solid var(--line);
+  padding: 6px 10px;
+  vertical-align: top;
+  word-break: break-word;
+}
+
+.policy-key,
+.policy-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.policy-note td {
+  color: var(--muted);
+}
+
+.policy-refused td {
+  color: var(--danger);
+}
+
+.policy-tag {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.policy-warning {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  color: var(--warn);
+  font-size: 12px;
+  padding: 8px 10px;
+}
+
+.policy-other-refused {
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.policy-other-refused ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
 }
 
 .settings-page-hint {

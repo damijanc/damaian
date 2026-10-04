@@ -1472,16 +1472,253 @@ function configRepo() {
   return repo();
 }
 
+// The provider and model syncing parse the plain policy text; the table is
+// drawn from the attributed policy, fetched separately (spec 31 Task 7).
 function renderConfigPolicy(payload) {
-  $("config-output").textContent = payload.effectiveError
-    ? `Effective policy could not be loaded:\n${payload.effectiveError}`
-    : payload.effectivePolicy;
-  if (!payload.effectiveError) {
-    syncProviderCatalogFromPolicy(payload.effectivePolicy);
-    currentPolicyModelOptions = modelOptionsFromPolicy(payload.effectivePolicy);
-    syncChatModelControlsFromPolicy(payload.effectivePolicy);
-    renderProviderConfigSelect();
+  if (payload.effectiveError) {
+    renderEffectivePolicyError(payload.effectiveError);
+    return;
   }
+  syncProviderCatalogFromPolicy(payload.effectivePolicy);
+  currentPolicyModelOptions = modelOptionsFromPolicy(payload.effectivePolicy);
+  syncChatModelControlsFromPolicy(payload.effectivePolicy);
+  renderProviderConfigSelect();
+  void loadEffectivePolicy().catch((error) => renderEffectivePolicyError(errorMessage(error)));
+}
+
+// "local" is a name heuristic, and every place that names it says so
+// (spec 31 context.md §7).
+const LOCAL_COMMANDS_CAVEAT =
+  "local means no command Damaian recognises as networked. That is a name heuristic, " +
+  "not a sandbox: a command Damaian does not recognise, such as python -c with urllib, " +
+  "can still reach the network. It also blocks every npm, pnpm and yarn command.";
+
+const PERMISSION_PROFILE_DESCRIPTIONS = {
+  full: "Today's behaviour. The profile narrows nothing; user, repository and admin config decide.",
+  safe_local: `File edits need your approval. Commands are limited to local. ${LOCAL_COMMANDS_CAVEAT}`,
+  read_only:
+    "Reads and explanations only. No file edits, no commands, no browser diagnostics, " +
+    "and only read-only MCP tools.",
+  offline_private:
+    `Commands are limited to local. ${LOCAL_COMMANDS_CAVEAT} No browser diagnostics, no MCP, ` +
+    "and audit and checkpoint retention lowered to 7 days. It does not stop model traffic: " +
+    "prompts still go to the model provider's base URL.",
+};
+
+const POLICY_CLASS_LABELS = {
+  restrict_only: "restrict-only",
+  forbidden: "forbidden",
+  user_owned: "yours to set",
+  unparsable: "could not be parsed",
+};
+
+const POLICY_REFUSED_BY_LABELS = {
+  repository: "repository config",
+  profile: "the permission profile",
+};
+
+let currentEffectivePolicy = null;
+
+async function loadEffectivePolicy() {
+  const params = new URLSearchParams({ repo: repo() });
+  if (repo() && currentSessionId) params.set("session", currentSessionId);
+  renderEffectivePolicy(await api(`/api/effective-policy?${params}`));
+}
+
+function renderEffectivePolicyError(message) {
+  currentEffectivePolicy = null;
+  $("policy-header").textContent = `Effective policy could not be loaded: ${message}`;
+  $("policy-table").tBodies[0].replaceChildren();
+  $("policy-other-refused").hidden = true;
+  renderPermissionProfilePicker();
+}
+
+function policyCell(text, className = "") {
+  const cell = document.createElement("td");
+  cell.textContent = text;
+  if (className) cell.className = className;
+  return cell;
+}
+
+function policySourceCell(sources, adminWidened) {
+  const cell = policyCell(sources.map((source) => source.label).join(", "));
+  if (adminWidened) {
+    const tag = document.createElement("span");
+    tag.className = "policy-tag";
+    tag.textContent = "widened by admin config";
+    cell.append(" ", tag);
+  }
+  return cell;
+}
+
+function policyNoteRow(text, className) {
+  const row = document.createElement("tr");
+  row.className = className;
+  const cell = policyCell(text);
+  cell.colSpan = 3;
+  row.append(cell);
+  return row;
+}
+
+// Key and class only: the policy carries no refused value (context.md §8).
+function policyRefusalText(refused) {
+  const by = POLICY_REFUSED_BY_LABELS[refused.by] || refused.by;
+  const kind = POLICY_CLASS_LABELS[refused.class] || refused.class;
+  return `Refused: ${by} asked to set ${refused.key} (${kind})`;
+}
+
+function policyRuleRows(rule) {
+  const rows = [];
+  const entries = rule.entries;
+  if (entries?.length) {
+    // Consecutive entries from one source share a row, as in proposal §5.7's
+    // example, so a long default list does not bury the entry that differs.
+    const groups = [];
+    entries.forEach((entry) => {
+      const last = groups[groups.length - 1];
+      if (last && last.source.label === entry.source.label) last.values.push(entry.value);
+      else groups.push({ source: entry.source, values: [entry.value] });
+    });
+    groups.forEach((group, index) => {
+      const row = document.createElement("tr");
+      row.append(
+        policyCell(index === 0 ? rule.key : "", "policy-key"),
+        policyCell(group.values.join(", "), "policy-value"),
+        policySourceCell([group.source], index === 0 && rule.adminWidened),
+      );
+      rows.push(row);
+    });
+  } else {
+    const row = document.createElement("tr");
+    row.append(
+      policyCell(rule.key, "policy-key"),
+      policyCell(entries ? "none" : rule.value, "policy-value"),
+      policySourceCell(rule.sources, rule.adminWidened),
+    );
+    rows.push(row);
+  }
+  if (rule.key === "command_access" && (rule.value === "local" || rule.value === "read_only")) {
+    rows.push(
+      policyNoteRow(
+        rule.value === "local"
+          ? LOCAL_COMMANDS_CAVEAT
+          : "read_only allows only low-risk read-only commands that need no approval.",
+        "policy-note",
+      ),
+    );
+  }
+  rule.refused.forEach((refused) => {
+    rows.push(policyNoteRow(policyRefusalText(refused), "policy-refused"));
+  });
+  return rows;
+}
+
+function renderEffectivePolicy(policy) {
+  currentEffectivePolicy = policy;
+  $("policy-header").textContent = `Effective policy — ${policy.header}`;
+  $("policy-table").tBodies[0].replaceChildren(...policy.rules.flatMap(policyRuleRows));
+  const other = $("policy-other-refused");
+  other.replaceChildren();
+  if (policy.otherRefused.length) {
+    const title = document.createElement("p");
+    title.textContent = "Other refused requests";
+    const list = document.createElement("ul");
+    policy.otherRefused.forEach((refused) => {
+      const item = document.createElement("li");
+      item.textContent = policyRefusalText(refused);
+      list.append(item);
+    });
+    other.append(title, list);
+  }
+  other.hidden = !policy.otherRefused.length;
+  renderPermissionProfilePicker();
+}
+
+function isLoopbackUrl(value) {
+  let host;
+  try {
+    host = new URL(value).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host === "[::1]" ||
+    /^127(\.\d{1,3}){3}$/.test(host)
+  );
+}
+
+// The provider the composer has selected is the one the next turn sends to,
+// whatever the loaded config says (spec 31 Task 7, deviation 5). An unknown
+// URL counts as not loopback, so the warning fails toward showing.
+function activeModelBaseUrl(policy) {
+  const configured = policy.rules.find((rule) => rule.key === "model_provider")?.value;
+  const selected = selectedChatModelOptions().provider;
+  if (!configured || normalizeChatProvider(configured) === selected) {
+    return policy.rules.find((rule) => rule.key === "model_base_url")?.value || "";
+  }
+  return modelProviderPresets[selected]?.baseUrl || "";
+}
+
+function renderPermissionProfilePicker() {
+  const select = $("permission-profile-select");
+  const policy = currentEffectivePolicy;
+  for (const option of select.querySelectorAll("option[data-custom]")) option.remove();
+  if (policy && !PERMISSION_PROFILE_DESCRIPTIONS[policy.profile]) {
+    const option = document.createElement("option");
+    option.value = policy.profile;
+    option.textContent = `${policy.profileLabel} (custom)`;
+    option.dataset.custom = "true";
+    select.append(option);
+  }
+  // Enabled even when the policy failed to load, so a checkout whose custom
+  // profile file has gone missing can be switched away from it.
+  select.disabled = !repo();
+  if (policy) select.value = policy.profile;
+  const description = $("permission-profile-description");
+  if (!repo()) {
+    description.textContent = "Open a repository to choose its permission profile.";
+  } else if (policy) {
+    description.textContent =
+      PERMISSION_PROFILE_DESCRIPTIONS[policy.profile] ||
+      "Your own profile file. A profile can only narrow: keys that would loosen are " +
+        "ignored and listed below as refused.";
+  } else {
+    description.textContent = "";
+  }
+  const warning = $("permission-profile-warning");
+  const baseUrl = policy?.profile === "offline_private" ? activeModelBaseUrl(policy) : "";
+  warning.hidden = policy?.profile !== "offline_private" || isLoopbackUrl(baseUrl);
+  if (!warning.hidden) {
+    warning.textContent =
+      "Offline private does not stop model traffic. Prompts and the code in context still go " +
+      `to ${baseUrl || "the model provider"}, which is not a loopback address.`;
+  }
+}
+
+async function selectPermissionProfile(profile) {
+  const fields = { repo: repo(), profile };
+  if (currentSessionId) fields.session = currentSessionId;
+  renderEffectivePolicy(await api("/api/permission-profile", form(fields)));
+  await carryProfileSelectionIntoEditor();
+}
+
+// The selection is a line in user config, and the editor above saves user
+// config whole. Without this, editing anything and pressing Save after a pick
+// would silently write the old selection back. Only the selection lines are
+// carried over, so unsaved edits in the editor survive.
+async function carryProfileSelectionIntoEditor() {
+  const saved = await api(
+    `/api/config-file?scope=${encodeURIComponent(configScope())}&repo=${encodeURIComponent(
+      configRepo(),
+    )}`,
+  );
+  configEntries(saved.content)
+    .filter(([key]) => key.startsWith("permission_profile."))
+    .forEach(([key, value]) => {
+      $("config-editor").value = upsertConfigValue($("config-editor").value, key, value);
+    });
 }
 
 function configValue(content, key) {
@@ -6212,6 +6449,17 @@ $("session-mode-select").addEventListener("change", async () => {
     toast(error.message);
   }
   renderModeControl();
+});
+
+// Like the mode, the selection is the explicit user action, so there is no
+// confirmation step. It applies from the next turn, resume or command.
+$("permission-profile-select").addEventListener("change", async () => {
+  try {
+    await selectPermissionProfile($("permission-profile-select").value);
+  } catch (error) {
+    toast(errorMessage(error));
+    renderPermissionProfilePicker();
+  }
 });
 
 function looksLikeEditRequest(prompt) {

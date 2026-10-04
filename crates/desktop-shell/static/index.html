@@ -355,7 +355,31 @@
           </section>
           <section class="settings-section">
             <h3>Effective policy</h3>
-            <pre id="config-output"></pre>
+            <label class="field">
+              <span>Permission profile for this repository</span>
+              <select id="permission-profile-select">
+                <option value="full">Full repository development</option>
+                <option value="safe_local">Safe local development</option>
+                <option value="read_only">Read-only</option>
+                <option value="offline_private">Offline private</option>
+              </select>
+            </label>
+            <p id="permission-profile-description" class="settings-page-hint"></p>
+            <p id="permission-profile-warning" class="policy-warning" hidden></p>
+            <p id="policy-header" class="policy-header"></p>
+            <div class="policy-table-wrap">
+              <table id="policy-table" class="policy-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Rule</th>
+                    <th scope="col">Value</th>
+                    <th scope="col">Source</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <div id="policy-other-refused" class="policy-other-refused" hidden></div>
           </section>
         </section>
 

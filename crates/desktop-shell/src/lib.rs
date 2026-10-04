@@ -10,15 +10,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use workspace_engine::finding::{FindingStatus, RepairRequest};
 use workspace_engine::{
     AgentPlanProposal, CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions,
-    ChatTurnResult, Config, CostEstimate, CurlModelTransport, DataSchemaOutcome, ExportFormat,
-    GeneratedSecretWarning, McpClient, McpServerConfig, McpTokenResolver, McpTransport,
-    OpenAICompatibleAdapter, PlanRevisionStep, ProcessRegistry, ProposedFilePatch,
-    ResumeDecisionOptions, SearchOptions, Session, SessionMode, StepStatus, TaskPlan, TaskUsage,
-    TokenUsage, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind,
-    WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
-    WorkspaceEngine, allow_always_eligible, command_approval_prompt, ensure_data_dir_schema,
-    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
-    parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    ChatTurnResult, Config, CostEstimate, CurlModelTransport, DataSchemaOutcome, EffectivePolicy,
+    ExportFormat, GeneratedSecretWarning, McpClient, McpServerConfig, McpTokenResolver,
+    McpTransport, OpenAICompatibleAdapter, PlanRevisionStep, ProcessRegistry, ProfileId,
+    ProposedFilePatch, ResumeDecisionOptions, SearchOptions, Session, SessionMode, StepStatus,
+    TaskPlan, TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall,
+    WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
+    WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible, command_approval_prompt,
+    ensure_data_dir_schema, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -287,6 +288,8 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 ),
             )
         }
+        ("GET", "/api/effective-policy") => handle_effective_policy(stream, &request),
+        ("POST", "/api/permission-profile") => handle_permission_profile(stream, &request),
         ("GET", "/api/model-key-status") => {
             let repo = request.param("repo").unwrap_or_default();
             let model_provider = request.param("model_provider");
@@ -1660,6 +1663,59 @@ fn effective_policy_for_repo(repo: &str) -> (String, String) {
     }
 }
 
+/// `GET /api/effective-policy`: spec 31 Task 6's `EffectivePolicy`, which
+/// Settings › General draws as a table. With a session, the header shows the
+/// profile intersected with that session's mode (proposal §5.6).
+fn handle_effective_policy(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = request.param("repo").unwrap_or_default();
+    let session_id = request.param("session").unwrap_or_default();
+    let body = effective_policy_json(&repo, &session_id)?;
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// `POST /api/permission-profile`: the steps `damaian profile-set` runs.
+/// Config is loaded without the repository, so a checkout whose custom profile
+/// file has gone missing can still be switched away from it (spec 31 Task 3,
+/// deviation 2).
+fn handle_permission_profile(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let requested = required_form(&form, "profile")?;
+    let session_id = form.get("session").cloned().unwrap_or_default();
+    if !Path::new(&repo).is_dir() {
+        return Err(format!("Not a repository folder: {repo}"));
+    }
+    let id = ProfileId::parse(&requested).map_err(|error| error.to_string())?;
+    let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
+    let engine = WorkspaceEngine::new(config.clone());
+    select_profile(&config, Path::new(&repo), id, &engine.audit_log)
+        .map_err(|error| error.to_string())?;
+    let body = effective_policy_json(&repo, &session_id)?;
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// The attributed policy for `repo`, from one fresh load. A custom profile's
+/// refused keys are audited here, once per key, because this is where the
+/// shell shows them (spec 31 criterion 4).
+fn effective_policy_json(repo: &str, session_id: &str) -> Result<String, String> {
+    let root = (!repo.is_empty()).then(|| Path::new(repo));
+    let (config, report) =
+        Config::load_for_repository_reporting(root).map_err(|error| error.to_string())?;
+    let engine = WorkspaceEngine::new(config.clone());
+    review_profile_rejections(&config.data_dir, &report, &engine.audit_log)
+        .map_err(|error| error.to_string())?;
+    let mode = if session_id.is_empty() {
+        None
+    } else if repo.is_empty() {
+        return Err("A session's policy needs its repository".to_string());
+    } else {
+        let session = session_in_repository(&engine, repo, session_id)?;
+        Some(engine.session_store.session_mode(&session.id))
+    };
+    serde_json::to_string(&EffectivePolicy::from_load(&config, &report, mode))
+        .map_err(|error| error.to_string())
+}
+
 fn resolve_model_api_key(reference: &str) -> Result<String, String> {
     if let Some(account) = keychain::account_from_reference(reference) {
         if let Some(api_key) = cached_model_api_key(account) {
@@ -2506,6 +2562,10 @@ fn repository_config_review_json(repo: &str) -> Result<String, String> {
     let migration = engine
         .repository_trust
         .pending_allowlist_migration(&report)
+        .map_err(|error| error.to_string())?;
+    // Audited only. A profile's refusals are the user's own choice of file,
+    // not the repository's, so they stay out of this notice (spec 31 Task 3).
+    review_profile_rejections(&engine.config.data_dir, &report, &engine.audit_log)
         .map_err(|error| error.to_string())?;
 
     let rejected = notice
@@ -5677,6 +5737,264 @@ mod tests {
         let error = save_config_file(&path, "unknown_key=value\n").unwrap_err();
         assert!(error.contains("Unknown config key"));
         assert!(!path.exists());
+    }
+
+    /// A checkout whose `.damaian/config.conf` holds `repository_config`.
+    fn policy_fixture(name: &str, repository_config: &str) -> PathBuf {
+        isolated_data_dir();
+        let repo = temp_path(name);
+        fs::create_dir_all(repo.join(".damaian")).expect("repository");
+        fs::write(repo.join(".damaian").join("config.conf"), repository_config)
+            .expect("repository config");
+        repo
+    }
+
+    fn get_effective_policy_for_test(port: u16, token: &str, query: &str) -> String {
+        send_for_test(
+            port,
+            format!(
+                "GET /api/effective-policy?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-damaian-api-token: {token}\r\nconnection: close\r\n\r\n"
+            ),
+        )
+    }
+
+    /// Every refusal in the policy as `(key, class, by)`, from the rules and
+    /// from `otherRefused`.
+    fn refusals_of(json: &serde_json::Value) -> Vec<(String, String, String)> {
+        let rules = json["rules"].as_array().expect("rules");
+        rules
+            .iter()
+            .flat_map(|rule| rule["refused"].as_array().expect("refused").iter())
+            .chain(json["otherRefused"].as_array().expect("otherRefused"))
+            .map(|refused| {
+                (
+                    refused["key"].as_str().unwrap().to_string(),
+                    refused["class"].as_str().unwrap().to_string(),
+                    refused["by"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn rule_of<'a>(json: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
+        json["rules"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .find(|rule| rule["key"] == key)
+            .unwrap_or_else(|| panic!("{key} has no rule in {json}"))
+    }
+
+    /// Task 6's shape over the wire: per-entry sources, a refusal by key and
+    /// class, and the refused value nowhere in the response (`context.md` §8).
+    /// The rules must also be the lines of the text the provider syncing
+    /// parses, loaded for the same repository.
+    #[test]
+    fn get_effective_policy_serves_the_attributed_policy_without_a_refused_value() {
+        let repo = policy_fixture(
+            "policy-view",
+            "restricted_patterns=secrets/**\n\
+             require_approval_for_file_edits=false\n\
+             shell=/tmp/evil-shell-task7\n",
+        );
+        let (port, token) = serve_for_test();
+
+        let response =
+            get_effective_policy_for_test(port, &token, &format!("repo={}", repo.display()));
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(!response.contains("evil-shell-task7"), "{response}");
+        let json = json_of(&response);
+        assert_eq!(json["profile"], "full");
+        assert_eq!(json["profileSelected"], false);
+        assert!(json["mode"].is_null(), "{json}");
+        assert_eq!(json["header"], "Full repository development");
+        let entries = rule_of(&json, "restricted_patterns")["entries"]
+            .as_array()
+            .expect("a list rule carries entries");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["value"] == "secrets/**"
+                    && entry["source"]["kind"] == "repository"),
+            "{entries:?}"
+        );
+        let refusals = refusals_of(&json);
+        for expected in [
+            (
+                "require_approval_for_file_edits",
+                "restrict_only",
+                "repository",
+            ),
+            ("shell", "forbidden", "repository"),
+        ] {
+            assert!(
+                refusals.iter().any(
+                    |(key, class, by)| (key.as_str(), class.as_str(), by.as_str()) == expected
+                ),
+                "{expected:?} missing from {refusals:?}"
+            );
+        }
+        let (text, error) = effective_policy_for_repo(repo.to_str().unwrap());
+        assert!(error.is_empty(), "{error}");
+        let lines: Vec<String> = json["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|rule| {
+                format!(
+                    "{}={}",
+                    rule["key"].as_str().unwrap(),
+                    rule["value"].as_str().unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(lines, text.lines().collect::<Vec<_>>());
+    }
+
+    /// Proposal §5.6 in the header: the session's mode, intersected. A session
+    /// from another checkout is refused rather than shown against this one.
+    #[test]
+    fn get_effective_policy_intersects_the_sessions_mode() {
+        let repo = policy_fixture("policy-mode", "");
+        let engine = engine_for_repo(repo.to_str().unwrap()).expect("engine");
+        let repository_id = engine.indexer.repository_id_for_path(&repo).unwrap();
+        let session_id = engine
+            .session_store
+            .create_session(&repository_id, "Policy")
+            .unwrap()
+            .id;
+        engine
+            .session_store
+            .set_session_mode(&session_id, SessionMode::Ask, "user")
+            .unwrap();
+        let foreign = engine
+            .session_store
+            .create_session("repo_somewhere_else", "Foreign")
+            .unwrap()
+            .id;
+        let (port, token) = serve_for_test();
+
+        let response = get_effective_policy_for_test(
+            port,
+            &token,
+            &format!("repo={}&session={session_id}", repo.display()),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let json = json_of(&response);
+        assert_eq!(json["mode"], "ask");
+        assert_eq!(json["header"], "Full repository development ∩ Ask mode");
+
+        let refused = get_effective_policy_for_test(
+            port,
+            &token,
+            &format!("repo={}&session={foreign}", repo.display()),
+        );
+        assert!(!refused.starts_with("HTTP/1.1 200"), "{refused}");
+        assert!(refused.contains("another repository"), "{refused}");
+    }
+
+    /// The selection is written where `damaian profile-set` writes it, and
+    /// audited. The follow-up GET is what proves it persisted: an endpoint that
+    /// only answered with the requested profile would pass the first half.
+    #[test]
+    fn post_permission_profile_writes_audits_and_returns_the_new_policy() {
+        let repo = policy_fixture("policy-select", "");
+        let (port, token) = serve_for_test();
+        let query = format!("repo={}", repo.display());
+
+        let selected = post_form_for_test(
+            port,
+            &token,
+            "/api/permission-profile",
+            &format!("{query}&profile=safe_local"),
+        );
+
+        assert!(selected.starts_with("HTTP/1.1 200"), "{selected}");
+        let json = json_of(&selected);
+        assert_eq!(json["profile"], "safe_local");
+        assert_eq!(json["profileSelected"], true);
+        let edits = rule_of(&json, "require_approval_for_file_edits");
+        assert_eq!(edits["value"], "true");
+        assert_eq!(edits["sources"][0]["kind"], "profile");
+        assert_eq!(rule_of(&json, "command_access")["value"], "local");
+
+        let repository_id = workspace_engine::hash::repository_id_for_root(&repo);
+        let user_config =
+            fs::read_to_string(isolated_data_dir().join("config").join("user.conf")).unwrap();
+        assert!(
+            user_config.contains(&format!("permission_profile.{repository_id}=safe_local")),
+            "{user_config}"
+        );
+        let audit =
+            fs::read_to_string(isolated_data_dir().join("audit").join("events.jsonl")).unwrap();
+        assert!(
+            audit
+                .lines()
+                .any(|line| line.contains("permission_profile_set")
+                    && line.contains(&repository_id)
+                    && line.contains("safe_local")),
+            "{audit}"
+        );
+        let reread = json_of(&get_effective_policy_for_test(port, &token, &query));
+        assert_eq!(reread["profile"], "safe_local");
+
+        let rejected = post_form_for_test(
+            port,
+            &token,
+            "/api/permission-profile",
+            &format!("{query}&profile=sideways"),
+        );
+        assert!(!rejected.starts_with("HTTP/1.1 200"), "{rejected}");
+        assert!(rejected.contains("sideways"), "{rejected}");
+        let reread = json_of(&get_effective_policy_for_test(port, &token, &query));
+        assert_eq!(
+            reread["profile"], "safe_local",
+            "a refused name must not be written"
+        );
+    }
+
+    /// Criterion 4 for a hand-edited custom profile (Task 3's note for Task 7):
+    /// the shell audits what the profile could not apply, by key and class.
+    /// The refused value reaches neither the response nor the audit log.
+    #[test]
+    fn a_custom_profiles_refused_keys_are_audited_when_the_shell_shows_it() {
+        let repo = policy_fixture("policy-custom", "");
+        let profiles = isolated_data_dir().join("config").join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        fs::write(
+            profiles.join("task7_custom.conf"),
+            "command_access=read_only\nshell=/tmp/custom-shell-task7\n",
+        )
+        .unwrap();
+        let (port, token) = serve_for_test();
+
+        let selected = post_form_for_test(
+            port,
+            &token,
+            "/api/permission-profile",
+            &format!("repo={}&profile=task7_custom", repo.display()),
+        );
+
+        assert!(selected.starts_with("HTTP/1.1 200"), "{selected}");
+        assert!(!selected.contains("custom-shell-task7"), "{selected}");
+        let json = json_of(&selected);
+        assert_eq!(rule_of(&json, "command_access")["value"], "read_only");
+        assert!(
+            refusals_of(&json).contains(&("shell".into(), "forbidden".into(), "profile".into())),
+            "{json}"
+        );
+        let audit =
+            fs::read_to_string(isolated_data_dir().join("audit").join("events.jsonl")).unwrap();
+        assert!(
+            audit
+                .lines()
+                .any(|line| line.contains("permission_profile_key_rejected")
+                    && line.contains("task7_custom")
+                    && line.contains("\"shell\"")),
+            "{audit}"
+        );
+        assert!(!audit.contains("custom-shell-task7"), "{audit}");
     }
 
     /// Repository config is untrusted input, so a key it cannot parse is
