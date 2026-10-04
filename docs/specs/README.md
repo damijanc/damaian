@@ -51,6 +51,13 @@ implementation, because the fallback *offer* turned out to be a feature in its
 own right rather than a fragment of the backpressure work it came from — see
 its §1.
 
+#57 is a sixth exception: it came from describing how this repository is
+actually built — a planner session that owns specs and verification, worker
+sessions that implement one task each, in parallel worktrees — and asking what
+Damaian needs to host that workflow itself. It is user-driven sessions, not
+#38's agent delegation, so it is not subject to #38's readiness gates; its
+`context.md` §2 records why.
+
 From #14 onward, specs graduate from the delivery plan in `docs/PLAN/`, one spec
 per work package, per that directory's governance section. Each carries a
 `Plan:` line naming its phase and work package, and the plan's dashboard records
@@ -131,6 +138,11 @@ of these costs more than it looks like it does.
 and it closes the half of #48 that shipped as only a negative guarantee.
 [#50](50_model_initiated_clarification.md) is ready too and unblocks nothing,
 which is why it sits off the table rather than above #24.
+[#57](57_worker_sessions/proposal.md), added on 2026-10-03, is ready for the
+same reason and sits off the table for it: every dependency (#17, #20, #46) is
+built and nothing depends on it. It touches `chat.rs`'s turn loop (`TurnSink`)
+and the shell's routes, so check it against the parallel rule below before
+running it beside another spec.
 [#49](49_prompt_cache_accounting_and_reuse/proposal.md)'s accounting slice is
 done, off this table for the same reason #56 will be once it ships: nothing
 left in it is unbuilt. Its reuse slice re-enters this table once #55 or #26
@@ -236,6 +248,7 @@ is ready.
 | 54 | [54_image_input.md](54_image_input.md) | **Not started.** Roadmap Phase 3 WP9. Damaian takes screenshots it cannot look at: #12's diagnostics capture them as artifacts carrying a path and dimensions, and the model that asked receives the report text and a file reference. From the other side `ModelMessage.content` is a `String` and the composer offers "Add file" and a disabled "Add folder", so a user cannot paste a picture of the bug they are reporting. Its hard part is that **an image defeats `SecretScanner`** — a screenshot of a terminal can carry a key and no rule can match a pixel. OCR is rejected on three independent grounds, one being that a guarantee holding most of the time is worse than a stated limitation, because the user stops checking. The guarantee becomes informed consent plus one asymmetry: a user-attached image was chosen by the person accountable for it, an agent-captured screenshot was framed by Damaian, so no unseen image is ever sent and no setting can make screenshot inclusion automatic. |
 | 55 | [55_conversation_compaction.md](55_conversation_compaction.md) | **Not started.** Roadmap Phase 3 WP6 (Must, and in that phase's minimum slice). Corrects the work package's premise: conversations do not grow until a provider refuses, they are **clipped to the last eight messages, each cut to 2,000 characters**, by two literals in `build_model_prompt` with no configuration behind them. So the defect is silent unmarked loss, not growth — a constraint stated in the first message is gone from the model's view at the ninth, with nothing on screen saying so, which is a worse failure than the loud one the plan describes. Its load-bearing rule is that **a model never writes a field the engine can compute**: files changed, plan steps, approvals and validation status are read from the session log, and only objective, constraints, decisions, failed approaches and uncertainty come from a model — because a summary is re-sent every turn, so an invented fact becomes a false belief the agent holds for the rest of the session. Compaction appends a `conversation_compacted` event rather than rewriting anything, which makes #16's rewind work with no special case and keeps #17's append-only rule intact.
 | 56 | [56_provider_fallback_consent.md](56_provider_fallback_consent.md) | **Not started.** Split out of #48 during its implementation: the fallback *offer* — a one-shot, refused-by-default approval that re-issues a refused turn through a configured second provider — was recognisably its own feature (engine pause + shell Keychain + frontend approval + resume), the size of #10 or patch approval. #48 shipped only requirement 7's negative half (no switch without consent, fail closed); this spec is the positive half. Depends on #48's classification and `failureKind`, and reuses the pending-approval and resume machinery rather than building a second one.
+| 57 | [57_worker_sessions/proposal.md](57_worker_sessions/proposal.md) | **Not started.** Exception to the graduation rule (see above). Hosts the planner-and-workers workflow behind one user setting, off by default and forbidden to repository config. When on, Damaian itself tells the model to write handoffs as `worker-prompt` blocks — so it works without any `AGENTS.md` — and a *Start worker* button on exactly those blocks opens a prompt-only dialog pre-filled with it — no copy and paste — and the worker runs in its own new git worktree under `.damaian/worktrees/`, hosted by its own process — the app's own executable re-launched in worker mode — because the shell serves one request at a time. A per-project Workers board, a control strip with pause, resume and stop, and steering notes that enter the conversation at the next round boundary. Its two load-bearing rules: a worker is a different *host* for the same turn, proven by an audit-sequence comparison against the shell, and **nothing survives** — a stdin lifeline makes every worker and its process group exit when the shell dies for any reason, including `SIGKILL`. The API key reaches the worker on stdin from the shell's existing in-memory cache, so a worker never reads the Keychain and never prompts, and never sees the key in its environment. Loop detection, a structured `propose_worker` tool and a planner reading results are named follow-ups, not part of it. |
 
 **Ordering exception.** Numbers are assigned in creation order, so #34 is last in
 the table but is the next thing to implement. It is a bug-driven spec covering a
