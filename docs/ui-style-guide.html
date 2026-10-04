@@ -699,5 +699,70 @@
         </div>
       </div>
     </section>
+
+    <section class="sg-section">
+      <h2>Effective policy table</h2>
+      <p class="sg-hint">
+        Settings › General. Consecutive list entries from one source share a row. A refused
+        request is shown by key and class only, never by value, on a row under its rule.
+      </p>
+      <div class="sg-card">
+        <p class="policy-warning">
+          Offline private does not stop model traffic. Prompts and the code in context still go
+          to https://api.openai.com, which is not a loopback address.
+        </p>
+        <p class="policy-header">Effective policy — Safe local development ∩ Code mode</p>
+        <div class="policy-table-wrap">
+          <table class="policy-table">
+            <thead>
+              <tr>
+                <th scope="col">Rule</th>
+                <th scope="col">Value</th>
+                <th scope="col">Source</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="policy-key">restricted_patterns</td>
+                <td class="policy-value">.env, *.pem</td>
+                <td>user config</td>
+              </tr>
+              <tr>
+                <td class="policy-key"></td>
+                <td class="policy-value">secrets/**</td>
+                <td>repository config</td>
+              </tr>
+              <tr>
+                <td class="policy-key">require_approval_for_file_edits</td>
+                <td class="policy-value">true</td>
+                <td>profile: safe_local</td>
+              </tr>
+              <tr class="policy-refused">
+                <td colspan="3">
+                  Refused: repository config asked to set require_approval_for_file_edits
+                  (restrict-only)
+                </td>
+              </tr>
+              <tr>
+                <td class="policy-key">max_read_lines</td>
+                <td class="policy-value">2000</td>
+                <td>admin config <span class="policy-tag">widened by admin config</span></td>
+              </tr>
+              <tr>
+                <td class="policy-key">command_access</td>
+                <td class="policy-value">local</td>
+                <td>profile: safe_local</td>
+              </tr>
+              <tr class="policy-note">
+                <td colspan="3">
+                  local means no command Damaian recognises as networked. That is a name
+                  heuristic, not a sandbox.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
   </body>
 </html>

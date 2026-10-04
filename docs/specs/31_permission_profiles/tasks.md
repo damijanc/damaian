@@ -16,7 +16,7 @@ decisions it left open in [`context.md`](context.md)
 | 4 · `command_access` enforced in `CommandPolicy` as a block | Done 2026-10-01 | **Landed:** `CommandPolicy::classify` ends with the `command_access` block. It sets `blocked: true` and appends `Blocked by permission profile: command_access=<level>`. It never changes risk, `requires_approval`, `may_use_network` or expected effects. It adds no second reason to a command that is already blocked, and it still blocks an allowlisted command. The new private `command_access_permits` decides each level. Plan mode's predicate moved into `CommandClassification::is_read_only_without_approval`, and `mode_permits` and `ReadOnly` both call it. The `CommandAccess` doc comment was updated. Not touched: `chat.rs`, `validation.rs`, `repository_config_trust.rs`. **Tests:** 4 new in `permission_profiles` (28/28): the 7-row × 4-level table, the invariance test (every field except `blocked`/`reasons` matches `All`, and three `All` values are pinned literally), `ls` under `require_approval_for_all_commands`, and run-by-id with a control. The run-by-id test uses a nonexistent shell, so a regression cannot run a real login shell. With `repository_config_trust` (47, file unmodified) and `foundation`, 233/233 pass. The `workspace-engine` lib tests pass, 271 run and 4 ignored. `cargo fmt --check`, `cargo clippy -p workspace-engine --all-targets --locked -D warnings` and `typos` are clean. `cargo check -p desktop-shell -p damaian-cli -p eval-harness --all-targets` passes. The deterministic eval tier was not run, because the default `All` changes nothing; Task 5 runs it. **Mutations (all reverted, all caught):** (1) `ReadOnly => true` failed the table. (2) `Local` reading the `may_use_network` field failed the table on the allowlisted `npm ci`. (3) The block also setting `risk = Blocked` failed the invariance test. (4) Removing the block failed the table and run-by-id. (5) Dropping `!requires_approval` from the shared predicate was caught at first only by `mode.rs`'s `plan_refuses_a_command_that_would_require_approval_even_if_low_risk`. The plan's `ls ../elsewhere` row could not see it, because the path escape also raises the risk to Medium. The `require_approval_for_all_commands` test was added, and now both tests fail. (6) Pushing the reason when already blocked failed the invariance test on `rm -rf /`. **Deviations:** six, listed under Task 4. (1) The block runs after the whole classification, not before the allowlist. (2) The predicate moved to `command_policy.rs`, a one-line `mode.rs` change. (3) `run_proposal` needed no change, because `CommandRunner::run` already re-classifies. (4) `Local` reads the command text, so it also blocks `npm test`/`npm run *` but not `cargo test`. (5) `read_only` blocks everything under `require_approval_for_all_commands`. (6) Invariance is checked against `All`. **For Task 5:** a profile-blocked command in the main loop currently takes the blocklist path: it is stored blocked and pauses with "local policy blocks this command". Approving it ends the resume with a `PolicyBlocked` turn error (`chat.rs:975`). `profile_permits` should refuse it before proposing. At resume, re-classify the stored command rather than trusting `proposal.blocked`, which predates a profile switch. **For Task 9:** the user guide must say that `local` blocks every `npm`/`pnpm`/`yarn` command, validation scripts included (deviation 4) |
 | 5 · `profile ∩ mode` at every refusal point | Done 2026-10-04 | Expanded into full steps on 2026-10-04. Every call site was re-located: `context.md` §5's line numbers still held, except that `edit.rs` calls the patch gate twice at apply (`:573`, `:574`). It was planned on the old base while spec 22 Task 8 was being written in its own worktree, and implemented after that task merged to main (`00173ee`). **This branch is not rebased onto it.** Task 8 also edits `chat.rs` next to the web-diagnostic and command resume branches and the imports, so the merge back will need those few hunks resolved. **Landed:** `mode.rs` gains `ProfileLimit`, `Permission::RefusedByProfile { limit }`, `profile_permits` and `permits` (mode first, first refusal wins), and the profile case of `refusal_message`: `Refused: the permission profile does not allow this (<key>=<value>). Switching mode will not allow it.` `command_access_permits` is now `pub(crate)`. Every `mode_permits` call in `chat.rs` now calls `permits`: the tool list, where the closure is renamed `offered`; `action_permission`; and the three resume branches. The command resume re-classifies the stored command. A profile refusal is rejected as `profile_policy`, and a profile-refused web diagnostic is audited as `refused_by_profile`. `edit.rs`'s gate is now `refuse_unless_mode_and_profile_permit_patches`, and it asks the profile even with no session. `the_permission_matrix_matches_the_spec_table` is now one table: 17 tool-class rows × 4 modes × the 4 built-in profiles, from their real overlays. The Full column must equal `mode_permits` exactly. **Tests:** new in `mode.rs`: the matrix (rewritten) and 2 message tests, 18/18. Two in `chat.rs`'s `mode_refusal_tests`: the web and MCP resume points. Ten in `permission_profiles.rs` (36 pass, 1 ignored): the two criterion 10 cases with exact wording, the profile-blocked command refused before any proposal, the next turn, the resume refusal, the violation pairing, sessionless propose and apply. The in-flight test is `#[ignore]` because it uses the real login shell. It passes when run by hand. `repository_config_trust` 47/47, file unmodified. The three integration files total 241. The whole `workspace-engine` crate: 868 passed, 19 skipped. The deterministic eval tier: 16/16 scenarios pass and `approval_policy_violations` is 0. The other metrics were not compared with a run on the base commit. `cargo fmt --check`, `cargo clippy -p workspace-engine --all-targets --locked -D warnings` and `typos` are clean. `cargo check -p desktop-shell -p damaian-cli -p eval-harness --all-targets` passes. **Mutations (all reverted, all caught):** (1) `permits` = mode alone failed 8. The edit tests did not fail, which the plan had predicted they would: the sessionless path calls `profile_permits` directly. (2) Profile first failed the matrix. (3) `blocked` instead of `command_access_permits` failed the matrix, `code_under_read_only…` and `the_next_turn…`. (4) The tool list with mode alone failed `code_under_read_only…`. (5) The command resume with Full's capabilities failed the resume and violation tests. Spec 20's `a_mode_refused_proposal_that_is_later_run_by_id…` also failed once in that parallel run, but passes under the same mutation in isolation and 5/5 unmutated. That one failure is unexplained, probably its real login shell under load. (6) The web and MCP resumes with Full's capabilities each failed their `chat.rs` test. (7) The early return on an empty session failed only the sessionless propose test. Apply goes through `propose_edit`'s own session. (8) Mode wording for the profile case failed 4. (9) The in-flight test, falsified by switching before the resume engine is built, failed on "never started". As first planned, with the switch before the thread, it was not caught, because the test reused the turn's engine. The test now builds its own resume engine. **Deviations:** ten, listed under Task 5. (1) A new `RefusedByProfile` variant. (2) The refusal names `key=value`, not the profile. (3) The mode is named when both refuse. (4) `command_access_permits` is shared, and `blocked` is not read, so a blocklisted command keeps its card. (5) The resume re-classifies the stored command for both axes. (6) Sessionless patches are profile-checked. (7) Read-only still offers `propose_plan` and `complete_step`. (8) The web and MCP resume tests are in `chat.rs`. (9) The shell is `/usr/bin/true`: this Mac stalls exec of any freshly written executable, so a script cannot stand in. (10) Audit wording. **For Task 6/7:** a refusal shows the resolved `key=value` and never the scope that set it. The attributed view must show all five keys, including `mcp_enabled`. If the view needs the strings, make `ProfileLimit::setting` `pub(crate)` rather than copying it. **For Task 9:** the user guide should give the two refusal strings, deviation 3 (Ask under Read-only names the mode first) and deviation 7 |
 | 6 · Provenance: a source for every applied value | Done 2026-10-04 | Expanded into full steps on 2026-10-04, after checking every `apply_overlay_scoped` caller, each merge helper and `apply_repository_allowlist` against the code. **Landed:** `apply_overlay_scoped` returns `OverlayOutcome { rejected, applied: Vec<AppliedKey> }`. `AppliedKey { key, scope, entries, widened }` is recorded at every application. The seven list keys carry the entries the scope holds. MCP servers and model providers are recorded per field. The helpers report what they applied: `union_patterns`, `intersect_allowlist` → `Option<(entries, loosened)>`; the flag, access, limit and ceiling helpers → `Option<loosened>`; `lower_wins` → `bool`; `upsert_mcp_server_from_repository` → its fields. `widened` is set only at admin scope. `RepositoryConfigReport` gains `applied` and `allow_always_entries`, and `apply_repository_allowlist` returns what it added. New `effective_policy.rs`: `EffectivePolicy::{resolve, from_load, rule, to_text}`, with `PolicyRule`, `PolicyEntry`, `PolicySource`, `SourceKind`, `RefusedRequest` and `RefusedBy`, all re-exported. Its rules are the lines of `to_policy_text`, so the view and the text cannot disagree. Added `ProfileId::label`. CLI `config-show --sources [repo]`. Callers: `damaian-cli` and one `foundation.rs` test read `.rejected`. The rest ignore the result unchanged. The refusal order is unchanged. Not touched: `chat.rs`, the web UI, `repository_config_trust.rs`. **Tests:** 5 new in `permission_profiles`: the outcome API, §5.7's per-entry example with Allow Always and a profile, admin widening against narrowing and user loosening, a refusal by key and class with no value in the JSON, the text or `report.applied`, and resolver agreement against an independent `load_scoped`. The file passes 41, with 1 ignored. The three integration files total 246, all passing. `repository_config_trust` is 47/47 and the file is unmodified. `foundation`'s FSEvents watcher test timed out once under parallel load and passed on rerun. The `mode::`, `config::` and `profile::` lib tests pass, 18/18. `cargo fmt --check`, `cargo clippy -p workspace-engine -p damaian-cli --all-targets --locked -D warnings` and `typos` are clean. `cargo check -p desktop-shell -p damaian-cli -p eval-harness --all-targets` passes. A manual `config-show --sources` against a scratch data dir showed the per-entry sources, the profile attribution, the admin widening and the refusals. The refused `shell` value was absent. **Mutations (8, all reverted, all caught in the end):** (1) the untrusted union recording nothing failed 2 tests. (2) `widened` at every trusted scope was **not caught at first**, because `from_load` re-checked the scope. It now reads `widened` alone, and the mutation fails. (3) The flag ignoring the current value failed the admin test. (4) Values rendered from defaults failed agreement. (5) A narrowed allowlist recording `incoming` was **not caught at first**, because the view prints entries from `Config`. The test now scans `report.applied`, and the mutation fails. (6) Dropping the Allow Always record failed §5.7; the first version of this mutation did not compile and was redone. (7) First applier wins failed 3. (8) The limit never loosening failed the admin test. A restore with `shutil.move` kept the backup's older mtime, so cargo reused a mutated build once. Touch the sources after restoring. **Deviations:** ten, listed under Task 6. (1) Provenance travels on the report, and `load_scoped`'s signature is unchanged. (2) Allow Always is a report field, not a scope. (3) A source is the last scope whose value holds, so an untrusted scope that sets the restrictive value takes the attribution. (4) Forbidden and User-owned keys have no direction, so an admin value there is attributed but never marked widened (open for Task 9's review). (5) Limit and ceiling widen on a strict `>`. (6) `resolve(Option<&Path>, Option<SessionMode>)`, plus `from_load`. (7) Keys the text omits while unset have no rule, and their refusals go to `otherRefused`. (8) Repository allowlist entries awaiting migration are not in the view. (9) Attribution per field for MCP and providers. (10) `ProfileId::label`. **For Task 7:** serve `EffectivePolicy::from_load` (or `resolve`) as JSON. The exact shape is under Task 6, "The `EffectivePolicy` JSON shape". It is camelCase: `header`, `profile`, `profileLabel`, `profileSelected`, `mode`, and `rules[] { key, value, sources[] { kind, label }, entries[] | null, adminWidened, refused[] { key, class, by } }`, plus `otherRefused[]`. `kind` is one of `default`, `user`, `repository`, `admin`, `profile` or `allowAlways`, and `by` is `repository` or `profile`. The view describes the loaded config. The chat's per-request provider override (`config_for_repo_with_provider`) is not reflected. Pending allowlist entries come from the existing migration notice, not from this structure |
-| 7 · Attributed effective-policy view and profile picker | Not started | |
+| 7 · Attributed effective-policy view and profile picker | Done 2026-10-04 | Expanded into full steps on 2026-10-04, after checking the outline against `effective_policy_for_repo` and its three callers, `renderConfigPolicy` and its syncing, and the Settings › General markup. Spec 22 Task 11 was Not started, so the shared shell files were free. **Landed:** `GET /api/effective-policy?repo=&session=` and `POST /api/permission-profile` (`repo`, `profile`, optional `session`), both as handler functions, not inline arms (spec 22 Task 10, deviation 1). They share `effective_policy_json`, which serves Task 6's `EffectivePolicy` unchanged, from one `load_for_repository_reporting`. With a session, the mode is that session's, and the session must belong to `repo` (`session_in_repository`). The POST runs `damaian profile-set`'s steps: config without the repository, then `select_profile`, which writes user config and audits `permission_profile_set`. The shell now calls `review_profile_rejections` in `effective_policy_json` and `repository_config_review_json`, and the result stays out of spec 34's notice. The three text callers of `effective_policy_for_repo` are unchanged. The `<pre>` is now a Rule/Value/Source table with refusal rows (key and class only), a `local`/`read_only` caveat row, an admin-widening tag and an "Other refused requests" list. Above it are the per-repository picker, a description of each profile, and the Offline private warning. `renderConfigPolicy` still feeds the plain text to the provider and model syncing. `#config-output`'s CSS is gone, there are new `.policy-*` rules, and there is a specimen in `docs/ui-style-guide.html`. Not touched: `chat.rs`, `repository_config_trust.rs`, and every `workspace-engine` file. **Tests:** 4 new shell tests: the view over the wire (per-entry source, refusals by key and class, the refused value absent, and rules equal to the text's lines), the session's mode and the foreign-session refusal, the POST (the user config line, the audit event, the re-read, and an unknown name refused without writing), and a custom profile's refusals audited without the value. Before the routes, all 4 failed on `{"error":"not found"}`. `cargo nextest run -p desktop-shell`: 90 passed, 4 skipped. `repository_config_trust`: 47/47, file unmodified. `cargo fmt --check`, `cargo clippy -p desktop-shell -p workspace-engine --all-targets --locked -D warnings`, `node --check`, `npm run lint:web` and `typos` are clean. Biome's one info is in `scripts/check-spec-status.mjs` and predates this task. **Mutations (5, all reverted, all caught):** (1) Loading without the repository failed 3 tests. (2) The GET ignoring `session` and (3) no session check each failed the mode test. (4) The POST never selecting failed 2. (5) No profile review failed the custom-profile test. **In the running app** (the inspection server on 4899, PID-stopped): the table showed `secrets/**` from repository config among default entries, and `require_approval_for_file_edits=true` from `profile: safe_local` with the repository's restrict-only refusal under it. The `shell` refusal showed with no value, and `model_provider.attacker` was under "Other refused requests". The header read "… ∩ Code mode" with a session open. Each built-in applied from the picker. A custom file appeared as "review_only (custom)", with its own `shell` refusal, audited once and without the value. After the file was deleted, the load error showed, and the picker still switched back to Full. The Offline private warning showed for `https://api.openai.com`, and hid for a user-configured provider at `http://127.0.0.1:11434/v1`. `isLoopbackUrl` rejected `127.evil.com` and `localhost.evil.com`. **Deviations:** eight, listed under Task 7. The main ones: (6) the user-config editor saved `user.conf` whole and erased a fresh selection, found only in the running app and fixed by carrying the `permission_profile.*` lines into the editor after a pick; (4) the picker lists the built-ins plus the selected custom profile only; (5) the Offline private warning follows the composer's provider; (7) list entries are grouped by consecutive source. **For Task 8:** add a custom-profile listing endpoint, and offer the imported files in the picker (`renderPermissionProfilePicker` adds an option only for the custom profile in force). Deviation 6's hazard applies to an import that writes user config. **For Task 9:** the second-person review reads Settings › General. Open a repository first, or the picker is disabled and the table shows the global policy. The editor hazard also applies to Allow Always's `command_allowlist.<repository_id>`; it is out of scope here and worth an observation. The repository notice (spec 34) appears over the page on each repository selection with a new data dir, so dismiss it before reading |
 | 8 · Sanitized export and import | Not started | |
 | 9 · Docs, acceptance criteria, second-person review, close the spec | Not started | |
 
@@ -4077,26 +4077,551 @@ resolver. A refused request shows key and class, never the value. Not touched:
 ## Task 7: Attributed effective-policy view and profile picker
 
 **Requirements:** 2 and §5.7 (the view), and acceptance criterion 6. **Files:**
-`desktop-shell/src/lib.rs`, `app.js`, `index.html`, and `styles.css`.
+`crates/desktop-shell/src/lib.rs`, and `static/app.js`, `index.html` and
+`style.css`. Not touched: `chat.rs`, `repository_config_trust.rs`, and every
+`workspace-engine` source file.
 
-- `GET /api/effective-policy?repo=…&session=…` serves `EffectivePolicy` as
-  JSON with camelCase keys. It passes the session's mode when a session is
-  given.
-- `POST /api/permission-profile` writes the selection through the same code
-  as `profile-set`, and audits it. It returns the new policy.
-- Settings › General's "Effective policy" `<pre>`
-  (`renderConfigPolicy`) becomes a table with columns rule, value and source,
-  plus a refused-request line under any key that has one. Keep feeding the
-  raw text to the provider and model syncing that `renderConfigPolicy` does
-  today, and do not break it.
-- Add a per-repository profile `<select>` above the table. It describes each
-  profile, including the `local` caveat from `context.md` §7 in those words.
-  It shows the Offline private model-traffic warning when it applies.
-- Follow `docs/UI_STYLE_GUIDE.md`.
+Expanded from the outline on 2026-10-04, after checking it against the code.
+The shell serves Task 6's `EffectivePolicy` exactly as Task 6 defined it
+("The `EffectivePolicy` JSON shape"). It is not reshaped or wrapped. A refused
+request is shown by key and class, never by value (`context.md` §8).
 
-Verify in the running app. Follow the repository's desktop-shell UI
-verification practice: rebuild, restart on a port other than 4765 with a
-separate `DAMAIAN_DATA_DIR`, and drive it from the browser.
+**What the outline was checked against:**
+
+- **`effective_policy_for_repo`** (`lib.rs:1652`) returns
+  `(Config::to_policy_text(), error)`. It is still loaded with
+  `Config::load_for_repository`, not the reporting loader. It has three
+  callers: `GET /api/config-file` (`:274`), `POST /api/config-file`
+  (`:1215`) and `POST /api/model-key` (`:1240`). All three return the text as
+  `effectivePolicy`, with `effectiveError`. They stay as they are, because the
+  text is what the provider and model syncing parse.
+- **`renderConfigPolicy`** (`app.js:1475`) writes that text into
+  `<pre id="config-output">`. It then feeds the same text to
+  `syncProviderCatalogFromPolicy`, `modelOptionsFromPolicy`,
+  `syncChatModelControlsFromPolicy` and `renderProviderConfigSelect`. Its three
+  callers are `loadConfigFile`, `saveConfigFile` and `saveModelApiKey`. The
+  syncing keeps reading `payload.effectivePolicy` unchanged. Only the `<pre>`
+  write is replaced, by a fetch of the attributed policy.
+- **Settings › General** (`index.html:339-360`) has two sections: "User
+  configuration" (the editor) and "Effective policy" (the `<pre>`). The
+  `#config-output { min-height: 180px }` rule in `style.css` exists only for
+  that `<pre>`, so it goes with it.
+- **The `session` parameter.** The session's mode is
+  `SessionStore::session_mode`. The session must belong to `repo`, which is
+  checked with `session_in_repository`, as the findings routes do. A mode from
+  another checkout's session must not be shown intersected with this
+  checkout's profile.
+- **`select_profile`** (Task 3) is the code `damaian profile-set` runs. The CLI
+  wrapper, `set_permission_profile`, loads config **without** the repository
+  (Task 3, deviation 2), builds an engine for its audit log, and calls
+  `select_profile`. That writes user config and audits
+  `permission_profile_set`. The endpoint does the same three steps.
+- **`review_profile_rejections`** (Task 3's note for Task 7) is called by
+  nothing in the shell. Its job is to audit a custom profile's refused keys
+  once per key. It is now called wherever the shell loads a repository's
+  policy for display: `effective_policy_json` and
+  `repository_config_review_json`. Its result is not added to spec 34's
+  repository notice.
+- **Spec 22, Task 10, deviation 1.** A route written inline in
+  `handle_connection` overflowed the stack in debug test threads. Both new
+  routes are therefore functions.
+
+**Interfaces:**
+- Consumes: `EffectivePolicy::from_load`, `Config::load_for_repository_reporting`,
+  `Config::load_for_repository`, `ProfileId::parse`, `select_profile`,
+  `review_profile_rejections`, `SessionStore::session_mode`, and the shell's
+  `session_in_repository`.
+- Produces:
+  - `GET /api/effective-policy?repo=<path>&session=<id>`. Both parameters are
+    optional. It answers with the `EffectivePolicy` JSON. With a session, the
+    `mode` is that session's mode, and the `header` reads `<profile> ∩ <Mode>
+    mode`. Without one, the `mode` is `null`. A session from another
+    repository, or a session with no `repo`, is refused.
+  - `POST /api/permission-profile` with form fields `repo`, `profile` and an
+    optional `session`. `repo` must be an existing directory. `profile` is
+    parsed with `ProfileId::parse`. An unknown name is a custom profile that
+    does not exist, and is refused without writing anything. The response is
+    the new `EffectivePolicy`, from a fresh load, in the same shape as the GET.
+  - `fn effective_policy_json(repo: &str, session_id: &str) -> Result<String, String>`,
+    shared by both routes.
+
+- [x] **Step 1: Write the failing tests**
+
+  Add `ProfileId`/`select_profile`/`EffectivePolicy`/`review_profile_rejections`
+  to `lib.rs`'s `workspace_engine` imports in Step 3. The tests go in the
+  `tests` module of `crates/desktop-shell/src/lib.rs`, after the findings
+  tests. They reuse `serve_for_test`, `send_for_test`, `post_form_for_test`,
+  `json_of` and `isolated_data_dir`. Under nextest each test is its own
+  process, with its own isolated data directory, so the user config these
+  tests write is not shared.
+
+  ```rust
+  /// A checkout whose `.damaian/config.conf` holds `repository_config`.
+  fn policy_fixture(name: &str, repository_config: &str) -> PathBuf {
+      isolated_data_dir();
+      let repo = temp_path(name);
+      fs::create_dir_all(repo.join(".damaian")).expect("repository");
+      fs::write(repo.join(".damaian").join("config.conf"), repository_config)
+          .expect("repository config");
+      repo
+  }
+
+  fn get_effective_policy_for_test(port: u16, token: &str, query: &str) -> String {
+      send_for_test(
+          port,
+          format!(
+              "GET /api/effective-policy?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-damaian-api-token: {token}\r\nconnection: close\r\n\r\n"
+          ),
+      )
+  }
+
+  /// Every refusal in the policy as `(key, class, by)`, from the rules and
+  /// from `otherRefused`.
+  fn refusals_of(json: &serde_json::Value) -> Vec<(String, String, String)> {
+      let rules = json["rules"].as_array().expect("rules");
+      rules
+          .iter()
+          .flat_map(|rule| rule["refused"].as_array().expect("refused").iter())
+          .chain(json["otherRefused"].as_array().expect("otherRefused"))
+          .map(|refused| {
+              (
+                  refused["key"].as_str().unwrap().to_string(),
+                  refused["class"].as_str().unwrap().to_string(),
+                  refused["by"].as_str().unwrap().to_string(),
+              )
+          })
+          .collect()
+  }
+
+  fn rule_of<'a>(json: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
+      json["rules"]
+          .as_array()
+          .expect("rules")
+          .iter()
+          .find(|rule| rule["key"] == key)
+          .unwrap_or_else(|| panic!("{key} has no rule in {json}"))
+  }
+
+  /// Task 6's shape over the wire: per-entry sources, a refusal by key and
+  /// class, and the refused value nowhere in the response (`context.md` §8).
+  /// The rules must also be the lines of the text the provider syncing
+  /// parses, loaded for the same repository.
+  #[test]
+  fn get_effective_policy_serves_the_attributed_policy_without_a_refused_value() {
+      let repo = policy_fixture(
+          "policy-view",
+          "restricted_patterns=secrets/**\n\
+           require_approval_for_file_edits=false\n\
+           shell=/tmp/evil-shell-task7\n",
+      );
+      let (port, token) = serve_for_test();
+
+      let response =
+          get_effective_policy_for_test(port, &token, &format!("repo={}", repo.display()));
+
+      assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+      assert!(!response.contains("evil-shell-task7"), "{response}");
+      let json = json_of(&response);
+      assert_eq!(json["profile"], "full");
+      assert_eq!(json["profileSelected"], false);
+      assert!(json["mode"].is_null(), "{json}");
+      assert_eq!(json["header"], "Full repository development");
+      let entries = rule_of(&json, "restricted_patterns")["entries"]
+          .as_array()
+          .expect("a list rule carries entries");
+      assert!(
+          entries.iter().any(|entry| entry["value"] == "secrets/**"
+              && entry["source"]["kind"] == "repository"),
+          "{entries:?}"
+      );
+      let refusals = refusals_of(&json);
+      for expected in [
+          ("require_approval_for_file_edits", "restrict_only", "repository"),
+          ("shell", "forbidden", "repository"),
+      ] {
+          assert!(
+              refusals.iter().any(|(key, class, by)| (key.as_str(), class.as_str(), by.as_str())
+                  == expected),
+              "{expected:?} missing from {refusals:?}"
+          );
+      }
+      let (text, error) = effective_policy_for_repo(repo.to_str().unwrap());
+      assert!(error.is_empty(), "{error}");
+      let lines: Vec<String> = json["rules"]
+          .as_array()
+          .unwrap()
+          .iter()
+          .map(|rule| format!("{}={}", rule["key"].as_str().unwrap(), rule["value"].as_str().unwrap()))
+          .collect();
+      assert_eq!(lines, text.lines().collect::<Vec<_>>());
+  }
+
+  /// Proposal §5.6 in the header: the session's mode, intersected. A session
+  /// from another checkout is refused rather than shown against this one.
+  #[test]
+  fn get_effective_policy_intersects_the_sessions_mode() {
+      let repo = policy_fixture("policy-mode", "");
+      let engine = engine_for_repo(repo.to_str().unwrap()).expect("engine");
+      let repository_id = engine.indexer.repository_id_for_path(&repo).unwrap();
+      let session_id = engine
+          .session_store
+          .create_session(&repository_id, "Policy")
+          .unwrap()
+          .id;
+      engine
+          .session_store
+          .set_session_mode(&session_id, SessionMode::Ask, "user")
+          .unwrap();
+      let foreign = engine
+          .session_store
+          .create_session("repo_somewhere_else", "Foreign")
+          .unwrap()
+          .id;
+      let (port, token) = serve_for_test();
+
+      let response = get_effective_policy_for_test(
+          port,
+          &token,
+          &format!("repo={}&session={session_id}", repo.display()),
+      );
+      assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+      let json = json_of(&response);
+      assert_eq!(json["mode"], "ask");
+      assert_eq!(json["header"], "Full repository development ∩ Ask mode");
+
+      let refused = get_effective_policy_for_test(
+          port,
+          &token,
+          &format!("repo={}&session={foreign}", repo.display()),
+      );
+      assert!(!refused.starts_with("HTTP/1.1 200"), "{refused}");
+      assert!(refused.contains("another repository"), "{refused}");
+  }
+
+  /// The selection is written where `damaian profile-set` writes it, and
+  /// audited. The follow-up GET is what proves it persisted: an endpoint that
+  /// only answered with the requested profile would pass the first half.
+  #[test]
+  fn post_permission_profile_writes_audits_and_returns_the_new_policy() {
+      let repo = policy_fixture("policy-select", "");
+      let (port, token) = serve_for_test();
+      let query = format!("repo={}", repo.display());
+
+      let selected = post_form_for_test(
+          port,
+          &token,
+          "/api/permission-profile",
+          &format!("{query}&profile=safe_local"),
+      );
+
+      assert!(selected.starts_with("HTTP/1.1 200"), "{selected}");
+      let json = json_of(&selected);
+      assert_eq!(json["profile"], "safe_local");
+      assert_eq!(json["profileSelected"], true);
+      let edits = rule_of(&json, "require_approval_for_file_edits");
+      assert_eq!(edits["value"], "true");
+      assert_eq!(edits["sources"][0]["kind"], "profile");
+      assert_eq!(rule_of(&json, "command_access")["value"], "local");
+
+      let repository_id = workspace_engine::hash::repository_id_for_root(&repo);
+      let user_config =
+          fs::read_to_string(isolated_data_dir().join("config").join("user.conf")).unwrap();
+      assert!(
+          user_config.contains(&format!("permission_profile.{repository_id}=safe_local")),
+          "{user_config}"
+      );
+      let audit =
+          fs::read_to_string(isolated_data_dir().join("audit").join("events.jsonl")).unwrap();
+      assert!(
+          audit.lines().any(|line| line.contains("permission_profile_set")
+              && line.contains(&repository_id)
+              && line.contains("safe_local")),
+          "{audit}"
+      );
+      let reread = json_of(&get_effective_policy_for_test(port, &token, &query));
+      assert_eq!(reread["profile"], "safe_local");
+
+      let rejected = post_form_for_test(
+          port,
+          &token,
+          "/api/permission-profile",
+          &format!("{query}&profile=sideways"),
+      );
+      assert!(!rejected.starts_with("HTTP/1.1 200"), "{rejected}");
+      assert!(rejected.contains("sideways"), "{rejected}");
+      let reread = json_of(&get_effective_policy_for_test(port, &token, &query));
+      assert_eq!(reread["profile"], "safe_local", "a refused name must not be written");
+  }
+
+  /// Criterion 4 for a hand-edited custom profile (Task 3's note for Task 7):
+  /// the shell audits what the profile could not apply, by key and class.
+  /// The refused value reaches neither the response nor the audit log.
+  #[test]
+  fn a_custom_profiles_refused_keys_are_audited_when_the_shell_shows_it() {
+      let repo = policy_fixture("policy-custom", "");
+      let profiles = isolated_data_dir().join("config").join("profiles");
+      fs::create_dir_all(&profiles).unwrap();
+      fs::write(
+          profiles.join("task7_custom.conf"),
+          "command_access=read_only\nshell=/tmp/custom-shell-task7\n",
+      )
+      .unwrap();
+      let (port, token) = serve_for_test();
+
+      let selected = post_form_for_test(
+          port,
+          &token,
+          "/api/permission-profile",
+          &format!("repo={}&profile=task7_custom", repo.display()),
+      );
+
+      assert!(selected.starts_with("HTTP/1.1 200"), "{selected}");
+      assert!(!selected.contains("custom-shell-task7"), "{selected}");
+      let json = json_of(&selected);
+      assert_eq!(rule_of(&json, "command_access")["value"], "read_only");
+      assert!(
+          refusals_of(&json).contains(&("shell".into(), "forbidden".into(), "profile".into())),
+          "{json}"
+      );
+      let audit =
+          fs::read_to_string(isolated_data_dir().join("audit").join("events.jsonl")).unwrap();
+      assert!(
+          audit.lines().any(|line| line.contains("permission_profile_key_rejected")
+              && line.contains("task7_custom")
+              && line.contains("\"shell\"")),
+          "{audit}"
+      );
+      assert!(!audit.contains("custom-shell-task7"), "{audit}");
+  }
+  ```
+
+- [x] **Step 2: Run them and watch them fail**
+
+  ```bash
+  cargo nextest run -p desktop-shell --lib -E 'test(effective_policy) + test(permission_profile) + test(custom_profiles)'
+  ```
+
+  Expected: they compile, because they use only existing helpers, and all
+  four fail on the catch-all `{"error":"not found"}`.
+
+- [x] **Step 3: The routes**
+
+  In `handle_connection`, next to `/api/config-file`:
+
+  ```rust
+  ("GET", "/api/effective-policy") => handle_effective_policy(stream, &request),
+  ("POST", "/api/permission-profile") => handle_permission_profile(stream, &request),
+  ```
+
+  The handlers go after `effective_policy_for_repo`:
+
+  ```rust
+  /// `GET /api/effective-policy`: spec 31 Task 6's `EffectivePolicy`, which
+  /// Settings › General draws as a table. With a session, the header shows
+  /// the profile intersected with that session's mode (proposal §5.6).
+  fn handle_effective_policy(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+      let repo = request.param("repo").unwrap_or_default();
+      let session_id = request.param("session").unwrap_or_default();
+      let body = effective_policy_json(&repo, &session_id)?;
+      write_response(stream, request, 200, "application/json", &body)
+  }
+
+  /// `POST /api/permission-profile`: the steps `damaian profile-set` runs.
+  /// Config is loaded without the repository, so a checkout whose custom
+  /// profile file has gone missing can still be switched away from it
+  /// (spec 31 Task 3, deviation 2).
+  fn handle_permission_profile(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+      let form = parse_form(&request.body);
+      let repo = required_form(&form, "repo")?;
+      let requested = required_form(&form, "profile")?;
+      let session_id = form.get("session").cloned().unwrap_or_default();
+      if !Path::new(&repo).is_dir() {
+          return Err(format!("Not a repository folder: {repo}"));
+      }
+      let id = ProfileId::parse(&requested).map_err(|error| error.to_string())?;
+      let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
+      let engine = WorkspaceEngine::new(config.clone());
+      select_profile(&config, Path::new(&repo), id, &engine.audit_log)
+          .map_err(|error| error.to_string())?;
+      let body = effective_policy_json(&repo, &session_id)?;
+      write_response(stream, request, 200, "application/json", &body)
+  }
+
+  /// The attributed policy for `repo`, from one fresh load. A custom
+  /// profile's refused keys are audited here, once per key: this is where
+  /// the shell shows them (criterion 4).
+  fn effective_policy_json(repo: &str, session_id: &str) -> Result<String, String> {
+      let root = (!repo.is_empty()).then(|| Path::new(repo));
+      let (config, report) =
+          Config::load_for_repository_reporting(root).map_err(|error| error.to_string())?;
+      let engine = WorkspaceEngine::new(config.clone());
+      review_profile_rejections(&config.data_dir, &report, &engine.audit_log)
+          .map_err(|error| error.to_string())?;
+      let mode = if session_id.is_empty() {
+          None
+      } else if repo.is_empty() {
+          return Err("A session's policy needs its repository".to_string());
+      } else {
+          let session = session_in_repository(&engine, repo, session_id)?;
+          Some(engine.session_store.session_mode(&session.id))
+      };
+      serde_json::to_string(&EffectivePolicy::from_load(&config, &report, mode))
+          .map_err(|error| error.to_string())
+  }
+  ```
+
+  `repository_config_review_json` also calls `review_profile_rejections`
+  after spec 34's review. It discards the result, so a profile's refusals
+  never reach the repository notice.
+
+- [x] **Step 4: Run the tests and confirm they pass**
+
+  Same command as Step 2. Then run the whole crate:
+
+  ```bash
+  cargo nextest run -p desktop-shell
+  cargo nextest run -p workspace-engine --test repository_config_trust
+  ```
+
+  `repository_config_trust.rs` is unmodified.
+
+- [x] **Step 5: The view**
+
+  `index.html`, Settings › General: the `<pre id="config-output">` section
+  becomes:
+
+  - a `.field` labelled "Permission profile for this repository", with
+    `<select id="permission-profile-select">`. It offers the four built-ins
+    and, when one is in force, the custom profile;
+  - `#permission-profile-description`: what the selected profile does;
+  - `#permission-profile-warning` (`hidden` by default): the Offline private
+    model-traffic warning;
+  - `#policy-header` ("Effective policy — Safe local development ∩ Code
+    mode"), the `#policy-table` (Rule, Value, Source), and
+    `#policy-other-refused`.
+
+  `app.js`:
+
+  - `renderConfigPolicy(payload)` keeps the four syncing calls on
+    `payload.effectivePolicy` exactly as they are. Instead of filling
+    `<pre>`, it calls `loadEffectivePolicy()`, or shows `effectiveError` in
+    `#policy-header`.
+  - `loadEffectivePolicy()` GETs `/api/effective-policy` with `repo()`, and
+    with `currentSessionId` when a session is open. It then calls
+    `renderEffectivePolicy(policy)`.
+  - `renderEffectivePolicy` draws one row per rule. A list rule draws one row
+    per run of consecutive entries that share a source, as in §5.7's example.
+    The key is on the first row only. An empty list reads "none". An admin widening is a `--warn` tag beside
+    the source. Each refusal is a full-width row under its rule:
+    "Refused: repository config asked to set `<key>` (`<class>`)". The class
+    reads as words ("restrict-only", "forbidden", "yours to set", "could not
+    be parsed"). There is no value, because the structure carries none.
+    `command_access=local` and `read_only` get a note row with the §7 caveat.
+    `otherRefused` is listed under the table.
+  - `PERMISSION_PROFILE_DESCRIPTIONS` describes each built-in.
+    `safe_local` and `offline_private` say, in `context.md` §7's words, that
+    `local` means "no command Damaian recognises as networked". They also say
+    it is a name heuristic, not a sandbox, and that it blocks every
+    `npm`/`pnpm`/`yarn` command (Task 4, deviation 4). `offline_private` also
+    says it does not stop model traffic.
+  - The picker POSTs `/api/permission-profile`, with `currentSessionId`, and
+    renders the response. It is disabled with no repository open. It stays
+    enabled when the policy fails to load, so a missing custom file can be
+    switched away from. After a pick, it copies the saved
+    `permission_profile.*` lines into the user-config editor (deviation 6).
+  - The warning shows when the profile in force is `offline_private` and the
+    active provider's base URL is not loopback. "Active" means the provider
+    selected in the chat composer, because that is what the next turn sends
+    (`config_for_repo_with_provider`). Its base URL comes from the policy's
+    `model_base_url` when that provider is the configured one, and from the
+    provider catalogue otherwise. An unknown or unparsable URL counts as not
+    loopback, so the warning fails toward showing. Loopback means
+    `localhost`, `*.localhost`, `127.0.0.0/8` or `[::1]`.
+
+  `style.css`: drop `#config-output`'s rule. Add `.policy-table` (12px,
+  monospace values, `--line` row borders, capped with `max-height` and
+  `overflow: auto` per the style guide §6), `.policy-refused` (`--danger`
+  text), `.policy-note` (`--muted`), `.policy-tag` (`--warn`), and
+  `.policy-warning` (`--warn` on `--surface-soft`). Add the table to
+  `docs/ui-style-guide.html`'s inventory (style guide §9).
+
+- [x] **Step 6: Falsify** (revert each one)
+
+  Each was run against the four new tests and the existing
+  `effective_policy_survives_…`, then restored from a backup and touched.
+  1. `effective_policy_json` loads with `None` instead of the repository:
+     the view test, the POST test and the custom-profile test fail.
+  2. The GET ignores `session`: the mode test fails (`mode` is `null`).
+  3. The session check is skipped: the mode test fails, because the foreign
+     session gets a 200.
+  4. The POST never calls `select_profile`: the POST test and the
+     custom-profile test fail.
+  5. No `review_profile_rejections` in `effective_policy_json`: only the
+     custom-profile test fails, on the missing
+     `permission_profile_key_rejected` event.
+
+- [x] **Step 7: Verify in the running app**
+
+  Rebuild, because the static assets are `include_str!`-embedded. Start a
+  shell on a port other than 4765, with its own data directory, and record
+  its PID. The standalone `damaian-desktop-shell` takes its API token only
+  over Tauri IPC, so a browser cannot call `/api/*` on it. Use the
+  `#[ignore]`d `serves_the_ui_for_manual_inspection` instead: it serves on
+  4899 with a known token and an isolated data directory. Run its test binary
+  directly, so the recorded PID is the server's. Open it in the browser on a scratch repository whose
+  config sets a restriction and a refused key. Check the table, a refusal
+  line, the session header, each profile in the picker, the `local` caveat,
+  and the Offline private warning with a non-loopback provider. Then stop
+  that PID only.
+
+- [x] **Step 8: Scoped checks**
+
+  ```bash
+  cargo nextest run -p desktop-shell
+  cargo clippy -p desktop-shell -p workspace-engine --all-targets --locked -- -D warnings
+  cargo fmt --all -- --check
+  node --check crates/desktop-shell/static/app.js
+  npm run lint:web
+  typos
+  ```
+
+- [x] **Step 9: Update this file's progress row, show the change and the
+  check results, and ask before committing**
+
+  Suggested subject: `Show the attributed effective policy and a profile picker`.
+
+**Deviations from the outline:**
+
+1. The three existing text callers of `effective_policy_for_repo` are
+   unchanged. The table is a separate GET, and the text keeps feeding the
+   provider and model syncing.
+2. The parameter is `session`, as the outline names it, although the
+   findings routes use `session_id`. A session that is not in `repo` is
+   refused, as it is for findings.
+3. The shell now calls `review_profile_rejections`, which the outline did not
+   mention. Task 3 left it for this task.
+4. The picker lists the four built-ins and, when one is in force, the
+   selected custom profile. No endpoint lists the custom profile files yet.
+   Task 8's import is the first thing that writes them, so listing them
+   belongs there.
+5. The Offline private warning is decided in `app.js` from the composer's
+   provider. It is not decided from the loaded config, which the per-request
+   provider override never reaches (Task 6's note).
+6. **Found in the running app: the editor erased the selection.** The
+   user-config editor on the same page saves `user.conf` whole. It holds the
+   content loaded when Settings opened, so editing anything and pressing Save
+   after a pick silently wrote the old selection back. After a pick, the
+   picker now re-reads the saved file and upserts only its
+   `permission_profile.*` lines into the editor, so unsaved edits survive.
+   `saveModelApiKey` does the same for `model_api_key_env`. The same hazard
+   exists for any line written behind the editor's back, such as Allow
+   Always's `command_allowlist.<repository_id>`, and is out of scope here.
+7. Per-entry rows buried the one differing entry under 20 default
+   `restricted_patterns`, with the key scrolled out of view. Consecutive
+   entries from one source now share a row, as in §5.7's example.
+8. A specimen was added to `docs/ui-style-guide.html` (style guide §9).
+   The browser pane opens that file as an unstyled `data:` snapshot, so the
+   specimen's styling was checked only in the running app.
 
 ## Task 8: Sanitized export and import
 
