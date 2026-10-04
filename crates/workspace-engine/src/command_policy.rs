@@ -281,7 +281,10 @@ pub fn allow_always_eligible(config: &Config, command: &str, blocked: bool) -> b
 /// Whether `command_access` lets this command run. `Local` judges the text,
 /// not `classification.may_use_network`, which the allowlist branch sets to
 /// `false`. It is a name heuristic, not a sandbox (spec 31 `context.md` §7).
-fn command_access_permits(access: CommandAccess, classification: &CommandClassification) -> bool {
+pub(crate) fn command_access_permits(
+    access: CommandAccess,
+    classification: &CommandClassification,
+) -> bool {
     match access {
         CommandAccess::None => false,
         CommandAccess::ReadOnly => classification.is_read_only_without_approval(),

@@ -10,7 +10,7 @@ use crate::context_manager::{ContextItem, ContextManager};
 use crate::error::{ClientError, Result};
 use crate::hash::{create_id, repository_id_for_root};
 use crate::indexer::ProjectIndexer;
-use crate::mode::{mode_permits, refusal_message};
+use crate::mode::{permits, profile_permits, refusal_message};
 use crate::model::{ModelAdapter, ModelMessage, ModelRequest, ModelRun, TokenUsage};
 use crate::patch_engine::{
     GeneratedSecretWarning, PatchApplyResult, PatchEngine, ProposedChange, ProposedPatch,
@@ -292,27 +292,33 @@ impl EditOrchestrator {
         error
     }
 
-    /// Refuses unless `session_id`'s mode allows a mutation proposal. An
-    /// empty id has no mode to read and is allowed, the carve-out a legacy
-    /// patch and the CLI's sessionless `propose-edit` both rely on.
-    fn refuse_unless_mode_permits_patches(&self, session_id: &str) -> Result<()> {
-        if session_id.is_empty() {
-            return Ok(());
-        }
-        let permission = mode_permits(
-            self.session_store.session_mode(session_id),
-            &ToolAction::ProposePatch(GeneratedEdit {
-                summary: String::new(),
-                changes: Vec::new(),
-            }),
-            None,
-            None,
-        );
+    /// Refuses unless the permission profile and `session_id`'s mode both
+    /// allow a mutation proposal. The profile is not a property of a session,
+    /// so it is asked even with an empty id: the carve-out a legacy patch and
+    /// the CLI's sessionless `propose-edit` rely on covers the mode only
+    /// (spec 31 Task 5, deviation 6).
+    fn refuse_unless_mode_and_profile_permit_patches(&self, session_id: &str) -> Result<()> {
+        let action = ToolAction::ProposePatch(GeneratedEdit {
+            summary: String::new(),
+            changes: Vec::new(),
+        });
+        let capabilities = self.config.profile_capabilities();
+        let permission = if session_id.is_empty() {
+            profile_permits(&capabilities, &action, None, None)
+        } else {
+            permits(
+                self.session_store.session_mode(session_id),
+                &capabilities,
+                &action,
+                None,
+                None,
+            )
+        };
         if permission.is_allowed() {
             Ok(())
         } else {
             // `AccessDenied`, not `PolicyBlocked`: the latter already means the
-            // command policy blocked something, and a mode is a different
+            // command policy blocked something, and a mode or profile is a
             // boundary the user chose, not a policy verdict.
             Err(ClientError::AccessDenied(refusal_message(permission)))
         }
@@ -347,7 +353,7 @@ impl EditOrchestrator {
                 "Unknown session: {origin_session_id}"
             )));
         }
-        self.refuse_unless_mode_permits_patches(origin_session_id)?;
+        self.refuse_unless_mode_and_profile_permit_patches(origin_session_id)?;
         let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, &repository_root)?;
         let session = self
             .session_store
@@ -570,8 +576,8 @@ impl EditOrchestrator {
         // unrestricted, the same carve-out its marker gets.
         // A patch from the edit flow also names the conversation it was
         // proposed from, whose mode can change after the preview appears.
-        self.refuse_unless_mode_permits_patches(&patch.session_id)?;
-        self.refuse_unless_mode_permits_patches(&patch.origin_session_id)?;
+        self.refuse_unless_mode_and_profile_permit_patches(&patch.session_id)?;
+        self.refuse_unless_mode_and_profile_permit_patches(&patch.origin_session_id)?;
         // Writing files is the most side-effecting action in the engine, so its
         // marker brackets the write itself rather than a caller. A patch stored
         // before `session_id` existed has no log to name, so it gets no marker —

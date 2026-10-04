@@ -122,7 +122,7 @@ Re-checked on 2026-09-30, when [#31](31_permission_profiles/proposal.md) was
 planned to run alongside #22. The ready set is unchanged. One correction to the
 pairing: #31's file references never name `chat.rs`, but enforcing
 `profile ∩ mode` does, because spec 20's permission check is called from it.
-So #31 and #22 are safe together **except #31's Task 5 against #22's Task 7**,
+So #31 and #22 are safe together **except #31's Task 5 against #22's Task 8**,
 the one task on each side that edits `chat.rs`. Each spec's `tasks.md` says so
 in its Global Constraints.
 

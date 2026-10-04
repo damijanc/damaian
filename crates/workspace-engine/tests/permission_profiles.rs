@@ -8,6 +8,9 @@
 //! Task 3 applies a selected profile last and restrict-only (`context.md` §4):
 //! with no selection nothing changes, and no profile can loosen what user,
 //! repository and admin config resolved.
+//!
+//! Task 5 asks the profile at every point that asks the mode, and a switch
+//! takes effect at the next turn start, resume or apply (`context.md` §6).
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -15,11 +18,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, CancelToken, ClientError, CommandAccess, CommandClassification, CommandPolicy,
-    CommandRisk, Config, ConfigKeyKind, ConfigOverlay, ConfigScope, ProfileCapabilities, ProfileId,
-    RepositoryConfigReport, RepositoryKeyClass, RepositoryTrustStore, SecretScanner,
-    WorkspaceEngine, overlay_field_kinds, repository_id_for_root, review_profile_rejections,
-    select_profile,
+    AuditLog, CancelToken, ChatTurnResult, ClientError, CommandAccess, CommandClassification,
+    CommandPolicy, CommandRisk, Config, ConfigKeyKind, ConfigOverlay, ConfigScope,
+    MockModelAdapter, ModelProviderConfig, ProfileCapabilities, ProfileId, RepositoryConfigReport,
+    RepositoryKeyClass, RepositoryTrustStore, SecretScanner, SessionMode, ToolCall, TurnProgress,
+    TurnSink, WorkspaceEngine, overlay_field_kinds, repository_id_for_root,
+    review_profile_rejections, select_profile,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1430,4 +1434,492 @@ fn a_proposal_stored_under_all_is_refused_by_id_once_command_access_narrows() {
     );
 
     let _ = fs::remove_dir_all(&root);
+}
+
+// Task 5: `profile ∩ mode` at every refusal point. Selecting a profile writes
+// user config. Like the desktop shell, every turn start, resume and apply
+// loads config and builds a new engine, and that is where a switch takes
+// effect (`context.md` §6).
+
+const PROFILE_REFUSED_EDIT: &str = "Refused: the permission profile does not allow this \
+     (allow_file_edits=false). Switching mode will not allow it.";
+
+fn native_tools_provider() -> ModelProviderConfig {
+    ModelProviderConfig {
+        id: "openai".to_string(),
+        label: "OpenAI".to_string(),
+        base_url: String::new(),
+        api_key_env: String::new(),
+        models: Vec::new(),
+        supports_native_tools: true,
+        max_output_tokens: None,
+        context_token_budget: None,
+        provider_reports_usage: true,
+        price_per_million_input_tokens: None,
+        price_per_million_output_tokens: None,
+        price_per_million_cached_input_tokens: None,
+        supports_explicit_cache_breakpoints: false,
+    }
+}
+
+impl ProfileFixture {
+    /// The engine one desktop request builds: config loaded from disk now,
+    /// so it runs under whatever profile is selected now. The shell is
+    /// `/usr/bin/true`: called as `<shell> -lc <command>`, it runs nothing and
+    /// exits 0, so a command "executes" without a real login shell
+    /// (`AGENTS.md`). A script written by the test cannot stand in: macOS
+    /// stalls exec of a freshly written executable on this machine.
+    fn engine(&self) -> WorkspaceEngine {
+        self.engine_with_shell("/usr/bin/true")
+    }
+
+    fn engine_with_shell(&self, shell: &str) -> WorkspaceEngine {
+        let (mut config, _) = self.load();
+        config.enable_index_watcher = false;
+        config.model_providers.push(native_tools_provider());
+        config.shell = shell.to_string();
+        WorkspaceEngine::new(config)
+    }
+
+    fn switch_to(&self, profile: &str) {
+        select_profile(
+            &self.base(),
+            &self.root,
+            ProfileId::parse(profile).unwrap(),
+            &self.audit_log(),
+        )
+        .unwrap();
+    }
+
+    /// The proposal ids of every audit event of `event_type`, in log order.
+    fn audited_proposal_ids(&self, event_type: &str) -> Vec<String> {
+        self.audit_events()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["eventType"] == event_type)
+            .filter_map(|event| event["proposalId"].as_str().map(str::to_string))
+            .collect()
+    }
+}
+
+/// A warm-up turn creates the session, then its mode is set.
+fn chat_session(engine: &WorkspaceEngine, root: &Path, mode: SessionMode) -> String {
+    let mut warm = MockModelAdapter::new("Ready.");
+    let mut on_token = |_token: &str| {};
+    let first = engine
+        .chat_orchestrator
+        .ask(root, "warm up", &[], &mut warm, &mut on_token)
+        .unwrap();
+    engine
+        .session_store
+        .set_session_mode(&first.session.id, mode, "user")
+        .unwrap();
+    first.session.id
+}
+
+fn with_sink<T>(run: impl FnOnce(&mut TurnSink<'_>) -> T) -> T {
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let cancel = CancelToken::new();
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+    };
+    run(&mut sink)
+}
+
+fn chat_turn(
+    engine: &WorkspaceEngine,
+    root: &Path,
+    session_id: &str,
+    adapter: &mut MockModelAdapter,
+) -> ChatTurnResult {
+    with_sink(|sink| {
+        engine
+            .chat_orchestrator
+            .ask_with_session(root, "Go ahead.", &[], Some(session_id), adapter, sink)
+            .unwrap()
+    })
+}
+
+fn approve(engine: &WorkspaceEngine, proposal_id: &str) -> ChatTurnResult {
+    let mut after = MockModelAdapter::new("Understood.");
+    with_sink(|sink| {
+        engine
+            .chat_orchestrator
+            .resume_after_command_decision(proposal_id, true, "tester", &mut after, sink)
+            .unwrap()
+    })
+}
+
+/// The model makes `calls` in its first round, then answers in plain text.
+fn calls_then_answer(calls: &[(&str, &str)]) -> MockModelAdapter {
+    let calls = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (name, arguments_json))| ToolCall {
+            id: format!("call_{}", index + 1),
+            name: name.to_string(),
+            arguments_json: arguments_json.to_string(),
+        })
+        .collect();
+    MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Understood.".to_string()],
+        vec![calls, Vec::new()],
+    )
+}
+
+fn offered_tools(adapter: &MockModelAdapter) -> Vec<String> {
+    adapter.requests[0]
+        .tools
+        .as_ref()
+        .expect("native tools should be offered")
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect()
+}
+
+fn tool_results(engine: &WorkspaceEngine, session_id: &str) -> Vec<String> {
+    engine
+        .session_store
+        .read_messages(session_id)
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.role == "tool")
+        .map(|message| message.content)
+        .collect()
+}
+
+const PROPOSE_NEW_FILE: &str =
+    r#"{"summary":"Add a file","files":[{"path":"new.txt","content":"hello\n"}]}"#;
+
+/// Criterion 10, first half: Code mode under Read-only cannot edit, and the
+/// refusal names the profile's setting, not a mode.
+#[test]
+fn code_under_read_only_cannot_edit_and_the_refusal_names_the_profile() {
+    let fixture = profile_fixture("code-read-only");
+    fixture.switch_to("read_only");
+    let engine = fixture.engine();
+    let session = chat_session(&engine, &fixture.root, SessionMode::Code);
+
+    let mut adapter = calls_then_answer(&[("propose_patch", PROPOSE_NEW_FILE)]);
+    let result = chat_turn(&engine, &fixture.root, &session, &mut adapter);
+
+    let offered = offered_tools(&adapter);
+    for withheld in ["propose_patch", "edit_file", "run_command"] {
+        assert!(
+            !offered.iter().any(|tool| tool == withheld),
+            "offered {withheld}: {offered:?}"
+        );
+    }
+    // Deviation 7: planning is not a capability.
+    for kept in ["read_file", "propose_plan"] {
+        assert!(
+            offered.iter().any(|tool| tool == kept),
+            "withheld {kept}: {offered:?}"
+        );
+    }
+    assert!(result.patch_proposal.is_none());
+    assert!(!fixture.root.join("new.txt").exists());
+    assert_eq!(tool_results(&engine, &session), vec![PROFILE_REFUSED_EDIT]);
+
+    fixture.cleanup();
+}
+
+/// Criterion 10, second half: Ask mode under Full cannot edit, and the
+/// refusal names the mode.
+#[test]
+fn ask_under_full_cannot_edit_and_the_refusal_names_the_mode() {
+    let fixture = profile_fixture("ask-full");
+    fixture.switch_to("full");
+    let engine = fixture.engine();
+    let session = chat_session(&engine, &fixture.root, SessionMode::Ask);
+
+    let mut adapter = calls_then_answer(&[("propose_patch", PROPOSE_NEW_FILE)]);
+    let result = chat_turn(&engine, &fixture.root, &session, &mut adapter);
+
+    assert!(result.patch_proposal.is_none());
+    assert_eq!(
+        tool_results(&engine, &session),
+        vec!["Refused: Ask mode does not allow this. Switch to Code mode to allow it."]
+    );
+
+    fixture.cleanup();
+}
+
+/// Task 4's note: a command the profile blocks used to be stored as a
+/// blocked proposal and pause the turn for a decision nobody could make.
+/// It is now refused before anything is stored.
+#[test]
+fn a_command_the_profile_blocks_is_refused_before_any_proposal_or_card() {
+    let fixture = profile_fixture("safe-local-curl");
+    fixture.switch_to("safe_local");
+    let engine = fixture.engine();
+    let session = chat_session(&engine, &fixture.root, SessionMode::Code);
+
+    let mut adapter = calls_then_answer(&[(
+        "run_command",
+        r#"{"command":"curl example.com","reason":"Fetch"}"#,
+    )]);
+    let result = chat_turn(&engine, &fixture.root, &session, &mut adapter);
+
+    assert!(result.command_proposal.is_none(), "no approval card");
+    assert!(!fixture.audit_events().contains("command_proposal_stored"));
+    let results = tool_results(&engine, &session);
+    assert!(results[0].contains("(command_access=local)"), "{results:?}");
+
+    fixture.cleanup();
+}
+
+/// "Blocks the next one", at a turn start: what the last turn ran is
+/// refused by the next turn once the selection has changed.
+#[test]
+fn the_next_turn_after_switching_to_read_only_refuses_what_the_last_turn_ran() {
+    let fixture = profile_fixture("next-turn");
+    let engine = fixture.engine();
+    let session = chat_session(&engine, &fixture.root, SessionMode::Code);
+    let ls = [("run_command", r#"{"command":"ls","reason":"Look"}"#)];
+
+    let mut before = calls_then_answer(&ls);
+    chat_turn(&engine, &fixture.root, &session, &mut before);
+    assert_eq!(
+        fixture
+            .audited_proposal_ids("stored_command_executed")
+            .len(),
+        1
+    );
+
+    fixture.switch_to("read_only");
+    let engine = fixture.engine();
+    let mut after = calls_then_answer(&ls);
+    chat_turn(&engine, &fixture.root, &session, &mut after);
+
+    assert!(
+        !offered_tools(&after)
+            .iter()
+            .any(|tool| tool == "run_command")
+    );
+    assert_eq!(
+        fixture
+            .audited_proposal_ids("stored_command_executed")
+            .len(),
+        1
+    );
+    let results = tool_results(&engine, &session);
+    assert!(
+        results.last().unwrap().contains("(command_access=none)"),
+        "{results:?}"
+    );
+
+    fixture.cleanup();
+}
+
+/// Proposed under Full, approved after the selection changed to Read-only.
+fn command_refused_at_resume(fixture: &ProfileFixture) -> (String, String) {
+    let engine = fixture.engine();
+    let session = chat_session(&engine, &fixture.root, SessionMode::Code);
+    let mut adapter = calls_then_answer(&[(
+        "run_command",
+        r#"{"command":"touch resumed-marker","reason":"Change"}"#,
+    )]);
+    let first = chat_turn(&engine, &fixture.root, &session, &mut adapter);
+    let proposal = first.command_proposal.expect("Full asks for approval");
+
+    fixture.switch_to("read_only");
+    approve(&fixture.engine(), &proposal.id);
+    (session, proposal.id)
+}
+
+/// "Blocks the next one", at a resume: approving is a new decision, made
+/// under the profile selected now.
+#[test]
+fn a_command_paused_under_full_is_refused_at_resume_after_switching_to_read_only() {
+    let fixture = profile_fixture("resume-read-only");
+    let (session, proposal_id) = command_refused_at_resume(&fixture);
+
+    assert!(
+        !fixture.root.join("resumed-marker").exists(),
+        "the command ran"
+    );
+    assert!(
+        fixture
+            .audited_proposal_ids("stored_command_executed")
+            .is_empty()
+    );
+    assert_eq!(
+        fixture.audited_proposal_ids("stored_command_rejected"),
+        vec![proposal_id]
+    );
+    let results = tool_results(&fixture.engine(), &session);
+    assert!(
+        results.last().unwrap().contains("(command_access=none)"),
+        "{results:?}"
+    );
+
+    fixture.cleanup();
+}
+
+/// Criterion 12 and spec 20 `context.md` §9: a profile refusal marks the
+/// proposal rejected, as a mode refusal does. Run by id once the profile is
+/// wide again, it is the pairing `approval_policy_violations` counts
+/// (`eval-harness/src/runner.rs`).
+#[test]
+fn a_profile_refused_proposal_later_run_by_id_counts_as_an_approval_policy_violation() {
+    let fixture = profile_fixture("resume-violation");
+    let (_session, proposal_id) = command_refused_at_resume(&fixture);
+
+    fixture.switch_to("full");
+    let mut on_output = |_line: &str| {};
+    fixture
+        .engine()
+        .validation_orchestrator
+        .run_proposal(
+            &proposal_id,
+            true,
+            "tester",
+            None,
+            &CancelToken::new(),
+            &mut on_output,
+        )
+        .unwrap();
+
+    let rejected = fixture.audited_proposal_ids("stored_command_rejected");
+    let violations = fixture
+        .audited_proposal_ids("stored_command_executed")
+        .into_iter()
+        .filter(|executed| rejected.contains(executed))
+        .count();
+    assert_eq!(violations, 1);
+
+    fixture.cleanup();
+}
+
+/// "Does not interrupt an in-flight action": the switch lands while the
+/// approved command is running, and the command still finishes.
+///
+/// `#[ignore]`d per `AGENTS.md`: it needs a command that really runs for a
+/// while, so it spawns the real login shell (`$SHELL -lc`). Run it by hand:
+///
+/// ```sh
+/// cargo test -p workspace-engine --test permission_profiles -- --ignored --exact \
+///   a_command_already_running_finishes_after_a_switch_to_read_only
+/// ```
+#[test]
+#[ignore]
+fn a_command_already_running_finishes_after_a_switch_to_read_only() {
+    let fixture = profile_fixture("in-flight");
+    let shell = Config::default().shell;
+    let engine = fixture.engine_with_shell(&shell);
+    let session = chat_session(&engine, &fixture.root, SessionMode::Code);
+    let mut adapter = calls_then_answer(&[(
+        "run_command",
+        r#"{"command":"touch started && sleep 2 && touch finished","reason":"Slow"}"#,
+    )]);
+    let first = chat_turn(&engine, &fixture.root, &session, &mut adapter);
+    let proposal = first
+        .command_proposal
+        .expect("a chained command needs approval");
+
+    // The approval is its own request, so it builds its own engine, under Full.
+    let resume_engine = fixture.engine_with_shell(&shell);
+    let running = std::thread::spawn(move || {
+        approve(&resume_engine, &proposal.id);
+    });
+    let started = fixture.root.join("started");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the command never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        !fixture.root.join("finished").exists(),
+        "switch before the end"
+    );
+    fixture.switch_to("read_only");
+    running.join().unwrap();
+
+    assert!(
+        fixture.root.join("finished").exists(),
+        "the command was interrupted"
+    );
+    assert_eq!(
+        fixture
+            .audited_proposal_ids("stored_command_executed")
+            .len(),
+        1
+    );
+    assert_eq!(fixture.load().0.command_access, CommandAccess::None);
+
+    fixture.cleanup();
+}
+
+const EDIT_RESPONSE: &str = "DAMAIAN_EDIT_V1\nSUMMARY: Add a\nFILE: a.txt\nSTATUS: added\nCONTENT:\nhello\nEND_FILE\nEND_PATCH\n";
+
+/// Deviation 6: the CLI's sessionless `propose-edit` has no mode, and the
+/// profile still applies to it, before any model call.
+#[test]
+fn propose_edit_under_read_only_is_refused_before_the_model_even_without_a_session() {
+    let fixture = profile_fixture("edit-read-only");
+    fixture.switch_to("read_only");
+    let engine = fixture.engine();
+    let mut adapter = MockModelAdapter::new(EDIT_RESPONSE);
+
+    let error = engine
+        .edit_orchestrator
+        .propose_edit(&fixture.root, "Add a", &[], None, &mut adapter)
+        .expect_err("Read-only must refuse");
+
+    assert!(
+        matches!(&error, ClientError::AccessDenied(message) if message == PROFILE_REFUSED_EDIT),
+        "{error:?}"
+    );
+    assert!(adapter.requests.is_empty(), "the model was called");
+    assert!(
+        !fixture.data_dir.join("patches").exists(),
+        "a patch was stored"
+    );
+
+    fixture.cleanup();
+}
+
+/// An apply is its own decision point: a patch proposed under Full is
+/// refused once the selection is Read-only, and nothing is written.
+#[test]
+fn a_patch_proposed_under_full_is_refused_at_apply_after_switching_to_read_only() {
+    let fixture = profile_fixture("apply-read-only");
+    let mut adapter = MockModelAdapter::new(EDIT_RESPONSE);
+    let proposal = fixture
+        .engine()
+        .edit_orchestrator
+        .propose_edit(&fixture.root, "Add a", &[], None, &mut adapter)
+        .expect("Full allows the proposal");
+
+    fixture.switch_to("read_only");
+    let error = fixture
+        .engine()
+        .edit_orchestrator
+        .apply_stored_patch(
+            &fixture.root,
+            &proposal.patch.id,
+            None,
+            None,
+            "tester",
+            false,
+        )
+        .expect_err("Read-only must refuse the apply");
+
+    assert!(
+        matches!(&error, ClientError::AccessDenied(message) if message == PROFILE_REFUSED_EDIT),
+        "{error:?}"
+    );
+    assert!(
+        !fixture.root.join("a.txt").exists(),
+        "the patch was applied"
+    );
+
+    fixture.cleanup();
 }

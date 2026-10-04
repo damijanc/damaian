@@ -14,7 +14,7 @@ decisions it left open in [`context.md`](context.md)
 | 2 · The four profile capability keys | Done 2026-09-30 | **Landed:** `allow_file_edits`, `command_access`, `allow_browser_diagnostics` and `allow_mutating_mcp_tools` on `Config` (defaults `true`/`All`/`true`/`true`) and on `ConfigOverlay`. `pub enum CommandAccess { None, ReadOnly, Local, All }` has `parse` (returning `Option`) and `as_str`, with `Ord` as the restriction order. The keys are parsed in `ConfigOverlay::set` and written by both `to_policy_text`s. Repository scope treats them as Restrict-only: the flags go through `restrict_only_flag(.., false)`, and `command_access` through the new `restrict_only_access` (narrower-or-equal applies, wider is recorded as `RestrictOnly`). They are classified `Capability`, so the partition now has 38 capability and 7 preference fields. `CommandAccess` is re-exported. **Tests:** `permission_profiles` 10/10 pass. There are 4 new weakening cases and 6 new tests, including a 7-row `command_access` step table covering equal, narrower and one-step-wider. `repository_config_trust` and `foundation` also pass, 215 in total across the three files. `cargo fmt --check`, `cargo clippy -p workspace-engine --all-targets --locked -D warnings` and `typos` are clean. `cargo check` of `desktop-shell`, `damaian-cli` and `eval-harness` passes. **Mutations (all reverted):** (1) `restrict_only_access` accepting any value failed the step table ("local then all") and the `command_access` weakening case. (2) `allow_file_edits` with `restrictive = true` failed the narrowing test and its weakening case. **Visible effect:** the desktop "Effective policy" text now lists the four keys at their defaults. Nothing else changes until Tasks 4–5 enforce them. **For Task 3:** a profile sets these through `apply_overlay_scoped`, so `ConfigScope::Profile` gets the same restrict-only merge for free once its trust `match` routes it there |
 | 3 · Profiles, `ConfigScope::Profile`, and per-repository selection | Done 2026-09-30 | **Landed:** new `profile.rs` with `ProfileId` (`parse`, `custom`, `as_str`, `custom_path`, `overlay` with §3's built-ins), `ProfileCapabilities`, `select_profile` and `review_profile_rejections`. `ConfigScope::Profile`, and the trust check is now an exhaustive `match`. `permission_profile_by_repository` is on `Config` and `ConfigOverlay` (`permission_profile.<repository_id>=<id>`), User-owned at repository scope and classified `Capability`, so the partition is 39/7. `load_scoped` applies the selection after admin, before the `Allow Always` fold. The report gains `permission_profile` and `profile_rejected_keys`, and `Config` derives `PartialEq`. CLI `profile-set <repo> <id>`, and `config-review` now lists profile refusals. **Tests:** `permission_profiles` 24/24: 14 new, plus one new weakening case. `repository_config_trust` 47/47, file unmodified. With `foundation`, 229 pass across the three files. `cargo fmt --check`, `cargo clippy -p workspace-engine -p damaian-cli --all-targets --locked -D warnings` and `typos` are clean. `cargo check -p desktop-shell -p eval-harness --all-targets` passes. A manual CLI run against a scratch `DAMAIAN_DATA_DIR` behaved as Step 7 describes. **Mutations (all reverted, all caught):** (1) Profile trusted failed the loosen test and the audit test. (2) Defaulting to Read-only with no selection failed 6, including `with_no_profile_selected…` and the Task 2 repository tests. (3) Profile before admin failed `admin_can_widen…`. (4) Preferences applied at profile scope failed the loosen and audit tests. (5) A profile allowed to define an MCP server failed the MCP test. (6) `lower_wins` always assigning failed the Offline private and loosen tests. (7) Profile refusals copied into `rejected_keys` failed the loosen and audit tests. (8) The review not remembering failed "audited twice". (9) The selection trusted at repository scope failed the repository-selects test, the loosen test and the Task 1 weakening case. **Deviations:** nine, listed under Task 3. The main ones: `overlay` also returns the parse refusals; a missing selected custom file fails the load instead of resolving as Full; a profile may not define an MCP server at all; lower-wins records nothing; refused preferences are classed `Forbidden`; the real repository id format is `repo_sha256:<9 hex>`. **Visible now:** a selection made with `profile-set` already applies in the desktop app, which loads through the same `load_scoped`. Safe local's `require_approval_for_file_edits=true`, and Offline private's `mcp_enabled=false` and 7-day retention, take effect today, because those keys were already enforced. The four Task 2 keys wait for Tasks 4–5. **For Task 4/5:** read `Config::profile_capabilities()`. `CommandAccess` arrives already narrowed by the profile. **For Task 7:** the desktop shell's `engine_for_repo` still calls only `RepositoryTrustStore::review`. It must also call `review_profile_rejections` (criterion 4 for hand-edited custom files). `POST /api/permission-profile` should call `select_profile` with config loaded **without** the repository (deviation 2). **For Task 8:** use `ProfileId::custom` for reserved-id refusal and `custom_path` for the file. The profile scope reports an *equal* value of a `restrict_only_limit` or `restrict_only_ceiling` key as refused, so import's "would loosen" list should compare with `>`, not reuse those refusals as is |
 | 4 · `command_access` enforced in `CommandPolicy` as a block | Done 2026-10-01 | **Landed:** `CommandPolicy::classify` ends with the `command_access` block. It sets `blocked: true` and appends `Blocked by permission profile: command_access=<level>`. It never changes risk, `requires_approval`, `may_use_network` or expected effects. It adds no second reason to a command that is already blocked, and it still blocks an allowlisted command. The new private `command_access_permits` decides each level. Plan mode's predicate moved into `CommandClassification::is_read_only_without_approval`, and `mode_permits` and `ReadOnly` both call it. The `CommandAccess` doc comment was updated. Not touched: `chat.rs`, `validation.rs`, `repository_config_trust.rs`. **Tests:** 4 new in `permission_profiles` (28/28): the 7-row × 4-level table, the invariance test (every field except `blocked`/`reasons` matches `All`, and three `All` values are pinned literally), `ls` under `require_approval_for_all_commands`, and run-by-id with a control. The run-by-id test uses a nonexistent shell, so a regression cannot run a real login shell. With `repository_config_trust` (47, file unmodified) and `foundation`, 233/233 pass. The `workspace-engine` lib tests pass, 271 run and 4 ignored. `cargo fmt --check`, `cargo clippy -p workspace-engine --all-targets --locked -D warnings` and `typos` are clean. `cargo check -p desktop-shell -p damaian-cli -p eval-harness --all-targets` passes. The deterministic eval tier was not run, because the default `All` changes nothing; Task 5 runs it. **Mutations (all reverted, all caught):** (1) `ReadOnly => true` failed the table. (2) `Local` reading the `may_use_network` field failed the table on the allowlisted `npm ci`. (3) The block also setting `risk = Blocked` failed the invariance test. (4) Removing the block failed the table and run-by-id. (5) Dropping `!requires_approval` from the shared predicate was caught at first only by `mode.rs`'s `plan_refuses_a_command_that_would_require_approval_even_if_low_risk`. The plan's `ls ../elsewhere` row could not see it, because the path escape also raises the risk to Medium. The `require_approval_for_all_commands` test was added, and now both tests fail. (6) Pushing the reason when already blocked failed the invariance test on `rm -rf /`. **Deviations:** six, listed under Task 4. (1) The block runs after the whole classification, not before the allowlist. (2) The predicate moved to `command_policy.rs`, a one-line `mode.rs` change. (3) `run_proposal` needed no change, because `CommandRunner::run` already re-classifies. (4) `Local` reads the command text, so it also blocks `npm test`/`npm run *` but not `cargo test`. (5) `read_only` blocks everything under `require_approval_for_all_commands`. (6) Invariance is checked against `All`. **For Task 5:** a profile-blocked command in the main loop currently takes the blocklist path: it is stored blocked and pauses with "local policy blocks this command". Approving it ends the resume with a `PolicyBlocked` turn error (`chat.rs:975`). `profile_permits` should refuse it before proposing. At resume, re-classify the stored command rather than trusting `proposal.blocked`, which predates a profile switch. **For Task 9:** the user guide must say that `local` blocks every `npm`/`pnpm`/`yarn` command, validation scripts included (deviation 4) |
-| 5 · `profile ∩ mode` at every refusal point | Not started | **Touches `chat.rs`.** Do not run at the same time as spec 22 Task 7 (`context.md` §5) |
+| 5 · `profile ∩ mode` at every refusal point | Done 2026-10-04 | Expanded into full steps on 2026-10-04. Every call site was re-located: `context.md` §5's line numbers still held, except that `edit.rs` calls the patch gate twice at apply (`:573`, `:574`). It was planned on the old base while spec 22 Task 8 was being written in its own worktree, and implemented after that task merged to main (`00173ee`). **This branch is not rebased onto it.** Task 8 also edits `chat.rs` next to the web-diagnostic and command resume branches and the imports, so the merge back will need those few hunks resolved. **Landed:** `mode.rs` gains `ProfileLimit`, `Permission::RefusedByProfile { limit }`, `profile_permits` and `permits` (mode first, first refusal wins), and the profile case of `refusal_message`: `Refused: the permission profile does not allow this (<key>=<value>). Switching mode will not allow it.` `command_access_permits` is now `pub(crate)`. Every `mode_permits` call in `chat.rs` now calls `permits`: the tool list, where the closure is renamed `offered`; `action_permission`; and the three resume branches. The command resume re-classifies the stored command. A profile refusal is rejected as `profile_policy`, and a profile-refused web diagnostic is audited as `refused_by_profile`. `edit.rs`'s gate is now `refuse_unless_mode_and_profile_permit_patches`, and it asks the profile even with no session. `the_permission_matrix_matches_the_spec_table` is now one table: 17 tool-class rows × 4 modes × the 4 built-in profiles, from their real overlays. The Full column must equal `mode_permits` exactly. **Tests:** new in `mode.rs`: the matrix (rewritten) and 2 message tests, 18/18. Two in `chat.rs`'s `mode_refusal_tests`: the web and MCP resume points. Ten in `permission_profiles.rs` (36 pass, 1 ignored): the two criterion 10 cases with exact wording, the profile-blocked command refused before any proposal, the next turn, the resume refusal, the violation pairing, sessionless propose and apply. The in-flight test is `#[ignore]` because it uses the real login shell. It passes when run by hand. `repository_config_trust` 47/47, file unmodified. The three integration files total 241. The whole `workspace-engine` crate: 868 passed, 19 skipped. The deterministic eval tier: 16/16 scenarios pass and `approval_policy_violations` is 0. The other metrics were not compared with a run on the base commit. `cargo fmt --check`, `cargo clippy -p workspace-engine --all-targets --locked -D warnings` and `typos` are clean. `cargo check -p desktop-shell -p damaian-cli -p eval-harness --all-targets` passes. **Mutations (all reverted, all caught):** (1) `permits` = mode alone failed 8. The edit tests did not fail, which the plan had predicted they would: the sessionless path calls `profile_permits` directly. (2) Profile first failed the matrix. (3) `blocked` instead of `command_access_permits` failed the matrix, `code_under_read_only…` and `the_next_turn…`. (4) The tool list with mode alone failed `code_under_read_only…`. (5) The command resume with Full's capabilities failed the resume and violation tests. Spec 20's `a_mode_refused_proposal_that_is_later_run_by_id…` also failed once in that parallel run, but passes under the same mutation in isolation and 5/5 unmutated. That one failure is unexplained, probably its real login shell under load. (6) The web and MCP resumes with Full's capabilities each failed their `chat.rs` test. (7) The early return on an empty session failed only the sessionless propose test. Apply goes through `propose_edit`'s own session. (8) Mode wording for the profile case failed 4. (9) The in-flight test, falsified by switching before the resume engine is built, failed on "never started". As first planned, with the switch before the thread, it was not caught, because the test reused the turn's engine. The test now builds its own resume engine. **Deviations:** ten, listed under Task 5. (1) A new `RefusedByProfile` variant. (2) The refusal names `key=value`, not the profile. (3) The mode is named when both refuse. (4) `command_access_permits` is shared, and `blocked` is not read, so a blocklisted command keeps its card. (5) The resume re-classifies the stored command for both axes. (6) Sessionless patches are profile-checked. (7) Read-only still offers `propose_plan` and `complete_step`. (8) The web and MCP resume tests are in `chat.rs`. (9) The shell is `/usr/bin/true`: this Mac stalls exec of any freshly written executable, so a script cannot stand in. (10) Audit wording. **For Task 6/7:** a refusal shows the resolved `key=value` and never the scope that set it. The attributed view must show all five keys, including `mcp_enabled`. If the view needs the strings, make `ProfileLimit::setting` `pub(crate)` rather than copying it. **For Task 9:** the user guide should give the two refusal strings, deviation 3 (Ask under Read-only names the mode first) and deviation 7 |
 | 6 · Provenance: a source for every applied value | Not started | |
 | 7 · Attributed effective-policy view and profile picker | Not started | |
 | 8 · Sanitized export and import | Not started | |
@@ -81,7 +81,7 @@ Every task's requirements implicitly include this section.
   locally, and `cargo clippy --workspace --all-targets` up to 18 minutes cold.
   Tests that build an engine set `enable_index_watcher: false`.
 - **`chat.rs` belongs to Task 5 alone** (`context.md` §5). Before starting
-  Task 5, check spec 22's `tasks.md` progress table. If its Task 7 is in
+  Task 5, check spec 22's `tasks.md` progress table. If its Task 8 is in
   progress, wait, or agree which track rebases.
 - **Never `git commit` unasked.** Each task ends by showing the change and the
   scoped check results, then asking. When asked, write one subject line with no
@@ -2376,45 +2376,1046 @@ second reason.
 
 **Requirements:** 5 and 6. Acceptance criteria 9, 10 and 12. **Files:**
 `mode.rs`, `chat.rs`, `edit.rs`, and `tests/permission_profiles.rs`.
+**Also modified:** `command_policy.rs`, one visibility change (deviation 4).
+**Not touched:** `config.rs`, `profile.rs`, `validation.rs`,
+`repository_config_trust.rs`.
 **Touches `chat.rs`. Read Global Constraints before starting.**
 
-- In `mode.rs`, add
-  `pub(crate) fn permits(mode, &ProfileCapabilities, &ToolAction, Option<&CommandClassification>, Option<bool>) -> Permission`.
-  It returns the first refusal of `mode_permits` then `profile_permits`.
-  `profile_permits` refuses:
-  - edits and patch proposals when `allow_file_edits` is false;
-  - web diagnostics when `allow_browser_diagnostics` is false;
-  - an MCP call whose read-only hint is not `Some(true)` when
-    `allow_mutating_mcp_tools` is false, and any MCP call when `mcp_enabled`
-    is false;
-  - a `blocked` command. Task 4 makes the classification carry the profile.
-- `Permission::Refused` gains which axis refused it. `refusal_message` names
-  the mode or the profile.
-- Replace every `mode_permits` call site with `permits`:
-  - the tool-list filter;
-  - `action_permission`;
-  - the three resume branches;
-  - `refuse_unless_mode_permits_patches`, renamed to say both.
+`mode.rs` gains `profile_permits`, which crosses the resolved
+`ProfileCapabilities` with the tool class, and `permits`, which asks the mode
+first and then the profile and returns the first refusal. Every place that
+called `mode_permits` now calls one of these. `chat.rs` and `edit.rs` only call
+them. They read the capabilities from the orchestrator's own `Config`, which a
+desktop request loads once. So a profile switch takes effect at the next turn
+start, the next resume and the next apply, and never in the middle of an action
+already running (`context.md` §6).
 
-  Capabilities come from the orchestrator's `Config`, which is captured per
-  turn and per resume (`context.md` §6).
-- Extend `the_permission_matrix_matches_the_spec_table` into a matrix over
-  every mode × the four built-in profiles × every tool class. Do not add a
-  second matrix test.
+`profile_permits` refuses:
 
-Tests:
-- "Ask under Full cannot edit" and "Code under Read-only cannot edit", each
-  with the expected refusal wording.
-- Mid-session switching:
-  - A turn paused for command approval under Full, resumed after the
-    selection changed to Read-only, refuses at resume.
-  - A command already executing is not interrupted. Drive it with a
-    long-running command and assert it completes.
-- The eval harness's `approval_policy_violations` still counts a
-  profile-refused resume. It calls `reject_proposal` like a mode refusal
-  does.
+| Tool class | Refused when | Names |
+|---|---|---|
+| `ProposePatch`, `EditFile` | `allow_file_edits=false` | `allow_file_edits=false` |
+| `Command` | Task 4's `command_access_permits` says no | `command_access=<level>` |
+| `WebDiagnostic` | `allow_browser_diagnostics=false` | `allow_browser_diagnostics=false` |
+| `McpCall` | `mcp_enabled=false`, or `allow_mutating_mcp_tools=false` and the hint is not `Some(true)` | that key |
+| Reads, `ProposePlan`, `CompleteStep` | never | |
 
-Run the deterministic eval tier.
+The refusal names the axis. A mode refusal keeps its wording. A profile refusal
+reads:
+`Refused: the permission profile does not allow this (<key>=<value>). Switching mode will not allow it.`
+
+**Call sites, re-located against the code on 2026-10-04.** `context.md` §5's
+line numbers, taken on 2026-09-30, still match apart from edit.rs:
+
+- **The tool-list filter:** `chat.rs:1389-1521`. The mode is captured at
+  `:1395`. `mode_permits` is called at `:1401` (the `permits` closure that every
+  built-in definition uses), `:1420` (`run_command`) and `:1508` (MCP).
+- **`action_permission`:** `chat.rs:3015`, which calls `mode_permits` at
+  `:3037`. The main loop calls it once per action at `:2046` and renders a
+  refusal at `:2174`.
+- **The three resume branches** in `resume_after_command_decision_with_options`
+  (`chat.rs:800`). The mode is read at `:828`. Web diagnostic at `:837`, with
+  the decision at `:843` and the message at `:872`. MCP at `:890`, with the
+  message at `:901`. Command at `:934`, with the rejection at `:953` and the
+  message at `:954`.
+- **`refuse_unless_mode_permits_patches`:** `edit.rs:298`. It is called at
+  `:350` (`propose_edit`) and **twice** at apply, at `:573` (`session_id`) and
+  `:574` (`origin_session_id`). `context.md` §5 lists only `:573`. The second
+  call is spec 20's origin-session check, added later.
+
+No other `mode_permits` caller exists outside `mode.rs`'s own tests. The
+single apply path is `apply_stored_patch` (`edit.rs:554`), and nothing else
+calls `PatchEngine::apply_patch`.
+
+**Deviations from the outline:**
+
+1. **`Permission` gains a variant, `RefusedByProfile { limit }`, rather than a
+   field on `Refused`.** The variant is the axis. `Refused { blocked_by,
+   allowed_in }` stays the mode refusal, so spec 20's matches and tests are
+   unchanged. `is_allowed` and `refusal_message` handle both.
+2. **A profile refusal names the setting, not the profile.**
+   `ProfileCapabilities` holds resolved values, and user, repository or admin
+   config can also narrow each of these keys (Task 2). "Under the Read-only
+   profile" would then be false. So the message says `allow_file_edits=false`,
+   which is true whatever set it. Task 7's attributed view says which scope
+   set it.
+3. **When both axes refuse, the mode is named.** The outline says "first
+   refusal of `mode_permits` then `profile_permits`". So Ask under Read-only
+   says "Switch to Code mode", and the next attempt in Code is then refused
+   by the profile. Each message is true about its own axis. Task 7's view
+   shows both.
+4. **`command_access_permits` becomes `pub(crate)`** in `command_policy.rs`,
+   a one-line change. The outline says `profile_permits` refuses "a `blocked`
+   command". But `blocked` also means the blocklist and the hard block, which
+   are local policy, not the profile. Reading it would label a blocklisted
+   command a profile refusal. It would also refuse that command before the
+   blocked-proposal card it gets today, which changes behaviour under Full.
+   Task 4's predicate does not read `blocked`, so a stale stored flag cannot
+   decide either.
+5. **The command resume re-classifies the stored command**
+   (`ValidationOrchestrator::classify_command` on its working directory) and
+   asks both axes about that classification. This follows Task 4's note.
+   Before this task, the mode was asked about the fields stored with the
+   proposal. It now sees the current config too. The command text and
+   directory are the same, so only a config change between proposal and
+   approval can change the answer, and the current config is the one
+   `run_proposal` would enforce anyway.
+6. **The patch gate asks the profile even when the session id is empty.**
+   That case is the CLI's sessionless `propose-edit` and a legacy patch with
+   no session. A profile is not a property of a session. Without this, the
+   CLI could propose and apply edits under Read-only. The gate is renamed
+   `refuse_unless_mode_and_profile_permit_patches`. With no session it calls
+   `profile_permits` alone.
+7. **Read-only does not withhold `propose_plan` or `complete_step`.** No
+   capability key covers planning, and planning writes nothing. So Code under
+   Read-only offers Ask's tools plus the two planning tools. That differs from
+   `context.md` §3's "matches Ask mode's tool set", which holds for every
+   mutating class.
+8. **The web-diagnostic and MCP resume tests are in `chat.rs`'s
+   `mode_refusal_tests`**, beside their spec 20 siblings, because they reuse
+   that module's counting web runner and fake MCP server. The narrowed engine
+   is a clone of the config with the key turned off. The command and edit
+   tests are in `permission_profiles.rs`. They go through the real selection:
+   `select_profile` writes user config, and a new engine loads it.
+9. **The integration tests use `/usr/bin/true` as the shell.** The engine
+   calls `<shell> -lc <command>`. `true` ignores its arguments and exits 0,
+   so a command is recorded as executed without a real login shell, which
+   would force `#[ignore]` (`AGENTS.md`). The plan first used a stand-in
+   script written by the test. On this Mac, any freshly written executable
+   stalls at exec, even a copy of `/bin/echo`, inside the sandbox and outside
+   it. So a script written at test time cannot stand in. The one test that
+   needs a command which really runs for a while, the in-flight test, uses
+   the real `$SHELL`. It is `#[ignore]`d, with its manual command in its doc
+   comment.
+10. **Audit wording.** A profile-refused command is rejected with
+    `rejectedBy: profile_policy`, where a mode refusal uses `mode_policy`. A
+    profile-refused web diagnostic is audited with the decision
+    `refused_by_profile`. The eval harness pairs `stored_command_rejected` with
+    `stored_command_executed` by proposal id and never reads `rejectedBy`
+    (`runner.rs:425-445`). So a profile refusal counts in
+    `approval_policy_violations` as a mode refusal does.
+
+**Interfaces:**
+- Consumes `Config::profile_capabilities()` and `ProfileCapabilities` (Task 3),
+  `CommandAccess::as_str` (Task 2), and `command_access_permits` (Task 4,
+  now `pub(crate)`).
+- Produces, in `mode.rs`:
+  - `pub(crate) enum ProfileLimit { FileEdits, CommandAccess(CommandAccess), BrowserDiagnostics, MutatingMcpTools, McpDisabled }`,
+    with a private `setting(self) -> String` that returns `key=value`.
+  - `Permission::RefusedByProfile { limit: ProfileLimit }`.
+  - `pub(crate) fn profile_permits(&ProfileCapabilities, &ToolAction, Option<&CommandClassification>, Option<bool>) -> Permission`.
+    It panics on a `Command` with no classification, as `mode_permits` does.
+  - `pub(crate) fn permits(SessionMode, &ProfileCapabilities, &ToolAction, Option<&CommandClassification>, Option<bool>) -> Permission`.
+  - `refusal_message` with the profile case.
+- **For Task 6–7:** a refusal does not say which scope set the refusing value,
+  only `key=value` (deviation 2). The attributed view is where a user finds
+  that out, so it should show these five keys, `mcp_enabled` included.
+  `ProfileLimit::setting` is private. If the view wants the same strings, make
+  it `pub(crate)` rather than writing a second copy.
+- **For Task 9:** the user guide's refusal examples are the two strings
+  pinned in Step 1. Deviation 7 needs saying there, and so does deviation 3:
+  one action can be refused by the mode first and by the profile next.
+
+- [x] **Step 1: Write the failing tests**
+
+  In `mode.rs`'s test module, import `permits`, `ProfileLimit`, `Config`,
+  `ConfigScope`, `CommandAccess` and `ProfileId`. Replace the body of
+  `the_permission_matrix_matches_the_spec_table` with one table. Each tool
+  class has a mode row and a profile row, and `permits` must allow an action
+  exactly where both rows allow it. The old assertions are all rows in it,
+  and the Full column must equal `mode_permits` exactly:
+
+  ```rust
+  /// The work package's primary artifact per `proposal.md` §6, extended by
+  /// spec 31 Task 5: every mode × the four built-in profiles × every tool
+  /// class. Each class has a mode row (spec 20 `proposal.md` §5.1 plus
+  /// `context.md` §1's extension) and a profile row (spec 31 `context.md`
+  /// §3). `permits` allows exactly where both rows allow, and when the mode
+  /// refuses, the mode is the one named.
+  #[test]
+  fn the_permission_matrix_matches_the_spec_table() {
+      use SessionMode::*;
+      const T: bool = true;
+      const F: bool = false;
+      let modes = [Ask, Plan, Code, Review];
+      let profiles = [
+          ProfileId::ReadOnly,
+          ProfileId::SafeLocal,
+          ProfileId::Full,
+          ProfileId::OfflinePrivate,
+      ];
+      // The real overlays at the real scope, not a hand-copied table.
+      let capabilities_of = |profile: &ProfileId| {
+          let mut config = Config::default();
+          let (overlay, refused) = profile.overlay(&config.data_dir).unwrap();
+          assert!(refused.is_empty());
+          config.apply_overlay_scoped(overlay, ConfigScope::Profile);
+          config.profile_capabilities()
+      };
+      let command = |text: &str| {
+          ToolAction::Command(CommandRequest {
+              command: text.into(),
+              reason: String::new(),
+          })
+      };
+      let mcp = || ToolAction::McpCall {
+          server_id: "sentry".into(),
+          tool_name: "search_issues".into(),
+          arguments_json: "{}".into(),
+      };
+      let git_status = read_only_command();
+      let touch = CommandClassification {
+          command: "touch x".to_string(),
+          risk: CommandRisk::Medium,
+          requires_approval: true,
+          ..read_only_command()
+      };
+      let curl = CommandClassification {
+          command: "curl example.com".to_string(),
+          risk: CommandRisk::High,
+          requires_approval: true,
+          may_use_network: true,
+          ..read_only_command()
+      };
+
+      // (action, classification, MCP hint,
+      //  allowed in [Ask, Plan, Code, Review],
+      //  allowed under [read_only, safe_local, full, offline_private])
+      #[allow(clippy::type_complexity)]
+      let rows: Vec<(ToolAction, Option<&CommandClassification>, Option<bool>, [bool; 4], [bool; 4])> = vec![
+          (ToolAction::ReadFile { path: "x".into(), range: None }, None, None, [T, T, T, T], [T, T, T, T]),
+          (ToolAction::ListDirectory { dir: None, depth: None }, None, None, [T, T, T, T], [T, T, T, T]),
+          (
+              ToolAction::SearchContent { pattern: "x".into(), path_glob: None, max_matches: None },
+              None, None, [T, T, T, T], [T, T, T, T],
+          ),
+          (
+              ToolAction::SearchCodebase { query: "x".into(), semantic: false, limit: 8 },
+              None, None, [T, T, T, T], [T, T, T, T],
+          ),
+          (ToolAction::ReadGitStatus, None, None, [T, T, T, T], [T, T, T, T]),
+          (ToolAction::ReadGitDiff { staged: false }, None, None, [T, T, T, T], [T, T, T, T]),
+          (
+              ToolAction::ProposePatch(GeneratedEdit { summary: "x".into(), changes: vec![] }),
+              None, None, [F, F, T, F], [F, T, T, T],
+          ),
+          (
+              ToolAction::EditFile { summary: "x".into(), edits: vec![] },
+              None, None, [F, F, T, F], [F, T, T, T],
+          ),
+          // Deviation 7: no capability key covers planning.
+          (ToolAction::ProposePlan(vec![]), None, None, [F, T, T, F], [T, T, T, T]),
+          (ToolAction::CompleteStep, None, None, [F, T, T, F], [T, T, T, T]),
+          (command("git status"), Some(&git_status), None, [F, T, T, T], [F, T, T, T]),
+          (command("touch x"), Some(&touch), None, [F, F, T, F], [F, T, T, T]),
+          (command("curl example.com"), Some(&curl), None, [F, F, T, F], [F, F, T, F]),
+          (
+              ToolAction::WebDiagnostic(WebDiagnosticCall {
+                  kind: WebDiagnosticKind::Inspect,
+                  url: "http://localhost".into(),
+                  arguments_json: "{}".into(),
+                  session_id: None,
+                  task_id: None,
+              }),
+              None, None, [F, F, T, T], [F, T, T, F],
+          ),
+          // Offline private turns MCP off altogether.
+          (mcp(), None, Some(true), [T, T, T, T], [T, T, T, F]),
+          (mcp(), None, Some(false), [F, F, T, F], [F, T, T, F]),
+          (mcp(), None, None, [F, F, T, F], [F, T, T, F]),
+      ];
+
+      for (action, classification, hint, mode_row, profile_row) in &rows {
+          for (mode, mode_allows) in modes.iter().zip(mode_row) {
+              let mode_only = mode_permits(*mode, action, *classification, *hint);
+              assert_eq!(mode_only.is_allowed(), *mode_allows, "{mode:?} on {action:?} {hint:?}");
+              for (profile, profile_allows) in profiles.iter().zip(profile_row) {
+                  let permission =
+                      permits(*mode, &capabilities_of(profile), action, *classification, *hint);
+                  let context = format!("{mode:?} under {} on {action:?} {hint:?}", profile.as_str());
+                  match (mode_allows, profile_allows) {
+                      (true, true) => assert_eq!(permission, Permission::Allowed, "{context}"),
+                      (true, false) => assert!(
+                          matches!(permission, Permission::RefusedByProfile { .. }),
+                          "{context}: {permission:?}"
+                      ),
+                      // The mode is asked first, so it is the axis named.
+                      (false, _) => assert_eq!(permission, mode_only, "{context}"),
+                  }
+                  if *profile == ProfileId::Full {
+                      assert_eq!(permission, mode_only, "Full changes nothing: {context}");
+                  }
+              }
+          }
+      }
+  }
+  ```
+
+  Add beside it:
+
+  ```rust
+  #[test]
+  fn a_profile_refusal_names_the_setting_and_says_mode_will_not_help() {
+      let message = refusal_message(Permission::RefusedByProfile {
+          limit: ProfileLimit::FileEdits,
+      });
+      assert_eq!(
+          message,
+          "Refused: the permission profile does not allow this (allow_file_edits=false). \
+           Switching mode will not allow it."
+      );
+      let message = refusal_message(Permission::RefusedByProfile {
+          limit: ProfileLimit::CommandAccess(CommandAccess::Local),
+      });
+      assert!(message.contains("(command_access=local)"), "{message}");
+      assert!(!message.contains(" mode does not"), "{message}");
+  }
+
+  /// Each limit names the key that refused, so a refusal can be traced to
+  /// one setting.
+  #[test]
+  fn each_profile_limit_names_its_own_key() {
+      let names = [
+          (ProfileLimit::FileEdits, "allow_file_edits=false"),
+          (ProfileLimit::CommandAccess(CommandAccess::None), "command_access=none"),
+          (ProfileLimit::BrowserDiagnostics, "allow_browser_diagnostics=false"),
+          (ProfileLimit::MutatingMcpTools, "allow_mutating_mcp_tools=false"),
+          (ProfileLimit::McpDisabled, "mcp_enabled=false"),
+      ];
+      for (limit, setting) in names {
+          assert!(
+              refusal_message(Permission::RefusedByProfile { limit }).contains(&format!("({setting})")),
+              "{limit:?}"
+          );
+      }
+  }
+  ```
+
+  Append to `tests/permission_profiles.rs`, and add `ChatTurnResult`,
+  `MockModelAdapter`, `ModelProviderConfig`, `SessionMode`, `ToolCall`,
+  `TurnProgress` and `TurnSink` to its import:
+
+  ```rust
+  // Task 5: `profile ∩ mode` at every refusal point. Selecting a profile writes
+  // user config. Like the desktop shell, every turn start, resume and apply
+  // loads config and builds a new engine, and that is where a switch takes
+  // effect (`context.md` §6).
+
+  const PROFILE_REFUSED_EDIT: &str = "Refused: the permission profile does not allow this \
+       (allow_file_edits=false). Switching mode will not allow it.";
+
+  fn native_tools_provider() -> ModelProviderConfig {
+      ModelProviderConfig {
+          id: "openai".to_string(),
+          label: "OpenAI".to_string(),
+          base_url: String::new(),
+          api_key_env: String::new(),
+          models: Vec::new(),
+          supports_native_tools: true,
+          max_output_tokens: None,
+          context_token_budget: None,
+          provider_reports_usage: true,
+          price_per_million_input_tokens: None,
+          price_per_million_output_tokens: None,
+          price_per_million_cached_input_tokens: None,
+          supports_explicit_cache_breakpoints: false,
+      }
+  }
+
+  impl ProfileFixture {
+      /// The engine one desktop request builds: config loaded from disk now,
+      /// so it runs under whatever profile is selected now. The shell is
+      /// `/usr/bin/true`: called as `<shell> -lc <command>`, it runs nothing and
+      /// exits 0, so a command "executes" without a real login shell
+      /// (`AGENTS.md`). A script written by the test cannot stand in: macOS
+      /// stalls exec of a freshly written executable on this machine.
+      fn engine(&self) -> WorkspaceEngine {
+          self.engine_with_shell("/usr/bin/true")
+      }
+
+      fn engine_with_shell(&self, shell: &str) -> WorkspaceEngine {
+          let (mut config, _) = self.load();
+          config.enable_index_watcher = false;
+          config.model_providers.push(native_tools_provider());
+          config.shell = shell.to_string();
+          WorkspaceEngine::new(config)
+      }
+
+      fn switch_to(&self, profile: &str) {
+          select_profile(
+              &self.base(),
+              &self.root,
+              ProfileId::parse(profile).unwrap(),
+              &self.audit_log(),
+          )
+          .unwrap();
+      }
+
+      /// The proposal ids of every audit event of `event_type`, in log order.
+      fn audited_proposal_ids(&self, event_type: &str) -> Vec<String> {
+          self.audit_events()
+              .lines()
+              .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+              .filter(|event| event["eventType"] == event_type)
+              .filter_map(|event| event["proposalId"].as_str().map(str::to_string))
+              .collect()
+      }
+  }
+
+  /// A warm-up turn creates the session, then its mode is set.
+  fn chat_session(engine: &WorkspaceEngine, root: &Path, mode: SessionMode) -> String {
+      let mut warm = MockModelAdapter::new("Ready.");
+      let mut on_token = |_token: &str| {};
+      let first = engine
+          .chat_orchestrator
+          .ask(root, "warm up", &[], &mut warm, &mut on_token)
+          .unwrap();
+      engine
+          .session_store
+          .set_session_mode(&first.session.id, mode, "user")
+          .unwrap();
+      first.session.id
+  }
+
+  fn with_sink<T>(run: impl FnOnce(&mut TurnSink<'_>) -> T) -> T {
+      let mut on_token = |_token: &str| {};
+      let mut on_progress = |_event: TurnProgress| {};
+      let cancel = CancelToken::new();
+      let mut sink = TurnSink {
+          on_token: &mut on_token,
+          on_progress: &mut on_progress,
+          cancel: &cancel,
+      };
+      run(&mut sink)
+  }
+
+  fn chat_turn(
+      engine: &WorkspaceEngine,
+      root: &Path,
+      session_id: &str,
+      adapter: &mut MockModelAdapter,
+  ) -> ChatTurnResult {
+      with_sink(|sink| {
+          engine
+              .chat_orchestrator
+              .ask_with_session(root, "Go ahead.", &[], Some(session_id), adapter, sink)
+              .unwrap()
+      })
+  }
+
+  fn approve(engine: &WorkspaceEngine, proposal_id: &str) -> ChatTurnResult {
+      let mut after = MockModelAdapter::new("Understood.");
+      with_sink(|sink| {
+          engine
+              .chat_orchestrator
+              .resume_after_command_decision(proposal_id, true, "tester", &mut after, sink)
+              .unwrap()
+      })
+  }
+
+  /// The model makes `calls` in its first round, then answers in plain text.
+  fn calls_then_answer(calls: &[(&str, &str)]) -> MockModelAdapter {
+      let calls = calls
+          .iter()
+          .enumerate()
+          .map(|(index, (name, arguments_json))| ToolCall {
+              id: format!("call_{}", index + 1),
+              name: name.to_string(),
+              arguments_json: arguments_json.to_string(),
+          })
+          .collect();
+      MockModelAdapter::new_sequence_with_tool_calls(
+          vec![String::new(), "Understood.".to_string()],
+          vec![calls, Vec::new()],
+      )
+  }
+
+  fn offered_tools(adapter: &MockModelAdapter) -> Vec<String> {
+      adapter.requests[0]
+          .tools
+          .as_ref()
+          .expect("native tools should be offered")
+          .iter()
+          .map(|tool| tool.name.clone())
+          .collect()
+  }
+
+  fn tool_results(engine: &WorkspaceEngine, session_id: &str) -> Vec<String> {
+      engine
+          .session_store
+          .read_messages(session_id)
+          .unwrap()
+          .into_iter()
+          .filter(|message| message.role == "tool")
+          .map(|message| message.content)
+          .collect()
+  }
+
+  const PROPOSE_NEW_FILE: &str =
+      r#"{"summary":"Add a file","files":[{"path":"new.txt","content":"hello\n"}]}"#;
+
+  /// Criterion 10, first half: Code mode under Read-only cannot edit, and the
+  /// refusal names the profile's setting, not a mode.
+  #[test]
+  fn code_under_read_only_cannot_edit_and_the_refusal_names_the_profile() {
+      let fixture = profile_fixture("code-read-only");
+      fixture.switch_to("read_only");
+      let engine = fixture.engine();
+      let session = chat_session(&engine, &fixture.root, SessionMode::Code);
+
+      let mut adapter = calls_then_answer(&[("propose_patch", PROPOSE_NEW_FILE)]);
+      let result = chat_turn(&engine, &fixture.root, &session, &mut adapter);
+
+      let offered = offered_tools(&adapter);
+      for withheld in ["propose_patch", "edit_file", "run_command"] {
+          assert!(!offered.iter().any(|tool| tool == withheld), "offered {withheld}: {offered:?}");
+      }
+      // Deviation 7: planning is not a capability.
+      for kept in ["read_file", "propose_plan"] {
+          assert!(offered.iter().any(|tool| tool == kept), "withheld {kept}: {offered:?}");
+      }
+      assert!(result.patch_proposal.is_none());
+      assert!(!fixture.root.join("new.txt").exists());
+      assert_eq!(tool_results(&engine, &session), vec![PROFILE_REFUSED_EDIT]);
+
+      fixture.cleanup();
+  }
+
+  /// Criterion 10, second half: Ask mode under Full cannot edit, and the
+  /// refusal names the mode.
+  #[test]
+  fn ask_under_full_cannot_edit_and_the_refusal_names_the_mode() {
+      let fixture = profile_fixture("ask-full");
+      fixture.switch_to("full");
+      let engine = fixture.engine();
+      let session = chat_session(&engine, &fixture.root, SessionMode::Ask);
+
+      let mut adapter = calls_then_answer(&[("propose_patch", PROPOSE_NEW_FILE)]);
+      let result = chat_turn(&engine, &fixture.root, &session, &mut adapter);
+
+      assert!(result.patch_proposal.is_none());
+      assert_eq!(
+          tool_results(&engine, &session),
+          vec!["Refused: Ask mode does not allow this. Switch to Code mode to allow it."]
+      );
+
+      fixture.cleanup();
+  }
+
+  /// Task 4's note: a command the profile blocks used to be stored as a
+  /// blocked proposal and pause the turn for a decision nobody could make.
+  /// It is now refused before anything is stored.
+  #[test]
+  fn a_command_the_profile_blocks_is_refused_before_any_proposal_or_card() {
+      let fixture = profile_fixture("safe-local-curl");
+      fixture.switch_to("safe_local");
+      let engine = fixture.engine();
+      let session = chat_session(&engine, &fixture.root, SessionMode::Code);
+
+      let mut adapter = calls_then_answer(&[(
+          "run_command",
+          r#"{"command":"curl example.com","reason":"Fetch"}"#,
+      )]);
+      let result = chat_turn(&engine, &fixture.root, &session, &mut adapter);
+
+      assert!(result.command_proposal.is_none(), "no approval card");
+      assert!(!fixture.audit_events().contains("command_proposal_stored"));
+      let results = tool_results(&engine, &session);
+      assert!(results[0].contains("(command_access=local)"), "{results:?}");
+
+      fixture.cleanup();
+  }
+
+  /// "Blocks the next one", at a turn start: what the last turn ran is
+  /// refused by the next turn once the selection has changed.
+  #[test]
+  fn the_next_turn_after_switching_to_read_only_refuses_what_the_last_turn_ran() {
+      let fixture = profile_fixture("next-turn");
+      let engine = fixture.engine();
+      let session = chat_session(&engine, &fixture.root, SessionMode::Code);
+      let ls = [("run_command", r#"{"command":"ls","reason":"Look"}"#)];
+
+      let mut before = calls_then_answer(&ls);
+      chat_turn(&engine, &fixture.root, &session, &mut before);
+      assert_eq!(fixture.audited_proposal_ids("stored_command_executed").len(), 1);
+
+      fixture.switch_to("read_only");
+      let engine = fixture.engine();
+      let mut after = calls_then_answer(&ls);
+      chat_turn(&engine, &fixture.root, &session, &mut after);
+
+      assert!(!offered_tools(&after).iter().any(|tool| tool == "run_command"));
+      assert_eq!(fixture.audited_proposal_ids("stored_command_executed").len(), 1);
+      let results = tool_results(&engine, &session);
+      assert!(results.last().unwrap().contains("(command_access=none)"), "{results:?}");
+
+      fixture.cleanup();
+  }
+
+  /// Proposed under Full, approved after the selection changed to Read-only.
+  fn command_refused_at_resume(fixture: &ProfileFixture) -> (String, String) {
+      let engine = fixture.engine();
+      let session = chat_session(&engine, &fixture.root, SessionMode::Code);
+      let mut adapter = calls_then_answer(&[(
+          "run_command",
+          r#"{"command":"touch resumed-marker","reason":"Change"}"#,
+      )]);
+      let first = chat_turn(&engine, &fixture.root, &session, &mut adapter);
+      let proposal = first.command_proposal.expect("Full asks for approval");
+
+      fixture.switch_to("read_only");
+      approve(&fixture.engine(), &proposal.id);
+      (session, proposal.id)
+  }
+
+  /// "Blocks the next one", at a resume: approving is a new decision, made
+  /// under the profile selected now.
+  #[test]
+  fn a_command_paused_under_full_is_refused_at_resume_after_switching_to_read_only() {
+      let fixture = profile_fixture("resume-read-only");
+      let (session, proposal_id) = command_refused_at_resume(&fixture);
+
+      assert!(!fixture.root.join("resumed-marker").exists(), "the command ran");
+      assert!(fixture.audited_proposal_ids("stored_command_executed").is_empty());
+      assert_eq!(fixture.audited_proposal_ids("stored_command_rejected"), vec![proposal_id]);
+      let results = tool_results(&fixture.engine(), &session);
+      assert!(results.last().unwrap().contains("(command_access=none)"), "{results:?}");
+
+      fixture.cleanup();
+  }
+
+  /// Criterion 12 and spec 20 `context.md` §9: a profile refusal marks the
+  /// proposal rejected, as a mode refusal does. Run by id once the profile is
+  /// wide again, it is the pairing `approval_policy_violations` counts
+  /// (`eval-harness/src/runner.rs`).
+  #[test]
+  fn a_profile_refused_proposal_later_run_by_id_counts_as_an_approval_policy_violation() {
+      let fixture = profile_fixture("resume-violation");
+      let (_session, proposal_id) = command_refused_at_resume(&fixture);
+
+      fixture.switch_to("full");
+      let mut on_output = |_line: &str| {};
+      fixture
+          .engine()
+          .validation_orchestrator
+          .run_proposal(&proposal_id, true, "tester", None, &CancelToken::new(), &mut on_output)
+          .unwrap();
+
+      let rejected = fixture.audited_proposal_ids("stored_command_rejected");
+      let violations = fixture
+          .audited_proposal_ids("stored_command_executed")
+          .into_iter()
+          .filter(|executed| rejected.contains(executed))
+          .count();
+      assert_eq!(violations, 1);
+
+      fixture.cleanup();
+  }
+
+  /// "Does not interrupt an in-flight action": the switch lands while the
+  /// approved command is running, and the command still finishes.
+  ///
+  /// `#[ignore]`d per `AGENTS.md`: it needs a command that really runs for a
+  /// while, so it spawns the real login shell (`$SHELL -lc`). Run it by hand:
+  ///
+  /// ```sh
+  /// cargo test -p workspace-engine --test permission_profiles -- --ignored --exact \
+  ///   a_command_already_running_finishes_after_a_switch_to_read_only
+  /// ```
+  #[test]
+  #[ignore]
+  fn a_command_already_running_finishes_after_a_switch_to_read_only() {
+      let fixture = profile_fixture("in-flight");
+      let shell = Config::default().shell;
+      let engine = fixture.engine_with_shell(&shell);
+      let session = chat_session(&engine, &fixture.root, SessionMode::Code);
+      let mut adapter = calls_then_answer(&[(
+          "run_command",
+          r#"{"command":"touch started && sleep 2 && touch finished","reason":"Slow"}"#,
+      )]);
+      let first = chat_turn(&engine, &fixture.root, &session, &mut adapter);
+      let proposal = first.command_proposal.expect("a chained command needs approval");
+
+      // The approval is its own request, so it builds its own engine, under Full.
+      let resume_engine = fixture.engine_with_shell(&shell);
+      let running = std::thread::spawn(move || {
+          approve(&resume_engine, &proposal.id);
+      });
+      let started = fixture.root.join("started");
+      let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+      while !started.exists() {
+          assert!(std::time::Instant::now() < deadline, "the command never started");
+          std::thread::sleep(std::time::Duration::from_millis(20));
+      }
+      assert!(!fixture.root.join("finished").exists(), "switch before the end");
+      fixture.switch_to("read_only");
+      running.join().unwrap();
+
+      assert!(fixture.root.join("finished").exists(), "the command was interrupted");
+      assert_eq!(fixture.audited_proposal_ids("stored_command_executed").len(), 1);
+      assert_eq!(fixture.load().0.command_access, CommandAccess::None);
+
+      fixture.cleanup();
+  }
+
+  const EDIT_RESPONSE: &str = "DAMAIAN_EDIT_V1\nSUMMARY: Add a\nFILE: a.txt\nSTATUS: added\nCONTENT:\nhello\nEND_FILE\nEND_PATCH\n";
+
+  /// Deviation 6: the CLI's sessionless `propose-edit` has no mode, and the
+  /// profile still applies to it, before any model call.
+  #[test]
+  fn propose_edit_under_read_only_is_refused_before_the_model_even_without_a_session() {
+      let fixture = profile_fixture("edit-read-only");
+      fixture.switch_to("read_only");
+      let engine = fixture.engine();
+      let mut adapter = MockModelAdapter::new(EDIT_RESPONSE);
+
+      let error = engine
+          .edit_orchestrator
+          .propose_edit(&fixture.root, "Add a", &[], None, &mut adapter)
+          .expect_err("Read-only must refuse");
+
+      assert!(
+          matches!(&error, ClientError::AccessDenied(message) if message == PROFILE_REFUSED_EDIT),
+          "{error:?}"
+      );
+      assert!(adapter.requests.is_empty(), "the model was called");
+      assert!(!fixture.data_dir.join("patches").exists(), "a patch was stored");
+
+      fixture.cleanup();
+  }
+
+  /// An apply is its own decision point: a patch proposed under Full is
+  /// refused once the selection is Read-only, and nothing is written.
+  #[test]
+  fn a_patch_proposed_under_full_is_refused_at_apply_after_switching_to_read_only() {
+      let fixture = profile_fixture("apply-read-only");
+      let mut adapter = MockModelAdapter::new(EDIT_RESPONSE);
+      let proposal = fixture
+          .engine()
+          .edit_orchestrator
+          .propose_edit(&fixture.root, "Add a", &[], None, &mut adapter)
+          .expect("Full allows the proposal");
+
+      fixture.switch_to("read_only");
+      let error = fixture
+          .engine()
+          .edit_orchestrator
+          .apply_stored_patch(&fixture.root, &proposal.patch.id, None, None, "tester", false)
+          .expect_err("Read-only must refuse the apply");
+
+      assert!(
+          matches!(&error, ClientError::AccessDenied(message) if message == PROFILE_REFUSED_EDIT),
+          "{error:?}"
+      );
+      assert!(!fixture.root.join("a.txt").exists(), "the patch was applied");
+
+      fixture.cleanup();
+  }
+  ```
+
+  In `chat.rs`'s mode refusal test module (deviation 8), beside points 8 and 9:
+
+  ```rust
+  /// An engine over the same data directory as `engine`, with `narrow`
+  /// applied to its config: a new desktop request after the profile changed.
+  fn narrowed(engine: &WorkspaceEngine, narrow: impl FnOnce(&mut Config)) -> WorkspaceEngine {
+      let mut config = engine.config.clone();
+      narrow(&mut config);
+      WorkspaceEngine::new(config)
+  }
+
+  // Spec 31 Task 5: the web-diagnostic resume point also asks the profile.
+  #[test]
+  fn a_web_diagnostic_approved_after_the_profile_turned_diagnostics_off_is_refused_at_resume() {
+      let repo = temp_repo("resume-web-profile");
+      let (engine, calls) = engine_with_web_runner(&repo);
+      let session = session_in(&engine, &repo, SessionMode::Code);
+      let mut adapter = calls_then_answer(vec![call(
+          "call_1",
+          "run_web_scenario",
+          r##"{"url":"http://localhost:5001/","actions":[{"action":"click","selector":"#go"}]}"##,
+      )]);
+      let proposal = turn(&engine, &repo, &session, &mut adapter)
+          .command_proposal
+          .expect("a scenario needs approval in Code");
+
+      let mut after_switch = narrowed(&engine, |config| config.allow_browser_diagnostics = false);
+      after_switch
+          .chat_orchestrator
+          .set_web_diagnostics_runner(WebDiagnosticsRunnerHandle::new(CountingWebRunner {
+              calls: calls.clone(),
+          }));
+      let mut after = MockModelAdapter::new("Understood.");
+      resume(&after_switch, &proposal.id, &mut after);
+
+      assert_eq!(calls.load(Ordering::SeqCst), 0, "the diagnostic ran");
+      let results = tool_results(&engine, &session);
+      assert!(
+          results.last().unwrap().contains("(allow_browser_diagnostics=false)"),
+          "{results:?}"
+      );
+      assert!(audit_log(&repo).contains("refused_by_profile"));
+
+      fs::remove_dir_all(repo).unwrap();
+  }
+
+  // Spec 31 Task 5: the MCP resume point also asks the profile.
+  #[test]
+  fn an_mcp_call_approved_after_the_profile_turned_mutating_tools_off_is_refused_at_resume() {
+      let repo = temp_repo("resume-mcp-profile");
+      let (engine, marker) = engine_with_mcp(&repo, true);
+      let session = session_in(&engine, &repo, SessionMode::Code);
+      let mut adapter = calls_then_answer(vec![call("call_1", "mcp__fake__echo", "{}")]);
+      let proposal = turn(&engine, &repo, &session, &mut adapter)
+          .command_proposal
+          .expect("the server requires approval");
+
+      let after_switch = narrowed(&engine, |config| config.allow_mutating_mcp_tools = false);
+      let mut after = MockModelAdapter::new("Understood.");
+      resume(&after_switch, &proposal.id, &mut after);
+
+      assert!(!marker.exists(), "the MCP call reached the server");
+      let results = tool_results(&engine, &session);
+      assert!(
+          results.last().unwrap().contains("(allow_mutating_mcp_tools=false)"),
+          "{results:?}"
+      );
+
+      fs::remove_dir_all(repo).unwrap();
+  }
+  ```
+
+- [x] **Step 2: Run them and confirm they fail for the right reason**
+
+  ```bash
+  cargo nextest run -p workspace-engine --test permission_profiles
+  ```
+
+  Expected, before Step 3: the `mode.rs` tests do not compile (`permits`,
+  `ProfileLimit` and `RefusedByProfile` do not exist), so run the integration
+  file on its own first. Its Task 5 tests compile against today's public API.
+  They should fail as follows:
+  - `code_under_read_only…`: `propose_patch` is offered and creates a patch.
+  - `a_command_the_profile_blocks…`: an approval card for the blocked proposal.
+  - `the_next_turn…`: `run_command` is offered. `ls` is stored blocked and
+    pauses, but does not run.
+  - `a_command_paused_under_full…`: the resume reaches `run_proposal` and fails
+    with `PolicyBlocked`. The `approve` helper unwraps, so it panics.
+  - Both edit tests: the profile is not asked, so the edit is proposed and
+    applied.
+
+  Two tests are regression guards that already pass:
+  `ask_under_full…` (the mode wording) and `a_command_already_running…`
+  (nothing re-reads config today). Step 5's mutations are what make them
+  fail.
+
+- [x] **Step 3: Implement**
+
+  `command_policy.rs`: make `command_access_permits` `pub(crate)` (deviation
+  4).
+
+  `mode.rs`:
+
+  ```rust
+  use crate::command_policy::{CommandClassification, command_access_permits};
+  use crate::config::CommandAccess;
+  use crate::profile::ProfileCapabilities;
+
+  pub(crate) enum Permission {
+      Allowed,
+      Refused { blocked_by: SessionMode, allowed_in: SessionMode },
+      /// The mode allows the action and the resolved profile capabilities
+      /// do not (spec 31). Switching mode cannot help, so it names no mode.
+      RefusedByProfile { limit: ProfileLimit },
+  }
+
+  /// The one capability setting that refused an action. It names the
+  /// resolved value, not the profile, because user, repository or admin
+  /// config can narrow the same key (spec 31 Task 5, deviation 2).
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  pub(crate) enum ProfileLimit {
+      FileEdits,
+      CommandAccess(CommandAccess),
+      BrowserDiagnostics,
+      MutatingMcpTools,
+      McpDisabled,
+  }
+
+  impl ProfileLimit {
+      fn setting(self) -> String {
+          match self {
+              Self::FileEdits => "allow_file_edits=false".to_string(),
+              Self::CommandAccess(access) => format!("command_access={}", access.as_str()),
+              Self::BrowserDiagnostics => "allow_browser_diagnostics=false".to_string(),
+              Self::MutatingMcpTools => "allow_mutating_mcp_tools=false".to_string(),
+              Self::McpDisabled => "mcp_enabled=false".to_string(),
+          }
+      }
+  }
+  ```
+
+  `refusal_message` matches all three variants. `Allowed` still panics, the
+  mode wording is unchanged, and the profile case is:
+
+  ```rust
+  Permission::RefusedByProfile { limit } => format!(
+      "Refused: the permission profile does not allow this ({}). \
+       Switching mode will not allow it.",
+      limit.setting()
+  ),
+  ```
+
+  ```rust
+  /// `profile ∩ mode` (spec 31 `context.md` §5): the mode first, then the
+  /// profile, and the first refusal wins. Every refusal point calls this, or
+  /// `profile_permits` alone where there is no session to read a mode from.
+  pub(crate) fn permits(
+      mode: SessionMode,
+      capabilities: &ProfileCapabilities,
+      action: &ToolAction,
+      command: Option<&CommandClassification>,
+      mcp_tool_read_only: Option<bool>,
+  ) -> Permission {
+      match mode_permits(mode, action, command, mcp_tool_read_only) {
+          Permission::Allowed => profile_permits(capabilities, action, command, mcp_tool_read_only),
+          refused => refused,
+      }
+  }
+
+  /// The profile axis alone: the resolved capability keys crossed with the
+  /// tool class. Commands use Task 4's `command_access_permits`, not the
+  /// classification's `blocked`, which also means the blocklist, a local
+  /// policy verdict that keeps its own blocked-proposal path. Every variant
+  /// is named, so a new tool class has to be placed here.
+  pub(crate) fn profile_permits(
+      capabilities: &ProfileCapabilities,
+      action: &ToolAction,
+      command: Option<&CommandClassification>,
+      mcp_tool_read_only: Option<bool>,
+  ) -> Permission {
+      let limit = match action {
+          ToolAction::ReadFile { .. }
+          | ToolAction::ListDirectory { .. }
+          | ToolAction::SearchContent { .. }
+          | ToolAction::SearchCodebase { .. }
+          | ToolAction::ReadGitStatus
+          | ToolAction::ReadGitDiff { .. }
+          | ToolAction::ProposePlan(_)
+          | ToolAction::CompleteStep => None,
+          ToolAction::ProposePatch(_) | ToolAction::EditFile { .. } => {
+              (!capabilities.allow_file_edits).then_some(ProfileLimit::FileEdits)
+          }
+          ToolAction::Command(_) => {
+              let classification = command.expect(
+                  "profile_permits called with ToolAction::Command and no \
+                   CommandClassification",
+              );
+              (!command_access_permits(capabilities.command_access, classification))
+                  .then_some(ProfileLimit::CommandAccess(capabilities.command_access))
+          }
+          ToolAction::WebDiagnostic(_) => {
+              (!capabilities.allow_browser_diagnostics).then_some(ProfileLimit::BrowserDiagnostics)
+          }
+          ToolAction::McpCall { .. } => {
+              if !capabilities.mcp_enabled {
+                  Some(ProfileLimit::McpDisabled)
+              } else if !capabilities.allow_mutating_mcp_tools && mcp_tool_read_only != Some(true) {
+                  Some(ProfileLimit::MutatingMcpTools)
+              } else {
+                  None
+              }
+          }
+      };
+      limit.map_or(Permission::Allowed, |limit| Permission::RefusedByProfile { limit })
+  }
+  ```
+
+  `chat.rs`, calls only:
+  - The import is `permits` instead of `mode_permits`.
+  - **Tool list:** after `let mode = …` (`:1395`), add
+    `let capabilities = self.config.profile_capabilities();`. The three
+    `mode_permits(mode, …)` calls become `permits(mode, &capabilities, …)`.
+    Under `command_access=none` the placeholder `pwd` is refused, so
+    `run_command` is withheld. Update the comments that say `mode_permits`.
+  - **`action_permission`:** `permits(mode, &self.config.profile_capabilities(), …)`.
+  - **Resume:** read `let capabilities = self.config.profile_capabilities();`
+    beside the mode (`:828`).
+    - Web: call `permits`. The decision is `refused_by_mode` or
+      `refused_by_profile`, depending on the variant.
+    - MCP: call `permits`.
+    - Command: replace the hand-built classification from stored fields with
+      `self.validation_orchestrator.classify_command(Path::new(&proposal.working_directory), &proposal.command)`
+      (deviation 5). Call `permits`, and reject with `mode_policy` or
+      `profile_policy` (deviation 10).
+
+  `edit.rs`: rename the gate to
+  `refuse_unless_mode_and_profile_permit_patches` and update its three
+  callers. With an empty session id it asks `profile_permits` alone. Otherwise
+  it asks `permits` with the session's mode. In both cases it uses
+  `self.config.profile_capabilities()` (deviation 6).
+
+- [x] **Step 4: Run the scoped tests**
+
+  ```bash
+  cargo nextest run -p workspace-engine --test permission_profiles --test repository_config_trust --test foundation
+  cargo nextest run -p workspace-engine --lib -E 'test(mode::) | test(command_policy::) | test(validation::) | test(chat::) | test(edit::)'
+  cargo run -p eval-harness -- run --tier deterministic
+  ```
+
+  Expected: all pass. `repository_config_trust.rs` is unmodified. The spec 20
+  mode tests in `chat.rs` and `foundation.rs` pass unchanged. The
+  deterministic tier reports no new failures and `approval_policy_violations`
+  stays 0, because no scenario selects a profile.
+
+- [x] **Step 5: Falsify** (revert each one)
+
+  1. `permits` returns `mode_permits` alone: the matrix fails, and so do
+     `code_under_read_only…`, `a_command_the_profile_blocks…` and both edit
+     tests. **Result:** 8 failed: the matrix, both `chat.rs` resume tests,
+     and five integration tests. **The edit tests did not fail.** The
+     sessionless propose calls `profile_permits` directly. The apply path's
+     patch carries `propose_edit`'s own session, but no test reaches it
+     through `permits` alone. Mutation 7 covers the gate instead.
+  2. `permits` asks the profile first: the matrix fails on Ask under
+     Read-only, because the mode must be named.
+  3. `profile_permits` refuses a command on `classification.blocked` instead
+     of `command_access_permits`: the matrix fails, because its `git status`
+     row is not blocked but Read-only refuses it.
+  4. The tool list keeps `mode_permits`: `code_under_read_only…` fails on
+     the offered tools.
+  5. The command resume keeps `mode_permits`: `a_command_paused_under_full…`
+     panics on `PolicyBlocked`.
+  6. The web or MCP resume keeps `mode_permits`: the matching `chat.rs` test
+     fails.
+  7. The patch gate returns early on an empty session id, as before:
+     `propose_edit_under_read_only…` fails. **Result:** only that test
+     fails. The apply test still passes, because `propose_edit` stores the
+     patch under an edit session of its own. So apply takes the `permits`
+     branch, not the empty-id one.
+  8. `refusal_message` gives the profile case the mode wording: both message
+     tests and `code_under_read_only…` fail.
+  9. `a_command_already_running…` is a regression guard. No code mutation
+     can make it fail today, because nothing reads config after an engine is
+     built. So the test itself is falsified. **As planned, this did not
+     work:** moving `switch_to` before the thread changed nothing, because
+     the test approved through the turn's engine, which had loaded its
+     config before the switch. A resume is a new request with a new engine,
+     so the test now builds `resume_engine` just before approving. Moving the
+     switch before that line fails the test on "the command never started".
+
+- [x] **Step 6: Scoped checks**
+
+  ```bash
+  cargo fmt --all -- --check
+  cargo clippy -p workspace-engine --all-targets --locked -- -D warnings
+  typos
+  cargo check -p desktop-shell -p damaian-cli -p eval-harness --all-targets
+  ```
+
+- [x] **Step 7: Update this file's progress row, show the change and the
+  check results, and ask before committing**
+
+  Suggested subject: `Refuse what the permission profile does not allow at every mode check`.
 
 ## Task 6: Provenance: a source for every applied value
 

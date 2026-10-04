@@ -1,5 +1,7 @@
 use crate::chat::ToolAction;
-use crate::command_policy::CommandClassification;
+use crate::command_policy::{CommandClassification, command_access_permits};
+use crate::config::CommandAccess;
+use crate::profile::ProfileCapabilities;
 use serde::{Deserialize, Serialize};
 
 /// A session's working mode. Bounds what the model can do this turn,
@@ -68,6 +70,35 @@ pub(crate) enum Permission {
         blocked_by: SessionMode,
         allowed_in: SessionMode,
     },
+    /// The mode allows the action and the resolved profile capabilities do
+    /// not (spec 31). Switching mode cannot help, so it names no mode.
+    RefusedByProfile {
+        limit: ProfileLimit,
+    },
+}
+
+/// The one capability setting that refused an action. It names the resolved
+/// value, not the profile, because user, repository or admin config can
+/// narrow the same key (spec 31 Task 5, deviation 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileLimit {
+    FileEdits,
+    CommandAccess(CommandAccess),
+    BrowserDiagnostics,
+    MutatingMcpTools,
+    McpDisabled,
+}
+
+impl ProfileLimit {
+    fn setting(self) -> String {
+        match self {
+            Self::FileEdits => "allow_file_edits=false".to_string(),
+            Self::CommandAccess(access) => format!("command_access={}", access.as_str()),
+            Self::BrowserDiagnostics => "allow_browser_diagnostics=false".to_string(),
+            Self::MutatingMcpTools => "allow_mutating_mcp_tools=false".to_string(),
+            Self::McpDisabled => "mcp_enabled=false".to_string(),
+        }
+    }
 }
 
 impl Permission {
@@ -78,22 +109,93 @@ impl Permission {
 
 /// The one wording every Layer 3 refusal point uses (`proposal.md` §5.6:
 /// "which mode blocked it and what mode would allow it"), so nine call sites
-/// cannot drift into nine phrasings. Only ever called on a refusal — every
-/// call site has just matched `Permission::Refused` — so an `Allowed` here is
-/// a caller bug, and it panics rather than inventing a message for it.
+/// cannot drift into nine phrasings. A profile refusal names its setting and
+/// says the mode is not the cause (spec 31 `context.md` §5), so the user is
+/// not sent to switch modes for nothing. Only ever called on a refusal, so an
+/// `Allowed` here is a caller bug, and it panics rather than inventing a
+/// message for it.
 pub(crate) fn refusal_message(refused: Permission) -> String {
-    let Permission::Refused {
-        blocked_by,
-        allowed_in,
-    } = refused
-    else {
-        unreachable!("refusal_message called on an allowed permission")
+    match refused {
+        Permission::Refused {
+            blocked_by,
+            allowed_in,
+        } => format!(
+            "Refused: {} mode does not allow this. Switch to {} mode to allow it.",
+            blocked_by.label(),
+            allowed_in.label()
+        ),
+        Permission::RefusedByProfile { limit } => format!(
+            "Refused: the permission profile does not allow this ({}). \
+             Switching mode will not allow it.",
+            limit.setting()
+        ),
+        Permission::Allowed => unreachable!("refusal_message called on an allowed permission"),
+    }
+}
+
+/// `profile ∩ mode` (spec 31 `context.md` §5): the mode first, then the
+/// profile, and the first refusal wins. Every refusal point calls this, or
+/// `profile_permits` alone where there is no session to read a mode from.
+pub(crate) fn permits(
+    mode: SessionMode,
+    capabilities: &ProfileCapabilities,
+    action: &ToolAction,
+    command: Option<&CommandClassification>,
+    mcp_tool_read_only: Option<bool>,
+) -> Permission {
+    match mode_permits(mode, action, command, mcp_tool_read_only) {
+        Permission::Allowed => profile_permits(capabilities, action, command, mcp_tool_read_only),
+        refused => refused,
+    }
+}
+
+/// The profile axis alone: the resolved capability keys crossed with the tool
+/// class. Commands use spec 31 Task 4's `command_access_permits`, not the
+/// classification's `blocked`, which also means the blocklist, a local policy
+/// verdict that keeps its own blocked-proposal path. Every variant is named,
+/// so a new tool class has to be placed here.
+pub(crate) fn profile_permits(
+    capabilities: &ProfileCapabilities,
+    action: &ToolAction,
+    command: Option<&CommandClassification>,
+    mcp_tool_read_only: Option<bool>,
+) -> Permission {
+    let limit = match action {
+        ToolAction::ReadFile { .. }
+        | ToolAction::ListDirectory { .. }
+        | ToolAction::SearchContent { .. }
+        | ToolAction::SearchCodebase { .. }
+        | ToolAction::ReadGitStatus
+        | ToolAction::ReadGitDiff { .. }
+        | ToolAction::ProposePlan(_)
+        | ToolAction::CompleteStep => None,
+        ToolAction::ProposePatch(_) | ToolAction::EditFile { .. } => {
+            (!capabilities.allow_file_edits).then_some(ProfileLimit::FileEdits)
+        }
+        ToolAction::Command(_) => {
+            let classification = command.expect(
+                "profile_permits called with ToolAction::Command and no \
+                 CommandClassification",
+            );
+            (!command_access_permits(capabilities.command_access, classification))
+                .then_some(ProfileLimit::CommandAccess(capabilities.command_access))
+        }
+        ToolAction::WebDiagnostic(_) => {
+            (!capabilities.allow_browser_diagnostics).then_some(ProfileLimit::BrowserDiagnostics)
+        }
+        ToolAction::McpCall { .. } => {
+            if !capabilities.mcp_enabled {
+                Some(ProfileLimit::McpDisabled)
+            } else if !capabilities.allow_mutating_mcp_tools && mcp_tool_read_only != Some(true) {
+                Some(ProfileLimit::MutatingMcpTools)
+            } else {
+                None
+            }
+        }
     };
-    format!(
-        "Refused: {} mode does not allow this. Switch to {} mode to allow it.",
-        blocked_by.label(),
-        allowed_in.label()
-    )
+    limit.map_or(Permission::Allowed, |limit| Permission::RefusedByProfile {
+        limit,
+    })
 }
 
 /// The permission matrix from `proposal.md` §5.1, extended per
@@ -205,8 +307,12 @@ pub(crate) fn mode_permits(
 mod tests {
     use crate::chat::{CommandRequest, ToolAction};
     use crate::command_policy::{CommandClassification, CommandRisk};
+    use crate::config::{CommandAccess, Config, ConfigScope};
     use crate::edit::GeneratedEdit;
-    use crate::mode::{Permission, SessionMode, mode_permits, refusal_message};
+    use crate::mode::{
+        Permission, ProfileLimit, SessionMode, mode_permits, permits, refusal_message,
+    };
+    use crate::profile::ProfileId;
     use crate::web_diagnostics::{WebDiagnosticCall, WebDiagnosticKind};
 
     fn read_only_command() -> CommandClassification {
@@ -249,97 +355,278 @@ mod tests {
         assert_eq!(SessionMode::parse("Code"), None);
     }
 
-    /// The work package's primary artifact per `proposal.md` §6: every
-    /// mode crossed with every current tool class, asserting allowed or
-    /// refused. Table source: `proposal.md` §5.1 plus `context.md` §1's
-    /// extension for the five tools added since the flat spec was written.
+    /// The work package's primary artifact per `proposal.md` §6, extended by
+    /// spec 31 Task 5: every mode × the four built-in profiles × every tool
+    /// class. Each class has a mode row (spec 20 `proposal.md` §5.1 plus
+    /// `context.md` §1's extension) and a profile row (spec 31 `context.md`
+    /// §3). `permits` allows exactly where both rows allow, and when the mode
+    /// refuses, the mode is the one named.
     #[test]
     fn the_permission_matrix_matches_the_spec_table() {
         use SessionMode::*;
-        let read_actions = [
-            ToolAction::ReadFile {
-                path: "x".into(),
-                range: None,
-            },
-            ToolAction::ListDirectory {
-                dir: None,
-                depth: None,
-            },
-            ToolAction::SearchContent {
-                pattern: "x".into(),
-                path_glob: None,
-                max_matches: None,
-            },
-            ToolAction::SearchCodebase {
-                query: "x".into(),
-                semantic: false,
-                limit: 8,
-            },
-            ToolAction::ReadGitStatus,
-            ToolAction::ReadGitDiff { staged: false },
+        const T: bool = true;
+        const F: bool = false;
+        let modes = [Ask, Plan, Code, Review];
+        let profiles = [
+            ProfileId::ReadOnly,
+            ProfileId::SafeLocal,
+            ProfileId::Full,
+            ProfileId::OfflinePrivate,
         ];
-        for action in &read_actions {
-            for mode in [Ask, Plan, Code, Review] {
-                assert!(
-                    mode_permits(mode, action, None, None).is_allowed(),
-                    "{mode:?} should permit {action:?}"
-                );
-            }
-        }
-
-        let mutation_actions = [
-            ToolAction::ProposePatch(GeneratedEdit {
-                summary: "x".into(),
-                changes: vec![],
-            }),
-            ToolAction::EditFile {
-                summary: "x".into(),
-                edits: vec![],
-            },
-        ];
-        for action in &mutation_actions {
-            assert!(!mode_permits(Ask, action, None, None).is_allowed());
-            assert!(!mode_permits(Plan, action, None, None).is_allowed());
-            assert!(mode_permits(Code, action, None, None).is_allowed());
-            assert!(!mode_permits(Review, action, None, None).is_allowed());
-        }
-
-        let planning_actions = [ToolAction::ProposePlan(vec![]), ToolAction::CompleteStep];
-        for action in &planning_actions {
-            assert!(!mode_permits(Ask, action, None, None).is_allowed());
-            assert!(mode_permits(Plan, action, None, None).is_allowed());
-            assert!(mode_permits(Code, action, None, None).is_allowed());
-            assert!(!mode_permits(Review, action, None, None).is_allowed());
-        }
-
-        let web_action = ToolAction::WebDiagnostic(WebDiagnosticCall {
-            kind: WebDiagnosticKind::Inspect,
-            url: "http://localhost".into(),
-            arguments_json: "{}".into(),
-            session_id: None,
-            task_id: None,
-        });
-        assert!(!mode_permits(Ask, &web_action, None, None).is_allowed());
-        assert!(!mode_permits(Plan, &web_action, None, None).is_allowed());
-        assert!(mode_permits(Code, &web_action, None, None).is_allowed());
-        assert!(mode_permits(Review, &web_action, None, None).is_allowed());
-
-        let mcp_action = ToolAction::McpCall {
+        // The real overlays at the real scope, not a hand-copied table.
+        let capabilities_of = |profile: &ProfileId| {
+            let mut config = Config::default();
+            let (overlay, refused) = profile.overlay(&config.data_dir).unwrap();
+            assert!(refused.is_empty());
+            config.apply_overlay_scoped(overlay, ConfigScope::Profile);
+            config.profile_capabilities()
+        };
+        let command = |text: &str| {
+            ToolAction::Command(CommandRequest {
+                command: text.into(),
+                reason: String::new(),
+            })
+        };
+        let mcp = || ToolAction::McpCall {
             server_id: "sentry".into(),
             tool_name: "search_issues".into(),
             arguments_json: "{}".into(),
         };
-        for mode in [Ask, Plan, Code, Review] {
-            assert!(
-                mode_permits(mode, &mcp_action, None, Some(true)).is_allowed(),
-                "{mode:?} should permit an MCP call annotated read-only"
-            );
+        let git_status = read_only_command();
+        let touch = CommandClassification {
+            command: "touch x".to_string(),
+            risk: CommandRisk::Medium,
+            requires_approval: true,
+            ..read_only_command()
+        };
+        let curl = CommandClassification {
+            command: "curl example.com".to_string(),
+            risk: CommandRisk::High,
+            requires_approval: true,
+            may_use_network: true,
+            ..read_only_command()
+        };
+
+        // (action, classification, MCP hint,
+        //  allowed in [Ask, Plan, Code, Review],
+        //  allowed under [read_only, safe_local, full, offline_private])
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            ToolAction,
+            Option<&CommandClassification>,
+            Option<bool>,
+            [bool; 4],
+            [bool; 4],
+        )> = vec![
+            (
+                ToolAction::ReadFile {
+                    path: "x".into(),
+                    range: None,
+                },
+                None,
+                None,
+                [T, T, T, T],
+                [T, T, T, T],
+            ),
+            (
+                ToolAction::ListDirectory {
+                    dir: None,
+                    depth: None,
+                },
+                None,
+                None,
+                [T, T, T, T],
+                [T, T, T, T],
+            ),
+            (
+                ToolAction::SearchContent {
+                    pattern: "x".into(),
+                    path_glob: None,
+                    max_matches: None,
+                },
+                None,
+                None,
+                [T, T, T, T],
+                [T, T, T, T],
+            ),
+            (
+                ToolAction::SearchCodebase {
+                    query: "x".into(),
+                    semantic: false,
+                    limit: 8,
+                },
+                None,
+                None,
+                [T, T, T, T],
+                [T, T, T, T],
+            ),
+            (
+                ToolAction::ReadGitStatus,
+                None,
+                None,
+                [T, T, T, T],
+                [T, T, T, T],
+            ),
+            (
+                ToolAction::ReadGitDiff { staged: false },
+                None,
+                None,
+                [T, T, T, T],
+                [T, T, T, T],
+            ),
+            (
+                ToolAction::ProposePatch(GeneratedEdit {
+                    summary: "x".into(),
+                    changes: vec![],
+                }),
+                None,
+                None,
+                [F, F, T, F],
+                [F, T, T, T],
+            ),
+            (
+                ToolAction::EditFile {
+                    summary: "x".into(),
+                    edits: vec![],
+                },
+                None,
+                None,
+                [F, F, T, F],
+                [F, T, T, T],
+            ),
+            // Deviation 7: no capability key covers planning.
+            (
+                ToolAction::ProposePlan(vec![]),
+                None,
+                None,
+                [F, T, T, F],
+                [T, T, T, T],
+            ),
+            (
+                ToolAction::CompleteStep,
+                None,
+                None,
+                [F, T, T, F],
+                [T, T, T, T],
+            ),
+            (
+                command("git status"),
+                Some(&git_status),
+                None,
+                [F, T, T, T],
+                [F, T, T, T],
+            ),
+            (
+                command("touch x"),
+                Some(&touch),
+                None,
+                [F, F, T, F],
+                [F, T, T, T],
+            ),
+            (
+                command("curl example.com"),
+                Some(&curl),
+                None,
+                [F, F, T, F],
+                [F, F, T, F],
+            ),
+            (
+                ToolAction::WebDiagnostic(WebDiagnosticCall {
+                    kind: WebDiagnosticKind::Inspect,
+                    url: "http://localhost".into(),
+                    arguments_json: "{}".into(),
+                    session_id: None,
+                    task_id: None,
+                }),
+                None,
+                None,
+                [F, F, T, T],
+                [F, T, T, F],
+            ),
+            // Offline private turns MCP off altogether.
+            (mcp(), None, Some(true), [T, T, T, T], [T, T, T, F]),
+            (mcp(), None, Some(false), [F, F, T, F], [F, T, T, F]),
+            (mcp(), None, None, [F, F, T, F], [F, T, T, F]),
+        ];
+
+        for (action, classification, hint, mode_row, profile_row) in &rows {
+            for (mode, mode_allows) in modes.iter().zip(mode_row) {
+                let mode_only = mode_permits(*mode, action, *classification, *hint);
+                assert_eq!(
+                    mode_only.is_allowed(),
+                    *mode_allows,
+                    "{mode:?} on {action:?} {hint:?}"
+                );
+                for (profile, profile_allows) in profiles.iter().zip(profile_row) {
+                    let permission = permits(
+                        *mode,
+                        &capabilities_of(profile),
+                        action,
+                        *classification,
+                        *hint,
+                    );
+                    let context =
+                        format!("{mode:?} under {} on {action:?} {hint:?}", profile.as_str());
+                    match (mode_allows, profile_allows) {
+                        (true, true) => assert_eq!(permission, Permission::Allowed, "{context}"),
+                        (true, false) => assert!(
+                            matches!(permission, Permission::RefusedByProfile { .. }),
+                            "{context}: {permission:?}"
+                        ),
+                        // The mode is asked first, so it is the axis named.
+                        (false, _) => assert_eq!(permission, mode_only, "{context}"),
+                    }
+                    if *profile == ProfileId::Full {
+                        assert_eq!(permission, mode_only, "Full changes nothing: {context}");
+                    }
+                }
+            }
         }
-        for hint in [Some(false), None] {
-            assert!(!mode_permits(Ask, &mcp_action, None, hint).is_allowed());
-            assert!(!mode_permits(Plan, &mcp_action, None, hint).is_allowed());
-            assert!(mode_permits(Code, &mcp_action, None, hint).is_allowed());
-            assert!(!mode_permits(Review, &mcp_action, None, hint).is_allowed());
+    }
+
+    #[test]
+    fn a_profile_refusal_names_the_setting_and_says_mode_will_not_help() {
+        let message = refusal_message(Permission::RefusedByProfile {
+            limit: ProfileLimit::FileEdits,
+        });
+        assert_eq!(
+            message,
+            "Refused: the permission profile does not allow this (allow_file_edits=false). \
+             Switching mode will not allow it."
+        );
+        let message = refusal_message(Permission::RefusedByProfile {
+            limit: ProfileLimit::CommandAccess(CommandAccess::Local),
+        });
+        assert!(message.contains("(command_access=local)"), "{message}");
+        assert!(!message.contains(" mode does not"), "{message}");
+    }
+
+    /// Each limit names the key that refused, so a refusal can be traced to
+    /// one setting.
+    #[test]
+    fn each_profile_limit_names_its_own_key() {
+        let names = [
+            (ProfileLimit::FileEdits, "allow_file_edits=false"),
+            (
+                ProfileLimit::CommandAccess(CommandAccess::None),
+                "command_access=none",
+            ),
+            (
+                ProfileLimit::BrowserDiagnostics,
+                "allow_browser_diagnostics=false",
+            ),
+            (
+                ProfileLimit::MutatingMcpTools,
+                "allow_mutating_mcp_tools=false",
+            ),
+            (ProfileLimit::McpDisabled, "mcp_enabled=false"),
+        ];
+        for (limit, setting) in names {
+            assert!(
+                refusal_message(Permission::RefusedByProfile { limit })
+                    .contains(&format!("({setting})")),
+                "{limit:?}"
+            );
         }
     }
 

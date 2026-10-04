@@ -194,7 +194,7 @@ Outside `chat.rs`, the stored-patch gate is `refuse_unless_mode_permits_patches`
 **Decision:** the combination lives in `mode.rs`, beside `mode_permits`, as one
 function taking the mode and a `ProfileCapabilities` value read from `Config`.
 The `chat.rs` edits are only calls to that function. They are all in **one
-task (Task 5)**. It must not run at the same time as spec 22's Task 7, which
+task (Task 5)**. It must not run at the same time as spec 22's Task 8 (renumbered from 7 on 2026-10-02), which
 may also edit `chat.rs`. Check `tasks.md` in
 [`22_findings_model_and_panel`](../22_findings_model_and_panel/tasks.md)
 before starting it. Every other task in this spec leaves `chat.rs` alone.
