@@ -4290,6 +4290,13 @@ function describeEvidence(entry) {
   if (entry.kind === "fileRead") {
     return `${entry.path} was read`;
   }
+  if (entry.kind === "findings") {
+    const failing = Number.isInteger(entry.failing) ? entry.failing : 0;
+    const total = Array.isArray(entry.refs) ? entry.refs.length : 0;
+    return failing > 0
+      ? `the check reported ${failing} failing finding${failing === 1 ? "" : "s"}`
+      : `the check reported ${total} finding${total === 1 ? "" : "s"}, none failing`;
+  }
   return "recorded";
 }
 

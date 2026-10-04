@@ -210,7 +210,16 @@ fn a_step_whose_command_failed_is_blocked_however_the_model_describes_it() {
         StepStatus::Blocked,
         "a non-zero exit blocks the step no matter what the model claims"
     );
-    assert_eq!(plan.steps[0].evidence.len(), 1, "the exit is recorded");
+    // The exit is recorded, and since spec 22 Task 8, so are the findings
+    // the failed command produced (spec 22 `context.md` §14).
+    assert!(
+        matches!(
+            plan.steps[0].evidence.as_slice(),
+            [Evidence::CommandExit { .. }, Evidence::Findings { .. }]
+        ),
+        "{:?}",
+        plan.steps[0].evidence
+    );
     assert!(
         !plan.steps[0].is_unverified(),
         "blocked is not completed-unverified; that would launder a failure into a soft pass"

@@ -17,7 +17,7 @@ decisions it left open in [`context.md`](context.md)
 | 5 · Biome parser | Done 2026-10-02 | Planned in full on 2026-10-01 against captured Biome 2.5.7 output (`context.md` §11). Landed as sketched, with only rustfmt changes. The fixtures were extracted from this file's line ranges, so they are byte-identical to the plan, and `grep -c '^  $'` on the check stderr prints 28. `finding/biome.rs` is new. `finding.rs` declares `mod biome;` and registers `BiomeParser` third. Before the implementation the tests failed to compile (`E0425` on `parse_biome`/`BiomeParser`, plus `E0433`). After it, `test(finding::)` passed 89/89 (71 unchanged + 18). All eight mutations failed their named test. (1) Ending a block at a whitespace-only line failed 10 tests, `details_run_past_…` among them: the empty line after each header ends the block before its marker, so every summary falls back to the category. (2) A greedy path failed 5, including `a_lint_error_keeps_…`. (3) No OSC 8 alternative failed only `forced_colour_output_parses_the_same`. (4) Plain-only markers failed `colour_markers_map_like_plain_ones` and the forced-colour test. (5) Non-error→`Warning` failed `an_info_marker_is_info`, `a_passing_run_keeps_its_info` and the colour-marker test. (6) No `HIDDEN` check failed only `hidden_diagnostics_become_one_info_draft`. (7) Any `npm run` script failed only `does_not_match_other_commands`. (8) Skipping marker-less blocks failed only `a_block_without_a_marker_is_kept_…`. Scoped fmt, clippy `-p workspace-engine`, `test(finding::)` and typos are clean. typos needed no fixture exclusion. |
 | 6 · Browser findings from spec 12's `WebDiagnosticDetails` | Done 2026-10-02 | Re-scoped on 2026-09-29 by spec 12's close-out, so there is no `entries` field (`context.md` §7.1). Planned in full on 2026-10-02 (`context.md` §12). Landed as sketched, with only rustfmt changes. `browser.rs` was extracted from this file's line ranges, so before formatting it was byte-identical to the plan. rustfmt rewrapped lines in `browser.rs` and sorted `mod browser;` below `mod biome;`, not above it as Step 2 says. It did not touch the `finding.rs` test array, contrary to Step 7's note. `finding/browser.rs` is new. `finding.rs` adds `FindingSource::BrowserScenario` (`"browser_scenario"`), broadens `Command`'s doc and re-exports `findings_from_web_record`. In `web_diagnostics.rs`, the three `model_item`s and `is_loopback_url` became `pub(crate)`, and nothing else changed. Steps 1 and 2 were applied together, so Step 1's separate test run was skipped. Before the implementation the tests failed to compile (`E0425` on `findings_from_web_record`/`served_path`, `E0432` on the re-export). After it, `test(finding::) + test(web_diagnostics::)` passed 121/121: 107 `finding::` (89 + 18 `browser::tests`), and the `web_diagnostics::` tests were unchanged. All six mutations failed only their named tests. (1) No `node_modules` exclusion failed only `a_console_error_at_a_served_url_maps_to_…`. (2) First candidate wins failed only `an_ambiguous_served_path_has_no_range`. (3) No `is_loopback_url` failed `a_console_location_on_another_origin_has_no_range` and `served_path_accepts_only_loopback_…`. (4) No `!explained` failed only `a_tool_failure_is_not_doubled_…`. (5) Skipping failed steps failed only `a_failed_scenario_step_is_a_browser_scenario_error`. (6) Every problem level as `Error` failed only `an_inspection_yields_one_finding_per_problem_…`. Scoped fmt, clippy `-p workspace-engine`, `test(finding::) + test(web_diagnostics::)` and typos are clean. |
 | 7 · Persistence, derived status, `Evidence::Findings` | Done 2026-10-03 | Split on 2026-10-02 from the old "Recording, persistence, staleness" task (`context.md` §13.1) and planned in full. Landed as sketched, with only rustfmt changes. The tests and implementation were extracted from this file's line ranges. `session.rs` gains `record_finding`, `set_finding_status` and `read_findings` after `read_session_web_diagnostics`, and the free functions `replay_findings` and `finding_is_stale` before `parse_session_log`. The `let`-chains compiled as written. `plan.rs` gains `Evidence::Findings` and its two match arms. rustfmt turned the `status_from_evidence` arm into a block. Two comments in `plan.rs` were reworded beyond the plan because the new variant made them stale: the `#[non_exhaustive]` note, which said `Findings` "joins this enum when spec 22 exists", and the "Neither has a failure mode" comment, which now covers three variants. Step 1's two task-number comments were updated. Before the implementation, the session tests failed to compile (`E0599` on all three methods). After it, `test(session::tests) + binary(plan) + test(finding::)` passed 181/181. That includes the 15 new session tests (`session::tests` is now 23) and the 4 new plan tests (`binary(plan)` is now 51). All seven mutations failed only their named test. Mutations 1–6 ran with `--lib -E 'test(session::tests)'`, and 7 ran with `binary(plan)`. (1) Checking every status failed `a_dismissed_finding_is_not_re_marked_stale`. (2) Missing hash as stale failed `a_finding_without_a_recorded_hash_is_never_stale`. (3) `Err(_) => false` failed `a_deleted_file_makes_its_finding_stale`. (4) No `Stale` refusal failed `setting_stale_directly_is_refused_…`. (5) No unknown-id check failed `a_status_change_for_an_unknown_finding_…`. (6) `parsed_events(content).0` failed `a_rewind_takes_the_findings_…`. (7) `*failing > 0` failed `findings_evidence_alone_does_not_block_a_step`. No other crate needed a change. Scoped fmt, clippy `-p workspace-engine`, the scoped tests and typos are clean. |
-| 8 · Record findings where checks run (`chat.rs`) | Not started | New on 2026-10-02 from the Task 7 split, and planned in full on 2026-10-04 (`context.md` §13.4, §14). |
+| 8 · Record findings where checks run (`chat.rs`) | Done 2026-10-04 | New on 2026-10-02 from the Task 7 split, and planned in full on 2026-10-04 (`context.md` §13.4, §14). Landed as sketched, with only rustfmt changes, in a separate worktree, with no other spec editing `chat.rs`. `tests/finding_recording.rs` was extracted from this file's line ranges. `workspace_engine::hash` and `::web_diagnostics` resolved as written, so no re-export was needed. The `chat.rs` line numbers in Step 5 still matched. `command_findings` assigned inside the arm passed borrowck, so `ActionOutcome` is unchanged. Two deviations, both cosmetic. The `use` is a top-level `crate::finding::{…}` import, and `record_command_findings` takes `&CommandExecution` through the file's existing import. The `command_findings` declaration also gained a two-line comment saying why it is a local. `repository_files` uses `config.ignore_patterns` as planned. `Config::default()` already fills it with the defaults that `indexer.rs` falls back to, so nothing is lost. Before the implementation: as Step 4 predicts, four `finding_recording` tests and the changed `plan_turn` assertion failed at runtime, each on "nothing recorded" after its setup passed. The approved test had got past its approval assertion. `a_passing_sandbox_command_records_nothing` passed. After: the Step 7 selection passed 250/250 (5 `finding_recording`, 19 `plan_turn`, 51 `plan`, 107 `finding::`, 23 `session::tests`, 45 `chat::`). All six mutations failed exactly their named tests, with `binary(finding_recording) + binary(plan_turn)`. (1) No sandbox recording failed `a_failed_sandbox_command_…`, `the_failed_step_carries_…` and the `plan_turn` assertion, because no findings means no evidence. (2) No approval recording failed only `an_approved_command_…`, on `[]`. (3) No `record_web_findings` failed only `a_browser_console_error_…`, on `[]`. (4) `None => finding` (keep every range) failed only `an_approved_command_…`, on "src/gone.rs is not in the repository". (5) No `command_findings.take()` push failed `the_failed_step_carries_…` and the `plan_turn` assertion. (6) An empty file list failed only `a_browser_console_error_…`, on the missing range. **Environment, not code:** in mutation 1's run, `an_approved_command_…` also failed. Its `./cargo check` reported `timed out` after 600.28s. It passed in under a second in every other run, and mutation 1 does not touch that path. The next run's `--list` of the relinked test binary sat at `_dyld_start + 0` for about 5 minutes while `XprotectService` was busy. So macOS XProtect can hold a newly written executable at launch, and this test writes one (`./cargo`) on every run. The test is unchanged, and this is recorded as an observation. Scoped fmt, clippy `-p workspace-engine`, `node --check`, `lint:web` and typos are clean. `lint:web`'s one info is pre-existing, in `scripts/check-spec-status.mjs`. The eval harness deterministic tier passed 16/16. Metrics match `evals/baseline.json` except tokens, 101950 against 101963 (not investigated), and latency, median 57 against 44 ms and p90 128 against 109 ms, measured while XProtect was loading the machine. The baseline was not regenerated. |
 | 9 · Dismissal and the scoped repair request | Not started | |
 | 10 · Shell API | Not started | |
 | 11 · Findings panel | Not started | |
@@ -4678,7 +4678,7 @@ spec that edits `chat.rs`.
     `CommandExit` of a sandbox command that produced findings.
   - A `findings` wording in `describeEvidence`.
 
-- [ ] **Step 1: Add `Finding::without_range`**
+- [x] **Step 1: Add `Finding::without_range`**
 
   In `finding.rs`, after `with_file_hash`:
 
@@ -4692,7 +4692,7 @@ spec that edits `chat.rs`.
       }
   ```
 
-- [ ] **Step 2: Write the failing integration tests**
+- [x] **Step 2: Write the failing integration tests**
 
   Create `crates/workspace-engine/tests/finding_recording.rs`:
 
@@ -4977,7 +4977,7 @@ spec that edits `chat.rs`.
   reachable as written, use the crate's re-exports from `lib.rs` instead, and
   record which. Both modules are `pub mod`.
 
-- [ ] **Step 3: Change the one existing assertion**
+- [x] **Step 3: Change the one existing assertion**
 
   In `tests/plan_turn.rs`, `a_step_whose_command_failed_is_blocked_however_the_model_describes_it`,
   replace
@@ -5001,7 +5001,7 @@ spec that edits `chat.rs`.
       );
   ```
 
-- [ ] **Step 4: Run the tests and confirm they fail**
+- [x] **Step 4: Run the tests and confirm they fail**
 
   Run: `cargo nextest run -p workspace-engine -E 'binary(finding_recording) + binary(plan_turn)'`
   Expected: `binary(finding_recording)` fails four tests at runtime: every one
@@ -5010,7 +5010,7 @@ spec that edits `chat.rs`.
   findings yet, so the plan has no `Findings` entry. `without_range` is not
   used by any test, so Step 1 does not affect this.
 
-- [ ] **Step 5: Write the implementation in `chat.rs`**
+- [x] **Step 5: Write the implementation in `chat.rs`**
 
   Add these `use`s, or the paths inline, matching the file's style:
   `crate::finding::{Finding, Severity, default_parsers, findings_from_execution, findings_from_web_record}`.
@@ -5163,7 +5163,7 @@ spec that edits `chat.rs`.
   it the same way the arm already carries `exit_code`. Do not change
   `ActionOutcome` (§14). Record the deviation.
 
-- [ ] **Step 6: Wording in the shell**
+- [x] **Step 6: Wording in the shell**
 
   In `crates/desktop-shell/static/app.js`, `describeEvidence`, add before the
   final `return "recorded";`:
@@ -5178,14 +5178,14 @@ spec that edits `chat.rs`.
     }
   ```
 
-- [ ] **Step 7: Run the tests and confirm they pass**
+- [x] **Step 7: Run the tests and confirm they pass**
 
   Run: `cargo nextest run -p workspace-engine -E 'binary(finding_recording) + binary(plan_turn) + binary(plan) + test(finding::) + test(session::tests) + test(chat::)'`
   Expected: all 5 `finding_recording` tests pass, and every other selected
   test passes. The only existing assertion that changed is Step 3's. Count
   the totals.
 
-- [ ] **Step 8: Mutation-test the wiring**
+- [x] **Step 8: Mutation-test the wiring**
 
   Apply each change on its own, confirm the named test fails, then revert it:
 
@@ -5205,7 +5205,7 @@ spec that edits `chat.rs`.
 
   Record all six results in the progress row.
 
-- [ ] **Step 9: Scoped checks**
+- [x] **Step 9: Scoped checks**
 
   Run `cargo fmt --all` first. Then:
 
@@ -5225,7 +5225,7 @@ spec that edits `chat.rs`.
   passes, and record any metric that moved. Do **not** regenerate
   `evals/baseline.json` in this task.
 
-- [ ] **Step 10: Update this file's Task 8 row, then show the change and the
+- [x] **Step 10: Update this file's Task 8 row, then show the change and the
   check results and ask before committing**
 
 ## Task 9: Dismissal and the scoped repair request
