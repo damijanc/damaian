@@ -80,6 +80,20 @@ pub enum FindingStatus {
     Stale,
 }
 
+impl FindingStatus {
+    /// The serialised form back to a status. Exact and case-sensitive, like
+    /// `SessionMode::parse`. An unknown string is `None`, never a default.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "open" => Some(Self::Open),
+            "dismissed" => Some(Self::Dismissed),
+            "fixed" => Some(Self::Fixed),
+            "stale" => Some(Self::Stale),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceRange {
@@ -602,6 +616,20 @@ mod tests {
             severities,
             [Severity::Error, Severity::Warning, Severity::Info]
         );
+    }
+
+    /// The shell's status parser (`context.md` §16). It accepts `stale`, so
+    /// `set_finding_status` stays the one place that refuses it.
+    #[test]
+    fn finding_status_parses_its_serialised_forms_only() {
+        use FindingStatus::*;
+        for status in [Open, Dismissed, Fixed, Stale] {
+            let text = serde_json::to_value(status).unwrap();
+            assert_eq!(FindingStatus::parse(text.as_str().unwrap()), Some(status));
+        }
+        for text in ["sideways", "Open", "", " open"] {
+            assert_eq!(FindingStatus::parse(text), None, "{text:?}");
+        }
     }
 }
 

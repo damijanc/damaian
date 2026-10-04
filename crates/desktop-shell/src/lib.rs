@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use workspace_engine::finding::{FindingStatus, RepairRequest};
 use workspace_engine::{
     AgentPlanProposal, CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions,
     ChatTurnResult, Config, CostEstimate, CurlModelTransport, DataSchemaOutcome, ExportFormat,
@@ -692,6 +693,14 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 &format!("{{\"session\":{}}}", session_json(&session, mode)),
             )
         }
+        // Spec 22 Task 10. Each findings route is its own function, so the
+        // engine it builds lives in that frame rather than this one: every
+        // arm's locals share `handle_connection`'s frame, and inlining three
+        // more `WorkspaceEngine`s overflowed a 2 MiB thread stack in a debug
+        // build, which is what the desktop app gives the server.
+        ("GET", "/api/findings") => handle_findings(stream, &request),
+        ("POST", "/api/finding-status") => handle_finding_status(stream, &request),
+        ("POST", "/api/findings-repair") => handle_findings_repair(stream, &request),
         ("POST", "/api/session-delete") => {
             let form = parse_form(&request.body);
             let session_id = required_form(&form, "session_id")?;
@@ -3312,6 +3321,111 @@ fn session_summary_json(session: &Session) -> String {
     format!("{{{}}}", session_fields_json(session))
 }
 
+/// `GET /api/findings`. Every findings route takes `repo`, because staleness
+/// is derived against the repository's files, and refuses a session from
+/// another repository (spec 22 `context.md` §16).
+fn handle_findings(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = required_param(request, "repo")?;
+    let session_id = required_param(request, "session_id")?;
+    let engine = engine_for_repo(&repo)?;
+    session_in_repository(&engine, &repo, &session_id)?;
+    let body = findings_json(&engine, &repo, &session_id)?;
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// `POST /api/finding-status`, answered with the refreshed findings so the
+/// panel redraws from what was stored.
+fn handle_finding_status(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let session_id = required_form(&form, "session_id")?;
+    let finding_id = required_form(&form, "finding_id")?;
+    let requested = required_form(&form, "status")?;
+    // Rejected, never defaulted, as for `/api/session-mode`. `stale`
+    // parses, and the store refuses it (spec 22 `context.md` §13.2).
+    let status = FindingStatus::parse(&requested).ok_or_else(|| {
+        format!("Unknown finding status: {requested}. Expected open, dismissed, or fixed.")
+    })?;
+    let engine = engine_for_repo(&repo)?;
+    session_in_repository(&engine, &repo, &session_id)?;
+    engine
+        .session_store
+        .set_finding_status(&session_id, &finding_id, status)
+        .map_err(|error| error.to_string())?;
+    let body = findings_json(&engine, &repo, &session_id)?;
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// `POST /api/findings-repair`. Marks nothing: it returns the request and its
+/// rendered prompt, or `null` when nothing is left to repair (§15, §16).
+fn handle_findings_repair(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let session_id = required_form(&form, "session_id")?;
+    let selected: Vec<String> = required_form(&form, "finding_ids")?
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect();
+    let engine = engine_for_repo(&repo)?;
+    session_in_repository(&engine, &repo, &session_id)?;
+    // Built from the findings as they are now, so an edit since the
+    // panel was drawn still makes its finding stale (§15).
+    let findings = engine
+        .session_store
+        .read_findings(&session_id, Path::new(&repo))
+        .map_err(|error| error.to_string())?;
+    let repair = RepairRequest::select(&findings, &selected);
+    let repair_json = serde_json::to_string(&repair).map_err(|error| error.to_string())?;
+    let prompt = repair.render().map_or_else(
+        || "null".to_string(),
+        |text| format!("\"{}\"", escape_json(&text)),
+    );
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!("{{\"request\":{repair_json},\"prompt\":{prompt}}}"),
+    )
+}
+
+/// The session, when it exists and belongs to `repo`. A finding's staleness
+/// is judged against `repo`'s files, so a session from another checkout must
+/// not be read against this one (spec 22 `context.md` §16).
+fn session_in_repository(
+    engine: &WorkspaceEngine,
+    repo: &str,
+    session_id: &str,
+) -> Result<Session, String> {
+    let session = engine
+        .session_store
+        .read_session(session_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Unknown session: {session_id}"))?;
+    let repository_id = engine
+        .indexer
+        .repository_id_for_path(repo)
+        .map_err(|error| error.to_string())?;
+    if session.repository_id != repository_id {
+        return Err(format!(
+            "Session {session_id} belongs to another repository"
+        ));
+    }
+    Ok(session)
+}
+
+/// `{"findings":[…]}` in record order, with status derived against `repo`.
+fn findings_json(engine: &WorkspaceEngine, repo: &str, session_id: &str) -> Result<String, String> {
+    let findings = engine
+        .session_store
+        .read_findings(session_id, Path::new(repo))
+        .map_err(|error| error.to_string())?;
+    let findings = serde_json::to_string(&findings).map_err(|error| error.to_string())?;
+    Ok(format!("{{\"findings\":{findings}}}"))
+}
+
 /// One session with its working mode (spec 20), for the responses that open,
 /// create, rename, or change the mode of a single session.
 fn session_json(session: &Session, mode: SessionMode) -> String {
@@ -3618,8 +3732,10 @@ mod tests {
     use workspace_engine::CheckpointRestoreResult;
     use workspace_engine::{
         AgentPlanProposal, CancelToken, Config, Evidence, GeneratedSecretWarning, MockModelAdapter,
-        PlanStep, SessionMode, StepStatus, TaskPlan, TaskUsage, ToolCall, TurnProgress, TurnSink,
-        UsageSource, WebDiagnosticRecord, WebDiagnosticReport, WorkspaceEngine,
+        PlanStep, SecretScanner, SessionMode, StepStatus, TaskPlan, TaskUsage, ToolCall,
+        TurnProgress, TurnSink, UsageSource, WebDiagnosticRecord, WebDiagnosticReport,
+        WorkspaceEngine,
+        finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange},
     };
 
     /// Points every engine built in this test binary at a throwaway data
@@ -5039,6 +5155,254 @@ mod tests {
         assert!(rejected.contains("sideways"), "{rejected}");
         let reread = get_session_for_test(port, &token, &session_id);
         assert!(reread.contains("\"mode\":\"review\""), "{reread}");
+    }
+
+    /// A repository with one source file, an engine for it, and a session
+    /// that belongs to it.
+    fn findings_fixture(name: &str) -> (PathBuf, WorkspaceEngine, String) {
+        isolated_data_dir();
+        let repo = std::env::temp_dir().join(format!(
+            "damaian-shell-findings-{name}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(repo.join("src")).expect("repository");
+        fs::write(repo.join("src/lib.rs"), "fn a() {}\n").expect("source file");
+        let engine = engine_for_repo(repo.to_str().unwrap()).expect("engine");
+        let repository_id = engine
+            .indexer
+            .repository_id_for_path(&repo)
+            .expect("repository id");
+        let session_id = engine
+            .session_store
+            .create_session(&repository_id, "Findings")
+            .expect("session")
+            .id;
+        (repo, engine, session_id)
+    }
+
+    /// Records a finding. With a path, it is ranged and hashed the way
+    /// recording does it (spec 22 Task 8), so editing the file makes it stale.
+    fn record_finding_for_test(
+        engine: &WorkspaceEngine,
+        repo: &std::path::Path,
+        session_id: &str,
+        summary: &str,
+        path: Option<&str>,
+    ) -> String {
+        let mut finding = Finding::new(
+            FindingDraft {
+                source: FindingSource::Compiler,
+                severity: Severity::Error,
+                summary: summary.to_string(),
+                details: None,
+                range: path.map(|path| SourceRange {
+                    path: path.to_string(),
+                    start_line: 1,
+                    start_column: None,
+                    end_line: None,
+                    end_column: None,
+                }),
+                code: None,
+            },
+            &SecretScanner::default(),
+        );
+        if let Some(path) = path {
+            finding =
+                finding.with_file_hash(workspace_engine::hash::file_hash(repo.join(path)).unwrap());
+        }
+        engine
+            .session_store
+            .record_finding(session_id, &finding)
+            .expect("record finding");
+        finding.id().to_string()
+    }
+
+    fn get_findings_for_test(
+        port: u16,
+        token: &str,
+        repo: &std::path::Path,
+        session_id: &str,
+    ) -> String {
+        send_for_test(
+            port,
+            format!(
+                "GET /api/findings?repo={}&session_id={session_id} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-damaian-api-token: {token}\r\nconnection: close\r\n\r\n",
+                repo.display()
+            ),
+        )
+    }
+
+    fn post_form_for_test(port: u16, token: &str, path: &str, body: &str) -> String {
+        send_for_test(
+            port,
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/x-www-form-urlencoded\r\nx-damaian-api-token: {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    }
+
+    fn json_of(response: &str) -> serde_json::Value {
+        let body = response.split("\r\n\r\n").nth(1).expect("a body");
+        serde_json::from_str(body).expect("JSON body")
+    }
+
+    fn status_of(json: &serde_json::Value, id: &str) -> String {
+        json["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .find(|finding| finding["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from {json}"))["status"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Staleness is derived against `repo`'s files (spec 22 `context.md`
+    /// §16), so an edit shows up in the next GET. The untouched ranged finding
+    /// is what pins the root: read against any other directory its file is
+    /// missing or different, and it would be stale too.
+    #[test]
+    fn get_findings_returns_them_with_staleness_derived_against_the_repository() {
+        let (repo, engine, session_id) = findings_fixture("get");
+        fs::write(repo.join("src/kept.rs"), "fn kept() {}\n").expect("second file");
+        let unranged = record_finding_for_test(&engine, &repo, &session_id, "no file", None);
+        let ranged =
+            record_finding_for_test(&engine, &repo, &session_id, "on a file", Some("src/lib.rs"));
+        let untouched =
+            record_finding_for_test(&engine, &repo, &session_id, "kept", Some("src/kept.rs"));
+        fs::write(repo.join("src/lib.rs"), "fn a() { edited() }\n").unwrap();
+        let (port, token) = serve_for_test();
+
+        let response = get_findings_for_test(port, &token, &repo, &session_id);
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let json = json_of(&response);
+        assert_eq!(json["findings"][0]["id"], unranged.as_str(), "record order");
+        assert_eq!(status_of(&json, &unranged), "open");
+        assert_eq!(status_of(&json, &ranged), "stale");
+        assert_eq!(status_of(&json, &untouched), "open");
+    }
+
+    /// §16: reading a session against another checkout would judge
+    /// staleness on the wrong files.
+    #[test]
+    fn findings_endpoints_refuse_a_session_from_another_repository() {
+        let (repo, engine, _) = findings_fixture("other-repo");
+        let foreign = engine
+            .session_store
+            .create_session("repo_somewhere_else", "Foreign")
+            .unwrap()
+            .id;
+        let (port, token) = serve_for_test();
+
+        let response = get_findings_for_test(port, &token, &repo, &foreign);
+        assert!(!response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("another repository"), "{response}");
+
+        let body = format!("repo={}&session_id={foreign}&finding_ids=x", repo.display());
+        let repair = post_form_for_test(port, &token, "/api/findings-repair", &body);
+        assert!(!repair.starts_with("HTTP/1.1 200"), "{repair}");
+    }
+
+    /// The follow-up GET proves the write persisted. An endpoint that only
+    /// echoed the request would pass the first assertion.
+    #[test]
+    fn post_finding_status_dismisses_and_a_later_get_shows_it() {
+        let (repo, engine, session_id) = findings_fixture("dismiss");
+        let id = record_finding_for_test(&engine, &repo, &session_id, "waved away", None);
+        let (port, token) = serve_for_test();
+
+        let body = format!(
+            "repo={}&session_id={session_id}&finding_id={id}&status=dismissed",
+            repo.display()
+        );
+        let changed = post_form_for_test(port, &token, "/api/finding-status", &body);
+        assert!(changed.starts_with("HTTP/1.1 200"), "{changed}");
+        assert_eq!(status_of(&json_of(&changed), &id), "dismissed");
+
+        let reread = get_findings_for_test(port, &token, &repo, &session_id);
+        assert_eq!(status_of(&json_of(&reread), &id), "dismissed");
+    }
+
+    /// Rejected, never defaulted (`/api/session-mode`'s rule), and `stale`
+    /// is refused by the store (spec 22 `context.md` §13.2).
+    #[test]
+    fn post_finding_status_rejects_an_unknown_status_and_refuses_stale() {
+        let (repo, engine, session_id) = findings_fixture("reject");
+        let id = record_finding_for_test(&engine, &repo, &session_id, "x", None);
+        let (port, token) = serve_for_test();
+
+        for status in ["sideways", "stale"] {
+            let body = format!(
+                "repo={}&session_id={session_id}&finding_id={id}&status={status}",
+                repo.display()
+            );
+            let rejected = post_form_for_test(port, &token, "/api/finding-status", &body);
+            assert!(
+                !rejected.starts_with("HTTP/1.1 200"),
+                "{status}: {rejected}"
+            );
+        }
+        let reread = get_findings_for_test(port, &token, &repo, &session_id);
+        assert_eq!(status_of(&json_of(&reread), &id), "open");
+    }
+
+    #[test]
+    fn post_findings_repair_returns_the_request_and_its_prompt() {
+        let (repo, engine, session_id) = findings_fixture("repair");
+        let open = record_finding_for_test(&engine, &repo, &session_id, "fix me", None);
+        let stale =
+            record_finding_for_test(&engine, &repo, &session_id, "moved", Some("src/lib.rs"));
+        fs::write(repo.join("src/lib.rs"), "fn a() { edited() }\n").unwrap();
+        let (port, token) = serve_for_test();
+
+        let body = format!(
+            "repo={}&session_id={session_id}&finding_ids={open},{stale}",
+            repo.display()
+        );
+        let response = post_form_for_test(port, &token, "/api/findings-repair", &body);
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let json = json_of(&response);
+        assert_eq!(json["request"]["findings"][0]["id"], open.as_str());
+        assert_eq!(json["request"]["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(json["request"]["excluded"][0]["findingId"], stale.as_str());
+        assert_eq!(json["request"]["excluded"][0]["reason"], "stale");
+        let prompt = json["prompt"].as_str().expect("a prompt");
+        assert!(prompt.contains(&format!("(finding {open})")), "{prompt}");
+        assert!(prompt.contains(&format!("- {stale}: stale")), "{prompt}");
+    }
+
+    /// spec 22 `context.md` §15: a prompt that fixes nothing is not sent.
+    #[test]
+    fn post_findings_repair_with_nothing_open_returns_a_null_prompt() {
+        let (repo, engine, session_id) = findings_fixture("repair-empty");
+        let id = record_finding_for_test(&engine, &repo, &session_id, "done", None);
+        engine
+            .session_store
+            .set_finding_status(
+                &session_id,
+                &id,
+                workspace_engine::finding::FindingStatus::Fixed,
+            )
+            .unwrap();
+        let (port, token) = serve_for_test();
+
+        let body = format!(
+            "repo={}&session_id={session_id}&finding_ids={id}",
+            repo.display()
+        );
+        let response = post_form_for_test(port, &token, "/api/findings-repair", &body);
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let json = json_of(&response);
+        assert!(json["prompt"].is_null(), "{json}");
+        assert_eq!(json["request"]["excluded"][0]["reason"], "fixed");
     }
 
     const REFUSED_TURN_ANSWER: &str =
