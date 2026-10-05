@@ -2534,6 +2534,46 @@ button:disabled {
   padding-left: 18px;
 }
 
+/* Export and import of permission profiles (spec 31 Task 8). */
+.profile-file-text {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  min-height: 96px;
+}
+
+.profile-import-review {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  font-size: 12px;
+  padding: 10px;
+}
+
+/* `display: grid` would otherwise override the `hidden` attribute, and the
+   empty review box would stay on screen after Cancel. */
+.profile-import-review[hidden] {
+  display: none;
+}
+
+.profile-import-review p {
+  margin: 0;
+}
+
+.profile-import-review ul {
+  margin: 2px 0 0;
+  padding-left: 18px;
+}
+
+.profile-import-not-carried {
+  color: var(--danger);
+}
+
+.profile-import-loosening {
+  color: var(--warn);
+}
+
 .settings-page-hint {
   color: var(--muted);
   font-size: 12px;

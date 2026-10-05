@@ -2285,3 +2285,439 @@ fn the_effective_policy_agrees_with_load_scoped_for_every_key() {
 
     fixture.cleanup();
 }
+
+// Task 8: sanitized export and import (context.md §9). A profile carries only
+// keys it may narrow, an export names no credential reference, and an import
+// lists what it will not apply before it writes.
+
+/// One line for every preference field, so together with Task 1's weakening
+/// table every `ConfigOverlay` field is set.
+const EVERY_PREFERENCE: &str = concat!(
+    "max_file_bytes=2048\n",
+    "max_command_output_bytes=4096\n",
+    "audit_retention_days=7\n",
+    "enable_semantic_search=true\n",
+    "agent_max_tool_rounds=4\n",
+    "agent_web_debug_max_tool_rounds=6\n",
+    "agent_tool_retry_limit=1\n",
+);
+
+/// Every field a profile may carry, each with a narrowing value, plus the
+/// two MCP flags a profile may set on a server the user has.
+const EVERY_PROFILE_KEY: &str = concat!(
+    "max_read_lines=100\n",
+    "max_list_entries=50\n",
+    "max_search_matches=40\n",
+    "max_match_line_chars=120\n",
+    "command_timeout_secs=30\n",
+    "ignore_patterns=vendor/\n",
+    "restricted_patterns=secrets/**|*.key\n",
+    "command_blocklist=git push\n",
+    "require_approval_for_file_edits=true\n",
+    "require_approval_for_risky_commands=true\n",
+    "require_approval_for_all_commands=true\n",
+    "allow_file_edits=false\n",
+    "command_access=read_only\n",
+    "allow_browser_diagnostics=false\n",
+    "allow_mutating_mcp_tools=false\n",
+    "audit_retention_days=7\n",
+    "checkpoint_retention_days=7\n",
+    "agent_max_task_tokens=5000\n",
+    "agent_max_turn_messages=12\n",
+    "mcp_enabled=false\n",
+    "mcp_server_allowlist=blessed\n",
+    "mcp_server.helper.enabled=false\n",
+    "mcp_server.helper.require_approval=true\n",
+);
+
+fn refusal_set(
+    refused: &[workspace_engine::RejectedConfigKey],
+) -> BTreeSet<(String, &'static str)> {
+    refused
+        .iter()
+        .map(|rejected| (rejected.key.clone(), rejected.class.as_str()))
+        .collect()
+}
+
+fn keys_of(refused: &[workspace_engine::RejectedConfigKey]) -> BTreeSet<&str> {
+    refused
+        .iter()
+        .map(|rejected| rejected.key.as_str())
+        .collect()
+}
+
+/// The split is a second statement of what the profile scope accepts, so it
+/// is held to the real merge: over an overlay that sets every field, it
+/// refuses exactly what `apply_overlay_scoped` refuses at profile scope for
+/// any reason other than direction, with the same class. What it carries,
+/// the merge refuses only by direction.
+#[test]
+fn the_keys_a_profile_may_carry_agree_with_the_profile_scope_merge() {
+    let every_capability: String = weakening_cases()
+        .iter()
+        .map(|case| case.repository)
+        .collect();
+    let text = format!(
+        "{every_capability}{EVERY_PREFERENCE}\
+         mcp_server.helper.enabled=true\nmcp_server.helper.require_approval=false\n"
+    );
+    let (overlay, unparsable) = ConfigOverlay::parse_untrusted(&text);
+    assert!(unparsable.is_empty(), "{unparsable:?}");
+
+    let (carried, refused) = workspace_engine::split_profile_keys(overlay.clone());
+    let merged = Config::default().apply_overlay_scoped(overlay, ConfigScope::Profile);
+    let merge_refused: Vec<_> = merged
+        .rejected
+        .into_iter()
+        .filter(|rejected| rejected.class != RepositoryKeyClass::RestrictOnly)
+        .collect();
+
+    assert_eq!(refusal_set(&refused), refusal_set(&merge_refused));
+    assert!(!refused.is_empty() && !carried.to_policy_text().is_empty());
+    let carried_merge = Config::default().apply_overlay_scoped(carried, ConfigScope::Profile);
+    assert!(
+        carried_merge
+            .rejected
+            .iter()
+            .all(|rejected| rejected.class == RepositoryKeyClass::RestrictOnly),
+        "{:?}",
+        carried_merge.rejected
+    );
+}
+
+/// The export goes through the exhaustive serializer and parses back to
+/// exactly what a profile may carry: for every built-in, and for a custom
+/// profile that sets every carriable key beside keys it may not carry.
+#[test]
+fn an_export_carries_only_profile_keys_and_round_trips() {
+    let fixture = profile_fixture("export-round-trip");
+    for id in [
+        ProfileId::ReadOnly,
+        ProfileId::SafeLocal,
+        ProfileId::Full,
+        ProfileId::OfflinePrivate,
+    ] {
+        let text = workspace_engine::export_profile(&id, &fixture.data_dir).unwrap();
+        let (overlay, _) = id.overlay(&fixture.data_dir).unwrap();
+        assert_eq!(
+            ConfigOverlay::parse(&text).unwrap(),
+            overlay,
+            "{}: a built-in carries only profile keys, so it exports whole",
+            id.as_str()
+        );
+    }
+
+    fixture.write_custom_profile(
+        "everything",
+        &format!("{EVERY_PROFILE_KEY}shell=/tmp/evil-shell-task8\nmax_file_bytes=1\n"),
+    );
+    let id = ProfileId::parse("everything").unwrap();
+    let text = workspace_engine::export_profile(&id, &fixture.data_dir).unwrap();
+    assert_eq!(
+        ConfigOverlay::parse(&text).unwrap(),
+        ConfigOverlay::parse(EVERY_PROFILE_KEY).unwrap(),
+        "{text}"
+    );
+    assert!(!text.contains("shell"), "{text}");
+    assert!(!text.contains("max_file_bytes"), "{text}");
+
+    // Export, import under a new name, export again: the same keys.
+    let imported = workspace_engine::import_profile(
+        &fixture.base(),
+        &text,
+        "everything_copy",
+        false,
+        &fixture.audit_log(),
+    )
+    .unwrap();
+    let again = workspace_engine::export_profile(&imported.id, &fixture.data_dir).unwrap();
+    assert_eq!(
+        again.lines().skip(1).collect::<Vec<_>>(),
+        text.lines().skip(1).collect::<Vec<_>>()
+    );
+
+    fixture.cleanup();
+}
+
+/// Criterion 11 by construction (context.md §9), asserted against the text:
+/// a built-in reads no user config, and a custom file's credential
+/// references are not profile keys.
+#[test]
+fn no_export_names_a_credential_reference() {
+    let fixture = profile_fixture("export-credentials");
+    fixture.write_user(concat!(
+        "model_api_key_env=keychain:task8-model-key\n",
+        "mcp_server.helper.command=/usr/local/bin/helper\n",
+        "mcp_server.helper.auth_token_env=keychain:task8-helper-token\n",
+    ));
+    fixture.write_custom_profile(
+        "leaky",
+        concat!(
+            "command_access=local\n",
+            "model_api_key_env=keychain:task8-leak\n",
+            "model_provider.openai.api_key_env=keychain:task8-provider-leak\n",
+            "mcp_server.helper.auth_token_env=keychain:task8-token-leak\n",
+            "mcp_server.helper.enabled=false\n",
+        ),
+    );
+
+    for id in [
+        ProfileId::ReadOnly,
+        ProfileId::SafeLocal,
+        ProfileId::Full,
+        ProfileId::OfflinePrivate,
+        ProfileId::parse("leaky").unwrap(),
+    ] {
+        let text = workspace_engine::export_profile(&id, &fixture.data_dir).unwrap();
+        for forbidden in ["auth_token_env", "api_key_env", "keychain:", "task8"] {
+            assert!(
+                !text.contains(forbidden),
+                "{}: {forbidden} in {text}",
+                id.as_str()
+            );
+        }
+    }
+    let leaky =
+        workspace_engine::export_profile(&ProfileId::parse("leaky").unwrap(), &fixture.data_dir)
+            .unwrap();
+    assert!(leaky.contains("command_access=local"), "{leaky}");
+    assert!(leaky.contains("mcp_server.helper.enabled=false"), "{leaky}");
+
+    fixture.cleanup();
+}
+
+/// Proposal §5.9 as context.md §9 decides it: the import lists, itemised and
+/// before it writes, what a profile cannot carry (not written) and what would
+/// loosen the base (written, no effect). An equal limit is neither. The audit
+/// event names keys and counts, never a value, and user config is untouched.
+#[test]
+fn an_import_lists_what_it_will_not_apply_and_writes_only_profile_keys() {
+    let fixture = profile_fixture("import-review");
+    let user = "command_access=read_only\nmax_read_lines=400\nrestricted_patterns=.env\n";
+    fixture.write_user(user);
+    let base = fixture.resolve_without_profiles();
+    let text = concat!(
+        "model_base_url=http://127.0.0.1:9/task8\n",
+        "shell=./tools/task8-sh\n",
+        "command_access=all\n",
+        "require_approval_for_file_edits=true\n",
+        "max_read_lines=400\n",
+        "this line has no equals sign\n",
+    );
+
+    let review = workspace_engine::review_profile_import(&base, text);
+    assert_eq!(
+        refusal_set(&review.not_carried),
+        BTreeSet::from([
+            ("line 6".to_string(), "unparsable"),
+            ("model_base_url".to_string(), "forbidden"),
+            ("shell".to_string(), "forbidden"),
+        ])
+    );
+    assert_eq!(
+        refusal_set(&review.loosening),
+        BTreeSet::from([("command_access".to_string(), "restrict_only")])
+    );
+    assert_eq!(
+        review.carried,
+        [
+            "max_read_lines",
+            "require_approval_for_file_edits",
+            "command_access"
+        ]
+    );
+    let path = ProfileId::parse("imported")
+        .unwrap()
+        .custom_path(&fixture.data_dir)
+        .unwrap();
+    assert!(!path.exists(), "a review writes nothing");
+
+    let imported =
+        workspace_engine::import_profile(&base, text, "imported", false, &fixture.audit_log())
+            .unwrap();
+    assert_eq!(imported.path, path);
+    assert!(!imported.replaced);
+    assert_eq!(imported.review, review);
+    let written = fs::read_to_string(&path).unwrap();
+    for absent in ["model_base_url", "shell", "127.0.0.1", "task8"] {
+        assert!(!written.contains(absent), "{absent} in {written}");
+    }
+    assert!(
+        written.contains("require_approval_for_file_edits=true"),
+        "{written}"
+    );
+    assert_eq!(fs::read_to_string(&fixture.user_config).unwrap(), user);
+
+    let audit = fixture.audit_events();
+    let event = audit
+        .lines()
+        .find(|line| line.contains("permission_profile_imported"))
+        .unwrap_or_else(|| panic!("no import event in {audit}"));
+    for expected in [
+        "\"profileId\":\"imported\"",
+        "\"notCarriedCount\":\"3\"",
+        "model_base_url",
+        "\"looseningKeys\":\"command_access\"",
+        "\"carriedCount\":\"3\"",
+    ] {
+        assert!(event.contains(expected), "{expected} missing from {event}");
+    }
+    for value in ["127.0.0.1", "task8", "no equals"] {
+        assert!(!audit.contains(value), "{value} in {audit}");
+    }
+
+    fixture.cleanup();
+}
+
+/// Task 3's widening test with an imported file: an imported profile, once
+/// selected, cannot widen anything the user narrowed.
+#[test]
+fn an_imported_profile_once_selected_cannot_widen_anything() {
+    let fixture = profile_fixture("import-loosen");
+    let cases: Vec<_> = weakening_cases()
+        .into_iter()
+        .filter(|case| case.field != "checkpoint_retention_days")
+        .collect();
+    let user: String = cases.iter().map(|case| case.user).collect();
+    let profile: String = cases.iter().map(|case| case.repository).collect();
+    fixture.write_user(&format!(
+        "{user}checkpoint_retention_days=3\naudit_retention_days=3\n"
+    ));
+    let base = fixture.resolve_without_profiles();
+    let text = format!(
+        "{profile}checkpoint_retention_days=365\naudit_retention_days=365\n\
+         max_file_bytes=1\nagent_tool_retry_limit=1\n"
+    );
+
+    let imported =
+        workspace_engine::import_profile(&base, &text, "loosen", false, &fixture.audit_log())
+            .unwrap();
+    fixture.write_user(&format!(
+        "{user}checkpoint_retention_days=3\naudit_retention_days=3\n{}",
+        fixture.select("loosen")
+    ));
+    let (config, report) = fixture.load();
+
+    assert_eq!(
+        config,
+        fixture.resolve_without_profiles(),
+        "the imported profile loosened something"
+    );
+    assert_eq!(report.permission_profile, Some(imported.id));
+    let listed: BTreeSet<&str> = keys_of(&imported.review.not_carried)
+        .union(&keys_of(&imported.review.loosening))
+        .copied()
+        .collect();
+    for case in &cases {
+        if let Resists::Reported(key) = case.resists {
+            assert!(
+                listed.contains(key),
+                "{}: not listed in {listed:?}",
+                case.field
+            );
+        }
+    }
+    let written = fs::read_to_string(&imported.path).unwrap();
+    for key in keys_of(&imported.review.not_carried) {
+        assert!(
+            !written
+                .lines()
+                .any(|line| line.starts_with(&format!("{key}="))),
+            "{key} was written: {written}"
+        );
+    }
+
+    fixture.cleanup();
+}
+
+#[test]
+fn import_refuses_a_reserved_or_existing_name_unless_replacing() {
+    let fixture = profile_fixture("import-names");
+    let base = fixture.base();
+    let audit = fixture.audit_log();
+    let profiles = fixture.data_dir.join("config").join("profiles");
+
+    for reserved in ["full", "read_only", "safe_local", "offline_private"] {
+        let error = workspace_engine::import_profile(
+            &base,
+            "command_access=none\n",
+            reserved,
+            false,
+            &audit,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("built-in"), "{error}");
+    }
+    for invalid in ["../escape", "Mine", ""] {
+        assert!(
+            workspace_engine::import_profile(&base, "command_access=none\n", invalid, true, &audit)
+                .is_err(),
+            "{invalid:?}"
+        );
+    }
+    let error = workspace_engine::import_profile(&base, "shell=/bin/sh\n", "empty", false, &audit)
+        .unwrap_err();
+    assert!(error.to_string().contains("nothing to import"), "{error}");
+    assert!(!profiles.exists(), "a refused import wrote {profiles:?}");
+
+    workspace_engine::import_profile(&base, "command_access=none\n", "mine", false, &audit)
+        .unwrap();
+    let path = profiles.join("mine.conf");
+    let error =
+        workspace_engine::import_profile(&base, "command_access=local\n", "mine", false, &audit)
+            .unwrap_err();
+    assert!(error.to_string().contains("already exists"), "{error}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "command_access=none\n");
+
+    // Replacing forgets which of the old file's keys were already audited.
+    let review_state = fixture
+        .data_dir
+        .join("config")
+        .join("profile-review")
+        .join("mine.json");
+    fs::create_dir_all(review_state.parent().unwrap()).unwrap();
+    fs::write(&review_state, "{\"reportedKeys\":[\"command_access\"]}").unwrap();
+    let replaced =
+        workspace_engine::import_profile(&base, "command_access=local\n", "mine", true, &audit)
+            .unwrap();
+    assert!(replaced.replaced);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "command_access=local\n");
+    assert!(!review_state.exists());
+    assert!(fixture.audit_events().contains("\"replaced\":\"true\""));
+
+    fixture.cleanup();
+}
+
+#[test]
+fn the_custom_profile_listing_names_only_valid_custom_files() {
+    let fixture = profile_fixture("profile-listing");
+    assert!(
+        workspace_engine::custom_profile_ids(&fixture.data_dir)
+            .unwrap()
+            .is_empty(),
+        "no profiles directory is an empty list"
+    );
+    let profiles = fixture.data_dir.join("config").join("profiles");
+    fs::create_dir_all(profiles.join("nested.conf")).unwrap();
+    for file in [
+        "zeta.conf",
+        "alpha.conf",
+        "Upper.conf",
+        "full.conf",
+        "notes.txt",
+    ] {
+        fs::write(profiles.join(file), "command_access=none\n").unwrap();
+    }
+
+    let ids = workspace_engine::custom_profile_ids(&fixture.data_dir).unwrap();
+
+    assert_eq!(
+        ids,
+        [
+            ProfileId::parse("alpha").unwrap(),
+            ProfileId::parse("zeta").unwrap()
+        ]
+    );
+
+    fixture.cleanup();
+}

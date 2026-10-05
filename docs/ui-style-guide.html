@@ -867,5 +867,41 @@ error[E0308]: mismatched types
         </div>
       </div>
     </section>
+
+    <section class="sg-section">
+      <h2>Profile import review</h2>
+      <p class="sg-hint">
+        Settings › General › Permission profile files. Shown before anything is written. Keys a
+        profile cannot set are listed by key and class, never by value; Import is disabled while
+        the name is taken and Replace is not ticked.
+      </p>
+      <div class="sg-card">
+        <div class="profile-import-review">
+          <div>
+            <p>Will write to my_safe: require_approval_for_file_edits, command_access</p>
+            <div class="profile-import-not-carried">
+              <p>Not written, a profile cannot set these:</p>
+              <ul>
+                <li>shell (forbidden)</li>
+                <li>model_api_key_env (forbidden)</li>
+              </ul>
+            </div>
+            <div class="profile-import-loosening">
+              <p>
+                Written but no effect here, these would loosen your config and a profile only
+                narrows:
+              </p>
+              <ul>
+                <li>command_access (restrict-only)</li>
+              </ul>
+            </div>
+          </div>
+          <div class="inline-actions">
+            <button class="btn-primary" type="button">Import</button>
+            <button class="btn-quiet" type="button">Cancel</button>
+          </div>
+        </div>
+      </div>
+    </section>
   </body>
 </html>

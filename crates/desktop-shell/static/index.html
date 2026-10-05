@@ -426,6 +426,65 @@
             </div>
             <div id="policy-other-refused" class="policy-other-refused" hidden></div>
           </section>
+          <section class="settings-section">
+            <h3>Permission profile files</h3>
+            <p class="settings-page-hint">
+              An export carries only the keys a profile may set, so it never names a credential.
+              An import is checked first: keys a profile cannot set are not written, and keys that
+              would loosen your config are listed because a profile can only narrow.
+            </p>
+            <div class="inline-actions">
+              <button id="profile-export-btn" class="btn-quiet" type="button">
+                Export the selected profile
+              </button>
+            </div>
+            <textarea
+              id="profile-export-text"
+              class="profile-file-text"
+              rows="6"
+              readonly
+              hidden
+            ></textarea>
+            <label class="field">
+              <span>Profile file to import</span>
+              <textarea
+                id="profile-import-text"
+                class="profile-file-text"
+                rows="6"
+                placeholder="command_access=local&#10;require_approval_for_file_edits=true"
+              ></textarea>
+            </label>
+            <label class="field">
+              <span>Name for the imported profile</span>
+              <input
+                id="profile-import-name"
+                type="text"
+                maxlength="40"
+                placeholder="a-z, 0-9 and _"
+                autocomplete="off"
+              />
+            </label>
+            <label class="field-checkbox">
+              <input id="profile-import-replace" type="checkbox" />
+              <span>Replace a custom profile with this name</span>
+            </label>
+            <div class="inline-actions">
+              <button id="profile-import-review-btn" class="btn-quiet" type="button">
+                Review import
+              </button>
+            </div>
+            <div id="profile-import-review" class="profile-import-review" hidden>
+              <div id="profile-import-review-lists"></div>
+              <div class="inline-actions">
+                <button id="profile-import-confirm-btn" class="btn-primary" type="button">
+                  Import
+                </button>
+                <button id="profile-import-cancel-btn" class="btn-quiet" type="button">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </section>
         </section>
 
         <section id="settings-page-shortcuts" class="settings-page" data-page="shortcuts">

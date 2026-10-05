@@ -17,7 +17,7 @@ decisions it left open in [`context.md`](context.md)
 | 5 · `profile ∩ mode` at every refusal point | Done 2026-10-04 | Expanded into full steps on 2026-10-04. Every call site was re-located: `context.md` §5's line numbers still held, except that `edit.rs` calls the patch gate twice at apply (`:573`, `:574`). It was planned on the old base while spec 22 Task 8 was being written in its own worktree, and implemented after that task merged to main (`00173ee`). **This branch is not rebased onto it.** Task 8 also edits `chat.rs` next to the web-diagnostic and command resume branches and the imports, so the merge back will need those few hunks resolved. **Landed:** `mode.rs` gains `ProfileLimit`, `Permission::RefusedByProfile { limit }`, `profile_permits` and `permits` (mode first, first refusal wins), and the profile case of `refusal_message`: `Refused: the permission profile does not allow this (<key>=<value>). Switching mode will not allow it.` `command_access_permits` is now `pub(crate)`. Every `mode_permits` call in `chat.rs` now calls `permits`: the tool list, where the closure is renamed `offered`; `action_permission`; and the three resume branches. The command resume re-classifies the stored command. A profile refusal is rejected as `profile_policy`, and a profile-refused web diagnostic is audited as `refused_by_profile`. `edit.rs`'s gate is now `refuse_unless_mode_and_profile_permit_patches`, and it asks the profile even with no session. `the_permission_matrix_matches_the_spec_table` is now one table: 17 tool-class rows × 4 modes × the 4 built-in profiles, from their real overlays. The Full column must equal `mode_permits` exactly. **Tests:** new in `mode.rs`: the matrix (rewritten) and 2 message tests, 18/18. Two in `chat.rs`'s `mode_refusal_tests`: the web and MCP resume points. Ten in `permission_profiles.rs` (36 pass, 1 ignored): the two criterion 10 cases with exact wording, the profile-blocked command refused before any proposal, the next turn, the resume refusal, the violation pairing, sessionless propose and apply. The in-flight test is `#[ignore]` because it uses the real login shell. It passes when run by hand. `repository_config_trust` 47/47, file unmodified. The three integration files total 241. The whole `workspace-engine` crate: 868 passed, 19 skipped. The deterministic eval tier: 16/16 scenarios pass and `approval_policy_violations` is 0. The other metrics were not compared with a run on the base commit. `cargo fmt --check`, `cargo clippy -p workspace-engine --all-targets --locked -D warnings` and `typos` are clean. `cargo check -p desktop-shell -p damaian-cli -p eval-harness --all-targets` passes. **Mutations (all reverted, all caught):** (1) `permits` = mode alone failed 8. The edit tests did not fail, which the plan had predicted they would: the sessionless path calls `profile_permits` directly. (2) Profile first failed the matrix. (3) `blocked` instead of `command_access_permits` failed the matrix, `code_under_read_only…` and `the_next_turn…`. (4) The tool list with mode alone failed `code_under_read_only…`. (5) The command resume with Full's capabilities failed the resume and violation tests. Spec 20's `a_mode_refused_proposal_that_is_later_run_by_id…` also failed once in that parallel run, but passes under the same mutation in isolation and 5/5 unmutated. That one failure is unexplained, probably its real login shell under load. (6) The web and MCP resumes with Full's capabilities each failed their `chat.rs` test. (7) The early return on an empty session failed only the sessionless propose test. Apply goes through `propose_edit`'s own session. (8) Mode wording for the profile case failed 4. (9) The in-flight test, falsified by switching before the resume engine is built, failed on "never started". As first planned, with the switch before the thread, it was not caught, because the test reused the turn's engine. The test now builds its own resume engine. **Deviations:** ten, listed under Task 5. (1) A new `RefusedByProfile` variant. (2) The refusal names `key=value`, not the profile. (3) The mode is named when both refuse. (4) `command_access_permits` is shared, and `blocked` is not read, so a blocklisted command keeps its card. (5) The resume re-classifies the stored command for both axes. (6) Sessionless patches are profile-checked. (7) Read-only still offers `propose_plan` and `complete_step`. (8) The web and MCP resume tests are in `chat.rs`. (9) The shell is `/usr/bin/true`: this Mac stalls exec of any freshly written executable, so a script cannot stand in. (10) Audit wording. **For Task 6/7:** a refusal shows the resolved `key=value` and never the scope that set it. The attributed view must show all five keys, including `mcp_enabled`. If the view needs the strings, make `ProfileLimit::setting` `pub(crate)` rather than copying it. **For Task 9:** the user guide should give the two refusal strings, deviation 3 (Ask under Read-only names the mode first) and deviation 7 |
 | 6 · Provenance: a source for every applied value | Done 2026-10-04 | Expanded into full steps on 2026-10-04, after checking every `apply_overlay_scoped` caller, each merge helper and `apply_repository_allowlist` against the code. **Landed:** `apply_overlay_scoped` returns `OverlayOutcome { rejected, applied: Vec<AppliedKey> }`. `AppliedKey { key, scope, entries, widened }` is recorded at every application. The seven list keys carry the entries the scope holds. MCP servers and model providers are recorded per field. The helpers report what they applied: `union_patterns`, `intersect_allowlist` → `Option<(entries, loosened)>`; the flag, access, limit and ceiling helpers → `Option<loosened>`; `lower_wins` → `bool`; `upsert_mcp_server_from_repository` → its fields. `widened` is set only at admin scope. `RepositoryConfigReport` gains `applied` and `allow_always_entries`, and `apply_repository_allowlist` returns what it added. New `effective_policy.rs`: `EffectivePolicy::{resolve, from_load, rule, to_text}`, with `PolicyRule`, `PolicyEntry`, `PolicySource`, `SourceKind`, `RefusedRequest` and `RefusedBy`, all re-exported. Its rules are the lines of `to_policy_text`, so the view and the text cannot disagree. Added `ProfileId::label`. CLI `config-show --sources [repo]`. Callers: `damaian-cli` and one `foundation.rs` test read `.rejected`. The rest ignore the result unchanged. The refusal order is unchanged. Not touched: `chat.rs`, the web UI, `repository_config_trust.rs`. **Tests:** 5 new in `permission_profiles`: the outcome API, §5.7's per-entry example with Allow Always and a profile, admin widening against narrowing and user loosening, a refusal by key and class with no value in the JSON, the text or `report.applied`, and resolver agreement against an independent `load_scoped`. The file passes 41, with 1 ignored. The three integration files total 246, all passing. `repository_config_trust` is 47/47 and the file is unmodified. `foundation`'s FSEvents watcher test timed out once under parallel load and passed on rerun. The `mode::`, `config::` and `profile::` lib tests pass, 18/18. `cargo fmt --check`, `cargo clippy -p workspace-engine -p damaian-cli --all-targets --locked -D warnings` and `typos` are clean. `cargo check -p desktop-shell -p damaian-cli -p eval-harness --all-targets` passes. A manual `config-show --sources` against a scratch data dir showed the per-entry sources, the profile attribution, the admin widening and the refusals. The refused `shell` value was absent. **Mutations (8, all reverted, all caught in the end):** (1) the untrusted union recording nothing failed 2 tests. (2) `widened` at every trusted scope was **not caught at first**, because `from_load` re-checked the scope. It now reads `widened` alone, and the mutation fails. (3) The flag ignoring the current value failed the admin test. (4) Values rendered from defaults failed agreement. (5) A narrowed allowlist recording `incoming` was **not caught at first**, because the view prints entries from `Config`. The test now scans `report.applied`, and the mutation fails. (6) Dropping the Allow Always record failed §5.7; the first version of this mutation did not compile and was redone. (7) First applier wins failed 3. (8) The limit never loosening failed the admin test. A restore with `shutil.move` kept the backup's older mtime, so cargo reused a mutated build once. Touch the sources after restoring. **Deviations:** ten, listed under Task 6. (1) Provenance travels on the report, and `load_scoped`'s signature is unchanged. (2) Allow Always is a report field, not a scope. (3) A source is the last scope whose value holds, so an untrusted scope that sets the restrictive value takes the attribution. (4) Forbidden and User-owned keys have no direction, so an admin value there is attributed but never marked widened (open for Task 9's review). (5) Limit and ceiling widen on a strict `>`. (6) `resolve(Option<&Path>, Option<SessionMode>)`, plus `from_load`. (7) Keys the text omits while unset have no rule, and their refusals go to `otherRefused`. (8) Repository allowlist entries awaiting migration are not in the view. (9) Attribution per field for MCP and providers. (10) `ProfileId::label`. **For Task 7:** serve `EffectivePolicy::from_load` (or `resolve`) as JSON. The exact shape is under Task 6, "The `EffectivePolicy` JSON shape". It is camelCase: `header`, `profile`, `profileLabel`, `profileSelected`, `mode`, and `rules[] { key, value, sources[] { kind, label }, entries[] | null, adminWidened, refused[] { key, class, by } }`, plus `otherRefused[]`. `kind` is one of `default`, `user`, `repository`, `admin`, `profile` or `allowAlways`, and `by` is `repository` or `profile`. The view describes the loaded config. The chat's per-request provider override (`config_for_repo_with_provider`) is not reflected. Pending allowlist entries come from the existing migration notice, not from this structure |
 | 7 · Attributed effective-policy view and profile picker | Done 2026-10-04 | Expanded into full steps on 2026-10-04, after checking the outline against `effective_policy_for_repo` and its three callers, `renderConfigPolicy` and its syncing, and the Settings › General markup. Spec 22 Task 11 was Not started, so the shared shell files were free. **Landed:** `GET /api/effective-policy?repo=&session=` and `POST /api/permission-profile` (`repo`, `profile`, optional `session`), both as handler functions, not inline arms (spec 22 Task 10, deviation 1). They share `effective_policy_json`, which serves Task 6's `EffectivePolicy` unchanged, from one `load_for_repository_reporting`. With a session, the mode is that session's, and the session must belong to `repo` (`session_in_repository`). The POST runs `damaian profile-set`'s steps: config without the repository, then `select_profile`, which writes user config and audits `permission_profile_set`. The shell now calls `review_profile_rejections` in `effective_policy_json` and `repository_config_review_json`, and the result stays out of spec 34's notice. The three text callers of `effective_policy_for_repo` are unchanged. The `<pre>` is now a Rule/Value/Source table with refusal rows (key and class only), a `local`/`read_only` caveat row, an admin-widening tag and an "Other refused requests" list. Above it are the per-repository picker, a description of each profile, and the Offline private warning. `renderConfigPolicy` still feeds the plain text to the provider and model syncing. `#config-output`'s CSS is gone, there are new `.policy-*` rules, and there is a specimen in `docs/ui-style-guide.html`. Not touched: `chat.rs`, `repository_config_trust.rs`, and every `workspace-engine` file. **Tests:** 4 new shell tests: the view over the wire (per-entry source, refusals by key and class, the refused value absent, and rules equal to the text's lines), the session's mode and the foreign-session refusal, the POST (the user config line, the audit event, the re-read, and an unknown name refused without writing), and a custom profile's refusals audited without the value. Before the routes, all 4 failed on `{"error":"not found"}`. `cargo nextest run -p desktop-shell`: 90 passed, 4 skipped. `repository_config_trust`: 47/47, file unmodified. `cargo fmt --check`, `cargo clippy -p desktop-shell -p workspace-engine --all-targets --locked -D warnings`, `node --check`, `npm run lint:web` and `typos` are clean. Biome's one info is in `scripts/check-spec-status.mjs` and predates this task. **Mutations (5, all reverted, all caught):** (1) Loading without the repository failed 3 tests. (2) The GET ignoring `session` and (3) no session check each failed the mode test. (4) The POST never selecting failed 2. (5) No profile review failed the custom-profile test. **In the running app** (the inspection server on 4899, PID-stopped): the table showed `secrets/**` from repository config among default entries, and `require_approval_for_file_edits=true` from `profile: safe_local` with the repository's restrict-only refusal under it. The `shell` refusal showed with no value, and `model_provider.attacker` was under "Other refused requests". The header read "… ∩ Code mode" with a session open. Each built-in applied from the picker. A custom file appeared as "review_only (custom)", with its own `shell` refusal, audited once and without the value. After the file was deleted, the load error showed, and the picker still switched back to Full. The Offline private warning showed for `https://api.openai.com`, and hid for a user-configured provider at `http://127.0.0.1:11434/v1`. `isLoopbackUrl` rejected `127.evil.com` and `localhost.evil.com`. **Deviations:** eight, listed under Task 7. The main ones: (6) the user-config editor saved `user.conf` whole and erased a fresh selection, found only in the running app and fixed by carrying the `permission_profile.*` lines into the editor after a pick; (4) the picker lists the built-ins plus the selected custom profile only; (5) the Offline private warning follows the composer's provider; (7) list entries are grouped by consecutive source. **For Task 8:** add a custom-profile listing endpoint, and offer the imported files in the picker (`renderPermissionProfilePicker` adds an option only for the custom profile in force). Deviation 6's hazard applies to an import that writes user config. **For Task 9:** the second-person review reads Settings › General. Open a repository first, or the picker is disabled and the table shows the global policy. The editor hazard also applies to Allow Always's `command_allowlist.<repository_id>`; it is out of scope here and worth an observation. The repository notice (spec 34) appears over the page on each repository selection with a new data dir, so dismiss it before reading |
-| 8 · Sanitized export and import | Not started | |
+| 8 · Sanitized export and import | Done 2026-10-05 | Expanded into full steps on 2026-10-04, after checking the outline against `ProfileId::overlay`, the profile-scope merge and its helpers, `to_policy_text`, `review_profile_rejections` and Task 7's picker. **Landed:** in `profile.rs`, re-exported: `split_profile_keys` (exhaustive over `ConfigOverlay` and `McpServerConfigOverlay`), `export_profile`, `custom_profile_ids`, `profile_import_base`, `review_profile_import` → `ProfileImportReview { carried, not_carried, loosening }`, and `import_profile` → `ProfileImport { id, path, replaced, review }`, which audits `permission_profile_imported` with counts and key names. CLI `profile-export <profile> [file]` and `profile-import <name> <file> [--repo] [--replace] [--review]`, which prints the review before writing. Shell `GET /api/permission-profiles`, `GET /api/permission-profile-export`, and `POST /api/permission-profile-import` (`preview=true` writes nothing). Settings › General gains a "Permission profile files" section: export the selected profile, paste and name an import, Review import, then Import or Cancel. The picker now offers every custom profile. Style-guide specimen added. Not touched: `chat.rs`, `config.rs`, `repository_config_trust.rs`. **Tests:** 7 new in `permission_profiles` (the merge agreement, the round trip, no credential reference, the itemised review with audit and untouched `user.conf`, the imported profile cannot widen, name refusals and replace, and the listing). With `repository_config_trust` (unmodified), 95 pass and 1 is skipped (Task 5's ignored in-flight test). 2 new shell tests; `cargo nextest run -p desktop-shell`: 92 passed, 4 skipped. `cargo clippy -p workspace-engine -p desktop-shell -p damaian-cli --all-targets --locked -D warnings`, `cargo fmt --check`, `node --check`, `npm run lint:web` (its one info is the existing one in `scripts/check-spec-status.mjs`) and `typos` are clean. **Mutations (13, all reverted, all caught):** (1) the split carrying `shell` failed 5. (2) The export skipping the split failed the round trip and the credential test. (3) An equal limit listed as loosening failed the review test. (4) The loosening probe at user scope failed the review and widening tests. (5) The import writing the raw text failed the review and widening tests. (6) `replace` ignored and (7) the review state kept on replace each failed the names test. (8) The imported text in the audit event failed the review test. (9) An MCP server's `auth_token_env` carried failed only the credential test: the agreement test still matched, because the refusal is pushed either way. (10) The listing accepting any file stem failed the listing test. In the shell: (11) a preview that writes failed both shell tests. (12) The import base without the repository failed the preview test. (13) The import base with the selected profile failed the round-trip test. **Deviations:** ten, listed under Task 8. The main ones: (1) the filter is a new exhaustive `split_profile_keys` held to the real merge by a test, because `overlay_field_kinds` is not the carriable set; (2) a loosening key **is** written, as `context.md` §9 describes, and listed as having no effect, where the outline's test said it is not written; (3) loosening is judged against config without the selected profile; (6) the tests were written after a first draft, so falsification replaced watch-them-fail; (7) the review box ignored `hidden`, found in the running app. **In the running app** (the inspection server on 4899, rebuilt, PID-stopped, twice because of deviation 7): Safe local was picked and exported as its two keys. A hostile paste (`shell`, `model_api_key_env`, `allow_file_edits=true`) reviewed as "Not written: shell (forbidden), model_api_key_env (forbidden)", with no loosening (an equal flag), and neither value anywhere in the review. Cancel hid the box and wrote nothing. The clean export imported as `my_safe` with a real click, and the picker showed "my_safe (custom)". With an unsaved `max_file_bytes=4096` in the editor, `my_safe` was picked: the table showed `command_access=local` and `require_approval_for_file_edits=true` from "profile: my_safe", and after Save `user.conf` held both the selection and the edited line. The audit event carried counts and empty key lists only. A preview named `full` was refused with the built-in message. The CLI against a scratch data dir: export, `--review`, import, a refused duplicate (exit 1) and a re-export behaved as described. **For Task 9:** the user guide should describe export, the two import lists (not written, and written but no effect), that an import never selects the profile, and `--review`/`--replace`. Criterion 11's "widenings require review" is met as "widenings are listed and never applied" (`context.md` §9, deviation 2); proposal §7 should say so. `context.md` needed no change: the `overlay_field_kinds` wording was the outline's only |
 | 9 · Docs, acceptance criteria, second-person review, close the spec | Not started | |
 
 **Goal:** Named permission profiles that can only narrow the resolved config,
@@ -4626,31 +4626,461 @@ request is shown by key and class, never by value (`context.md` §8).
 ## Task 8: Sanitized export and import
 
 **Requirements:** 7, and acceptance criterion 11. **Files:** `profile.rs`,
-`desktop-shell/src/lib.rs`, `app.js`, `damaian-cli/src/main.rs`, and
-`tests/permission_profiles.rs`.
+`lib.rs` (re-exports), `desktop-shell/src/lib.rs`, `static/app.js`,
+`index.html`, `style.css`, `docs/ui-style-guide.html`,
+`damaian-cli/src/main.rs`, and `tests/permission_profiles.rs`. Not touched:
+`chat.rs`, `config.rs`, `repository_config_trust.rs`.
 
-- `export(id, data_dir) -> String`: the profile's overlay, restricted to the
-  keys a profile may carry (Task 3's rule) and serialized field by field
-  through `overlay_field_kinds`. Round-trip-tested, because the general
-  serializer drops keys (`context.md` §9).
-- `import(text, id, data_dir) -> ImportReport { written, not_applicable: Vec<RejectedConfigKey> }`:
-  - It parses with `parse_untrusted`.
-  - It lists keys a profile cannot carry, and keys that would loosen the
-    current resolved config and so have no effect.
-  - It then writes `<data_dir>/config/profiles/<id>.conf` and audits
-    `permission_profile_imported`, with counts and key names only.
-  - It refuses a reserved id or an existing custom id unless asked to
-    replace.
-- CLI `profile-export` / `profile-import`. Shell endpoints and Settings
-  buttons, where the import shows the not-applicable list before writing.
+Expanded from the outline on 2026-10-04, after checking it against
+`ProfileId::overlay`, `apply_overlay_scoped` at `ConfigScope::Profile` and its
+helpers, `ConfigOverlay::to_policy_text`, `review_profile_rejections`, and
+Task 7's picker. `context.md` §4 and §9 decide it: a profile only narrows, so
+an import lists widenings and never approves them, and an export carries
+profile keys only.
 
-Tests:
-- An export of every built-in profile contains no `auth_token_env` and no
-  `model_api_key_env` text, including when user config sets both.
-- An import carrying `model_base_url`, `shell` and a loosening
-  `command_access` writes none of them and lists all three.
-- An imported profile, once selected, cannot widen anything. Reuse Task 3's
-  widening test with the imported file.
+**What the outline was checked against:**
+
+- **"Serialized field by field through `overlay_field_kinds`."** That list
+  says capability or preference, which is not what a profile may carry:
+  `audit_retention_days` is a preference a profile may lower, and `shell` or
+  `model_api_key_env` are capability keys a profile may not set. What a profile
+  may carry is decided in `apply_overlay_scoped` at `ConfigScope::Profile`:
+  the restrict-only keys, the lower-wins retention keys, and the `enabled` and
+  `require_approval` flags of an MCP server the user already has. Everything
+  else is refused there as `Forbidden` (redirecting keys, the two checkpoint
+  budgets, preferences, MCP definition fields) or `UserOwned` (the allowlist
+  and the selection maps). So the filter is a new exhaustive destructure,
+  `split_profile_keys`, held to the real merge by a test (deviation 1). The
+  serializer stays `ConfigOverlay::to_policy_text`, which is already
+  exhaustive (`context.md` §9).
+- **"Keys that would loosen the current resolved config."** The merge's
+  direction refusals (`RestrictOnly`) at profile scope are exactly those keys,
+  with one false positive Task 3 recorded: `restrict_only_limit` and
+  `restrict_only_ceiling` refuse an *equal* value. Equal loosens nothing, so
+  it is filtered out (`equals_base_limit`).
+- **Which "resolved config".** Not the one `load_for_repository` returns,
+  because that already includes the selected profile, and an import would then
+  call `local` loosening merely because Read-only is in force. The base is
+  user, repository and admin config without the profile:
+  `load_scoped(.., repository_root: None)`, which skips the profile and the
+  Allow Always fold (no profile key is an allowlist). That is
+  `profile_import_base(repository_root)`.
+- **`review_profile_rejections`** remembers the audited keys per profile id,
+  in `<data_dir>/config/profile-review/<id>.json`. Replacing a profile would
+  leave that record describing the old file, so a replace deletes it.
+- **Task 7's picker** adds an option only for the custom profile in force
+  (Task 7, deviation 4). It now lists every custom file, from a new listing
+  endpoint, and keeps the in-force one even when its file is missing.
+- **Task 7, deviation 6** (the editor saves `user.conf` whole). An import
+  writes a profile file and never user config, and it never selects the
+  profile, so the editor cannot go stale because of it. Selecting the imported
+  profile goes through the existing picker, which already carries the
+  selection line into the editor.
+
+**Interfaces:**
+
+- Consumes: `ProfileId::{custom, custom_path, overlay}`,
+  `ConfigOverlay::{parse_untrusted, to_policy_text, save}`,
+  `Config::{apply_overlay_scoped, load_scoped, user_config_path,
+  admin_config_path, repository_config_path}`, `AuditLog::record`.
+- Produces, in `profile.rs`, all re-exported from `lib.rs`:
+  - `split_profile_keys(ConfigOverlay) -> (ConfigOverlay, Vec<RejectedConfigKey>)`:
+    the keys a profile may carry, and the refused ones by key and class.
+  - `export_profile(&ProfileId, data_dir: &Path) -> Result<String>`: a
+    `# Damaian permission profile: <id>` comment line, then
+    `split_profile_keys(overlay).0.to_policy_text()`.
+  - `custom_profile_ids(data_dir: &Path) -> Result<Vec<ProfileId>>`: the
+    `*.conf` files under `config/profiles/` whose stem is a valid,
+    unreserved custom id, sorted. A missing directory is an empty list.
+  - `profile_import_base(repository_root: Option<&Path>) -> Result<Config>`.
+  - `ProfileImportReview { carried: Vec<String>, not_carried: Vec<RejectedConfigKey>, loosening: Vec<RejectedConfigKey>, .. }`
+    and `review_profile_import(base: &Config, text: &str) -> ProfileImportReview`,
+    which writes nothing.
+  - `ProfileImport { id, path, replaced, review }` and
+    `import_profile(base: &Config, text, name, replace: bool, &AuditLog) -> Result<ProfileImport>`.
+    It refuses a reserved or invalid name, a file with nothing a profile can
+    carry, and an existing profile unless `replace`. It writes the carried
+    keys, deletes the profile's review state, and audits
+    `permission_profile_imported` with `profileId`, `replaced`,
+    `carriedCount`, `notCarriedCount`, `notCarriedKeys`, `looseningCount` and
+    `looseningKeys`. Key names and counts only.
+- CLI: `damaian profile-export <profile> [file]`, and
+  `damaian profile-import <custom-name> <file> [--repo <repo>] [--replace] [--review]`.
+  The import prints the review first, and `--review` stops there.
+- Shell, as handler functions (spec 22 Task 10, deviation 1):
+  - `GET /api/permission-profiles` → `{"custom": [<id>…]}`.
+  - `GET /api/permission-profile-export?profile=<id>` → `{"profile", "text"}`.
+  - `POST /api/permission-profile-import` with `name`, `text`, optional
+    `repo`, `replace=true` and `preview=true` →
+    `{"profile", "written", "replaced", "exists", "carried": [key…], "notCarried": [{key, class}…], "loosening": [{key, class}…]}`.
+    A preview checks the name too, so a reserved one is refused before the
+    user confirms anything.
+
+- [x] **Step 1: Write the tests**
+
+  In `tests/permission_profiles.rs`, after Task 6's tests. They reuse
+  `weakening_cases`, `profile_fixture` and `Resists`, plus two small helpers:
+  `refusal_set` (a `BTreeSet` of `(key, class.as_str())`) and `keys_of` (a
+  `BTreeSet` of key names). The code below is compacted; the file is
+  `rustfmt`ed.
+
+  ```rust
+  /// One line for every preference field, so together with Task 1's weakening
+  /// table every `ConfigOverlay` field is set.
+  const EVERY_PREFERENCE: &str = concat!(
+      "max_file_bytes=2048\n",
+      "max_command_output_bytes=4096\n",
+      "audit_retention_days=7\n",
+      "enable_semantic_search=true\n",
+      "agent_max_tool_rounds=4\n",
+      "agent_web_debug_max_tool_rounds=6\n",
+      "agent_tool_retry_limit=1\n",
+  );
+
+  /// Every field a profile may carry, each with a narrowing value, plus the
+  /// two MCP flags a profile may set on a server the user has.
+  const EVERY_PROFILE_KEY: &str = concat!(
+      "max_read_lines=100\n", "max_list_entries=50\n", "max_search_matches=40\n",
+      "max_match_line_chars=120\n", "command_timeout_secs=30\n",
+      "ignore_patterns=vendor/\n", "restricted_patterns=secrets/**|*.key\n",
+      "command_blocklist=git push\n",
+      "require_approval_for_file_edits=true\n",
+      "require_approval_for_risky_commands=true\n",
+      "require_approval_for_all_commands=true\n",
+      "allow_file_edits=false\n", "command_access=read_only\n",
+      "allow_browser_diagnostics=false\n", "allow_mutating_mcp_tools=false\n",
+      "audit_retention_days=7\n", "checkpoint_retention_days=7\n",
+      "agent_max_task_tokens=5000\n", "agent_max_turn_messages=12\n",
+      "mcp_enabled=false\n", "mcp_server_allowlist=blessed\n",
+      "mcp_server.helper.enabled=false\n",
+      "mcp_server.helper.require_approval=true\n",
+  );
+
+  /// The split is a second statement of what the profile scope accepts, so it
+  /// is held to the real merge: over an overlay that sets every field, it
+  /// refuses exactly what `apply_overlay_scoped` refuses at profile scope for
+  /// any reason other than direction, with the same class. What it carries,
+  /// the merge refuses only by direction.
+  #[test]
+  fn the_keys_a_profile_may_carry_agree_with_the_profile_scope_merge() {
+      let every_capability: String = weakening_cases().iter().map(|case| case.repository).collect();
+      let text = format!(
+          "{every_capability}{EVERY_PREFERENCE}\
+           mcp_server.helper.enabled=true\nmcp_server.helper.require_approval=false\n"
+      );
+      let (overlay, unparsable) = ConfigOverlay::parse_untrusted(&text);
+      assert!(unparsable.is_empty(), "{unparsable:?}");
+
+      let (carried, refused) = workspace_engine::split_profile_keys(overlay.clone());
+      let merged = Config::default().apply_overlay_scoped(overlay, ConfigScope::Profile);
+      let merge_refused: Vec<_> = merged
+          .rejected
+          .into_iter()
+          .filter(|rejected| rejected.class != RepositoryKeyClass::RestrictOnly)
+          .collect();
+
+      assert_eq!(refusal_set(&refused), refusal_set(&merge_refused));
+      assert!(!refused.is_empty() && !carried.to_policy_text().is_empty());
+      let carried_merge = Config::default().apply_overlay_scoped(carried, ConfigScope::Profile);
+      assert!(carried_merge
+          .rejected
+          .iter()
+          .all(|rejected| rejected.class == RepositoryKeyClass::RestrictOnly));
+  }
+
+  /// The export parses back to exactly what a profile may carry: every
+  /// built-in whole, and a custom profile that sets every carriable key beside
+  /// keys it may not carry. Export, import under a new name, export again.
+  #[test]
+  fn an_export_carries_only_profile_keys_and_round_trips() {
+      let fixture = profile_fixture("export-round-trip");
+      for id in [ProfileId::ReadOnly, ProfileId::SafeLocal, ProfileId::Full, ProfileId::OfflinePrivate] {
+          let text = workspace_engine::export_profile(&id, &fixture.data_dir).unwrap();
+          let (overlay, _) = id.overlay(&fixture.data_dir).unwrap();
+          assert_eq!(ConfigOverlay::parse(&text).unwrap(), overlay, "{}", id.as_str());
+      }
+      fixture.write_custom_profile(
+          "everything",
+          &format!("{EVERY_PROFILE_KEY}shell=/tmp/evil-shell-task8\nmax_file_bytes=1\n"),
+      );
+      let id = ProfileId::parse("everything").unwrap();
+      let text = workspace_engine::export_profile(&id, &fixture.data_dir).unwrap();
+      assert_eq!(ConfigOverlay::parse(&text).unwrap(), ConfigOverlay::parse(EVERY_PROFILE_KEY).unwrap());
+      assert!(!text.contains("shell"), "{text}");
+      assert!(!text.contains("max_file_bytes"), "{text}");
+      let imported = workspace_engine::import_profile(
+          &fixture.base(), &text, "everything_copy", false, &fixture.audit_log(),
+      ).unwrap();
+      let again = workspace_engine::export_profile(&imported.id, &fixture.data_dir).unwrap();
+      assert_eq!(again.lines().skip(1).collect::<Vec<_>>(), text.lines().skip(1).collect::<Vec<_>>());
+      fixture.cleanup();
+  }
+
+  /// Criterion 11 by construction, asserted against the text: a built-in reads
+  /// no user config, and a custom file's credential references are not
+  /// profile keys.
+  #[test]
+  fn no_export_names_a_credential_reference() {
+      let fixture = profile_fixture("export-credentials");
+      fixture.write_user(concat!(
+          "model_api_key_env=keychain:task8-model-key\n",
+          "mcp_server.helper.command=/usr/local/bin/helper\n",
+          "mcp_server.helper.auth_token_env=keychain:task8-helper-token\n",
+      ));
+      fixture.write_custom_profile("leaky", concat!(
+          "command_access=local\n",
+          "model_api_key_env=keychain:task8-leak\n",
+          "model_provider.openai.api_key_env=keychain:task8-provider-leak\n",
+          "mcp_server.helper.auth_token_env=keychain:task8-token-leak\n",
+          "mcp_server.helper.enabled=false\n",
+      ));
+      for id in [ProfileId::ReadOnly, ProfileId::SafeLocal, ProfileId::Full,
+                 ProfileId::OfflinePrivate, ProfileId::parse("leaky").unwrap()] {
+          let text = workspace_engine::export_profile(&id, &fixture.data_dir).unwrap();
+          for forbidden in ["auth_token_env", "api_key_env", "keychain:", "task8"] {
+              assert!(!text.contains(forbidden), "{}: {forbidden} in {text}", id.as_str());
+          }
+      }
+      let leaky = workspace_engine::export_profile(&ProfileId::parse("leaky").unwrap(), &fixture.data_dir).unwrap();
+      assert!(leaky.contains("command_access=local"), "{leaky}");
+      assert!(leaky.contains("mcp_server.helper.enabled=false"), "{leaky}");
+      fixture.cleanup();
+  }
+
+  /// The import lists, itemised and before it writes, what a profile cannot
+  /// carry (not written) and what would loosen the base (written, no effect).
+  /// An equal limit is neither. The audit names keys and counts, never a
+  /// value, and user config is untouched.
+  #[test]
+  fn an_import_lists_what_it_will_not_apply_and_writes_only_profile_keys() {
+      let fixture = profile_fixture("import-review");
+      let user = "command_access=read_only\nmax_read_lines=400\nrestricted_patterns=.env\n";
+      fixture.write_user(user);
+      let base = fixture.resolve_without_profiles();
+      let text = concat!(
+          "model_base_url=http://127.0.0.1:9/task8\n",
+          "shell=./tools/task8-sh\n",
+          "command_access=all\n",
+          "require_approval_for_file_edits=true\n",
+          "max_read_lines=400\n",
+          "this line has no equals sign\n",
+      );
+
+      let review = workspace_engine::review_profile_import(&base, text);
+      assert_eq!(refusal_set(&review.not_carried), BTreeSet::from([
+          ("line 6".to_string(), "unparsable"),
+          ("model_base_url".to_string(), "forbidden"),
+          ("shell".to_string(), "forbidden"),
+      ]));
+      assert_eq!(refusal_set(&review.loosening),
+                 BTreeSet::from([("command_access".to_string(), "restrict_only")]));
+      assert_eq!(review.carried,
+                 ["max_read_lines", "require_approval_for_file_edits", "command_access"]);
+      let path = ProfileId::parse("imported").unwrap().custom_path(&fixture.data_dir).unwrap();
+      assert!(!path.exists(), "a review writes nothing");
+
+      let imported = workspace_engine::import_profile(&base, text, "imported", false, &fixture.audit_log()).unwrap();
+      assert_eq!(imported.path, path);
+      assert!(!imported.replaced);
+      assert_eq!(imported.review, review);
+      let written = fs::read_to_string(&path).unwrap();
+      for absent in ["model_base_url", "shell", "127.0.0.1", "task8"] {
+          assert!(!written.contains(absent), "{absent} in {written}");
+      }
+      assert!(written.contains("require_approval_for_file_edits=true"), "{written}");
+      assert_eq!(fs::read_to_string(&fixture.user_config).unwrap(), user);
+
+      let audit = fixture.audit_events();
+      let event = audit.lines().find(|line| line.contains("permission_profile_imported")).unwrap();
+      for expected in ["\"profileId\":\"imported\"", "\"notCarriedCount\":\"3\"", "model_base_url",
+                       "\"looseningKeys\":\"command_access\"", "\"carriedCount\":\"3\""] {
+          assert!(event.contains(expected), "{expected} missing from {event}");
+      }
+      for value in ["127.0.0.1", "task8", "no equals"] {
+          assert!(!audit.contains(value), "{value} in {audit}");
+      }
+      fixture.cleanup();
+  }
+
+  /// Task 3's widening test with an imported file: once selected, it cannot
+  /// widen anything the user narrowed, and every key Task 1 reports is listed.
+  #[test]
+  fn an_imported_profile_once_selected_cannot_widen_anything() {
+      let fixture = profile_fixture("import-loosen");
+      let cases: Vec<_> = weakening_cases().into_iter()
+          .filter(|case| case.field != "checkpoint_retention_days").collect();
+      let user: String = cases.iter().map(|case| case.user).collect();
+      let profile: String = cases.iter().map(|case| case.repository).collect();
+      fixture.write_user(&format!("{user}checkpoint_retention_days=3\naudit_retention_days=3\n"));
+      let base = fixture.resolve_without_profiles();
+      let text = format!("{profile}checkpoint_retention_days=365\naudit_retention_days=365\n\
+                          max_file_bytes=1\nagent_tool_retry_limit=1\n");
+
+      let imported = workspace_engine::import_profile(&base, &text, "loosen", false, &fixture.audit_log()).unwrap();
+      fixture.write_user(&format!("{user}checkpoint_retention_days=3\naudit_retention_days=3\n{}",
+                                  fixture.select("loosen")));
+      let (config, report) = fixture.load();
+
+      assert_eq!(config, fixture.resolve_without_profiles(), "the imported profile loosened something");
+      assert_eq!(report.permission_profile, Some(imported.id));
+      let listed: BTreeSet<&str> = keys_of(&imported.review.not_carried)
+          .union(&keys_of(&imported.review.loosening)).copied().collect();
+      for case in &cases {
+          if let Resists::Reported(key) = case.resists {
+              assert!(listed.contains(key), "{}: not listed in {listed:?}", case.field);
+          }
+      }
+      let written = fs::read_to_string(&imported.path).unwrap();
+      for key in keys_of(&imported.review.not_carried) {
+          assert!(!written.lines().any(|line| line.starts_with(&format!("{key}="))), "{key} was written");
+      }
+      fixture.cleanup();
+  }
+  ```
+
+  Plus `import_refuses_a_reserved_or_existing_name_unless_replacing` (the
+  four built-in names say "built-in"; `../escape`, `Mine` and `""` are
+  refused; a file carrying only `shell` is "nothing to import"; none of these
+  creates the profiles directory; a second import of `mine` says "already
+  exists" and leaves the file unchanged; `replace` overwrites it, deletes a
+  planted `profile-review/mine.json`, and audits `"replaced":"true"`), and
+  `the_custom_profile_listing_names_only_valid_custom_files` (no directory is
+  empty; of `zeta.conf`, `alpha.conf`, `Upper.conf`, `full.conf`, `notes.txt`
+  and a directory named `nested.conf`, only `alpha` and `zeta` are listed, in
+  that order).
+
+  In `desktop-shell/src/lib.rs`'s `tests`, before Task 7's custom-profile
+  test, with a `get_for_test` helper:
+
+  - `a_built_in_exported_and_imported_under_a_new_name_can_be_selected`:
+    user config holds `max_file_bytes=4096` and `ignore_patterns=target/`.
+    Export `safe_local`. Select Read-only for the checkout, then preview the
+    import as `my_safe`: `written` and `exists` are false, both lists are
+    empty (so `local` is not called loosening while Read-only is in force),
+    and no file exists. Import: the file exists. The listing is
+    `["my_safe"]`. Selecting `my_safe` gives `command_access=local` and
+    `require_approval_for_file_edits=true`, and `user.conf` still holds both
+    original lines and the selection.
+  - `a_profile_import_preview_lists_what_will_not_apply_without_its_values`:
+    the repository config sets `command_access=read_only`. Preview
+    `shell=/tmp/evil-shell-task8`, `command_access=all` and
+    `allow_file_edits=false`: `notCarried` is exactly `shell`/`forbidden`,
+    `loosening` exactly `command_access`/`restrict_only` (so the base includes
+    repository config), `carried` is `allow_file_edits, command_access`, the
+    value is not in the response, and nothing is written. A preview named
+    `full` is refused with "built-in". Import, import again ("already
+    exists"), then `replace=true` gives `replaced: true`. The audit has the
+    event and not the value.
+
+- [x] **Step 2: Run them** (see deviation 6)
+
+  ```bash
+  cargo nextest run -p workspace-engine --test permission_profiles -E 'test(export) + test(import) + test(carry) + test(listing)'
+  cargo nextest run -p desktop-shell --lib -E 'test(imported_under_a_new_name) + test(import_preview)'
+  ```
+
+- [x] **Step 3: The engine** — `split_profile_keys`, `export_profile`,
+  `custom_profile_ids`, `profile_import_base`, `review_profile_import`,
+  `equals_base_limit` and `import_profile` in `profile.rs`, as the interfaces
+  above. The review applies the carried overlay to a clone of the base at
+  `ConfigScope::Profile`, keeps its `RestrictOnly` refusals, and drops the
+  equal limits. The written file is `carried.save(path)`, never the text.
+
+- [x] **Step 4: The CLI** — `profile-export` and `profile-import` in
+  `damaian-cli/src/main.rs`, with `import_permission_profile` printing the
+  carried keys and both lists before it calls `import_profile`.
+
+- [x] **Step 5: The shell** — the three routes, next to
+  `/api/permission-profile`, as `handle_permission_profiles`,
+  `handle_permission_profile_export` and `handle_permission_profile_import`.
+  The JSON is built with `serde_json::json!`, from keys and classes only.
+
+- [x] **Step 6: The view** — Settings › General gains a "Permission profile
+  files" section under the effective policy: "Export the selected profile"
+  (exports what the picker shows into a read-only monospace textarea), a
+  textarea for the file to import, a name field, "Replace a custom profile
+  with this name", and "Review import". The review box lists "Will write to
+  <name>: …", "Not written, a profile cannot set these" (`--danger`) and
+  "Written but no effect here, these would loosen your config and a profile
+  only narrows" (`--warn`), by key and class. Import is disabled when the name
+  is taken and Replace is not ticked, or when nothing would be written.
+  Import sends exactly what was reviewed (`pendingProfileImport`), and editing
+  any field closes the review. After an import, the custom listing is
+  reloaded. `renderPermissionProfilePicker` offers every custom profile from
+  `GET /api/permission-profiles`, plus the one in force if its file is
+  missing. `renderConfigPolicy` reloads the listing beside the policy.
+  `style.css` adds `.profile-file-text`, `.profile-import-review` (with a
+  `[hidden]` rule, deviation 7), `.profile-import-not-carried` and
+  `.profile-import-loosening`. `docs/ui-style-guide.html` gains a "Profile
+  import review" specimen.
+
+- [x] **Step 7: Falsify** (revert each one; see the progress row)
+
+- [x] **Step 8: Verify in the running app** — as Task 7 Step 7: rebuild, run
+  the `#[ignore]`d `serves_the_ui_for_manual_inspection` test binary directly
+  (4899, its own data dir), record its PID, and stop only that PID.
+
+- [x] **Step 9: Scoped checks**
+
+  ```bash
+  cargo nextest run -p workspace-engine --test permission_profiles --test repository_config_trust
+  cargo nextest run -p desktop-shell
+  cargo clippy -p workspace-engine -p desktop-shell -p damaian-cli --all-targets --locked -- -D warnings
+  cargo fmt --all -- --check
+  node --check crates/desktop-shell/static/app.js
+  npm run lint:web
+  typos
+  ```
+
+- [x] **Step 10: Update this file's progress row, show the change and the
+  check results, and ask before committing**
+
+  Suggested subject: `Export and import permission profiles without credential references`.
+
+**Deviations from the outline:**
+
+1. **The filter is `split_profile_keys`, not `overlay_field_kinds`.** The
+   capability/preference partition is not the carriable set (see above). The
+   new function destructures `ConfigOverlay` and `McpServerConfigOverlay`
+   with no `..`, so a new field fails to compile there too, and
+   `the_keys_a_profile_may_carry_agree_with_the_profile_scope_merge` holds
+   it to `apply_overlay_scoped` key by key and class by class.
+2. **A loosening key is written, and listed as having no effect.** The
+   outline's test said the loosening `command_access` is not written.
+   `context.md` §9 says such a key "has no effect when the profile is
+   selected", which describes a key that is in the file. Writing it is the
+   safer reading: the profile scope is restrict-only, so the key can never
+   widen anything, and it keeps the author's narrowing if the user later
+   loosens their own config (`local` over a base the user later raises to
+   `all`). Keys a profile cannot carry are not written.
+3. **Loosening is judged against config without the profile**
+   (`profile_import_base`), not the loaded config, which already includes the
+   selected profile.
+4. **The review and the write are two calls.** `review_profile_import` writes
+   nothing, and the shell's `preview=true` returns it, so Settings shows the
+   lists before anything is written. The CLI prints the same review before it
+   writes, and `--review` stops there. The outline's single
+   `import(..) -> ImportReport { written, not_applicable }` became
+   `ProfileImport { id, path, replaced, review }`, with the two lists kept
+   apart because they mean different things to the user.
+5. **Also refused: a file with nothing a profile can carry.** An empty
+   custom profile resolves as Full, so importing one is almost certainly the
+   wrong file.
+6. **The tests were written after a first draft of `profile.rs`**, so the
+   watch-them-fail step was replaced by the falsification below: every new
+   test fails under at least one mutation.
+7. **Found in the running app: the review box ignored `hidden`.**
+   `.profile-import-review { display: grid }` overrides the attribute, so the
+   empty box stayed on screen after Cancel. A `[hidden] { display: none }`
+   rule fixed it.
+8. **A replace deletes the profile's review state**
+   (`config/profile-review/<id>.json`), so the new file's refusals are
+   audited afresh. The outline did not mention it.
+9. **The export has a header comment line**, `# Damaian permission profile:
+   <id>`, which every parser skips.
+10. **An import never selects the profile.** Selection stays the picker's
+    explicit action (or `profile-set`), so an import cannot change what any
+    checkout runs under, and never writes user config.
 
 ## Task 9: Docs, acceptance criteria, second-person review, close the spec
 

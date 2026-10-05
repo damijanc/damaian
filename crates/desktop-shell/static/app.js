@@ -1484,6 +1484,7 @@ function renderConfigPolicy(payload) {
   syncChatModelControlsFromPolicy(payload.effectivePolicy);
   renderProviderConfigSelect();
   void loadEffectivePolicy().catch((error) => renderEffectivePolicyError(errorMessage(error)));
+  void loadCustomPermissionProfiles().catch((error) => toast(errorMessage(error)));
 }
 
 // "local" is a name heuristic, and every place that names it says so
@@ -1661,17 +1662,34 @@ function activeModelBaseUrl(policy) {
   return modelProviderPresets[selected]?.baseUrl || "";
 }
 
+let customPermissionProfiles = [];
+
+async function loadCustomPermissionProfiles() {
+  customPermissionProfiles = (await api("/api/permission-profiles")).custom;
+  renderPermissionProfilePicker();
+}
+
 function renderPermissionProfilePicker() {
   const select = $("permission-profile-select");
   const policy = currentEffectivePolicy;
   for (const option of select.querySelectorAll("option[data-custom]")) option.remove();
-  if (policy && !PERMISSION_PROFILE_DESCRIPTIONS[policy.profile]) {
+  // Every custom file, plus the one in force even if its file has gone, so
+  // the picker can still show what the load error is about.
+  const custom = [...customPermissionProfiles];
+  if (
+    policy &&
+    !PERMISSION_PROFILE_DESCRIPTIONS[policy.profile] &&
+    !custom.includes(policy.profile)
+  ) {
+    custom.push(policy.profile);
+  }
+  custom.forEach((id) => {
     const option = document.createElement("option");
-    option.value = policy.profile;
-    option.textContent = `${policy.profileLabel} (custom)`;
+    option.value = id;
+    option.textContent = `${id} (custom)`;
     option.dataset.custom = "true";
     select.append(option);
-  }
+  });
   // Enabled even when the policy failed to load, so a checkout whose custom
   // profile file has gone missing can be switched away from it.
   select.disabled = !repo();
@@ -1702,6 +1720,111 @@ async function selectPermissionProfile(profile) {
   if (currentSessionId) fields.session = currentSessionId;
   renderEffectivePolicy(await api("/api/permission-profile", form(fields)));
   await carryProfileSelectionIntoEditor();
+}
+
+async function exportPermissionProfile() {
+  const profile = $("permission-profile-select").value;
+  const payload = await api(
+    `/api/permission-profile-export?profile=${encodeURIComponent(profile)}`,
+  );
+  const output = $("profile-export-text");
+  output.value = payload.text;
+  output.hidden = false;
+  output.select();
+}
+
+// What the review was made for. Import sends exactly this, so editing the
+// fields after a review cannot import something nobody reviewed.
+let pendingProfileImport = null;
+
+function profileImportFields(preview) {
+  const fields = {
+    name: pendingProfileImport.name,
+    text: pendingProfileImport.text,
+    repo: repo(),
+    replace: pendingProfileImport.replace ? "true" : "false",
+  };
+  if (preview) fields.preview = "true";
+  return fields;
+}
+
+function profileImportList(title, keys, className) {
+  const section = document.createElement("div");
+  section.className = className;
+  const heading = document.createElement("p");
+  heading.textContent = `${title}: ${keys.length ? "" : "none"}`;
+  section.append(heading);
+  if (keys.length) {
+    const list = document.createElement("ul");
+    keys.forEach((refused) => {
+      const item = document.createElement("li");
+      item.textContent = `${refused.key} (${POLICY_CLASS_LABELS[refused.class] || refused.class})`;
+      list.append(item);
+    });
+    section.append(list);
+  }
+  return section;
+}
+
+// Key and class only: the preview carries no refused value (context.md §8).
+function renderProfileImportReview(review) {
+  const carried = document.createElement("p");
+  carried.textContent = review.carried.length
+    ? `Will write to ${review.profile}: ${review.carried.join(", ")}`
+    : "The file sets no key a permission profile can carry, so there is nothing to import.";
+  const lists = [
+    carried,
+    profileImportList(
+      "Not written, a profile cannot set these",
+      review.notCarried,
+      "profile-import-not-carried",
+    ),
+    profileImportList(
+      "Written but no effect here, these would loosen your config and a profile only narrows",
+      review.loosening,
+      "profile-import-loosening",
+    ),
+  ];
+  const blocked = review.exists && !pendingProfileImport.replace;
+  if (blocked) {
+    const note = document.createElement("p");
+    note.className = "profile-import-not-carried";
+    note.textContent = `A custom profile named ${review.profile} already exists. Tick Replace to overwrite it.`;
+    lists.push(note);
+  }
+  $("profile-import-review-lists").replaceChildren(...lists);
+  $("profile-import-confirm-btn").disabled = blocked || !review.carried.length;
+  $("profile-import-review").hidden = false;
+}
+
+async function reviewPermissionProfileImport() {
+  pendingProfileImport = {
+    name: $("profile-import-name").value.trim(),
+    text: $("profile-import-text").value,
+    replace: $("profile-import-replace").checked,
+  };
+  renderProfileImportReview(
+    await api("/api/permission-profile-import", form(profileImportFields(true))),
+  );
+}
+
+function clearProfileImportReview() {
+  pendingProfileImport = null;
+  $("profile-import-review").hidden = true;
+  $("profile-import-review-lists").replaceChildren();
+}
+
+async function confirmPermissionProfileImport() {
+  if (!pendingProfileImport) return;
+  const result = await api("/api/permission-profile-import", form(profileImportFields(false)));
+  clearProfileImportReview();
+  $("profile-import-text").value = "";
+  $("profile-import-name").value = "";
+  $("profile-import-replace").checked = false;
+  await loadCustomPermissionProfiles();
+  toast(
+    `${result.replaced ? "Replaced" : "Imported"} ${result.profile}. Choose it in the picker to use it.`,
+  );
 }
 
 // The selection is a line in user config, and the editor above saves user
@@ -6752,6 +6875,23 @@ $("permission-profile-select").addEventListener("change", async () => {
     renderPermissionProfilePicker();
   }
 });
+
+$("profile-export-btn").addEventListener("click", () => {
+  exportPermissionProfile().catch((error) => toast(errorMessage(error)));
+});
+$("profile-import-review-btn").addEventListener("click", () => {
+  reviewPermissionProfileImport().catch((error) => {
+    clearProfileImportReview();
+    toast(errorMessage(error));
+  });
+});
+$("profile-import-confirm-btn").addEventListener("click", () => {
+  confirmPermissionProfileImport().catch((error) => toast(errorMessage(error)));
+});
+$("profile-import-cancel-btn").addEventListener("click", clearProfileImportReview);
+for (const id of ["profile-import-text", "profile-import-name", "profile-import-replace"]) {
+  $(id).addEventListener("input", clearProfileImportReview);
+}
 
 function looksLikeEditRequest(prompt) {
   const text = prompt.trim().toLowerCase();
