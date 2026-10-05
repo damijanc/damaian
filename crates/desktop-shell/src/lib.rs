@@ -17,9 +17,10 @@ use workspace_engine::{
     TaskPlan, TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall,
     WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
     WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible, command_approval_prompt,
-    ensure_data_dir_schema, normalize_mcp_server_id, normalize_model_provider,
-    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
-    review_profile_rejections, select_profile,
+    custom_profile_ids, ensure_data_dir_schema, export_profile, import_profile,
+    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
+    parse_hunk_selection, parse_mcp_transport, patch_diff_text, profile_import_base,
+    review_profile_import, review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -290,6 +291,13 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         }
         ("GET", "/api/effective-policy") => handle_effective_policy(stream, &request),
         ("POST", "/api/permission-profile") => handle_permission_profile(stream, &request),
+        ("GET", "/api/permission-profiles") => handle_permission_profiles(stream, &request),
+        ("GET", "/api/permission-profile-export") => {
+            handle_permission_profile_export(stream, &request)
+        }
+        ("POST", "/api/permission-profile-import") => {
+            handle_permission_profile_import(stream, &request)
+        }
         ("GET", "/api/model-key-status") => {
             let repo = request.param("repo").unwrap_or_default();
             let model_provider = request.param("model_provider");
@@ -1691,6 +1699,82 @@ fn handle_permission_profile(stream: &mut TcpStream, request: &Request) -> Resul
     select_profile(&config, Path::new(&repo), id, &engine.audit_log)
         .map_err(|error| error.to_string())?;
     let body = effective_policy_json(&repo, &session_id)?;
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// `GET /api/permission-profiles`: the custom profiles the picker offers
+/// beside the built-ins (spec 31 Task 7, deviation 4).
+fn handle_permission_profiles(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
+    let custom: Vec<String> = custom_profile_ids(&config.data_dir)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .map(|id| id.as_str().to_string())
+        .collect();
+    let body = serde_json::json!({ "custom": custom }).to_string();
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// `GET /api/permission-profile-export?profile=<id>`: the profile as a file
+/// someone can share, carrying only profile keys (spec 31, `context.md` §9).
+fn handle_permission_profile_export(
+    stream: &mut TcpStream,
+    request: &Request,
+) -> Result<(), String> {
+    let requested = request.param("profile").unwrap_or_default();
+    let id = ProfileId::parse(&requested).map_err(|error| error.to_string())?;
+    let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
+    let text = export_profile(&id, &config.data_dir).map_err(|error| error.to_string())?;
+    let body = serde_json::json!({ "profile": id.as_str(), "text": text }).to_string();
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// `POST /api/permission-profile-import` with `name`, `text`, and optional
+/// `repo`, `replace` and `preview`. With `preview=true` it only reviews, so
+/// Settings can show what will not apply before anything is written
+/// (`context.md` §9). The import writes a profile file, never user config,
+/// so the editor's copy of `user.conf` cannot go stale (Task 7, deviation 6).
+fn handle_permission_profile_import(
+    stream: &mut TcpStream,
+    request: &Request,
+) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let name = required_form(&form, "name")?;
+    let text = required_form(&form, "text")?;
+    let repo = form.get("repo").cloned().unwrap_or_default();
+    let flag = |key: &str| form.get(key).is_some_and(|value| value == "true");
+    let root = (!repo.is_empty()).then(|| Path::new(&repo));
+    let base = profile_import_base(root).map_err(|error| error.to_string())?;
+    let (review, written, replaced) = if flag("preview") {
+        // The name is checked even for a preview, so a reserved or invalid
+        // name is refused before the user confirms anything.
+        ProfileId::custom(&name).map_err(|error| error.to_string())?;
+        (review_profile_import(&base, &text), false, false)
+    } else {
+        let engine = WorkspaceEngine::new(base.clone());
+        let imported = import_profile(&base, &text, &name, flag("replace"), &engine.audit_log)
+            .map_err(|error| error.to_string())?;
+        (imported.review, true, imported.replaced)
+    };
+    let refusals = |keys: &[workspace_engine::RejectedConfigKey]| {
+        keys.iter()
+            .map(|rejected| serde_json::json!({ "key": rejected.key, "class": rejected.class.as_str() }))
+            .collect::<Vec<_>>()
+    };
+    let exists = ProfileId::custom(&name)
+        .ok()
+        .and_then(|id| id.custom_path(&base.data_dir))
+        .is_some_and(|path| path.is_file());
+    let body = serde_json::json!({
+        "profile": name,
+        "written": written,
+        "replaced": replaced,
+        "exists": exists,
+        "carried": review.carried,
+        "notCarried": refusals(&review.not_carried),
+        "loosening": refusals(&review.loosening),
+    })
+    .to_string();
     write_response(stream, request, 200, "application/json", &body)
 }
 
@@ -6077,6 +6161,171 @@ mod tests {
             reread["profile"], "safe_local",
             "a refused name must not be written"
         );
+    }
+
+    fn get_for_test(port: u16, token: &str, path_and_query: &str) -> String {
+        send_for_test(
+            port,
+            format!(
+                "GET {path_and_query} HTTP/1.1\r\nHost: 127.0.0.1\r\nx-damaian-api-token: {token}\r\nconnection: close\r\n\r\n"
+            ),
+        )
+    }
+
+    /// Spec 31 Task 8 in the shell: export a built-in, preview the import
+    /// (nothing written), import it under a new name, find it in the custom
+    /// listing and select it. The user's own `user.conf` lines survive, since
+    /// an import writes a profile file and never user config (Task 7,
+    /// deviation 6).
+    #[test]
+    fn a_built_in_exported_and_imported_under_a_new_name_can_be_selected() {
+        let repo = policy_fixture("profile-import", "");
+        let user_config = isolated_data_dir().join("config").join("user.conf");
+        fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+        fs::write(
+            &user_config,
+            "max_file_bytes=4096\nignore_patterns=target/\n",
+        )
+        .unwrap();
+        let (port, token) = serve_for_test();
+
+        let exported = get_for_test(
+            port,
+            &token,
+            "/api/permission-profile-export?profile=safe_local",
+        );
+        assert!(exported.starts_with("HTTP/1.1 200"), "{exported}");
+        let text = json_of(&exported)["text"].as_str().unwrap().to_string();
+        assert!(text.contains("command_access=local"), "{text}");
+        let import_form = |extra: &str| {
+            format!(
+                "repo={}&name=my_safe&text={}{extra}",
+                repo.display(),
+                percent_encode_for_test(&text)
+            )
+        };
+        let profile_file = isolated_data_dir()
+            .join("config")
+            .join("profiles")
+            .join("my_safe.conf");
+        // Read-only is in force here, but the import is compared with the
+        // config a profile would narrow, so `local` is not called loosening.
+        let narrowed = post_form_for_test(
+            port,
+            &token,
+            "/api/permission-profile",
+            &format!("repo={}&profile=read_only", repo.display()),
+        );
+        assert!(narrowed.starts_with("HTTP/1.1 200"), "{narrowed}");
+
+        let preview = post_form_for_test(
+            port,
+            &token,
+            "/api/permission-profile-import",
+            &import_form("&preview=true"),
+        );
+        assert!(preview.starts_with("HTTP/1.1 200"), "{preview}");
+        let preview = json_of(&preview);
+        assert_eq!(preview["written"], false);
+        assert_eq!(preview["exists"], false);
+        assert!(
+            preview["notCarried"].as_array().unwrap().is_empty(),
+            "{preview}"
+        );
+        assert!(
+            preview["loosening"].as_array().unwrap().is_empty(),
+            "{preview}"
+        );
+        assert!(!profile_file.exists(), "a preview wrote the profile");
+
+        let imported = post_form_for_test(
+            port,
+            &token,
+            "/api/permission-profile-import",
+            &import_form(""),
+        );
+        assert!(imported.starts_with("HTTP/1.1 200"), "{imported}");
+        assert_eq!(json_of(&imported)["written"], true);
+        assert!(profile_file.is_file());
+
+        let listed = json_of(&get_for_test(port, &token, "/api/permission-profiles"));
+        assert_eq!(listed["custom"], serde_json::json!(["my_safe"]));
+
+        let selected = post_form_for_test(
+            port,
+            &token,
+            "/api/permission-profile",
+            &format!("repo={}&profile=my_safe", repo.display()),
+        );
+        assert!(selected.starts_with("HTTP/1.1 200"), "{selected}");
+        let json = json_of(&selected);
+        assert_eq!(json["profile"], "my_safe");
+        assert_eq!(rule_of(&json, "command_access")["value"], "local");
+        assert_eq!(
+            rule_of(&json, "require_approval_for_file_edits")["value"],
+            "true"
+        );
+        let user = fs::read_to_string(&user_config).unwrap();
+        for line in ["max_file_bytes=4096", "ignore_patterns=target/", "=my_safe"] {
+            assert!(user.contains(line), "{line} missing from {user}");
+        }
+    }
+
+    /// The preview lists, by key and class, what a profile cannot carry and
+    /// what would loosen this checkout's config, and writes nothing. The
+    /// refused value is not in the response. A reserved name is refused at
+    /// preview, and an existing one at import unless replacing.
+    #[test]
+    fn a_profile_import_preview_lists_what_will_not_apply_without_its_values() {
+        let repo = policy_fixture("profile-import-review", "command_access=read_only\n");
+        let (port, token) = serve_for_test();
+        let text = "shell=/tmp/evil-shell-task8\ncommand_access=all\nallow_file_edits=false\n";
+        let post = |name: &str, extra: &str| {
+            post_form_for_test(
+                port,
+                &token,
+                "/api/permission-profile-import",
+                &format!(
+                    "repo={}&name={name}&text={}{extra}",
+                    repo.display(),
+                    percent_encode_for_test(text)
+                ),
+            )
+        };
+
+        let preview = post("reviewed", "&preview=true");
+
+        assert!(preview.starts_with("HTTP/1.1 200"), "{preview}");
+        assert!(!preview.contains("evil-shell-task8"), "{preview}");
+        let json = json_of(&preview);
+        assert_eq!(
+            json["notCarried"],
+            serde_json::json!([{ "key": "shell", "class": "forbidden" }])
+        );
+        assert_eq!(
+            json["loosening"],
+            serde_json::json!([{ "key": "command_access", "class": "restrict_only" }])
+        );
+        assert_eq!(
+            json["carried"],
+            serde_json::json!(["allow_file_edits", "command_access"])
+        );
+        let profiles = isolated_data_dir().join("config").join("profiles");
+        assert!(!profiles.join("reviewed.conf").exists());
+
+        let reserved = post("full", "&preview=true");
+        assert!(!reserved.starts_with("HTTP/1.1 200"), "{reserved}");
+        assert!(reserved.contains("built-in"), "{reserved}");
+
+        assert!(post("reviewed", "").starts_with("HTTP/1.1 200"));
+        let again = post("reviewed", "");
+        assert!(again.contains("already exists"), "{again}");
+        let replaced = post("reviewed", "&replace=true");
+        assert_eq!(json_of(&replaced)["replaced"], true, "{replaced}");
+        let audit =
+            fs::read_to_string(isolated_data_dir().join("audit").join("events.jsonl")).unwrap();
+        assert!(audit.contains("permission_profile_imported"), "{audit}");
+        assert!(!audit.contains("evil-shell-task8"), "{audit}");
     }
 
     /// Criterion 4 for a hand-edited custom profile (Task 3's note for Task 7):

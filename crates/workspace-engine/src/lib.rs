@@ -106,7 +106,9 @@ pub use process_registry::{
     SweepDecision, SweepReport, SweepScope,
 };
 pub use profile::{
-    ProfileCapabilities, ProfileId, ProfileSelection, review_profile_rejections, select_profile,
+    ProfileCapabilities, ProfileId, ProfileImport, ProfileImportReview, ProfileSelection,
+    custom_profile_ids, export_profile, import_profile, profile_import_base, review_profile_import,
+    review_profile_rejections, select_profile, split_profile_keys,
 };
 pub use recovery::{
     ReattachedApproval, RecoveredTask, abandon, classify_all, classify_session, headline,

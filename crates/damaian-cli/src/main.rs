@@ -5,8 +5,9 @@ use workspace_engine::{
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, CommandProposal, CommandRisk, Config, ConfigOverlay,
     ConfigScope, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, MockModelAdapter,
     OpenAICompatibleAdapter, ProcessRegistry, ProfileId, ReadWindow, SearchResult, WorkspaceEngine,
-    command_approval_prompt, ensure_data_dir_schema, parse_hunk_selection, patch_diff_text,
-    patch_hunk_summary, render_markdown_to_ansi, review_profile_rejections, select_profile,
+    command_approval_prompt, ensure_data_dir_schema, export_profile, import_profile,
+    parse_hunk_selection, patch_diff_text, patch_hunk_summary, profile_import_base,
+    render_markdown_to_ansi, review_profile_import, review_profile_rejections, select_profile,
 };
 
 fn usage() -> &'static str {
@@ -27,6 +28,8 @@ fn usage() -> &'static str {
   damaian config-set repo <repo> <key> <value>
   damaian config-set admin <key> <value>
   damaian profile-set <repo> <read_only|safe_local|full|offline_private|custom-name>
+  damaian profile-export <profile> [file]
+  damaian profile-import <custom-name> <file> [--repo <repo>] [--replace] [--review]
   damaian propose-command <repo> <command>
   damaian propose-validations <repo>
   damaian run-command <proposal-id> --approve [--always]
@@ -232,6 +235,21 @@ fn run() -> workspace_engine::Result<()> {
             let repo = require_arg(&args, 1, "<repo>")?;
             let profile = require_arg(&args, 2, "<profile>")?;
             print!("{}", set_permission_profile(repo, profile)?);
+        }
+        "profile-export" => {
+            let profile = require_arg(&args, 1, "<profile>")?;
+            let config = Config::load_for_repository(None)?;
+            let text = export_profile(&ProfileId::parse(profile)?, &config.data_dir)?;
+            match args.get(2) {
+                Some(file) => {
+                    std::fs::write(file, &text)?;
+                    println!("exported permission profile {profile} to {file}");
+                }
+                None => print!("{text}"),
+            }
+        }
+        "profile-import" => {
+            print!("{}", import_permission_profile(&args[1..])?);
         }
         "config-allowlist-keep" => {
             let repo = require_arg(&args, 1, "<repo>")?;
@@ -659,6 +677,84 @@ fn set_permission_profile(repo: &str, profile: &str) -> workspace_engine::Result
             .as_ref()
             .map_or("none", ProfileId::as_str)
     ))
+}
+
+/// `profile-import <custom-name> <file> [--repo <repo>] [--replace] [--review]`.
+/// The review is printed before anything is written (spec 31, `context.md`
+/// §9): what a profile cannot carry, and what would have no effect because it
+/// loosens this checkout's config. `--review` stops there.
+fn import_permission_profile(args: &[String]) -> workspace_engine::Result<String> {
+    let mut positional = Vec::new();
+    let mut repo = None;
+    let mut replace = false;
+    let mut review_only = false;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--repo" => {
+                repo = Some(rest.next().ok_or_else(|| {
+                    workspace_engine::ClientError::InvalidInput("Missing <repo>".to_string())
+                })?)
+            }
+            "--replace" => replace = true,
+            "--review" => review_only = true,
+            _ => positional.push(arg.as_str()),
+        }
+    }
+    let name = require_arg_str(&positional, 0, "<custom-name>")?;
+    let file = require_arg_str(&positional, 1, "<file>")?;
+    let text = std::fs::read_to_string(file)?;
+    let base = profile_import_base(repo.map(Path::new))?;
+
+    let review = review_profile_import(&base, &text);
+    let mut output = String::new();
+    let listed = |title: &str, keys: &[workspace_engine::RejectedConfigKey]| {
+        let mut section = format!("{title}: {}\n", keys.len());
+        for rejected in keys {
+            section.push_str(&format!(
+                "  {} ({})\n",
+                rejected.key,
+                rejected.class.as_str()
+            ));
+        }
+        section
+    };
+    output.push_str(&format!("carried: {}\n", review.carried.join(", ")));
+    output.push_str(&listed(
+        "not carried, a profile cannot set these (not written)",
+        &review.not_carried,
+    ));
+    output.push_str(&listed(
+        "no effect, these would loosen this config and a profile only narrows",
+        &review.loosening,
+    ));
+    print!("{output}");
+    if review_only {
+        return Ok("review only: nothing was written\n".to_string());
+    }
+    let engine = WorkspaceEngine::new(base.clone());
+    let imported = import_profile(&base, &text, name, replace, &engine.audit_log)?;
+    Ok(format!(
+        "{} permission profile {} at {}\nselect it with: damaian profile-set <repo> {}\n",
+        if imported.replaced {
+            "replaced"
+        } else {
+            "imported"
+        },
+        imported.id.as_str(),
+        imported.path.display(),
+        imported.id.as_str()
+    ))
+}
+
+fn require_arg_str<'a>(
+    args: &[&'a str],
+    index: usize,
+    name: &str,
+) -> workspace_engine::Result<&'a str> {
+    args.get(index)
+        .copied()
+        .ok_or_else(|| workspace_engine::ClientError::InvalidInput(format!("Missing {name}")))
 }
 
 /// Answers the migration question: the named commands move to user config

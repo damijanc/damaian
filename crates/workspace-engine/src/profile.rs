@@ -8,7 +8,8 @@
 
 use crate::audit::AuditLog;
 use crate::config::{
-    CommandAccess, Config, ConfigOverlay, RejectedConfigKey, RepositoryConfigReport,
+    CommandAccess, Config, ConfigOverlay, ConfigScope, McpServerConfigOverlay, RejectedConfigKey,
+    RepositoryConfigReport, RepositoryKeyClass,
 };
 use crate::error::{ClientError, Result};
 use crate::hash::repository_id_for_root;
@@ -306,4 +307,406 @@ pub fn review_profile_rejections(
     })?;
     fs::write(state_path, json)?;
     Ok(fresh)
+}
+
+/// Splits an overlay into the keys a profile may carry and the ones it may
+/// not (spec 31, `context.md` §4 and §9). Export and import both go through
+/// it, so an exported file cannot carry a credential reference and an
+/// imported one cannot smuggle in a redirecting key.
+///
+/// It agrees with what [`Config::apply_overlay_scoped`] refuses at
+/// [`ConfigScope::Profile`] for any reason other than direction, and a test
+/// holds the two together. Exhaustive, deliberately without `..`, so a new
+/// field is a decision here too. A refused key gets the class the merge would
+/// give it, and never its value.
+pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<RejectedConfigKey>) {
+    let ConfigOverlay {
+        data_dir,
+        max_file_bytes,
+        max_read_lines,
+        max_list_entries,
+        max_search_matches,
+        max_match_line_chars,
+        max_command_output_bytes,
+        command_timeout_secs,
+        allowed_roots,
+        ignore_patterns,
+        restricted_patterns,
+        command_allowlist,
+        command_allowlist_by_repository,
+        permission_profile_by_repository,
+        command_blocklist,
+        secret_patterns,
+        require_approval_for_file_edits,
+        require_approval_for_risky_commands,
+        require_approval_for_all_commands,
+        allow_file_edits,
+        command_access,
+        allow_browser_diagnostics,
+        allow_mutating_mcp_tools,
+        block_generated_secrets,
+        audit_enabled,
+        audit_retention_days,
+        checkpoint_retention_days,
+        checkpoint_max_total_bytes,
+        checkpoint_census_max_paths,
+        enable_semantic_search,
+        agent_max_tool_rounds,
+        agent_web_debug_max_tool_rounds,
+        agent_tool_retry_limit,
+        agent_max_task_tokens,
+        agent_max_turn_messages,
+        shell,
+        model_provider,
+        model_name,
+        model_base_url,
+        model_api_key_env,
+        model_reasoning_level,
+        model_providers,
+        mcp_enabled,
+        mcp_server_allowlist,
+        mcp_servers,
+    } = overlay;
+
+    let mut refused = Vec::new();
+    let mut refuse = |key: String, class: RepositoryKeyClass| {
+        refused.push(RejectedConfigKey { key, class });
+    };
+    // Redirecting keys, budgets a profile may not touch, and preferences: the
+    // merge refuses a preference at profile scope as Forbidden too.
+    for (key, present) in [
+        ("data_dir", data_dir.is_some()),
+        ("allowed_roots", allowed_roots.is_some()),
+        ("secret_patterns", secret_patterns.is_some()),
+        ("block_generated_secrets", block_generated_secrets.is_some()),
+        ("audit_enabled", audit_enabled.is_some()),
+        ("shell", shell.is_some()),
+        ("model_provider", model_provider.is_some()),
+        ("model_name", model_name.is_some()),
+        ("model_base_url", model_base_url.is_some()),
+        ("model_api_key_env", model_api_key_env.is_some()),
+        ("model_reasoning_level", model_reasoning_level.is_some()),
+        (
+            "checkpoint_max_total_bytes",
+            checkpoint_max_total_bytes.is_some(),
+        ),
+        (
+            "checkpoint_census_max_paths",
+            checkpoint_census_max_paths.is_some(),
+        ),
+        ("max_file_bytes", max_file_bytes.is_some()),
+        (
+            "max_command_output_bytes",
+            max_command_output_bytes.is_some(),
+        ),
+        ("enable_semantic_search", enable_semantic_search.is_some()),
+        ("agent_max_tool_rounds", agent_max_tool_rounds.is_some()),
+        (
+            "agent_web_debug_max_tool_rounds",
+            agent_web_debug_max_tool_rounds.is_some(),
+        ),
+        ("agent_tool_retry_limit", agent_tool_retry_limit.is_some()),
+    ] {
+        if present {
+            refuse(key.to_string(), RepositoryKeyClass::Forbidden);
+        }
+    }
+    for provider in model_providers {
+        refuse(
+            format!("model_provider.{}", provider.id),
+            RepositoryKeyClass::Forbidden,
+        );
+    }
+    // The user's own decisions about a checkout.
+    if command_allowlist.is_some() {
+        refuse(
+            "command_allowlist".to_string(),
+            RepositoryKeyClass::UserOwned,
+        );
+    }
+    for repository_id in command_allowlist_by_repository.keys() {
+        refuse(
+            format!("command_allowlist.{repository_id}"),
+            RepositoryKeyClass::UserOwned,
+        );
+    }
+    for repository_id in permission_profile_by_repository.keys() {
+        refuse(
+            format!("permission_profile.{repository_id}"),
+            RepositoryKeyClass::UserOwned,
+        );
+    }
+    // A profile may disable or gate a server the user has, never define one:
+    // the definition is where `auth_token_env` lives.
+    let mut carried_servers = Vec::new();
+    for server in mcp_servers {
+        let McpServerConfigOverlay {
+            id,
+            label,
+            transport,
+            command,
+            args,
+            env,
+            url,
+            auth_token_env,
+            enabled,
+            require_approval,
+        } = server;
+        for (field, present) in [
+            ("label", label.is_some()),
+            ("transport", transport.is_some()),
+            ("command", command.is_some()),
+            ("args", args.is_some()),
+            ("env", env.is_some()),
+            ("url", url.is_some()),
+            ("auth_token_env", auth_token_env.is_some()),
+        ] {
+            if present {
+                refuse(
+                    format!("mcp_server.{id}.{field}"),
+                    RepositoryKeyClass::Forbidden,
+                );
+            }
+        }
+        if enabled.is_some() || require_approval.is_some() {
+            carried_servers.push(McpServerConfigOverlay {
+                id,
+                enabled,
+                require_approval,
+                ..McpServerConfigOverlay::default()
+            });
+        }
+    }
+
+    let carried = ConfigOverlay {
+        max_read_lines,
+        max_list_entries,
+        max_search_matches,
+        max_match_line_chars,
+        command_timeout_secs,
+        ignore_patterns,
+        restricted_patterns,
+        command_blocklist,
+        require_approval_for_file_edits,
+        require_approval_for_risky_commands,
+        require_approval_for_all_commands,
+        allow_file_edits,
+        command_access,
+        allow_browser_diagnostics,
+        allow_mutating_mcp_tools,
+        audit_retention_days,
+        checkpoint_retention_days,
+        agent_max_task_tokens,
+        agent_max_turn_messages,
+        mcp_enabled,
+        mcp_server_allowlist,
+        mcp_servers: carried_servers,
+        ..ConfigOverlay::default()
+    };
+    (carried, refused)
+}
+
+/// A profile as a file someone can share: only the keys a profile may carry,
+/// through the exhaustive overlay serializer (`context.md` §9). A built-in
+/// reads nothing from disk; a custom profile reads its own file, never user
+/// config, so no credential reference can reach the text.
+pub fn export_profile(id: &ProfileId, data_dir: &Path) -> Result<String> {
+    let (overlay, _) = id.overlay(data_dir)?;
+    let (carried, _) = split_profile_keys(overlay);
+    Ok(format!(
+        "# Damaian permission profile: {}\n{}",
+        id.as_str(),
+        carried.to_policy_text()
+    ))
+}
+
+/// The custom profiles in `<data_dir>/config/profiles/`, by name. A file whose
+/// name is not a valid custom id, or is a reserved one, is not a profile.
+pub fn custom_profile_ids(data_dir: &Path) -> Result<Vec<ProfileId>> {
+    let directory = data_dir.join("config").join("profiles");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut ids = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if !path.is_file() || path.extension().is_none_or(|extension| extension != "conf") {
+            continue;
+        }
+        if let Some(id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| ProfileId::custom(stem).ok())
+        {
+            ids.push(id);
+        }
+    }
+    ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    Ok(ids)
+}
+
+/// The config a profile would narrow for this checkout: user, repository and
+/// admin config, without the selected profile. An import compares against
+/// this, so a key is called loosening for what it is, not for what the
+/// currently selected profile already narrowed.
+pub fn profile_import_base(repository_root: Option<&Path>) -> Result<Config> {
+    let config = Config::default();
+    let user_path = config.user_config_path();
+    let admin_path = config.admin_config_path();
+    let repository_path = repository_root.map(Config::repository_config_path);
+    let (base, _) = Config::load_scoped(
+        config,
+        Some(&user_path),
+        repository_path.as_deref(),
+        Some(&admin_path),
+        None,
+    )?;
+    Ok(base)
+}
+
+/// What an import would write and what it would not apply, before anything
+/// is written (`context.md` §9). Key names and classes only: an imported file
+/// is untrusted input, so no refused value is kept.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileImportReview {
+    /// The keys the written file carries, as it names them.
+    pub carried: Vec<String>,
+    /// Keys a profile cannot carry, and lines that did not parse. Not written.
+    pub not_carried: Vec<RejectedConfigKey>,
+    /// Keys written but with no effect against the base config, because they
+    /// would loosen it and a profile only narrows.
+    pub loosening: Vec<RejectedConfigKey>,
+    overlay: ConfigOverlay,
+}
+
+/// Reviews an import against `base`, the config the profile would narrow
+/// ([`profile_import_base`]). Writes nothing.
+pub fn review_profile_import(base: &Config, text: &str) -> ProfileImportReview {
+    let (overlay, mut not_carried) = ConfigOverlay::parse_untrusted(text);
+    let (carried, refused) = split_profile_keys(overlay);
+    not_carried.extend(refused);
+    // Applying the carried keys at profile scope is the merge that will run
+    // when the profile is selected, so its direction refusals are exactly the
+    // keys that would have no effect.
+    let mut probe = base.clone();
+    let loosening = probe
+        .apply_overlay_scoped(carried.clone(), ConfigScope::Profile)
+        .rejected
+        .into_iter()
+        .filter(|rejected| rejected.class == RepositoryKeyClass::RestrictOnly)
+        .filter(|rejected| !equals_base_limit(&rejected.key, &carried, base))
+        .collect();
+    let carried_keys = carried
+        .to_policy_text()
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(key, _)| key.to_string()))
+        .collect();
+    ProfileImportReview {
+        carried: carried_keys,
+        not_carried,
+        loosening,
+        overlay: carried,
+    }
+}
+
+/// The merge refuses a limit or ceiling equal to the current one at an
+/// untrusted scope (spec 31 Task 3's note for Task 8). Equal changes nothing
+/// and loosens nothing, so it is not listed as loosening.
+fn equals_base_limit(key: &str, carried: &ConfigOverlay, base: &Config) -> bool {
+    match key {
+        "max_read_lines" => carried.max_read_lines == Some(base.max_read_lines),
+        "max_list_entries" => carried.max_list_entries == Some(base.max_list_entries),
+        "max_search_matches" => carried.max_search_matches == Some(base.max_search_matches),
+        "max_match_line_chars" => carried.max_match_line_chars == Some(base.max_match_line_chars),
+        "command_timeout_secs" => carried.command_timeout_secs == Some(base.command_timeout_secs),
+        "agent_max_turn_messages" => {
+            carried.agent_max_turn_messages == Some(base.agent_max_turn_messages)
+        }
+        "agent_max_task_tokens" => {
+            carried.agent_max_task_tokens.is_some()
+                && carried.agent_max_task_tokens == base.agent_max_task_tokens
+        }
+        _ => false,
+    }
+}
+
+/// The result of [`import_profile`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileImport {
+    pub id: ProfileId,
+    pub path: PathBuf,
+    pub replaced: bool,
+    pub review: ProfileImportReview,
+}
+
+/// Imports `text` as the custom profile `name`: reviews it against `base`,
+/// writes only the keys a profile may carry to
+/// `<data_dir>/config/profiles/<name>.conf`, and audits
+/// `permission_profile_imported` with counts and key names. It never touches
+/// user config and never selects the profile.
+///
+/// A reserved id is refused, and so is an existing profile unless `replace`.
+pub fn import_profile(
+    base: &Config,
+    text: &str,
+    name: &str,
+    replace: bool,
+    audit_log: &AuditLog,
+) -> Result<ProfileImport> {
+    let id = ProfileId::custom(name)?;
+    let path = id.custom_path(&base.data_dir).ok_or_else(|| {
+        ClientError::InvalidInput(format!("Invalid permission profile name: {name}"))
+    })?;
+    let review = review_profile_import(base, text);
+    if review.carried.is_empty() {
+        return Err(ClientError::InvalidInput(
+            "The file sets no key a permission profile can carry, so there is nothing to import"
+                .to_string(),
+        ));
+    }
+    let replaced = path.exists();
+    if replaced && !replace {
+        return Err(ClientError::InvalidInput(format!(
+            "A custom permission profile named {name} already exists. Choose another name, \
+             or replace it."
+        )));
+    }
+    review.overlay.save(&path)?;
+    // The once-per-key record belongs to the file it was made for: the new
+    // file's refusals must be audited afresh.
+    let review_state = base
+        .data_dir
+        .join("config")
+        .join("profile-review")
+        .join(format!("{name}.json"));
+    if review_state.exists() {
+        fs::remove_file(review_state)?;
+    }
+    let names = |keys: &[RejectedConfigKey]| {
+        keys.iter()
+            .map(|rejected| rejected.key.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    audit_log.record(
+        "permission_profile_imported",
+        &[
+            ("actor", "user".to_string()),
+            ("profileId", id.as_str().to_string()),
+            ("replaced", replaced.to_string()),
+            ("carriedCount", review.carried.len().to_string()),
+            ("notCarriedCount", review.not_carried.len().to_string()),
+            ("notCarriedKeys", names(&review.not_carried)),
+            ("looseningCount", review.loosening.len().to_string()),
+            ("looseningKeys", names(&review.loosening)),
+        ],
+    )?;
+    Ok(ProfileImport {
+        id,
+        path,
+        replaced,
+        review,
+    })
 }
