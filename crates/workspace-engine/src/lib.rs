@@ -31,6 +31,7 @@ pub mod process_registry;
 pub mod profile;
 pub mod recovery;
 mod render;
+pub mod repository_map;
 pub mod repository_trust;
 pub mod secret_scanner;
 pub mod session;
@@ -53,7 +54,7 @@ pub use checkpoint::{
     CheckpointRestoreResult, CheckpointStore, CommandCensus, PendingApproval,
 };
 pub use command_policy::{
-    CommandClassification, CommandPolicy, CommandRisk, allow_always_eligible,
+    CommandClassification, CommandPolicy, CommandRisk, PROJECT_MANIFESTS, allow_always_eligible,
 };
 pub use command_runner::{CommandExecution, CommandRunOptions, CommandRunner, CommandTermination};
 pub use config::{
@@ -117,6 +118,10 @@ pub use recovery::{
 };
 pub use render::{
     render_markdown_to_ansi, render_markdown_to_html, render_markdown_to_html_with_file_links,
+};
+pub use repository_map::{
+    DetectedRoot, ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH, RootDetection, RootEvidence,
+    VENDOR_DIRECTORIES, detect_roots,
 };
 pub use repository_trust::{
     RepositoryAllowlistMigration, RepositoryConfigNotice, RepositoryTrustStore,

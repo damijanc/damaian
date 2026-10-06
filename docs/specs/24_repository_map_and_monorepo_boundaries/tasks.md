@@ -10,7 +10,7 @@ decisions it left open in [`context.md`](context.md)
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · Root detection from the index's path lists | Not started | Planned in full on 2026-10-06 |
+| 1 · Root detection from the index's path lists | Done 2026-10-06 | Landed as planned: `PROJECT_MANIFESTS` in `command_policy.rs` (`detect_project_commands` unchanged), new `repository_map.rs` with `detect_roots`, `MAX_ROOT_DEPTH = 6`, `VENDOR_DIRECTORIES` and the serde types, re-exported from `lib.rs`. Nothing calls `detect_roots` outside tests yet. `tests/repository_map.rs`: 7 tests, all pass; written first and confirmed failing to compile. Mutations, each reverted and confirmed failing for the stated reason: (1) `>=` for `>` on the depth ceiling fails the depth test (`a/b/c/d/e/f` excluded); (2) dropping the files-loop `vendor_prefix` check fails the vendor test (`node_modules/left-pad` and `packages/api/node_modules/react` become roots); (3) first-seen-wins evidence fails the order test (backward run names `Cargo.toml`); (4) adding `setup.py` to `PROJECT_MANIFESTS` fails the manifest-command test with its §10 message; (5) dropping the repository-root insertion fails the no-manifest and depth tests; (6) `contains` for `==` fails the nested-roots test (`docs` and `examples` become roots). `repository_config_trust` and `permission_profiles`: 97 pass, 1 skipped, neither file touched. `fmt --check`, scoped `clippy -D warnings`, `typos` clean. No deviation from the plan |
 | 2 · Root-aware command classification, proposals and Allow Always | Not started | |
 | 3 · `RepositoryMap::build`: per-root metadata and commands | Not started | |
 | 4 · User overrides in repository config | Not started | Touches spec 31's partition tests (`context.md` §6) |
@@ -230,7 +230,7 @@ warning.
   - The test file `tests/repository_map.rs`, with its `temp_dir` helper,
     which later tasks extend.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
   Create `crates/workspace-engine/tests/repository_map.rs`:
 
@@ -483,14 +483,14 @@ warning.
   }
   ```
 
-- [ ] **Step 2: Run the tests and confirm they fail**
+- [x] **Step 2: Run the tests and confirm they fail**
 
   Run: `cargo nextest run -p workspace-engine --test repository_map`
 
   Expected: a compile error, because `detect_roots`, `PROJECT_MANIFESTS` and
   the other names are not in `workspace_engine`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
   In `crates/workspace-engine/src/command_policy.rs`, above
   `impl CommandPolicy` (`:61`), add:
@@ -703,7 +703,7 @@ warning.
 
   Then run `cargo fmt --all` so the lists are in `rustfmt` order.
 
-- [ ] **Step 4: Run the tests and confirm they pass**
+- [x] **Step 4: Run the tests and confirm they pass**
 
   Run: `cargo nextest run -p workspace-engine --test repository_map`
 
@@ -712,7 +712,7 @@ warning.
   `ExcludedPath` sorts by path, then reason. Do not weaken an assertion to
   make it pass.
 
-- [ ] **Step 5: Mutation-test the load-bearing guarantees**
+- [x] **Step 5: Mutation-test the load-bearing guarantees**
 
   Do each one, confirm it fails as described, revert it, and record all six
   in the progress row:
@@ -737,13 +737,13 @@ warning.
      `nested_roots_are_kept_and_each_names_its_manifest` fails on
      `docs` and `examples`.
 
-- [ ] **Step 6: Confirm nothing else moved**
+- [x] **Step 6: Confirm nothing else moved**
 
   Run: `cargo nextest run -p workspace-engine --test repository_config_trust --test permission_profiles`
 
   Expected: all pass. Neither file is modified (`git diff --stat`).
 
-- [ ] **Step 7: Scoped checks**
+- [x] **Step 7: Scoped checks**
 
   ```bash
   cargo fmt --all -- --check
@@ -751,7 +751,7 @@ warning.
   typos
   ```
 
-- [ ] **Step 8: Update this file's Task 1 row, then show the change and the
+- [x] **Step 8: Update this file's Task 1 row, then show the change and the
   check results and ask before committing**
 
   In the Notes, record what landed, the test count, the six mutations, and
