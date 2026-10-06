@@ -120,7 +120,8 @@ pub use render::{
     render_markdown_to_ansi, render_markdown_to_html, render_markdown_to_html_with_file_links,
 };
 pub use repository_map::{
-    DetectedRoot, ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH, RootDetection, RootEvidence,
+    DetectedRoot, ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH, ProjectRoot,
+    REPOSITORY_MAP_SCHEMA_VERSION, RepositoryMap, RootCommand, RootDetection, RootEvidence,
     VENDOR_DIRECTORIES, detect_roots,
 };
 pub use repository_trust::{

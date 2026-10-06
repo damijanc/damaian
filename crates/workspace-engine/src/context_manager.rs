@@ -5,7 +5,7 @@ use crate::vector_index::VectorIndexCache;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-const AGENT_INSTRUCTIONS_FILE: &str = "AGENTS.md";
+pub(crate) const AGENT_INSTRUCTIONS_FILE: &str = "AGENTS.md";
 const PROJECT_RULES: &[&str] = &[
     "README.md",
     "CONTRIBUTING.md",
@@ -281,7 +281,7 @@ fn add_text(
     true
 }
 
-fn agent_instruction_paths(context_paths: &[String]) -> Vec<String> {
+pub(crate) fn agent_instruction_paths(context_paths: &[String]) -> Vec<String> {
     let mut paths = vec![AGENT_INSTRUCTIONS_FILE.to_string()];
     for context_path in context_paths {
         if context_path.starts_with('/') || context_path.contains("../") || context_path == ".." {

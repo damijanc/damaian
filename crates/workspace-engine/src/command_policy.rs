@@ -1,9 +1,12 @@
 use crate::config::{CommandAccess, Config};
 use crate::error::Result;
+use crate::repository_map::RootCommand;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CommandRisk {
     Low,
     Medium,
@@ -268,15 +271,50 @@ impl CommandPolicy {
         root_path: impl AsRef<Path>,
     ) -> Result<Vec<ProjectCommand>> {
         let root = root_path.as_ref();
+        self.detect_in(root, root)
+    }
+
+    /// The commands of the project root `root` (repository-relative, `""` for
+    /// the repository root), each carrying the directory it runs in. Sorted
+    /// by name (spec 24 §5.3).
+    pub fn detect_root_commands(
+        &self,
+        repository_root: &Path,
+        root: &str,
+    ) -> Result<Vec<RootCommand>> {
+        let directory = if root.is_empty() {
+            repository_root.to_path_buf()
+        } else {
+            repository_root.join(root)
+        };
+        let mut commands: Vec<RootCommand> = self
+            .detect_in(repository_root, &directory)?
+            .into_iter()
+            .map(|command| RootCommand {
+                name: command.name,
+                command: command.command,
+                risk: command.risk,
+                working_directory: root.to_string(),
+            })
+            .collect();
+        commands.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.command.cmp(&b.command)));
+        Ok(commands)
+    }
+
+    /// Detects the commands `directory`'s manifests give it, classified where
+    /// they will run: inside `repository_root`, at `directory`. So a grant
+    /// qualified with a sub-root counts for that root's commands (spec 24
+    /// `context.md` §2).
+    fn detect_in(&self, repository_root: &Path, directory: &Path) -> Result<Vec<ProjectCommand>> {
         let mut commands = Vec::new();
-        let package_path = root.join("package.json");
+        let package_path = directory.join("package.json");
         if let Ok(package_json) = fs::read_to_string(package_path) {
             for name in ["test", "lint", "typecheck", "build", "format"] {
                 if package_json.contains(&format!("\"{name}\"")) {
                     let command = format!("npm run {name}");
                     commands.push(ProjectCommand {
                         name: name.to_string(),
-                        risk: self.classify(&command, root).risk,
+                        risk: self.classify_at(&command, repository_root, directory).risk,
                         command,
                     });
                 }
@@ -285,7 +323,9 @@ impl CommandPolicy {
                 commands.push(ProjectCommand {
                     name: "test-shortcut".to_string(),
                     command: "npm test".to_string(),
-                    risk: self.classify("npm test", root).risk,
+                    risk: self
+                        .classify_at("npm test", repository_root, directory)
+                        .risk,
                 });
             }
         }
@@ -298,11 +338,11 @@ impl CommandPolicy {
             ("go.mod", "go test ./..."),
             ("Cargo.toml", "cargo test"),
         ] {
-            if root.join(file_name).exists() {
+            if directory.join(file_name).exists() {
                 commands.push(ProjectCommand {
                     name: file_name.to_string(),
                     command: command.to_string(),
-                    risk: self.classify(command, root).risk,
+                    risk: self.classify_at(command, repository_root, directory).risk,
                 });
             }
         }

@@ -8,16 +8,21 @@
 //! Task 2 pins the command location pair (`context.md` §1–§2): tokens
 //! resolve against the working directory, containment and the allowlist
 //! are judged against the repository root.
+//!
+//! Task 3 pins `RepositoryMap::build` over a real index of a temp monorepo:
+//! per-root metadata and commands, determinism, `root_for_path` and the
+//! input fingerprint.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use workspace_engine::indexer::SkippedFile;
 use workspace_engine::{
-    CancelToken, CommandPolicy, CommandRisk, CommandStore, Config, DetectedRoot, ExcludedPath,
-    ExclusionReason, MAX_ROOT_DEPTH, PROJECT_MANIFESTS, RootDetection, RootEvidence,
-    WorkspaceEngine, detect_roots, repository_id_for_root,
+    AuditLog, CancelToken, CommandPolicy, CommandRisk, CommandStore, Config, DetectedRoot,
+    ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH, PROJECT_MANIFESTS, ProjectIndexer, ProjectRoot,
+    REPOSITORY_MAP_SCHEMA_VERSION, RepositoryIndex, RepositoryMap, RootCommand, RootDetection,
+    RootEvidence, SecretScanner, WorkspaceEngine, detect_roots, repository_id_for_root,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -620,4 +625,374 @@ fn at_the_repository_root_nothing_changes() {
     let reloaded = repo.policy().classify("npm run build", &repo.root);
     assert_eq!(reloaded.risk, CommandRisk::Low);
     assert!(!reloaded.requires_approval);
+}
+
+/// A Cargo workspace with two member crates beside two npm packages, nested
+/// `AGENTS.md` files, a `packages/apiary` directory that only shares a
+/// prefix with a root, and two ignored build-output directories. Its data
+/// directory is outside the repository, so nothing it writes is indexed.
+struct IndexedMonorepo {
+    root: PathBuf,
+    data_dir: PathBuf,
+}
+
+const INDEXED_MONOREPO: &[(&str, &str)] = &[
+    ("AGENTS.md", "Repository instructions.\n"),
+    ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+    ("README.md", "# Monorepo\n"),
+    ("crates/AGENTS.md", "Crate instructions.\n"),
+    ("crates/cli/Cargo.toml", "[package]\nname = \"cli\"\n"),
+    ("crates/cli/src/main.rs", "fn main() {}\n"),
+    ("crates/engine/AGENTS.md", "Engine instructions.\n"),
+    ("crates/engine/Cargo.toml", "[package]\nname = \"engine\"\n"),
+    ("crates/engine/src/lib.rs", "pub fn engine() {}\n"),
+    ("crates/engine/tests/it.rs", "#[test]\nfn it() {}\n"),
+    ("docs/guide.md", "# Guide\n"),
+    (
+        "packages/api/package.json",
+        "{\"scripts\":{\"test\":\"node test.js\",\"lint\":\"eslint .\"}}",
+    ),
+    ("packages/api/src/index.ts", "export {};\n"),
+    ("packages/api/tests/api.test.ts", "export {};\n"),
+    ("packages/api/dist/bundle.js", "generated\n"),
+    ("packages/apiary/x.ts", "export {};\n"),
+    (
+        "packages/web/package.json",
+        "{\"scripts\":{\"build\":\"tsc\"}}",
+    ),
+    ("packages/web/index.js", "module.exports = {};\n"),
+    ("target/debug/out.txt", "generated\n"),
+];
+
+impl IndexedMonorepo {
+    fn new(name: &str) -> Self {
+        let root = temp_dir(name);
+        for (path, content) in INDEXED_MONOREPO {
+            let file = root.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, content).unwrap();
+        }
+        Self {
+            root,
+            data_dir: temp_dir(&format!("{name}-data")),
+        }
+    }
+
+    fn config(&self) -> Config {
+        Config {
+            data_dir: self.data_dir.clone(),
+            enable_index_watcher: false,
+            shell: "/usr/bin/true".to_string(),
+            ..Config::default()
+        }
+    }
+
+    fn index(&self) -> RepositoryIndex {
+        let config = self.config();
+        let scanner = SecretScanner::new(config.secret_patterns.clone());
+        let audit_log = AuditLog::new(&self.data_dir, true, scanner.clone());
+        ProjectIndexer::new(config, scanner, audit_log)
+            .index_repository(&self.root)
+            .expect("the fixture should index")
+    }
+
+    fn build_with(&self, policy: &CommandPolicy) -> RepositoryMap {
+        RepositoryMap::build(&self.index(), policy)
+    }
+
+    fn build(&self) -> RepositoryMap {
+        self.build_with(&CommandPolicy::new(self.config()))
+    }
+}
+
+impl Drop for IndexedMonorepo {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(&self.data_dir);
+    }
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| value.to_string()).collect()
+}
+
+fn command(name: &str, command: &str, risk: CommandRisk, working_directory: &str) -> RootCommand {
+    RootCommand {
+        name: name.to_string(),
+        command: command.to_string(),
+        risk,
+        working_directory: working_directory.to_string(),
+    }
+}
+
+fn map_root<'a>(map: &'a RepositoryMap, path: &str) -> &'a ProjectRoot {
+    map.roots
+        .iter()
+        .find(|root| root.path == path)
+        .unwrap_or_else(|| panic!("no root {path:?} in {:?}", map.roots))
+}
+
+fn without_generated_at(map: &RepositoryMap) -> serde_json::Value {
+    let mut value = serde_json::to_value(map).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("generatedAtMs")
+        .expect("the map serialises generatedAtMs");
+    value
+}
+
+#[test]
+fn two_builds_of_an_unchanged_repository_serialise_identically() {
+    let repo = IndexedMonorepo::new("determinism");
+    let first = repo.build();
+    let second = repo.build();
+    assert_eq!(without_generated_at(&first), without_generated_at(&second));
+    assert_eq!(first.schema_version, REPOSITORY_MAP_SCHEMA_VERSION);
+    assert_eq!(first.repository_id, repo.index().repository_id);
+
+    // The watcher appends patched records at the end of `files`
+    // (context.md §3), so the map must not depend on the index's order.
+    let mut index = repo.index();
+    index.files.reverse();
+    index.skipped.reverse();
+    let reordered = RepositoryMap::build(&index, &CommandPolicy::new(repo.config()));
+    assert_eq!(
+        without_generated_at(&first),
+        without_generated_at(&reordered)
+    );
+}
+
+#[test]
+fn nested_roots_each_carry_their_own_metadata_and_commands() {
+    let repo = IndexedMonorepo::new("nested");
+    let map = repo.build();
+    use CommandRisk::Medium;
+
+    let paths: Vec<&str> = map.roots.iter().map(|root| root.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "",
+            "crates/cli",
+            "crates/engine",
+            "packages/api",
+            "packages/web"
+        ]
+    );
+    assert_eq!(
+        map.excluded,
+        vec![
+            excluded("packages/api/dist", ExclusionReason::Vendor),
+            excluded("target", ExclusionReason::Vendor),
+        ]
+    );
+
+    assert_eq!(
+        *map_root(&map, ""),
+        ProjectRoot {
+            path: String::new(),
+            detected_by: RootEvidence::Manifest {
+                path: "Cargo.toml".to_string()
+            },
+            languages: strings(&["markdown", "toml", "typescript"]),
+            manifests: strings(&["Cargo.toml"]),
+            entry_points: vec![],
+            test_paths: vec![],
+            generated_paths: strings(&["target"]),
+            major_directories: strings(&["crates", "docs", "packages"]),
+            instruction_files: strings(&["AGENTS.md"]),
+            commands: vec![command("Cargo.toml", "cargo test", Medium, "")],
+        }
+    );
+    assert_eq!(
+        *map_root(&map, "crates/engine"),
+        ProjectRoot {
+            path: "crates/engine".to_string(),
+            detected_by: RootEvidence::Manifest {
+                path: "crates/engine/Cargo.toml".to_string()
+            },
+            // Met in walk order as markdown, toml, rust: the map sorts.
+            languages: strings(&["markdown", "rust", "toml"]),
+            manifests: strings(&["crates/engine/Cargo.toml"]),
+            entry_points: strings(&["crates/engine/src/lib.rs"]),
+            test_paths: strings(&["crates/engine/tests"]),
+            generated_paths: vec![],
+            major_directories: strings(&["crates/engine/src", "crates/engine/tests"]),
+            instruction_files: strings(&[
+                "AGENTS.md",
+                "crates/AGENTS.md",
+                "crates/engine/AGENTS.md"
+            ]),
+            commands: vec![command("Cargo.toml", "cargo test", Medium, "crates/engine")],
+        }
+    );
+    assert_eq!(
+        *map_root(&map, "packages/api"),
+        ProjectRoot {
+            path: "packages/api".to_string(),
+            detected_by: RootEvidence::Manifest {
+                path: "packages/api/package.json".to_string()
+            },
+            languages: strings(&["json", "typescript"]),
+            manifests: strings(&["packages/api/package.json"]),
+            entry_points: strings(&["packages/api/src/index.ts"]),
+            test_paths: strings(&["packages/api/tests"]),
+            generated_paths: strings(&["packages/api/dist"]),
+            major_directories: strings(&["packages/api/src", "packages/api/tests"]),
+            instruction_files: strings(&["AGENTS.md"]),
+            commands: vec![
+                command("lint", "npm run lint", Medium, "packages/api"),
+                command("test", "npm run test", Medium, "packages/api"),
+                command("test-shortcut", "npm test", Medium, "packages/api"),
+            ],
+        }
+    );
+
+    let cli = map_root(&map, "crates/cli");
+    assert_eq!(cli.entry_points, strings(&["crates/cli/src/main.rs"]));
+    assert_eq!(
+        cli.commands,
+        vec![command("Cargo.toml", "cargo test", Medium, "crates/cli")]
+    );
+    let web = map_root(&map, "packages/web");
+    assert_eq!(web.entry_points, strings(&["packages/web/index.js"]));
+    assert_eq!(
+        web.commands,
+        vec![command("build", "npm run build", Medium, "packages/web")]
+    );
+
+    assert_eq!(
+        serde_json::to_value(command("test", "npm test", Medium, "packages/api")).unwrap(),
+        serde_json::json!({
+            "name": "test",
+            "command": "npm test",
+            "risk": "medium",
+            "workingDirectory": "packages/api"
+        })
+    );
+}
+
+#[test]
+fn a_roots_command_risk_honours_a_grant_qualified_with_that_root() {
+    let repo = IndexedMonorepo::new("qualified-risk");
+    let mut config = repo.config();
+    config
+        .command_allowlist
+        .push("cd packages/api && npm test".to_string());
+    let map = repo.build_with(&CommandPolicy::new(config));
+
+    let risk_of = |root: &str, name: &str| {
+        map_root(&map, root)
+            .commands
+            .iter()
+            .find(|command| command.name == name)
+            .unwrap_or_else(|| panic!("{root} has no {name} command"))
+            .risk
+            .clone()
+    };
+    assert_eq!(risk_of("packages/api", "test-shortcut"), CommandRisk::Low);
+    assert_eq!(risk_of("packages/api", "test"), CommandRisk::Medium);
+}
+
+#[test]
+fn instruction_files_resolve_per_root_broadest_first() {
+    let repo = IndexedMonorepo::new("instructions");
+    let map = repo.build();
+    // Spec 11's ancestor walk for a path inside each root, kept when indexed.
+    assert_eq!(
+        map_root(&map, "crates/engine").instruction_files,
+        strings(&["AGENTS.md", "crates/AGENTS.md", "crates/engine/AGENTS.md"])
+    );
+    assert_eq!(
+        map_root(&map, "crates/cli").instruction_files,
+        strings(&["AGENTS.md", "crates/AGENTS.md"])
+    );
+    assert_eq!(
+        map_root(&map, "packages/web").instruction_files,
+        strings(&["AGENTS.md"])
+    );
+}
+
+#[test]
+fn root_for_path_is_the_longest_root_that_is_a_segment_prefix() {
+    let repo = IndexedMonorepo::new("root-for-path");
+    let map = repo.build();
+    assert_eq!(
+        map.root_for_path("packages/api/src/index.ts"),
+        "packages/api"
+    );
+    assert_eq!(map.root_for_path("packages/api"), "packages/api");
+    assert_eq!(map.root_for_path("packages/apiary/x.ts"), "");
+    assert_eq!(map.root_for_path("README.md"), "");
+    assert_eq!(
+        map.root_for_path("crates/engine/src/lib.rs"),
+        "crates/engine"
+    );
+    assert_eq!(map.root_for_path("crates/AGENTS.md"), "");
+}
+
+#[test]
+fn the_fingerprint_tracks_manifest_content_and_not_modification_times() {
+    let repo = IndexedMonorepo::new("fingerprint");
+    let before = repo.build().fingerprint;
+
+    let readme = fs::File::options()
+        .write(true)
+        .open(repo.root.join("README.md"))
+        .unwrap();
+    readme
+        .set_modified(SystemTime::now() + Duration::from_secs(3600))
+        .unwrap();
+    drop(readme);
+    assert_eq!(repo.build().fingerprint, before, "an mtime is not an input");
+
+    fs::write(
+        repo.root.join("packages/api/package.json"),
+        "{\"scripts\":{\"test\":\"node test.js\",\"lint\":\"biome lint\"}}",
+    )
+    .unwrap();
+    assert_ne!(
+        repo.build().fingerprint,
+        before,
+        "a manifest's content is an input"
+    );
+}
+
+#[test]
+fn detect_project_commands_is_unchanged() {
+    let dir = temp_dir("detect-unchanged");
+    fs::write(
+        dir.join("package.json"),
+        "{\"scripts\":{\"format\":\"x\",\"test\":\"x\",\"lint\":\"x\"}}",
+    )
+    .unwrap();
+    fs::write(dir.join("Cargo.toml"), "").unwrap();
+    fs::write(dir.join("go.mod"), "").unwrap();
+    let policy = CommandPolicy::new(Config {
+        data_dir: dir.join(".damaian"),
+        enable_index_watcher: false,
+        command_allowlist: vec!["npm test".to_string()],
+        ..Config::default()
+    });
+    let commands: Vec<(String, String, CommandRisk)> = policy
+        .detect_project_commands(&dir)
+        .unwrap()
+        .into_iter()
+        .map(|command| (command.name, command.command, command.risk))
+        .collect();
+    let _ = fs::remove_dir_all(&dir);
+
+    // Script order, then the shortcut, then the manifest table, unsorted,
+    // classified at the root so a plain grant applies.
+    let expected = [
+        ("test", "npm run test", CommandRisk::Medium),
+        ("lint", "npm run lint", CommandRisk::Medium),
+        ("format", "npm run format", CommandRisk::Medium),
+        ("test-shortcut", "npm test", CommandRisk::Low),
+        ("go.mod", "go test ./...", CommandRisk::Medium),
+        ("Cargo.toml", "cargo test", CommandRisk::Medium),
+    ]
+    .map(|(name, command, risk)| (name.to_string(), command.to_string(), risk));
+    assert_eq!(commands, expected);
 }

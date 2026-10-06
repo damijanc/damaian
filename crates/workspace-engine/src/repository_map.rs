@@ -5,10 +5,16 @@
 //! exactly the ignore, size and symlink rules the index does, and it is a
 //! pure function of the index's paths (`context.md` §3).
 
-use crate::command_policy::PROJECT_MANIFESTS;
-use crate::indexer::SkippedFile;
+use crate::command_policy::{CommandPolicy, CommandRisk, PROJECT_MANIFESTS};
+use crate::context_manager::{AGENT_INSTRUCTIONS_FILE, agent_instruction_paths};
+use crate::hash::{now_millis, sha256};
+use crate::indexer::{RepositoryIndex, SkippedFile};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Bumped whenever the map's shape or derivation changes, so a persisted
+/// map from an older build is rebuilt rather than trusted (§5.8).
+pub const REPOSITORY_MAP_SCHEMA_VERSION: u32 = 1;
 
 /// Deepest directory, in path segments, that can be a root. `""` is depth 0
 /// and `packages/api` is depth 2. A manifest deeper than this is recorded in
@@ -27,6 +33,28 @@ pub const VENDOR_DIRECTORIES: [&str; 7] = [
     ".venv",
     "venv",
 ];
+
+/// Root-relative paths that are a root's entry points when they exist. Path
+/// based, because proposal §4 rules out parsing manifests. `src/bin/*.rs`
+/// and `cmd/*/main.go` are matched by [`is_entry_point`].
+const ENTRY_POINTS: [&str; 13] = [
+    "src/main.rs",
+    "src/lib.rs",
+    "main.go",
+    "index.js",
+    "index.ts",
+    "src/index.js",
+    "src/index.ts",
+    "src/main.js",
+    "src/main.ts",
+    "main.py",
+    "__main__.py",
+    "app.py",
+    "manage.py",
+];
+
+/// Names of a root's immediate child directories that hold its tests.
+const TEST_DIRECTORIES: [&str; 5] = ["tests", "test", "__tests__", "spec", "e2e"];
 
 /// Why a directory is a root. The UI turns this into a sentence the user can
 /// disagree with (requirement 7).
@@ -172,4 +200,269 @@ fn vendor_prefix(directory: &str) -> Option<String> {
         .iter()
         .position(|segment| VENDOR_DIRECTORIES.contains(segment))?;
     Some(segments[..=index].join("/"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RootCommand {
+    pub name: String,
+    pub command: String,
+    pub risk: CommandRisk,
+    /// Repository-relative directory the command runs in. `""` is the
+    /// repository root (requirement 5).
+    pub working_directory: String,
+}
+
+/// One project root and what it holds. Every path is repository-relative,
+/// like `path` itself, so a reader never has to know which root a path was
+/// relative to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRoot {
+    /// `""` is the repository root.
+    pub path: String,
+    /// Why this is a root (requirement 7).
+    pub detected_by: RootEvidence,
+    /// Distinct languages of the files this root owns, except `text`.
+    pub languages: Vec<String>,
+    /// The root's own [`PROJECT_MANIFESTS`] files.
+    pub manifests: Vec<String>,
+    pub entry_points: Vec<String>,
+    /// Immediate child directories named like test directories.
+    pub test_paths: Vec<String>,
+    /// Excluded vendor and build-output directories this root owns.
+    pub generated_paths: Vec<String>,
+    /// Immediate child directories that are not roots (`context.md` §12).
+    pub major_directories: Vec<String>,
+    /// Spec 11's `AGENTS.md` files for a path inside this root, broadest
+    /// first, kept when indexed (`context.md` §14). Not sorted: the order is
+    /// the precedence.
+    pub instruction_files: Vec<String>,
+    /// Sorted by name.
+    pub commands: Vec<RootCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryMap {
+    pub repository_id: String,
+    pub schema_version: u32,
+    pub generated_at_ms: u128,
+    /// Hash of the inputs the map was derived from, for staleness detection
+    /// (`context.md` §3).
+    pub fingerprint: String,
+    /// Sorted by path, so `""` is first.
+    pub roots: Vec<ProjectRoot>,
+    pub excluded: Vec<ExcludedPath>,
+}
+
+impl RepositoryMap {
+    /// Derives the map from an index, with no second walk. Only the commands
+    /// read the disk, through [`CommandPolicy::detect_root_commands`]. Every
+    /// collection is sorted here rather than trusted to the index's order,
+    /// because the watcher appends patched records at the end (§5.3).
+    pub fn build(index: &RepositoryIndex, policy: &CommandPolicy) -> Self {
+        let detection = detect_roots(
+            index.files.iter().map(|file| file.path.as_str()),
+            &index.skipped,
+        );
+        let root_paths: Vec<&str> = detection
+            .roots
+            .iter()
+            .map(|root| root.path.as_str())
+            .collect();
+        let indexed: BTreeSet<&str> = index.files.iter().map(|file| file.path.as_str()).collect();
+
+        let mut roots: Vec<ProjectRoot> = detection
+            .roots
+            .iter()
+            .map(|root| ProjectRoot {
+                path: root.path.clone(),
+                detected_by: root.detected_by.clone(),
+                languages: Vec::new(),
+                manifests: Vec::new(),
+                entry_points: Vec::new(),
+                test_paths: Vec::new(),
+                generated_paths: Vec::new(),
+                major_directories: Vec::new(),
+                instruction_files: instruction_files(&root.path, &indexed),
+                commands: policy
+                    .detect_root_commands(&index.root_path, &root.path)
+                    .unwrap_or_default(),
+            })
+            .collect();
+
+        for file in &index.files {
+            let owner = nearest_root(&root_paths, &file.path);
+            let root = &mut roots[owner];
+            let relative = relative_to(root_paths[owner], &file.path);
+            if file.language != "text" && !root.languages.contains(&file.language) {
+                root.languages.push(file.language.clone());
+            }
+            if PROJECT_MANIFESTS.contains(&relative) {
+                root.manifests.push(file.path.clone());
+            }
+            if is_entry_point(relative) {
+                root.entry_points.push(file.path.clone());
+            }
+
+            // A child directory belongs to every enclosing root, not only the
+            // nearest: `crates` is a major directory of the workspace even
+            // when every file beneath it belongs to a member crate.
+            for (position, root_path) in root_paths.iter().enumerate() {
+                if !owns(root_path, &file.path) {
+                    continue;
+                }
+                let Some((child, _)) = relative_to(root_path, &file.path).split_once('/') else {
+                    continue;
+                };
+                let child_path = join(root_path, child);
+                if root_paths.contains(&child_path.as_str()) {
+                    continue;
+                }
+                if TEST_DIRECTORIES.contains(&child) {
+                    roots[position].test_paths.push(child_path.clone());
+                }
+                roots[position].major_directories.push(child_path);
+            }
+        }
+
+        for excluded in &detection.excluded {
+            if excluded.reason == ExclusionReason::Vendor {
+                let owner = nearest_root(&root_paths, &excluded.path);
+                roots[owner].generated_paths.push(excluded.path.clone());
+            }
+        }
+
+        for root in &mut roots {
+            root.languages.sort();
+            sort_and_dedup(&mut root.manifests);
+            sort_and_dedup(&mut root.entry_points);
+            sort_and_dedup(&mut root.test_paths);
+            sort_and_dedup(&mut root.generated_paths);
+            sort_and_dedup(&mut root.major_directories);
+        }
+
+        RepositoryMap {
+            repository_id: index.repository_id.clone(),
+            schema_version: REPOSITORY_MAP_SCHEMA_VERSION,
+            generated_at_ms: now_millis(),
+            fingerprint: fingerprint(index, &detection.excluded),
+            roots,
+            excluded: detection.excluded,
+        }
+    }
+
+    /// The root that owns `path`: the longest root that is a path-segment
+    /// prefix of it, so `packages/a` does not own `packages/ab/x`. Falls back
+    /// to the repository root.
+    pub fn root_for_path(&self, path: &str) -> &str {
+        self.roots
+            .iter()
+            .filter(|root| owns(&root.path, path))
+            .max_by_key(|root| root.path.len())
+            .map_or("", |root| root.path.as_str())
+    }
+}
+
+/// Hashes the map's inputs, not its output (`context.md` §3): the sorted
+/// indexed paths, the content of every manifest and instruction file, the
+/// excluded directories read from the skip list, and the schema version.
+/// Other files' content and every modification time are left out, so an
+/// edit to source code does not make the map stale.
+fn fingerprint(index: &RepositoryIndex, excluded: &[ExcludedPath]) -> String {
+    let mut files: Vec<(&str, &str)> = index
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file.content_hash.as_str()))
+        .collect();
+    files.sort_unstable();
+
+    // Length-prefixed fields, so no path can be confused with a separator.
+    let mut input = format!("schema {REPOSITORY_MAP_SCHEMA_VERSION}\n");
+    for (path, content_hash) in files {
+        let file_name = path.rsplit('/').next().unwrap_or(path);
+        let hashed = PROJECT_MANIFESTS.contains(&file_name) || file_name == AGENT_INSTRUCTIONS_FILE;
+        let content_hash = if hashed { content_hash } else { "" };
+        input.push_str(&format!(
+            "file {}:{path} {}:{content_hash}\n",
+            path.len(),
+            content_hash.len()
+        ));
+    }
+    for entry in excluded {
+        input.push_str(&format!(
+            "excluded {}:{} {:?}\n",
+            entry.path.len(),
+            entry.path,
+            entry.reason
+        ));
+    }
+    sha256(input)
+}
+
+/// Spec 11's ancestor walk for a path inside `root`, kept when indexed.
+fn instruction_files(root: &str, indexed: &BTreeSet<&str>) -> Vec<String> {
+    agent_instruction_paths(&[join(root, "_")])
+        .into_iter()
+        .filter(|path| indexed.contains(path.as_str()))
+        .collect()
+}
+
+fn is_entry_point(relative: &str) -> bool {
+    if ENTRY_POINTS.contains(&relative) {
+        return true;
+    }
+    if let Some(binary) = relative.strip_prefix("src/bin/") {
+        return !binary.contains('/') && binary.len() > ".rs".len() && binary.ends_with(".rs");
+    }
+    if let Some(rest) = relative.strip_prefix("cmd/") {
+        return rest
+            .strip_suffix("/main.go")
+            .is_some_and(|command| !command.is_empty() && !command.contains('/'));
+    }
+    false
+}
+
+/// Whether the root `root` contains `path`, by whole path segments.
+fn owns(root: &str, path: &str) -> bool {
+    root.is_empty()
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Index into `roots` of the root that owns `path`. `roots` always holds
+/// `""`, which owns everything.
+fn nearest_root(roots: &[&str], path: &str) -> usize {
+    roots
+        .iter()
+        .enumerate()
+        .filter(|(_, root)| owns(root, path))
+        .max_by_key(|(_, root)| root.len())
+        .map_or(0, |(position, _)| position)
+}
+
+/// `path` relative to `root`, which owns it.
+fn relative_to<'a>(root: &str, path: &'a str) -> &'a str {
+    if root.is_empty() {
+        path
+    } else {
+        path.strip_prefix(root)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or("")
+    }
+}
+
+fn join(root: &str, child: &str) -> String {
+    if root.is_empty() {
+        child.to_string()
+    } else {
+        format!("{root}/{child}")
+    }
+}
+
+fn sort_and_dedup(values: &mut Vec<String>) {
+    values.sort();
+    values.dedup();
 }
