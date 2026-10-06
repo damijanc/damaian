@@ -74,6 +74,7 @@ pub use edit::{
 };
 pub use effective_policy::{
     EffectivePolicy, PolicyEntry, PolicyRule, PolicySource, RefusedBy, RefusedRequest, SourceKind,
+    rule_label,
 };
 pub use error::{ClientError, ProviderRefusal, Result};
 pub use file_access::{FileAccessController, FileRead, LineRange, ReadWindow};

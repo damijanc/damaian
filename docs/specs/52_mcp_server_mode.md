@@ -6,7 +6,7 @@ Plan: `docs/PLAN/04_phase_4_customization_and_extensibility.md`, Phase 4,
 Work Package 6 (Could). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#31](31_permission_profiles/proposal.md) (the profile the exposed set
-narrows) — **not built**; [#33](33_mcp_management_and_deferred_discovery.md)
+narrows) — built; [#33](33_mcp_management_and_deferred_discovery.md)
 (the MCP runtime) — **not built**. Everything else named below is a
 cross-reference, not a prerequisite.
 Related implementation specs:

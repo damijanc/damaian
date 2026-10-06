@@ -70,6 +70,9 @@ impl RefusedBy {
 #[serde(rename_all = "camelCase")]
 pub struct RefusedRequest {
     pub key: String,
+    /// [`rule_label`] of the key, or the key itself when it has none (an
+    /// unknown or unparsable line).
+    pub label: String,
     /// [`crate::RepositoryKeyClass::as_str`]: `forbidden`, `restrict_only`,
     /// `user_owned` or `unparsable`.
     pub class: String,
@@ -80,6 +83,8 @@ pub struct RefusedRequest {
 #[serde(rename_all = "camelCase")]
 pub struct PolicyRule {
     pub key: String,
+    /// What the rule means, for a person who does not know the config keys.
+    pub label: String,
     /// As `Config::to_policy_text` prints it; a list is `|`-joined.
     pub value: String,
     /// For a scalar, the one source whose value holds. For a list, the
@@ -108,6 +113,95 @@ pub struct EffectivePolicy {
     /// Refusals of keys that have no rule, such as a `model_provider.<id>`
     /// the repository tried to define, or an unparsable line.
     pub other_refused: Vec<RefusedRequest>,
+}
+
+/// A plain-language name for a rule key. The settings view leads with it,
+/// because a reader who did not build Damaian cannot be expected to know what
+/// `require_approval_for_risky_commands` decides (spec 31 §5.7). `None` for a
+/// key with no name, which the view then shows as the key itself;
+/// `every_rule_has_a_human_name` keeps that from happening to a rule.
+pub fn rule_label(key: &str) -> Option<String> {
+    let fixed = match key {
+        "data_dir" => "Damaian's data folder",
+        "max_file_bytes" => "Largest file Damaian reads (bytes)",
+        "max_read_lines" => "Lines returned per file read",
+        "max_list_entries" => "Entries returned per folder listing",
+        "max_search_matches" => "Matches returned per search",
+        "max_match_line_chars" => "Characters kept per search match",
+        "max_command_output_bytes" => "Command output kept (bytes)",
+        "command_timeout_secs" => "Time limit per command (seconds)",
+        "allowed_roots" => "Folders Damaian may open as a repository",
+        "ignore_patterns" => "Files left out of the index",
+        "restricted_patterns" => "Files Damaian may not read",
+        "command_allowlist" => "Commands that run without asking",
+        "command_blocklist" => "Commands that are always blocked",
+        "secret_patterns" => "Extra patterns redacted as secrets",
+        "require_approval_for_file_edits" => "Ask before changing files",
+        "require_approval_for_risky_commands" => "Ask before test, build and lint commands",
+        "require_approval_for_all_commands" => "Ask before every command",
+        "allow_file_edits" => "File changes allowed",
+        "command_access" => "Which commands may run",
+        "allow_browser_diagnostics" => "Browser diagnostics allowed",
+        "allow_mutating_mcp_tools" => "MCP tools that change things allowed",
+        "block_generated_secrets" => "Stop changes that add a secret",
+        "audit_enabled" => "Audit log on",
+        "audit_retention_days" => "Audit files kept (days)",
+        "checkpoint_retention_days" => "Checkpoints kept (days)",
+        "checkpoint_max_total_bytes" => "Checkpoint storage limit (bytes)",
+        "checkpoint_census_max_paths" => "Changed files a command checkpoint covers",
+        "enable_semantic_search" => "Semantic search",
+        "agent_max_tool_rounds" => "Tool rounds per turn",
+        "agent_web_debug_max_tool_rounds" => "Tool rounds per browser-debugging turn",
+        "agent_tool_retry_limit" => "Retries of a failing tool call",
+        "agent_max_task_tokens" => "Token limit per turn",
+        "agent_max_turn_messages" => "Messages sent per model request",
+        "shell" => "Shell that runs commands",
+        "model_provider" => "Model provider",
+        "model_name" => "Model",
+        "model_base_url" => "Where model requests are sent",
+        "model_api_key_env" => "Where the API key is read from",
+        "model_reasoning_level" => "Reasoning level",
+        "mcp_enabled" => "MCP servers on",
+        "mcp_server_allowlist" => "MCP servers allowed",
+        _ => "",
+    };
+    if !fixed.is_empty() {
+        return Some(fixed.to_string());
+    }
+    // The per-checkout and per-server keys, which reach the view as refusals
+    // (`command_allowlist.<repository id>`) or as rules of their own.
+    let (prefix, rest) = key.split_once('.')?;
+    let owner = match prefix {
+        "command_allowlist" => return rule_label(prefix),
+        "permission_profile" => return Some("Permission profile".to_string()),
+        "model_provider" => "Model provider",
+        "mcp_server" => "MCP server",
+        _ => return None,
+    };
+    let Some((id, field)) = rest.rsplit_once('.') else {
+        return Some(format!("{owner} {rest}"));
+    };
+    let field = match (prefix, field) {
+        ("model_provider", "label") => "name",
+        ("model_provider", "base_url") => "where requests are sent",
+        ("model_provider", "api_key_env") => "where the API key is read from",
+        ("model_provider", "models") => "models",
+        ("model_provider", "supports_native_tools") => "native tool calling",
+        ("model_provider", "max_output_tokens") => "largest reply (tokens)",
+        ("model_provider", "context_token_budget") => "context sent per request (tokens)",
+        ("model_provider", field) if field.starts_with("price_per_million_") => "price",
+        ("mcp_server", "label") => "name",
+        ("mcp_server", "enabled") => "on",
+        ("mcp_server", "require_approval") => "ask before each call",
+        ("mcp_server", "transport") => "transport",
+        ("mcp_server", "command") => "command it runs",
+        ("mcp_server", "args") => "arguments",
+        ("mcp_server", "env") => "environment",
+        ("mcp_server", "url") => "address",
+        ("mcp_server", "auth_token_env") => "where its token is read from",
+        _ => return None,
+    };
+    Some(format!("{owner} {id}: {field}"))
 }
 
 /// The rules whose value is a list, with the resolved entries in order.
@@ -184,6 +278,7 @@ impl EffectivePolicy {
             keys.iter()
                 .map(move |rejected| RefusedRequest {
                     key: rejected.key.clone(),
+                    label: rule_label(&rejected.key).unwrap_or_else(|| rejected.key.clone()),
                     class: rejected.class.as_str().to_string(),
                     by,
                 })
@@ -247,6 +342,7 @@ impl EffectivePolicy {
             };
             rules.push(PolicyRule {
                 key: key.to_string(),
+                label: rule_label(key).unwrap_or_else(|| key.to_string()),
                 value: value.to_string(),
                 sources,
                 entries,

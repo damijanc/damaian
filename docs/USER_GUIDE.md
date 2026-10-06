@@ -170,6 +170,211 @@ Known limits:
   inside the repository is therefore not refused. A path outside it needs
   approval and is refused.
 - The CLI's `propose-edit` runs outside any session, so no mode applies to it.
+  The repository's permission profile still does: under Read-only it is refused
+  before the model is asked anything.
+
+## Permission Profiles
+
+A permission profile decides what Damaian may do in one repository, whatever
+the session is doing. A mode is what this session is doing; a profile is what
+you allow in this checkout. You choose one per repository:
+
+| Profile | File edits | Commands | Browser diagnostics | MCP tools | Also |
+|---|---|---|---|---|---|
+| **Full repository development** | as configured | as configured | yes | yes | Narrows nothing. The default, and what every repository had before profiles existed |
+| **Safe local development** | always need your approval | `local` only | yes | yes | |
+| **Offline private** | as configured | `local` only | no | none (MCP off) | Audit and checkpoint retention lowered to 7 days |
+| **Read-only** | no | none | no | read-only tools only | |
+| A custom profile | | | | | One you imported (see below) |
+
+"As configured" means the profile leaves that key to your own settings.
+
+**Choosing one.** In `Settings` › `General`, open a repository, then pick from
+`Permission profile for this repository`. The choice is stored in your user
+config as `permission_profile.<repository_id>=<profile>`, keyed by the working
+folder the way `Allow Always` is, so it does not carry over to another clone. A
+repository cannot choose its own profile in either direction. From the CLI:
+
+```bash
+damaian profile-set /path/to/repo safe_local
+```
+
+The ids are `read_only`, `safe_local`, `full` and `offline_private`, or the name
+of a custom profile.
+
+**A profile only narrows.** It is applied after your user config, the
+repository's config and admin config, and it can only make the result stricter.
+A profile that sets something looser than what is already in force changes
+nothing; a profile that tries to set a key it may not carry, such as `shell` or
+a `model_*` key, has that key ignored and reported. So a profile can never undo
+a restriction you or the repository set, and admin config cannot undo a
+narrower profile you picked.
+
+**When it takes effect.** At the next turn, at the next resume after you approve
+something, and at the next command run by id. Anything already running finishes
+under the profile it started with, exactly as with a mode switch.
+
+### Profile and mode together
+
+Both must allow an action:
+
+```text
+what the session may do = profile ∩ mode
+```
+
+Neither can widen the other. Ask mode under Full repository development cannot
+edit a file, because Ask does not allow it; Code mode under Read-only cannot
+either, because Read-only does not.
+
+The refusal says which one refused, because the fix is different:
+
+- A mode refusal: "Refused: Ask mode does not allow this. Switch to Code mode to
+  allow it."
+- A profile refusal: "Refused: the permission profile does not allow this
+  (allow_file_edits=false). Switching mode will not allow it."
+
+The profile refusal names the setting rather than the profile, because the same
+setting can also come from your own config or the repository's. The effective
+policy view says which.
+
+When both refuse, the mode is named first. In Ask under Read-only, an edit is
+refused with "Switch to Code mode"; in Code it is then refused by the profile.
+
+Read-only still lets Code mode make and advance a plan (`propose_plan`,
+`complete_step`): planning writes nothing, so no profile setting covers it.
+
+### What `local` and Offline private cannot promise
+
+**`local` means no command Damaian recognises as networked.** That is a name
+heuristic, not a sandbox. Damaian recognises `curl`, `wget`, `npm`, `pnpm`,
+`yarn`, `pip`, `docker`, and `git pull`/`push`/`fetch`/`clone`. A command it
+does not recognise, such as `python -c` with `urllib`, can still reach the
+network. Because the check reads the command name, `local` also blocks every
+`npm`, `pnpm` and `yarn` command, `npm test` and `npm run …` included, while
+`cargo test` is allowed.
+
+A custom profile may also use `command_access=read_only`, which allows only the
+low-risk read-only commands Plan mode allows. It inherits that check's known gap
+(`git diff --output=<file>` counts as read-only). The built-in Read-only profile
+uses `none`, so it does not.
+
+**Offline private does not stop model traffic.** Your prompts and the code in
+context are network traffic to the model provider, and no profile can change
+where the model provider is. When Offline private is selected and the
+provider's base URL is not a loopback address, Settings shows a warning saying
+so. It does not refuse to run. For no model traffic leaving the machine, use a
+local provider (see [Model Providers and API Keys](#model-providers-and-api-keys)).
+
+### Reading the effective policy view
+
+`Settings` › `General` › `Effective policy` shows the policy in force for the
+open repository. Open a repository first; without one the picker is disabled
+and the table shows the global policy.
+
+The header names the profile, and the mode when a session is open, for example
+`Safe local development ∩ Code mode`.
+
+Each row is one rule. The rule is named in plain words, such as `Ask before
+changing files`, with its config key (`require_approval_for_file_edits`)
+underneath in small type. Refusal messages and this guide use the key. Each row
+also shows the rule's value and its **source**:
+
+| Source | Meaning |
+|---|---|
+| `default` | Built-in default; nothing set it |
+| `user config` | Your `user.conf` |
+| `repository config` | The repository's `.damaian/config.conf` |
+| `admin config` | `admin.conf` or `DAMAIAN_ADMIN_CONFIG` |
+| `profile: <id>` | The selected profile |
+| `this repository (Allow Always)` | A command you allowed always in this repository |
+
+A list such as `restricted_patterns` shows a source per entry, grouped where
+consecutive entries share one. Where several scopes agree on a value, the source
+is the last scope whose value holds.
+
+A rule an admin value loosened carries the tag `widened by admin config`. Admin
+config is the one scope allowed to loosen what came before it. Some keys have no
+looser or stricter direction, such as `audit_enabled`, `allowed_roots` or
+`secret_patterns`; an admin value for one of those shows `admin config` as its
+source but is never tagged. Read `admin config` as "your administrator decided
+this", which may be looser than your own setting.
+
+Below a rule, a `Refused:` line is a request that was not applied:
+
+```text
+Refused: repository config tried to change “Ask before changing files”
+(require_approval_for_file_edits). It may only make this stricter.
+```
+
+It names who asked (`repository config` or `the permission profile`), the rule,
+and why:
+
+- "It may never set this": that scope can never set the key.
+- "It may only make this stricter": this request would have loosened it.
+- "Only your own config may set this": for example `command_allowlist`.
+- "The line could not be read".
+
+The refused value is never shown, because it is text the repository or the
+profile file controls. A refusal of a key with no row of its own is listed under
+`Other refused requests`.
+
+Under `command_access=local` or `read_only`, a note row repeats what that level
+can and cannot promise.
+
+The CLI prints the same view:
+
+```bash
+damaian config-show --sources /path/to/repo
+```
+
+### Exporting and importing profiles
+
+`Settings` › `General` › `Permission profile files`.
+
+**Export** writes the selected profile as a short config file, starting with a
+`# Damaian permission profile: <id>` comment. It contains only the keys a
+profile may carry, so it never contains `model_api_key_env`, an MCP server's
+`auth_token_env`, or any other credential reference, and it is safe to paste
+into an issue.
+
+**Import** treats the file as untrusted. Paste it, name it, and press `Review
+import`. Nothing is written yet. The review lists:
+
+- **Will write** — the keys the profile will carry.
+- **Not written, a profile cannot set these** — keys such as `shell`, `model_*`
+  or `allowed_roots`. They are dropped.
+- **Written but no effect here** — keys that would loosen this repository's
+  config. They are kept in the file, but a profile only narrows, so they do
+  nothing while your config is stricter. If you later loosen your own config,
+  they keep the profile's narrowing.
+
+There is nothing to approve in the third list: no profile can widen anything,
+so an imported one cannot either. Then press `Import` or `Cancel`. A name that
+is a built-in, or that an existing custom profile already uses, is refused
+unless you tick `Replace a custom profile with this name`.
+
+**An import never selects the profile.** It adds it to the picker; choosing it
+is a separate step, so importing a file cannot change what any repository runs
+under.
+
+From the CLI:
+
+```bash
+damaian profile-export safe_local my-profile.conf
+```
+
+```bash
+damaian profile-import my_profile my-profile.conf --repo /path/to/repo --review
+```
+
+`--review` prints the three lists and writes nothing. Without it the lists are
+printed and the profile is written. `--repo` judges "would loosen" against that
+repository's config. `--replace` overwrites an existing custom profile of the
+same name. Then select it with `damaian profile-set <repo> <name>`.
+
+Imported profiles live in `config/profiles/<name>.conf` inside the data
+directory. Custom names are lowercase letters, digits and `_`, up to 40
+characters.
 
 ## Provider Limits and Retries
 
@@ -774,6 +979,7 @@ Damaian keeps the local app in control of important effects:
 - Sandbox-safe assistant command requests are limited to read-only local commands.
 - Commands outside the sandbox require user approval before execution, unless the exact command was previously approved with `Allow Always` for that repository.
 - Restricted files and detected secrets are redacted or blocked by policy.
+- A [permission profile](#permission-profiles) per repository can narrow all of this further, and never widen it.
 - Important actions are recorded in a local audit trail.
 
 ## Troubleshooting

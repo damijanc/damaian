@@ -1513,6 +1513,14 @@ const POLICY_CLASS_LABELS = {
   unparsable: "could not be parsed",
 };
 
+// Why a request was refused, in words, for "Refused: … tried to change …".
+const POLICY_REFUSAL_REASONS = {
+  restrict_only: "It may only make this stricter.",
+  forbidden: "It may never set this.",
+  user_owned: "Only your own config may set this.",
+  unparsable: "The line could not be read.",
+};
+
 const POLICY_REFUSED_BY_LABELS = {
   repository: "repository config",
   profile: "the permission profile",
@@ -1541,6 +1549,24 @@ function policyCell(text, className = "") {
   return cell;
 }
 
+// The plain-language name leads; the config key stays underneath because
+// refusal messages and the docs name the key (`allow_file_edits=false`).
+function policyRuleCell(rule) {
+  const cell = policyCell(rule.label, "policy-key");
+  if (rule.label !== rule.key) {
+    const key = document.createElement("span");
+    key.className = "policy-key-name";
+    key.textContent = rule.key;
+    cell.append(key);
+  }
+  return cell;
+}
+
+// An empty list reads as "none", except where empty means unrestricted.
+function policyEmptyListText(rule) {
+  return rule.key === "allowed_roots" ? "any folder" : "none";
+}
+
 function policySourceCell(sources, adminWidened) {
   const cell = policyCell(sources.map((source) => source.label).join(", "));
   if (adminWidened) {
@@ -1564,8 +1590,9 @@ function policyNoteRow(text, className) {
 // Key and class only: the policy carries no refused value (context.md §8).
 function policyRefusalText(refused) {
   const by = POLICY_REFUSED_BY_LABELS[refused.by] || refused.by;
-  const kind = POLICY_CLASS_LABELS[refused.class] || refused.class;
-  return `Refused: ${by} asked to set ${refused.key} (${kind})`;
+  const kind = POLICY_REFUSAL_REASONS[refused.class] || `(${refused.class})`;
+  const what = refused.label === refused.key ? refused.key : `“${refused.label}” (${refused.key})`;
+  return `Refused: ${by} tried to change ${what}. ${kind}`;
 }
 
 function policyRuleRows(rule) {
@@ -1583,7 +1610,7 @@ function policyRuleRows(rule) {
     groups.forEach((group, index) => {
       const row = document.createElement("tr");
       row.append(
-        policyCell(index === 0 ? rule.key : "", "policy-key"),
+        index === 0 ? policyRuleCell(rule) : policyCell("", "policy-key"),
         policyCell(group.values.join(", "), "policy-value"),
         policySourceCell([group.source], index === 0 && rule.adminWidened),
       );
@@ -1592,8 +1619,8 @@ function policyRuleRows(rule) {
   } else {
     const row = document.createElement("tr");
     row.append(
-      policyCell(rule.key, "policy-key"),
-      policyCell(entries ? "none" : rule.value, "policy-value"),
+      policyRuleCell(rule),
+      policyCell(entries ? policyEmptyListText(rule) : rule.value, "policy-value"),
       policySourceCell(rule.sources, rule.adminWidened),
     );
     rows.push(row);

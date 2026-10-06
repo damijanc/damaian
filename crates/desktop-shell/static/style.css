@@ -2497,7 +2497,20 @@ button:disabled {
   word-break: break-word;
 }
 
-.policy-key,
+.policy-key {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* The config key under the plain-language name: what refusals and docs cite. */
+.policy-key-name {
+  display: block;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  font-weight: 400;
+}
+
 .policy-value {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }

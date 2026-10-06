@@ -136,6 +136,13 @@ on #23 and #31. #31 is in progress, not ready. #22 also closed #21's deferred
 `Evidence::Findings`. The ready set is now #23, #24, #50, #56, #57 and the
 speculative #38.
 
+Re-derived on 2026-10-06, when [#31](31_permission_profiles/proposal.md) was
+finished. Four `Depends on:` lines named #31 not built: #32, #33, #35 and #52.
+**One is promoted:** [#32](32_hooks.md), whose other dependencies (#17, #22)
+were already built. The other three still wait. #33 waits on #26, #35 on #23,
+and #52 on #33. The ready set is now #23, #24, #32, #50, #56, #57 and the
+speculative #38.
+
 **#24 and #26 are the keystones now that #22 has landed.** #24 is ready and
 sits in front of #25 and #26; the whole tail waits on #26. Preferring a spec
 that unblocks nothing over one of these costs more than it looks like it does.
@@ -143,12 +150,12 @@ that unblocks nothing over one of these costs more than it looks like it does.
 | | Build | Why here |
 |---|---|---|
 | 1 | **#24 → #26** | The keystone now that #22 is done: #24 is ready, and #26 is the real unlock; #25 follows #24 |
-| 2 | #31 profiles | In progress; in front of #32, #33, #35 and #52, and extends #20's permission matrix |
-| 3 | #23 verification | Ready now that #22 is done; in front of #35. Its loop lives in `chat.rs`, so check the parallel rule below before pairing it |
+| 2 | #23 verification | Ready now that #22 is done; the last thing in front of #35. Its loop lives in `chat.rs`, so check the parallel rule below before pairing it |
+| 3 | #32 hooks | Ready now that #31 is done; unblocks nothing, but it is the one Must-tier Phase 4 package that can start |
 | 4 | #55 compaction | Also unblocks #49's reuse slice, which is why that slice waits |
 | 5 | #27, #54, #51 | The fan-out once #26 has landed |
 | 6 | #28 → #29 → #30 | Memory, strictly serial |
-| 7 | #35 → #36/#37; #33 → #52; #32 | Delivery and extensibility clusters |
+| 7 | #35 → #36/#37; #33 → #52 | Delivery and extensibility clusters |
 | 8 | #38/#39/#40 | Last, and #40 may legitimately conclude "do not" |
 
 [#56](56_provider_fallback_consent.md) is the opportunistic one: small, ready,
@@ -239,7 +246,7 @@ is ready.
 | 28 | [28_memory_model_and_storage.md](28_memory_model_and_storage.md) | **Not started.** Roadmap Phase 3b WP1. The memory record and store, with a `project_key` resolved from the repository's root commit — because `repository_id` is a path hash and cannot give the sharing property the roadmap asks for. Memory refuses secrets rather than redacting them. |
 | 29 | [29_memory_creation_and_consent.md](29_memory_creation_and_consent.md) | **Not started.** Roadmap Phase 3b WP2. The consent gate: `MemoryProposal` and `MemoryEntry` are separate types with one conversion requiring a user confirmation, so unconfirmed persistence is unrepresentable. Instruction-shaped candidates from untrusted origins get no proposal at all. |
 | 30 | [30_memory_retrieval_and_lifecycle.md](30_memory_retrieval_and_lifecycle.md) | **Not started.** Roadmap Phase 3b WP4. Memory reaches the model only as a `ContextItem` in the lowest-priority category, is visible and removable in #27, and is marked stale by hash comparison against its evidence. Proven by prompt-injection evals, not design argument. |
-| 31 | [31_permission_profiles/](31_permission_profiles/proposal.md) | **In progress.** Split into a folder and planned on 2026-09-30; see `tasks.md` for the nine-task breakdown. Roadmap Phase 4 WP3. Its security subset shipped as #34, which closed the repository-config override and moved `command_allowlist` to user scope; what remains here is the profile machinery — the capability/preference partition as a general mechanism, effective-policy source attribution, and profile export/import. Specified before #32 because both #32 and #33 reference the profile they cannot widen. |
+| 31 | [31_permission_profiles/](31_permission_profiles/proposal.md) | **Done (2026-10-06).** Roadmap Phase 4 WP3, built in nine tasks. Its security subset shipped first as #34; this spec adds the profile machinery on top. Four built-in profiles (Read-only, Safe local, Full, Offline private) plus imported custom ones are applied last and can only narrow. `profile ∩ mode` is checked at every refusal point, and `command_access` also blocks in the command policy, so a proposal run by id is refused. The capability/preference partition is exhaustive at compile time. The Settings view attributes every rule to its source, names it in plain words and shows refused requests without their values. Export never carries a credential reference, and import lists widenings rather than applying them. **Criterion 7, the second-person review, did not happen**: the project owner waived it on 2026-10-06 after their own reading led to the plain-language names (proposal §7.3). Two documented limits: `local` is a command-name heuristic, not a sandbox, and Offline private does not stop model traffic. |
 | 32 | [32_hooks.md](32_hooks.md) | **Not started.** Roadmap Phase 4 WP2. Nine lifecycle events, hooks as external programs returning a verdict — `deny`/`request_approval`/`warn`/`allow`, with no `approve`, so widening is unrepresentable. Mandatory is the default classification so a broken hook fails closed. |
 | 33 | [33_mcp_management_and_deferred_discovery.md](33_mcp_management_and_deferred_discovery.md) | **Not started.** Roadmap Phase 4 WP4. Every enabled server's full schema currently reaches every request, outside #26's accounting. Adds a search tool with on-demand schemas, per-tool enable, lazy startup, and treats a remote read-only claim as an assertion that cannot lower an approval requirement. |
 | 34 | [34_repository_config_trust_boundary.md](34_repository_config_trust_boundary.md) | **Done — implemented ahead of #14 onward.** Bug-driven, not a roadmap graduation. `apply_overlay` is scope-blind, so repository config overrides user config: a repo-set `shell` runs its own script for every approved command (verified), a repo-set `model_base_url` exfiltrates the API key and code with no approval, and a repo `command_allowlist` executes commands unprompted. Adds a scope-aware overlay, a forbidden-key list, restrict-only merges, and moves `Allow Always` to user scope keyed by repository. Security subset of #31, extracted so it need not wait for Phase 4. |
