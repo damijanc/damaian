@@ -826,7 +826,9 @@ error[E0308]: mismatched types
             </thead>
             <tbody>
               <tr>
-                <td class="policy-key">restricted_patterns</td>
+                <td class="policy-key">
+                  Files Damaian may not read<span class="policy-key-name">restricted_patterns</span>
+                </td>
                 <td class="policy-value">.env, *.pem</td>
                 <td>user config</td>
               </tr>
@@ -836,23 +838,29 @@ error[E0308]: mismatched types
                 <td>repository config</td>
               </tr>
               <tr>
-                <td class="policy-key">require_approval_for_file_edits</td>
+                <td class="policy-key">
+                  Ask before changing files<span class="policy-key-name">require_approval_for_file_edits</span>
+                </td>
                 <td class="policy-value">true</td>
                 <td>profile: safe_local</td>
               </tr>
               <tr class="policy-refused">
                 <td colspan="3">
-                  Refused: repository config asked to set require_approval_for_file_edits
-                  (restrict-only)
+                  Refused: repository config tried to change “Ask before changing files”
+                  (require_approval_for_file_edits). It may only make this stricter.
                 </td>
               </tr>
               <tr>
-                <td class="policy-key">max_read_lines</td>
+                <td class="policy-key">
+                  Lines returned per file read<span class="policy-key-name">max_read_lines</span>
+                </td>
                 <td class="policy-value">2000</td>
                 <td>admin config <span class="policy-tag">widened by admin config</span></td>
               </tr>
               <tr>
-                <td class="policy-key">command_access</td>
+                <td class="policy-key">
+                  Which commands may run<span class="policy-key-name">command_access</span>
+                </td>
                 <td class="policy-value">local</td>
                 <td>profile: safe_local</td>
               </tr>

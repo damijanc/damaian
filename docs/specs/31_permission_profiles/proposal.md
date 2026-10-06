@@ -314,6 +314,12 @@ and a **request that was refused**. A repository asking for something it did not
 get is more informative than the resolved value alone — it tells the user
 something about the repository.
 
+**Amended 2026-10-06 (Task 9):** the desktop view names each rule in plain words
+(`rule_label`, `effective_policy.rs`), such as "Ask before changing files", with
+the config key underneath, because the bare key was unreadable to the user
+reading it. A refusal names the rule and says why in a sentence. The CLI's
+`config-show --sources` still prints keys. The example above shows the keys.
+
 Requirement 12's validation criterion is that someone who did not build this can
 read the view, so it is reviewed by a second person before the work package is
 closed.
@@ -388,7 +394,121 @@ secret, command, path, and key boundaries.
 
 ## 7. Implementation Notes
 
-To be completed during implementation.
+Built in nine tasks, recorded in [`tasks.md`](tasks.md). The decisions that
+override this proposal are in [`context.md`](context.md); the main ones are that
+a profile is applied last and only narrows (§4), that `model_*` and the
+lower-wins caps are capability keys (§2), and that an import lists widenings
+instead of approving them (§9).
+
+### 7.1 Acceptance criteria
+
+Numbered in §6's order. Tests are in
+`crates/workspace-engine/tests/permission_profiles.rs` unless named otherwise.
+`context.md` §9 and Task 8 call the export criterion "11"; in §6's order it is
+12. Checked on 2026-10-06.
+
+| # | Criterion | Evidence |
+|---|---|---|
+| 1 | Spec 34's criteria do not regress; the matrix runs with a hostile repository present | `repository_config_trust.rs` passes unchanged (47 tests; no task edited the file). **Gap found in Task 9:** `the_permission_matrix_matches_the_spec_table` (`mode.rs`) reads each built-in's capabilities from `Config::default()`, and only Full had been loaded under spec 34's hostile fixture. Closed by `every_built_in_profile_keeps_spec_34s_refusals_under_a_hostile_repository`: for each built-in, under `HOSTILE_REPOSITORY`, the capabilities equal the matrix's input, the repository refusals equal the no-profile run's, no profile key is refused, and the config equals the profile applied over spec 34's base. Falsified: re-applying the repository file at user scope once a profile is selected, and a Read-only overlay carrying `require_approval_for_file_edits=false`, each fail it |
+| 2 | The partition covers every field and agrees with spec 34 | `every_overlay_field_is_classified_exactly_once`, `the_preference_keys_are_exactly_spec_34s_free_keys`, `every_capability_key_resists_weakening_from_repository_scope`, `every_preference_key_applies_from_repository_scope` (the last two drive the real `apply_overlay_scoped`) |
+| 3 | Repository config that only adds restrictions applies with no prompt | Spec 34's `repository_config_adding_restrictions_applies_without_a_prompt` and `a_repository_without_rejected_keys_produces_no_notice`; for the four profile keys, `a_repository_can_narrow_each_profile_key_without_a_refusal` |
+| 4 | Every refused widening is audited | Repository scope: `rejected_repository_keys_are_audited_with_their_class_and_without_their_value` (spec 34). Profile scope: `profile_refusals_stay_out_of_the_repository_notice_and_are_audited_once`, and in the shell `a_custom_profiles_refused_keys_are_audited_when_the_shell_shows_it`. Import: `an_import_lists_what_it_will_not_apply_and_writes_only_profile_keys` (`permission_profile_imported` with key names, no values). A refusal at resume is audited as `profile_policy` / `refused_by_profile` (`a_command_paused_under_full_is_refused_at_resume_after_switching_to_read_only`, and `chat.rs`'s two resume tests) |
+| 5 | Admin can widen and narrow; every admin-sourced widening is attributed | `admin_config_can_still_widen_and_narrow` (spec 34), `an_admin_widening_is_marked_and_an_admin_narrowing_is_not`, `admin_can_widen_the_base_but_not_undo_the_users_profile`. **Met as attributed, not always tagged:** an admin value on a key with no restrict-only direction (`audit_enabled`, `allowed_roots`, `secret_patterns`, `block_generated_secrets`, `command_allowlist`, …) is attributed to `admin config` but never tagged "widened by admin config" (Task 6, deviation 4). Checked by hand on 2026-10-06: an admin `audit_enabled=false` prints `[admin config]` with no tag. The user guide says to read `admin config` as "your administrator decided this" |
+| 6 | The view names the source of every rule and shows refused requests | `the_section_5_7_example_attributes_each_list_entry_to_its_scope`, `a_refused_request_is_shown_by_key_and_class_never_by_value`, `the_effective_policy_agrees_with_load_scoped_for_every_key`; over the wire, `get_effective_policy_serves_the_attributed_policy_without_a_refused_value` (`desktop-shell`). A refused request is shown by key and class, never by value (`context.md` §8). Every rule also has a plain-language name (`every_rule_has_a_human_name`, §7.3) |
+| 7 | A second person can read the view and state what the session may do | §7.3. **Not yet done** |
+| 8 | An unclassified new field fails to compile | Not testable as a test. `classify_overlay_fields!`, `apply_overlay_scoped`, `to_policy_text` and `split_profile_keys` all destructure `ConfigOverlay` with no `..`. Task 1's mutation 3 (`pub probe: Option<bool>`) broke the build in three places |
+| 9 | The matrix passes across every profile × every tool class, extending spec 20's | `the_permission_matrix_matches_the_spec_table` (`mode.rs`): 17 tool-class rows × 4 modes × the 4 built-ins from their real overlays; the Full column must equal `mode_permits`. A custom profile has no fixed row; it reaches the same `profile_permits` through its resolved capabilities |
+| 10 | `profile ∩ mode` holds both ways | `ask_under_full_cannot_edit_and_the_refusal_names_the_mode`, `code_under_read_only_cannot_edit_and_the_refusal_names_the_profile` |
+| 11 | Switching to Read-only mid-session does not interrupt an in-flight action but blocks the next | `a_command_already_running_finishes_after_a_switch_to_read_only` (`#[ignore]`, real login shell; run by hand on 2026-10-06, passed), `the_next_turn_after_switching_to_read_only_refuses_what_the_last_turn_ran`, `a_command_paused_under_full_is_refused_at_resume_after_switching_to_read_only`, `a_patch_proposed_under_full_is_refused_at_apply_after_switching_to_read_only`, `a_proposal_stored_under_all_is_refused_by_id_once_command_access_narrows`. "Next" is the next decision point (`context.md` §6) |
+| 12 | An export has no `auth_token_env` or `model_api_key_env`; an import's widenings require review | `no_export_names_a_credential_reference`, `an_export_carries_only_profile_keys_and_round_trips`, `the_keys_a_profile_may_carry_agree_with_the_profile_scope_merge`. **Met as "widenings are listed and never applied"** (`context.md` §9): `an_import_lists_what_it_will_not_apply_and_writes_only_profile_keys`, `an_imported_profile_once_selected_cannot_widen_anything`, and in the shell `a_profile_import_preview_lists_what_will_not_apply_without_its_values`. There is nothing to approve, because a profile cannot widen; an import never selects the profile |
+| 13 | `command_allowlist` stays exact-command | `docker_allowlist_is_exact_command_only` and `allowlist_does_not_bypass_shell_control_detection` (`foundation.rs`; `configured_exact_matches` in `command_policy.rs` is unchanged). A profile cannot carry `command_allowlist` at all (`split_profile_keys`, held to the merge by `the_keys_a_profile_may_carry_agree_with_the_profile_scope_merge`) |
+| 14 | The quality gate passes, and the spec 18 baseline shows no increase in approval-policy violations | §7.2 |
+
+### 7.2 Gate, 2026-10-06
+
+Run in Task 9's worktree on the final tree, except where noted.
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: pass
+  (47s; the target directory was warm), and again after Task 9's test was
+  added.
+- `cargo nextest run --workspace --locked`: 1060 passed, 24 skipped, on the
+  final tree, including both of Task 9's tests.
+- `node --check crates/desktop-shell/static/app.js`: pass.
+- `npm run lint:web`: pass; its one info is the known one in
+  `scripts/check-spec-status.mjs`.
+- `typos`: pass. `cargo deny check`: advisories, bans, licenses, sources ok.
+- `npm run specs:check`: 57 specs, dependency lines agree.
+- `cargo run -p eval-harness -- run --tier deterministic`: 16/16 scenarios
+  pass, **approval-policy violations 0**, the same as every record in the
+  committed `evals/baseline.json` (criterion 14).
+
+### 7.3 Second-person review (§5.7, criterion 7)
+
+**Not yet done.** On 2026-10-06 no reviewer was available, so the spec stays
+In progress and this criterion is open.
+
+**A first reading, by the project owner (2026-10-06).** They did not build
+the view, but they are not the cold reader the criterion asks for. Their
+finding: the view was confusing, because every rule was named only by its
+config key. Fixed the same day:
+
+- Every rule now leads with a plain-language name and shows its key
+  underneath. `every_rule_has_a_human_name` fails when a line has no name;
+  removing one name made it fail, and the name was restored.
+- Refusals are sentences: *Refused: repository config tried to change "Ask
+  before changing files" (require_approval_for_file_edits). It may only make
+  this stricter.*
+- An empty `allowed_roots` reads "any folder" instead of "none". Empty means
+  unrestricted (`path_policy.rs`, `canonical_root`), so "none" said the
+  opposite of the truth.
+
+The rule `require_approval_for_risky_commands` is now named "Ask before test,
+build and lint commands", which is what it controls (`is_validation_command`).
+That also removes the misread anticipated below. The review itself still has to
+happen with the new view.
+
+To set it up again:
+
+1. Start the inspection server on port 4899:
+   `cargo test -p desktop-shell --lib -- --ignored --nocapture serves_the_ui`.
+   It prints its `repository`, `session` and `data_dir`.
+2. Seed the policy, with `D` the printed data dir and `R` the printed
+   repository:
+   - `R/.damaian/config.conf`: `restricted_patterns=secrets/**`,
+     `require_approval_for_file_edits=false`, `shell=./tools/sh`;
+   - `D/config/admin.conf`: `require_approval_for_risky_commands=false`;
+   - `DAMAIAN_DATA_DIR=D damaian profile-set R safe_local`;
+   - append `command_allowlist.<repository id>=cargo test` to
+     `D/config/user.conf`, using the id `profile-set` printed.
+
+   `DAMAIAN_DATA_DIR=D damaian config-show --sources R` should then show
+   both refusals, `secrets/**` from repository config, `profile: safe_local`,
+   `this repository (Allow Always)`, and `widened by admin config`.
+3. In a browser at `http://127.0.0.1:4899/`, run `apiToken =
+   "damaian-ui-inspection-token"; setRepository("<R>", false);` in the console.
+   Dismiss the repository notice, open the printed `session` (Code mode), and
+   run `openSettings("general")`. In the app, Settings opens from the menu
+   instead.
+4. Ask someone who did not build this: "What may this session do, and who
+   decided each thing?"
+
+A correct reading covers these points:
+
+- files can be read except the restricted ones, with `secrets/**` from the
+  repository;
+- edits need approval, set by the profile, and the repository's request to
+  turn approval off was refused;
+- commands are `local` only, which is a name heuristic that also blocks
+  npm/pnpm/yarn;
+- `cargo test` runs unasked through Allow Always;
+- admin turned `require_approval_for_risky_commands` off;
+- the repository's `shell` was refused.
+
+That admin key only skips approval for validation commands. Reading it as
+"every risky command runs unasked" is a misread worth recording.
+
+### 7.4 Recording questions
 
 The §1 finding was extracted into
 [spec 34](../34_repository_config_trust_boundary.md) and is implemented ahead of this
@@ -405,3 +525,6 @@ Also record:
 - Whether the second-person review of the policy view (§5.7) actually passed, and
   what they misread if it did not. That is the work package's real acceptance
   test.
+
+Both are answered when the review in §7.3 has happened. Until then the spec
+stays In progress.

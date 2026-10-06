@@ -882,6 +882,66 @@ fn each_built_in_profile_resolves_to_its_table_row() {
     fixture.cleanup();
 }
 
+/// Proposal §6, criterion 1: the matrix runs with a hostile repository
+/// present. The matrix in `mode.rs` reads each built-in's capabilities from
+/// `Config::default()`, so this pins that a hostile repository changes
+/// neither those inputs nor spec 34's refusals, under every built-in.
+#[test]
+fn every_built_in_profile_keeps_spec_34s_refusals_under_a_hostile_repository() {
+    let fixture = profile_fixture("hostile-built-ins");
+    fixture.write_repository(HOSTILE_REPOSITORY);
+    fixture.write_user(RESTRICTIVE_USER);
+    let (_, without_profile) = fixture.load();
+    assert!(!without_profile.rejected_keys.is_empty());
+
+    for id in [
+        ProfileId::ReadOnly,
+        ProfileId::SafeLocal,
+        ProfileId::Full,
+        ProfileId::OfflinePrivate,
+    ] {
+        let name = id.as_str().to_string();
+        let (overlay, refused) = id.overlay(&fixture.data_dir).unwrap();
+        assert!(refused.is_empty(), "{name}");
+
+        // The matrix's input for this profile.
+        let mut matrix_config = Config::default();
+        matrix_config.apply_overlay_scoped(overlay.clone(), ConfigScope::Profile);
+        fixture.write_user(&fixture.select(&name));
+        let (config, report) = fixture.load();
+        assert_eq!(
+            config.profile_capabilities(),
+            matrix_config.profile_capabilities(),
+            "{name}: the hostile repository moved a matrix input"
+        );
+
+        // Over a restrictive user: the same refusals as with no profile, and
+        // the profile applied on top of the base spec 34 resolves.
+        let user = format!("{RESTRICTIVE_USER}{}", fixture.select(&name));
+        fixture.write_user(&user);
+        let (config, report_restrictive) = fixture.load();
+        assert_eq!(
+            refusal_set(&report_restrictive.rejected_keys),
+            refusal_set(&without_profile.rejected_keys),
+            "{name}"
+        );
+        assert!(report.profile_rejected_keys.is_empty(), "{name}");
+        assert!(
+            report_restrictive.profile_rejected_keys.is_empty(),
+            "{name}"
+        );
+        let mut expected = fixture.base();
+        expected.apply_overlay_scoped(ConfigOverlay::parse(&user).unwrap(), ConfigScope::User);
+        let (repository, _) = ConfigOverlay::parse_untrusted(HOSTILE_REPOSITORY);
+        expected.apply_overlay_scoped(repository, ConfigScope::Repository);
+        expected.apply_overlay_scoped(overlay, ConfigScope::Profile);
+        expected.apply_repository_allowlist(&fixture.root);
+        assert_eq!(config, expected, "{name}");
+    }
+
+    fixture.cleanup();
+}
+
 #[test]
 fn offline_private_only_lowers_the_retention_windows() {
     let fixture = profile_fixture("offline-retention");
@@ -1985,6 +2045,79 @@ fn apply_overlay_scoped_reports_what_it_applied_alongside_what_it_refused() {
     );
 }
 
+/// The view leads with a plain-language name, so a reader who does not know
+/// the config keys can read it (proposal §5.7, criterion 7). Every line
+/// `to_policy_text` can print is present here, including the ones that print
+/// only when set and the per-provider and per-server ones, so a new line
+/// without a name fails.
+#[test]
+fn every_rule_has_a_human_name() {
+    let user = concat!(
+        "agent_max_task_tokens=1000\n",
+        "mcp_server_allowlist=local|remote\n",
+        "model_provider.deepseek.base_url=https://api.deepseek.com\n",
+        "model_provider.deepseek.models=deepseek-chat\n",
+        "model_provider.deepseek.supports_native_tools=true\n",
+        "model_provider.deepseek.max_output_tokens=8192\n",
+        "model_provider.deepseek.context_token_budget=16000\n",
+        "mcp_server.local.command=/usr/local/bin/helper\n",
+        "mcp_server.local.args=--quiet\n",
+        "mcp_server.local.env=MODE=test\n",
+        "mcp_server.remote.transport=http\n",
+        "mcp_server.remote.url=https://mcp.example.com\n",
+        "mcp_server.remote.auth_token_env=REMOTE_TOKEN\n",
+    );
+    let repository = concat!(
+        "shell=./tools/sh\n",
+        "command_allowlist=make\n",
+        "model_provider.attacker.base_url=http://127.0.0.1:9\n",
+    );
+    let (config, report) = load("human-names", user, repository);
+    let policy = EffectivePolicy::from_load(&config, &report, None);
+
+    for key in [
+        "agent_max_task_tokens",
+        "mcp_server_allowlist",
+        "model_provider.deepseek.context_token_budget",
+        "mcp_server.local.env",
+        "mcp_server.remote.auth_token_env",
+    ] {
+        assert!(policy.rule(key).is_some(), "the fixture lost {key}");
+    }
+    for rule in &policy.rules {
+        assert_ne!(rule.label, rule.key, "{} has no human name", rule.key);
+        assert_eq!(
+            Some(&rule.label),
+            workspace_engine::rule_label(&rule.key).as_ref()
+        );
+    }
+    assert_eq!(
+        policy
+            .rule("mcp_server.remote.auth_token_env")
+            .unwrap()
+            .label,
+        "MCP server remote: where its token is read from"
+    );
+
+    let refused: Vec<_> = policy
+        .rules
+        .iter()
+        .flat_map(|rule| rule.refused.iter())
+        .chain(policy.other_refused.iter())
+        .map(|request| (request.key.as_str(), request.label.as_str()))
+        .collect();
+    for expected in [
+        ("shell", "Shell that runs commands"),
+        ("command_allowlist", "Commands that run without asking"),
+        ("model_provider.attacker", "Model provider attacker"),
+    ] {
+        assert!(
+            refused.contains(&expected),
+            "{expected:?} not in {refused:?}"
+        );
+    }
+}
+
 #[test]
 fn the_section_5_7_example_attributes_each_list_entry_to_its_scope() {
     let fixture = profile_fixture("sources-5-7");
@@ -2135,6 +2268,7 @@ fn a_refused_request_is_shown_by_key_and_class_never_by_value() {
         file_edits.refused,
         [RefusedRequest {
             key: "require_approval_for_file_edits".into(),
+            label: "Ask before changing files".into(),
             class: "restrict_only".into(),
             by: RefusedBy::Repository,
         }]

@@ -92,15 +92,21 @@ restart "fixes" stale-index symptoms.
 
 ### Configuration layers
 
-Three files overlay onto the built-in defaults, applied in this order. Later
-wins — **except at repository scope**, which is untrusted because that file
-arrives with a clone and can only make the policy stricter:
+Three files overlay onto the built-in defaults, then the repository's
+permission profile, applied in this order. Later wins — **except at repository
+and profile scope**. Repository scope is untrusted because that file arrives
+with a clone, and a profile exists only to narrow, so both can only make the
+policy stricter:
 
 | Order | Scope | Path | Can weaken? | Override |
 |-------|-------|------|-------------|----------|
 | 1 | User | `<data-dir>/config/user.conf` | yes | — |
 | 2 | Repository | `<repo>/.damaian/config.conf` | **no** | — |
 | 3 | Admin | `<data-dir>/config/admin.conf` | yes | `DAMAIAN_ADMIN_CONFIG` |
+| 4 | Profile | built in, or `<data-dir>/config/profiles/<name>.conf` | **no** | selected by `permission_profile.<repository_id>` in user config |
+
+With no profile selected, nothing is applied at step 4 (Full repository
+development).
 
 A missing file is skipped silently, not an error. The format is flat
 `key=value`, one per line; blank lines and `#` comments are ignored
@@ -152,6 +158,59 @@ cargo run -p damaian-cli -- config-review /path/to/repo
 
 `config-set repo` prints the same note immediately after writing a key that
 repository scope will ignore.
+
+#### Why a rule is in force
+
+Read the attributed view rather than the raw files. In the desktop app it is
+`Settings` › `General` › `Effective policy` with the repository open; from the
+CLI:
+
+```bash
+cargo run -p damaian-cli -- config-show --sources /path/to/repo
+```
+
+The desktop table names each rule in plain words with its config key
+underneath; the CLI prints the key only. Every rule names its source:
+`default`, `user config`, `repository config`,
+`admin config`, `profile: <id>`, or `this repository (Allow Always)`. List keys
+name a source per entry. When two scopes agree, the source is the last one
+whose value holds, so a repository that repeats your own restriction takes the
+attribution. `widened by admin config` marks a rule an admin value loosened. An
+admin value on a key with no direction (`audit_enabled`, `allowed_roots`,
+`secret_patterns`, `block_generated_secrets`, `command_allowlist`, …) shows
+`admin config` as its source and is never tagged.
+
+If a command, edit or diagnostic is refused and the message names a setting,
+for example `(command_access=local)`, find that key in the view: its source says
+whether the profile, your config, the repository or admin set it. The view
+describes the loaded config. A provider you pick in the composer for one
+request is not reflected.
+
+#### A permission profile key had no effect
+
+A profile only narrows. A profile key has no effect when:
+
+- **It would loosen what is already in force.** For example `command_access=all`
+  in a custom profile over a user config that set `local`. Nothing is reported
+  for this at load; import lists such keys under "Written but no effect here".
+- **A profile may not carry it.** `shell`, `data_dir`, `allowed_roots`,
+  `secret_patterns`, `audit_enabled`, `block_generated_secrets`, every `model_*`
+  key, the preference keys (`max_file_bytes`, `enable_semantic_search`, the
+  `agent_*` round limits, …), `command_allowlist`, a
+  `permission_profile.<id>` selection, and an MCP server definition. These
+  appear in the view as `Refused: the permission profile tried to change
+  “<rule>” (<key>). …`, or in `config-show --sources` as `refused: the
+  permission profile asked to set <key> (<class>)`. Each is audited once per
+  key per profile.
+
+If the selected custom profile's file is missing, the load fails with an error
+naming it rather than silently running as Full. Pick another profile, or
+restore the file.
+
+`local` blocks every `npm`, `pnpm` and `yarn` command, validation scripts
+included, because it matches command names. That is expected, not a
+misclassification; see the user guide's "What `local` and Offline private
+cannot promise".
 
 #### Where `Allow Always` entries live
 
@@ -314,6 +373,27 @@ which is repository-controlled text:
 ```bash
 jq -r 'select(.eventType=="repository_config_key_rejected") | "\(.repositoryId) \(.key) \(.class)"' ~/Library/Application\ Support/DamaianClient/audit/events.jsonl
 ```
+
+Permission profiles leave three events, none of which carries a refused or
+imported value:
+
+- `permission_profile_set` — a selection, with `repositoryId`,
+  `repositoryPath`, `from` and `to`.
+- `permission_profile_key_rejected` — a key the selected profile may not carry,
+  with `profileId`, `repositoryId`, `key` and `class`. Once per key per profile;
+  replacing a custom profile by import resets that, so the new file's refusals
+  are audited afresh.
+- `permission_profile_imported` — with `profileId`, `replaced`, and the counts
+  and key names of what was not carried and what would loosen.
+
+```bash
+jq -c 'select(.eventType|startswith("permission_profile"))' ~/Library/Application\ Support/DamaianClient/audit/events.jsonl
+```
+
+A command or browser diagnostic the profile refused when you approved it is
+recorded as `stored_command_rejected` with `rejectedBy: "profile_policy"`, or
+with `decision: "refused_by_profile"` (see
+[the refusal section](#the-assistant-was-refused-the-session-mode-the-permission-profile-or-the-command-policy)).
 
 ```bash
 tail -20 ~/Library/Application\ Support/DamaianClient/audit/events.jsonl | jq .
@@ -841,9 +921,12 @@ Effective config for a repository, with all three overlays applied:
 cargo run -p damaian-cli -- config-show /path/to/repo
 ```
 
-Omit the repo argument to see user + admin only, without repo scope. In the
-desktop app the same data is the **Effective Policy** view, and
-`GET /api/config` returns it as JSON.
+Omit the repo argument to see user + admin only, without repo scope. Add
+`--sources` to name the scope behind every value and list refused requests
+([Why a rule is in force](#why-a-rule-is-in-force)). In the desktop app the
+attributed form is the **Effective policy** table. `GET /api/config` returns
+the plain values, and `GET /api/effective-policy?repo=<path>` the attributed
+form, both as JSON.
 
 `command_allowlist` in `config-show` output is the effective list for that
 repository: the user and admin machine-wide entries plus the `Allow Always`
@@ -1036,10 +1119,10 @@ model quotes the reason back. Two refusals are expected, not bugs:
 Neither refusal writes anything to disk. A refused edit goes back to the model
 as a tool result, so it can retry within the same turn.
 
-### The assistant was refused: the session mode or the command policy?
+### The assistant was refused: the session mode, the permission profile, or the command policy?
 
-They are different boundaries (see the user guide's Working Modes section), and
-the wording tells them apart:
+They are different boundaries (see the user guide's Working Modes and
+Permission Profiles sections), and the wording tells them apart:
 
 - **A mode refusal** always names two modes: `Refused: <mode> mode does not
   allow this. Switch to <mode> mode to allow it.` It appears as a grey tool-result
@@ -1047,6 +1130,14 @@ the wording tells them apart:
   approval card is shown, because the mode forbids the action whatever you
   would answer. When a stored patch is refused at apply, the same sentence
   comes back as an `access_denied` error rather than `policy_blocked`.
+- **A profile refusal** names a setting and no mode: `Refused: the permission
+  profile does not allow this (<key>=<value>). Switching mode will not allow
+  it.` The setting is the resolved value, which your own config or the
+  repository's may also have set; [Why a rule is in force](#why-a-rule-is-in-force)
+  finds its source. When both mode and profile refuse, the mode is named.
+  A command `command_access` blocks is refused before any proposal or card in a
+  turn, and a stored proposal run by id is re-classified and blocked with
+  `Blocked by permission profile: command_access=<level>`.
 - **A command-policy refusal** names no mode. It reads `local policy blocks this
   command`, or `Command proposal is blocked by policy` at run time, and it
   happens in Code mode too.
@@ -1073,7 +1164,10 @@ Refusals leave a trace in the audit log (`audit/events.jsonl`). A command
 refused when you approve it is recorded as `stored_command_rejected` with
 `rejectedBy: "mode_policy"`. Its `actor` field still reads `user`, which is a
 known wart. A browser diagnostic refused the same way is recorded with
-`decision: "refused_by_mode"`. A refusal inside a turn, before any approval
+`decision: "refused_by_mode"`. The profile equivalents are
+`rejectedBy: "profile_policy"` and `decision: "refused_by_profile"`. Profile
+switches are `permission_profile_set` audit events, not session events, and a
+profile change takes effect at the same points as a mode change. A refusal inside a turn, before any approval
 card was shown, leaves no proposal at all. What it leaves is a failed
 `action_finished` in the session log, next to the tool-result message.
 

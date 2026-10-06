@@ -53,4 +53,15 @@ A repository cannot set `shell`, `data_dir`, `allowed_roots`, `secret_patterns`,
 
 Admin config keeps its ability to both widen and narrow: it is a local file, not something a clone carries.
 
+## Permission Profiles Narrow Only
+
+A permission profile (built in, or a custom file under `<data_dir>/config/profiles/`) is applied after user, repository and admin config, and only ever narrows the result. A profile value that would loosen what is already in force has no effect. A profile cannot carry the redirecting keys (`shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, any `model_*`), `command_allowlist`, or an MCP server definition; such keys are ignored and audited by key and class, never by value. The selection is the user's, stored in user config per checkout, so a repository cannot choose its own profile. Admin config cannot undo a narrower profile the user picked. The capability a session has is the profile intersected with the session's working mode, checked at every refusal point, and a command the profile blocks is also blocked in the command policy, so a stored proposal run by id is re-classified and refused.
+
+An exported profile contains only keys a profile may carry, so it never names a credential reference (`model_api_key_env`, an MCP server's `auth_token_env`). An imported profile is untrusted input: keys a profile cannot carry are not written, keys that would loosen are listed and, like any profile key, cannot widen anything, and importing never selects the profile.
+
+Two limits are deliberate and documented rather than hidden:
+
+- `command_access=local` means no command Damaian recognises as networked. That is a name heuristic, not a sandbox: a command Damaian does not recognise, such as `python -c` with `urllib`, can still reach the network.
+- The Offline private profile does not stop model traffic. Prompts and code in context still go to the configured model provider, and `model_base_url` is not something a profile controls. The settings view warns when that address is not loopback.
+
 The same rule covers the other untrusted repository-supplied inputs. `AGENTS.md` instructions cannot widen a working mode or grant capability, and an MCP server descriptor's tool names and descriptions are data, not instructions.
