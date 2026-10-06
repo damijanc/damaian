@@ -7,7 +7,7 @@ Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#21](21_task_plan_progress_and_budget/proposal.md) (plan state) —
 built; [#22](22_findings_model_and_panel/proposal.md) (findings) — built;
-[#24](24_repository_map_and_monorepo_boundaries.md) (the repository map) —
+[#24](24_repository_map_and_monorepo_boundaries/proposal.md) (the repository map) —
 **not built**; [#25](25_symbol_and_relationship_index.md) (the symbol index) —
 **not built**. Everything else named below is a cross-reference, not a
 prerequisite.
@@ -19,7 +19,7 @@ Related implementation specs:
 precedence), [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md)
 (plan state as a context category),
 [`22_findings_model_and_panel/proposal.md`](22_findings_model_and_panel/proposal.md) (findings as a
-category), [`24_repository_map_and_monorepo_boundaries.md`](24_repository_map_and_monorepo_boundaries.md),
+category), [`24_repository_map_and_monorepo_boundaries/`](24_repository_map_and_monorepo_boundaries/proposal.md),
 [`25_symbol_and_relationship_index.md`](25_symbol_and_relationship_index.md),
 [`27_context_inspector.md`](27_context_inspector.md) (renders the manifest this
 spec produces).

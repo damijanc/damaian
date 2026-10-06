@@ -32,7 +32,7 @@ and [`34_repository_config_trust_boundary.md`](../34_repository_config_trust_bou
 [`19_token_and_cost_accounting/proposal.md`](../19_token_and_cost_accounting/proposal.md) and
 [`21_task_plan_progress_and_budget/proposal.md`](../21_task_plan_progress_and_budget/proposal.md)
 (own the budget this defers to),
-[`24_repository_map_and_monorepo_boundaries.md`](../24_repository_map_and_monorepo_boundaries.md),
+[`24_repository_map_and_monorepo_boundaries/`](../24_repository_map_and_monorepo_boundaries/proposal.md),
 [`25_symbol_and_relationship_index.md`](../25_symbol_and_relationship_index.md) and
 [`26_context_assembly.md`](../26_context_assembly.md) (the durable versions of the
 navigation and ranged-read floor this establishes).
@@ -79,7 +79,7 @@ diagnostics runner is attached, plus discovered MCP tools.
 
 Two of these gaps have durable successors already specified — ranged context
 belongs to [#26](../26_context_assembly.md), which adds line ranges to
-`ContextItem`, and structural navigation to [#24](../24_repository_map_and_monorepo_boundaries.md)
+`ContextItem`, and structural navigation to [#24](../24_repository_map_and_monorepo_boundaries/proposal.md)
 and [#25](../25_symbol_and_relationship_index.md). **This spec is the cheap
 deterministic floor beneath them, not a substitute.** It is specified first
 because those three cannot be built by an agent that lacks it.
@@ -119,7 +119,7 @@ because those three cannot be built by an agent that lacks it.
 - Changing the approval model of [#10](../10_persistent_command_approval.md) or the
   scope rules of [#34](../34_repository_config_trust_boundary.md). Requirement 3 is
   a constraint on the design, not an invitation to revisit them.
-- Replacing [#24](../24_repository_map_and_monorepo_boundaries.md),
+- Replacing [#24](../24_repository_map_and_monorepo_boundaries/proposal.md),
   [#25](../25_symbol_and_relationship_index.md) or
   [#26](../26_context_assembly.md). Those stay as specified.
 - Removing the tool-round cap. Requirement 6 replaces a fixed count with a

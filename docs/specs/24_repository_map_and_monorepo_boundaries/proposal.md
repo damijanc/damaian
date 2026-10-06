@@ -1,20 +1,32 @@
 # Feature Spec: Repository Map and Monorepo Boundaries
 
-Status: Not started
+Status: In progress. Split into a folder and planned on 2026-10-06. Design
+unchanged from the original flat spec. Corrections where it no longer matches
+the code are in [`context.md`](context.md), not inlined here, the way specs 20,
+22 and 31 kept theirs. The most important ones:
+- commands already carry a working directory, but Allow Always and the
+  outside-root check both read it as the repository root;
+- the allowlist is per repository, so §5.5's per-root test fails today;
+- the index is in memory only, so roots are looked up rather than stamped on
+  `FileRecord`;
+- the map reaches the model as a context item, so `build_model_prompt` is
+  never edited and only Task 7 touches `chat.rs`.
+
+Read `context.md` before starting any task in [`tasks.md`](tasks.md).
 Order: 24 of 27
 Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#21](21_task_plan_progress_and_budget/proposal.md) (plan state) —
-built; [#22](22_findings_model_and_panel/proposal.md) (findings) — built.
+Depends on: [#21](../21_task_plan_progress_and_budget/proposal.md) (plan state) —
+built; [#22](../22_findings_model_and_panel/proposal.md) (findings) — built.
 Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.2
 (project indexer), section 7.4 (command approval). Related implementation specs:
-[`02_semantic_search.md`](02_semantic_search.md),
-[`11_agents_md_support.md`](11_agents_md_support.md) (the per-root precedent this
+[`02_semantic_search.md`](../02_semantic_search.md),
+[`11_agents_md_support.md`](../11_agents_md_support.md) (the per-root precedent this
 extends; instruction precedence is defined there and not redefined here),
-[`13_docker_command_support.md`](13_docker_command_support.md),
-[`23_verification_loop.md`](23_verification_loop.md) (runs the commands this
+[`13_docker_command_support.md`](../13_docker_command_support.md),
+[`23_verification_loop.md`](../23_verification_loop.md) (runs the commands this
 work package assigns to roots).
 
 ## 1. Motivation
@@ -55,7 +67,7 @@ instructions, and search results respect that boundary afterwards.
   `agent_instruction_paths` (`crates/workspace-engine/src/context_manager.rs:280-309`)
   takes the context paths and walks each one's directory ancestors, emitting an
   `AGENTS.md` candidate per level, rejecting absolute paths and `../` traversal.
-  This is the mechanism [spec 11](11_agents_md_support.md) delivered, and it is
+  This is the mechanism [spec 11](../11_agents_md_support.md) delivered, and it is
   the precedent for per-root behaviour.
 - **The index is flat and path-keyed.** `RepositoryIndex { repository_id,
   root_path, indexed_at_ms, files, skipped }`
@@ -94,7 +106,7 @@ instructions, and search results respect that boundary afterwards.
    different packages are never conflated.
 7. Root detection is explainable and manually overridable, and a correction
    persists.
-8. Instruction precedence follows [spec 11](11_agents_md_support.md). This work
+8. Instruction precedence follows [spec 11](../11_agents_md_support.md). This work
    package does not invent a second precedence rule.
 
 ## 4. Non-goals
@@ -230,7 +242,7 @@ most useful information survives a large repository:
 When anything is dropped, the rendered map says so explicitly ("12 of 47 roots
 shown"), because a silently abridged map is a map the agent will draw wrong
 conclusions from. The full map remains available to the UI and the context
-inspector ([spec 27](27_context_inspector.md)); only the rendered-for-model form
+inspector ([spec 27](../27_context_inspector.md)); only the rendered-for-model form
 is bounded.
 
 ### 5.5 Per-root command execution
@@ -238,7 +250,7 @@ is bounded.
 `detect_project_commands` is called once per detected root, with that root's
 path, and each resulting command records `working_directory: root.path`.
 
-The verification loop ([spec 23](23_verification_loop.md)) and every other
+The verification loop ([spec 23](../23_verification_loop.md)) and every other
 command path use `working_directory` when executing. Requirement 5 is then a
 property of the data rather than a rule each call site must remember.
 
@@ -319,7 +331,7 @@ files, and its commands with their working directories.
 
 Requirement 4's "the UI shows which roots a task touched" is satisfied by
 grouping the task's changed files and command runs by `root_path` in the
-completion report ([spec 23](23_verification_loop.md)).
+completion report ([spec 23](../23_verification_loop.md)).
 
 ### 5.10 Documentation
 
@@ -344,7 +356,7 @@ directory is wrongly detected, and how to read `detected_by`.
 - Roots below the depth ceiling are recorded in `excluded`, not silently
   dropped.
 - Nested `AGENTS.md` files resolve per root, matching
-  [spec 11](11_agents_md_support.md)'s rules, with no second precedence rule
+  [spec 11](../11_agents_md_support.md)'s rules, with no second precedence rule
   introduced.
 - A misdetected root corrected by the user persists across a rescan, and its
   `detected_by` reports the override.
@@ -357,7 +369,7 @@ directory is wrongly detected, and how to read `detected_by`.
   did.
 - A root cannot widen `path_policy.rs`.
 - Every quality-gate command from `AGENTS.md` passes, and the
-  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  [spec 18](../18_local_evaluation_harness/proposal.md) baseline shows no
   regression.
 
 ## 7. Implementation Notes

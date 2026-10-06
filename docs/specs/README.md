@@ -130,7 +130,7 @@ Re-derived on 2026-10-04, when [#22](22_findings_model_and_panel/proposal.md)
 was finished. Five `Depends on:` lines named #22 not built: #23, #24, #26, #32
 and #35. **Two are promoted:** [#23](23_verification_loop.md), whose other
 dependencies (#18, #21) were already built, and
-[#24](24_repository_map_and_monorepo_boundaries.md), whose other one (#21)
+[#24](24_repository_map_and_monorepo_boundaries/proposal.md), whose other one (#21)
 was. The other three still wait. #26 waits on #24 and #25, #32 on #31, and #35
 on #23 and #31. #31 is in progress, not ready. #22 also closed #21's deferred
 `Evidence::Findings`. The ready set is now #23, #24, #50, #56, #57 and the
@@ -143,13 +143,29 @@ were already built. The other three still wait. #33 waits on #26, #35 on #23,
 and #52 on #33. The ready set is now #23, #24, #32, #50, #56, #57 and the
 speculative #38.
 
-**#24 and #26 are the keystones now that #22 has landed.** #24 is ready and
+Re-checked on 2026-10-06, when [#24](24_repository_map_and_monorepo_boundaries/proposal.md)
+was planned. The ready set and the order are unchanged. #24 is in progress, so
+it leaves the ready set. Three facts about pairing it, from its
+[`context.md`](24_repository_map_and_monorepo_boundaries/context.md) §5 and §9:
+
+- **It never edits `build_model_prompt`.** The map reaches the model as a
+  `ContextItem` built in `context_manager.rs`. So #24 does not collide with
+  #55 or #49's reuse slice. #26 rewrites `build_context`, but #26 waits on
+  #24 and absorbs that item as its planned repository-map category.
+- **Only its Task 7 edits `chat.rs`.** So #24 may run beside a `chat.rs` spec
+  (#23, #32, #50, #56 or #57), except Task 7 against that spec's `chat.rs`
+  task. Its `tasks.md` says so in its Global Constraints.
+- **Its Task 5 changes `propose_detected_validations` to take the map** and
+  propose per root. #23 calls that function as its only discovery mechanism.
+  If #23 is built alongside, agree which side adapts.
+
+**#24 and #26 are the keystones now that #22 has landed.** #24 is in progress and
 sits in front of #25 and #26; the whole tail waits on #26. Preferring a spec
 that unblocks nothing over one of these costs more than it looks like it does.
 
 | | Build | Why here |
 |---|---|---|
-| 1 | **#24 → #26** | The keystone now that #22 is done: #24 is ready, and #26 is the real unlock; #25 follows #24 |
+| 1 | **#24 → #26** | The keystone now that #22 is done: #24 is in progress, and #26 is the real unlock; #25 follows #24 |
 | 2 | #23 verification | Ready now that #22 is done; the last thing in front of #35. Its loop lives in `chat.rs`, so check the parallel rule below before pairing it |
 | 3 | #32 hooks | Ready now that #31 is done; unblocks nothing, but it is the one Must-tier Phase 4 package that can start |
 | 4 | #55 compaction | Also unblocks #49's reuse slice, which is why that slice waits |
@@ -239,7 +255,7 @@ is ready.
 | 21 | [21_task_plan_progress_and_budget/](21_task_plan_progress_and_budget/proposal.md) | **Done.** Roadmap Phase 2 WP2. Ordered steps with observable evidence, so a step is never complete because the model said so, plus an enforced per-turn token ceiling using #19's accounting. Persists through #17's event log. Two model-facing tools split the authority the spec left open: `propose_plan` supplies titles only, and `complete_step` takes **no arguments by design** — the model asks to move on, the engine decides from what it observed. Planning against the code found eight statements the design assumed and the code contradicts; three changed the design: a "task" is one turn, so "per task" means per turn and a resumed turn is a *new* task whose plan is carried across explicitly; the round-budget pattern §5.4 says to copy does not stop the loop but makes one more model call, which on a grown context is the turn's most expensive — so the ceiling check moved *before* the call; and the session log had no failure outcome to read evidence from, because every tool arm recorded `"ok"` whatever the tool reported, which is the same defect that made #18's error rate 0.000 by construction. Fixing it moved that metric to 0.333 and `check_pass_rate` off a by-construction zero. Implementation found three more: the review gate cannot reuse the crash-recovery `sideEffecting` flag to decide what "mutating" means (it is conservative on purpose and would gate a sandbox-safe `ls`), so it consults the command policy instead; `renderMessages` marked *every* assistant message of a turn, so a tool-budget stop had long been rendering a duplicate row per message on reload; and `Evidence::FileRead` existed with nothing constructing one, so every reading step reported "completed unverified" while the path and hash sat in hand. `Evidence::Findings` stays deferred because #22 does not exist to produce the ids, and the acceptance criterion citing #23's fixture is restated against #18's harness as the `planned_task` scenario, which runs in CI. |
 | 22 | [22_findings_model_and_panel/](22_findings_model_and_panel/proposal.md) | **Done 2026-10-04.** Roadmap Phase 2 WP6. One `Finding` type shared by compiler, test, lint, browser and (later) review sources, with parsers that degrade to one honest generic finding rather than losing a failure, persisted in #17's session log, and a session panel to filter, open a location through #05, dismiss, or send a selected subset to the agent as a scoped repair. Numbered ahead of #23 because the type must exist before the loop that produces them. Planning against the code changed the design in seven places. §5.1's `Finding` recorded no hash for its own staleness rule, so it gained `file_hash`, and `Stale` is derived on read, never stored. Its public fields would have let a struct literal skip §5.6's redaction, so they are private, and parsers return plain drafts that one dispatcher turns into findings. Redaction runs before the bound, or a cut key escapes the scanner. A generic finding needed a source of its own, `Command`, so a reader can tell it from a parsed one, and a failed browser scenario step needed `BrowserScenario`. The old recording task was split, so persistence and the `chat.rs` wiring were reviewed apart. "Fix selected" bypasses the shell's edit-request heuristic, which would otherwise have sent the repair to the one-shot patch flow. #12 had already built the browser structure as `WebDiagnosticDetails`, so §5.4's `entries` was never added. Real captures changed two parser rules: a run whose parser found only warnings still gets the generic finding, and `cargo test` reports diagnostics and failing tests together. Of eight captured failing runs, two fell through to the generic finding (a crashed test binary and `cargo nextest`). It also closed #21's deferred `Evidence::Findings`, which links a step to its findings and never decides its status. |
 | 23 | [23_verification_loop.md](23_verification_loop.md) | **Not started.** Roadmap Phase 2 WP3. Sequences apply → discover checks → run → find → repair → rerun → report, driven by the orchestrator rather than the model, so a completion report distinguishes verified from assumed. Consumes #21 and #22. |
-| 24 | [24_repository_map_and_monorepo_boundaries.md](24_repository_map_and_monorepo_boundaries.md) | **Not started.** Roadmap Phase 3 WP2. A deterministic, token-bounded map of project roots, plus per-root working directories so a command discovered in `packages/api` runs there. Reuses `detect_project_commands`' manifest list per root rather than inventing a second one. |
+| 24 | [24_repository_map_and_monorepo_boundaries/](24_repository_map_and_monorepo_boundaries/proposal.md) | **In progress.** Split into a folder and planned on 2026-10-06; see `tasks.md` for the nine-task breakdown, and `context.md` for where the code contradicted the design (a command's working directory already exists but is read as the repository root by Allow Always and the outside-root check, and the allowlist is per repository rather than per root). Roadmap Phase 3 WP2. A deterministic, token-bounded map of project roots, plus per-root working directories so a command discovered in `packages/api` runs there. Reuses `detect_project_commands`' manifest list per root rather than inventing a second one. |
 | 25 | [25_symbol_and_relationship_index.md](25_symbol_and_relationship_index.md) | **Not started.** Roadmap Phase 3 WP3. A rescope, not greenfield: `FileRecord.symbols`/`imports` already exist as prefix heuristics. Adds locations, kinds, relationships, and a `Provenance` label separating language-server fact from heuristic guess. Satisfies Phase 2's deferred LSP dependency. |
 | 26 | [26_context_assembly.md](26_context_assembly.md) | **Not started.** Roadmap Phase 3 WP4. Replaces the single first-come-first-served budget with per-category allocation, range deduplication, and a manifest recording what was excluded and why. Adds line ranges to `ContextItem`, without which two of its requirements are unexpressible. |
 | 27 | [27_context_inspector.md](27_context_inspector.md) | **Not started.** Roadmap Phase 3 WP5. Renders #26's manifest pre- and post-send, and adds pins and path restrictions. Makes "the user can see what context the agent uses" true; Phase 3b's memory arrives as one more category in this view. |
