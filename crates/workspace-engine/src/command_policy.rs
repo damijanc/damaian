@@ -84,18 +84,45 @@ impl CommandPolicy {
         &self.config
     }
 
+    /// Classifies a command run at the repository root. Every caller that
+    /// predates spec 24 passes the root, so this is [`Self::classify_at`]
+    /// with the two halves of the location equal.
     pub fn classify(&self, command: &str, working_directory: &Path) -> CommandClassification {
-        let mut classification = self.classify_pattern(command);
+        self.classify_at(command, working_directory, working_directory)
+    }
+
+    /// Classifies a command run in `working_directory`, inside the repository
+    /// at `repository_root` (spec 24 `context.md` §1). Relative paths in the
+    /// command resolve against the directory, but containment is checked
+    /// against the repository root, and a directory other than the root only
+    /// matches allowlist entries qualified with it (`context.md` §2). So a
+    /// root changes where a command runs, never what it may reach or whether
+    /// it needs approval.
+    pub fn classify_at(
+        &self,
+        command: &str,
+        repository_root: &Path,
+        working_directory: &Path,
+    ) -> CommandClassification {
+        let location = relative_location(repository_root, working_directory);
+        let mut classification = self.classify_pattern(command, location.as_deref());
+        if !classification.blocked && location.is_none() {
+            escalate(
+                &mut classification,
+                "Working directory is outside the selected repository",
+            );
+        }
         if !classification.blocked
-            && references_path_outside_root(&classification.command, working_directory)
+            && references_path_outside_root(
+                &classification.command,
+                repository_root,
+                working_directory,
+            )
         {
-            classification.requires_approval = true;
-            if classification.risk == CommandRisk::Low {
-                classification.risk = CommandRisk::Medium;
-            }
-            classification
-                .reasons
-                .push("Command references a path outside the selected repository".to_string());
+            escalate(
+                &mut classification,
+                "Command references a path outside the selected repository",
+            );
         }
         // After the whole classification, so the block never has to invent a
         // risk (spec 31 proposal §4) and sees the outside-root approval, the way
@@ -113,7 +140,9 @@ impl CommandPolicy {
         classification
     }
 
-    fn classify_pattern(&self, command: &str) -> CommandClassification {
+    /// `location` is the working directory relative to the repository root:
+    /// `Some("")` at the root, `None` outside the repository.
+    fn classify_pattern(&self, command: &str, location: Option<&str>) -> CommandClassification {
         let normalized = command.trim().to_string();
 
         if configured_prefix_matches(&self.config.command_blocklist, &normalized)
@@ -144,7 +173,15 @@ impl CommandPolicy {
             };
         }
 
-        if configured_exact_matches(&self.config.command_allowlist, &normalized) {
+        let allowlisted = match location {
+            Some("") => configured_exact_matches(&self.config.command_allowlist, &normalized),
+            Some(relative) => configured_exact_matches(
+                &self.config.command_allowlist,
+                &root_qualified_allowlist_entry(relative, &normalized),
+            ),
+            None => false,
+        };
+        if allowlisted {
             return CommandClassification {
                 command: normalized,
                 risk: CommandRisk::Low,
@@ -307,6 +344,42 @@ pub(crate) fn command_access_permits(
     }
 }
 
+fn escalate(classification: &mut CommandClassification, reason: &str) {
+    classification.requires_approval = true;
+    if classification.risk == CommandRisk::Low {
+        classification.risk = CommandRisk::Medium;
+    }
+    classification.reasons.push(reason.to_string());
+}
+
+/// The allowlist entry that authorises `command` in the directory `relative`
+/// to the repository root, and nowhere else (spec 24 `context.md` §2).
+///
+/// The form cannot match a command anyone types: it contains `&&`, and
+/// `classify_pattern` returns at the shell-control gate before it consults
+/// the allowlist. So it only ever matches through this function, and it
+/// still reads in the Settings policy view as the command it authorises.
+pub(crate) fn root_qualified_allowlist_entry(relative: &str, command: &str) -> String {
+    format!("cd {relative} && {command}")
+}
+
+/// `working_directory` relative to `repository_root`, with `/` separators,
+/// computed lexically like the outside-root check. `Some("")` is the root
+/// itself, and `None` means the directory is outside the repository.
+pub(crate) fn relative_location(
+    repository_root: &Path,
+    working_directory: &Path,
+) -> Option<String> {
+    let root = normalize_lexically(repository_root);
+    let directory = normalize_lexically(working_directory);
+    let relative = directory.strip_prefix(&root).ok()?;
+    let parts: Vec<String> = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    Some(parts.join("/"))
+}
+
 fn configured_prefix_matches(patterns: &[String], command: &str) -> bool {
     patterns.iter().any(|pattern| command.starts_with(pattern))
 }
@@ -432,7 +505,13 @@ fn may_use_network(command: &str) -> bool {
 
 // Heuristic, not a security boundary: shell commands aren't sandboxed by path, so this only
 // flags likely out-of-repo path arguments for the approval prompt shown to the user.
-fn references_path_outside_root(command: &str, working_directory: &Path) -> bool {
+// Relative tokens resolve against the working directory, but the boundary is
+// always the repository root: a sub-root never narrows or widens it.
+fn references_path_outside_root(
+    command: &str,
+    repository_root: &Path,
+    working_directory: &Path,
+) -> bool {
     command
         .split_whitespace()
         .flat_map(|token| {
@@ -442,10 +521,10 @@ fn references_path_outside_root(command: &str, working_directory: &Path) -> bool
                 _ => vec![token],
             }
         })
-        .any(|token| token_escapes_root(token, working_directory))
+        .any(|token| token_escapes_root(token, repository_root, working_directory))
 }
 
-fn token_escapes_root(token: &str, working_directory: &Path) -> bool {
+fn token_escapes_root(token: &str, repository_root: &Path, working_directory: &Path) -> bool {
     if token.is_empty() || token.starts_with('-') {
         return false;
     }
@@ -461,7 +540,7 @@ fn token_escapes_root(token: &str, working_directory: &Path) -> bool {
     } else {
         working_directory.join(candidate)
     };
-    !normalize_lexically(&absolute).starts_with(normalize_lexically(working_directory))
+    !normalize_lexically(&absolute).starts_with(normalize_lexically(repository_root))
 }
 
 fn normalize_lexically(path: &Path) -> PathBuf {
@@ -535,25 +614,42 @@ mod tests {
     #[test]
     fn detects_relative_traversal_outside_root() {
         let root = Path::new("/Users/example/project");
-        assert!(references_path_outside_root("cat ../secrets/id_rsa", root));
-        assert!(references_path_outside_root("ls ../../other-project", root));
+        assert!(references_path_outside_root(
+            "cat ../secrets/id_rsa",
+            root,
+            root
+        ));
+        assert!(references_path_outside_root(
+            "ls ../../other-project",
+            root,
+            root
+        ));
     }
 
     #[test]
     fn detects_absolute_path_outside_root() {
         let root = Path::new("/Users/example/project");
-        assert!(references_path_outside_root("cat /etc/passwd", root));
-        assert!(references_path_outside_root("cat ~/secrets.txt", root));
+        assert!(references_path_outside_root("cat /etc/passwd", root, root));
+        assert!(references_path_outside_root(
+            "cat ~/secrets.txt",
+            root,
+            root
+        ));
     }
 
     #[test]
     fn does_not_flag_paths_inside_root() {
         let root = Path::new("/Users/example/project");
-        assert!(!references_path_outside_root("cat src/main.rs", root));
+        assert!(!references_path_outside_root("cat src/main.rs", root, root));
         assert!(!references_path_outside_root(
             "cat /Users/example/project/src/main.rs",
+            root,
             root
         ));
-        assert!(!references_path_outside_root("git status --short", root));
+        assert!(!references_path_outside_root(
+            "git status --short",
+            root,
+            root
+        ));
     }
 }

@@ -1,7 +1,8 @@
 use crate::audit::AuditLog;
 use crate::cancel::CancelToken;
 use crate::command_policy::{
-    CommandClassification, CommandPolicy, CommandRisk, allow_always_eligible,
+    CommandClassification, CommandPolicy, CommandRisk, allow_always_eligible, relative_location,
+    root_qualified_allowlist_entry,
 };
 use crate::command_runner::{CommandExecution, CommandRunOptions, CommandRunner};
 use crate::config::ConfigOverlay;
@@ -15,6 +16,9 @@ pub struct CommandProposal {
     pub id: String,
     pub command: String,
     pub working_directory: String,
+    /// The repository the command belongs to. Equal to `working_directory`
+    /// unless the command runs in a sub-root (spec 24 `context.md` §1).
+    pub repository_root: String,
     pub reason: String,
     pub risk: CommandRisk,
     pub requires_approval: bool,
@@ -165,8 +169,22 @@ impl ValidationOrchestrator {
         working_directory: impl AsRef<Path>,
         command: &str,
     ) -> CommandClassification {
-        self.command_policy
-            .classify(command, working_directory.as_ref())
+        self.classify_command_at(&working_directory, &working_directory, command)
+    }
+
+    /// [`Self::classify_command`] for a command run in `working_directory`
+    /// inside the repository at `repository_root`.
+    pub fn classify_command_at(
+        &self,
+        repository_root: impl AsRef<Path>,
+        working_directory: impl AsRef<Path>,
+        command: &str,
+    ) -> CommandClassification {
+        self.command_policy.classify_at(
+            command,
+            repository_root.as_ref(),
+            working_directory.as_ref(),
+        )
     }
 
     pub fn propose_command(
@@ -175,11 +193,26 @@ impl ValidationOrchestrator {
         command: &str,
         reason: &str,
     ) -> Result<CommandProposal> {
-        let classification = self
-            .command_policy
-            .classify(command, working_directory.as_ref());
-        let proposal =
-            proposal_from_classification(working_directory.as_ref(), reason, classification);
+        self.propose_command_at(&working_directory, &working_directory, command, reason)
+    }
+
+    /// Stores a proposal to run `command` in `working_directory`, inside the
+    /// repository at `repository_root`.
+    pub fn propose_command_at(
+        &self,
+        repository_root: impl AsRef<Path>,
+        working_directory: impl AsRef<Path>,
+        command: &str,
+        reason: &str,
+    ) -> Result<CommandProposal> {
+        let classification =
+            self.classify_command_at(&repository_root, &working_directory, command);
+        let proposal = proposal_from_classification(
+            repository_root.as_ref(),
+            working_directory.as_ref(),
+            reason,
+            classification,
+        );
         self.command_store.save_proposal(&proposal)?;
         self.audit_log.record(
             "command_proposal_stored",
@@ -188,6 +221,7 @@ impl ValidationOrchestrator {
                 ("proposalId", proposal.id.clone()),
                 ("command", proposal.command.clone()),
                 ("workingDirectory", proposal.working_directory.clone()),
+                ("repositoryRoot", proposal.repository_root.clone()),
                 ("risk", proposal.risk.as_str().to_string()),
                 ("requiresApproval", proposal.requires_approval.to_string()),
                 ("blocked", proposal.blocked.to_string()),
@@ -235,8 +269,9 @@ impl ValidationOrchestrator {
                 "Command proposal requires explicit approval before execution".to_string(),
             ));
         }
-        let execution = self.command_runner.run(
+        let execution = self.command_runner.run_at(
             &proposal.command,
+            &proposal.repository_root,
             &proposal.working_directory,
             &proposal.reason,
             CommandRunOptions {
@@ -272,13 +307,15 @@ impl ValidationOrchestrator {
     /// indistinguishable from one that arrived with a clone — which is how a
     /// repository could allow its own commands (spec 34 §5.4). The id is per
     /// checkout, so a grant does not transfer to another clone of the same
-    /// project. Returns the path written.
+    /// project. A proposal made in a sub-root stores the root-qualified entry
+    /// under the repository's id (spec 24 `context.md` §2), so the grant
+    /// authorises that directory only. Returns the path written.
     ///
     /// The caller is expected to run the command afterwards: this only records
     /// the decision.
     pub fn allow_command_always(&self, proposal_id: &str, approved_by: &str) -> Result<PathBuf> {
         let proposal = self.command_store.load_proposal(proposal_id)?;
-        let repository_root = PathBuf::from(&proposal.working_directory);
+        let repository_root = PathBuf::from(&proposal.repository_root);
 
         // Deliberately the config this orchestrator was built with, not a
         // fresh load from disk: the answer here must match the policy that
@@ -306,7 +343,20 @@ impl ValidationOrchestrator {
             .remove(&repository_id)
             .unwrap_or_default();
 
-        let command = proposal.command.trim().to_string();
+        let command = proposal.command.trim();
+        let command =
+            match relative_location(&repository_root, Path::new(&proposal.working_directory)) {
+                Some(relative) if relative.is_empty() => command.to_string(),
+                Some(relative) => root_qualified_allowlist_entry(&relative, command),
+                // No entry could ever match there (`classify_pattern`), so a
+                // grant would be a click that does nothing.
+                None => {
+                    return Err(ClientError::PolicyBlocked(format!(
+                        "Command runs outside its repository and cannot be permanently allowed: {}",
+                        proposal.command
+                    )));
+                }
+            };
         let already_allowed = allowlist.iter().any(|entry| entry.trim() == command);
         if !already_allowed {
             allowlist.push(command.clone());
@@ -354,6 +404,7 @@ impl ValidationOrchestrator {
 }
 
 fn proposal_from_classification(
+    repository_root: &Path,
     working_directory: &Path,
     reason: &str,
     classification: CommandClassification,
@@ -362,6 +413,7 @@ fn proposal_from_classification(
         id: create_id("cmdprop"),
         command: classification.command,
         working_directory: working_directory.to_string_lossy().to_string(),
+        repository_root: repository_root.to_string_lossy().to_string(),
         reason: reason.to_string(),
         risk: classification.risk,
         requires_approval: classification.requires_approval,
@@ -419,6 +471,9 @@ fn serialize_proposal(proposal: &CommandProposal) -> String {
         &proposal.created_at_ms.to_string(),
     );
     write_field(&mut output, "STATUS", &proposal.status);
+    // Last, so a reader can treat it as optional: proposals stored before
+    // spec 24 end at `STATUS`.
+    write_field(&mut output, "REPOSITORY_ROOT", &proposal.repository_root);
     output.push_str("END_COMMAND_PROPOSAL\n");
     output
 }
@@ -445,10 +500,17 @@ fn deserialize_proposal(raw: &str) -> Result<CommandProposal> {
         .parse()
         .map_err(|_| ClientError::InvalidInput("Invalid command proposal timestamp".to_string()))?;
     let status = cursor.read_field("STATUS")?;
+    // Every proposal stored before spec 24 ran at the repository root.
+    let repository_root = if cursor.next_field_is("REPOSITORY_ROOT") {
+        cursor.read_field("REPOSITORY_ROOT")?
+    } else {
+        working_directory.clone()
+    };
     Ok(CommandProposal {
         id,
         command,
         working_directory,
+        repository_root,
         reason,
         risk,
         requires_approval,
@@ -576,6 +638,10 @@ impl<'a> Cursor<'a> {
             self.position += 1;
         }
         Ok(value)
+    }
+
+    fn next_field_is(&self, name: &str) -> bool {
+        self.raw[self.position..].starts_with(&format!("{name} "))
     }
 
     fn read_line(&mut self) -> Result<String> {

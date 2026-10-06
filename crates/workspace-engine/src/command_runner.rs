@@ -184,6 +184,7 @@ impl CommandRunner {
         }
     }
 
+    /// Runs a command at the repository root.
     pub fn run(
         &self,
         command: &str,
@@ -191,7 +192,23 @@ impl CommandRunner {
         reason: &str,
         options: CommandRunOptions<'_>,
     ) -> Result<CommandExecution> {
-        let classification = self.command_policy.classify(command, cwd.as_ref());
+        self.run_at(command, cwd.as_ref(), cwd.as_ref(), reason, options)
+    }
+
+    /// Runs a command in `cwd`, re-classifying it at the location pair so
+    /// the check here is the one the proposal was judged by (spec 24
+    /// `context.md` §1).
+    pub fn run_at(
+        &self,
+        command: &str,
+        repository_root: impl AsRef<Path>,
+        cwd: impl AsRef<Path>,
+        reason: &str,
+        options: CommandRunOptions<'_>,
+    ) -> Result<CommandExecution> {
+        let classification =
+            self.command_policy
+                .classify_at(command, repository_root.as_ref(), cwd.as_ref());
         self.audit_log.record(
             "command_proposed",
             &[
