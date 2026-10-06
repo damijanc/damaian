@@ -53,6 +53,20 @@ pub struct ProjectCommand {
     pub risk: CommandRisk,
 }
 
+/// Every manifest that gives a directory project commands, in the order
+/// `detect_project_commands` checks them. Root detection (spec 24) reads this
+/// list, so a directory is a root exactly when it has something to run. A
+/// test ties the two together (`every_root_manifest_gives_its_directory_a_command`).
+pub const PROJECT_MANIFESTS: [&str; 7] = [
+    "package.json",
+    "pyproject.toml",
+    "pytest.ini",
+    "pom.xml",
+    "build.gradle",
+    "go.mod",
+    "Cargo.toml",
+];
+
 #[derive(Debug, Clone)]
 pub struct CommandPolicy {
     config: Config,
