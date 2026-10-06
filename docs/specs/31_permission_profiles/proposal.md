@@ -1,12 +1,13 @@
 # Feature Spec: Permission Profiles
 
-Status: In progress. Split into a folder and planned on 2026-09-30. Design
-unchanged from the original flat spec. Corrections where it no longer matches
-the code are in [`context.md`](context.md), not inlined here, the way specs 20
-and 22 kept theirs. The most important ones: [spec 34](../34_repository_config_trust_boundary.md)
-has already built most of §5.2, the profiles in §5.5 need capability keys that
-do not exist yet, and enforcing §5.6 touches `chat.rs`. Read `context.md` before
-starting any task in [`tasks.md`](tasks.md).
+Status: Done (2026-10-06). Every acceptance criterion in §6 is met except
+criterion 7, the second-person review, which the project owner waived (§7.3).
+Built in nine tasks ([`tasks.md`](tasks.md)). Corrections where this proposal no
+longer matches the code are in [`context.md`](context.md), not inlined here, the
+way specs 20 and 22 kept theirs. The most important ones:
+[spec 34](../34_repository_config_trust_boundary.md) built most of §5.2, the
+profiles in §5.5 needed four new capability keys, and enforcing §5.6 touches
+`chat.rs`.
 Order: 31 of 33
 Plan: `docs/PLAN/04_phase_4_customization_and_extensibility.md`, Phase 4,
 Work Package 3 (Must). That directory is local-only and not committed, so the
@@ -415,7 +416,7 @@ Numbered in §6's order. Tests are in
 | 4 | Every refused widening is audited | Repository scope: `rejected_repository_keys_are_audited_with_their_class_and_without_their_value` (spec 34). Profile scope: `profile_refusals_stay_out_of_the_repository_notice_and_are_audited_once`, and in the shell `a_custom_profiles_refused_keys_are_audited_when_the_shell_shows_it`. Import: `an_import_lists_what_it_will_not_apply_and_writes_only_profile_keys` (`permission_profile_imported` with key names, no values). A refusal at resume is audited as `profile_policy` / `refused_by_profile` (`a_command_paused_under_full_is_refused_at_resume_after_switching_to_read_only`, and `chat.rs`'s two resume tests) |
 | 5 | Admin can widen and narrow; every admin-sourced widening is attributed | `admin_config_can_still_widen_and_narrow` (spec 34), `an_admin_widening_is_marked_and_an_admin_narrowing_is_not`, `admin_can_widen_the_base_but_not_undo_the_users_profile`. **Met as attributed, not always tagged:** an admin value on a key with no restrict-only direction (`audit_enabled`, `allowed_roots`, `secret_patterns`, `block_generated_secrets`, `command_allowlist`, …) is attributed to `admin config` but never tagged "widened by admin config" (Task 6, deviation 4). Checked by hand on 2026-10-06: an admin `audit_enabled=false` prints `[admin config]` with no tag. The user guide says to read `admin config` as "your administrator decided this" |
 | 6 | The view names the source of every rule and shows refused requests | `the_section_5_7_example_attributes_each_list_entry_to_its_scope`, `a_refused_request_is_shown_by_key_and_class_never_by_value`, `the_effective_policy_agrees_with_load_scoped_for_every_key`; over the wire, `get_effective_policy_serves_the_attributed_policy_without_a_refused_value` (`desktop-shell`). A refused request is shown by key and class, never by value (`context.md` §8). Every rule also has a plain-language name (`every_rule_has_a_human_name`, §7.3) |
-| 7 | A second person can read the view and state what the session may do | §7.3. **Not yet done** |
+| 7 | A second person can read the view and state what the session may do | **Not met: waived by the project owner** (§7.3). Their own reading led to plain-language rule names, pinned by `every_rule_has_a_human_name` |
 | 8 | An unclassified new field fails to compile | Not testable as a test. `classify_overlay_fields!`, `apply_overlay_scoped`, `to_policy_text` and `split_profile_keys` all destructure `ConfigOverlay` with no `..`. Task 1's mutation 3 (`pub probe: Option<bool>`) broke the build in three places |
 | 9 | The matrix passes across every profile × every tool class, extending spec 20's | `the_permission_matrix_matches_the_spec_table` (`mode.rs`): 17 tool-class rows × 4 modes × the 4 built-ins from their real overlays; the Full column must equal `mode_permits`. A custom profile has no fixed row; it reaches the same `profile_permits` through its resolved capabilities |
 | 10 | `profile ∩ mode` holds both ways | `ask_under_full_cannot_edit_and_the_refusal_names_the_mode`, `code_under_read_only_cannot_edit_and_the_refusal_names_the_profile` |
@@ -445,8 +446,13 @@ Run in Task 9's worktree on the final tree, except where noted.
 
 ### 7.3 Second-person review (§5.7, criterion 7)
 
-**Not yet done.** On 2026-10-06 no reviewer was available, so the spec stays
-In progress and this criterion is open.
+**Not met: waived by the project owner on 2026-10-06.** No reviewer was
+available, and the owner said there will be none, so the spec was closed
+without the review this criterion asks for. The only reading the view has had
+is the owner's own, below. It found a real problem, which was fixed, but the
+owner is not the cold reader the criterion describes. If someone who did not
+build Damaian ever reads this view, the steps below set the review up, and
+their answer belongs here.
 
 **A first reading, by the project owner (2026-10-06).** They did not build
 the view, but they are not the cold reader the criterion asks for. Their
@@ -465,8 +471,7 @@ config key. Fixed the same day:
 
 The rule `require_approval_for_risky_commands` is now named "Ask before test,
 build and lint commands", which is what it controls (`is_validation_command`).
-That also removes the misread anticipated below. The review itself still has to
-happen with the new view.
+That also removes the misread anticipated below.
 
 To set it up again:
 
@@ -526,5 +531,19 @@ Also record:
   what they misread if it did not. That is the work package's real acceptance
   test.
 
-Both are answered when the review in §7.3 has happened. Until then the spec
-stays In progress.
+Answers, 2026-10-06:
+
+- **Repositories carrying a widening entry: none of the 10 in this
+  installation's real use.** The owner's audit log
+  (`~/Library/Application Support/DamaianClient/audit/events.jsonl`) records
+  `repository_indexed` for 10 distinct repositories and no
+  `repository_config_key_rejected` event at all. So no repository config has
+  tried to set a key it may not, and spec 34's notice and allowlist migration
+  have never fired here. On this evidence the review prompt is a rare event,
+  not a routine annoyance. The sample is one person's repositories, so this
+  says little about cloned third-party code, which is the case the boundary
+  exists for.
+- **The second-person review did not happen** (§7.3). The owner's own reading
+  failed on legibility: rules named only by config key were confusing. That
+  was fixed with plain-language names before close. Whether a cold reader can
+  state what the session may do is untested.
