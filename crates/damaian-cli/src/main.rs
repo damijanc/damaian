@@ -3,12 +3,13 @@ use std::io::IsTerminal;
 use std::path::Path;
 use workspace_engine::{
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, CommandProposal, CommandRisk, Config, ConfigOverlay,
-    ConfigScope, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, MockModelAdapter,
-    OpenAICompatibleAdapter, ProcessRegistry, ProfileId, ReadWindow, RootOverrideEdit,
-    SearchResult, WorkspaceEngine, command_approval_prompt, edit_root_overrides,
-    ensure_data_dir_schema, export_profile, import_profile, parse_hunk_selection, patch_diff_text,
-    patch_hunk_summary, profile_import_base, render_markdown_to_ansi, review_profile_import,
-    review_profile_rejections, select_profile,
+    ConfigScope, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExclusionReason, MapLoad,
+    MockModelAdapter, OpenAICompatibleAdapter, ProcessRegistry, ProfileId, ReadWindow,
+    RebuildReason, RepositoryMap, RootEvidence, RootOverride, RootOverrideEdit, SearchResult,
+    WorkspaceEngine, command_approval_prompt, edit_root_overrides, ensure_data_dir_schema,
+    export_profile, import_profile, parse_hunk_selection, patch_diff_text, patch_hunk_summary,
+    profile_import_base, render_markdown_to_ansi, review_profile_import, review_profile_rejections,
+    select_profile,
 };
 
 fn usage() -> &'static str {
@@ -21,6 +22,7 @@ fn usage() -> &'static str {
   damaian git-status <repo>
   damaian git-diff <repo>
   damaian detect-commands <repo>
+  damaian repo-map <repo> [--json]
   damaian classify-command <command>
   damaian config-show [--sources] [repo]
   damaian config-review <repo>
@@ -33,7 +35,7 @@ fn usage() -> &'static str {
   damaian profile-import <custom-name> <file> [--repo <repo>] [--replace] [--review]
   damaian repo-root <repo> add|remove|clear <path>
   damaian propose-command <repo> <command>
-  damaian propose-validations <repo>
+  damaian propose-validations <repo>     (each root's commands, run in that root)
   damaian run-command <proposal-id> --approve [--always]
   damaian reject-command <proposal-id>
   damaian ask <repo> <prompt>
@@ -280,12 +282,28 @@ fn run() -> workspace_engine::Result<()> {
             print!("{}", command_approval_prompt(&proposal));
             println!("{}", command_proposal_json(&proposal));
         }
+        "repo-map" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let json = args.iter().skip(2).any(|arg| arg == "--json");
+            let engine = engine_for_repo(repo)?;
+            let (map, load) = engine.repository_map(repo)?;
+            if json {
+                println!(
+                    "{{\"load\":{},\"map\":{}}}",
+                    map_load_json(&load),
+                    map.to_json()
+                );
+            } else {
+                print!("{}", repository_map_summary(&map, &load));
+            }
+        }
         "propose-validations" => {
             let repo = require_arg(&args, 1, "<repo>")?;
             let engine = engine_for_repo(repo)?;
+            let (map, _) = engine.repository_map(repo)?;
             let proposals = engine
                 .validation_orchestrator
-                .propose_detected_validations(repo)?;
+                .propose_detected_validations(repo, &map)?;
             println!(
                 "[{}]",
                 proposals
@@ -891,6 +909,83 @@ fn search_results_json(results: &[SearchResult]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{body}]")
+}
+
+fn map_load_json(load: &MapLoad) -> String {
+    match load {
+        MapLoad::Reused => "{\"outcome\":\"reused\"}".to_string(),
+        MapLoad::Built => "{\"outcome\":\"built\"}".to_string(),
+        MapLoad::Rebuilt { reason } => match reason {
+            RebuildReason::SchemaMismatch { found } => format!(
+                "{{\"outcome\":\"rebuilt\",\"reason\":\"{}\",\"foundSchemaVersion\":{found}}}",
+                reason.as_str()
+            ),
+            _ => format!(
+                "{{\"outcome\":\"rebuilt\",\"reason\":\"{}\"}}",
+                reason.as_str()
+            ),
+        },
+    }
+}
+
+/// One line per root and per exclusion, after a line saying whether the
+/// stored map was reused or why it was rebuilt.
+fn repository_map_summary(map: &RepositoryMap, load: &MapLoad) -> String {
+    let mut output = match load {
+        MapLoad::Reused => "map reused (inputs unchanged)\n".to_string(),
+        MapLoad::Built => "map built (none stored)\n".to_string(),
+        MapLoad::Rebuilt { reason } => match reason {
+            RebuildReason::Corrupt => "map rebuilt: the stored map was unreadable\n".to_string(),
+            RebuildReason::SchemaMismatch { found } => format!(
+                "map rebuilt: the stored map was schema version {found}, this build reads {}\n",
+                map.schema_version
+            ),
+            RebuildReason::Stale => {
+                "map rebuilt: the repository or its config changed\n".to_string()
+            }
+        },
+    };
+    output.push_str(&format!("{} roots\n", map.roots.len()));
+    for root in &map.roots {
+        let path = if root.path.is_empty() {
+            "."
+        } else {
+            &root.path
+        };
+        let evidence = match &root.detected_by {
+            RootEvidence::RepositoryRoot => "repository root".to_string(),
+            RootEvidence::Manifest { path } => path.clone(),
+            RootEvidence::UserOverride => "added by you".to_string(),
+        };
+        if root.user_override == Some(RootOverride::Removed) {
+            output.push_str(&format!("  {path}  ({evidence}, removed by you)\n"));
+            continue;
+        }
+        let commands = root
+            .commands
+            .iter()
+            .map(|command| command.command.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!(
+            "  {path}  ({evidence})  languages: {}  commands: {}\n",
+            or_none(&root.languages.join(", ")),
+            or_none(&commands)
+        ));
+    }
+    for excluded in &map.excluded {
+        let reason = match excluded.reason {
+            ExclusionReason::Vendor => "vendor or build output",
+            ExclusionReason::BelowDepthCeiling => "below the depth ceiling",
+            ExclusionReason::InvalidOverride => "override not applied",
+        };
+        output.push_str(&format!("  excluded {}  ({reason})\n", excluded.path));
+    }
+    output
+}
+
+fn or_none(value: &str) -> &str {
+    if value.is_empty() { "none" } else { value }
 }
 
 fn risk_json(risk: &CommandRisk) -> &'static str {

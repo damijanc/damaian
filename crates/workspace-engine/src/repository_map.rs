@@ -5,14 +5,19 @@
 //! exactly the ignore, size and symlink rules the index does, and it is a
 //! pure function of the index's paths (`context.md` §3).
 
+use crate::audit::AuditLog;
 use crate::command_policy::{CommandPolicy, CommandRisk, PROJECT_MANIFESTS};
-use crate::config::ConfigOverlay;
+use crate::config::{Config, ConfigOverlay};
 use crate::context_manager::{AGENT_INSTRUCTIONS_FILE, agent_instruction_paths};
-use crate::hash::{now_millis, sha256};
+use crate::error::{ClientError, Result};
+use crate::hash::{create_id, now_millis, sha256};
 use crate::indexer::{RepositoryIndex, SkippedFile};
 use crate::path_policy::PathPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 /// Bumped whenever the map's shape or derivation changes, so a persisted
 /// map from an older build is rebuilt rather than trusted (§5.8).
@@ -285,18 +290,8 @@ impl RepositoryMap {
     /// disagree about which repository config is in effect.
     pub fn build(index: &RepositoryIndex, policy: &CommandPolicy) -> Self {
         let config = policy.config();
-        let mut detection = detect_roots(
-            index.files.iter().map(|file| file.path.as_str()),
-            &index.skipped,
-        );
         let indexed: BTreeSet<&str> = index.files.iter().map(|file| file.path.as_str()).collect();
-        let overrides = apply_overrides(
-            &mut detection,
-            &config.project_roots_added,
-            &config.project_roots_removed,
-            &indexed,
-            &PathPolicy::new(config),
-        );
+        let (detection, overrides) = detect_with_overrides(index, &indexed, config);
         // A removed root is not a root for ownership, so its files, its
         // directory and its vendor output go to the nearest root that is
         // not removed. `active[i]` is the position in `roots` of
@@ -399,15 +394,18 @@ impl RepositoryMap {
             repository_id: index.repository_id.clone(),
             schema_version: REPOSITORY_MAP_SCHEMA_VERSION,
             generated_at_ms: now_millis(),
-            fingerprint: fingerprint(
-                index,
-                &detection.excluded,
-                &config.project_roots_added,
-                &config.project_roots_removed,
-            ),
+            fingerprint: fingerprint(index, &detection.excluded, config),
             roots,
             excluded: detection.excluded,
         }
+    }
+
+    /// The map as the JSON the map file holds, for callers with no serde of
+    /// their own (the CLI).
+    pub fn to_json(&self) -> String {
+        // Every field is a string, a number, a vector or a unit-tagged enum,
+        // none of which can fail to serialise.
+        serde_json::to_string_pretty(self).expect("a repository map always serialises")
     }
 
     /// The root that owns `path`: the longest root that is a path-segment
@@ -424,17 +422,188 @@ impl RepositoryMap {
     }
 }
 
+/// How [`RepositoryMapStore::load_or_build`] got its map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapLoad {
+    /// The stored map matched the inputs and was returned as stored.
+    Reused,
+    /// There was no stored map.
+    Built,
+    /// A stored map existed and could not be used (§5.8).
+    Rebuilt { reason: RebuildReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebuildReason {
+    /// Not a map this build can read, or another repository's.
+    Corrupt,
+    SchemaMismatch {
+        found: u32,
+    },
+    /// Readable, but derived from inputs that have since changed.
+    Stale,
+}
+
+impl RebuildReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Corrupt => "corrupt",
+            Self::SchemaMismatch { .. } => "schemaMismatch",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+/// The persisted map, one JSON file per repository, reused while its input
+/// fingerprint matches and rebuilt otherwise (`context.md` §3).
+#[derive(Debug, Clone)]
+pub struct RepositoryMapStore {
+    data_dir: PathBuf,
+    audit_log: AuditLog,
+}
+
+impl RepositoryMapStore {
+    pub fn new(data_dir: impl AsRef<Path>, audit_log: AuditLog) -> Self {
+        Self {
+            data_dir: data_dir.as_ref().to_path_buf(),
+            audit_log,
+        }
+    }
+
+    pub fn path(data_dir: &Path, repository_id: &str) -> PathBuf {
+        data_dir
+            .join("repository-map")
+            .join(format!("{repository_id}.json"))
+    }
+
+    /// The stored map of `index` when it is still the map `policy` would
+    /// build, and otherwise a fresh one, written before it is returned.
+    /// Reuse is decided on the fingerprint alone, which needs no command
+    /// detection, so a reuse reads one file and the index.
+    ///
+    /// Nothing about approval rests on a stored map: every proposal is
+    /// classified again when it is made.
+    pub fn load_or_build(
+        &self,
+        index: &RepositoryIndex,
+        policy: &CommandPolicy,
+    ) -> Result<(RepositoryMap, MapLoad)> {
+        let path = Self::path(&self.data_dir, &index.repository_id);
+        let reason = match fs::read(&path) {
+            Ok(bytes) => match stored_map(&bytes, &index.repository_id) {
+                Ok(map) if map.fingerprint == input_fingerprint(index, policy) => {
+                    return Ok((map, MapLoad::Reused));
+                }
+                Ok(_) => Some(RebuildReason::Stale),
+                Err(reason) => Some(reason),
+            },
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+
+        let map = RepositoryMap::build(index, policy);
+        let json = serde_json::to_vec_pretty(&map).map_err(|error| {
+            ClientError::Io(format!("Failed to serialise the repository map: {error}"))
+        })?;
+        write_replacing(&path, &json)?;
+        let Some(reason) = reason else {
+            return Ok((map, MapLoad::Built));
+        };
+        let mut fields = vec![
+            ("repositoryId", map.repository_id.clone()),
+            ("reason", reason.as_str().to_string()),
+        ];
+        if let RebuildReason::SchemaMismatch { found } = reason {
+            fields.push(("foundSchemaVersion", found.to_string()));
+        }
+        self.audit_log.record("repository_map_rebuilt", &fields)?;
+        Ok((map, MapLoad::Rebuilt { reason }))
+    }
+}
+
+/// Parses a stored map, or says why it cannot be used. The version is read
+/// before the shape, so a map from another schema is reported as that rather
+/// than as corrupt.
+fn stored_map(
+    bytes: &[u8],
+    repository_id: &str,
+) -> std::result::Result<RepositoryMap, RebuildReason> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| RebuildReason::Corrupt)?;
+    let found = value
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or(RebuildReason::Corrupt)?;
+    if found != REPOSITORY_MAP_SCHEMA_VERSION {
+        return Err(RebuildReason::SchemaMismatch { found });
+    }
+    let map: RepositoryMap = serde_json::from_value(value).map_err(|_| RebuildReason::Corrupt)?;
+    if map.repository_id != repository_id {
+        return Err(RebuildReason::Corrupt);
+    }
+    Ok(map)
+}
+
+/// Writes `path` through a temp file in the same directory and a rename, so
+/// a crash leaves the old file or the new one, never half of either. The
+/// temp name is unique, so two processes rebuilding at once do not write
+/// into each other's file.
+fn write_replacing(path: &Path, bytes: &[u8]) -> Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| ClientError::Io(format!("{} has no parent", path.display())))?;
+    fs::create_dir_all(directory)?;
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp_path = directory.join(format!(".{file_name}.{}.tmp", create_id("map")));
+    let written = fs::write(&temp_path, bytes).and_then(|()| fs::rename(&temp_path, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    Ok(written?)
+}
+
+/// Root detection with the user's overrides applied, the part of
+/// [`RepositoryMap::build`] that reads neither the disk nor the commands.
+fn detect_with_overrides(
+    index: &RepositoryIndex,
+    indexed: &BTreeSet<&str>,
+    config: &Config,
+) -> (RootDetection, BTreeMap<String, RootOverride>) {
+    let mut detection = detect_roots(
+        index.files.iter().map(|file| file.path.as_str()),
+        &index.skipped,
+    );
+    let overrides = apply_overrides(
+        &mut detection,
+        &config.project_roots_added,
+        &config.project_roots_removed,
+        indexed,
+        &PathPolicy::new(config),
+    );
+    (detection, overrides)
+}
+
+/// The fingerprint [`RepositoryMap::build`] would give a map of `index`
+/// under `policy`, without building one: no command is detected and no
+/// manifest is read.
+fn input_fingerprint(index: &RepositoryIndex, policy: &CommandPolicy) -> String {
+    let indexed: BTreeSet<&str> = index.files.iter().map(|file| file.path.as_str()).collect();
+    let (detection, _) = detect_with_overrides(index, &indexed, policy.config());
+    fingerprint(index, &detection.excluded, policy.config())
+}
+
 /// Hashes the map's inputs, not its output (`context.md` §3): the sorted
 /// indexed paths, the content of every manifest and instruction file, the
-/// excluded entries, the user's override lists, and the schema version.
-/// Other files' content and every modification time are left out, so an
-/// edit to source code does not make the map stale.
-fn fingerprint(
-    index: &RepositoryIndex,
-    excluded: &[ExcludedPath],
-    added: &[String],
-    removed: &[String],
-) -> String {
+/// excluded entries, the schema version, and the config the map reads: the
+/// user's override lists, and `command_allowlist` and `command_blocklist`,
+/// which decide a command's risk. Without those two a stored map would keep
+/// a risk from before a grant. `restricted_patterns` is not hashed itself:
+/// its only effect on the map is whether an override applies, and a
+/// rejected override is an `excluded` entry, which is. Other files' content
+/// and every modification time are left out, so an edit to source code does
+/// not make the map stale.
+fn fingerprint(index: &RepositoryIndex, excluded: &[ExcludedPath], config: &Config) -> String {
     let mut files: Vec<(&str, &str)> = index
         .files
         .iter()
@@ -462,7 +631,12 @@ fn fingerprint(
             entry.reason
         ));
     }
-    for (list, entries) in [("added", added), ("removed", removed)] {
+    for (list, entries) in [
+        ("added", &config.project_roots_added),
+        ("removed", &config.project_roots_removed),
+        ("allowlist", &config.command_allowlist),
+        ("blocklist", &config.command_blocklist),
+    ] {
         for entry in entries {
             input.push_str(&format!("{list} {}:{entry}\n", entry.len()));
         }

@@ -6,16 +6,20 @@ use crate::command_runner::CommandRunner;
 use crate::config::Config;
 use crate::context_manager::ContextManager;
 use crate::edit::{EditOrchestrator, PatchStore};
+use crate::error::Result;
 use crate::file_access::FileAccessController;
 use crate::git_service::GitService;
+use crate::index_cache::IndexCache;
 use crate::indexer::ProjectIndexer;
 use crate::navigation::NavigationController;
 use crate::patch_engine::PatchEngine;
 use crate::path_policy::PathPolicy;
+use crate::repository_map::{MapLoad, RepositoryMap, RepositoryMapStore};
 use crate::repository_trust::RepositoryTrustStore;
 use crate::secret_scanner::SecretScanner;
 use crate::session::SessionStore;
 use crate::validation::{CommandStore, ValidationOrchestrator};
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceEngine {
@@ -144,6 +148,17 @@ impl WorkspaceEngine {
             validation_orchestrator,
             repository_trust,
         }
+    }
+
+    /// The repository's map, from the cached index: the stored map when it
+    /// is still current, and otherwise a fresh one (spec 24 §5.8).
+    pub fn repository_map(
+        &self,
+        repository_root: impl AsRef<Path>,
+    ) -> Result<(RepositoryMap, MapLoad)> {
+        let index = IndexCache::get_or_build(&self.indexer, repository_root)?;
+        RepositoryMapStore::new(&self.config.data_dir, self.audit_log.clone())
+            .load_or_build(&index, &self.command_policy)
     }
 }
 

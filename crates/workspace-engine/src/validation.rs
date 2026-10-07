@@ -8,6 +8,7 @@ use crate::command_runner::{CommandExecution, CommandRunOptions, CommandRunner};
 use crate::config::ConfigOverlay;
 use crate::error::{ClientError, Result};
 use crate::hash::{create_id, now_millis, repository_id_for_root};
+use crate::repository_map::{RepositoryMap, RootOverride};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -230,23 +231,36 @@ impl ValidationOrchestrator {
         Ok(proposal)
     }
 
+    /// Proposes every root's detected commands, each at its own root's
+    /// directory, so a command found in `packages/api` runs there (spec 24
+    /// `context.md` §9). A removed root proposes nothing. The map's stored
+    /// risk is not used: each proposal is classified again where it will run.
     pub fn propose_detected_validations(
         &self,
-        working_directory: impl AsRef<Path>,
+        repository_root: impl AsRef<Path>,
+        map: &RepositoryMap,
     ) -> Result<Vec<CommandProposal>> {
-        let commands = self
-            .command_policy
-            .detect_project_commands(&working_directory)?;
-        commands
-            .iter()
-            .map(|command| {
-                self.propose_command(
+        let repository_root = repository_root.as_ref();
+        let mut proposals = Vec::new();
+        for root in &map.roots {
+            if root.user_override == Some(RootOverride::Removed) {
+                continue;
+            }
+            for command in &root.commands {
+                let working_directory = if command.working_directory.is_empty() {
+                    repository_root.to_path_buf()
+                } else {
+                    repository_root.join(&command.working_directory)
+                };
+                proposals.push(self.propose_command_at(
+                    repository_root,
                     &working_directory,
                     &command.command,
                     &format!("Detected project validation command from {}", command.name),
-                )
-            })
-            .collect()
+                )?);
+            }
+        }
+        Ok(proposals)
     }
 
     pub fn run_proposal(

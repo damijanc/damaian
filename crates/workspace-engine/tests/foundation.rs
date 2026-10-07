@@ -4756,9 +4756,10 @@ fn proposes_detected_validation_commands() {
         "{\"scripts\":{\"test\":\"node --test\",\"lint\":\"eslint .\"}}\n",
     );
     let engine = WorkspaceEngine::new(test_config(&repo));
+    let (map, _) = engine.repository_map(&repo).unwrap();
     let proposals = engine
         .validation_orchestrator
-        .propose_detected_validations(&repo)
+        .propose_detected_validations(&repo, &map)
         .unwrap();
 
     assert!(

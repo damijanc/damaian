@@ -16,6 +16,10 @@
 //! Task 4 pins the user's `project_roots_added` and `project_roots_removed`
 //! overrides: what they do to the map, what is rejected, and that both are
 //! preference keys.
+//!
+//! Task 5 pins the persisted map: when a stored file is reused and when it
+//! is rebuilt, and why. It also pins validations proposed per root, each at
+//! that root's directory.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,10 +28,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use workspace_engine::indexer::SkippedFile;
 use workspace_engine::{
     AuditLog, CancelToken, CommandPolicy, CommandRisk, CommandStore, Config, ConfigOverlay,
-    DetectedRoot, ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH, PROJECT_MANIFESTS, ProjectIndexer,
-    ProjectRoot, REPOSITORY_MAP_SCHEMA_VERSION, RepositoryIndex, RepositoryKeyClass, RepositoryMap,
-    RootCommand, RootDetection, RootEvidence, RootOverride, SecretScanner, WorkspaceEngine,
-    detect_roots, repository_id_for_root, split_profile_keys,
+    DetectedRoot, ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH, MapLoad, PROJECT_MANIFESTS,
+    ProjectIndexer, ProjectRoot, REPOSITORY_MAP_SCHEMA_VERSION, RebuildReason, RepositoryIndex,
+    RepositoryKeyClass, RepositoryMap, RepositoryMapStore, RootCommand, RootDetection,
+    RootEvidence, RootOverride, SecretScanner, WorkspaceEngine, detect_roots,
+    repository_id_for_root, split_profile_keys,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1308,4 +1313,306 @@ fn editing_the_overrides_keeps_a_path_in_at_most_one_list() {
         overlay,
         ConfigOverlay::parse("max_file_bytes=2048\n").unwrap()
     );
+}
+
+impl IndexedMonorepo {
+    fn store(&self) -> RepositoryMapStore {
+        let scanner = SecretScanner::new(self.config().secret_patterns.clone());
+        RepositoryMapStore::new(&self.data_dir, AuditLog::new(&self.data_dir, true, scanner))
+    }
+
+    fn load_with(&self, policy: &CommandPolicy) -> (RepositoryMap, MapLoad) {
+        self.store()
+            .load_or_build(&self.index(), policy)
+            .expect("the map should load or build")
+    }
+
+    fn load(&self) -> (RepositoryMap, MapLoad) {
+        self.load_with(&CommandPolicy::new(self.config()))
+    }
+
+    fn map_file(&self) -> PathBuf {
+        RepositoryMapStore::path(&self.data_dir, &self.index().repository_id)
+    }
+
+    /// The `repository_map_rebuilt` events in the audit log, oldest first.
+    fn rebuild_events(&self) -> Vec<serde_json::Value> {
+        fs::read_to_string(self.data_dir.join("audit/events.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["eventType"] == "repository_map_rebuilt")
+            .collect()
+    }
+}
+
+#[test]
+fn a_missing_map_is_built_and_an_unchanged_repository_reuses_it_untouched() {
+    let repo = IndexedMonorepo::new("store-reuse");
+    let (built, outcome) = repo.load();
+    assert_eq!(outcome, MapLoad::Built);
+    let path = repo.map_file();
+    assert!(
+        path.ends_with(format!("repository-map/{}.json", built.repository_id)),
+        "{}",
+        path.display()
+    );
+    let bytes = fs::read(&path).expect("the map is written");
+    assert_eq!(
+        serde_json::from_slice::<RepositoryMap>(&bytes).unwrap(),
+        built
+    );
+
+    let (reused, outcome) = repo.load();
+    assert_eq!(outcome, MapLoad::Reused);
+    assert_eq!(reused, built, "the stored map, generatedAtMs included");
+    assert_eq!(fs::read(&path).unwrap(), bytes, "a reuse does not rewrite");
+    assert!(repo.rebuild_events().is_empty(), "neither is a rebuild");
+    // No temp file is left behind beside the map.
+    let entries: Vec<_> = fs::read_dir(path.parent().unwrap()).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+}
+
+#[test]
+fn a_garbage_map_file_is_rebuilt_as_corrupt_and_audited() {
+    let repo = IndexedMonorepo::new("store-corrupt");
+    let path = repo.map_file();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "{ not json").unwrap();
+
+    let (map, outcome) = repo.load();
+    assert_eq!(
+        outcome,
+        MapLoad::Rebuilt {
+            reason: RebuildReason::Corrupt
+        }
+    );
+    assert_eq!(
+        serde_json::from_slice::<RepositoryMap>(&fs::read(&path).unwrap()).unwrap(),
+        map
+    );
+    let events = repo.rebuild_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["reason"], "corrupt");
+    assert_eq!(events[0]["repositoryId"], map.repository_id.as_str());
+    assert_eq!(repo.load().1, MapLoad::Reused);
+}
+
+#[test]
+fn a_map_from_another_schema_version_is_rebuilt_as_a_mismatch() {
+    let repo = IndexedMonorepo::new("store-schema");
+    repo.load();
+    let path = repo.map_file();
+    let mut stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    stored["schemaVersion"] = 0.into();
+    fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+    let (map, outcome) = repo.load();
+    assert_eq!(
+        outcome,
+        MapLoad::Rebuilt {
+            reason: RebuildReason::SchemaMismatch { found: 0 }
+        }
+    );
+    assert_eq!(map.schema_version, REPOSITORY_MAP_SCHEMA_VERSION);
+    let events = repo.rebuild_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["reason"], "schemaMismatch");
+    assert_eq!(events[0]["foundSchemaVersion"], "0");
+}
+
+#[test]
+fn a_manifest_change_rebuilds_the_map_as_stale() {
+    let repo = IndexedMonorepo::new("store-stale");
+    let (before, _) = repo.load();
+    assert_eq!(map_root(&before, "packages/web").commands.len(), 1);
+
+    repo.write(
+        "packages/web/package.json",
+        "{\"scripts\":{\"build\":\"tsc\",\"lint\":\"eslint .\"}}",
+    );
+    let (after, outcome) = repo.load();
+    assert_eq!(
+        outcome,
+        MapLoad::Rebuilt {
+            reason: RebuildReason::Stale
+        }
+    );
+    assert_eq!(map_root(&after, "packages/web").commands.len(), 2);
+    let events = repo.rebuild_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["reason"], "stale");
+}
+
+/// Task 4's gap: command risk depends on `command_allowlist`, so a grant
+/// made after the map was stored must not leave the stored risk in place.
+#[test]
+fn a_new_allowlist_grant_makes_the_stored_map_stale() {
+    let repo = IndexedMonorepo::new("store-allowlist");
+    let risk_of = |map: &RepositoryMap| {
+        map_root(map, "packages/api")
+            .commands
+            .iter()
+            .find(|command| command.name == "test-shortcut")
+            .expect("packages/api has npm test")
+            .risk
+            .clone()
+    };
+    let (before, _) = repo.load();
+    assert_eq!(risk_of(&before), CommandRisk::Medium);
+
+    let mut config = repo.config();
+    config
+        .command_allowlist
+        .push("cd packages/api && npm test".to_string());
+    let (after, outcome) = repo.load_with(&CommandPolicy::new(config.clone()));
+    assert_eq!(
+        outcome,
+        MapLoad::Rebuilt {
+            reason: RebuildReason::Stale
+        }
+    );
+    assert_eq!(risk_of(&after), CommandRisk::Low);
+
+    // A blocklist entry changes risk too.
+    config.command_blocklist.push("npm test".to_string());
+    let (blocked, outcome) = repo.load_with(&CommandPolicy::new(config));
+    assert_eq!(
+        outcome,
+        MapLoad::Rebuilt {
+            reason: RebuildReason::Stale
+        }
+    );
+    assert_eq!(risk_of(&blocked), CommandRisk::Blocked);
+}
+
+/// `restricted_patterns` decides whether an override applies. It reaches the
+/// fingerprint through the `invalidOverride` entry it causes, not by being
+/// hashed itself.
+#[test]
+fn a_new_restricted_pattern_makes_the_stored_map_stale() {
+    let repo = IndexedMonorepo::new("store-restricted");
+    let config = repo.overriding(&["docs"], &[]);
+    let (before, _) = repo.load_with(&CommandPolicy::new(config.clone()));
+    assert_eq!(
+        map_root(&before, "docs").user_override,
+        Some(RootOverride::Added)
+    );
+
+    let mut restricted = config;
+    restricted.restricted_patterns.push("docs".to_string());
+    let (after, outcome) = repo.load_with(&CommandPolicy::new(restricted));
+    assert_eq!(
+        outcome,
+        MapLoad::Rebuilt {
+            reason: RebuildReason::Stale
+        }
+    );
+    assert!(after.roots.iter().all(|root| root.path != "docs"));
+    assert!(
+        after
+            .excluded
+            .contains(&excluded("docs", ExclusionReason::InvalidOverride))
+    );
+}
+
+#[test]
+fn the_engine_builds_the_map_once_and_then_reuses_it() {
+    let repo = IndexedMonorepo::new("engine-map");
+    let engine = WorkspaceEngine::new(repo.config());
+    let (built, outcome) = engine.repository_map(&repo.root).unwrap();
+    assert_eq!(outcome, MapLoad::Built);
+    assert_eq!(built.repository_id, repo.index().repository_id);
+    let (reused, outcome) = engine.repository_map(&repo.root).unwrap();
+    assert_eq!(outcome, MapLoad::Reused);
+    assert_eq!(reused, built);
+}
+
+#[test]
+fn detected_validations_are_proposed_and_run_at_their_own_root() {
+    let repo = IndexedMonorepo::new("validations-per-root");
+    let engine = WorkspaceEngine::new(repo.config());
+    let (map, _) = engine.repository_map(&repo.root).unwrap();
+    let proposals = engine
+        .validation_orchestrator
+        .propose_detected_validations(&repo.root, &map)
+        .unwrap();
+
+    let repository_root = repo.root.to_string_lossy().to_string();
+    assert!(
+        proposals
+            .iter()
+            .all(|proposal| proposal.repository_root == repository_root),
+        "{proposals:?}"
+    );
+    // At the repository root nothing changes: its commands run there.
+    let at_root = proposals
+        .iter()
+        .find(|proposal| proposal.command == "cargo test")
+        .expect("the workspace root proposes cargo test");
+    assert_eq!(at_root.working_directory, repository_root);
+
+    let api = proposals
+        .iter()
+        .find(|proposal| proposal.command == "npm run lint")
+        .expect("packages/api proposes its lint script");
+    assert!(
+        api.working_directory.ends_with("packages/api"),
+        "{}",
+        api.working_directory
+    );
+    let web: Vec<_> = proposals
+        .iter()
+        .filter(|proposal| proposal.working_directory.ends_with("packages/web"))
+        .map(|proposal| proposal.command.as_str())
+        .collect();
+    assert_eq!(web, ["npm run build"]);
+
+    let record = engine
+        .validation_orchestrator
+        .run_proposal(
+            &api.id,
+            true,
+            "tester",
+            None,
+            &CancelToken::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+    assert!(
+        record.execution.working_directory.ends_with("packages/api"),
+        "{}",
+        record.execution.working_directory
+    );
+    assert_eq!(record.execution.exit_code, Some(0));
+}
+
+#[test]
+fn a_removed_root_yields_no_proposal() {
+    let repo = IndexedMonorepo::new("validations-removed");
+    let engine = WorkspaceEngine::new(repo.config());
+    let in_web = |map: &RepositoryMap| {
+        engine
+            .validation_orchestrator
+            .propose_detected_validations(&repo.root, map)
+            .unwrap()
+            .into_iter()
+            .filter(|proposal| proposal.working_directory.ends_with("packages/web"))
+            .count()
+    };
+
+    let removed = repo.build_overriding(&[], &["packages/web"]);
+    assert_eq!(in_web(&removed), 0);
+
+    // The field decides, not the empty command list: a map that still lists
+    // a removed root's commands proposes none of them.
+    let mut marked = repo.build();
+    assert_eq!(in_web(&marked), 1);
+    marked
+        .roots
+        .iter_mut()
+        .find(|root| root.path == "packages/web")
+        .unwrap()
+        .user_override = Some(RootOverride::Removed);
+    assert_eq!(in_web(&marked), 0);
 }
