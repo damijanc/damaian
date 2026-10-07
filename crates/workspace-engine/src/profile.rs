@@ -356,6 +356,8 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         agent_tool_retry_limit,
         agent_max_task_tokens,
         agent_max_turn_messages,
+        project_roots_added,
+        project_roots_removed,
         shell,
         model_provider,
         model_name,
@@ -406,6 +408,8 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
             agent_web_debug_max_tool_rounds.is_some(),
         ),
         ("agent_tool_retry_limit", agent_tool_retry_limit.is_some()),
+        ("project_roots_added", project_roots_added.is_some()),
+        ("project_roots_removed", project_roots_removed.is_some()),
     ] {
         if present {
             refuse(key.to_string(), RepositoryKeyClass::Forbidden);

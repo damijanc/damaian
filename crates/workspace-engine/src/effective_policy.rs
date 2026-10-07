@@ -155,6 +155,8 @@ pub fn rule_label(key: &str) -> Option<String> {
         "agent_tool_retry_limit" => "Retries of a failing tool call",
         "agent_max_task_tokens" => "Token limit per turn",
         "agent_max_turn_messages" => "Messages sent per model request",
+        "project_roots_added" => "Folders you made project roots",
+        "project_roots_removed" => "Folders you said are not project roots",
         "shell" => "Shell that runs commands",
         "model_provider" => "Model provider",
         "model_name" => "Model",

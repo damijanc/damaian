@@ -6,9 +6,11 @@
 //! pure function of the index's paths (`context.md` §3).
 
 use crate::command_policy::{CommandPolicy, CommandRisk, PROJECT_MANIFESTS};
+use crate::config::ConfigOverlay;
 use crate::context_manager::{AGENT_INSTRUCTIONS_FILE, agent_instruction_paths};
 use crate::hash::{now_millis, sha256};
 use crate::indexer::{RepositoryIndex, SkippedFile};
+use crate::path_policy::PathPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -65,6 +67,18 @@ pub enum RootEvidence {
     RepositoryRoot,
     /// This manifest, repository-relative, exists.
     Manifest { path: String },
+    /// Named in `project_roots_added`, with no manifest of its own.
+    UserOverride,
+}
+
+/// The user's correction to detection (requirement 7, §5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RootOverride {
+    Added,
+    /// Kept in the map so the UI can show and undo it, but not a root for
+    /// anything: it owns no files and offers no commands.
+    Removed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -72,6 +86,9 @@ pub enum RootEvidence {
 pub enum ExclusionReason {
     Vendor,
     BelowDepthCeiling,
+    /// A `project_roots_added` or `project_roots_removed` entry that was not
+    /// applied (`context.md` §6).
+    InvalidOverride,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -240,6 +257,7 @@ pub struct ProjectRoot {
     pub instruction_files: Vec<String>,
     /// Sorted by name.
     pub commands: Vec<RootCommand>,
+    pub user_override: Option<RootOverride>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,40 +279,71 @@ impl RepositoryMap {
     /// read the disk, through [`CommandPolicy::detect_root_commands`]. Every
     /// collection is sorted here rather than trusted to the index's order,
     /// because the watcher appends patched records at the end (§5.3).
+    ///
+    /// The user's overrides come from the policy's config, the same config
+    /// that classifies the commands, so the map and the approvals never
+    /// disagree about which repository config is in effect.
     pub fn build(index: &RepositoryIndex, policy: &CommandPolicy) -> Self {
-        let detection = detect_roots(
+        let config = policy.config();
+        let mut detection = detect_roots(
             index.files.iter().map(|file| file.path.as_str()),
             &index.skipped,
         );
-        let root_paths: Vec<&str> = detection
+        let indexed: BTreeSet<&str> = index.files.iter().map(|file| file.path.as_str()).collect();
+        let overrides = apply_overrides(
+            &mut detection,
+            &config.project_roots_added,
+            &config.project_roots_removed,
+            &indexed,
+            &PathPolicy::new(config),
+        );
+        // A removed root is not a root for ownership, so its files, its
+        // directory and its vendor output go to the nearest root that is
+        // not removed. `active[i]` is the position in `roots` of
+        // `root_paths[i]`.
+        let (active, root_paths): (Vec<usize>, Vec<&str>) = detection
             .roots
             .iter()
-            .map(|root| root.path.as_str())
-            .collect();
-        let indexed: BTreeSet<&str> = index.files.iter().map(|file| file.path.as_str()).collect();
+            .enumerate()
+            .filter(|(_, root)| overrides.get(&root.path) != Some(&RootOverride::Removed))
+            .map(|(position, root)| (position, root.path.as_str()))
+            .unzip();
 
         let mut roots: Vec<ProjectRoot> = detection
             .roots
             .iter()
-            .map(|root| ProjectRoot {
-                path: root.path.clone(),
-                detected_by: root.detected_by.clone(),
-                languages: Vec::new(),
-                manifests: Vec::new(),
-                entry_points: Vec::new(),
-                test_paths: Vec::new(),
-                generated_paths: Vec::new(),
-                major_directories: Vec::new(),
-                instruction_files: instruction_files(&root.path, &indexed),
-                commands: policy
-                    .detect_root_commands(&index.root_path, &root.path)
-                    .unwrap_or_default(),
+            .map(|root| {
+                let user_override = overrides.get(&root.path).copied();
+                let removed = user_override == Some(RootOverride::Removed);
+                ProjectRoot {
+                    path: root.path.clone(),
+                    detected_by: root.detected_by.clone(),
+                    languages: Vec::new(),
+                    manifests: Vec::new(),
+                    entry_points: Vec::new(),
+                    test_paths: Vec::new(),
+                    generated_paths: Vec::new(),
+                    major_directories: Vec::new(),
+                    instruction_files: if removed {
+                        Vec::new()
+                    } else {
+                        instruction_files(&root.path, &indexed)
+                    },
+                    commands: if removed {
+                        Vec::new()
+                    } else {
+                        policy
+                            .detect_root_commands(&index.root_path, &root.path)
+                            .unwrap_or_default()
+                    },
+                    user_override,
+                }
             })
             .collect();
 
         for file in &index.files {
             let owner = nearest_root(&root_paths, &file.path);
-            let root = &mut roots[owner];
+            let root = &mut roots[active[owner]];
             let relative = relative_to(root_paths[owner], &file.path);
             if file.language != "text" && !root.languages.contains(&file.language) {
                 root.languages.push(file.language.clone());
@@ -320,17 +369,20 @@ impl RepositoryMap {
                 if root_paths.contains(&child_path.as_str()) {
                     continue;
                 }
+                let root = &mut roots[active[position]];
                 if TEST_DIRECTORIES.contains(&child) {
-                    roots[position].test_paths.push(child_path.clone());
+                    root.test_paths.push(child_path.clone());
                 }
-                roots[position].major_directories.push(child_path);
+                root.major_directories.push(child_path);
             }
         }
 
         for excluded in &detection.excluded {
             if excluded.reason == ExclusionReason::Vendor {
                 let owner = nearest_root(&root_paths, &excluded.path);
-                roots[owner].generated_paths.push(excluded.path.clone());
+                roots[active[owner]]
+                    .generated_paths
+                    .push(excluded.path.clone());
             }
         }
 
@@ -347,7 +399,12 @@ impl RepositoryMap {
             repository_id: index.repository_id.clone(),
             schema_version: REPOSITORY_MAP_SCHEMA_VERSION,
             generated_at_ms: now_millis(),
-            fingerprint: fingerprint(index, &detection.excluded),
+            fingerprint: fingerprint(
+                index,
+                &detection.excluded,
+                &config.project_roots_added,
+                &config.project_roots_removed,
+            ),
             roots,
             excluded: detection.excluded,
         }
@@ -356,9 +413,11 @@ impl RepositoryMap {
     /// The root that owns `path`: the longest root that is a path-segment
     /// prefix of it, so `packages/a` does not own `packages/ab/x`. Falls back
     /// to the repository root.
+    /// A removed root owns nothing.
     pub fn root_for_path(&self, path: &str) -> &str {
         self.roots
             .iter()
+            .filter(|root| root.user_override != Some(RootOverride::Removed))
             .filter(|root| owns(&root.path, path))
             .max_by_key(|root| root.path.len())
             .map_or("", |root| root.path.as_str())
@@ -367,10 +426,15 @@ impl RepositoryMap {
 
 /// Hashes the map's inputs, not its output (`context.md` §3): the sorted
 /// indexed paths, the content of every manifest and instruction file, the
-/// excluded directories read from the skip list, and the schema version.
+/// excluded entries, the user's override lists, and the schema version.
 /// Other files' content and every modification time are left out, so an
 /// edit to source code does not make the map stale.
-fn fingerprint(index: &RepositoryIndex, excluded: &[ExcludedPath]) -> String {
+fn fingerprint(
+    index: &RepositoryIndex,
+    excluded: &[ExcludedPath],
+    added: &[String],
+    removed: &[String],
+) -> String {
     let mut files: Vec<(&str, &str)> = index
         .files
         .iter()
@@ -398,7 +462,120 @@ fn fingerprint(index: &RepositoryIndex, excluded: &[ExcludedPath]) -> String {
             entry.reason
         ));
     }
+    for (list, entries) in [("added", added), ("removed", removed)] {
+        for entry in entries {
+            input.push_str(&format!("{list} {}:{entry}\n", entry.len()));
+        }
+    }
     sha256(input)
+}
+
+/// Applies the user's overrides to `detection` and returns the override of
+/// each root it touched. An entry that cannot apply is recorded in
+/// `detection.excluded` as `invalidOverride` and changes nothing else
+/// (`context.md` §6).
+fn apply_overrides(
+    detection: &mut RootDetection,
+    added: &[String],
+    removed: &[String],
+    indexed: &BTreeSet<&str>,
+    paths: &PathPolicy,
+) -> BTreeMap<String, RootOverride> {
+    let mut overrides = BTreeMap::new();
+    let mut invalid = Vec::new();
+    let valid = |entry: &str| valid_override(entry, indexed, paths);
+
+    for entry in added {
+        if !valid(entry) || removed.contains(entry) {
+            invalid.push(entry.clone());
+            continue;
+        }
+        if !detection.roots.iter().any(|root| root.path == *entry) {
+            detection.roots.push(DetectedRoot {
+                path: entry.clone(),
+                detected_by: RootEvidence::UserOverride,
+            });
+        }
+        overrides.insert(entry.clone(), RootOverride::Added);
+    }
+    for entry in removed {
+        // The repository root is never removed: the map is never empty
+        // (§5.2). An entry that names no root would do nothing, so the user
+        // is shown it rather than left to think it worked.
+        let names_root = detection.roots.iter().any(|root| root.path == *entry);
+        if entry.is_empty() || !valid(entry) || added.contains(entry) || !names_root {
+            invalid.push(entry.clone());
+            continue;
+        }
+        overrides.insert(entry.clone(), RootOverride::Removed);
+    }
+
+    detection.roots.sort_by(|a, b| a.path.cmp(&b.path));
+    detection
+        .excluded
+        .extend(invalid.into_iter().map(|path| ExcludedPath {
+            path,
+            reason: ExclusionReason::InvalidOverride,
+        }));
+    detection.excluded.sort();
+    detection.excluded.dedup();
+    overrides
+}
+
+/// Whether `entry` can be a root: a normalised repository-relative path, not
+/// under a vendor directory, not restricted, and a directory holding at
+/// least one indexed file.
+fn valid_override(entry: &str, indexed: &BTreeSet<&str>, paths: &PathPolicy) -> bool {
+    if entry.is_empty() {
+        return false;
+    }
+    let segments: Vec<&str> = entry.split('/').collect();
+    // Rejects absolute paths (a leading empty segment), `.`, `..`, `//` and
+    // a trailing `/`.
+    if segments
+        .iter()
+        .any(|segment| matches!(*segment, "" | "." | ".."))
+    {
+        return false;
+    }
+    if segments
+        .iter()
+        .any(|segment| VENDOR_DIRECTORIES.contains(segment))
+    {
+        return false;
+    }
+    // A restricted ancestor restricts everything beneath it.
+    if (1..=segments.len()).any(|end| paths.is_restricted(&segments[..end].join("/"), true)) {
+        return false;
+    }
+    indexed
+        .iter()
+        .any(|path| path.len() > entry.len() && owns(entry, path))
+}
+
+/// What `damaian repo-root` and the UI do to repository config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootOverrideEdit {
+    Add,
+    Remove,
+    /// Forget the path in both lists, so detection decides again.
+    Clear,
+}
+
+/// Edits the override lists in `overlay`. A path is in at most one list
+/// afterwards, and an emptied list is unset so its line disappears.
+pub fn edit_root_overrides(overlay: &mut ConfigOverlay, edit: RootOverrideEdit, path: &str) {
+    let mut added = overlay.project_roots_added.take().unwrap_or_default();
+    let mut removed = overlay.project_roots_removed.take().unwrap_or_default();
+    added.retain(|entry| entry != path);
+    removed.retain(|entry| entry != path);
+    match edit {
+        RootOverrideEdit::Add => added.push(path.to_string()),
+        RootOverrideEdit::Remove => removed.push(path.to_string()),
+        RootOverrideEdit::Clear => {}
+    }
+    overlay.project_roots_added = (!added.is_empty()).then_some(added);
+    overlay.project_roots_removed = (!removed.is_empty()).then_some(removed);
 }
 
 /// Spec 11's ancestor walk for a path inside `root`, kept when indexed.

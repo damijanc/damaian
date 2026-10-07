@@ -122,7 +122,7 @@ pub use render::{
 pub use repository_map::{
     DetectedRoot, ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH, ProjectRoot,
     REPOSITORY_MAP_SCHEMA_VERSION, RepositoryMap, RootCommand, RootDetection, RootEvidence,
-    VENDOR_DIRECTORIES, detect_roots,
+    RootOverride, RootOverrideEdit, VENDOR_DIRECTORIES, detect_roots, edit_root_overrides,
 };
 pub use repository_trust::{
     RepositoryAllowlistMigration, RepositoryConfigNotice, RepositoryTrustStore,

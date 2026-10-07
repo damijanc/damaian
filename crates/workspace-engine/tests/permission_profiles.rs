@@ -109,6 +109,10 @@ fn the_preference_keys_are_exactly_spec_34s_free_keys() {
         "agent_max_tool_rounds",
         "agent_web_debug_max_tool_rounds",
         "agent_tool_retry_limit",
+        // Spec 24: a root changes where an approved command runs, never
+        // whether it needs approval (24 context.md §6).
+        "project_roots_added",
+        "project_roots_removed",
     ]
     .into_iter()
     .collect();
@@ -469,6 +473,16 @@ fn every_preference_key_applies_from_repository_scope() {
             field: "agent_tool_retry_limit",
             repository: "agent_tool_retry_limit=1\n",
             applied: |c| c.agent_tool_retry_limit == 1,
+        },
+        PreferenceCase {
+            field: "project_roots_added",
+            repository: "project_roots_added=tools/scripts\n",
+            applied: |c| c.project_roots_added == ["tools/scripts"],
+        },
+        PreferenceCase {
+            field: "project_roots_removed",
+            repository: "project_roots_removed=examples/legacy\n",
+            applied: |c| c.project_roots_removed == ["examples/legacy"],
         },
     ];
     let covered: BTreeSet<&str> = cases.iter().map(|c| c.field).collect();

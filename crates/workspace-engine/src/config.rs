@@ -325,6 +325,13 @@ pub struct Config {
     /// the same reason as the read caps. The session log still holds every
     /// round; only the request is bounded.
     pub agent_max_turn_messages: usize,
+    /// Directories the user made project roots, repository-relative (spec 24
+    /// §5.7). Validated when the map is built, not here, so a bad entry is
+    /// shown in the map's `excluded` rather than failing the config load.
+    pub project_roots_added: Vec<String>,
+    /// Detected roots the user said are not projects. Kept in the map, marked
+    /// removed, so the decision can be seen and undone.
+    pub project_roots_removed: Vec<String>,
     pub shell: String,
     pub model_provider: String,
     pub model_name: String,
@@ -828,6 +835,8 @@ impl Config {
             agent_tool_retry_limit,
             agent_max_task_tokens,
             agent_max_turn_messages,
+            project_roots_added,
+            project_roots_removed,
             shell,
             model_provider,
             model_name,
@@ -1334,6 +1343,20 @@ impl Config {
         ) {
             self.agent_tool_retry_limit = value;
             outcome.record(scope, "agent_tool_retry_limit", None, false);
+        }
+        if let Some(value) = preference(project_roots_added, "project_roots_added", scope, rejected)
+        {
+            self.project_roots_added = value;
+            outcome.record(scope, "project_roots_added", None, false);
+        }
+        if let Some(value) = preference(
+            project_roots_removed,
+            "project_roots_removed",
+            scope,
+            rejected,
+        ) {
+            self.project_roots_removed = value;
+            outcome.record(scope, "project_roots_removed", None, false);
         }
 
         outcome.rejected = refused;
@@ -1959,6 +1982,16 @@ impl Config {
             "agent_max_turn_messages",
             &self.agent_max_turn_messages.to_string(),
         );
+        push_line(
+            &mut output,
+            "project_roots_added",
+            &join_list(&self.project_roots_added),
+        );
+        push_line(
+            &mut output,
+            "project_roots_removed",
+            &join_list(&self.project_roots_removed),
+        );
         push_line(&mut output, "shell", &self.shell);
         push_line(&mut output, "model_provider", &self.model_provider);
         push_line(&mut output, "model_name", &self.model_name);
@@ -2036,6 +2069,8 @@ impl Default for Config {
             // configuration does on upgrade (§5.4).
             agent_max_task_tokens: None,
             agent_max_turn_messages: 24,
+            project_roots_added: Vec::new(),
+            project_roots_removed: Vec::new(),
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string()),
             model_provider: "openai".to_string(),
             model_name: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1".to_string()),
@@ -2091,6 +2126,8 @@ pub struct ConfigOverlay {
     pub agent_tool_retry_limit: Option<u32>,
     pub agent_max_task_tokens: Option<u64>,
     pub agent_max_turn_messages: Option<usize>,
+    pub project_roots_added: Option<Vec<String>>,
+    pub project_roots_removed: Option<Vec<String>>,
     pub shell: Option<String>,
     pub model_provider: Option<String>,
     pub model_name: Option<String>,
@@ -2212,6 +2249,11 @@ classify_overlay_fields! {
     agent_tool_retry_limit => Preference,
     agent_max_task_tokens => Capability,
     agent_max_turn_messages => Capability,
+    // A root changes which directory an approved command runs in, never
+    // whether it needs approval or what is readable, and committing a
+    // manifest makes the same root (spec 24, context.md §6).
+    project_roots_added => Preference,
+    project_roots_removed => Preference,
     shell => Capability,
     model_provider => Capability,
     model_name => Capability,
@@ -2396,6 +2438,8 @@ impl ConfigOverlay {
             "agent_max_task_tokens" => {
                 self.agent_max_task_tokens = Some(parse_task_token_ceiling(key, value)?)
             }
+            "project_roots_added" => self.project_roots_added = Some(split_list(value)),
+            "project_roots_removed" => self.project_roots_removed = Some(split_list(value)),
             "agent_max_turn_messages" => {
                 self.agent_max_turn_messages = Some(parse_read_lines(key, value)?)
             }
@@ -2601,6 +2645,8 @@ impl ConfigOverlay {
             agent_tool_retry_limit,
             agent_max_task_tokens,
             agent_max_turn_messages,
+            project_roots_added,
+            project_roots_removed,
             shell,
             model_provider,
             model_name,
@@ -2749,6 +2795,12 @@ impl ConfigOverlay {
         }
         if let Some(value) = agent_max_turn_messages {
             push_line(&mut output, "agent_max_turn_messages", &value.to_string());
+        }
+        if let Some(value) = project_roots_added {
+            push_line(&mut output, "project_roots_added", &join_list(value));
+        }
+        if let Some(value) = project_roots_removed {
+            push_line(&mut output, "project_roots_removed", &join_list(value));
         }
         if let Some(value) = shell {
             push_line(&mut output, "shell", value);

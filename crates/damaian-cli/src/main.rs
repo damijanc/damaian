@@ -4,10 +4,11 @@ use std::path::Path;
 use workspace_engine::{
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, CommandProposal, CommandRisk, Config, ConfigOverlay,
     ConfigScope, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, MockModelAdapter,
-    OpenAICompatibleAdapter, ProcessRegistry, ProfileId, ReadWindow, SearchResult, WorkspaceEngine,
-    command_approval_prompt, ensure_data_dir_schema, export_profile, import_profile,
-    parse_hunk_selection, patch_diff_text, patch_hunk_summary, profile_import_base,
-    render_markdown_to_ansi, review_profile_import, review_profile_rejections, select_profile,
+    OpenAICompatibleAdapter, ProcessRegistry, ProfileId, ReadWindow, RootOverrideEdit,
+    SearchResult, WorkspaceEngine, command_approval_prompt, edit_root_overrides,
+    ensure_data_dir_schema, export_profile, import_profile, parse_hunk_selection, patch_diff_text,
+    patch_hunk_summary, profile_import_base, render_markdown_to_ansi, review_profile_import,
+    review_profile_rejections, select_profile,
 };
 
 fn usage() -> &'static str {
@@ -30,6 +31,7 @@ fn usage() -> &'static str {
   damaian profile-set <repo> <read_only|safe_local|full|offline_private|custom-name>
   damaian profile-export <profile> [file]
   damaian profile-import <custom-name> <file> [--repo <repo>] [--replace] [--review]
+  damaian repo-root <repo> add|remove|clear <path>
   damaian propose-command <repo> <command>
   damaian propose-validations <repo>
   damaian run-command <proposal-id> --approve [--always]
@@ -257,6 +259,9 @@ fn run() -> workspace_engine::Result<()> {
         }
         "config-set" => {
             set_config_value(&args)?;
+        }
+        "repo-root" => {
+            print!("{}", edit_repository_roots(&args)?);
         }
         "propose-command" => {
             let repo = require_arg(&args, 1, "<repo>")?;
@@ -790,6 +795,34 @@ fn repository_scope_refusals(
     Ok(probe
         .apply_overlay_scoped(single, ConfigScope::Repository)
         .rejected)
+}
+
+/// Corrects root detection in `<repo>/.damaian/config.conf` (spec 24 §5.7).
+/// The strict parse refuses a file with a line it cannot read, so a
+/// hand-edited file is never rewritten without that line. The path is
+/// validated when the map is built, where a bad entry shows as
+/// `invalidOverride`.
+fn edit_repository_roots(args: &[String]) -> workspace_engine::Result<String> {
+    let repo = require_arg(args, 1, "<repo>")?;
+    let edit = match require_arg(args, 2, "add|remove|clear")? {
+        "add" => RootOverrideEdit::Add,
+        "remove" => RootOverrideEdit::Remove,
+        "clear" => RootOverrideEdit::Clear,
+        _ => {
+            return Err(workspace_engine::ClientError::InvalidInput(
+                "repo-root takes add, remove or clear".to_string(),
+            ));
+        }
+    };
+    let root = require_arg(args, 3, "<path>")?;
+    let path = Config::repository_config_path(repo);
+    let mut overlay = ConfigOverlay::load_or_default(&path)?;
+    edit_root_overrides(&mut overlay, edit, root);
+    overlay.save(&path)?;
+    Ok(format!(
+        "wrote {} (in your working tree, so git status shows it)\n",
+        path.to_string_lossy()
+    ))
 }
 
 fn set_config_value(args: &[String]) -> workspace_engine::Result<()> {

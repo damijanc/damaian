@@ -12,6 +12,10 @@
 //! Task 3 pins `RepositoryMap::build` over a real index of a temp monorepo:
 //! per-root metadata and commands, determinism, `root_for_path` and the
 //! input fingerprint.
+//!
+//! Task 4 pins the user's `project_roots_added` and `project_roots_removed`
+//! overrides: what they do to the map, what is rejected, and that both are
+//! preference keys.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,10 +23,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use workspace_engine::indexer::SkippedFile;
 use workspace_engine::{
-    AuditLog, CancelToken, CommandPolicy, CommandRisk, CommandStore, Config, DetectedRoot,
-    ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH, PROJECT_MANIFESTS, ProjectIndexer, ProjectRoot,
-    REPOSITORY_MAP_SCHEMA_VERSION, RepositoryIndex, RepositoryMap, RootCommand, RootDetection,
-    RootEvidence, SecretScanner, WorkspaceEngine, detect_roots, repository_id_for_root,
+    AuditLog, CancelToken, CommandPolicy, CommandRisk, CommandStore, Config, ConfigOverlay,
+    DetectedRoot, ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH, PROJECT_MANIFESTS, ProjectIndexer,
+    ProjectRoot, REPOSITORY_MAP_SCHEMA_VERSION, RepositoryIndex, RepositoryKeyClass, RepositoryMap,
+    RootCommand, RootDetection, RootEvidence, RootOverride, SecretScanner, WorkspaceEngine,
+    detect_roots, repository_id_for_root, split_profile_keys,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -703,6 +708,26 @@ impl IndexedMonorepo {
     fn build(&self) -> RepositoryMap {
         self.build_with(&CommandPolicy::new(self.config()))
     }
+
+    fn write(&self, path: &str, content: &str) {
+        let file = self.root.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, content).unwrap();
+    }
+
+    /// The config with these override lists, as `load_scoped` would leave
+    /// them after reading `project_roots_added` and `project_roots_removed`.
+    fn overriding(&self, added: &[&str], removed: &[&str]) -> Config {
+        Config {
+            project_roots_added: strings(added),
+            project_roots_removed: strings(removed),
+            ..self.config()
+        }
+    }
+
+    fn build_overriding(&self, added: &[&str], removed: &[&str]) -> RepositoryMap {
+        self.build_with(&CommandPolicy::new(self.overriding(added, removed)))
+    }
 }
 
 impl Drop for IndexedMonorepo {
@@ -803,6 +828,7 @@ fn nested_roots_each_carry_their_own_metadata_and_commands() {
             major_directories: strings(&["crates", "docs", "packages"]),
             instruction_files: strings(&["AGENTS.md"]),
             commands: vec![command("Cargo.toml", "cargo test", Medium, "")],
+            user_override: None,
         }
     );
     assert_eq!(
@@ -825,6 +851,7 @@ fn nested_roots_each_carry_their_own_metadata_and_commands() {
                 "crates/engine/AGENTS.md"
             ]),
             commands: vec![command("Cargo.toml", "cargo test", Medium, "crates/engine")],
+            user_override: None,
         }
     );
     assert_eq!(
@@ -846,6 +873,7 @@ fn nested_roots_each_carry_their_own_metadata_and_commands() {
                 command("test", "npm run test", Medium, "packages/api"),
                 command("test-shortcut", "npm test", Medium, "packages/api"),
             ],
+            user_override: None,
         }
     );
 
@@ -995,4 +1023,289 @@ fn detect_project_commands_is_unchanged() {
     ]
     .map(|(name, command, risk)| (name.to_string(), command.to_string(), risk));
     assert_eq!(commands, expected);
+}
+
+// Task 4: user overrides (context.md §6). Both lists are preference keys,
+// validated when the map is built, and a rejected entry is recorded in
+// `excluded` rather than applied.
+
+#[test]
+fn an_added_override_makes_a_root_the_user_named() {
+    let repo = IndexedMonorepo::new("override-added");
+    repo.write("tools/scripts/release.sh", "echo release\n");
+    assert_eq!(repo.build().root_for_path("tools/scripts/release.sh"), "");
+
+    let map = repo.build_overriding(&["tools/scripts"], &[]);
+    let added = map_root(&map, "tools/scripts");
+    assert_eq!(added.detected_by, RootEvidence::UserOverride);
+    assert_eq!(added.user_override, Some(RootOverride::Added));
+    let json = serde_json::to_value(added).unwrap();
+    assert_eq!(json["detectedBy"]["kind"], "userOverride");
+    assert_eq!(json["userOverride"], "added");
+    assert_eq!(
+        map.root_for_path("tools/scripts/release.sh"),
+        "tools/scripts"
+    );
+    assert!(
+        map.excluded
+            .iter()
+            .all(|entry| entry.reason != ExclusionReason::InvalidOverride),
+        "{:?}",
+        map.excluded
+    );
+
+    // A root detection also found keeps its manifest as the evidence.
+    let map = repo.build_overriding(&["packages/api"], &[]);
+    let api = map_root(&map, "packages/api");
+    assert_eq!(
+        api.detected_by,
+        RootEvidence::Manifest {
+            path: "packages/api/package.json".to_string()
+        }
+    );
+    assert_eq!(api.user_override, Some(RootOverride::Added));
+    assert_eq!(api.commands.len(), 3);
+}
+
+#[test]
+fn a_removed_root_stays_visible_and_its_files_go_to_the_enclosing_root() {
+    let repo = IndexedMonorepo::new("override-removed");
+    repo.write(
+        "examples/package.json",
+        "{\"scripts\":{\"test\":\"node t.js\"}}",
+    );
+    repo.write(
+        "examples/legacy/package.json",
+        "{\"scripts\":{\"test\":\"node t.js\"}}",
+    );
+    repo.write("examples/legacy/index.js", "module.exports = {};\n");
+
+    let detected = repo.build();
+    assert!(!map_root(&detected, "examples/legacy").commands.is_empty());
+    assert_eq!(
+        detected.root_for_path("examples/legacy/index.js"),
+        "examples/legacy"
+    );
+    assert!(map_root(&detected, "examples").major_directories.is_empty());
+
+    let map = repo.build_overriding(&[], &["examples/legacy"]);
+    // Kept, with its evidence, so the UI can show the removal and undo it.
+    assert_eq!(
+        *map_root(&map, "examples/legacy"),
+        ProjectRoot {
+            path: "examples/legacy".to_string(),
+            detected_by: RootEvidence::Manifest {
+                path: "examples/legacy/package.json".to_string()
+            },
+            languages: vec![],
+            manifests: vec![],
+            entry_points: vec![],
+            test_paths: vec![],
+            generated_paths: vec![],
+            major_directories: vec![],
+            instruction_files: vec![],
+            commands: vec![],
+            user_override: Some(RootOverride::Removed),
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(map_root(&map, "examples/legacy")).unwrap()["userOverride"],
+        "removed"
+    );
+    // No longer a root for anything else: its files, languages and directory
+    // belong to the nearest root that is not removed.
+    assert_eq!(map.root_for_path("examples/legacy/index.js"), "examples");
+    let examples = map_root(&map, "examples");
+    assert_eq!(examples.major_directories, strings(&["examples/legacy"]));
+    assert!(examples.languages.contains(&"javascript".to_string()));
+    assert!(
+        examples
+            .manifests
+            .iter()
+            .all(|manifest| manifest == "examples/package.json"),
+        "{:?}",
+        examples.manifests
+    );
+}
+
+#[test]
+fn overrides_survive_a_rebuild_after_the_repository_changed() {
+    let repo = IndexedMonorepo::new("override-rebuild");
+    repo.write("tools/scripts/release.sh", "echo release\n");
+    repo.write(
+        "examples/legacy/package.json",
+        "{\"scripts\":{\"test\":\"node t.js\"}}",
+    );
+    let policy = CommandPolicy::new(repo.overriding(&["tools/scripts"], &["examples/legacy"]));
+    let before = repo.build_with(&policy);
+
+    repo.write("tools/scripts/notes.md", "# Notes\n");
+    repo.write(
+        "examples/legacy/package.json",
+        "{\"scripts\":{\"test\":\"node t.js\",\"lint\":\"eslint .\"}}",
+    );
+    // `build_with` indexes afresh, so this is a rescan of a changed tree.
+    let after = repo.build_with(&policy);
+    assert_ne!(before.fingerprint, after.fingerprint);
+
+    for map in [&before, &after] {
+        let added = map_root(map, "tools/scripts");
+        assert_eq!(added.detected_by, RootEvidence::UserOverride);
+        assert_eq!(added.user_override, Some(RootOverride::Added));
+        let removed = map_root(map, "examples/legacy");
+        assert_eq!(removed.user_override, Some(RootOverride::Removed));
+        assert!(removed.commands.is_empty());
+    }
+    assert!(
+        map_root(&after, "tools/scripts")
+            .languages
+            .contains(&"markdown".to_string())
+    );
+}
+
+#[test]
+fn the_fingerprint_includes_the_override_lists() {
+    let repo = IndexedMonorepo::new("override-fingerprint");
+    let plain = repo.build().fingerprint;
+    let added = repo.build_overriding(&["docs"], &[]).fingerprint;
+    let removed = repo.build_overriding(&[], &["packages/web"]).fingerprint;
+    assert_ne!(plain, added);
+    assert_ne!(plain, removed);
+    assert_ne!(added, removed);
+    assert_eq!(repo.build_overriding(&["docs"], &[]).fingerprint, added);
+}
+
+#[test]
+fn an_invalid_override_is_recorded_and_changes_nothing_else() {
+    let repo = IndexedMonorepo::new("override-invalid");
+    fs::create_dir_all(repo.root.join("empty")).unwrap();
+    repo.write("node_modules/x/index.js", "module.exports = {};\n");
+    repo.write(".env/local.txt", "placeholder\n");
+    // Indexed, so only `restricted_patterns` can reject `.env`.
+    assert!(
+        repo.index()
+            .files
+            .iter()
+            .any(|file| file.path == ".env/local.txt")
+    );
+    let baseline = repo.build();
+
+    let cases: [(&[&str], &[&str], &str); 13] = [
+        (&["../outside"], &[], "../outside"),
+        (&["/etc"], &[], "/etc"),
+        (&["node_modules/x"], &[], "node_modules/x"),
+        (&["empty"], &[], "empty"),
+        (&[".env"], &[], ".env"),
+        (&["./docs"], &[], "./docs"),
+        (&["docs/"], &[], "docs/"),
+        (&["packages//api"], &[], "packages//api"),
+        // A file, not a directory holding one.
+        (&["README.md"], &[], "README.md"),
+        // The repository root is never removed: the map is never empty.
+        (&[], &[""], ""),
+        (&[], &["."], "."),
+        // Names no root, so removing it would do nothing.
+        (&[], &["docs"], "docs"),
+        // Both added and removed: neither applies.
+        (&["docs"], &["docs"], "docs"),
+    ];
+    for (added, removed, entry) in cases {
+        let map = repo.build_overriding(added, removed);
+        assert_eq!(map.roots, baseline.roots, "{entry:?} changed the roots");
+        let mut expected = baseline.excluded.clone();
+        expected.push(excluded(entry, ExclusionReason::InvalidOverride));
+        expected.sort();
+        assert_eq!(map.excluded, expected, "{entry:?}");
+    }
+}
+
+#[test]
+fn repository_config_sets_the_override_keys_and_a_profile_cannot_carry_them() {
+    let repo = IndexedMonorepo::new("override-config");
+    let repository_config = Config::repository_config_path(&repo.root);
+    fs::create_dir_all(repository_config.parent().unwrap()).unwrap();
+    fs::write(
+        &repository_config,
+        "project_roots_added=tools/scripts|tools/ci\nproject_roots_removed=examples/legacy\n",
+    )
+    .unwrap();
+    let (config, report) = Config::load_scoped(
+        repo.config(),
+        None,
+        Some(&repository_config),
+        None,
+        Some(&repo.root),
+    )
+    .unwrap();
+    assert_eq!(
+        config.project_roots_added,
+        strings(&["tools/scripts", "tools/ci"])
+    );
+    assert_eq!(config.project_roots_removed, strings(&["examples/legacy"]));
+    assert!(
+        report.rejected_keys.is_empty(),
+        "{:?}",
+        report.rejected_keys
+    );
+    let shown = config.to_policy_text();
+    assert!(
+        shown.contains("project_roots_added=tools/scripts|tools/ci\n"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("project_roots_removed=examples/legacy\n"),
+        "{shown}"
+    );
+
+    let overlay =
+        ConfigOverlay::parse("project_roots_added=a|b\nproject_roots_removed=c\n").unwrap();
+    assert_eq!(
+        ConfigOverlay::parse(&overlay.to_policy_text()).unwrap(),
+        overlay
+    );
+    let (carried, refused) = split_profile_keys(overlay);
+    assert_eq!(carried, ConfigOverlay::default());
+    let refused: Vec<(&str, RepositoryKeyClass)> = refused
+        .iter()
+        .map(|rejected| (rejected.key.as_str(), rejected.class))
+        .collect();
+    assert_eq!(
+        refused,
+        vec![
+            ("project_roots_added", RepositoryKeyClass::Forbidden),
+            ("project_roots_removed", RepositoryKeyClass::Forbidden),
+        ]
+    );
+}
+
+#[test]
+fn editing_the_overrides_keeps_a_path_in_at_most_one_list() {
+    use workspace_engine::{RootOverrideEdit, edit_root_overrides};
+    let mut overlay = ConfigOverlay::parse("max_file_bytes=2048\n").unwrap();
+    edit_root_overrides(&mut overlay, RootOverrideEdit::Add, "tools/scripts");
+    edit_root_overrides(&mut overlay, RootOverrideEdit::Add, "tools/scripts");
+    edit_root_overrides(&mut overlay, RootOverrideEdit::Remove, "examples/legacy");
+    assert_eq!(
+        overlay.project_roots_added,
+        Some(strings(&["tools/scripts"]))
+    );
+    assert_eq!(
+        overlay.project_roots_removed,
+        Some(strings(&["examples/legacy"]))
+    );
+
+    edit_root_overrides(&mut overlay, RootOverrideEdit::Remove, "tools/scripts");
+    assert_eq!(overlay.project_roots_added, None);
+    assert_eq!(
+        overlay.project_roots_removed,
+        Some(strings(&["examples/legacy", "tools/scripts"]))
+    );
+
+    edit_root_overrides(&mut overlay, RootOverrideEdit::Clear, "examples/legacy");
+    edit_root_overrides(&mut overlay, RootOverrideEdit::Clear, "tools/scripts");
+    // Emptied lists are unset, and the user's other keys are untouched.
+    assert_eq!(
+        overlay,
+        ConfigOverlay::parse("max_file_bytes=2048\n").unwrap()
+    );
 }
