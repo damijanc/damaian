@@ -27,7 +27,7 @@ untrusted),
 [`13_docker_command_support.md`](../13_docker_command_support.md),
 [`20_working_modes/proposal.md`](../20_working_modes/proposal.md) (mode narrows a profile; the
 permission matrix this extends),
-[`32_hooks.md`](../32_hooks.md) and
+[`32_hooks/proposal.md`](../32_hooks/proposal.md) and
 [`33_mcp_management_and_deferred_discovery.md`](../33_mcp_management_and_deferred_discovery.md)
 (both reference "the effective profile" this spec defines).
 
@@ -154,7 +154,7 @@ system can read the resolved state.
 - Organization-wide or remotely managed policy — Phase 6 WP6. `admin.conf`
   remains a local file.
 - Per-tool MCP permissions — [spec 33](../33_mcp_management_and_deferred_discovery.md).
-- Hook permissions — [spec 32](../32_hooks.md).
+- Hook permissions — [spec 32](../32_hooks/proposal.md).
 - Replacing modes. Mode and profile are different axes: a profile is what the
   installation permits, mode is what this session is doing.
   §5.6 defines the intersection.
@@ -181,7 +181,7 @@ reach the network:
 `require_approval_for_risky_commands`, `require_approval_for_all_commands`,
 `mcp_enabled`, `mcp_server_allowlist`, per-server `enabled` and
 `require_approval`, `data_dir`, and every profile field added by
-[spec 32](../32_hooks.md) or
+[spec 32](../32_hooks/proposal.md) or
 [spec 33](../33_mcp_management_and_deferred_discovery.md).
 
 **Preference keys** — everything else: `max_file_bytes`,

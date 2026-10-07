@@ -138,7 +138,7 @@ speculative #38.
 
 Re-derived on 2026-10-06, when [#31](31_permission_profiles/proposal.md) was
 finished. Four `Depends on:` lines named #31 not built: #32, #33, #35 and #52.
-**One is promoted:** [#32](32_hooks.md), whose other dependencies (#17, #22)
+**One is promoted:** [#32](32_hooks/proposal.md), whose other dependencies (#17, #22)
 were already built. The other three still wait. #33 waits on #26, #35 on #23,
 and #52 on #33. The ready set is now #23, #24, #32, #50, #56, #57 and the
 speculative #38.
@@ -170,6 +170,21 @@ than in progress until its Task 1 starts. Two facts about pairing it, from its
 - **Its Task 2 adds a config key**, so it edits `config.rs`, `profile.rs`,
   `effective_policy.rs` and `tests/permission_profiles.rs`, the same four
   files as #24's Task 6. That is a rebase, not a blocker.
+
+Re-checked on 2026-10-07, when [#32](32_hooks/proposal.md) was planned. The
+ready set and the order are unchanged. #32 stays ready rather than in progress
+until its Task 1 starts. Three facts about pairing it, from its
+[`context.md`](32_hooks/context.md) §3 and §14:
+
+- **Its Tasks 7 and 8 edit `chat.rs`**, and no other task does. Of the
+  `chat.rs` specs, it may pair with #25 only: not with #23, #50, #56 or #57,
+  and not with #24's Task 7.
+- **Its Task 1 adds hook config keys**, so it edits `config.rs`, `profile.rs`,
+  `effective_policy.rs` and `tests/permission_profiles.rs`, the same four
+  files as #24's Task 6 and #50's Task 2. That is a rebase, not a blocker.
+- **Its Task 6 edits `edit.rs`'s `apply_stored_patch` and
+  `context_manager.rs`**, which #24's Task 6 also edits for its context
+  item. Same rule.
 
 **#24 and #26 are the keystones now that #22 has landed.** #24 is in progress and
 sits in front of #25 and #26; the whole tail waits on #26. Preferring a spec
@@ -275,7 +290,7 @@ is ready.
 | 29 | [29_memory_creation_and_consent.md](29_memory_creation_and_consent.md) | **Not started.** Roadmap Phase 3b WP2. The consent gate: `MemoryProposal` and `MemoryEntry` are separate types with one conversion requiring a user confirmation, so unconfirmed persistence is unrepresentable. Instruction-shaped candidates from untrusted origins get no proposal at all. |
 | 30 | [30_memory_retrieval_and_lifecycle.md](30_memory_retrieval_and_lifecycle.md) | **Not started.** Roadmap Phase 3b WP4. Memory reaches the model only as a `ContextItem` in the lowest-priority category, is visible and removable in #27, and is marked stale by hash comparison against its evidence. Proven by prompt-injection evals, not design argument. |
 | 31 | [31_permission_profiles/](31_permission_profiles/proposal.md) | **Done (2026-10-06).** Roadmap Phase 4 WP3, built in nine tasks. Its security subset shipped first as #34; this spec adds the profile machinery on top. Four built-in profiles (Read-only, Safe local, Full, Offline private) plus imported custom ones are applied last and can only narrow. `profile ∩ mode` is checked at every refusal point, and `command_access` also blocks in the command policy, so a proposal run by id is refused. The capability/preference partition is exhaustive at compile time. The Settings view attributes every rule to its source, names it in plain words and shows refused requests without their values. Export never carries a credential reference, and import lists widenings rather than applying them. **Criterion 7, the second-person review, did not happen**: the project owner waived it on 2026-10-06 after their own reading led to the plain-language names (proposal §7.3). Two documented limits: `local` is a command-name heuristic, not a sandbox, and Offline private does not stop model traffic. |
-| 32 | [32_hooks.md](32_hooks.md) | **Not started.** Roadmap Phase 4 WP2. Nine lifecycle events, hooks as external programs returning a verdict — `deny`/`request_approval`/`warn`/`allow`, with no `approve`, so widening is unrepresentable. Mandatory is the default classification so a broken hook fails closed. |
+| 32 | [32_hooks/](32_hooks/proposal.md) | **Not started; split into a folder and planned 2026-10-07** in ten tasks (see its `tasks.md`). [`context.md`](32_hooks/context.md) found that `CommandRunner` already has the deadline, process-group kill and PID registry entry the flat spec said were missing, that three events live outside `chat.rs` and `session_end` has no teardown to attach to (it fires on deletion and only observes), and it fixes what each verdict means where there is nothing to approve or nothing left to block. It also tables how hook config is classified per scope: a repository may define a hook that stays inactive until reviewed at a hash, and may never touch a user hook. Roadmap Phase 4 WP2. Nine lifecycle events, hooks as external programs returning a verdict — `deny`/`request_approval`/`warn`/`allow`, with no `approve`, so widening is unrepresentable. Mandatory is the default classification so a broken hook fails closed. |
 | 33 | [33_mcp_management_and_deferred_discovery.md](33_mcp_management_and_deferred_discovery.md) | **Not started.** Roadmap Phase 4 WP4. Every enabled server's full schema currently reaches every request, outside #26's accounting. Adds a search tool with on-demand schemas, per-tool enable, lazy startup, and treats a remote read-only claim as an assertion that cannot lower an approval requirement. |
 | 34 | [34_repository_config_trust_boundary.md](34_repository_config_trust_boundary.md) | **Done — implemented ahead of #14 onward.** Bug-driven, not a roadmap graduation. `apply_overlay` is scope-blind, so repository config overrides user config: a repo-set `shell` runs its own script for every approved command (verified), a repo-set `model_base_url` exfiltrates the API key and code with no approval, and a repo `command_allowlist` executes commands unprompted. Adds a scope-aware overlay, a forbidden-key list, restrict-only merges, and moves `Allow Always` to user scope keyed by repository. Security subset of #31, extracted so it need not wait for Phase 4. |
 | 35 | [35_commit_preparation.md](35_commit_preparation.md) | **Not started.** Roadmap Phase 5 WP1. Damaian's first write to a user's Git repository. Builds the commit through a private index so the user's staging is never touched, runs hooks rather than bypassing them, and closes a trap: `GitService::diff` redacts, so a user could approve a diff showing `[REDACTED]` and commit the real secret. |
