@@ -150,6 +150,7 @@ pub fn rule_label(key: &str) -> Option<String> {
         "checkpoint_max_total_bytes" => "Checkpoint storage limit (bytes)",
         "checkpoint_census_max_paths" => "Changed files a command checkpoint covers",
         "enable_semantic_search" => "Semantic search",
+        "enable_worker_sessions" => "Worker sessions",
         "agent_max_tool_rounds" => "Tool rounds per turn",
         "agent_web_debug_max_tool_rounds" => "Tool rounds per browser-debugging turn",
         "agent_tool_retry_limit" => "Retries of a failing tool call",

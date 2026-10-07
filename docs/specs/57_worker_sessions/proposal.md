@@ -1,6 +1,6 @@
 # Feature Spec: Worker Sessions
 
-Status: Not started
+Status: In progress (Task 1 of 11 done 2026-10-07; see [`tasks.md`](tasks.md))
 Order: 57 of 57
 Plan: none. An exception to the graduation rule, like #41–#44 and #47: it came
 from describing how this repository is actually built — a planner session that
@@ -128,15 +128,21 @@ Recorded because each was a real choice with a rejected alternative.
 
 **Setting.** `enable_worker_sessions: bool` in `Config`, default `false`, shown
 in Settings as "Worker sessions" with a one-line description. It is classified
-`RepositoryKeyClass::Forbidden` ([`config.rs:70`](../../../crates/workspace-engine/src/config.rs)):
+`RepositoryKeyClass::Forbidden` ([`config.rs:77`](../../../crates/workspace-engine/src/config.rs)),
+and so a `Capability` key in #31's partition:
 a repository must not be able to change how the user's sessions behave or add
 text to their system prompt. Turning it off while workers are running does not
 stop them; it hides the entry points for new ones, and the board stays
 reachable until no worker is left on it.
 
-**Instruction.** When the setting is on, `system_prompt`
-([`chat.rs:3439`](../../../crates/workspace-engine/src/chat.rs)) appends one
-fixed paragraph for every session that is **not** itself a worker:
+**Instruction.** When the setting is on, one fixed paragraph
+(`WORKER_HANDOFF_PARAGRAPH`) is appended to the system prompt of every session
+that is **not** itself a worker. `system_prompt(mode)` only knows the mode, so
+it is left unchanged; the turn calls `system_prompt_for_session(mode,
+offer_handoffs)` instead, with `offer_handoffs = enable_worker_sessions &&
+worker_record(session).is_none()`
+([`chat.rs`](../../../crates/workspace-engine/src/chat.rs), correction C1 in
+[`tasks.md`](tasks.md)):
 
 > When work should continue in a separate session — because it is a
 > self-contained task, or one of several that can run in parallel — write each
@@ -147,7 +153,7 @@ fixed paragraph for every session that is **not** itself a worker:
 > `worker-prompt` tag for anything else.
 
 The paragraph is Damaian's own text, not repository content. When the setting is
-off, `system_prompt` returns exactly what it returns today; the existing test
+off, the turn sends exactly what `system_prompt` returns today; the existing test
 pinning today's Code-mode prompt (`TODAYS_CODE_SYSTEM_PROMPT`) keeps passing
 unmodified, and that is part of the proof. Worker sessions never get the
 paragraph, so a worker is not invited to hand off further work.
@@ -216,7 +222,14 @@ exists, `-2`, `-3`, … is appended to both until neither does.
    with the configured round budget, and append a `worker_spawned` event to it
    recording parent, source repository, worktree path, branch, base commit, the
    include choice, and the exact git commands run. Append a `worker_spawned`
-   event to the parent (if any) carrying the worker's session id.
+   event to the parent (if any) carrying the worker's session id. Both go
+   through typed `SessionStore` methods (`record_worker_spawned`,
+   `record_worker_child`), since `append_session_event` stays private.
+   Sessions are keyed by repository id, and each worktree is its own
+   repository id, so the worktree path and source repository live only in the
+   worker's `worker_spawned` record. `worker_record`, `worker_children` and
+   `worker_sessions_for_source` read them back (correction C2 in
+   [`tasks.md`](tasks.md)).
 8. Record the same facts as a `worker_spawned` audit event.
 9. Start the worker process (§5.2) with the prompt as its first message.
 

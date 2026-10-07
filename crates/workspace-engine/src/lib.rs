@@ -132,6 +132,7 @@ pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{
     ActionMarker, ChatMessage, DanglingAction, ExportFormat, PendingApprovalRef, SearchOptions,
     Session, SessionSearchHit, SessionSearchResult, SessionStore, Task, TaskStatus, TaskUsage,
+    WorkerRecord,
 };
 pub use tree_walk::{WalkEvent, WalkFile, WalkSkip};
 pub use validation::{

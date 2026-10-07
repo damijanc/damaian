@@ -3,13 +3,13 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md) · background in [`context.md`](context.md)
-**Started:** not yet (planned 2026-10-04)
+**Started:** 2026-10-07 (planned 2026-10-04; references re-checked against the tree on 2026-10-07, after #24 Tasks 1–5 landed)
 
 ## Progress
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · Setting, worker record, handoff instruction | Not started | |
+| 1 · Setting, worker record, handoff instruction | Done 2026-10-07 | `enable_worker_sessions` (default off) is Forbidden at repository scope and a `Capability` key in #31's partition. Beyond the planned touchpoints it needed `profile.rs::split_profile_keys`, a `weakening_cases` row, and a human name in `effective_policy.rs` (`every_rule_has_a_human_name` caught that one). `WorkerRecord` plus `record_worker_spawned`, `record_worker_child`, `worker_record`, `worker_children` and `worker_sessions_for_source` on `SessionStore`. Both `worker_spawned` events share one type; the parent's carries `workerSessionId`, which is how `worker_record` tells them apart. `worker_record` reads with `parsed_events`, so a rewind cannot turn a worker back into a session that is offered handoffs. `record_steering_note` is deferred to Task 2, which writes and tests the event. `system_prompt_for_session` and `WORKER_HANDOFF_PARAGRAPH` are in `chat.rs`, and `ask_with_session` calls it. Tests: 15 filtered tests, `repository_config_trust` (48) and `permission_profiles` all pass; fmt, clippy (`workspace-engine`) and typos are clean. **Order deviation:** a second agent started this task in the same worktree and was stopped. It had already written the config implementation, so Step 2 (fail first) was not observed. Step 6 stood in for it. Each change below was made separately and reverted, and each test it names failed: paragraph in `system_prompt` → the byte-identical test; dropping `is_none()` → `a_worker_session_never_gets_the_paragraph`; repository value applied → `repository_config_cannot_enable_worker_sessions`; by-source lookup ignoring the source → its test; default `true` → `worker_sessions_are_off_by_default`. The first breakage showed that the worker test compared only against `system_prompt(Code)`. It now also asserts that the prompt has no `worker-prompt`. |
 | 2 · `TurnSteering` and `TaskStatus::Paused` | Not started | |
 | 3 · The progress file | Not started | |
 | 4 · Worktree creation and removal | Not started | |
@@ -59,7 +59,7 @@ Every task's requirements implicitly include this section.
 - **Off means byte-for-byte off** (requirement 1). With
   `enable_worker_sessions = false`, `system_prompt` output, every existing
   route's response and the rendered UI are unchanged.
-  `code_mode_system_prompt_is_byte_identical_to_todays` (`chat.rs:5360`)
+  `code_mode_system_prompt_is_byte_identical_to_todays` (`chat.rs:5526`)
   passes **unmodified**. Do not edit that test or its constant.
 - **Nothing survives** (requirement 8). Every process kill goes through the #46
   registry and a `ProcessIdentity` comparison. Never kill by name: no `pkill`,
@@ -76,14 +76,20 @@ Every task's requirements implicitly include this section.
   `MockModelAdapter` or `DAMAIAN_MOCK_MODEL_RESPONSE`. Anything that spawns a
   real worker process, binds a socket outside a temp dir, or `SIGKILL`s
   something is `#[ignore]`d, with the exact manual command in its doc comment.
-  `crates/workspace-engine/tests/process_registry.rs:125-224` is the
-  re-exec pattern to copy.
+  `crates/workspace-engine/tests/process_registry.rs:125-261` is the
+  re-exec pattern to copy (the test, its helpers and `register_silent_child`).
 - **Falsify every load-bearing test.** Break what it guards and confirm it
   fails, then record that in the Progress row. #49's Task 5 found a test that
   passed against a broken implementation.
 - **UI verification** runs the shell on a port other than 4765, with its own
   `DAMAIAN_DATA_DIR`. Static assets are `include_str!`-embedded, so rebuild and
   restart before checking. Stop the instance by its PID.
+- **A private Cargo target directory per worktree.** Tasks run in parallel
+  worktrees. Every `cargo` command is prefixed with
+  `CARGO_TARGET_DIR="$PWD/target"` and run from the worktree root, so that
+  builds neither share nor thrash one target directory. Shell state does not
+  persist between an agent's commands, so put the prefix on each invocation,
+  e.g. `CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine`.
 - **Scoped checks per task.** The full seven-command gate from `AGENTS.md`
   runs once, in Task 11. It takes `cargo nextest run --workspace` about 5
   minutes locally.
@@ -96,23 +102,24 @@ Each one names the task that owns it.
 
 | # | Proposal says | Code says | Resolution |
 |---|---|---|---|
-| C1 | `system_prompt` appends the paragraph (§5.0) | `fn system_prompt(mode: SessionMode) -> String` (`chat.rs:3439`) knows only the mode; its one caller is `chat.rs:760` | Keep `system_prompt(mode)` unchanged. Add `system_prompt_for_session(mode, offer_handoffs: bool)`, called at `chat.rs:760`. **Task 1** |
+| C1 | `system_prompt` appends the paragraph (§5.0) | `fn system_prompt(mode: SessionMode) -> String` (`chat.rs:3580`) knows only the mode; its one caller is `chat.rs:765` | Keep `system_prompt(mode)` unchanged. Add `system_prompt_for_session(mode, offer_handoffs: bool)`, called at `chat.rs:765`. **Task 1** |
 | C2 | Events are appended to the session (§5.1 step 7) | `append_session_event` (`session.rs:1906`) is private. Sessions are keyed by repository id, and `create_session(repository_id, title)` takes no path | Add typed public methods on `SessionStore` (Interfaces, Task 1). The worktree path lives only in the `worker_spawned` record. **Task 1** |
-| C3 | Notes and progress pass "the same redaction as the session log" (§5.4, §5.5) | The session log is deliberately unredacted on write (`session.rs:1648`). Redaction happens at the call sites (`SecretScanner::redact`) | Notes are redacted where user messages are, i.e. on the way to the model. Every progress-file value goes through `SecretScanner::redact` before it is written. **Tasks 2, 3** |
-| C4 | Adding `steering` to `TurnSink` (§5.4) | There are 32 `TurnSink { .. }` literals: 6 in `chat.rs`, 5 in `desktop-shell/src/lib.rs`, 1 in `eval-harness/src/runner.rs` and 20 under `workspace-engine/tests/` | Mechanical: `steering: None` at each. The compiler names them all. **Task 2** |
+| C3 | Notes and progress pass "the same redaction as the session log" (§5.4, §5.5) | The session log is deliberately unredacted on write (`session.rs:1649`). Redaction happens at the call sites (`SecretScanner::redact`) | Notes are redacted where user messages are, i.e. on the way to the model. Every progress-file value goes through `SecretScanner::redact` before it is written. **Tasks 2, 3** |
+| C4 | Adding `steering` to `TurnSink` (§5.4) | There are 36 `TurnSink { .. }` literals (32 when planned; #31 added `tests/permission_profiles.rs`, and more were added since): 6 in `chat.rs`, 5 in `desktop-shell/src/lib.rs`, 1 in `eval-harness/src/runner.rs` and 24 under `workspace-engine/tests/` | Mechanical: `steering: None` at each. The compiler names them all. **Task 2** |
 | C5 | `Paused` is recoverable via #17 (§5.4) | `recovery.rs::classify_session` treats any non-terminal status except `WaitingForApproval` as `Interrupted`, and may **auto-resume** it in the shell | Correct for classification. But a worker session must never auto-resume in the shell: its repository is a worktree and its host is gone. Recovery skips auto-resume for any session with a worker record, and the UI offers *Restart worker* instead. **Tasks 2, 7** |
 | C6 | "The worker registers its PID … tagged with its session id" (§5.2) | `ProcessRegistry` records the **owner** as the registering process (`process_registry.rs:99`). `ProcessKind` has no `Worker` variant | The **shell** registers the worker child (`ProcessKind::Worker`, the worker's session id, owner = shell), so the launch sweep kills workers of a crashed shell. Each worker registers its own children (owner = worker), so `sweep_own` inside the worker kills exactly its children. **Tasks 5, 7** |
-| C7 | `/api/worker-control` takes `{sessionId, command, ...}` (§5.7) | Every shell route takes url-encoded form fields (`parse_form`, `lib.rs:2741`) | Form fields: `session_id`, `command`, plus `text`, `note` and `proposal_id` as needed. Only the **socket** speaks JSON lines. **Task 7** |
-| C8 | The tag rule is "checked by driving `renderMarkdown`" (§6) | A finished message is re-rendered **server-side** (`finalizeChatMessage`, `app.js:3123` → `render.rs:376`), which writes the trimmed info string verbatim into `class="language-…"`. `renderMarkdown` strips non-`[a-z0-9_-]` characters | Attach the action after `finalizeChatMessage`. Match `code.className === "language-worker-prompt"` exactly, which rejects `worker-prompt extra`. Verify through both renderers. **Task 8** |
-| C9 | "Worker sessions" shown in Settings (§5.0) | Settings has no bool toggle. General is a raw config textarea. `/api/config` returns policy text only | A `.field-checkbox` on the General page, written through `upsertConfigValue` + `saveConfigFile` (the MCP form's pattern, `app.js:2295`). `GET /api/workers-enabled` reads the effective value. **Task 8** |
-| C10 | The board polls about once a second (§5.7) | The accept loop (`lib.rs:112`) is blocked for the whole of an `/api/ask-stream` turn | **Accepted, decided 2026-10-04.** While any session in the window is streaming, the board and progress polls stall until the turn ends. Workers keep running, and only the view lags. Document this in proposal §5.7 and `TROUBLESHOOTING.md`, and name "serve worker routes during a stream" as a follow-up in §7. **Tasks 9, 11** |
-| C11 | `RunEvent::Exit` hook (§5.3.4) | `desktop-app/src/main.rs:122` ends in `.run(ctx)`, and the shell runs **in-process** on a thread (line 84). `current_exe()` is the Tauri binary | Switch to `.build(ctx)?.run(\|app, event\| …)`. The `--worker` branch goes at the top of **both** `desktop-app` `main()` (line 36) and `desktop-shell` `main()`, before `install_shutdown_handler` (`desktop-shell/src/main.rs:4`). **Tasks 5, 7** |
+| C7 | `/api/worker-control` takes `{sessionId, command, ...}` (§5.7) | Every shell route takes url-encoded form fields (`parse_form`, `lib.rs:2894`) | Form fields: `session_id`, `command`, plus `text`, `note` and `proposal_id` as needed. Only the **socket** speaks JSON lines. **Task 7** |
+| C8 | The tag rule is "checked by driving `renderMarkdown`" (§6) | A finished message is re-rendered **server-side** (`finalizeChatMessage`, `app.js:3513` → `workspace-engine/src/render.rs:376`), which writes the trimmed info string verbatim into `class="language-…"`. `renderMarkdown` strips non-`[a-z0-9_-]` characters | Attach the action after `finalizeChatMessage`. Match `code.className === "language-worker-prompt"` exactly, which rejects `worker-prompt extra`. Verify through both renderers. **Task 8** |
+| C9 | "Worker sessions" shown in Settings (§5.0) | Settings has no bool toggle. General is a raw config textarea. `/api/config` returns policy text only | A `.field-checkbox` on the General page, written through `upsertConfigValue` + `saveConfigFile` (the MCP form's pattern, `upsertMcpConfig`/`saveMcpServer`, `app.js:2923`/`2951`). `GET /api/workers-enabled` reads the effective value. **Task 8** |
+| C10 | The board polls about once a second (§5.7) | The accept loop (`lib.rs:115`) is blocked for the whole of an `/api/ask-stream` turn | **Accepted, decided 2026-10-04.** While any session in the window is streaming, the board and progress polls stall until the turn ends. Workers keep running, and only the view lags. Document this in proposal §5.7 and `TROUBLESHOOTING.md`, and name "serve worker routes during a stream" as a follow-up in §7. **Tasks 9, 11** |
+| C11 | `RunEvent::Exit` hook (§5.3.4) | `desktop-app/src/main.rs:122` ends in `.run(tauri::generate_context!())`, and the shell runs **in-process** on a thread (line 84). `current_exe()` is the Tauri binary | Switch to `.build(ctx)?.run(\|app, event\| …)`. The `--worker` branch goes at the top of **both** `desktop-app` `main()` (line 36) and `desktop-shell` `main()`, before `install_shutdown_handler` (`desktop-shell/src/main.rs:4`). **Tasks 5, 7** |
 
 ## File Structure
 
 | File | Change |
 |---|---|
-| `crates/workspace-engine/src/config.rs` | `enable_worker_sessions` (copy `audit_enabled`'s eight touchpoints: field 184, default 1601, overlay 1653, `set` 1807, destructure 625, `scoped` 684, both `to_policy_text`s) |
+| `crates/workspace-engine/src/config.rs` | `enable_worker_sessions` (copy `audit_enabled`'s touchpoints: field 265, default 2058, overlay field 2118, `set` 2417, destructure 827, `scoped` 902, `classify_overlay_fields!` 2238 (Capability, added by #31), and both `to_policy_text`s, 1930 and 2754 with its destructure at 2637) |
+| `crates/workspace-engine/src/profile.rs`, `tests/permission_profiles.rs` | `split_profile_keys` refuses the key (348, 384); a `weakening_cases` row (228). Both added by #31 after this plan's line numbers were first taken |
 | `crates/workspace-engine/src/session.rs` | `TaskStatus::Paused`; `WorkerRecord`; worker and steering-note event methods |
 | `crates/workspace-engine/src/chat.rs` | `TurnSink.steering`; `system_prompt_for_session`; the round-boundary pause/note step; `TurnProgress` variants |
 | `crates/workspace-engine/src/steering.rs` | **New.** `TurnSteering` |
@@ -159,6 +166,7 @@ impl SessionStore {
     pub fn worker_children(&self, parent_session_id: &str) -> Result<Vec<String>>;
     /// Every worker session whose record names `source_repository`, across all repository ids.
     pub fn worker_sessions_for_source(&self, source_repository: &Path) -> Result<Vec<Session>>;
+    /// Added by Task 2, with the event it writes (deferred from Task 1).
     pub fn record_steering_note(&self, session_id: &str, message_id: &str) -> Result<()>;
 }
 
@@ -240,10 +248,10 @@ beside any other spec that touches `chat.rs`** (`docs/specs/README.md`,
 ## Task 1: Setting, worker record, handoff instruction
 
 **Requirements:** 1, 2 (the instruction half). **Proposal:** §5.0, §5.8.
-**Corrections:** C1, C2. **Files:** `config.rs`, `session.rs`, `chat.rs`,
-`AGENTS.md`, `tests/repository_config_trust.rs`.
+**Corrections:** C1, C2. **Files:** `config.rs`, `profile.rs`, `session.rs`, `chat.rs`,
+`AGENTS.md`, `tests/repository_config_trust.rs`, `tests/permission_profiles.rs`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
   - `config.rs`: `worker_sessions_are_off_by_default`.
   - `repository_config_trust.rs`: `repository_config_cannot_enable_worker_sessions`.
     In repository scope the key is dropped and recorded as a forbidden key,
@@ -262,26 +270,29 @@ beside any other spec that touches `chat.rs`** (`docs/specs/README.md`,
     read `adapter.requests[0].messages[0]`:
     `a_non_worker_session_gets_the_paragraph_when_enabled` and
     `a_worker_session_never_gets_the_paragraph`.
-- [ ] **Step 2: Run them and confirm they fail**
-- [ ] **Step 3: Add the setting**, following `audit_enabled`'s touchpoints
-      (File Structure). The exhaustive destructure at `config.rs:605` forces
-      the classification, which is the guard working. Add the key to the
+- [x] **Step 2: Run them and confirm they fail**
+- [x] **Step 3: Add the setting**, following `audit_enabled`'s touchpoints
+      (File Structure). The exhaustive destructures at `config.rs:802` and
+      `config.rs:2637`, and `classify_overlay_fields!` at `config.rs:2212`, force
+      the classification, which is the guard working. The #31 kind is
+      `Capability`: a key repository scope does not apply freely is a
+      capability key (`config.rs:2178`). Add the key to the
       Forbidden row of
       [`../34_repository_config_trust_boundary.md`](../34_repository_config_trust_boundary.md)'s
       table.
-- [ ] **Step 4: Add `WorkerRecord` and the `SessionStore` methods.** They are
+- [x] **Step 4: Add `WorkerRecord` and the `SessionStore` methods.** They are
       thin public wrappers over the private `append_session_event`. Do not
       make that function public.
-- [ ] **Step 5: Add `system_prompt_for_session`** and switch `chat.rs:760` to
+- [x] **Step 5: Add `system_prompt_for_session`** and switch `chat.rs:765` to
       it, with
       `offer_handoffs = config.enable_worker_sessions && worker_record(&session.id)?.is_none()`.
-- [ ] **Step 6: Falsify.** Make `system_prompt` itself append the paragraph and
+- [x] **Step 6: Falsify.** Make `system_prompt` itself append the paragraph and
       confirm `code_mode_system_prompt_is_byte_identical_to_todays` fails.
       Drop the `is_none()` term and confirm the worker test fails. Revert both.
-- [ ] **Step 7: `AGENTS.md`.** Change the task-prompt template's fence from
+- [x] **Step 7: `AGENTS.md`.** Change the task-prompt template's fence from
       `text` to `worker-prompt` (proposal §5.0, last paragraph).
-- [ ] **Step 8: Update the proposal** for C1 and C2.
-- [ ] **Step 9: Scoped checks.** Run
+- [x] **Step 8: Update the proposal** for C1 and C2.
+- [x] **Step 9: Scoped checks.** Run
       `cargo nextest run -p workspace-engine -E 'test(worker) + test(system_prompt) + test(handoff)'`
       and `cargo nextest run -p workspace-engine --test repository_config_trust`,
       then `cargo fmt --all`, `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`
@@ -313,8 +324,8 @@ C4, C5. **Files:** `steering.rs` (new), `chat.rs`, `session.rs`,
   - In `steering.rs` unit tests: `wait_while_paused_returns_on_cancel_without_wake`.
 - [ ] **Step 2: Run to verify they fail**
 - [ ] **Step 3: Add `TaskStatus::Paused`.** The compiler names `as_str` and
-      `tests/crash_recovery.rs:834`. Also update `all()` and the string lists
-      in `tests/session_rewind.rs:434-494`. It is neither terminal nor
+      `tests/crash_recovery.rs:836`. Also update `all()` and the string lists
+      in `tests/session_rewind.rs:435-495`. It is neither terminal nor
       side-effect-in-flight. Grep `app.js` for status strings and give
       `paused` a label wherever the others have one.
 - [ ] **Step 4: Recovery (C5).** Add
@@ -322,11 +333,11 @@ C4, C5. **Files:** `steering.rs` (new), `chat.rs`, `session.rs`,
       `Paused` or `RunningTool` task in a session with a worker record is
       classified `Interrupted` and is not auto-resumed. Implement it in
       `recovery.rs`.
-- [ ] **Step 5: Add `steering: None` to all 32 `TurnSink` literals** (C4). Do
+- [ ] **Step 5: Add `steering: None` to all 36 `TurnSink` literals** (C4). Do
       this in its own step, so the diff for the behaviour change stays
       readable.
 - [ ] **Step 6: Implement** `TurnSteering` and the boundary step at
-      `chat.rs:1570`, in proposal §5.4's order: cancelled → paused-wait →
+      `chat.rs:1690`, in proposal §5.4's order: cancelled → paused-wait →
       drain notes → running. Add the `TurnProgress` variants. In
       `desktop-shell`'s `turn_progress_event`, map them to no SSE event: the
       shell never steers.
@@ -471,7 +482,7 @@ This task runs **no turns**. It builds the host, and Task 6 puts the turn in it.
 shared engine-construction helper factored out of `run_chat_request`).
 
 - [ ] **Step 1: Factor, don't copy.** The worker builds its engine and adapter
-      exactly as `run_chat_request` (`lib.rs:1514`) does: same
+      exactly as `run_chat_request` (`lib.rs:1534`) does: same
       `engine_for_repo_with_model_options`, `configure_chat_integrations`,
       `CurlModelTransport::new(.., ProcessRegistry::open(&data_dir), ..)`, and
       the same adapter. The key comes from the handover instead of
@@ -613,7 +624,7 @@ warning; §5.7 Parent session. **Corrections:** C8, C9. **Files:** `app.js`,
 **Requirements:** 5, 6. **Proposal:** §5.7 Sidebar, Workers board.
 **Corrections:** C10. **Files:** `app.js`, `style.css`.
 
-- [ ] **Step 1: Sidebar.** `renderProjectSession` (`app.js:4727`) nests
+- [ ] **Step 1: Sidebar.** `renderProjectSession` (`app.js:5395`) nests
       workers under their parent and shows a status dot (running, needs you,
       paused, finished, failed). Parentless workers are listed with a dot.
       A **Workers** entry with a needs-you badge sits at the top of each

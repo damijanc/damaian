@@ -187,7 +187,7 @@ would otherwise default to repo-writable.
 
 | Class | Repository behaviour | Fields |
 |---|---|---|
-| **Forbidden** | Ignored, audited | `shell`, `data_dir`, `model_provider`, `model_name`, `model_base_url`, `model_api_key_env`, `model_reasoning_level`, `model_providers`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `allowed_roots` |
+| **Forbidden** | Ignored, audited | `shell`, `data_dir`, `model_provider`, `model_name`, `model_base_url`, `model_api_key_env`, `model_reasoning_level`, `model_providers`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `allowed_roots`, `enable_worker_sessions` (spec 57: it adds text to every session's system prompt) |
 | **Restrict-only** | Applied only in the more restrictive direction | `restricted_patterns`, `ignore_patterns`, `command_blocklist` (union); `require_approval_for_file_edits`, `require_approval_for_risky_commands`, `require_approval_for_all_commands` (logical OR); `mcp_enabled`, per-server `enabled` (logical AND); `mcp_server_allowlist` (intersection when both non-empty); `max_read_lines`, `max_list_entries`, `max_search_matches`, `max_match_line_chars`, `command_timeout_secs`, `agent_max_turn_messages` (lower value wins) |
 | **User-owned** | Never taken from repository config — §5.4 | `command_allowlist` |
 | **Free** | Applied as today | `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, `agent_max_tool_rounds`, `agent_web_debug_max_tool_rounds`, `agent_tool_retry_limit`, `mcp_servers` definitions (subject to the restrict-only enable rules above) |

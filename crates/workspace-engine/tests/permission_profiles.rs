@@ -231,6 +231,12 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             Reported("audit_enabled"),
         ),
         case(
+            "enable_worker_sessions",
+            "enable_worker_sessions=false\n",
+            "enable_worker_sessions=true\n",
+            Reported("enable_worker_sessions"),
+        ),
+        case(
             "checkpoint_retention_days",
             "",
             "checkpoint_retention_days=1\n",
