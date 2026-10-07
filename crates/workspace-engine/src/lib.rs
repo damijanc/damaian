@@ -64,7 +64,7 @@ pub use config::{
     RepositoryConfigReport, RepositoryKeyClass, normalize_mcp_server_id, normalize_model_provider,
     normalize_model_reasoning_level, overlay_field_kinds, parse_mcp_transport,
 };
-pub use context_manager::{ContextItem, ContextManager, ContextPlan};
+pub use context_manager::{ContextItem, ContextManager, ContextPlan, RepositoryMapSource};
 pub use data_schema::{
     CURRENT_DATA_SCHEMA_VERSION, DataSchemaError, DataSchemaOutcome, ensure_data_dir_schema,
 };
@@ -120,10 +120,10 @@ pub use render::{
     render_markdown_to_ansi, render_markdown_to_html, render_markdown_to_html_with_file_links,
 };
 pub use repository_map::{
-    DetectedRoot, ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH, MapLoad, ProjectRoot,
-    REPOSITORY_MAP_SCHEMA_VERSION, RebuildReason, RepositoryMap, RepositoryMapStore, RootCommand,
-    RootDetection, RootEvidence, RootOverride, RootOverrideEdit, VENDOR_DIRECTORIES, detect_roots,
-    edit_root_overrides,
+    Degradation, DetectedRoot, ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH, MapLoad, ProjectRoot,
+    REPOSITORY_MAP_SCHEMA_VERSION, RebuildReason, RenderedMap, RepositoryMap, RepositoryMapStore,
+    RootCommand, RootDetection, RootEvidence, RootOverride, RootOverrideEdit, VENDOR_DIRECTORIES,
+    detect_roots, edit_root_overrides,
 };
 pub use repository_trust::{
     RepositoryAllowlistMigration, RepositoryConfigNotice, RepositoryTrustStore,

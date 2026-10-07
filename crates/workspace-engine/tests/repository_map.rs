@@ -20,6 +20,12 @@
 //! Task 5 pins the persisted map: when a stored file is reused and when it
 //! is rebuilt, and why. It also pins validations proposed per root, each at
 //! that root's directory.
+//!
+//! Task 6 pins the map as model context: the rendering stays under
+//! `repository_map_max_tokens`, degrades in proposal §5.4's order and says
+//! what it dropped, and `build_context` places it before retrieved files.
+//! The key is lower-wins at repository scope, and a map that cannot be
+//! loaded is left out rather than failing the turn.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,10 +34,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use workspace_engine::indexer::SkippedFile;
 use workspace_engine::{
     AuditLog, CancelToken, CommandPolicy, CommandRisk, CommandStore, Config, ConfigOverlay,
-    DetectedRoot, ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH, MapLoad, PROJECT_MANIFESTS,
-    ProjectIndexer, ProjectRoot, REPOSITORY_MAP_SCHEMA_VERSION, RebuildReason, RepositoryIndex,
-    RepositoryKeyClass, RepositoryMap, RepositoryMapStore, RootCommand, RootDetection,
-    RootEvidence, RootOverride, SecretScanner, WorkspaceEngine, detect_roots,
+    Degradation, DetectedRoot, ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH, MapLoad,
+    PROJECT_MANIFESTS, ProjectIndexer, ProjectRoot, REPOSITORY_MAP_SCHEMA_VERSION, RebuildReason,
+    RepositoryIndex, RepositoryKeyClass, RepositoryMap, RepositoryMapStore, RootCommand,
+    RootDetection, RootEvidence, RootOverride, SecretScanner, WorkspaceEngine, detect_roots,
     repository_id_for_root, split_profile_keys,
 };
 
@@ -1615,4 +1621,362 @@ fn a_removed_root_yields_no_proposal() {
         .unwrap()
         .user_override = Some(RootOverride::Removed);
     assert_eq!(in_web(&marked), 0);
+}
+
+// Task 6: bounded rendering and the `repository_map` context item.
+
+fn project_root(path: &str, entry_points: &[&str], test_paths: &[&str]) -> ProjectRoot {
+    let under = |child: &str| {
+        if path.is_empty() {
+            child.to_string()
+        } else {
+            format!("{path}/{child}")
+        }
+    };
+    ProjectRoot {
+        path: path.to_string(),
+        detected_by: RootEvidence::Manifest {
+            path: under("package.json"),
+        },
+        languages: strings(&["json", "typescript"]),
+        manifests: vec![under("package.json")],
+        entry_points: strings(entry_points),
+        test_paths: strings(test_paths),
+        generated_paths: vec![under("dist")],
+        major_directories: vec![under("src"), under("tests")],
+        instruction_files: Vec::new(),
+        commands: vec![command("test", "npm run test", CommandRisk::Medium, path)],
+        user_override: None,
+    }
+}
+
+fn synthetic_map(roots: Vec<ProjectRoot>) -> RepositoryMap {
+    RepositoryMap {
+        repository_id: "repo_sha256:000000000".to_string(),
+        schema_version: REPOSITORY_MAP_SCHEMA_VERSION,
+        generated_at_ms: 0,
+        fingerprint: String::new(),
+        roots,
+        excluded: Vec::new(),
+    }
+}
+
+/// Three roots whose entry-point and test lines differ in size, so the
+/// largest is unambiguous, beside a removed root that must never render.
+fn three_root_map() -> RepositoryMap {
+    let mut removed = project_root("examples/legacy", &[], &[]);
+    removed.user_override = Some(RootOverride::Removed);
+    synthetic_map(vec![
+        project_root("", &["src/main.ts"], &["tests"]),
+        removed,
+        project_root(
+            "packages/api",
+            &[
+                "packages/api/src/index.ts",
+                "packages/api/src/main.ts",
+                "packages/api/index.ts",
+            ],
+            &["packages/api/tests"],
+        ),
+        project_root("packages/api/v2", &["packages/api/v2/index.ts"], &[]),
+    ])
+}
+
+fn label(degradation: &Degradation) -> String {
+    match degradation {
+        Degradation::EntryPointsAndTestPaths { root } => format!("details:{root}"),
+        Degradation::MajorDirectories => "directories".to_string(),
+        Degradation::GeneratedPathsCounted => "generated".to_string(),
+        Degradation::Roots { omitted } => format!("roots:{}", omitted.join(",")),
+    }
+}
+
+#[test]
+fn a_small_map_is_rendered_whole_with_no_degradation_line() {
+    let map = three_root_map();
+    let rendered = map.render_for_model(800);
+    assert!(rendered.dropped.is_empty(), "{:?}", rendered.dropped);
+    assert_eq!(rendered.roots_total, 3, "a removed root is not counted");
+    assert_eq!(rendered.roots_shown, 3);
+    assert_eq!(rendered.tokens, rendered.text.len().div_ceil(4));
+    for expected in [
+        "packages/api/src/main.ts",
+        "packages/api/tests",
+        "packages/api/v2/dist",
+        "npm run test",
+        "typescript",
+    ] {
+        assert!(
+            rendered.text.contains(expected),
+            "{expected}: {}",
+            rendered.text
+        );
+    }
+    assert!(
+        !rendered.text.contains("examples/legacy"),
+        "{}",
+        rendered.text
+    );
+    assert!(!rendered.text.contains("omitted"), "{}", rendered.text);
+    assert!(!rendered.text.contains("shown"), "{}", rendered.text);
+}
+
+#[test]
+fn each_degradation_step_fires_in_order_as_the_ceiling_falls() {
+    let map = three_root_map();
+    let full = map.render_for_model(usize::MAX);
+    assert!(full.dropped.is_empty());
+
+    let mut previous: Vec<String> = Vec::new();
+    let mut last_fitting = Vec::new();
+    for ceiling in (0..=full.tokens).rev() {
+        let rendered = map.render_for_model(ceiling);
+        assert!(
+            rendered.tokens <= ceiling,
+            "{} tokens at a ceiling of {ceiling}: {}",
+            rendered.tokens,
+            rendered.text
+        );
+        let labels: Vec<String> = rendered.dropped.iter().map(label).collect();
+        // A lower ceiling only ever drops more: each step extends the
+        // previous one, or omits a further root.
+        let extends = labels.starts_with(&previous)
+            || (labels.len() == previous.len()
+                && labels[..labels.len() - 1] == previous[..previous.len() - 1]
+                && labels.last().unwrap().starts_with("roots:")
+                && labels.last().unwrap().starts_with(previous.last().unwrap()));
+        assert!(extends, "{previous:?} then {labels:?} at {ceiling}");
+        if !labels.is_empty() {
+            assert!(
+                rendered.text.is_empty() || rendered.text.contains("roots shown"),
+                "a degraded map says so: {}",
+                rendered.text
+            );
+        }
+        if rendered.roots_shown > 0 {
+            last_fitting = labels.clone();
+        }
+        previous = labels;
+    }
+
+    assert_eq!(
+        last_fitting,
+        vec![
+            // Largest first, by the length of what is dropped.
+            "details:packages/api".to_string(),
+            "details:packages/api/v2".to_string(),
+            "details:".to_string(),
+            "directories".to_string(),
+            "generated".to_string(),
+            // Deepest first, and the repository root is never dropped.
+            "roots:packages/api/v2,packages/api".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn sixty_long_roots_stay_under_the_default_ceiling_and_say_what_was_dropped() {
+    let mut roots = vec![project_root("", &["src/main.ts"], &["tests"])];
+    for group in 0..6 {
+        for package in 0..10 {
+            let path = format!(
+                "packages/group-{group:02}/a-rather-long-package-directory-name-{package:02}"
+            );
+            let entry = format!("{path}/src/index.ts");
+            let tests = format!("{path}/tests");
+            roots.push(project_root(&path, &[&entry], &[&tests]));
+        }
+    }
+    let map = synthetic_map(roots);
+    let rendered = map.render_for_model(800);
+    assert!(rendered.tokens <= 800, "{} tokens", rendered.tokens);
+    assert!(rendered.text.len().div_ceil(4) <= 800);
+    assert_eq!(rendered.roots_total, 61);
+    assert!(rendered.roots_shown < 61, "{}", rendered.roots_shown);
+    assert!(rendered.roots_shown >= 1);
+    assert!(
+        rendered
+            .text
+            .contains(&format!("{} of 61 roots shown", rendered.roots_shown)),
+        "{}",
+        rendered.text
+    );
+    assert!(
+        rendered
+            .text
+            .contains("entry points and test paths omitted"),
+        "{}",
+        rendered.text
+    );
+    let Some(Degradation::Roots { omitted }) = rendered.dropped.last() else {
+        panic!("roots were dropped last: {:?}", rendered.dropped);
+    };
+    assert_eq!(omitted.len(), 61 - rendered.roots_shown);
+    assert!(
+        !omitted.contains(&String::new()),
+        "the repository root stays"
+    );
+    // Equal depth, so by path: the last package of the last group goes first.
+    assert_eq!(
+        omitted[0],
+        "packages/group-05/a-rather-long-package-directory-name-09"
+    );
+}
+
+#[test]
+fn build_context_places_one_map_item_before_retrieved_files() {
+    let repo = IndexedMonorepo::new("context-item");
+    let engine = WorkspaceEngine::new(repo.config());
+    let index = repo.index();
+    let plan = engine.context_manager.build_context(
+        &repo.root,
+        &index.repository_id,
+        "task_map",
+        "change the engine function and the api index",
+        Some(&index),
+        &[],
+        16_000,
+    );
+    let kinds: Vec<&str> = plan.items.iter().map(|item| item.kind.as_str()).collect();
+    let maps: Vec<usize> = kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| **kind == "repository_map")
+        .map(|(position, _)| position)
+        .collect();
+    assert_eq!(maps.len(), 1, "{kinds:?}");
+    let first_retrieved = kinds
+        .iter()
+        .position(|kind| *kind == "retrieved_file")
+        .expect("the prompt retrieves files, or this test proves nothing");
+    assert!(maps[0] < first_retrieved, "{kinds:?}");
+    let last_rule = kinds.iter().rposition(|kind| *kind == "project_rule");
+    assert!(last_rule.is_none_or(|rule| rule < maps[0]), "{kinds:?}");
+
+    let item = &plan.items[maps[0]];
+    assert_eq!(item.path, None);
+    assert!(item.tokens <= 800);
+    assert!(item.content.contains("packages/api"), "{}", item.content);
+    assert!(
+        !plan
+            .files
+            .iter()
+            .any(|file| file.contains("repository-map")),
+        "{:?}",
+        plan.files
+    );
+
+    let off = WorkspaceEngine::new(Config {
+        repository_map_max_tokens: 0,
+        ..repo.config()
+    });
+    let plan = off.context_manager.build_context(
+        &repo.root,
+        &index.repository_id,
+        "task_map_off",
+        "change the engine function and the api index",
+        Some(&index),
+        &[],
+        16_000,
+    );
+    assert!(
+        !plan.items.iter().any(|item| item.kind == "repository_map"),
+        "a ceiling of 0 turns the item off"
+    );
+
+    let plan = engine.context_manager.build_context(
+        &repo.root,
+        &index.repository_id,
+        "task_map_no_index",
+        "change the engine function",
+        None,
+        &[],
+        16_000,
+    );
+    assert!(!plan.items.iter().any(|item| item.kind == "repository_map"));
+}
+
+#[test]
+fn a_map_that_cannot_be_stored_is_left_out_and_the_turn_goes_on() {
+    let repo = IndexedMonorepo::new("context-item-unwritable");
+    // A file where the map directory should be, so the store cannot write.
+    fs::write(repo.data_dir.join("repository-map"), "not a directory").unwrap();
+    let engine = WorkspaceEngine::new(repo.config());
+    assert!(
+        engine.repository_map(&repo.root).is_err(),
+        "the store fails"
+    );
+
+    let index = repo.index();
+    let plan = engine.context_manager.build_context(
+        &repo.root,
+        &index.repository_id,
+        "task_map_unwritable",
+        "change the engine function and the api index",
+        Some(&index),
+        &[],
+        16_000,
+    );
+    let kinds: Vec<&str> = plan.items.iter().map(|item| item.kind.as_str()).collect();
+    assert!(!kinds.contains(&"repository_map"), "{kinds:?}");
+    assert!(kinds.contains(&"user_prompt"), "{kinds:?}");
+    assert!(kinds.contains(&"retrieved_file"), "{kinds:?}");
+}
+
+#[test]
+fn repository_config_may_lower_the_map_ceiling_but_not_raise_it() {
+    let repo = IndexedMonorepo::new("map-ceiling-config");
+    assert_eq!(repo.config().repository_map_max_tokens, 800);
+    let repository_config = Config::repository_config_path(&repo.root);
+    fs::create_dir_all(repository_config.parent().unwrap()).unwrap();
+    let load = |line: &str| {
+        fs::write(&repository_config, line).unwrap();
+        Config::load_scoped(
+            repo.config(),
+            None,
+            Some(&repository_config),
+            None,
+            Some(&repo.root),
+        )
+        .unwrap()
+    };
+
+    let (config, report) = load("repository_map_max_tokens=100000\n");
+    assert_eq!(config.repository_map_max_tokens, 800);
+    let refused = report
+        .rejected_keys
+        .iter()
+        .find(|rejected| rejected.key == "repository_map_max_tokens")
+        .unwrap_or_else(|| panic!("not refused: {:?}", report.rejected_keys));
+    assert_eq!(refused.class, RepositoryKeyClass::RestrictOnly);
+
+    let (config, report) = load("repository_map_max_tokens=50\n");
+    assert_eq!(config.repository_map_max_tokens, 50);
+    assert!(
+        report.rejected_keys.is_empty(),
+        "{:?}",
+        report.rejected_keys
+    );
+    assert!(
+        config
+            .to_policy_text()
+            .contains("repository_map_max_tokens=50\n")
+    );
+
+    let (config, _) = load("repository_map_max_tokens=0\n");
+    assert_eq!(
+        config.repository_map_max_tokens, 0,
+        "a repository may turn it off"
+    );
+
+    let overlay = ConfigOverlay::parse("repository_map_max_tokens=120\n").unwrap();
+    assert_eq!(overlay.repository_map_max_tokens, Some(120));
+    assert_eq!(
+        ConfigOverlay::parse(&overlay.to_policy_text()).unwrap(),
+        overlay
+    );
+    // A capability key: a profile carries it.
+    let (carried, refused) = split_profile_keys(overlay.clone());
+    assert_eq!(carried, overlay);
+    assert!(refused.is_empty(), "{refused:?}");
 }

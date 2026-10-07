@@ -226,6 +226,11 @@ pub struct Config {
     /// Characters of a matching line returned before it is trimmed, so one
     /// minified line cannot fill the model's context on its own.
     pub max_match_line_chars: usize,
+    /// Tokens the repository map may take in model context (spec 24 §5.4).
+    /// `0` leaves the map out. Restrict-only, same reasoning as
+    /// `max_read_lines`: it bounds how much of the repository's layout
+    /// leaves the machine per turn (spec 24 `context.md` §7).
+    pub repository_map_max_tokens: usize,
     pub max_command_output_bytes: usize,
     /// Seconds a running command may run before its process group is killed
     /// and it is reported as timed out.
@@ -806,6 +811,7 @@ impl Config {
             max_list_entries,
             max_search_matches,
             max_match_line_chars,
+            repository_map_max_tokens,
             max_command_output_bytes,
             command_timeout_secs,
             allowed_roots,
@@ -1215,6 +1221,11 @@ impl Config {
                 "max_match_line_chars",
                 &mut self.max_match_line_chars,
                 max_match_line_chars,
+            ),
+            (
+                "repository_map_max_tokens",
+                &mut self.repository_map_max_tokens,
+                repository_map_max_tokens,
             ),
             (
                 "command_timeout_secs",
@@ -1847,6 +1858,11 @@ impl Config {
         );
         push_line(
             &mut output,
+            "repository_map_max_tokens",
+            &self.repository_map_max_tokens.to_string(),
+        );
+        push_line(
+            &mut output,
             "max_command_output_bytes",
             &self.max_command_output_bytes.to_string(),
         );
@@ -2031,6 +2047,9 @@ impl Default for Config {
             max_list_entries: 200,
             max_search_matches: 50,
             max_match_line_chars: 500,
+            // Spec 26's planned 5% share of the 16,000-token default context
+            // budget (spec 24 `context.md` §7).
+            repository_map_max_tokens: 800,
             max_command_output_bytes: 1024 * 1024,
             command_timeout_secs: 600,
             allowed_roots: Vec::new(),
@@ -2095,6 +2114,7 @@ pub struct ConfigOverlay {
     pub max_list_entries: Option<usize>,
     pub max_search_matches: Option<usize>,
     pub max_match_line_chars: Option<usize>,
+    pub repository_map_max_tokens: Option<usize>,
     pub max_command_output_bytes: Option<usize>,
     pub command_timeout_secs: Option<usize>,
     pub allowed_roots: Option<Vec<PathBuf>>,
@@ -2216,6 +2236,7 @@ classify_overlay_fields! {
     max_list_entries => Capability,
     max_search_matches => Capability,
     max_match_line_chars => Capability,
+    repository_map_max_tokens => Capability,
     max_command_output_bytes => Preference,
     command_timeout_secs => Capability,
     allowed_roots => Capability,
@@ -2375,6 +2396,10 @@ impl ConfigOverlay {
             "max_search_matches" => self.max_search_matches = Some(parse_read_lines(key, value)?),
             "max_match_line_chars" => {
                 self.max_match_line_chars = Some(parse_read_lines(key, value)?)
+            }
+            // `0` is valid: it turns the map off for model context.
+            "repository_map_max_tokens" => {
+                self.repository_map_max_tokens = Some(parse_u64(key, value)? as usize)
             }
             "max_command_output_bytes" => {
                 self.max_command_output_bytes = Some(parse_u64(key, value)? as usize)
@@ -2616,6 +2641,7 @@ impl ConfigOverlay {
             max_list_entries,
             max_search_matches,
             max_match_line_chars,
+            repository_map_max_tokens,
             max_command_output_bytes,
             command_timeout_secs,
             allowed_roots,
@@ -2673,6 +2699,9 @@ impl ConfigOverlay {
         }
         if let Some(value) = max_match_line_chars {
             push_line(&mut output, "max_match_line_chars", &value.to_string());
+        }
+        if let Some(value) = repository_map_max_tokens {
+            push_line(&mut output, "repository_map_max_tokens", &value.to_string());
         }
         if let Some(value) = max_file_bytes {
             push_line(&mut output, "max_file_bytes", &value.to_string());

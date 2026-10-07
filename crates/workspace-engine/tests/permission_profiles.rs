@@ -272,6 +272,14 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "max_match_line_chars=100000\n",
             Reported("max_match_line_chars"),
         ),
+        // Spec 24: the map ceiling bounds how much of the repository's
+        // layout leaves the machine per turn (24 context.md §7).
+        case(
+            "repository_map_max_tokens",
+            "repository_map_max_tokens=800\n",
+            "repository_map_max_tokens=100000\n",
+            Reported("repository_map_max_tokens"),
+        ),
         case(
             "command_timeout_secs",
             "command_timeout_secs=600\n",

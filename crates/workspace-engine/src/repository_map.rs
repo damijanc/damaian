@@ -408,6 +408,116 @@ impl RepositoryMap {
         serde_json::to_string_pretty(self).expect("a repository map always serialises")
     }
 
+    /// The map as model context, at most `max_tokens` by the `len / 4`
+    /// estimate `build_context` uses. A map that does not fit degrades in
+    /// proposal §5.4's order and ends with a line saying what it dropped:
+    ///
+    /// 1. each root's entry points and test paths, the root with the most
+    ///    of them (by length) first;
+    /// 2. major directories;
+    /// 3. generated paths, reduced to a count;
+    /// 4. whole roots, deepest first and then from the end of path order,
+    ///    so what stays is a prefix of each depth. The repository root goes
+    ///    only when nothing else fits, and then the text is empty.
+    ///
+    /// Languages and commands are never dropped from a root that is shown.
+    /// Removed roots are never rendered or counted.
+    pub fn render_for_model(&self, max_tokens: usize) -> RenderedMap {
+        let roots: Vec<&ProjectRoot> = self
+            .roots
+            .iter()
+            .filter(|root| root.user_override != Some(RootOverride::Removed))
+            .collect();
+        let mut rendering = Rendering {
+            shown: vec![true; roots.len()],
+            details: vec![true; roots.len()],
+            directories: true,
+            generated: true,
+            dropped: Vec::new(),
+            roots,
+        };
+        let fits = |rendering: &Rendering| {
+            let text = rendering.text();
+            (estimate_tokens(&text) <= max_tokens).then_some(text)
+        };
+        if let Some(text) = fits(&rendering) {
+            return rendering.finish(text);
+        }
+
+        let mut by_size: Vec<usize> = (0..rendering.roots.len())
+            .filter(|&position| detail_length(rendering.roots[position]) > 0)
+            .collect();
+        by_size.sort_by(|&a, &b| {
+            let (a, b) = (rendering.roots[a], rendering.roots[b]);
+            detail_length(b)
+                .cmp(&detail_length(a))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        for position in by_size {
+            rendering.details[position] = false;
+            rendering
+                .dropped
+                .push(Degradation::EntryPointsAndTestPaths {
+                    root: rendering.roots[position].path.clone(),
+                });
+            if let Some(text) = fits(&rendering) {
+                return rendering.finish(text);
+            }
+        }
+
+        if rendering
+            .roots
+            .iter()
+            .any(|root| !root.major_directories.is_empty())
+        {
+            rendering.directories = false;
+            rendering.dropped.push(Degradation::MajorDirectories);
+            if let Some(text) = fits(&rendering) {
+                return rendering.finish(text);
+            }
+        }
+
+        if rendering
+            .roots
+            .iter()
+            .any(|root| !root.generated_paths.is_empty())
+        {
+            rendering.generated = false;
+            rendering.dropped.push(Degradation::GeneratedPathsCounted);
+            if let Some(text) = fits(&rendering) {
+                return rendering.finish(text);
+            }
+        }
+
+        let mut by_depth: Vec<usize> = (0..rendering.roots.len())
+            .filter(|&position| !rendering.roots[position].path.is_empty())
+            .collect();
+        by_depth.sort_by(|&a, &b| {
+            let (a, b) = (rendering.roots[a], rendering.roots[b]);
+            depth(&b.path)
+                .cmp(&depth(&a.path))
+                .then_with(|| b.path.cmp(&a.path))
+        });
+        rendering.dropped.push(Degradation::Roots {
+            omitted: Vec::new(),
+        });
+        for position in by_depth {
+            rendering.omit(position);
+            if let Some(text) = fits(&rendering) {
+                return rendering.finish(text);
+            }
+        }
+
+        // Not even the repository root fits. The ceiling is the bound, so
+        // nothing is rendered rather than something over it.
+        for position in 0..rendering.roots.len() {
+            if rendering.shown[position] {
+                rendering.omit(position);
+            }
+        }
+        rendering.finish(String::new())
+    }
+
     /// The root that owns `path`: the longest root that is a path-segment
     /// prefix of it, so `packages/a` does not own `packages/ab/x`. Falls back
     /// to the repository root.
@@ -420,6 +530,219 @@ impl RepositoryMap {
             .max_by_key(|root| root.path.len())
             .map_or("", |root| root.path.as_str())
     }
+}
+
+/// [`RepositoryMap::render_for_model`]'s output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedMap {
+    /// Empty when not even the repository root fits.
+    pub text: String,
+    /// `text.len().div_ceil(4)`, the estimate `build_context` uses.
+    pub tokens: usize,
+    pub roots_shown: usize,
+    /// Roots that are not removed.
+    pub roots_total: usize,
+    /// In the order applied.
+    pub dropped: Vec<Degradation>,
+}
+
+/// One step of proposal §5.4's degradation, in the order they are applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Degradation {
+    /// This root's entry points and test paths were left out.
+    EntryPointsAndTestPaths { root: String },
+    /// Every root's major directories were left out.
+    MajorDirectories,
+    /// Every root's generated paths were reduced to a count.
+    GeneratedPathsCounted,
+    /// These roots were left out, in the order they were dropped.
+    Roots { omitted: Vec<String> },
+}
+
+/// What [`RepositoryMap::render_for_model`] keeps at one step.
+struct Rendering<'a> {
+    roots: Vec<&'a ProjectRoot>,
+    shown: Vec<bool>,
+    /// Entry points and test paths, per root.
+    details: Vec<bool>,
+    directories: bool,
+    /// Listed rather than counted.
+    generated: bool,
+    dropped: Vec<Degradation>,
+}
+
+impl Rendering<'_> {
+    fn omit(&mut self, position: usize) {
+        self.shown[position] = false;
+        if let Some(Degradation::Roots { omitted }) = self.dropped.last_mut() {
+            omitted.push(self.roots[position].path.clone());
+        }
+    }
+
+    fn roots_shown(&self) -> usize {
+        self.shown.iter().filter(|shown| **shown).count()
+    }
+
+    fn finish(self, text: String) -> RenderedMap {
+        RenderedMap {
+            tokens: estimate_tokens(&text),
+            text,
+            roots_shown: self.roots_shown(),
+            roots_total: self.roots.len(),
+            dropped: self.dropped,
+        }
+    }
+
+    fn text(&self) -> String {
+        let mut output = String::from(
+            "Project roots. Paths are repository-relative and `.` is the repository root. \
+             A root's commands belong to its directory.\n",
+        );
+        for (position, root) in self.roots.iter().enumerate() {
+            if !self.shown[position] {
+                continue;
+            }
+            let name = if root.path.is_empty() {
+                "."
+            } else {
+                &root.path
+            };
+            output.push_str("- ");
+            output.push_str(name);
+            // A root's manifests sit in its own directory, so the file name
+            // says enough.
+            let manifests: Vec<&str> = root
+                .manifests
+                .iter()
+                .map(|manifest| manifest.rsplit('/').next().unwrap_or(manifest))
+                .collect();
+            let about: Vec<String> = [manifests.join(", "), root.languages.join(", ")]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect();
+            if !about.is_empty() {
+                output.push_str(&format!(" ({})", about.join("; ")));
+            }
+            output.push('\n');
+
+            push_list(
+                &mut output,
+                "commands",
+                root.commands
+                    .iter()
+                    .map(|command| format!("`{}`", command.command)),
+            );
+            // Only the root's own: an enclosing root lists the files above
+            // it, and spec 11 loads them for any path in context.
+            push_list(
+                &mut output,
+                "instructions",
+                root.instruction_files
+                    .iter()
+                    .filter(|file| {
+                        let directory =
+                            file.rsplit_once('/').map_or("", |(directory, _)| directory);
+                        directory == root.path
+                    })
+                    .cloned(),
+            );
+            if self.details[position] {
+                push_list(
+                    &mut output,
+                    "entry points",
+                    root.entry_points.iter().cloned(),
+                );
+                push_list(&mut output, "tests", root.test_paths.iter().cloned());
+            }
+            if self.directories {
+                // Test directories are also major directories. While the
+                // test line is shown, they are not repeated here.
+                push_list(
+                    &mut output,
+                    "directories",
+                    root.major_directories
+                        .iter()
+                        .filter(|directory| {
+                            !self.details[position] || !root.test_paths.contains(directory)
+                        })
+                        .cloned(),
+                );
+            }
+            match root.generated_paths.len() {
+                0 => {}
+                count if !self.generated => {
+                    let noun = if count == 1 { "path" } else { "paths" };
+                    output.push_str(&format!("  generated: {count} {noun}\n"));
+                }
+                _ => push_list(
+                    &mut output,
+                    "generated",
+                    root.generated_paths.iter().cloned(),
+                ),
+            }
+        }
+        if !self.dropped.is_empty() {
+            output.push_str(&self.abridgement());
+        }
+        output
+    }
+
+    /// The line that says what was dropped, so an abridged map is never
+    /// mistaken for a whole one (§5.4).
+    fn abridgement(&self) -> String {
+        let mut parts = vec![format!(
+            "{} of {} roots shown",
+            self.roots_shown(),
+            self.roots.len()
+        )];
+        let without_details = self
+            .dropped
+            .iter()
+            .filter(|step| matches!(step, Degradation::EntryPointsAndTestPaths { .. }))
+            .count();
+        let with_details = self
+            .roots
+            .iter()
+            .filter(|root| detail_length(root) > 0)
+            .count();
+        if without_details == with_details && without_details > 0 {
+            parts.push("entry points and test paths omitted".to_string());
+        } else if without_details > 0 {
+            parts.push(format!(
+                "entry points and test paths omitted for {without_details} of {with_details} roots"
+            ));
+        }
+        if !self.directories {
+            parts.push("major directories omitted".to_string());
+        }
+        if !self.generated {
+            parts.push("generated paths counted".to_string());
+        }
+        format!("Abridged to fit: {}.\n", parts.join("; "))
+    }
+}
+
+fn push_list(output: &mut String, label: &str, items: impl Iterator<Item = String>) {
+    let items: Vec<String> = items.collect();
+    if !items.is_empty() {
+        output.push_str(&format!("  {label}: {}\n", items.join(", ")));
+    }
+}
+
+/// The length of what step 1 drops from a root, which decides which root is
+/// largest.
+fn detail_length(root: &ProjectRoot) -> usize {
+    root.entry_points
+        .iter()
+        .chain(&root.test_paths)
+        .map(String::len)
+        .sum()
+}
+
+/// `build_context`'s estimate, so the map's ceiling and the context budget
+/// count the same way.
+fn estimate_tokens(text: &str) -> usize {
+    text.len().div_ceil(4)
 }
 
 /// How [`RepositoryMapStore::load_or_build`] got its map.
