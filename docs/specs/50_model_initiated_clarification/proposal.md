@@ -1,26 +1,43 @@
 # Feature Spec: Model-Initiated Clarification
 
-Status: Not started
+Status: Not started. Split into a folder and planned on 2026-10-07. Design
+unchanged from the original flat spec. Corrections where it no longer matches
+the code, and the decisions it leaves open, are in [`context.md`](context.md),
+not inlined here, the way specs 20, 22, 24 and 31 kept theirs. The most
+important ones:
+- `PendingApprovalRef` is not the only untyped path: the paused-turn file
+  store is keyed by an id string, and both resume entry points load whatever
+  file that id names, so a typed `PendingDecision` alone does not close
+  requirement 2;
+- recovery fails any waiting task whose link it does not recognise, so a
+  question-waiting task is failed on restart until recovery learns the new
+  link;
+- no "headless" flag exists, so availability becomes a turn option that
+  defaults to *no user present*;
+- nothing in CI or the quality gate runs doctests, so the "compile-fail test"
+  is a `const` assertion that breaks the build, not a doctest.
+
+Read `context.md` before starting any task in [`tasks.md`](tasks.md).
 Order: 50 of 53
 Plan: `docs/PLAN/02_phase_2_complete_task_workflow.md`, Phase 2, Work
 Package 8 (Should). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#20](20_working_modes/proposal.md) (modes) — built;
-[#21](21_task_plan_progress_and_budget/proposal.md) (the plan gate and turn
+Depends on: [#20](../20_working_modes/proposal.md) (modes) — built;
+[#21](../21_task_plan_progress_and_budget/proposal.md) (the plan gate and turn
 budget) — built. Everything else named below is a cross-reference, not a
 prerequisite.
 Related implementation specs:
-[`03_structured_tool_calling.md`](03_structured_tool_calling.md) (owns the tool
+[`03_structured_tool_calling.md`](../03_structured_tool_calling.md) (owns the tool
 surface this adds to),
-[`10_persistent_command_approval.md`](10_persistent_command_approval.md) and
-[`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)
+[`10_persistent_command_approval.md`](../10_persistent_command_approval.md) and
+[`34_repository_config_trust_boundary.md`](../34_repository_config_trust_boundary.md)
 (own the approval path this must never become),
-[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
+[`17_durable_task_state_and_crash_recovery/proposal.md`](../17_durable_task_state_and_crash_recovery/proposal.md)
 (owns the waiting state and reattach machinery this reuses),
-[`20_working_modes/proposal.md`](20_working_modes/proposal.md) (the capability boundary this sits
-inside), [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md)
+[`20_working_modes/proposal.md`](../20_working_modes/proposal.md) (the capability boundary this sits
+inside), [`21_task_plan_progress_and_budget/proposal.md`](../21_task_plan_progress_and_budget/proposal.md)
 (owns the plan review gate and the budget this counts against), and
-[`29_memory_creation_and_consent.md`](29_memory_creation_and_consent.md) (the
+[`29_memory_creation_and_consent.md`](../29_memory_creation_and_consent.md) (the
 type-separation pattern §5.2 follows).
 
 ## 1. Motivation
@@ -37,7 +54,7 @@ several rounds assembling.
 
 Both are expensive in a way that is easy to measure and hard to notice. A wrong
 guess is discovered at review time, after the tokens are spent, and the recovery
-is a new turn that re-reads everything. [Spec 21](21_task_plan_progress_and_budget/proposal.md)
+is a new turn that re-reads everything. [Spec 21](../21_task_plan_progress_and_budget/proposal.md)
 made this sharper rather than softer: a turn now has an enforced token ceiling,
 so rounds spent on a misread instruction are rounds the correct work no longer
 has.
@@ -51,7 +68,7 @@ costs the turn.
 ## 2. Current State
 
 - **Tools are the only way the model reaches the outside**, through the native
-  tool-call surface from [spec 03](03_structured_tool_calling.md). The current
+  tool-call surface from [spec 03](../03_structured_tool_calling.md). The current
   set is `read_file`, `search_codebase`, `run_command`, `propose_patch`,
   `read_git_diff`, `read_git_status`, `inspect_web_page`, `run_web_scenario`,
   `propose_plan` and `complete_step`. None of them asks anything.
@@ -59,13 +76,13 @@ costs the turn.
   `TaskStatus::WaitingForApproval` and records a `PendingApprovalRef { kind,
   proposal_id }` on the status event; `pending_approval_for` replays the log to
   find it, and a later status event without one clears it. This survives
-  restart — [spec 17](17_durable_task_state_and_crash_recovery/proposal.md)'s
+  restart — [spec 17](../17_durable_task_state_and_crash_recovery/proposal.md)'s
   pending-approval reattach — and it is the machinery to reuse.
 - **`PendingApprovalRef.kind` is a `String`.** Nothing in the type system stops
   a new kind of pending thing from being stored there, which is precisely the
   hazard §5.2 addresses.
 - **The plan review gate is the nearest existing thing.**
-  [Spec 21](21_task_plan_progress_and_budget/proposal.md) pauses before the
+  [Spec 21](../21_task_plan_progress_and_budget/proposal.md) pauses before the
   first mutating step for the user to review a plan. That is a fixed,
   engine-driven checkpoint, not a question the model chose to ask.
 - **`complete_step` takes no arguments by design** (spec 21): the model asks to
@@ -99,17 +116,17 @@ costs the turn.
 - **Any widening of what the agent may do.** The tool returns a string. It
   gains the agent no capability, and requirement 2 is the constraint the design
   is built around rather than a caveat on it.
-- **Replacing the plan review gate.** [Spec 21](21_task_plan_progress_and_budget/proposal.md)'s
+- **Replacing the plan review gate.** [Spec 21](../21_task_plan_progress_and_budget/proposal.md)'s
   gate is engine-driven and fires whether or not the model wants it. This tool
   does not weaken it, substitute for it, or let the model skip it by asking a
   question instead.
 - **Free-form conversation mid-turn.** One question, one answer, one tool
   result. A dialogue is a turn.
 - **Asking the user to choose between patches.** Diff review already does that
-  ([spec 04](04_hunk_level_patch_apply.md)), and routing it through a question
+  ([spec 04](../04_hunk_level_patch_apply.md)), and routing it through a question
   would bypass the review surface.
 - **Remembering answers across turns or sessions.** That is memory
-  ([spec 28](28_memory_model_and_storage.md) onward) and has its own consent
+  ([spec 28](../28_memory_model_and_storage.md) onward) and has its own consent
   rules.
 - **A timeout that answers for the user.** A question with no answer waits. An
   engine that picked a default after thirty seconds would be guessing with extra
@@ -143,7 +160,7 @@ value of this tool is that answering it takes one click.
 ### 5.2 A question is not an approval, and the types make that true
 
 This is the load-bearing rule, and it is enforced by construction rather than by
-discipline — the pattern [spec 29](29_memory_creation_and_consent.md) uses to
+discipline — the pattern [spec 29](../29_memory_creation_and_consent.md) uses to
 make unconfirmed persistence unrepresentable.
 
 `PendingApprovalRef.kind` is a `String` today, so the cheap implementation is to
@@ -173,9 +190,9 @@ the compiler enforces requirement 2 rather than a reviewer.
 
 The waiting state is the existing `TaskStatus::WaitingForApproval`. Reusing it is
 deliberate: it is already terminal-adjacent, already in
-[spec 17](17_durable_task_state_and_crash_recovery/proposal.md)'s kill matrix,
+[spec 17](../17_durable_task_state_and_crash_recovery/proposal.md)'s kill matrix,
 already reattached on restart, and already understood by
-[spec 45](45_crash_recovery_prompt.md)'s card. A new state would add three
+[spec 45](../45_crash_recovery_prompt.md)'s card. A new state would add three
 matrix cells and a recovery classification to distinguish two things that behave
 identically — the task is stopped, waiting for a human, with no side effect in
 flight. What is waiting is named by the `PendingDecision`, which is where the
@@ -185,8 +202,8 @@ waiting for your answer", not "An approval was pending".
 ### 5.3 Budget and pacing
 
 At most **two** questions per turn, and each consumes a tool round from the
-same budget every other tool call draws on ([spec 21](21_task_plan_progress_and_budget/proposal.md),
-and the continuation budget in [spec 47](47_agent_working_capability/proposal.md)). A
+same budget every other tool call draws on ([spec 21](../21_task_plan_progress_and_budget/proposal.md),
+and the continuation budget in [spec 47](../47_agent_working_capability/proposal.md)). A
 third call in a turn is refused with a tool error saying so, which the model can
 read and work around by proceeding.
 
@@ -216,14 +233,14 @@ prompt for those contexts instructs it to proceed under an explicitly stated
 assumption and record it — which lands in the task report (Phase 5 WP7) as a
 line saying what was assumed and why.
 
-[Spec 20](20_working_modes/proposal.md)'s mode gate is the mechanism: the tool is
+[Spec 20](../20_working_modes/proposal.md)'s mode gate is the mechanism: the tool is
 read-only and available in every mode, and the headless case is an execution
 context that narrows the offered set, never a mode that widens one.
 
 ### 5.5 Untrusted text
 
 The question is written by a model, and in a session carrying repository content
-or fetched pages ([spec 51](51_external_reference_retrieval.md)) it may be
+or fetched pages ([spec 51](../51_external_reference_retrieval.md)) it may be
 repeating text from either. It is therefore rendered as untrusted content on the
 same terms as any other model output: no markup interpretation that could
 produce a control, no link that navigates anywhere on its own, and the
@@ -232,14 +249,14 @@ quotes a line of a config file must not be the path by which a key reaches the
 transcript unredacted.
 
 The dialog is visually a *question*, distinct from the approval surface
-([spec 41](41_ui_density_and_action_hierarchy/proposal.md)'s button scale), and
+([spec 41](../41_ui_density_and_action_hierarchy/proposal.md)'s button scale), and
 it never uses the approval card's shape or its primary-button treatment. A user
 who learns to click through questions must not have learned to click through
 approvals.
 
 ### 5.6 Persistence
 
-Two events, following [spec 17](17_durable_task_state_and_crash_recovery/proposal.md)'s
+Two events, following [spec 17](../17_durable_task_state_and_crash_recovery/proposal.md)'s
 append-only rule:
 
 ```json
@@ -285,7 +302,7 @@ now has one more tool available to it.
 - A question containing a secret-shaped string is redacted before display and
   before it reaches the session log.
 - The question surface is visually distinct from the approval surface, per
-  [`docs/UI_STYLE_GUIDE.md`](../UI_STYLE_GUIDE.md).
+  [`docs/UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md).
 - A reloaded session renders the question and answer in the transcript in place.
 - Every quality-gate command from `AGENTS.md` passes.
 
@@ -293,7 +310,7 @@ now has one more tool available to it.
 
 To be completed during implementation. Record:
 
-- How often the model used the tool across the [spec 18](18_local_evaluation_harness/proposal.md)
+- How often the model used the tool across the [spec 18](../18_local_evaluation_harness/proposal.md)
   scenarios, and whether the questions were worth asking. A model that never
   asks and a model that always asks are both failures, and the number tells
   which one was built.
