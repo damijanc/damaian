@@ -5,7 +5,7 @@ via `dump-header`), classified from status first and the error object's
 `code`/`type` second — never prose — retried under two bounds with a
 cancellable, visible wait, and recorded as a named failure (`failureKind`) with
 a measured-zero cost that never inflates the reported spend. The fallback
-*offer* is deferred to [`../56_provider_fallback_consent.md`](../56_provider_fallback_consent.md);
+*offer* is deferred to [`../56_provider_fallback_consent/proposal.md`](../56_provider_fallback_consent/proposal.md);
 requirement 7's negative half — no switch without consent — ships here. The
 provider-behaviour items in §7 remain unmeasured (no real provider was
 exercised, per the plan to run the quality gate last).
@@ -343,7 +343,7 @@ offer that switches provider on consent — is a cross-cutting feature (engine
 signal, shell Keychain, frontend approval, resume machinery) roughly the size of
 [spec 10](../10_persistent_command_approval.md) or patch approval, and is
 specified separately in
-[spec 56](../56_provider_fallback_consent.md). §5.6 is its requirement, not this
+[spec 56](../56_provider_fallback_consent/proposal.md). §5.6 is its requirement, not this
 spec's.
 
 **Defect fixed 2026-09-28: a completed 200 stream was classified as a
