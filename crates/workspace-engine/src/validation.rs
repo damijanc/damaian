@@ -8,6 +8,7 @@ use crate::command_runner::{CommandExecution, CommandRunOptions, CommandRunner};
 use crate::config::ConfigOverlay;
 use crate::error::{ClientError, Result};
 use crate::hash::{create_id, now_millis, repository_id_for_root};
+use crate::path_policy::PathPolicy;
 use crate::repository_map::{RepositoryMap, RootOverride};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,40 @@ pub struct CommandRunRecord {
     pub stdout_ref: PathBuf,
     pub stderr_ref: PathBuf,
     pub summary_ref: PathBuf,
+}
+
+/// Resolves a model-requested, repository-relative working directory into the
+/// absolute directory a command may run in (spec 24 Task 7).
+///
+/// An empty request is the repository root, exactly as before the tool could
+/// name a directory. Otherwise the path must resolve inside the repository,
+/// name a directory, and not be restricted by policy. A refusal is the
+/// `ClientError` the chat loop hands back to the model as the tool result, so
+/// nothing is proposed or run.
+pub fn resolve_command_directory(
+    path_policy: &PathPolicy,
+    repository_root: &Path,
+    requested: &str,
+) -> Result<PathBuf> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return Ok(repository_root.to_path_buf());
+    }
+    let resolved = path_policy.resolve_existing(repository_root, requested, false)?;
+    if !resolved.absolute_path.is_dir() {
+        return Err(ClientError::InvalidInput(format!(
+            "Working directory is not a directory: {requested}"
+        )));
+    }
+    if path_policy.is_restricted(&resolved.relative_path, true) {
+        return Err(ClientError::AccessDenied(format!(
+            "Working directory is restricted by policy: {}",
+            resolved.relative_path
+        )));
+    }
+    // Kept relative to the caller's `repository_root` rather than the
+    // canonical one, so the pair `classify_at` compares stays consistent.
+    Ok(repository_root.join(&resolved.relative_path))
 }
 
 #[derive(Debug, Clone)]

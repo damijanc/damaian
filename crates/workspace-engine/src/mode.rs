@@ -385,6 +385,7 @@ mod tests {
             ToolAction::Command(CommandRequest {
                 command: text.into(),
                 reason: String::new(),
+                working_directory: None,
             })
         };
         let mcp = || ToolAction::McpCall {
@@ -651,6 +652,7 @@ mod tests {
         let action = ToolAction::Command(CommandRequest {
             command: "git status".into(),
             reason: String::new(),
+            working_directory: None,
         });
         assert!(
             !mode_permits(SessionMode::Ask, &action, Some(&read_only_command()), None).is_allowed()
@@ -662,6 +664,7 @@ mod tests {
         let action = ToolAction::Command(CommandRequest {
             command: "git status".into(),
             reason: String::new(),
+            working_directory: None,
         });
         assert!(
             mode_permits(SessionMode::Plan, &action, Some(&read_only_command()), None).is_allowed()
@@ -677,6 +680,7 @@ mod tests {
         let action = ToolAction::Command(CommandRequest {
             command: "git status".into(),
             reason: String::new(),
+            working_directory: None,
         });
         assert!(
             !mode_permits(SessionMode::Plan, &action, Some(&classification), None).is_allowed()
@@ -688,6 +692,7 @@ mod tests {
         let action = ToolAction::Command(CommandRequest {
             command: "npm install".into(),
             reason: String::new(),
+            working_directory: None,
         });
         assert!(
             !mode_permits(
@@ -705,6 +710,7 @@ mod tests {
         let action = ToolAction::Command(CommandRequest {
             command: "npm install".into(),
             reason: String::new(),
+            working_directory: None,
         });
         assert!(
             mode_permits(
@@ -722,10 +728,12 @@ mod tests {
         let read = ToolAction::Command(CommandRequest {
             command: "git status".into(),
             reason: String::new(),
+            working_directory: None,
         });
         let mutate = ToolAction::Command(CommandRequest {
             command: "npm install".into(),
             reason: String::new(),
+            working_directory: None,
         });
         assert!(
             mode_permits(SessionMode::Review, &read, Some(&read_only_command()), None).is_allowed()
@@ -763,6 +771,7 @@ mod tests {
         let action = ToolAction::Command(CommandRequest {
             command: "npm run build".into(),
             reason: String::new(),
+            working_directory: None,
         });
         assert_eq!(
             mode_permits(
@@ -783,6 +792,7 @@ mod tests {
         let action = ToolAction::Command(CommandRequest {
             command: "npm run build".into(),
             reason: String::new(),
+            working_directory: None,
         });
         assert_eq!(
             mode_permits(
@@ -855,6 +865,7 @@ mod tests {
         let action = ToolAction::Command(CommandRequest {
             command: "git status".into(),
             reason: String::new(),
+            working_directory: None,
         });
         let result =
             std::panic::catch_unwind(|| mode_permits(SessionMode::Plan, &action, None, None));

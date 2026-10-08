@@ -136,7 +136,7 @@ pub use session::{
 pub use tree_walk::{WalkEvent, WalkFile, WalkSkip};
 pub use validation::{
     CommandProposal, CommandRunRecord, CommandStore, ValidationOrchestrator,
-    command_approval_prompt,
+    command_approval_prompt, resolve_command_directory,
 };
 pub use web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebConsoleEntry, WebDiagnosticArtifact, WebDiagnosticCall,

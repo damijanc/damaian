@@ -12,6 +12,7 @@ use crate::error::{ClientError, Result};
 use crate::file_access::{FileAccessController, LineRange, ReadWindow};
 use crate::finding::{
     Finding, Severity, default_parsers, findings_from_execution, findings_from_web_record,
+    resolve_finding_path,
 };
 use crate::git_service::{GitService, GitStatus};
 use crate::hash::{create_id, now_millis};
@@ -30,6 +31,7 @@ use crate::secret_scanner::SecretScanner;
 use crate::session::{ChatMessage, Session, SessionStore, Task, TaskStatus, TaskUsage};
 use crate::validation::{
     CommandProposal, CommandStore, ValidationOrchestrator, command_approval_prompt,
+    resolve_command_directory,
 };
 use crate::vector_index::VectorIndexCache;
 use crate::web_diagnostics::{
@@ -946,13 +948,18 @@ impl ChatOrchestrator {
             let command_request = CommandRequest {
                 command: proposal.command.clone(),
                 reason: proposal.reason.clone(),
+                working_directory: None,
             };
             // The stored command is what `run_proposal` would execute, classified
             // again under the current config, because the stored fields predate
             // any profile or config change since (spec 31 Task 5, deviation 5).
-            let classification = self
-                .validation_orchestrator
-                .classify_command(Path::new(&proposal.working_directory), &proposal.command);
+            // Classified at the proposal's own pair, so a command in a sub-root
+            // is judged with the repository as its boundary (spec 24 Task 7).
+            let classification = self.validation_orchestrator.classify_command_at(
+                Path::new(&proposal.repository_root),
+                Path::new(&proposal.working_directory),
+                &proposal.command,
+            );
             let permission = permits(
                 mode,
                 &capabilities,
@@ -1305,6 +1312,7 @@ impl ChatOrchestrator {
         let findings = findings_from_execution(execution, &default_parsers(), &self.scanner);
         self.record_findings(
             repository_root,
+            Path::new(&execution.working_directory),
             session_id,
             task_id,
             &execution.id,
@@ -1329,6 +1337,7 @@ impl ChatOrchestrator {
         let findings = findings_from_web_record(record, &files, &self.scanner);
         self.record_findings(
             repository_root,
+            repository_root,
             session_id,
             &record.task_id,
             &record.id,
@@ -1337,12 +1346,15 @@ impl ChatOrchestrator {
         .map(|_| ())
     }
 
-    /// Keeps a range only when it names a file in the repository, hashing
-    /// the file then. Attaches the task and origin, and appends each finding
-    /// (`context.md` §13.4).
+    /// Keeps a range only when its printed path resolves to a file in the
+    /// repository, hashing the file then. The printed path is resolved from
+    /// the command's working directory, so a tool in a sub-root keeps its
+    /// range (spec 24 `context.md` §8). Attaches the task and origin, and
+    /// appends each finding (`context.md` §13.4).
     fn record_findings(
         &self,
         repository_root: &Path,
+        working_directory: &Path,
         session_id: &str,
         task_id: &str,
         origin_ref: &str,
@@ -1352,16 +1364,13 @@ impl ChatOrchestrator {
         let mut failing = 0;
         for finding in findings {
             let mut finding = finding.with_task_id(task_id).with_origin_ref(origin_ref);
-            if let Some(path) = finding
-                .range()
-                .map(|range| repository_root.join(&range.path))
-            {
-                finding = match path
-                    .is_file()
-                    .then(|| crate::hash::file_hash(&path).ok())
-                    .flatten()
-                {
-                    Some(hash) => finding.with_file_hash(hash),
+            if let Some(printed) = finding.range().map(|range| range.path.clone()) {
+                finding = match resolve_finding_path(repository_root, working_directory, &printed) {
+                    Some(relative) => match crate::hash::file_hash(repository_root.join(&relative))
+                    {
+                        Ok(hash) => finding.with_range_path(relative).with_file_hash(hash),
+                        Err(_) => finding.without_range(),
+                    },
                     None => finding.without_range(),
                 };
             }
@@ -1537,6 +1546,7 @@ impl ChatOrchestrator {
                 &ToolAction::Command(CommandRequest {
                     command: String::new(),
                     reason: String::new(),
+                    working_directory: None,
                 }),
                 Some(&permissive_command),
                 None,
@@ -2280,6 +2290,19 @@ impl ChatOrchestrator {
                 // A sandbox command's findings leave its arm through this local
                 // rather than through `ActionOutcome` (spec 22 `context.md` §14).
                 let mut command_findings: Option<crate::plan::Evidence> = None;
+                // A working directory the policy refuses fails the tool result
+                // before anything is proposed or run (spec 24 Task 7). It is
+                // resolved once here so the dispatch arm proposes in the same
+                // directory the classifier saw.
+                let refused_directory = match &tool_action {
+                    ToolAction::Command(request) => resolve_command_directory(
+                        &self.path_policy,
+                        repository_root,
+                        request.working_directory.as_deref().unwrap_or_default(),
+                    )
+                    .err(),
+                    _ => None,
+                };
                 let (assistant_summary, tool_result_text, action_outcome) = if !permission
                     .is_allowed()
                 {
@@ -2292,6 +2315,12 @@ impl ChatOrchestrator {
                             tool_action_marker(&tool_action).0
                         ),
                         refusal_message(permission),
+                        ActionOutcome::Failed,
+                    )
+                } else if let Some(error) = refused_directory {
+                    (
+                        format!("Attempted to run `{}`.", tool_action_marker(&tool_action).1),
+                        error.to_string(),
                         ActionOutcome::Failed,
                     )
                 } else if action_is_batchable_read_only(&tool_action) {
@@ -2309,8 +2338,11 @@ impl ChatOrchestrator {
                 } else {
                     match tool_action {
                         ToolAction::Command(command_request) => {
-                            let proposal = self.validation_orchestrator.propose_command(
+                            let working_directory =
+                                self.command_working_directory(repository_root, &command_request);
+                            let proposal = self.validation_orchestrator.propose_command_at(
                                 repository_root,
+                                &working_directory,
                                 &command_request.command,
                                 &command_request.reason,
                             )?;
@@ -3142,6 +3174,23 @@ impl ChatOrchestrator {
         })
     }
 
+    /// The directory a requested command will run in, used to classify it
+    /// before dispatch. A request the policy refuses resolves to the
+    /// repository root here; the dispatch arm refuses it, with the reason,
+    /// before anything is stored (spec 24 Task 7).
+    fn command_working_directory(
+        &self,
+        repository_root: &Path,
+        request: &CommandRequest,
+    ) -> PathBuf {
+        resolve_command_directory(
+            &self.path_policy,
+            repository_root,
+            request.working_directory.as_deref().unwrap_or_default(),
+        )
+        .unwrap_or_else(|_| repository_root.to_path_buf())
+    }
+
     /// Asks the permission matrix about one dispatched action, supplying the
     /// context only two classes need (`permits`'s own contract): a
     /// command's classification — the same classifier `propose_command` runs,
@@ -3155,10 +3204,14 @@ impl ChatOrchestrator {
         mcp: &McpRuntime,
     ) -> Permission {
         let classification = match action {
-            ToolAction::Command(request) => Some(
-                self.validation_orchestrator
-                    .classify_command(repository_root, &request.command),
-            ),
+            ToolAction::Command(request) => {
+                let working_directory = self.command_working_directory(repository_root, request);
+                Some(self.validation_orchestrator.classify_command_at(
+                    repository_root,
+                    &working_directory,
+                    &request.command,
+                ))
+            }
             _ => None,
         };
         let read_only_hint = match action {
@@ -3713,6 +3766,10 @@ fn bounded_messages(messages: &[ModelMessage], max_messages: usize) -> Vec<Model
 pub(crate) struct CommandRequest {
     pub(crate) command: String,
     pub(crate) reason: String,
+    /// Repository-relative directory the model asked the command to run in.
+    /// `None` means the repository root, which is what every request before
+    /// spec 24 meant.
+    pub(crate) working_directory: Option<String>,
 }
 
 /// One step as the model proposed it. Only a title and an optional detail: the
@@ -3994,7 +4051,7 @@ fn run_command_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "run_command".to_string(),
         description: "Request a local shell command in the selected repository. Damaian runs sandbox-safe read-only commands automatically and pauses for user approval before running commands with side effects, network access, Docker access, shell control, or unknown risk.".to_string(),
-        parameters_json: "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The shell command to run\"},\"reason\":{\"type\":\"string\",\"description\":\"Why this command is needed\"}},\"required\":[\"command\"]}".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The shell command to run\"},\"reason\":{\"type\":\"string\",\"description\":\"Why this command is needed\"},\"working_directory\":{\"type\":\"string\",\"description\":\"Repository-relative directory to run in; defaults to the repository root\"}},\"required\":[\"command\"]}".to_string(),
     }
 }
 
@@ -4434,7 +4491,17 @@ fn command_request_from_tool_call(call: &ToolCall) -> Option<CommandRequest> {
         .filter(|value| !value.is_empty())
         .unwrap_or("Assistant requested a local command")
         .to_string();
-    Some(CommandRequest { command, reason })
+    let working_directory = arguments
+        .get("working_directory")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Some(CommandRequest {
+        command,
+        reason,
+        working_directory,
+    })
 }
 
 fn parse_command_request(value: &str) -> Option<CommandRequest> {
@@ -4447,12 +4514,18 @@ fn parse_command_request(value: &str) -> Option<CommandRequest> {
     };
     let mut command = String::new();
     let mut reason = String::new();
+    let mut working_directory: Option<String> = None;
     for raw_line in envelope.lines() {
         let line = raw_line.trim();
         if let Some(value) = line.strip_prefix("COMMAND:") {
             command = value.trim().to_string();
         } else if let Some(value) = line.strip_prefix("REASON:") {
             reason = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("WORKING_DIRECTORY:") {
+            let value = value.trim();
+            if !value.is_empty() {
+                working_directory = Some(value.to_string());
+            }
         } else if line.trim() == "END_COMMAND" {
             break;
         }
@@ -4463,7 +4536,11 @@ fn parse_command_request(value: &str) -> Option<CommandRequest> {
     if reason.is_empty() {
         reason = "Assistant requested a local command".to_string();
     }
-    Some(CommandRequest { command, reason })
+    Some(CommandRequest {
+        command,
+        reason,
+        working_directory,
+    })
 }
 
 fn command_proposal_response(proposal: &CommandProposal) -> String {
