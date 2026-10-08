@@ -410,6 +410,7 @@
               ><span class="command-approval-risk" data-blocked="false">review</span>
             </div>
             <code class="command-approval-command">cargo test -p damaian-core</code>
+            <p class="command-approval-location">Runs in <code>crates/engine</code></p>
             <div class="command-approval-footer">
               <button type="button" class="disclosure" aria-expanded="false">
                 <span class="disclosure-caret" aria-hidden="true"></span> Why this command
@@ -908,6 +909,66 @@ error[E0308]: mismatched types
             <button class="btn-primary" type="button">Import</button>
             <button class="btn-quiet" type="button">Cancel</button>
           </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>Diff card file header</h2>
+      <p class="sg-hint">
+        A patch file header names its root when the file is not in the repository root, so a
+        patch that spans two roots shows both (spec 24 §13).
+      </p>
+      <div class="sg-card">
+        <div class="diff-card-header">
+          <label class="diff-file-select">
+            <input type="checkbox" checked />
+            <span>packages/api/src/index.ts</span>
+            <span class="diff-root">packages/api</span>
+          </label>
+          <div class="diff-meta">
+            <span class="diff-stats">+4 -1</span>
+            <span class="diff-state">modified</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>Repository roots</h2>
+      <p class="sg-hint">
+        Settings › General. Each root is listed with its languages, command count and whether
+        it was detected or changed by the user. Add, remove and undo write to
+        <code>.damaian/config.conf</code> in the repository, which Git shows.
+      </p>
+      <div class="sg-card" style="display: grid; gap: 12px">
+        <div class="repository-roots-list">
+          <button type="button" class="repository-root-row">
+            <code class="repository-root-path">.</code>
+            <span class="repository-root-meta">rust · 2 commands · detected</span>
+          </button>
+          <button type="button" class="repository-root-row">
+            <code class="repository-root-path">packages/api</code>
+            <span class="repository-root-meta">typescript · 2 commands · detected</span>
+          </button>
+          <button type="button" class="repository-root-row">
+            <code class="repository-root-path">tools/scripts</code>
+            <span class="repository-root-meta">typescript · 0 commands · added by you</span>
+          </button>
+        </div>
+        <div class="repository-root-detail">
+          <div class="repository-root-detail-header">
+            <code>packages/api</code>
+            <button type="button" class="btn-sm btn-danger">Remove root</button>
+          </div>
+          <p class="repository-root-evidence">
+            Treated as a root because packages/api/package.json exists.
+          </p>
+          <div class="repository-root-section-label">Commands</div>
+          <ul class="repository-root-commands">
+            <li><code>npm run test</code><span> — runs in packages/api</span></li>
+            <li><code>npm test</code><span> — runs in packages/api</span></li>
+          </ul>
         </div>
       </div>
     </section>

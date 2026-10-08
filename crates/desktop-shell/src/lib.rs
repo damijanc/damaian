@@ -1169,6 +1169,9 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 )
             }
         }
+        ("GET", "/api/repository-map") => handle_repository_map(stream, &request),
+        ("POST", "/api/repository-roots") => handle_repository_roots(stream, &request),
+        ("GET", "/api/command-proposal") => handle_command_proposal(stream, &request),
         ("GET", "/api/repository-config-review") => {
             let repo = request.param("repo").unwrap_or_default();
             write_response(
@@ -3535,6 +3538,121 @@ fn handle_findings_repair(stream: &mut TcpStream, request: &Request) -> Result<(
     )
 }
 
+/// `GET /api/repository-map?repo=`: the repository's map, plus how the store
+/// got it (spec 24 Task 8). Shaped like `damaian repo-map --json`, so the UI
+/// and the CLI read the same JSON.
+fn handle_repository_map(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = required_param(request, "repo")?;
+    let engine = engine_for_repo(&repo)?;
+    let (map, load) = engine
+        .repository_map(&repo)
+        .map_err(|error| error.to_string())?;
+    let body = format!(
+        "{{\"load\":{},\"map\":{}}}",
+        map_load_json(&load),
+        map.to_json()
+    );
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// `POST /api/repository-roots`: add, remove or clear a user root override in
+/// the repository's own config, then answer with the rebuilt map.
+///
+/// The write goes to `<repo>/.damaian/config.conf`, in the user's working
+/// tree, so Git shows it; the UI says so before the first write. A repo that
+/// is not a usable directory, or lies outside `allowed_roots`, is refused, so
+/// an override is only ever written inside a repository the user may open.
+fn handle_repository_roots(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let action = required_form(&form, "action")?;
+    let path = required_form(&form, "path")?;
+    validate_working_folder(&repo)?;
+    let config_path = repository_config_write_target(&engine_for_repo(&repo)?, &repo)?;
+    let edit = match action.as_str() {
+        "add" => workspace_engine::RootOverrideEdit::Add,
+        "remove" => workspace_engine::RootOverrideEdit::Remove,
+        "clear" => workspace_engine::RootOverrideEdit::Clear,
+        other => {
+            return Err(format!(
+                "repository-roots action must be add, remove or clear, got {other}"
+            ));
+        }
+    };
+    let mut overlay = workspace_engine::ConfigOverlay::load_or_default(&config_path)
+        .map_err(|error| error.to_string())?;
+    workspace_engine::edit_root_overrides(&mut overlay, edit, &path);
+    overlay
+        .save(&config_path)
+        .map_err(|error| error.to_string())?;
+
+    // A fresh engine, so the map is built from the config just written.
+    let engine = engine_for_repo(&repo)?;
+    let (map, load) = engine
+        .repository_map(&repo)
+        .map_err(|error| error.to_string())?;
+    let body = format!(
+        "{{\"configPath\":\"{}\",\"load\":{},\"map\":{}}}",
+        escape_json(&config_path.to_string_lossy()),
+        map_load_json(&load),
+        map.to_json()
+    );
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// Where a root override for `repo` is written, once `repo` passes the path
+/// policy. Indexing does not consult `allowed_roots`, so without this check
+/// the endpoint would write into any directory it is named.
+fn repository_config_write_target(engine: &WorkspaceEngine, repo: &str) -> Result<PathBuf, String> {
+    engine
+        .path_policy
+        .canonical_root(repo)
+        .map_err(|error| error.to_string())?;
+    Ok(Config::repository_config_path(repo))
+}
+
+/// `GET /api/command-proposal?repo=&proposal_id=`: the stored proposal's
+/// working directory and repository root, so a command-approval card can say
+/// "Runs in `packages/api`".
+///
+/// The card's payload streams out of `chat.rs`'s `AgentCommandProposal`, which
+/// carries neither (spec 24 Task 8); the shell reads them from the
+/// `CommandStore` the proposal was written to instead of changing `chat.rs`.
+fn handle_command_proposal(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = required_param(request, "repo")?;
+    let proposal_id = required_param(request, "proposal_id")?;
+    let engine = engine_for_repo(&repo)?;
+    let proposal = engine
+        .validation_orchestrator
+        .load_proposal(&proposal_id)
+        .map_err(|error| error.to_string())?;
+    let body = format!(
+        "{{\"proposalId\":\"{}\",\"workingDirectory\":\"{}\",\"repositoryRoot\":\"{}\"}}",
+        escape_json(&proposal.id),
+        escape_json(&proposal.working_directory),
+        escape_json(&proposal.repository_root)
+    );
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+fn map_load_json(load: &workspace_engine::MapLoad) -> String {
+    use workspace_engine::MapLoad;
+    match load {
+        MapLoad::Reused => "{\"outcome\":\"reused\"}".to_string(),
+        MapLoad::Built => "{\"outcome\":\"built\"}".to_string(),
+        MapLoad::Rebuilt { reason } => match reason {
+            workspace_engine::RebuildReason::SchemaMismatch { found } => format!(
+                "{{\"outcome\":\"rebuilt\",\"reason\":\"{}\",\"foundSchemaVersion\":{found}}}",
+                reason.as_str()
+            ),
+            _ => format!(
+                "{{\"outcome\":\"rebuilt\",\"reason\":\"{}\"}}",
+                reason.as_str()
+            ),
+        },
+    }
+}
+
 /// The session, when it exists and belongs to `repo`. A finding's staleness
 /// is judged against `repo`'s files, so a session from another checkout must
 /// not be read against this one (spec 22 `context.md` §16).
@@ -3859,12 +3977,12 @@ mod tests {
         generated_secret_warnings_json, handle_connection, index_html, json_error,
         json_optional_string, keychain, mcp_browser_arguments, parse_form, parse_path_list,
         percent_decode, plan_json, plan_proposal_json, relay_turn_events, remember_model_api_key,
-        render_markdown_with_optional_file_links, repository_config_review_json, require_api_token,
-        run_server, run_terminal_command, save_config_file, sweep_orphaned_processes,
-        task_states_json, task_usage_json, terminal_cwd_for_repo, turn_progress_event,
-        validate_context_files, validate_working_folder, validate_workspace_path,
-        verify_data_dir_schema_at, web_diagnostic_json, web_diagnostic_reveal_target,
-        write_basic_response, write_sse_event,
+        render_markdown_with_optional_file_links, repository_config_review_json,
+        repository_config_write_target, require_api_token, run_server, run_terminal_command,
+        save_config_file, sweep_orphaned_processes, task_states_json, task_usage_json,
+        terminal_cwd_for_repo, turn_progress_event, validate_context_files,
+        validate_working_folder, validate_workspace_path, verify_data_dir_schema_at,
+        web_diagnostic_json, web_diagnostic_reveal_target, write_basic_response, write_sse_event,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -5346,6 +5464,243 @@ mod tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("read response");
         response
+    }
+
+    fn form_body_for_test(fields: &[(&str, &str)]) -> String {
+        fields
+            .iter()
+            .map(|(key, value)| format!("{key}={}", percent_encode_for_test(value)))
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
+    fn post_fields_for_test(port: u16, token: &str, path: &str, fields: &[(&str, &str)]) -> String {
+        let body = form_body_for_test(fields);
+        send_for_test(
+            port,
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/x-www-form-urlencoded\r\nx-damaian-api-token: {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    }
+
+    /// A monorepo with two npm packages and a directory that only becomes a
+    /// root when the user adds it (no manifest of its own).
+    fn repository_map_fixture(name: &str) -> PathBuf {
+        let repo = temp_path(name);
+        for directory in ["packages/api/src", "packages/web/src", "tools/scripts"] {
+            fs::create_dir_all(repo.join(directory)).unwrap();
+        }
+        let scripts = "{\"scripts\":{\"test\":\"node test.js\"}}";
+        fs::write(repo.join("packages/api/package.json"), scripts).unwrap();
+        fs::write(repo.join("packages/web/package.json"), scripts).unwrap();
+        fs::write(repo.join("packages/api/src/index.ts"), "export {};\n").unwrap();
+        fs::write(repo.join("packages/web/src/index.ts"), "export {};\n").unwrap();
+        fs::write(repo.join("tools/scripts/run.ts"), "export {};\n").unwrap();
+        repo
+    }
+
+    fn find_root<'a>(payload: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+        payload["map"]["roots"]
+            .as_array()?
+            .iter()
+            .find(|root| root["path"] == path)
+    }
+
+    #[test]
+    fn repository_map_endpoint_serves_the_map_and_its_load_shape() {
+        let repo = repository_map_fixture("repomap-shape");
+        let (port, token) = serve_for_test();
+        let url = format!(
+            "/api/repository-map?repo={}",
+            percent_encode_for_test(&repo.to_string_lossy())
+        );
+        let response = get_for_test(port, &token, &url);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        let payload = json_of(&response);
+        assert_eq!(payload["load"]["outcome"], "built", "{payload}");
+        assert_eq!(payload["map"]["schemaVersion"], 1, "{payload}");
+
+        let api = find_root(&payload, "packages/api")
+            .unwrap_or_else(|| panic!("packages/api root missing: {payload}"));
+        assert_eq!(api["detectedBy"]["kind"], "manifest");
+        assert_eq!(api["detectedBy"]["path"], "packages/api/package.json");
+        let commands = api["commands"].as_array().expect("commands array");
+        assert!(
+            commands
+                .iter()
+                .any(|command| command["command"] == "npm test"),
+            "{api}"
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|command| command["workingDirectory"] == "packages/api"),
+            "{api}"
+        );
+    }
+
+    #[test]
+    fn repository_roots_endpoint_writes_and_re_reads_an_added_root() {
+        let repo = repository_map_fixture("repomap-add");
+        let repo_str = repo.to_string_lossy().to_string();
+        let (port, token) = serve_for_test();
+
+        let response = post_fields_for_test(
+            port,
+            &token,
+            "/api/repository-roots",
+            &[
+                ("repo", &repo_str),
+                ("action", "add"),
+                ("path", "tools/scripts"),
+            ],
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let payload = json_of(&response);
+        assert_eq!(
+            payload["configPath"],
+            repo.join(".damaian/config.conf").to_string_lossy().as_ref(),
+            "{payload}"
+        );
+
+        let written = fs::read_to_string(repo.join(".damaian/config.conf")).unwrap();
+        assert!(
+            written.contains("project_roots_added=tools/scripts"),
+            "{written}"
+        );
+
+        let added = find_root(&payload, "tools/scripts")
+            .unwrap_or_else(|| panic!("added root missing: {payload}"));
+        assert_eq!(added["detectedBy"]["kind"], "userOverride");
+        assert_eq!(added["userOverride"], "added");
+
+        let url = format!(
+            "/api/repository-map?repo={}",
+            percent_encode_for_test(&repo_str)
+        );
+        let reread = json_of(&get_for_test(port, &token, &url));
+        assert!(
+            find_root(&reread, "tools/scripts").is_some_and(|root| root["userOverride"] == "added"),
+            "{reread}"
+        );
+    }
+
+    #[test]
+    fn repository_roots_endpoint_reports_an_invalid_path_as_an_invalid_override() {
+        let repo = repository_map_fixture("repomap-invalid");
+        let repo_str = repo.to_string_lossy().to_string();
+        let (port, token) = serve_for_test();
+
+        let response = post_fields_for_test(
+            port,
+            &token,
+            "/api/repository-roots",
+            &[
+                ("repo", &repo_str),
+                ("action", "add"),
+                ("path", "../outside"),
+            ],
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let payload = json_of(&response);
+
+        let excluded = payload["map"]["excluded"]
+            .as_array()
+            .expect("excluded array");
+        assert!(
+            excluded
+                .iter()
+                .any(|entry| entry["path"] == "../outside" && entry["reason"] == "invalidOverride"),
+            "{payload}"
+        );
+        assert!(
+            find_root(&payload, "../outside").is_none(),
+            "an invalid override must not become a root: {payload}"
+        );
+    }
+
+    #[test]
+    fn repository_roots_endpoint_refuses_a_foreign_repository() {
+        let (port, token) = serve_for_test();
+        let not_a_repository = temp_path("repomap-foreign");
+        fs::write(&not_a_repository, "not a directory").unwrap();
+        let path = not_a_repository.to_string_lossy().to_string();
+
+        let response = post_fields_for_test(
+            port,
+            &token,
+            "/api/repository-roots",
+            &[
+                ("repo", &path),
+                ("action", "add"),
+                ("path", "tools/scripts"),
+            ],
+        );
+        assert!(response.starts_with("HTTP/1.1 500"), "{response}");
+    }
+
+    #[test]
+    fn a_root_override_is_never_written_outside_the_allowed_roots() {
+        let allowed = temp_path("repomap-allowed");
+        let inside = allowed.join("repo");
+        let outside = temp_path("repomap-outside");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let engine = WorkspaceEngine::new(Config {
+            data_dir: allowed.join(".damaian-data"),
+            allowed_roots: vec![allowed.clone()],
+            enable_index_watcher: false,
+            ..Config::default()
+        });
+
+        let inside_str = inside.to_string_lossy().to_string();
+        assert_eq!(
+            repository_config_write_target(&engine, &inside_str).unwrap(),
+            Config::repository_config_path(&inside_str)
+        );
+        let refused = repository_config_write_target(&engine, &outside.to_string_lossy());
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.contains("not allowed")),
+            "{refused:?}"
+        );
+        assert!(!outside.join(".damaian").exists());
+    }
+
+    #[test]
+    fn command_proposal_endpoint_serves_a_stored_proposals_directories() {
+        let repo = repository_map_fixture("repomap-proposal");
+        let repo_str = repo.to_string_lossy().to_string();
+        let engine = engine_for_repo(&repo_str).unwrap();
+        let proposal = engine
+            .validation_orchestrator
+            .propose_command_at(
+                &repo,
+                repo.join("packages/api"),
+                "npm test",
+                "test proposal",
+            )
+            .unwrap();
+
+        let (port, token) = serve_for_test();
+        let url = format!(
+            "/api/command-proposal?repo={}&proposal_id={}",
+            percent_encode_for_test(&repo_str),
+            proposal.id
+        );
+        let response = get_for_test(port, &token, &url);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let payload = json_of(&response);
+        assert_eq!(
+            payload["workingDirectory"],
+            repo.join("packages/api").to_string_lossy().as_ref(),
+            "{payload}"
+        );
+        assert_eq!(payload["repositoryRoot"], repo_str, "{payload}");
     }
 
     fn get_session_for_test(port: u16, token: &str, session_id: &str) -> String {

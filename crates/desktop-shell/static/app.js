@@ -13,6 +13,10 @@ let bootstrapPromise = null;
 let bootstrapError = null;
 let chatSubmitting = false;
 let pinnedContextFiles = [];
+// Repository-relative root paths for the selected repository, newest map
+// first. Used to qualify a basename or a patch file by the root that owns it
+// (`context.md` §4, §13). Loaded from `/api/repository-map`.
+let repositoryRoots = [];
 let contextChipsDismissed = false;
 let terminalOpen = false;
 let term = null;
@@ -929,6 +933,248 @@ function fileBaseName(path) {
   return parts[parts.length - 1] || path;
 }
 
+// The repository-relative part of `target` when it lies inside `root`, and
+// `""` otherwise. Both are absolute paths from the engine, so a proposal's
+// working directory is rendered as the root it runs in (`context.md` §13).
+function repositoryRelative(root, target) {
+  const base = String(root || "").replace(/\/+$/, "");
+  const full = String(target || "").replace(/\/+$/, "");
+  if (!base || !full || full === base) return "";
+  return full.startsWith(`${base}/`) ? full.slice(base.length + 1) : "";
+}
+
+// The nearest root that owns `path`, by longest path-segment prefix — the
+// same rule as `RepositoryMap::root_for_path`. `""` (the repository root)
+// owns everything, so a non-empty result is what gets shown.
+function rootForPath(path) {
+  const candidate = String(path || "").replace(/^\.\//, "");
+  let best = "";
+  for (const root of repositoryRoots) {
+    if (!root || root.length <= best.length) continue;
+    if (candidate === root || candidate.startsWith(`${root}/`)) best = root;
+  }
+  return best;
+}
+
+function rootTag(path) {
+  const root = rootForPath(path);
+  return root ? ` · ${root}` : "";
+}
+
+// Refreshes the roots cache and redraws the chips and the Roots section from
+// a `/api/repository-map` or `/api/repository-roots` payload.
+function applyRepositoryMap(payload) {
+  repositoryRoots = (payload?.map?.roots || [])
+    .filter((root) => root.userOverride !== "removed")
+    .map((root) => root.path);
+  renderRepositoryRoots(payload);
+  renderPinnedContextFiles();
+}
+
+/// Fetches the selected repository's map and refreshes everything that names
+/// a root. A missing repository clears both.
+async function refreshRepositoryRoots(repoPath = repo()) {
+  if (!repoPath) {
+    applyRepositoryMap(null);
+    return null;
+  }
+  const payload = await api(`/api/repository-map?repo=${encodeURIComponent(repoPath)}`);
+  applyRepositoryMap(payload);
+  return payload;
+}
+
+function rootDisplayPath(path) {
+  return path === "" ? "." : path;
+}
+
+function rootEvidenceSentence(root) {
+  const detected = root.detectedBy || {};
+  switch (detected.kind) {
+    case "repositoryRoot":
+      return "Treated as a root because it is the repository root.";
+    case "manifest":
+      return `Treated as a root because ${detected.path} exists.`;
+    case "userOverride":
+      return "Added by you — it has no manifest of its own.";
+    default:
+      return "Treated as a root.";
+  }
+}
+
+function rootStatusLabel(root) {
+  if (root.userOverride === "added") return "added by you";
+  if (root.userOverride === "removed") return "removed by you";
+  return "detected";
+}
+
+function renderRepositoryRoots(payload) {
+  const list = $("repository-roots-list");
+  const detail = $("repository-root-detail");
+  const excluded = $("repository-roots-excluded");
+  const status = $("repository-roots-status");
+  if (!list || !detail || !excluded || !status) return;
+  list.innerHTML = "";
+  detail.innerHTML = "";
+  detail.hidden = true;
+  excluded.innerHTML = "";
+  excluded.hidden = true;
+
+  if (!payload) {
+    status.textContent = "No repository selected.";
+    return;
+  }
+  const roots = payload.map?.roots || [];
+  status.textContent = roots.length === 1 ? "1 root" : `${roots.length} roots`;
+
+  roots.forEach((root) => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "repository-root-row";
+    row.dataset.rootPath = root.path;
+
+    const path = document.createElement("code");
+    path.className = "repository-root-path";
+    path.textContent = rootDisplayPath(root.path);
+
+    const meta = document.createElement("span");
+    meta.className = "repository-root-meta";
+    const languages = (root.languages || []).join(", ") || "no language detected";
+    const commandCount = (root.commands || []).length;
+    const commands = commandCount === 1 ? "1 command" : `${commandCount} commands`;
+    meta.textContent = `${languages} · ${commands} · ${rootStatusLabel(root)}`;
+
+    row.append(path, meta);
+    row.addEventListener("click", () => renderRepositoryRootDetail(root));
+    list.append(row);
+  });
+
+  const invalid = (payload.map?.excluded || []).filter(
+    (entry) => entry.reason === "invalidOverride",
+  );
+  if (invalid.length) {
+    const label = document.createElement("p");
+    label.className = "settings-page-hint";
+    label.textContent = "Overrides Damaian did not apply:";
+    excluded.append(label);
+    const items = document.createElement("ul");
+    invalid.forEach((entry) => {
+      const item = document.createElement("li");
+      const path = document.createElement("code");
+      path.textContent = entry.path;
+      const reason = document.createElement("span");
+      reason.textContent = " — not a directory inside this repository";
+      item.append(path, reason);
+      items.append(item);
+    });
+    excluded.append(items);
+    excluded.hidden = false;
+  }
+}
+
+function renderRepositoryRootDetail(root) {
+  const detail = $("repository-root-detail");
+  detail.innerHTML = "";
+
+  const header = document.createElement("div");
+  header.className = "repository-root-detail-header";
+  const path = document.createElement("code");
+  path.textContent = rootDisplayPath(root.path);
+  header.append(path);
+
+  // The repository root cannot be removed — the map is never empty — so it
+  // offers no control. An override is undone rather than reversed.
+  if (root.path !== "") {
+    const override = root.userOverride === "added" || root.userOverride === "removed";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = override ? "btn-sm btn-quiet" : "btn-sm btn-danger";
+    button.textContent = override ? "Undo" : "Remove root";
+    button.addEventListener("click", async () => {
+      try {
+        button.disabled = true;
+        const confirmed = await confirmDialog(
+          override ? "Undo this override?" : "Stop treating this as a root?",
+          override
+            ? "This writes to .damaian/config.conf in the repository, which Git shows."
+            : "This writes to .damaian/config.conf in the repository, which Git shows. " +
+                "Damaian will detect the root again if a manifest still marks it.",
+          { confirmLabel: override ? "Undo" : "Remove" },
+        );
+        if (!confirmed) {
+          button.disabled = false;
+          return;
+        }
+        await writeRootOverride(override ? "clear" : "remove", root.path);
+      } catch (error) {
+        button.disabled = false;
+        toast(error.message);
+      }
+    });
+    header.append(button);
+  }
+  detail.append(header);
+
+  const evidence = document.createElement("p");
+  evidence.className = "repository-root-evidence";
+  evidence.textContent = rootEvidenceSentence(root);
+  detail.append(evidence);
+
+  if (root.path !== "" && (root.instruction_files || []).length) {
+    detail.append(repositoryRootList("Instruction files", root.instruction_files));
+  }
+  if ((root.commands || []).length) {
+    const commands = document.createElement("ul");
+    commands.className = "repository-root-commands";
+    root.commands.forEach((command) => {
+      const item = document.createElement("li");
+      const code = document.createElement("code");
+      code.textContent = command.command;
+      const runsIn = document.createElement("span");
+      runsIn.textContent = ` — runs in ${rootDisplayPath(command.workingDirectory || root.path)}`;
+      item.append(code, runsIn);
+      commands.append(item);
+    });
+    const heading = document.createElement("p");
+    heading.className = "repository-root-section-label";
+    heading.textContent = "Commands";
+    detail.append(heading, commands);
+  } else if (root.userOverride !== "removed") {
+    const empty = document.createElement("p");
+    empty.className = "settings-page-hint";
+    empty.textContent = "No commands detected in this root.";
+    detail.append(empty);
+  }
+
+  detail.hidden = false;
+}
+
+function repositoryRootList(label, values) {
+  const heading = document.createElement("p");
+  heading.className = "repository-root-section-label";
+  heading.textContent = label;
+  const list = document.createElement("ul");
+  list.className = "repository-root-files";
+  values.forEach((value) => {
+    const item = document.createElement("li");
+    const code = document.createElement("code");
+    code.textContent = value;
+    item.append(code);
+    list.append(item);
+  });
+  const wrapper = document.createElement("div");
+  wrapper.append(heading, list);
+  return wrapper;
+}
+
+async function writeRootOverride(action, path) {
+  const payload = await api("/api/repository-roots", form({ repo: requireRepo(), action, path }));
+  applyRepositoryMap(payload);
+  if (action === "add") toast(`Added root ${path}`);
+  else if (action === "remove") toast(`Removed root ${path}`);
+  else toast(`Restored detection for ${path}`);
+  return payload;
+}
+
 function renderPinnedContextFiles() {
   const wrapper = $("composer-context");
   const container = $("pinned-context-files");
@@ -945,7 +1191,9 @@ function renderPinnedContextFiles() {
     icon.setAttribute("aria-hidden", "true");
     const label = document.createElement("span");
     label.className = "context-chip-label";
-    label.textContent = fileBaseName(path);
+    // A chip whose file is in a sub-root reads `index.ts · packages/api`, so
+    // two files named `index.ts` are distinguishable (`context.md` §4).
+    label.textContent = `${fileBaseName(path)}${rootTag(path)}`;
     const remove = document.createElement("button");
     remove.type = "button";
     remove.setAttribute("aria-label", `Remove ${path} from context`);
@@ -974,6 +1222,9 @@ function applyRepositoryState(value, persist = true) {
   }
   currentSessionId = "";
   loadPinnedContextFiles("");
+  // Refresh the roots cache so chips and patch files can qualify by root. A
+  // failure here is not fatal: the UI simply shows unqualified names.
+  void refreshRepositoryRoots(projectPath).catch(() => {});
   // Switching repositories restarts the shell in the new working folder.
   if (terminalOpen) {
     void restartTerminal().catch((error) => toast(error.message));
@@ -1205,6 +1456,7 @@ function openSettings(page = "providers") {
   document.body.classList.add("settings-open");
   renderSettingsProviderLists();
   renderSettingsModels();
+  void refreshRepositoryRoots().catch(() => {});
   void loadConfigFile().catch((error) => setModelKeyStatus(error.message, "error"));
 }
 
@@ -6203,6 +6455,15 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
       const name = document.createElement("span");
       name.textContent = file.path;
       label.append(checkbox, name);
+      // Each file header names its root when it is not the repository root,
+      // so a patch that spans two roots shows both (`context.md` §13).
+      const fileRoot = rootForPath(file.path);
+      if (fileRoot) {
+        const rootLabel = document.createElement("span");
+        rootLabel.className = "diff-root";
+        rootLabel.textContent = fileRoot;
+        label.append(rootLabel);
+      }
 
       const fileState = document.createElement("span");
       fileState.className = "diff-state";
@@ -6369,6 +6630,29 @@ function createCommandApprovalPreview(
   const command = document.createElement("code");
   command.className = "command-approval-command";
   command.textContent = proposal.command || "";
+
+  // The card payload comes from `chat.rs`'s `AgentCommandProposal`, which
+  // carries no working directory (spec 24 Task 8), so the shell reads it from
+  // the stored proposal. The card says where the command runs only when that
+  // is a sub-root (`context.md` §13).
+  const location = document.createElement("p");
+  location.className = "command-approval-location";
+  location.hidden = true;
+  if (proposal.proposalId && proposalRepo) {
+    void api(
+      `/api/command-proposal?repo=${encodeURIComponent(proposalRepo)}&proposal_id=${encodeURIComponent(proposal.proposalId)}`,
+    )
+      .then((stored) => {
+        const relative = repositoryRelative(stored.repositoryRoot, stored.workingDirectory);
+        if (!relative) return;
+        location.textContent = "Runs in ";
+        const code = document.createElement("code");
+        code.textContent = relative;
+        location.append(code);
+        location.hidden = false;
+      })
+      .catch(() => {});
+  }
 
   // The rationale sits behind a disclosure because the common case is a short
   // command approved without reading it.
@@ -6597,7 +6881,7 @@ function createCommandApprovalPreview(
   });
 
   footer.append(disclosure, actions);
-  wrapper.append(header, command, details, footer, output);
+  wrapper.append(header, command, location, details, footer, output);
   return wrapper;
 }
 
@@ -7288,6 +7572,21 @@ $("mcp-remove-btn").addEventListener("click", async () => {
     if (!id || !(await confirmDialog("Remove server?", `Remove MCP server ${id}?`))) return;
     await removeMcpServerFromSettings();
     toast("MCP server removed");
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$("roots-add-btn").addEventListener("click", async () => {
+  try {
+    if (!repo()) {
+      toast("Select a repository first");
+      return;
+    }
+    const path = await promptDialog("Add a repository root (writes to .damaian/config.conf)", "");
+    const trimmed = String(path || "").trim();
+    if (!trimmed) return;
+    await writeRootOverride("add", trimmed);
   } catch (error) {
     toast(error.message);
   }
