@@ -382,6 +382,20 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "permission_profile.repo_0123456789abcdef=full\n",
             Reported("permission_profile.repo_0123456789abcdef"),
         ),
+        // Spec 32: a repository may define a hook of its own but never touch
+        // a user's, and a review is the user's decision (32 context.md §7.1).
+        case(
+            "hooks",
+            "hook.guard.command=/usr/local/bin/guard\nhook.guard.events=before_tool\n",
+            "hook.guard.enabled=false\n",
+            Reported("hook.guard.enabled"),
+        ),
+        case(
+            "hook_reviews_by_repository",
+            "",
+            "hook_review.repo_0123456789abcdef.lint=sha256:abc\n",
+            Reported("hook_review.repo_0123456789abcdef.lint"),
+        ),
     ]
 }
 

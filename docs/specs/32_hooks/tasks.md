@@ -4,13 +4,13 @@
 
 **Implements:** [`proposal.md`](proposal.md) in full · corrections and the
 decisions it left open in [`context.md`](context.md)
-**Started:** not yet (planned 2026-10-07)
+**Started:** 2026-10-07
 
 ## Progress
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · Hook configuration and its scope classification | Not started | Edits the same four config files as #24's Task 6 and #50's Task 2 (`context.md` §14) |
+| 1 · Hook configuration and its scope classification | Done 2026-10-09 | Landed as planned. `config.rs`: `HookEvent` (`ALL`, `as_str`, `parse`, `default_timeout_ms`), `HookMode` (default `Mandatory`), `HookSource`, `HookConfig` (with `deadline_ms(event)`), `HookConfigOverlay`, `HookReview` (`sha256:<hex>` or `declined`), `MAX_HOOK_TIMEOUT_MS = 60_000`, `Config.hooks`, `Config.hook_reviews_by_repository`, `Config::hook(id)`, both overlay fields classified **Capability**. `hook.<id>.<field>` and `hook_review.<repository id>.<hook id>` parse in `set` (`validate_hook_id` is the `[a-z0-9_]{1,40}` rule; `timeout_ms` must be 1..=60,000; `events` must be non-empty and known). `apply_overlay_scoped` has a `hooks` arm with an exhaustive scope `match`: user and admin upsert, with an admin `enabled=false`, `mode=optional` or longer timeout on an existing hook recorded as a widening; repository defines only a new, complete id and otherwise refuses every present field as `Forbidden` (incomplete: `Unparsable`); profile refuses every field as `Forbidden`. Reviews apply at trusted scopes and are `UserOwned` elsewhere. `load_scoped` fails when a user or admin hook lacks `command` or `events`. Both `to_policy_text`s print hooks (`push_hook_config`, `push_hook_overlay`); `Config`'s leaves out the reviews like the other per-repository maps. `profile.rs`: `split_profile_keys` refuses hook fields (`Forbidden`) and reviews (`UserOwned`). `effective_policy.rs`: `rule_label` names `hook.<id>.<field>` and `hook_review.*`. `lib.rs` re-exports the types. `tests/hooks.rs`: 16 tests, written first and confirmed failing to compile on the missing types. `tests/permission_profiles.rs`: two weakening cases (`hooks`, `hook_reviews_by_repository`), nothing else changed. Engine `--lib` + `hooks` + `permission_profiles` + `repository_config_trust` + `foundation`: 646 pass, 5 skipped; `repository_config_trust.rs` untouched. `fmt --check`, scoped `clippy -D warnings`, `typos` clean, and `cargo check` of `damaian-cli`, `desktop-shell`, `eval-harness` (`--all-targets`) passes. Mutations, each reverted and confirmed failing: (1) `HookMode` default `Optional` fails the defaults test and three others; (2) the repository arm upserting onto an existing id fails `a_repository_cannot_touch_a_user_hook` and spec 31's weakening test; (3) profile scope treated as admin fails the profile test, spec 31's split/merge agreement test and `a_profile_cannot_loosen_anything_the_user_config_narrowed`; (4) reviews accepted at repository scope fails the review test, the weakening test and the agreement test; (5) no completeness check fails the incomplete-user-hook test; (6) admin `enabled=false` not flagged fails the admin-widening test. **Deviations:** a profile's `hook_review.*` is refused as `UserOwned`, not `Forbidden` as `context.md` §7.1 first said, so it matches how the merge already refuses the other per-repository maps at profile scope and spec 31's split/merge agreement test holds (§7.1 corrected). The policy view shows one rule per hook field (`hook.<id>.command`, `.events`, `.mode`, …), the way MCP servers appear, rather than one rule per hook. `HookEvent::default_timeout_ms` and `HookConfig::deadline_ms` landed here, not in Task 3, because judging an admin timeout as a widening needs them. **For Task 3:** use `HookConfig::deadline_ms(event)` rather than adding `default_timeout`. **For Task 4:** a repository hook's `command` is not yet checked to resolve inside the repository or to be an absolute path (`context.md` §7.1). That belongs in `activation`. `HookConfig.source` is the scope that created the hook, and an admin change to a user hook keeps it `User`. **For every later task's mutation runs:** restoring a file by renaming a backup over it keeps the backup's older mtime, and cargo then reuses the mutated build. One test kept failing after a correct restore until `config.rs` was touched. Restore by writing the content back, or `touch` the file after restoring |
 | 2 · The contract: events, envelope, strict response, resolution | Not started | Pure types and functions, no I/O |
 | 3 · The hook runner: spawn, deadline, bounds, environment | Not started | Adds `ProcessKind::Hook` |
 | 4 · The dispatcher: order, review gate, audit, findings | Not started | Adds `FindingSource::Hook` |
@@ -239,7 +239,7 @@ scope and show in the policy view.
   `ConfigOverlay.hook_reviews_by_repository`.
 - `pub const MAX_HOOK_TIMEOUT_MS: u64 = 60_000`.
 
-- [ ] **Step 1: Write the failing tests** in a new
+- [x] **Step 1: Write the failing tests** in a new
   `crates/workspace-engine/tests/hooks.rs`, with the `temp_dir` helper and a
   `load(user, repository, admin)` helper modelled on
   `permission_profiles.rs`' `load` (`:52`). Cases:
@@ -271,11 +271,11 @@ scope and show in the policy view.
   repository `hook_review.<repository id>.<hook>=sha256:…`. Do not change an
   existing case.
 
-- [ ] **Step 2: Run the tests and confirm they fail to compile** on the
+- [x] **Step 2: Run the tests and confirm they fail to compile** on the
   missing types:
   `CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test hooks`.
 
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - Parse `hook.<id>.<field>` in `ConfigOverlay::set` beside the
     `mcp_server.` prefix (`config.rs:2382`), and
     `hook_review.<repository_id>.<hook_id>` beside the
@@ -304,12 +304,12 @@ scope and show in the policy view.
     `<id>` (mandatory) on before_patch_apply, before_tool". Review state is
     Task 4's, so leave a `review` field `None` for now.
 
-- [ ] **Step 4: Run the tests and confirm they pass.** Then confirm nothing
+- [x] **Step 4: Run the tests and confirm they pass.** Then confirm nothing
   else moved:
   `CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test hooks --test permission_profiles --test repository_config_trust`.
   `repository_config_trust.rs` is untouched (`git diff --stat`).
 
-- [ ] **Step 5: Mutation-test.** Record each in the progress row:
+- [x] **Step 5: Mutation-test.** Record each in the progress row:
   1. Make `HookMode::default()` `Optional`. The defaults test fails.
   2. Let the repository arm upsert onto an existing id. The "cannot touch a
      user hook" test and spec 31's new weakening case fail.
@@ -318,7 +318,7 @@ scope and show in the policy view.
   4. Accept `hook_review.*` at repository scope. Both the review test and the
      weakening case fail.
 
-- [ ] **Step 6: Scoped checks.**
+- [x] **Step 6: Scoped checks.**
 
   ```bash
   cargo fmt --all -- --check
@@ -326,7 +326,7 @@ scope and show in the policy view.
   typos
   ```
 
-- [ ] **Step 7: Update this file's Task 1 row, then show the change and the
+- [x] **Step 7: Update this file's Task 1 row, then show the change and the
   check results and ask before committing.** Suggested subject:
   `Configure hooks with a repository-safe scope classification`.
 

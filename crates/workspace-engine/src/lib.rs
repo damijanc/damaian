@@ -59,7 +59,8 @@ pub use command_policy::{
 pub use command_runner::{CommandExecution, CommandRunOptions, CommandRunner, CommandTermination};
 pub use config::{
     AppliedKey, CommandAccess, Config, ConfigKeyKind, ConfigOverlay, ConfigScope, CostEstimate,
-    DEFAULT_CONTEXT_TOKEN_BUDGET, McpServerConfig, McpServerConfigOverlay, McpTransport,
+    DEFAULT_CONTEXT_TOKEN_BUDGET, HookConfig, HookConfigOverlay, HookEvent, HookMode, HookReview,
+    HookSource, MAX_HOOK_TIMEOUT_MS, McpServerConfig, McpServerConfigOverlay, McpTransport,
     ModelProviderConfig, ModelProviderConfigOverlay, OverlayOutcome, RejectedConfigKey,
     RepositoryConfigReport, RepositoryKeyClass, normalize_mcp_server_id, normalize_model_provider,
     normalize_model_reasoning_level, overlay_field_kinds, parse_mcp_transport,

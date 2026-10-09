@@ -368,6 +368,8 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         mcp_enabled,
         mcp_server_allowlist,
         mcp_servers,
+        hooks,
+        hook_reviews_by_repository,
     } = overlay;
 
     let mut refused = Vec::new();
@@ -439,6 +441,24 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
             format!("permission_profile.{repository_id}"),
             RepositoryKeyClass::UserOwned,
         );
+    }
+    for (repository_id, reviews) in &hook_reviews_by_repository {
+        for hook_id in reviews.keys() {
+            refuse(
+                format!("hook_review.{repository_id}.{hook_id}"),
+                RepositoryKeyClass::UserOwned,
+            );
+        }
+    }
+    // A hook is an executable to run, which a profile does not configure:
+    // not a new one, and not a change to the user's (spec 32 context.md §7.1).
+    for hook in &hooks {
+        for field in hook.present_fields() {
+            refuse(
+                format!("hook.{}.{field}", hook.id),
+                RepositoryKeyClass::Forbidden,
+            );
+        }
     }
     // A profile may disable or gate a server the user has, never define one:
     // the definition is where `auth_token_env` lives.

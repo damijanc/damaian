@@ -176,8 +176,10 @@ pub fn rule_label(key: &str) -> Option<String> {
     let owner = match prefix {
         "command_allowlist" => return rule_label(prefix),
         "permission_profile" => return Some("Permission profile".to_string()),
+        "hook_review" => return Some("Your review of a repository hook".to_string()),
         "model_provider" => "Model provider",
         "mcp_server" => "MCP server",
+        "hook" => "Hook",
         _ => return None,
     };
     let Some((id, field)) = rest.rsplit_once('.') else {
@@ -201,6 +203,13 @@ pub fn rule_label(key: &str) -> Option<String> {
         ("mcp_server", "env") => "environment",
         ("mcp_server", "url") => "address",
         ("mcp_server", "auth_token_env") => "where its token is read from",
+        ("hook", "command") => "command it runs",
+        ("hook", "args") => "arguments",
+        ("hook", "events") => "when it runs",
+        ("hook", "mode") => "if it fails (mandatory blocks, optional warns)",
+        ("hook", "order") => "run order",
+        ("hook", "timeout_ms") => "time limit (milliseconds)",
+        ("hook", "enabled") => "on",
         _ => return None,
     };
     Some(format!("{owner} {id}: {field}"))

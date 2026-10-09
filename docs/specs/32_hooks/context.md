@@ -272,7 +272,7 @@ field added by spec 32" as capability.
 | `hook.<id>.*` for an id no earlier scope defined | Defines the hook | **Defines a pending hook**: inactive until reviewed (below) | Defines the hook | **Forbidden** |
 | `hook.<id>.*` for an id user or admin config already defined, any field | Applies | **Forbidden** (redefining, disabling, retiming or making optional a user's hook) | Applies, both directions. A loosening (`enabled=false`, `mode=optional`, a longer timeout) is marked as an admin widening in the policy view | **Forbidden** |
 | `hook.<id>.enabled=false` on a hook the same repository defined | — | Applies (a repository may switch off its own hook) | — | — |
-| `hook_review.<repository_id>.<hook_id>` | The user's decision | **User-owned**: refused, like `command_allowlist.<repository_id>` | Applies | **Forbidden** |
+| `hook_review.<repository_id>.<hook_id>` | The user's decision | **User-owned**: refused, like `command_allowlist.<repository_id>` | Applies | **User-owned** (corrected in Task 1, see below) |
 | An unparsable `hook.*` key or value (bad id, unknown event, bad mode, missing `command`/`events`) | Load error (strict parse) | **Unparsable**: skipped and reported | Load error | **Forbidden** |
 
 Notes on the table:
@@ -282,6 +282,13 @@ Notes on the table:
   configure executables. `split_profile_keys` (`profile.rs:322`) refuses
   `hook.*` and `hook_review.*`, so an imported profile cannot carry a hook.
   An export never contains one.
+- **A review at profile scope is refused as User-owned, not Forbidden.**
+  Corrected in Task 1. The merge already refuses the other per-repository
+  maps (`command_allowlist.<id>`, `permission_profile.<id>`) as User-owned
+  at profile scope, and spec 31's
+  `the_keys_a_profile_may_carry_agree_with_the_profile_scope_merge` holds
+  `split_profile_keys` and the merge to the same class. Either class refuses
+  the key. User-owned keeps the classes consistent.
 - **A repository-defined hook arrives pending, not refused.** §5.8 says "a
   repository *can* add a hook once reviewed". Its definition is applied, its
   status is `pending_review`, and it never runs until the user approves its
