@@ -5,15 +5,18 @@
 //! waiting question leaves on its task (never an approval link), and the two
 //! question events that put the exchange in the transcript. Nothing in the
 //! chat loop writes these yet.
+//!
+//! Task 2 pins the per-turn cap, `agent_max_questions_per_turn`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    ANSWER_MAX_CHARS, AskUserInput, OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN, PendingApprovalRef,
-    PendingDecision, PendingQuestionRef, QUESTION_MAX_CHARS, SessionStore, Task, TaskStatus,
-    validate_answer,
+    ANSWER_MAX_CHARS, AskUserInput, Config, ConfigOverlay, MAX_QUESTIONS_PER_TURN_CEILING,
+    OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN, PendingApprovalRef, PendingDecision,
+    PendingQuestionRef, QUESTION_MAX_CHARS, RepositoryConfigReport, RepositoryKeyClass,
+    SessionStore, Task, TaskStatus, validate_answer,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -499,4 +502,142 @@ fn questions_are_counted_per_task() {
             .unwrap(),
         1
     );
+}
+
+// Task 2: the per-turn cap is a Preference with a hard ceiling (`context.md`
+// §8). Over the ceiling is an error at every scope, never a clamp: a clamp
+// would let a repository ask for an interrogation and quietly get the most
+// allowed.
+
+/// Loads `user` then `repository` at their real scopes, as a desktop request
+/// does. The user file is trusted, so a bad value there fails the load.
+fn load_config(
+    name: &str,
+    user: &str,
+    repository: &str,
+) -> workspace_engine::Result<(Config, RepositoryConfigReport)> {
+    let root = temp_data_dir(name);
+    let data_dir = root.join(".damaian");
+    let user_config = data_dir.join("config").join("user.conf");
+    let repository_config = Config::repository_config_path(&root);
+    fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    fs::write(&user_config, user).unwrap();
+    fs::create_dir_all(repository_config.parent().unwrap()).unwrap();
+    fs::write(&repository_config, repository).unwrap();
+    let base = Config {
+        data_dir,
+        ..Config::default()
+    };
+    let loaded = Config::load_scoped(
+        base,
+        Some(&user_config),
+        Some(&repository_config),
+        None,
+        Some(&root),
+    );
+    let _ = fs::remove_dir_all(&root);
+    loaded
+}
+
+#[test]
+fn the_question_cap_defaults_to_two_under_a_ceiling_of_four() {
+    assert_eq!(Config::default().agent_max_questions_per_turn, 2);
+    assert_eq!(MAX_QUESTIONS_PER_TURN_CEILING, 4);
+    let (config, report) = load_config("cap-default", "", "").unwrap();
+    assert_eq!(config.agent_max_questions_per_turn, 2);
+    assert!(report.rejected_keys.is_empty());
+}
+
+#[test]
+fn a_cap_over_the_ceiling_fails_a_user_config_and_names_the_ceiling() {
+    let error = ConfigOverlay::parse("agent_max_questions_per_turn=5\n")
+        .expect_err("5 is over the ceiling")
+        .to_string();
+    assert!(error.contains("agent_max_questions_per_turn"), "{error}");
+    let ceiling = MAX_QUESTIONS_PER_TURN_CEILING.to_string();
+    assert!(
+        error.contains(&ceiling),
+        "the error must name the ceiling: {error}"
+    );
+
+    let loaded = load_config("cap-user-over", "agent_max_questions_per_turn=5\n", "");
+    assert!(loaded.is_err(), "a user value over the ceiling must fail");
+}
+
+#[test]
+fn a_cap_over_the_ceiling_is_refused_at_repository_scope_not_clamped() {
+    let (config, report) =
+        load_config("cap-repo-over", "", "agent_max_questions_per_turn=5\n").unwrap();
+    assert_eq!(
+        config.agent_max_questions_per_turn, 2,
+        "the default holds; a clamp would read 4"
+    );
+    assert_eq!(
+        report.rejected_key_names(),
+        vec!["agent_max_questions_per_turn"]
+    );
+    assert_eq!(
+        report.rejected_keys[0].class,
+        RepositoryKeyClass::Unparsable
+    );
+}
+
+#[test]
+fn zero_and_the_ceiling_are_accepted_at_both_scopes() {
+    for value in [0, MAX_QUESTIONS_PER_TURN_CEILING] {
+        let line = format!("agent_max_questions_per_turn={value}\n");
+        let (config, _) = load_config("cap-user-ok", &line, "").unwrap();
+        assert_eq!(config.agent_max_questions_per_turn, value, "user {value}");
+
+        let (config, report) = load_config("cap-repo-ok", "", &line).unwrap();
+        assert_eq!(config.agent_max_questions_per_turn, value, "repo {value}");
+        assert!(
+            report.rejected_keys.is_empty(),
+            "{:?}",
+            report.rejected_keys
+        );
+    }
+}
+
+#[test]
+fn a_repository_may_lower_or_raise_the_cap_within_the_ceiling() {
+    let (config, report) = load_config(
+        "cap-repo-raise",
+        "agent_max_questions_per_turn=1\n",
+        "agent_max_questions_per_turn=3\n",
+    )
+    .unwrap();
+    assert_eq!(config.agent_max_questions_per_turn, 3);
+    assert!(report.rejected_keys.is_empty());
+}
+
+#[test]
+fn the_cap_round_trips_through_both_policy_texts() {
+    let overlay = ConfigOverlay::parse("agent_max_questions_per_turn=0\n").unwrap();
+    assert!(
+        overlay
+            .to_policy_text()
+            .contains("agent_max_questions_per_turn=0"),
+        "{}",
+        overlay.to_policy_text()
+    );
+    let config = Config {
+        agent_max_questions_per_turn: 3,
+        ..Config::default()
+    };
+    assert!(
+        config
+            .to_policy_text()
+            .contains("agent_max_questions_per_turn=3")
+    );
+}
+
+#[test]
+fn a_profile_may_not_carry_the_cap() {
+    let overlay = ConfigOverlay::parse("agent_max_questions_per_turn=1\n").unwrap();
+    let (carried, refused) = workspace_engine::split_profile_keys(overlay);
+    assert_eq!(carried.agent_max_questions_per_turn, None);
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].key, "agent_max_questions_per_turn");
+    assert_eq!(refused[0].class, RepositoryKeyClass::Forbidden);
 }

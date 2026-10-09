@@ -56,8 +56,9 @@ pub use checkpoint::{
     CheckpointRestoreResult, CheckpointStore, CommandCensus, PendingApproval,
 };
 pub use clarification::{
-    ANSWER_MAX_CHARS, AskUserInput, OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN, PendingDecision,
-    PendingQuestionRef, QUESTION_MAX_CHARS, QuestionState, validate_answer,
+    ANSWER_MAX_CHARS, AskUserInput, MAX_QUESTIONS_PER_TURN_CEILING, OPTION_MAX_CHARS, OPTIONS_MAX,
+    OPTIONS_MIN, PendingDecision, PendingQuestionRef, QUESTION_MAX_CHARS, QuestionState,
+    validate_answer,
 };
 pub use command_policy::{
     CommandClassification, CommandPolicy, CommandRisk, PROJECT_MANIFESTS, allow_always_eligible,
