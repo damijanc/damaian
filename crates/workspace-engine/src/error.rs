@@ -52,6 +52,25 @@ impl ProviderRefusal {
             _ => None,
         }
     }
+
+    /// The inverse of [`Self::code`], for a refusal that was persisted as its
+    /// code — a paused fallback offer (spec 56). The retry guidance is not
+    /// kept: by the time a persisted refusal is read back, its wait is over.
+    pub fn from_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "provider_rate_limited" => Self::RateLimited {
+                retry_after_secs: None,
+            },
+            "provider_overloaded" => Self::Overloaded {
+                retry_after_secs: None,
+            },
+            "provider_quota_exhausted" => Self::QuotaExhausted,
+            "provider_auth_failed" => Self::AuthFailed,
+            "provider_bad_request" => Self::BadRequest,
+            "provider_refused" => Self::Unknown,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

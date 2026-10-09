@@ -3478,6 +3478,7 @@ fn continue_debugging_turns_use_the_absolute_round_cap() {
             &mut sink,
             ChatTurnOptions {
                 continue_debugging: true,
+                ..ChatTurnOptions::default()
             },
         )
         .unwrap();

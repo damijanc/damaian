@@ -1531,6 +1531,32 @@ impl Config {
             .find(|provider| provider.id == id)
     }
 
+    /// The provider a refused turn may be offered to answer with instead, or
+    /// `None` when there is nothing to offer and the refusal fails closed
+    /// (spec 56 §5.2).
+    ///
+    /// Names only: whether a key actually sits behind `api_key_env` is the
+    /// shell's question, because the engine never resolves credentials. A
+    /// candidate is a *different* configured provider whose native-tool support
+    /// matches the active one's, because the paused turn's messages were built
+    /// for that contract (spec 56 `tasks.md` C3). An exhausted quota is
+    /// offered only a provider with its own key: one sharing the active key
+    /// variable is the same empty account under another name (C2).
+    /// Deterministic: the first match in configuration order.
+    pub fn fallback_provider_for(
+        &self,
+        refusal: &crate::error::ProviderRefusal,
+    ) -> Option<&ModelProviderConfig> {
+        let native_tools = self.supports_native_tools();
+        self.model_providers.iter().find(|candidate| {
+            candidate.id != self.model_provider
+                && !candidate.api_key_env.trim().is_empty()
+                && candidate.supports_native_tools == native_tools
+                && (*refusal != crate::error::ProviderRefusal::QuotaExhausted
+                    || candidate.api_key_env != self.model_api_key_env)
+        })
+    }
+
     fn upsert_model_provider(&mut self, overlay: ModelProviderConfigOverlay) {
         // A built-in provider is not in `model_providers` — it is produced on
         // demand by `builtin_model_provider_config` — so an overlay naming one

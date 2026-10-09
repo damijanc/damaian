@@ -8,7 +8,7 @@ use crate::command_runner::{CommandExecution, CommandTermination};
 use crate::config::{Config, CostEstimate, McpTransport};
 use crate::context_manager::ContextManager;
 use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes};
-use crate::error::{ClientError, Result};
+use crate::error::{ClientError, ProviderRefusal, Result};
 use crate::file_access::{FileAccessController, LineRange, ReadWindow};
 use crate::finding::{
     Finding, Severity, default_parsers, findings_from_execution, findings_from_web_record,
@@ -303,6 +303,29 @@ pub struct AgentPlanProposal {
     pub deferred_action: String,
 }
 
+/// A one-shot offer to answer a refused turn with a different configured
+/// provider (spec 56). Declined by default: nothing switches until the user
+/// approves this one occurrence, and there is no "always".
+///
+/// Names both sides so the card can say who refused and who would answer —
+/// approving in the abstract is what the spec rules out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentFallbackProposal {
+    /// The id to hand back to
+    /// [`ChatOrchestrator::resume_after_fallback_decision`].
+    pub id: String,
+    pub refused_provider: String,
+    pub refused_model: String,
+    pub fallback_provider: String,
+    /// The model the fallback would answer with: its first configured model,
+    /// or empty when it lists none and the shell's own default applies.
+    pub fallback_model: String,
+    /// The refusal's stable code, e.g. `provider_rate_limited`.
+    pub refusal_code: String,
+    /// The provider's own message, shown verbatim (spec 48 §5.7).
+    pub message: String,
+}
+
 /// One step of a user's revision to a proposed plan.
 ///
 /// Identifies the step by id rather than position so a reorder and a deletion
@@ -329,6 +352,10 @@ pub struct ChatTurnResult {
     /// mutating step. Resumed through
     /// [`ChatOrchestrator::resume_after_plan_decision`].
     pub plan_proposal: Option<AgentPlanProposal>,
+    /// The provider refused and a different configured provider could answer.
+    /// The turn is paused, not failed, until
+    /// [`ChatOrchestrator::resume_after_fallback_decision`] decides.
+    pub fallback_proposal: Option<AgentFallbackProposal>,
     /// The user stopped this turn. Distinct from a failure: `response` holds
     /// whatever had been generated, and it is persisted.
     pub cancelled: bool,
@@ -366,6 +393,17 @@ struct TurnProposals {
 pub struct ChatTurnOptions {
     #[serde(default)]
     pub continue_debugging: bool,
+    /// This turn has already been offered — and has approved — a provider
+    /// fallback, so a second refusal fails rather than offering again
+    /// (spec 56 §5.5: a loop of offers is the failure mode the offer exists
+    /// to avoid). Carried here because these options are already saved with
+    /// every paused turn, so the guard survives a later command pause and a
+    /// restart within the same turn. Callers leave it `false`; the engine sets
+    /// it on an approved switch. Public only so callers can build the struct
+    /// with `..Default::default()` — and setting it can only *suppress* an
+    /// offer, which is the fail-closed direction, never cause a switch.
+    #[serde(default)]
+    pub provider_fallback_used: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -823,6 +861,14 @@ impl ChatOrchestrator {
                 "Proposal {proposal_id} is a plan review; resume it with resume_after_plan_decision"
             )));
         }
+        // Same reasoning for a fallback offer: nothing was dispatched, and
+        // `last_content` is empty rather than a command.
+        if pending.provider_fallback.is_some() {
+            self.pending_commands.save(&pending)?;
+            return Err(ClientError::InvalidInput(format!(
+                "Proposal {proposal_id} is a provider fallback offer; resume it with resume_after_fallback_decision"
+            )));
+        }
         let repository_root = PathBuf::from(&pending.repository_root);
         let mut messages = pending.messages;
         // Layer 3's resume-path points (`context.md` §8): approving a paused
@@ -1215,6 +1261,146 @@ impl ChatOrchestrator {
             model_adapter,
             sink,
             pending.turn_options,
+        )
+    }
+
+    /// Decides a provider-fallback offer (spec 56).
+    ///
+    /// Declining — the default — fails the task exactly as an unoffered
+    /// refusal does (spec 48 §5.4): `failureKind`, the provider's message, and
+    /// the refusal returned as the error. The marker and the measured zero
+    /// were already written when the refusal arrived, so nothing is booked
+    /// twice.
+    pub fn resume_after_fallback_decision(
+        &self,
+        proposal_id: &str,
+        approved: bool,
+        approved_by: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let pending = self.pending_commands.take(proposal_id)?;
+        let Some(offer) = pending.provider_fallback.clone() else {
+            self.pending_commands.save(&pending)?;
+            return Err(ClientError::InvalidInput(format!(
+                "Proposal {proposal_id} is not a provider fallback offer"
+            )));
+        };
+
+        if approved {
+            // The request takes its provider, model, token ceiling and tool
+            // contract from `self.config`, not from the adapter, so the caller
+            // must resume on an engine whose config has the fallback active
+            // (spec 56 `tasks.md` C1). Anything else would send the refused
+            // provider's model name to the fallback's endpoint — refused, and
+            // the offer put back so the right engine can still take it.
+            if self.config.model_provider != offer.fallback_provider {
+                self.pending_commands.save(&pending)?;
+                return Err(ClientError::InvalidInput(format!(
+                    "Proposal {proposal_id} must be resumed with {} as the active provider, not {}",
+                    offer.fallback_provider, self.config.model_provider
+                )));
+            }
+            return self.reissue_through_fallback(pending, offer, approved_by, model_adapter, sink);
+        }
+
+        self.audit_log.record(
+            "provider_fallback_decision",
+            &[
+                ("actor", approved_by.to_string()),
+                ("sessionId", pending.session.id.clone()),
+                ("taskId", pending.task.id.clone()),
+                ("proposalId", proposal_id.to_string()),
+                ("refusedProvider", offer.refused_provider.clone()),
+                ("fallbackProvider", offer.fallback_provider.clone()),
+                ("decision", "declined".to_string()),
+            ],
+        )?;
+        self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
+        self.session_store.update_task_status_with_kind(
+            &pending.task,
+            TaskStatus::Failed,
+            Some(offer.message.as_str()),
+            Some(offer.refusal_code.as_str()),
+        )?;
+        Err(ClientError::Provider(
+            ProviderRefusal::from_code(&offer.refusal_code).unwrap_or(ProviderRefusal::Unknown),
+            offer.message,
+        ))
+    }
+
+    /// The approved half of [`Self::resume_after_fallback_decision`]: records
+    /// the switch, then re-issues the refused round through this engine's
+    /// provider — which the caller has already made the fallback.
+    ///
+    /// The round is re-entered, not advanced: it never completed, so the
+    /// fallback gets the same messages the refused provider was sent and the
+    /// round budget is not charged twice. The plan is left exactly where the
+    /// refusal left it, which is what "carried across unchanged" means here.
+    fn reissue_through_fallback(
+        &self,
+        pending: PendingChatTurn,
+        offer: PendingProviderFallback,
+        approved_by: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        self.audit_log.record(
+            "provider_fallback_decision",
+            &[
+                ("actor", approved_by.to_string()),
+                ("sessionId", pending.session.id.clone()),
+                ("taskId", pending.task.id.clone()),
+                ("proposalId", pending.proposal_id.clone()),
+                ("refusedProvider", offer.refused_provider.clone()),
+                ("fallbackProvider", offer.fallback_provider.clone()),
+                ("fallbackModel", self.config.model_name.clone()),
+                ("decision", "approved".to_string()),
+            ],
+        )?;
+        self.session_store.record_provider_fallback(
+            &pending.task,
+            &offer.refused_provider,
+            &offer.fallback_provider,
+            approved_by,
+        )?;
+        // The transcript marker (requirement 6). Worded as what happened, not
+        // as an instruction: earlier turns reach the model as plain
+        // `role: content` lines, so this is read as a fact about the
+        // conversation. Written before the call, so it says "switched to"
+        // rather than claiming an answer the fallback may yet refuse.
+        self.session_store.append_message(
+            &pending.session.id,
+            Some(&pending.task.id),
+            "system",
+            &format!(
+                "Switched to {} ({}) for this turn after {} refused it ({}).",
+                offer.fallback_provider,
+                self.config.model_name,
+                offer.refused_provider,
+                offer.refusal_code
+            ),
+        )?;
+        self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
+        let task = self.session_store.update_task_status(
+            &pending.task,
+            TaskStatus::PreparingContext,
+            None,
+        )?;
+        let turn_options = ChatTurnOptions {
+            provider_fallback_used: true,
+            ..pending.turn_options
+        };
+        self.run_agentic_turn(
+            &PathBuf::from(&pending.repository_root),
+            pending.session,
+            task,
+            pending.context_files,
+            pending.messages,
+            pending.round,
+            model_adapter,
+            sink,
+            turn_options,
         )
     }
 
@@ -1918,6 +2104,35 @@ impl ChatOrchestrator {
                             ("message", message.clone()),
                         ],
                     )?;
+                    // Spec 56: where a different configured provider could
+                    // answer, the refusal becomes a declined-by-default offer
+                    // rather than a failure. Everything above — the marker, the
+                    // measured zero, the audit — has already happened either
+                    // way; only the task's outcome waits on the user.
+                    if let Some(candidate) = self
+                        .config
+                        .fallback_provider_for(&refusal)
+                        .filter(|_| !turn_options.provider_fallback_used)
+                    {
+                        let offer = PendingProviderFallback {
+                            refused_provider: self.config.model_provider.clone(),
+                            refused_model: self.config.model_name.clone(),
+                            fallback_provider: candidate.id.clone(),
+                            fallback_model: candidate.models.first().cloned().unwrap_or_default(),
+                            refusal_code: refusal.code().to_string(),
+                            message,
+                        };
+                        return self.pause_for_provider_fallback(
+                            repository_root,
+                            session,
+                            task,
+                            context_files,
+                            messages,
+                            round,
+                            turn_options,
+                            offer,
+                        );
+                    }
                     let _ = self.session_store.update_task_status_with_kind(
                         &task,
                         TaskStatus::Failed,
@@ -2206,6 +2421,7 @@ impl ChatOrchestrator {
                         plan_review: Some(PendingPlanReview {
                             deferred_action: deferred_action.clone(),
                         }),
+                        provider_fallback: None,
                     })?;
                     self.note_pending_approvals(
                         &session,
@@ -2333,6 +2549,7 @@ impl ChatOrchestrator {
                                     mcp_call: None,
                                     web_diagnostic_call: None,
                                     plan_review: None,
+                                    provider_fallback: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -2663,6 +2880,7 @@ impl ChatOrchestrator {
                                     mcp_call: None,
                                     web_diagnostic_call: Some(PendingWebDiagnosticCall { call }),
                                     plan_review: None,
+                                    provider_fallback: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -2774,6 +2992,7 @@ impl ChatOrchestrator {
                                     }),
                                     web_diagnostic_call: None,
                                     plan_review: None,
+                                    provider_fallback: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -3064,6 +3283,114 @@ impl ChatOrchestrator {
             command_proposal: proposals.command,
             patch_proposal: proposals.patch,
             plan_proposal: proposals.plan,
+            fallback_proposal: None,
+            cancelled: false,
+            usage,
+            estimated_cost,
+        })
+    }
+
+    /// Parks a refused turn on a provider-fallback offer (spec 56 §5.1).
+    ///
+    /// Returned from the refusal arm directly rather than through the loop's
+    /// `terminal` value: there is no model run to finish and no response to
+    /// persist, and skipping the seal is right — like a plan review, nothing
+    /// has happened yet and the turn may still continue.
+    #[allow(clippy::too_many_arguments)]
+    fn pause_for_provider_fallback(
+        &self,
+        repository_root: &Path,
+        session: Session,
+        task: Task,
+        context_files: Vec<String>,
+        messages: Vec<ModelMessage>,
+        round: u32,
+        turn_options: ChatTurnOptions,
+        offer: PendingProviderFallback,
+    ) -> Result<ChatTurnResult> {
+        let proposal_id = create_id("fallback");
+        let response = provider_fallback_response(&offer);
+        self.pending_commands.save(&PendingChatTurn {
+            proposal_id: proposal_id.clone(),
+            session: session.clone(),
+            task: task.clone(),
+            repository_root: repository_root.to_string_lossy().to_string(),
+            context_files: context_files.clone(),
+            round,
+            // The request as the provider refused it: approving re-issues this
+            // round, so nothing is appended for a call that never answered.
+            messages,
+            matched_tool_call: None,
+            last_content: String::new(),
+            turn_options,
+            reasoning_content: None,
+            round_calls_fed_back: false,
+            mcp_call: None,
+            web_diagnostic_call: None,
+            plan_review: None,
+            provider_fallback: Some(offer.clone()),
+        })?;
+        self.note_pending_approvals(
+            &session,
+            &task,
+            vec![PendingApproval {
+                kind: "provider_fallback".to_string(),
+                proposal_id: proposal_id.clone(),
+            }],
+        );
+        let task = self.session_store.await_approval(
+            &task,
+            &crate::session::PendingApprovalRef {
+                kind: "provider_fallback".to_string(),
+                proposal_id: proposal_id.clone(),
+            },
+        )?;
+        self.audit_log.record(
+            "provider_fallback_offered",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session.id.clone()),
+                ("taskId", task.id.clone()),
+                ("proposalId", proposal_id.clone()),
+                ("refusedProvider", offer.refused_provider.clone()),
+                ("fallbackProvider", offer.fallback_provider.clone()),
+                ("classification", offer.refusal_code.clone()),
+            ],
+        )?;
+        let usage = self
+            .session_store
+            .read_task_usage(&session.id)
+            .ok()
+            .and_then(|usage| usage.get(&task.id).copied());
+        let estimated_cost = usage.as_ref().and_then(|usage| {
+            self.config.estimated_cost(&TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                source: usage.source,
+            })
+        });
+        let mut model_run =
+            ModelRun::cancelled_before_start(&offer.refused_provider, &offer.refused_model);
+        model_run.content = response.clone();
+        Ok(ChatTurnResult {
+            session,
+            task,
+            model_run,
+            context_files,
+            response,
+            command_proposal: None,
+            patch_proposal: None,
+            plan_proposal: None,
+            fallback_proposal: Some(AgentFallbackProposal {
+                id: proposal_id,
+                refused_provider: offer.refused_provider,
+                refused_model: offer.refused_model,
+                fallback_provider: offer.fallback_provider,
+                fallback_model: offer.fallback_model,
+                refusal_code: offer.refusal_code,
+                message: offer.message,
+            }),
             cancelled: false,
             usage,
             estimated_cost,
@@ -3136,6 +3463,7 @@ impl ChatOrchestrator {
             command_proposal: None,
             patch_proposal: None,
             plan_proposal: None,
+            fallback_proposal: None,
             cancelled: true,
             usage,
             estimated_cost,
@@ -3462,11 +3790,31 @@ struct PendingChatTurn {
     /// pending turns written before the gate existed loadable.
     #[serde(default)]
     plan_review: Option<PendingPlanReview>,
+    /// Present when the pause is a provider-fallback offer (spec 56). As with
+    /// a plan review nothing was dispatched: `messages` is the request the
+    /// provider refused, and `round` is the round it refused in, because that
+    /// round never completed. `#[serde(default)]` keeps pending turns written
+    /// before the offer existed loadable.
+    #[serde(default)]
+    provider_fallback: Option<PendingProviderFallback>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PendingPlanReview {
     deferred_action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingProviderFallback {
+    refused_provider: String,
+    refused_model: String,
+    fallback_provider: String,
+    fallback_model: String,
+    /// [`ProviderRefusal::code`], kept as the string the decline records as
+    /// `failureKind` — the refusal itself is not serialisable and its code is
+    /// all the decline needs.
+    refusal_code: String,
+    message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3517,6 +3865,22 @@ impl PausedTurns {
         value
             .get("plan_review")?
             .get("deferred_action")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// The provider a paused fallback offer would answer with, or `None` when
+    /// the id names no paused turn, or one that is not a fallback offer
+    /// (spec 56). The shell reads it to know whose engine and key to build
+    /// before resuming; recovery reads it to know whether the offer can still
+    /// be made.
+    pub fn provider_fallback_target(&self, proposal_id: &str) -> Option<String> {
+        let path = PendingCommandStore::new(&self.data_dir).path_for(proposal_id);
+        let content = fs::read_to_string(path).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+        value
+            .get("provider_fallback")?
+            .get("fallback_provider")?
             .as_str()
             .map(str::to_string)
     }
@@ -3936,6 +4300,13 @@ fn apply_plan_revision(current: &TaskPlan, revision: &[PlanRevisionStep]) -> Tas
 }
 
 /// The text a paused turn shows while its plan is under review.
+fn provider_fallback_response(offer: &PendingProviderFallback) -> String {
+    format!(
+        "{} refused this request ({}): {}\n\n{} is configured and could answer this turn instead. Nothing has been switched; declining leaves the task failed.",
+        offer.refused_provider, offer.refusal_code, offer.message, offer.fallback_provider
+    )
+}
+
 fn plan_review_response(plan: &TaskPlan, deferred_action: &str) -> String {
     let mut text = String::from("Before going further, here is the plan:\n");
     for (index, step) in plan.steps.iter().enumerate() {

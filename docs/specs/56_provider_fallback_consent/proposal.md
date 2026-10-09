@@ -1,6 +1,6 @@
 # Feature Spec: Provider Fallback Consent
 
-Status: Not started
+Status: In progress — Tasks 1 and 2 of 3 (the engine: offer, decline, approval) done 2026-10-09; Task 3 (shell, frontend, docs) remains. See [`tasks.md`](tasks.md).
 Order: 56 of 56
 Plan: none. Split out of
 [`48_provider_limits_and_backpressure`](../48_provider_limits_and_backpressure/proposal.md)
@@ -53,6 +53,16 @@ behind their back.
   they pass into `ChatOrchestrator::ask_with_session`. The orchestrator holds no
   credentials and cannot build a fallback adapter itself. A switch therefore has
   to be orchestrated by the caller that owns the Keychain, not by the engine.
+  Only the desktop shell drives chat turns: the CLI never calls
+  `ask_with_session` or a `resume_after_*` method, so there is no CLI turn to
+  pause and the offer surfaces in the shell only.
+- **The request reads the provider from the orchestrator's config, not the
+  adapter.** `run_agentic_turn` takes the request's `provider`, `model` and
+  `max_tokens`, the native-tools contract, the context budget, and the audit
+  fields from `self.config`. Handing over a different adapter alone would send
+  the refused provider's model name to the fallback's endpoint, so the caller
+  resumes on an engine built from a config with the fallback active — in
+  memory, never written back.
 - **The pending-approval machinery already exists.** Command and patch approval
   pause a turn by persisting a `PendingChatTurn`, setting the task to
   `WaitingForApproval`, and resuming through a decision method that takes a
@@ -118,11 +128,21 @@ task exactly as spec 48 §5.4 does.
 
 A terminal refusal only. Transient refusals that spec 48 §5.3 retries never
 reach the offer mid-retry; only the exhausted or permanent outcome does. A
-fallback candidate is a provider in `Config.model_providers` whose id differs
-from the active provider and whose `api_key_env` is non-empty. For quota
-exhaustion the candidate must be a *different* provider (requirement 7); for
-rate limiting and overload a second model on the same provider is acceptable,
-though a different provider is preferred.
+fallback candidate (`Config::fallback_provider_for`) is a provider in
+`Config.model_providers` that:
+
+- has an id different from the active provider's — a second model on the same
+  provider is never offered, because the config has no per-model credentials to
+  tell it apart from the one that refused;
+- has a non-empty `api_key_env` (a name only: whether a key is actually behind
+  it is the shell's question);
+- has the same `supports_native_tools` as the active provider, because the
+  paused turn's messages were built for that contract and may already carry
+  native tool calls;
+- for quota exhaustion, also has an `api_key_env` different from the active
+  one (requirement 7): two provider ids reading one key are one account.
+
+The first match in configuration order is offered.
 
 ### 5.3 The offer is one-shot and refused by default
 
@@ -170,4 +190,39 @@ records nothing beyond spec 48's existing failure path.
 
 ## 7. Implementation Notes
 
-To be completed during implementation.
+**Task 1 (the offer and the decline), 2026-10-07.** The refusal arm of
+`run_agentic_turn` keeps every piece of spec 48's bookkeeping (marker
+`"refused"`, measured zero or mid-stream estimate, `provider_refusal` audit) and
+only then asks `Config::fallback_provider_for`. With a candidate, it parks the
+turn through `pause_for_provider_fallback`: it saves a `PendingChatTurn` with
+`provider_fallback` set and the refused round's messages, records a
+`"provider_fallback"` pending approval, audits `provider_fallback_offered`, and
+returns `Ok` with `ChatTurnResult::fallback_proposal`. It returns directly
+rather than through the loop's `terminal` value, so the turn's checkpoint is
+not sealed and no assistant message is appended. Declining through
+`resume_after_fallback_decision` fails the task with the refusal's
+`failureKind` and returns the refusal as the error. Reattach after a restart
+goes through a new `ReattachedApproval::ProviderFallback`. A command or plan
+resume of a fallback offer is refused, and the offer is put back.
+
+**Task 2 (approval), 2026-10-09.** Approving re-enters the *refused* round,
+not the next one, with the messages the refused provider was sent, so the
+fallback sees the same request and the round budget is not charged twice. The
+approving engine must already have the fallback active: `self.config` supplies
+the request's provider, model and token ceiling, so an approval on the refused
+provider's engine is refused and the offer is put back. A switch is recorded
+three ways: a `provider_fallback` task event, a `system` transcript message
+written before the re-issued call ("Switched to … after … refused it"), and an
+approved `provider_fallback_decision` audit row naming the fallback's model.
+`ChatTurnOptions.provider_fallback_used` carries "already offered" through any
+later pause in the same turn. A fallback that also refuses fails the task with
+its own `failureKind` instead of offering again. The flag does not reach the
+next turn, which starts on the configured provider and is offered afresh.
+
+**Spec 48's pinning test inverted.** `no_fallback_happens_without_approval`
+used to assert that a refusal with a second provider configured *fails*. It now
+asserts a pause that names both providers and calls only the refusing adapter.
+`a_refusal_with_no_candidate_still_fails_closed` carries the fail-closed
+assertion forward.
+
+The task-by-task record, including deviations, is in [`tasks.md`](tasks.md).

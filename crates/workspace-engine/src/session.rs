@@ -218,7 +218,7 @@ pub enum ExportFormat {
 /// link back to the task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingApprovalRef {
-    /// `"command"` or `"patch"`.
+    /// `"command"`, `"patch"`, `"plan"` or `"provider_fallback"`.
     pub kind: String,
     pub proposal_id: String,
 }
@@ -1467,6 +1467,58 @@ impl SessionStore {
                 escape_json(approved_by)
             ),
         )
+    }
+
+    /// Records that the user let this task's refused model call be answered by
+    /// a different provider (spec 56 §5.4). Its own event, like
+    /// [`Self::approve_plan`]: a switch is a decision taken at a moment, and a
+    /// turn whose second half was answered by another model must say so after
+    /// a reload too.
+    pub fn record_provider_fallback(
+        &self,
+        task: &Task,
+        refused_provider: &str,
+        fallback_provider: &str,
+        approved_by: &str,
+    ) -> Result<()> {
+        self.append_session_event(
+            &task.session_id,
+            "provider_fallback",
+            &format!(
+                "{{\"taskId\":\"{}\",\"refusedProvider\":\"{}\",\"fallbackProvider\":\"{}\",\"approvedBy\":\"{}\"}}",
+                escape_json(&task.id),
+                escape_json(refused_provider),
+                escape_json(fallback_provider),
+                escape_json(approved_by)
+            ),
+        )
+    }
+
+    /// Every provider switch recorded on this session's tasks, as
+    /// `(task_id, refused_provider, fallback_provider)` in log order.
+    ///
+    /// All events, not only active ones, like [`Self::read_task_usage`]: a
+    /// rewind moves the conversation back, but it does not un-happen which
+    /// model answered a call that was billed.
+    pub fn read_provider_fallbacks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(Vec::new());
+        };
+        Ok(parsed_events(&content)
+            .0
+            .iter()
+            .filter(|event| event.event_type == "provider_fallback")
+            .filter_map(|event| {
+                Some((
+                    event.text("taskId")?,
+                    event.text("refusedProvider")?,
+                    event.text("fallbackProvider")?,
+                ))
+            })
+            .collect())
     }
 
     /// Whether this task's plan has been approved.
