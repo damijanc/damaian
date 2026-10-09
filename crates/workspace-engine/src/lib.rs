@@ -2,6 +2,7 @@ pub mod audit;
 pub mod cancel;
 pub mod chat;
 pub mod checkpoint;
+pub mod clarification;
 pub mod command_policy;
 pub mod command_runner;
 pub mod config;
@@ -40,6 +41,7 @@ pub mod tree_walk;
 pub mod validation;
 pub mod vector_index;
 pub mod web_diagnostics;
+pub mod worker_progress;
 pub mod workspace_engine;
 
 pub use audit::AuditLog;
@@ -53,6 +55,10 @@ pub use checkpoint::{
     CheckpointConversation, CheckpointExclusion, CheckpointFile, CheckpointManifest,
     CheckpointOrigin, CheckpointPath, CheckpointRequest, CheckpointRestoreOptions,
     CheckpointRestoreResult, CheckpointStore, CommandCensus, PendingApproval,
+};
+pub use clarification::{
+    ANSWER_MAX_CHARS, AskUserInput, OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN, PendingDecision,
+    PendingQuestionRef, QUESTION_MAX_CHARS, QuestionState, validate_answer,
 };
 pub use command_policy::{
     CommandClassification, CommandPolicy, CommandRisk, PROJECT_MANIFESTS, allow_always_eligible,
