@@ -56,6 +56,7 @@ fn ask(
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     engine
         .chat_orchestrator
@@ -82,6 +83,7 @@ fn ask_watching_plans(
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     let result = engine
         .chat_orchestrator
@@ -125,6 +127,7 @@ fn decide(
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     engine
         .chat_orchestrator
@@ -700,6 +703,7 @@ fn a_turn_that_arrives_with_a_plan_reports_it_before_doing_anything() {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     let mut after = scripted(vec![vec![patch_call("src/retry.rs")]]);
     engine

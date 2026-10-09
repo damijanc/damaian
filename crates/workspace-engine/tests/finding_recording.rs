@@ -64,6 +64,7 @@ fn ask(
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     engine
         .chat_orchestrator
@@ -84,6 +85,7 @@ fn ask_in(
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     engine
         .chat_orchestrator
@@ -101,6 +103,7 @@ fn approve(
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     engine
         .chat_orchestrator

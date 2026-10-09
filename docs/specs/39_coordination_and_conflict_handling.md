@@ -6,6 +6,10 @@ Plan: `docs/PLAN/06_phase_6_advanced_autonomy.md`, Phase 6, Work
 Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#38](38_subagent_model.md) (the subagent model) — **not built**.
+#38 was deferred on 2026-10-09, and its stage 2 is superseded by
+[#57](57_worker_sessions/proposal.md)'s worktree workers. If #38 returns as
+stage 1 only, this spec shrinks to what read-only children need. See #38's
+Deferral section.
 Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.6 (tool
 and action orchestrator), section 7.7 (diff and patch engine). Related

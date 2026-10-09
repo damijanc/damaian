@@ -2019,6 +2019,7 @@ fn chat_turn(
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     engine
         .chat_orchestrator
@@ -2035,6 +2036,7 @@ fn approve(engine: &WorkspaceEngine, proposal_id: &str) -> ChatTurnResult {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     engine
         .chat_orchestrator

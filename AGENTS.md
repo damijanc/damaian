@@ -207,7 +207,7 @@ Repository exploration should be demand-driven.
 
 A typical task prompt should be sufficient at roughly this level:
 
-```text
+```worker-prompt
 Implement Task N from docs/specs/<feature>/tasks.md.
 
 Read AGENTS.md, the feature's global constraints, and the sections
