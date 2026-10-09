@@ -1,4 +1,7 @@
 use crate::audit::escape_json;
+use crate::clarification::{
+    AskUserInput, PendingDecision, PendingQuestionRef, QuestionState, validate_answer,
+};
 use crate::error::Result;
 use crate::hash::{create_id, now_millis};
 use crate::mode::SessionMode;
@@ -547,8 +550,7 @@ impl SessionStore {
         // reloaded session shows the position the user rewound to.
         Ok(active_events(&content)
             .iter()
-            .filter(|event| event.event_type == "message_appended")
-            .filter_map(parse_message_event)
+            .filter_map(parse_transcript_event)
             .collect())
     }
 
@@ -795,6 +797,180 @@ impl SessionStore {
             });
         }
         Ok(found)
+    }
+
+    /// Sets [`TaskStatus::WaitingForApproval`] for a task waiting on the user's
+    /// answer to `question` (spec 50 §5.2). The link goes under its own key,
+    /// `pendingQuestion`, never `pendingApproval`, so [`Self::pending_approval_for`]
+    /// can never return a question.
+    pub fn await_answer(&self, task: &Task, question: &PendingQuestionRef) -> Result<Task> {
+        if self
+            .question_state(&task.session_id, question.question_id())?
+            .is_none()
+        {
+            return Err(crate::error::ClientError::InvalidInput(format!(
+                "Unknown question: {}",
+                question.question_id()
+            )));
+        }
+        let mut updated = task.clone();
+        updated.status = TaskStatus::WaitingForApproval;
+        let payload = format!(
+            "{{\"task\":{},\"pendingQuestion\":{{\"questionId\":\"{}\"}}}}",
+            task_json(&updated),
+            escape_json(question.question_id())
+        );
+        self.append_session_event(&task.session_id, "task_status_updated", &payload)?;
+        Ok(updated)
+    }
+
+    /// What the task is waiting on, from the newest status event that records
+    /// it. `None` when it is waiting on nothing, or when the newest status
+    /// event carries no link.
+    pub fn pending_decision_for(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<Option<PendingDecision>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(None);
+        };
+        let mut found = None;
+        for event in active_events(&content) {
+            if event.event_type != "task_status_updated" {
+                continue;
+            }
+            let task = event.payload.get("task").unwrap_or(&event.payload);
+            if task.get("id").and_then(|value| value.as_str()) != Some(task_id) {
+                continue;
+            }
+            found = if let Some(pending) = event.payload.get("pendingApproval") {
+                (|| {
+                    Some(PendingDecision::Approval(PendingApprovalRef {
+                        kind: pending.get("kind")?.as_str()?.to_string(),
+                        proposal_id: pending.get("proposalId")?.as_str()?.to_string(),
+                    }))
+                })()
+            } else {
+                event
+                    .payload
+                    .get("pendingQuestion")
+                    .and_then(|pending| pending.get("questionId")?.as_str())
+                    .map(|id| {
+                        PendingDecision::Question(PendingQuestionRef::recorded(id.to_string()))
+                    })
+            };
+        }
+        Ok(found)
+    }
+
+    /// Records a question the model asked (spec 50 §5.6). The input must
+    /// already be redacted: the chat loop runs the secret scanner before it
+    /// gets here. An input that breaks a bound is refused, not stored.
+    pub fn record_question_asked(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        question: &PendingQuestionRef,
+        input: &AskUserInput,
+    ) -> Result<()> {
+        input
+            .validate()
+            .map_err(crate::error::ClientError::InvalidInput)?;
+        let payload = serde_json::json!({
+            "questionId": question.question_id(),
+            "sessionId": session_id,
+            "taskId": task_id,
+            "question": input.question,
+            "options": input.options,
+            "allowFreeText": input.allow_free_text,
+            "createdAtMs": now_millis() as u64,
+        });
+        self.append_session_event(session_id, "question_asked", &payload.to_string())
+    }
+
+    /// Records the user's answer. Refused when the question is unknown,
+    /// already answered, or the answer does not fit it. An answered question
+    /// is never re-asked, and is never answered twice either (requirement 4).
+    pub fn record_question_answered(
+        &self,
+        session_id: &str,
+        question_id: &str,
+        answer: &str,
+        selected_option: Option<usize>,
+    ) -> Result<QuestionState> {
+        let Some(mut state) = self.question_state(session_id, question_id)? else {
+            return Err(crate::error::ClientError::InvalidInput(format!(
+                "Unknown question: {question_id}"
+            )));
+        };
+        if state.answer.is_some() {
+            return Err(crate::error::ClientError::InvalidInput(format!(
+                "Question {question_id} is already answered"
+            )));
+        }
+        validate_answer(&state.input(), answer, selected_option)
+            .map_err(crate::error::ClientError::InvalidInput)?;
+        let mut payload = serde_json::json!({
+            "id": create_id("msg"),
+            "questionId": question_id,
+            "sessionId": session_id,
+            "taskId": state.task_id,
+            "answer": answer,
+            "createdAtMs": now_millis() as u64,
+        });
+        if let Some(index) = selected_option {
+            payload["selectedOption"] = serde_json::json!(index);
+        }
+        self.append_session_event(session_id, "question_answered", &payload.to_string())?;
+        state.answer = Some((answer.to_string(), selected_option));
+        Ok(state)
+    }
+
+    /// A question and its answer, replayed from the active conversation. A
+    /// question rewound past is `None`.
+    pub fn question_state(
+        &self,
+        session_id: &str,
+        question_id: &str,
+    ) -> Result<Option<QuestionState>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(None);
+        };
+        let mut state: Option<QuestionState> = None;
+        for event in active_events(&content) {
+            if event.text("questionId").as_deref() != Some(question_id) {
+                continue;
+            }
+            match event.event_type.as_str() {
+                "question_asked" => state = parse_question_asked(&event),
+                "question_answered" => {
+                    if let (Some(state), Some(answer)) = (state.as_mut(), event.text("answer")) {
+                        let selected = event
+                            .payload
+                            .get("selectedOption")
+                            .and_then(|value| value.as_u64())
+                            .and_then(|value| usize::try_from(value).ok());
+                        state.answer = Some((answer, selected));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(state)
+    }
+
+    /// How many questions a task has asked, for the per-turn cap (§5.3). Read
+    /// from the log, so a resumed turn counts what it already asked.
+    pub fn questions_asked_in_task(&self, session_id: &str, task_id: &str) -> Result<usize> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(0);
+        };
+        Ok(active_events(&content)
+            .iter()
+            .filter(|event| event.event_type == "question_asked")
+            .filter(|event| event.text("taskId").as_deref() == Some(task_id))
+            .count())
     }
 
     /// Appends one run's token usage. One event per call that reached the
@@ -2221,9 +2397,57 @@ fn parse_message_event(event: &SessionEvent) -> Option<ChatMessage> {
 fn messages_with_seq(content: &str) -> Vec<(u64, ChatMessage)> {
     active_events(content)
         .iter()
-        .filter(|event| event.event_type == "message_appended")
-        .filter_map(|event| parse_message_event(event).map(|message| (event.seq, message)))
+        .filter_map(|event| parse_transcript_event(event).map(|message| (event.seq, message)))
         .collect()
+}
+
+/// An event that belongs in the transcript, as a message. Besides ordinary
+/// messages, a question the assistant asked reads as role `question` and the
+/// user's answer as role `answer`, so the exchange shows as what it was
+/// (spec 50 requirement 3, `context.md` §6).
+fn parse_transcript_event(event: &SessionEvent) -> Option<ChatMessage> {
+    match event.event_type.as_str() {
+        "message_appended" => parse_message_event(event),
+        "question_asked" => Some(ChatMessage {
+            id: event.text("questionId")?,
+            session_id: event.text("sessionId")?,
+            task_id: event.text("taskId"),
+            role: "question".to_string(),
+            content: event.text("question")?,
+            created_at_ms: event.number("createdAtMs")?,
+        }),
+        "question_answered" => Some(ChatMessage {
+            id: event.text("id")?,
+            session_id: event.text("sessionId")?,
+            task_id: event.text("taskId"),
+            role: "answer".to_string(),
+            content: event.text("answer")?,
+            created_at_ms: event.number("createdAtMs")?,
+        }),
+        _ => None,
+    }
+}
+
+fn parse_question_asked(event: &SessionEvent) -> Option<QuestionState> {
+    let options = event
+        .payload
+        .get("options")?
+        .as_array()?
+        .iter()
+        .map(|option| option.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    Some(QuestionState {
+        question_id: event.text("questionId")?,
+        task_id: event.text("taskId")?,
+        question: event.text("question")?,
+        options,
+        allow_free_text: event
+            .payload
+            .get("allowFreeText")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        answer: None,
+    })
 }
 
 /// The case-insensitive substrings a query is split into: one literal phrase, or

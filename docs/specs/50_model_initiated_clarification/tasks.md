@@ -4,14 +4,14 @@
 
 **Implements:** [`proposal.md`](proposal.md) in full · corrections and the
 decisions it left open in [`context.md`](context.md)
-**Started:** not yet (planned 2026-10-07)
+**Started:** 2026-10-09
 
 ## Progress
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · Question types, bounds, typed link and session events | Not started | No `chat.rs`. Carries the build-breaking no-conversion assertion |
-| 2 · `agent_max_questions_per_turn` | Not started | No `chat.rs`. Shares four files with #24's Task 6 |
+| 1 · Question types, bounds, typed link and session events | Done 2026-10-09 | Landed as planned. New `clarification.rs`: the bound constants (`QUESTION_MAX_CHARS` 300, `OPTIONS_MIN`/`OPTIONS_MAX` 2/4, `OPTION_MAX_CHARS` 60, `ANSWER_MAX_CHARS` 2,000, counted in characters), `AskUserInput` (serde `camelCase`, `allowFreeText` defaulting to false) with `validate`, `validate_answer`, `PendingQuestionRef`, `PendingDecision` and `QuestionState` (`input()` rebuilds what was asked), all re-exported from `lib.rs`. `session.rs`: `await_answer`, `pending_decision_for`, `record_question_asked`, `record_question_answered` (returns the updated `QuestionState`), `question_state` and `questions_asked_in_task`. `read_messages` and `read_messages_with_seq` now go through `parse_transcript_event`, which adds the `question` and `answer` roles. **The compile-fail test is two `const` assertions** at the bottom of `clarification.rs` (`context.md` §5), one for `PendingQuestionRef` and one for `PendingDecision`. They run on every build. The inherent impl needs `#[allow(dead_code)]`: clippy reports its `CONVERTS` as unused precisely while the rule holds (checked by removing the allow). `tests/clarification.rs`: 16 tests, all pass. They were written first and failed to compile on the missing API. Mutations, each reverted and confirmed failing: (1) `impl From<PendingQuestionRef> for PendingApprovalRef` **fails the build** with `error[E0080]: evaluation panicked: a question must never convert into an approval`; (2) `await_answer` writing `pendingApproval` with `kind: "question"` fails `a_question_link_is_not_an_approval_link`; (3) dropping the already-answered check fails `an_answered_question_cannot_be_answered_again`; (4) `question_state` reading `parsed_events` instead of `active_events` fails `a_question_rewound_past_is_gone`; (5) accepting an over-long question fails the bounds test; (6) the transcript ignoring `question_asked` fails `questions_appear_in_the_transcript_in_order`. Floor: `--lib` with `crash_recovery`, `recovery_prompt`, `session_rewind`, `repository_config_trust`, `session_search_export`, `plan_turn` and `agent_tools` gave 544 passed, 7 skipped, none of those files touched. `fmt --check`, scoped `clippy -D warnings` and `typos` are clean. **Deviations:** ids come from the repository's `create_id("question")` (`question_<hex>_<pid>_<n>`), not a UUID. No UUID dependency exists, and the prefix is what keeps the id off a proposal-id shape. `PendingQuestionRef`'s id is private, read through `question_id()`. It has only two constructors: `new()` and the crate-private `recorded(id)` replay uses. Beyond the plan's bounds, `validate` also refuses an empty question, an empty option, and a repeated option label, because a repeated label would make "which option was chosen" ambiguous. `await_answer` refuses a question that was never recorded. The event payloads are written with `serde_json::json!`, not hand-formatted. **For Task 4:** call `record_question_asked` with the input already redacted. It validates again but does not redact. The answer is stored exactly as given; decide in Task 4 whether it is redacted like a user prompt (`context.md` §7). Count with `questions_asked_in_task`, which ignores questions that were rewound past. **For Task 5:** `pending_decision_for` is the recovery entry point. A status event carrying a malformed `pendingApproval` reads as `None`, as `pending_approval_for` does. **For Tasks 6 and 8:** because `messages_with_seq` feeds session search and export, questions and answers now also appear in **search hits and exports**, as roles `question`/`answer`. Export redacts as before. #24 closed on 2026-10-08, so its Task 6 and Task 7 no longer constrain Tasks 2–4 |
+| 2 · `agent_max_questions_per_turn` | Not started | No `chat.rs`. #24, which shared its four files, is now Done |
 | 3 · Offer `ask_user` where a user is present | Not started | **Edits `chat.rs`.** Changes the headless system prompt: run the deterministic eval tier |
 | 4 · Pause, answer, resume; no resume crosses kinds | Not started | **Edits `chat.rs`.** The requirement 2 task |
 | 5 · Recovery of an open or answered question | Not started | `chat.rs` only if `PausedTurns` needs a method (`context.md` §3). Check the pairing rule first if it does |
@@ -180,7 +180,7 @@ This task changes no behaviour. Nothing writes the new events except tests.
   `role: "question"` and `question_answered` as `role: "answer"`, in log
   order (`context.md` §6).
 
-- [ ] **Step 1: Write the failing tests** in `tests/clarification.rs`:
+- [x] **Step 1: Write the failing tests** in `tests/clarification.rs`:
   - `the_bounds_are_enforced_as_errors_not_truncation`. One case per bound,
     each asserting the error names the bound. An input exactly at a bound
     passes.
@@ -204,17 +204,17 @@ This task changes no behaviour. Nothing writes the new events except tests.
   - `a_session_with_no_questions_reads_exactly_as_before`. Compare
     `read_messages` against a fixture written without any question event.
   - `questions_are_counted_per_task`.
-- [ ] **Step 2: Confirm they fail to compile** on the missing names:
+- [x] **Step 2: Confirm they fail to compile** on the missing names:
   `CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test clarification`.
-- [ ] **Step 3: Implement.**
+- [x] **Step 3: Implement.**
   - Write the event payloads by hand like `await_approval`, or with
     `serde_json::json!`.
   - Read them by parsed `eventType` from `active_events`, never with
     `line.contains` (spec 17 §5.2).
   - Add the `const` assertion from `context.md` §5 at the bottom of
     `clarification.rs`, with a comment citing proposal §5.2.
-- [ ] **Step 4: Confirm the tests pass.**
-- [ ] **Step 5: Mutation-test and record each one:**
+- [x] **Step 4: Confirm the tests pass.**
+- [x] **Step 5: Mutation-test and record each one:**
   1. Add `impl From<PendingQuestionRef> for PendingApprovalRef`. The **build
      fails** on the `const` assertion. This is the compile-fail test.
   2. Make `await_answer` write `pendingApproval` with `kind: "question"`.
@@ -225,12 +225,12 @@ This task changes no behaviour. Nothing writes the new events except tests.
      `active_events`. The rewind test fails.
   5. Truncate an over-long question instead of erroring. The bounds test
      fails.
-- [ ] **Step 6: Confirm the floor holds:**
+- [x] **Step 6: Confirm the floor holds:**
   `CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test crash_recovery --test recovery_prompt --test session_rewind --test repository_config_trust`.
-- [ ] **Step 7: Scoped checks.** `cargo fmt --all -- --check`; scoped
+- [x] **Step 7: Scoped checks.** `cargo fmt --all -- --check`; scoped
   `clippy -D warnings` on `workspace-engine` with `CARGO_TARGET_DIR`;
   `typos`.
-- [ ] **Step 8: Update this task's row, then show the change and ask before
+- [x] **Step 8: Update this task's row, then show the change and ask before
   committing.** Suggested subject: `Add typed question links and question
   events to the session log`.
 
