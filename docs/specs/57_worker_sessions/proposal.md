@@ -1,6 +1,6 @@
 # Feature Spec: Worker Sessions
 
-Status: In progress (Tasks 1–2 of 11 done, 2026-10-07 and 2026-10-09; see [`tasks.md`](tasks.md))
+Status: In progress (Tasks 1–3 of 11 done, 2026-10-07, 2026-10-09 and 2026-10-09; see [`tasks.md`](tasks.md))
 Order: 57 of 57
 Plan: none. An exception to the graduation rule, like #41–#44 and #47: it came
 from describing how this repository is actually built — a planner session that
@@ -384,8 +384,11 @@ turn up on its own. The user restarts the worker instead (§5.7).
 
 ### 5.5 The progress file
 
-`<data_dir>/sessions/<id>.progress.jsonl`, one JSON object per line, each with
-`seq` (strictly increasing from 1 within the file) and `timestampMs`:
+`<data_dir>/sessions/<id>.progress.jsonl`, one JSON object per line:
+`{"seq", "timestampMs", "kind", "payload"}`. `seq` strictly increases from 1
+within the file. `timestampMs` uses the session log's clock. `payload`
+carries the columns below, nested so that a payload field can never collide
+with `seq` or `kind`:
 
 | `kind` | Carries |
 |---|---|
@@ -397,9 +400,14 @@ turn up on its own. The user restarts the worker instead (§5.7).
 | `approval` | the pending proposal, as the approval card needs it |
 | `note` | a steering note was added |
 
-Every value passes through the same secret redaction as the session log before it
-is written. The file is truncated when a worker process starts, and deleted with
-the session. The audit log stays the authoritative record of tool calls; this
+Every string in the payload, at any depth, passes through
+`SecretScanner::redact` before it is written. This is not "the same redaction
+as the session log": that log is unredacted on write and redacts at its call
+sites (correction C3), so this file redacts for itself and does not trust its
+caller. The file is truncated when a worker process starts, and deleted with
+the session (`SessionStore::delete_session`). A reader skips any line that does
+not parse, because it may read while the worker is appending. Each line is
+written whole by one `write_all`, so only the last line can be torn. The audit log stays the authoritative record of tool calls; this
 file exists so the board can show a per-session list without joining audit
 events on `taskId` (context §3.5).
 

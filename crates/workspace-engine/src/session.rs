@@ -556,6 +556,10 @@ impl SessionStore {
         if path.exists() {
             fs::remove_file(path)?;
         }
+        let progress = crate::worker_progress::progress_path(&self.data_dir, session_id);
+        if progress.exists() {
+            fs::remove_file(progress)?;
+        }
         Ok(())
     }
 
@@ -2918,6 +2922,29 @@ mod tests {
         // A rewind discards conversation, not what the session is.
         store.rewind_conversation(&worker.id, 0).unwrap();
         assert!(store.worker_record(&worker.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn deleting_a_session_deletes_its_progress_file() {
+        use crate::worker_progress::{ProgressKind, ProgressWriter, progress_path};
+        let data_dir = temp_data_dir("worker-progress-delete");
+        let store = SessionStore::new(&data_dir);
+        let worker = store.create_session("repo_worktree", "Worker").unwrap();
+        let mut progress =
+            ProgressWriter::create(&data_dir, &worker.id, SecretScanner::default()).unwrap();
+        progress
+            .append(
+                ProgressKind::Status,
+                serde_json::json!({"status": "running"}),
+            )
+            .unwrap();
+        let path = progress_path(&data_dir, &worker.id);
+        assert!(path.exists());
+
+        store.delete_session(&worker.id).unwrap();
+
+        assert!(!path.exists());
+        assert!(!store.session_log_path(&worker.id).exists());
     }
 
     #[test]
