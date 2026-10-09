@@ -374,12 +374,114 @@ directory is wrongly detected, and how to read `detected_by`.
 
 ## 7. Implementation Notes
 
-To be completed during implementation. Record:
+Written in Task 9 (2026-10-09). The per-task record is
+[`tasks.md`](tasks.md)'s progress table. The decisions that replaced parts of
+§5 are in [`context.md`](context.md).
 
-- The depth ceiling chosen, and the root count and map size measured on the
-  largest repository tested.
-- The `repository_map_max_tokens` default, and which degradation steps actually
-  triggered on a large repository.
-- Whether nested-root detection produced any surprising roots in real use — a
-  directory with a stray `package.json` is the likely case, and the answer
-  informs whether the manifest list needs refining.
+### 7.1 Acceptance criteria and the tests that prove them
+
+Engine tests are in `crates/workspace-engine/tests/repository_map.rs` unless
+another file is named. Shell tests are in the `tests` module of
+`crates/desktop-shell/src/lib.rs`.
+
+| §6 criterion | Proved by | State |
+|---|---|---|
+| Two runs over an unchanged repository produce identical output, ignoring `generated_at_ms` | `two_builds_of_an_unchanged_repository_serialise_identically` (full serialisations with `generatedAtMs` removed, one build from a reversed index); `detection_does_not_depend_on_input_order` | Met |
+| The map stays under `repository_map_max_tokens` on a large fixture and states what it dropped | `sixty_long_roots_stay_under_the_default_ceiling_and_say_what_was_dropped`; `each_degradation_step_fires_in_order_as_the_ceiling_falls`; `a_small_map_is_rendered_whole_with_no_degradation_line` | Met |
+| A validation command discovered in `packages/api` runs with `packages/api` as its working directory | `detected_validations_are_proposed_and_run_at_their_own_root`; `a_proposal_in_a_sub_root_runs_in_that_directory`; `a_requested_working_directory_routes_the_proposal_to_that_root` (the model-requested path, Task 7) | Met |
+| Nested roots are both detected, each with its own commands | `nested_roots_are_kept_and_each_names_its_manifest`; `nested_roots_each_carry_their_own_metadata_and_commands` | Met |
+| `node_modules`, `vendor`, `target`, `dist`, `build` never appear as roots and appear in `excluded` with a reason | `vendor_and_build_output_directories_are_never_roots_and_are_recorded` | Met |
+| A repository with no manifest produces a map with one root | `a_repository_with_no_manifest_has_exactly_one_root` | Met |
+| Roots below the depth ceiling are recorded in `excluded` | `roots_below_the_depth_ceiling_are_recorded_not_dropped` | Met |
+| Nested `AGENTS.md` files resolve per root by spec 11's rules, with no second precedence rule | `instruction_files_resolve_per_root_broadest_first`, which reads spec 11's own `agent_instruction_paths` (`context.md` §14) | Met |
+| A user correction persists across a rescan and `detected_by` reports it | `overrides_survive_a_rebuild_after_the_repository_changed`; `an_added_override_makes_a_root_the_user_named` (`UserOverride` evidence); `a_removed_root_stays_visible_and_its_files_go_to_the_enclosing_root`; shell `repository_roots_endpoint_writes_and_re_reads_an_added_root` | Met. A removed root keeps its manifest evidence and reports the correction in `userOverride` (Task 4's decision), so the UI can say "found by `package.json`, removed by you" |
+| The same command classifies per root, and an exact allowlist entry in one root does not authorise it in another | `a_root_qualified_grant_authorises_its_directory_only`; `a_plain_allowlist_entry_matches_only_at_the_repository_root`; `a_roots_command_risk_honours_a_grant_qualified_with_that_root`; `allow_always_in_a_sub_root_writes_a_qualified_grant_under_the_repository_id`; `a_root_qualified_grant_authorises_the_command_in_its_root_only` (through the chat loop) | Met, by root-qualified grants (`context.md` §2), not by the per-repository allowlist §5.5 assumed |
+| Search results and file displays qualify a basename by its root | `root_for_path_is_the_longest_root_that_is_a_segment_prefix` (the rule `app.js`'s `rootForPath` copies). Model-facing results already carry full paths (`context.md` §4) | Met, but the UI half has **no automated test**: the web UI has no JS test harness. Task 8 verified the chips (`index.ts · packages/api`), patch root tags and "Runs in" by hand in the running app |
+| A corrupt or version-mismatched map file rebuilds cleanly and reports that it did | `a_garbage_map_file_is_rebuilt_as_corrupt_and_audited`; `a_map_from_another_schema_version_is_rebuilt_as_a_mismatch`; `a_manifest_change_rebuilds_the_map_as_stale` | Met |
+| A root cannot widen `path_policy.rs` | `paths_resolve_from_the_working_directory_and_are_bounded_by_the_repository`; `a_working_directory_outside_the_repository_matches_nothing_and_needs_approval`; `a_refused_working_directory_never_stores_a_proposal`; shell `a_root_override_is_never_written_outside_the_allowed_roots` | Met |
+| Every quality-gate command passes, and the spec 18 baseline shows no regression | The Task 9 gate run, recorded in `tasks.md` | **Not met on 2026-10-09.** `cargo nextest run --workspace --locked` fails: 25 `desktop-shell` tests abort with SIGABRT at the default test-thread stack (`OBSERVATIONS.md` #26, pre-existing, being fixed separately). `token_ceiling::a_turn_stops_before_the_call_that_would_cross_the_ceiling` also failed because of this spec, and is now fixed (§7.3). The other six gate commands pass. The eval tier passes, and its token rise is exactly the one Tasks 6 and 7 recorded |
+
+Two requirements have no design in §5 and were **not built**
+(`context.md` §12):
+
+- **Frameworks** (requirement 1). Not met. Detecting a framework means reading
+  a manifest's dependencies, which §4 rules out. `ProjectRoot` records
+  `languages` and `manifests` and has no `frameworks` field.
+- **Optional permission restrictions per root** (requirement 3). Not met. A
+  permission profile is per repository (spec 31), and no scope narrower than a
+  repository exists. A per-root restriction needs a new config scope, which is
+  a spec 31 design change.
+
+### 7.2 Recording questions
+
+**Depth ceiling.** `MAX_ROOT_DEPTH = 6` path segments, a constant rather than a
+config key (`context.md` §11). Added roots are not held to it.
+
+**Root count and map size on the largest repository tested** (this one, the
+only real repository measured). A fresh `damaian repo-map` on 2026-10-09, with
+a scratch `DAMAIAN_DATA_DIR`, found **7 roots**: `.`, the five crates, and
+`crates/eval-harness/fixtures/rust-workspace`. `excluded` held `node_modules`
+and `target`, both `vendor`. The stored file is **6,710 bytes**. Task 5
+measured 277 indexed files, a `Built` load of about 0.38 ms and a `Reused`
+load of about 0.17 ms in release builds, so the on-demand design in
+`context.md` §3 needed no revisit.
+
+**Token default and degradation.** `repository_map_max_tokens` defaults to
+**800**, spec 26's planned 5% share of the 16,000-token default context budget
+(`context.md` §7). On this repository the map rendered whole at 465 tokens in
+Task 6. Task 7 lengthened only the header sentence, so it still fits well
+inside 800, and **no degradation step fired at the default**. Every step was
+exercised only below the default or on synthetic fixtures. On this repository,
+300 tokens drops entry points, test paths and major directories, and 150
+tokens shows 3 of 7 roots (Task 6). The 60-root fixture fires every step at
+800. No repository large enough to degrade at the default was available, so
+the order of the steps is tested but not tuned on real data.
+
+**Surprising roots.**
+
+- **A test fixture is a root.** `crates/eval-harness/fixtures/rust-workspace`
+  has its own `Cargo.toml`, so it is detected and proposes `cargo test`. That
+  is the stray-manifest case §7 anticipated. It is correct by the detection
+  rule, and `project_roots_removed` exists to correct it. No fixture heuristic
+  was added. Such a rule would be a second notion of "project", which §5.2
+  warns against.
+- **The repository root's evidence reads `package.json`, not `Cargo.toml`.**
+  Both sit at the root, and `package.json` is first in `PROJECT_MANIFESTS`.
+  That order is `detect_project_commands`' own. The evidence is true but less
+  telling than `Cargo.toml` would be for a Rust workspace.
+- **The root's npm scripts are missed.** `detect_project_commands` matches only
+  the script names `test`, `lint`, `typecheck`, `build` and `format`. This
+  repository names its lint script `lint:web`, so `.` offers only `cargo test`.
+  This is behaviour that predates the spec, and §4 says the function is called
+  per root, not replaced.
+- **The Cargo workspace root and each member all propose `cargo test`.** Seven
+  identical command strings, each at its own directory. They are kept
+  deliberately (Task 6). Spec 23 should expect overlapping per-root proposals.
+
+**Does the manifest list need refining?** Not the list itself. Nothing beyond
+the fixture was a false root, and nothing real was missed. The gap is in what a
+manifest *yields*: exact script-name matching misses common variants
+(`lint:web`, `test:unit`). Refining that changes `detect_project_commands` for
+every caller, so it is left for a later spec rather than done here.
+
+### 7.3 The `token_ceiling` failure this spec caused
+
+`crates/workspace-engine/tests/token_ceiling.rs`,
+`a_turn_stops_before_the_call_that_would_cross_the_ceiling`, asserts that a
+turn under a 1,000-token ceiling makes exactly 3 model calls. With this spec,
+it makes 2 (`left: 2, right: 3`). Every request now carries the
+`repository_map` item and the longer `run_command` schema (Tasks 6 and 7), so
+the estimated usage reaches 1,000 one call sooner. The ceiling still stops
+*before* the call that would cross it, which is the property the test exists
+for. Only the call count it was measured at has moved. Confirmed on
+2026-10-09: with `repository_map_max_tokens: 0` in that test's config, all 13
+`token_ceiling` tests pass. No per-task scoped run included this test file,
+which is why Tasks 6 and 7 did not see it.
+
+**Fixed in Task 9** by setting `repository_map_max_tokens: 0` in
+`engine_with_ceiling`, the fixture every `token_ceiling` test uses. The test
+was not changed to expect 2, for three reasons. The test is about where the
+ceiling stops, not what a request costs. The eval tier already records the
+map's per-request cost. And a count tied to the map's size would move again
+whenever the rendering changed. The exact count of 3 still guards
+`context.md` §3.3 of spec 21.

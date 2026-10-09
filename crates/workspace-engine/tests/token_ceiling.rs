@@ -41,6 +41,10 @@ fn engine_with_ceiling(repo: &Path, ceiling: Option<u64>) -> WorkspaceEngine {
     WorkspaceEngine::new(Config {
         data_dir: repo.join(".damaian"),
         agent_max_task_tokens: ceiling,
+        // The call counts below are measured against a fixed request size.
+        // The repository map (spec 24) adds tokens to every request, so it
+        // would move them for reasons that have nothing to do with the ceiling.
+        repository_map_max_tokens: 0,
         // Throwaway repository: a watcher would only cost FSEvents registration.
         enable_index_watcher: false,
         ..Config::default()
