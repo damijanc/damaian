@@ -114,6 +114,7 @@ const HOSTILE_FORBIDDEN: &str = concat!(
     "audit_enabled=false\n",
     "block_generated_secrets=false\n",
     "allowed_roots=/\n",
+    "enable_worker_sessions=true\n",
 );
 
 /// A restrictive user config: the policy the repository must not be able to
@@ -252,6 +253,26 @@ fn repository_config_cannot_disable_the_audit_log_or_secret_defences() {
     assert!(config.audit_enabled);
     assert!(config.block_generated_secrets);
     assert_eq!(config.secret_patterns, vec!["USER_SECRET".to_string()]);
+
+    fixture.cleanup();
+}
+
+/// Spec 57 §5.8: the setting adds Damaian's handoff paragraph to every
+/// session's system prompt, so a clone that could turn it on would be adding
+/// text to the user's prompt.
+#[test]
+fn repository_config_cannot_enable_worker_sessions() {
+    let fixture = fixture(
+        "workers",
+        "enable_worker_sessions=false\n",
+        "enable_worker_sessions=true\n",
+    );
+
+    let (config, report) = fixture.load_reporting();
+
+    assert!(!config.enable_worker_sessions, "the user value must stand");
+    assert_eq!(report.rejected_key_names(), vec!["enable_worker_sessions"]);
+    assert_eq!(report.rejected_keys[0].class, RepositoryKeyClass::Forbidden);
 
     fixture.cleanup();
 }
@@ -529,6 +550,10 @@ fn hostile_repository_config_changes_nothing_it_should_not() {
     assert_eq!(hostile.model_providers, user_only.model_providers);
     assert_eq!(hostile.secret_patterns, user_only.secret_patterns);
     assert_eq!(hostile.audit_enabled, user_only.audit_enabled);
+    assert_eq!(
+        hostile.enable_worker_sessions,
+        user_only.enable_worker_sessions
+    );
     assert_eq!(
         hostile.block_generated_secrets,
         user_only.block_generated_secrets

@@ -41,6 +41,10 @@ fn engine_with_ceiling(repo: &Path, ceiling: Option<u64>) -> WorkspaceEngine {
     WorkspaceEngine::new(Config {
         data_dir: repo.join(".damaian"),
         agent_max_task_tokens: ceiling,
+        // The call counts below are measured against a fixed request size.
+        // The repository map (spec 24) adds tokens to every request, so it
+        // would move them for reasons that have nothing to do with the ceiling.
+        repository_map_max_tokens: 0,
         // Throwaway repository: a watcher would only cost FSEvents registration.
         enable_index_watcher: false,
         ..Config::default()
@@ -62,6 +66,7 @@ fn ask(
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     let result = engine
         .chat_orchestrator
@@ -246,6 +251,7 @@ fn raising_the_ceiling_and_asking_again_resumes_the_plan() {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     let resumed = roomy
         .chat_orchestrator
@@ -297,6 +303,7 @@ fn a_turn_after_a_completed_task_starts_with_no_plan() {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     let second = engine
         .chat_orchestrator
@@ -371,6 +378,7 @@ fn completing_a_carried_step_keeps_evidence_the_turn_never_saw() {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     let resumed = roomy
         .chat_orchestrator
@@ -459,6 +467,7 @@ fn continuing_after_a_crash_resumes_the_plan() {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     let resumed = engine
         .chat_orchestrator
@@ -509,6 +518,7 @@ fn a_turn_after_an_unsuperseded_task_starts_with_no_plan() {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     let second = engine
         .chat_orchestrator

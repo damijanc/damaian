@@ -158,6 +158,7 @@ fn ask(
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     engine
         .chat_orchestrator
@@ -185,6 +186,7 @@ fn decide_fallback(
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     // An adapter that would answer, so a test can tell "not called" from
     // "called and refused".
@@ -215,6 +217,7 @@ fn approve_with(
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     engine.chat_orchestrator.resume_after_fallback_decision(
         proposal_id,
@@ -692,6 +695,7 @@ fn a_fallback_pending_turn_cannot_be_resumed_as_a_command_or_a_plan() {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     let mut answering = MockModelAdapter::new("answered");
     let as_command = engine.chat_orchestrator.resume_after_command_decision(
@@ -1040,6 +1044,7 @@ fn a_later_turn_is_offered_again_rather_than_switched() {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     let mut refusing = RefusingAdapter::rate_limited();
     let next = engine

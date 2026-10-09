@@ -1401,6 +1401,7 @@ fn ask_with_cancel(
         on_token,
         on_progress: &mut on_progress,
         cancel,
+        steering: None,
     };
     engine
         .chat_orchestrator
@@ -1734,6 +1735,7 @@ fn resume_command_decision(
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     engine
         .chat_orchestrator
@@ -1755,6 +1757,7 @@ fn resume_command_decision_with_options(
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     engine
         .chat_orchestrator
@@ -1786,6 +1789,7 @@ fn collect_turn_progress(
             on_token: &mut on_token,
             on_progress: &mut on_progress,
             cancel: &cancel,
+            steering: None,
         };
         engine
             .chat_orchestrator
@@ -3127,6 +3131,7 @@ fn browser_diagnostic_session_approval_allows_later_scenarios() {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     let second = engine
         .chat_orchestrator
@@ -3217,6 +3222,7 @@ fn browser_diagnostic_session_approval_does_not_cover_remote_urls() {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     let remote = engine
         .chat_orchestrator
@@ -3465,6 +3471,7 @@ fn continue_debugging_turns_use_the_absolute_round_cap() {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
 
     engine

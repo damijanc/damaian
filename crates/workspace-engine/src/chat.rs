@@ -12,6 +12,7 @@ use crate::error::{ClientError, ProviderRefusal, Result};
 use crate::file_access::{FileAccessController, LineRange, ReadWindow};
 use crate::finding::{
     Finding, Severity, default_parsers, findings_from_execution, findings_from_web_record,
+    resolve_finding_path,
 };
 use crate::git_service::{GitService, GitStatus};
 use crate::hash::{create_id, now_millis};
@@ -28,8 +29,10 @@ use crate::path_policy::PathPolicy;
 use crate::plan::TaskPlan;
 use crate::secret_scanner::SecretScanner;
 use crate::session::{ChatMessage, Session, SessionStore, Task, TaskStatus, TaskUsage};
+use crate::steering::TurnSteering;
 use crate::validation::{
     CommandProposal, CommandStore, ValidationOrchestrator, command_approval_prompt,
+    resolve_command_directory,
 };
 use crate::vector_index::VectorIndexCache;
 use crate::web_diagnostics::{
@@ -195,6 +198,15 @@ pub enum TurnProgress {
     /// Boxed because a record carries a whole report, several times larger
     /// than every other variant.
     WebDiagnostic(Box<WebDiagnosticRecord>),
+    /// The turn is holding at a round boundary because its steering asked it
+    /// to (spec 57 §5.4). Only a host that passed `steering` ever sees this.
+    Paused,
+    /// The paused turn continues, in the same task.
+    Resumed,
+    /// A steering note entered the conversation as this user message.
+    NoteAdded {
+        message_id: String,
+    },
 }
 
 /// The per-turn side channel: where answer tokens go, where progress goes, and
@@ -208,6 +220,10 @@ pub struct TurnSink<'a> {
     pub on_token: &'a mut dyn FnMut(&str),
     pub on_progress: &'a mut dyn FnMut(TurnProgress),
     pub cancel: &'a CancelToken,
+    /// Pause and steering notes, applied at round boundaries. `None` for every
+    /// host but a worker, and then the turn is exactly what it was before
+    /// spec 57 (§5.4).
+    pub steering: Option<&'a TurnSteering>,
 }
 
 impl TurnSink<'_> {
@@ -227,6 +243,10 @@ impl TurnSink<'_> {
 
     fn web_diagnostic(&mut self, record: WebDiagnosticRecord) {
         (self.on_progress)(TurnProgress::WebDiagnostic(Box::new(record)));
+    }
+
+    fn progress(&mut self, event: TurnProgress) {
+        (self.on_progress)(event);
     }
 }
 
@@ -672,6 +692,7 @@ impl ChatOrchestrator {
             on_token,
             on_progress: &mut discard_progress,
             cancel: &never_cancelled,
+            steering: None,
         };
         self.ask_with_session(
             repository_root,
@@ -799,8 +820,11 @@ impl ChatOrchestrator {
         );
         let model_prompt = build_model_prompt(prompt, &context.items, &prior_messages, None);
         let mode = self.session_store.session_mode(&session.id);
+        // A worker is never invited to hand off further work (spec 57 §5.0).
+        let offer_handoffs = self.config.enable_worker_sessions
+            && self.session_store.worker_record(&session.id)?.is_none();
         let messages = vec![
-            ModelMessage::system(system_prompt(mode)),
+            ModelMessage::system(system_prompt_for_session(mode, offer_handoffs)),
             ModelMessage::user(model_prompt),
         ];
 
@@ -992,13 +1016,18 @@ impl ChatOrchestrator {
             let command_request = CommandRequest {
                 command: proposal.command.clone(),
                 reason: proposal.reason.clone(),
+                working_directory: None,
             };
             // The stored command is what `run_proposal` would execute, classified
             // again under the current config, because the stored fields predate
             // any profile or config change since (spec 31 Task 5, deviation 5).
-            let classification = self
-                .validation_orchestrator
-                .classify_command(Path::new(&proposal.working_directory), &proposal.command);
+            // Classified at the proposal's own pair, so a command in a sub-root
+            // is judged with the repository as its boundary (spec 24 Task 7).
+            let classification = self.validation_orchestrator.classify_command_at(
+                Path::new(&proposal.repository_root),
+                Path::new(&proposal.working_directory),
+                &proposal.command,
+            );
             let permission = permits(
                 mode,
                 &capabilities,
@@ -1491,6 +1520,7 @@ impl ChatOrchestrator {
         let findings = findings_from_execution(execution, &default_parsers(), &self.scanner);
         self.record_findings(
             repository_root,
+            Path::new(&execution.working_directory),
             session_id,
             task_id,
             &execution.id,
@@ -1515,6 +1545,7 @@ impl ChatOrchestrator {
         let findings = findings_from_web_record(record, &files, &self.scanner);
         self.record_findings(
             repository_root,
+            repository_root,
             session_id,
             &record.task_id,
             &record.id,
@@ -1523,12 +1554,15 @@ impl ChatOrchestrator {
         .map(|_| ())
     }
 
-    /// Keeps a range only when it names a file in the repository, hashing
-    /// the file then. Attaches the task and origin, and appends each finding
-    /// (`context.md` §13.4).
+    /// Keeps a range only when its printed path resolves to a file in the
+    /// repository, hashing the file then. The printed path is resolved from
+    /// the command's working directory, so a tool in a sub-root keeps its
+    /// range (spec 24 `context.md` §8). Attaches the task and origin, and
+    /// appends each finding (`context.md` §13.4).
     fn record_findings(
         &self,
         repository_root: &Path,
+        working_directory: &Path,
         session_id: &str,
         task_id: &str,
         origin_ref: &str,
@@ -1538,16 +1572,13 @@ impl ChatOrchestrator {
         let mut failing = 0;
         for finding in findings {
             let mut finding = finding.with_task_id(task_id).with_origin_ref(origin_ref);
-            if let Some(path) = finding
-                .range()
-                .map(|range| repository_root.join(&range.path))
-            {
-                finding = match path
-                    .is_file()
-                    .then(|| crate::hash::file_hash(&path).ok())
-                    .flatten()
-                {
-                    Some(hash) => finding.with_file_hash(hash),
+            if let Some(printed) = finding.range().map(|range| range.path.clone()) {
+                finding = match resolve_finding_path(repository_root, working_directory, &printed) {
+                    Some(relative) => match crate::hash::file_hash(repository_root.join(&relative))
+                    {
+                        Ok(hash) => finding.with_range_path(relative).with_file_hash(hash),
+                        Err(_) => finding.without_range(),
+                    },
                     None => finding.without_range(),
                 };
             }
@@ -1723,6 +1754,7 @@ impl ChatOrchestrator {
                 &ToolAction::Command(CommandRequest {
                     command: String::new(),
                     reason: String::new(),
+                    working_directory: None,
                 }),
                 Some(&permissive_command),
                 None,
@@ -1870,6 +1902,26 @@ impl ChatOrchestrator {
         // cap so a provider that reports no usage cannot loop forever.
         let mut round_budget_extension: u32 = 0;
         let (final_run, response, proposals, stop_reason) = loop {
+            // Spec 57 §5.4, in its order: a pause holds here, before the
+            // cancel check, so a stop that arrives while paused ends the turn
+            // through the same path as any other stop.
+            if let Some(steering) = sink.steering
+                && steering.is_paused()
+                && !sink.cancel.is_cancelled()
+            {
+                let running = task.status.clone();
+                task = self
+                    .session_store
+                    .update_task_status(&task, TaskStatus::Paused, None)?;
+                sink.progress(TurnProgress::Paused);
+                if steering.wait_while_paused(sink.cancel) {
+                    task = self
+                        .session_store
+                        .update_task_status(&task, running, None)?;
+                    sink.progress(TurnProgress::Resumed);
+                }
+            }
+
             // Checked before each round rather than only mid-stream: stopping
             // here is what saves a whole model call, and it is the only point
             // that catches a stop arriving during context assembly or a tool.
@@ -1899,6 +1951,27 @@ impl ChatOrchestrator {
                     &partial_response,
                     cancelled_run,
                 );
+            }
+
+            // Notes join the conversation as ordinary user messages, before
+            // the request they should reach. The log keeps the user's text as
+            // written, like every user message; what goes to the model is
+            // redacted (spec 57 correction C3).
+            if let Some(steering) = sink.steering {
+                for note in steering.drain_notes() {
+                    let message = self.session_store.append_message(
+                        &session.id,
+                        Some(&task.id),
+                        "user",
+                        &note,
+                    )?;
+                    self.session_store
+                        .record_steering_note(&session.id, &message.id)?;
+                    messages.push(ModelMessage::user(self.scanner.redact(&note).text));
+                    sink.progress(TurnProgress::NoteAdded {
+                        message_id: message.id,
+                    });
+                }
             }
 
             // Before the request is built, not after the response arrives.
@@ -2496,6 +2569,19 @@ impl ChatOrchestrator {
                 // A sandbox command's findings leave its arm through this local
                 // rather than through `ActionOutcome` (spec 22 `context.md` §14).
                 let mut command_findings: Option<crate::plan::Evidence> = None;
+                // A working directory the policy refuses fails the tool result
+                // before anything is proposed or run (spec 24 Task 7). It is
+                // resolved once here so the dispatch arm proposes in the same
+                // directory the classifier saw.
+                let refused_directory = match &tool_action {
+                    ToolAction::Command(request) => resolve_command_directory(
+                        &self.path_policy,
+                        repository_root,
+                        request.working_directory.as_deref().unwrap_or_default(),
+                    )
+                    .err(),
+                    _ => None,
+                };
                 let (assistant_summary, tool_result_text, action_outcome) = if !permission
                     .is_allowed()
                 {
@@ -2508,6 +2594,12 @@ impl ChatOrchestrator {
                             tool_action_marker(&tool_action).0
                         ),
                         refusal_message(permission),
+                        ActionOutcome::Failed,
+                    )
+                } else if let Some(error) = refused_directory {
+                    (
+                        format!("Attempted to run `{}`.", tool_action_marker(&tool_action).1),
+                        error.to_string(),
                         ActionOutcome::Failed,
                     )
                 } else if action_is_batchable_read_only(&tool_action) {
@@ -2525,8 +2617,11 @@ impl ChatOrchestrator {
                 } else {
                     match tool_action {
                         ToolAction::Command(command_request) => {
-                            let proposal = self.validation_orchestrator.propose_command(
+                            let working_directory =
+                                self.command_working_directory(repository_root, &command_request);
+                            let proposal = self.validation_orchestrator.propose_command_at(
                                 repository_root,
+                                &working_directory,
                                 &command_request.command,
                                 &command_request.reason,
                             )?;
@@ -3470,6 +3565,23 @@ impl ChatOrchestrator {
         })
     }
 
+    /// The directory a requested command will run in, used to classify it
+    /// before dispatch. A request the policy refuses resolves to the
+    /// repository root here; the dispatch arm refuses it, with the reason,
+    /// before anything is stored (spec 24 Task 7).
+    fn command_working_directory(
+        &self,
+        repository_root: &Path,
+        request: &CommandRequest,
+    ) -> PathBuf {
+        resolve_command_directory(
+            &self.path_policy,
+            repository_root,
+            request.working_directory.as_deref().unwrap_or_default(),
+        )
+        .unwrap_or_else(|_| repository_root.to_path_buf())
+    }
+
     /// Asks the permission matrix about one dispatched action, supplying the
     /// context only two classes need (`permits`'s own contract): a
     /// command's classification — the same classifier `propose_command` runs,
@@ -3483,10 +3595,14 @@ impl ChatOrchestrator {
         mcp: &McpRuntime,
     ) -> Permission {
         let classification = match action {
-            ToolAction::Command(request) => Some(
-                self.validation_orchestrator
-                    .classify_command(repository_root, &request.command),
-            ),
+            ToolAction::Command(request) => {
+                let working_directory = self.command_working_directory(repository_root, request);
+                Some(self.validation_orchestrator.classify_command_at(
+                    repository_root,
+                    &working_directory,
+                    &request.command,
+                ))
+            }
             _ => None,
         };
         let read_only_hint = match action {
@@ -3941,6 +4057,23 @@ impl PendingCommandStore {
 /// on repeated tool calls.
 const ABSOLUTE_TOOL_ROUND_CAP: u32 = 16;
 
+/// Damaian's own handoff instruction, verbatim from spec 57 §5.0. It is what
+/// makes *Start worker* appear without any repository's `AGENTS.md` teaching
+/// the `worker-prompt` tag.
+pub const WORKER_HANDOFF_PARAGRAPH: &str = "When work should continue in a separate session — because it is a self-contained task, or one of several that can run in parallel — write each task as a prompt in its own fenced block tagged `worker-prompt`. The user can start a worker from that block. A worker starts with a fresh context in its own git worktree and sees only the repository and that prompt, so say what to read, what to change, which checks to run, and when to stop. Do not use the `worker-prompt` tag for anything else.";
+
+/// [`system_prompt`] plus the handoff paragraph when the session is offered
+/// handoffs. `system_prompt` itself never changes, which is how the setting
+/// being off stays byte-for-byte off (spec 57 requirement 1).
+fn system_prompt_for_session(mode: SessionMode, offer_handoffs: bool) -> String {
+    let prompt = system_prompt(mode);
+    if offer_handoffs {
+        format!("{prompt}\n\n{WORKER_HANDOFF_PARAGRAPH}")
+    } else {
+        prompt
+    }
+}
+
 fn system_prompt(mode: SessionMode) -> String {
     const PREFIX: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.";
     match mode {
@@ -4077,6 +4210,10 @@ fn bounded_messages(messages: &[ModelMessage], max_messages: usize) -> Vec<Model
 pub(crate) struct CommandRequest {
     pub(crate) command: String,
     pub(crate) reason: String,
+    /// Repository-relative directory the model asked the command to run in.
+    /// `None` means the repository root, which is what every request before
+    /// spec 24 meant.
+    pub(crate) working_directory: Option<String>,
 }
 
 /// One step as the model proposed it. Only a title and an optional detail: the
@@ -4365,7 +4502,7 @@ fn run_command_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "run_command".to_string(),
         description: "Request a local shell command in the selected repository. Damaian runs sandbox-safe read-only commands automatically and pauses for user approval before running commands with side effects, network access, Docker access, shell control, or unknown risk.".to_string(),
-        parameters_json: "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The shell command to run\"},\"reason\":{\"type\":\"string\",\"description\":\"Why this command is needed\"}},\"required\":[\"command\"]}".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The shell command to run\"},\"reason\":{\"type\":\"string\",\"description\":\"Why this command is needed\"},\"working_directory\":{\"type\":\"string\",\"description\":\"Repository-relative directory to run in; defaults to the repository root\"}},\"required\":[\"command\"]}".to_string(),
     }
 }
 
@@ -4805,7 +4942,17 @@ fn command_request_from_tool_call(call: &ToolCall) -> Option<CommandRequest> {
         .filter(|value| !value.is_empty())
         .unwrap_or("Assistant requested a local command")
         .to_string();
-    Some(CommandRequest { command, reason })
+    let working_directory = arguments
+        .get("working_directory")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Some(CommandRequest {
+        command,
+        reason,
+        working_directory,
+    })
 }
 
 fn parse_command_request(value: &str) -> Option<CommandRequest> {
@@ -4818,12 +4965,18 @@ fn parse_command_request(value: &str) -> Option<CommandRequest> {
     };
     let mut command = String::new();
     let mut reason = String::new();
+    let mut working_directory: Option<String> = None;
     for raw_line in envelope.lines() {
         let line = raw_line.trim();
         if let Some(value) = line.strip_prefix("COMMAND:") {
             command = value.trim().to_string();
         } else if let Some(value) = line.strip_prefix("REASON:") {
             reason = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("WORKING_DIRECTORY:") {
+            let value = value.trim();
+            if !value.is_empty() {
+                working_directory = Some(value.to_string());
+            }
         } else if line.trim() == "END_COMMAND" {
             break;
         }
@@ -4834,7 +4987,11 @@ fn parse_command_request(value: &str) -> Option<CommandRequest> {
     if reason.is_empty() {
         reason = "Assistant requested a local command".to_string();
     }
-    Some(CommandRequest { command, reason })
+    Some(CommandRequest {
+        command,
+        reason,
+        working_directory,
+    })
 }
 
 fn command_proposal_response(proposal: &CommandProposal) -> String {
@@ -5656,6 +5813,7 @@ mod mode_tool_list_tests {
             on_token: &mut on_token,
             on_progress: &mut on_progress,
             cancel: &cancel,
+            steering: None,
         };
         engine
             .chat_orchestrator
@@ -5973,6 +6131,163 @@ mod system_prompt_tests {
     }
 }
 
+/// Spec 57 §5.0: the handoff instruction. It reaches the model only when the
+/// user turned workers on, and never in a worker's own session.
+#[cfg(test)]
+mod worker_handoff_tests {
+    use super::*;
+    use crate::mode::SessionMode;
+    use crate::model::MockModelAdapter;
+    use crate::session::WorkerRecord;
+    use crate::workspace_engine::WorkspaceEngine;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const ALL_MODES: [SessionMode; 4] = [
+        SessionMode::Ask,
+        SessionMode::Plan,
+        SessionMode::Code,
+        SessionMode::Review,
+    ];
+
+    #[test]
+    fn the_handoff_paragraph_is_appended_when_offered() {
+        // Verbatim from proposal §5.0, re-typed here so an edit to the
+        // constant has to be an edit to the spec too.
+        let from_the_spec = "When work should continue in a separate session — because it is a self-contained task, or one of several that can run in parallel — write each task as a prompt in its own fenced block tagged `worker-prompt`. The user can start a worker from that block. A worker starts with a fresh context in its own git worktree and sees only the repository and that prompt, so say what to read, what to change, which checks to run, and when to stop. Do not use the `worker-prompt` tag for anything else.";
+        assert_eq!(WORKER_HANDOFF_PARAGRAPH, from_the_spec);
+
+        for mode in ALL_MODES {
+            assert_eq!(
+                system_prompt_for_session(mode, true),
+                format!("{}\n\n{from_the_spec}", system_prompt(mode)),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_mode_changes_when_handoffs_are_not_offered() {
+        for mode in ALL_MODES {
+            assert_eq!(
+                system_prompt_for_session(mode, false),
+                system_prompt(mode),
+                "{mode:?}"
+            );
+        }
+    }
+
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_repo(name: &str) -> PathBuf {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should work")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "damaian-worker-handoff-{name}-{now}-{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("README.md"), "# Worker handoff test\n").unwrap();
+        dir
+    }
+
+    fn engine_with_workers_on(repo: &Path) -> WorkspaceEngine {
+        WorkspaceEngine::new(Config {
+            data_dir: repo.join(".damaian"),
+            enable_index_watcher: false,
+            enable_worker_sessions: true,
+            ..Config::default()
+        })
+    }
+
+    fn system_message(adapter: &MockModelAdapter) -> &str {
+        &adapter.requests[0].messages[0].content
+    }
+
+    /// Runs one turn in a new session and returns the session id.
+    fn first_turn(engine: &WorkspaceEngine, repo: &Path, adapter: &mut MockModelAdapter) -> String {
+        let mut on_token = |_token: &str| {};
+        engine
+            .chat_orchestrator
+            .ask(repo, "Plan the work.", &[], adapter, &mut on_token)
+            .unwrap()
+            .session
+            .id
+    }
+
+    #[test]
+    fn a_non_worker_session_gets_the_paragraph_when_enabled() {
+        let repo = temp_repo("enabled");
+        let engine = engine_with_workers_on(&repo);
+
+        let mut adapter = MockModelAdapter::new("Here is the split.");
+        first_turn(&engine, &repo, &mut adapter);
+
+        assert!(
+            system_message(&adapter).ends_with(WORKER_HANDOFF_PARAGRAPH),
+            "{}",
+            system_message(&adapter)
+        );
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn a_worker_session_never_gets_the_paragraph() {
+        let repo = temp_repo("worker");
+        let engine = engine_with_workers_on(&repo);
+        let mut warm = MockModelAdapter::new("Ready.");
+        let session_id = first_turn(&engine, &repo, &mut warm);
+        engine
+            .session_store
+            .record_worker_spawned(
+                &session_id,
+                &WorkerRecord {
+                    parent_session_id: None,
+                    source_repository: repo.clone(),
+                    worktree_path: repo.join(".damaian/worktrees/worker"),
+                    branch: "damaian/worker".to_string(),
+                    base_commit: "0123456".to_string(),
+                    included_uncommitted: false,
+                    git_commands: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let mut adapter = MockModelAdapter::new("Working.");
+        let mut on_token = |_token: &str| {};
+        let cancel = CancelToken::new();
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        engine
+            .chat_orchestrator
+            .ask_with_session(
+                &repo,
+                "Do the task.",
+                &[],
+                Some(&session_id),
+                &mut adapter,
+                &mut sink,
+            )
+            .unwrap();
+
+        assert!(
+            !system_message(&adapter).contains("worker-prompt"),
+            "a worker must not be invited to hand off: {}",
+            system_message(&adapter)
+        );
+        assert_eq!(system_message(&adapter), system_prompt(SessionMode::Code));
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+}
+
 /// Layer 3 of spec 20's working modes (`docs/specs/20_working_modes`): the
 /// orchestrator refuses at every action path, independent of what Layers 1
 /// and 2 offered the model. One test per refusal point in `context.md` §8's
@@ -6224,6 +6539,7 @@ mod mode_refusal_tests {
             on_token: &mut on_token,
             on_progress: &mut on_progress,
             cancel: &cancel,
+            steering: None,
         };
         let result = engine
             .chat_orchestrator
@@ -6291,6 +6607,7 @@ mod mode_refusal_tests {
             on_token: &mut on_token,
             on_progress: &mut on_progress,
             cancel: &cancel,
+            steering: None,
         };
         let mut after = MockModelAdapter::new("Understood.");
         engine
@@ -6384,6 +6701,7 @@ done
             on_token: &mut on_token,
             on_progress: &mut on_progress,
             cancel: &cancel,
+            steering: None,
         };
         engine
             .chat_orchestrator
@@ -6403,6 +6721,7 @@ done
             on_token: &mut on_token,
             on_progress: &mut on_progress,
             cancel: &cancel,
+            steering: None,
         };
         engine
             .chat_orchestrator

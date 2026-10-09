@@ -35,6 +35,7 @@ pub mod repository_map;
 pub mod repository_trust;
 pub mod secret_scanner;
 pub mod session;
+pub mod steering;
 pub mod tree_walk;
 pub mod validation;
 pub mod vector_index;
@@ -132,11 +133,13 @@ pub use secret_scanner::{Redaction, SecretFinding, SecretScanner};
 pub use session::{
     ActionMarker, ChatMessage, DanglingAction, ExportFormat, PendingApprovalRef, SearchOptions,
     Session, SessionSearchHit, SessionSearchResult, SessionStore, Task, TaskStatus, TaskUsage,
+    WorkerRecord,
 };
+pub use steering::TurnSteering;
 pub use tree_walk::{WalkEvent, WalkFile, WalkSkip};
 pub use validation::{
     CommandProposal, CommandRunRecord, CommandStore, ValidationOrchestrator,
-    command_approval_prompt,
+    command_approval_prompt, resolve_command_directory,
 };
 pub use web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebConsoleEntry, WebDiagnosticArtifact, WebDiagnosticCall,

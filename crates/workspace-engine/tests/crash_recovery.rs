@@ -9,7 +9,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use workspace_engine::{AuditLog, SecretScanner, SessionStore, Task, TaskStatus, classify_session};
+use workspace_engine::{
+    AuditLog, SecretScanner, SessionStore, Task, TaskStatus, WorkerRecord, classify_session,
+};
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -93,6 +95,50 @@ fn a_dangling_side_effecting_action_classifies_as_unknown_external_outcome() {
         !recovered[0].auto_resume_permitted,
         "requirement 5: an unknown outcome is never repeated automatically"
     );
+}
+
+/// Spec 57 correction C5. A worker's repository is a worktree and its host
+/// process is gone, so the shell must not pick its turn up on its own, even a
+/// turn that would be resumable anywhere else. The user restarts the worker.
+#[test]
+fn a_worker_session_is_never_auto_resumed() {
+    for status in [
+        TaskStatus::Paused,
+        TaskStatus::PreparingContext,
+        TaskStatus::RunningTool,
+    ] {
+        let fixture = fixture("worker");
+        fixture
+            .store
+            .record_worker_spawned(
+                &fixture.session_id,
+                &WorkerRecord {
+                    parent_session_id: None,
+                    source_repository: PathBuf::from("/code/app"),
+                    worktree_path: PathBuf::from("/code/app/.damaian/worktrees/w"),
+                    branch: "damaian/w".to_string(),
+                    base_commit: "0123456".to_string(),
+                    included_uncommitted: false,
+                    git_commands: Vec::new(),
+                },
+            )
+            .unwrap();
+        task_left_in(&fixture, status.clone(), None);
+
+        let recovered =
+            classify_session(&fixture.store, &fixture.audit, &fixture.session_id).unwrap();
+
+        assert_eq!(recovered.len(), 1, "{status:?}");
+        assert_eq!(
+            recovered[0].classification,
+            TaskStatus::Interrupted,
+            "{status:?}"
+        );
+        assert!(
+            !recovered[0].auto_resume_permitted,
+            "{status:?}: a worker's turn must not resume in the shell"
+        );
+    }
 }
 
 /// §5.4 rule 2, first half.
@@ -854,9 +900,15 @@ fn expected(status: &TaskStatus, shape: CrashShape) -> Expected {
         // §5.1: a crash in these states leaves nothing half-done, so read-only
         // work resumes on its own. A billed-but-unanswered model call counts as
         // resumable — the cost of a second call, not an unrepeatable effect.
+        //
+        // `Paused` (spec 57 §5.4) holds between rounds, so nothing is in flight.
+        // Only a worker pauses, and a worker session is never auto-resumed —
+        // `a_worker_session_is_never_auto_resumed` covers that; this matrix's
+        // session is an ordinary one.
         TaskStatus::Created
         | TaskStatus::PreparingContext
         | TaskStatus::WaitingForModel
+        | TaskStatus::Paused
         | TaskStatus::Interrupted => {
             if in_a_side_effecting_action {
                 unknown_outcome()
@@ -931,10 +983,11 @@ fn every_state_and_crash_shape_recovers_the_way_the_matrix_says() {
             cells += 1;
         }
     }
-    // Fourteen states by three crash shapes. If this number moves, a state or
+    // Fifteen states by three crash shapes. If this number moves, a state or
     // a shape was added or removed — check the matrix is still complete before
-    // updating it. It moved from 39 when spec 21 added `TokenBudgetExhausted`.
-    assert_eq!(cells, 42, "the matrix must not shrink");
+    // updating it. It moved from 39 when spec 21 added `TokenBudgetExhausted`,
+    // and from 42 when spec 57 added `Paused`.
+    assert_eq!(cells, 45, "the matrix must not shrink");
 }
 
 /// The row `TaskStatus::all()` cannot reach: a status written by a *later*

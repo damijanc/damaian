@@ -1,6 +1,8 @@
 # Feature Spec: Subagent Model
 
-Status: Not started
+Status: Not started, and deferred on 2026-10-09. Stage 2 is superseded by
+[#57](57_worker_sessions/proposal.md); stage 1 is re-evaluated once #57 has
+shipped. See [Deferral](#deferral-2026-10-09).
 Order: 38 of 40
 Plan: `docs/PLAN/06_phase_6_advanced_autonomy.md`, Phase 6, Work
 Package 1 (Must). That directory is local-only and not committed, so the
@@ -22,6 +24,61 @@ subagent inherits and cannot widen),
 [`39_coordination_and_conflict_handling.md`](39_coordination_and_conflict_handling.md),
 [`40_autonomy_evaluations.md`](40_autonomy_evaluations.md). See also
 [`SECURITY.md`](../../SECURITY.md), `AGENTS.md`.
+
+## Deferral (2026-10-09)
+
+This spec was evaluated against [#57](57_worker_sessions/proposal.md) before
+being split into a folder, and deferred instead. The design below is left as
+written. It is still the design if the spec is picked up again, but it is not
+next.
+
+**What #57 already covers.** #57 workers are ordinary sessions the user starts,
+each in its own git worktree and its own process, watchable, pausable and
+stoppable, with nothing outliving the application.
+
+- **Stage 2 (§5.4) is superseded.** A worktree per worker isolates parallel
+  editing more cleanly than §5.5's declared file ownership. It is the
+  mechanism requirement 5 lists first, and it now exists without Phase 2 WP4.
+- Stage 2 is the part of this spec that most of
+  [#39](39_coordination_and_conflict_handling.md) exists to make safe. If
+  stage 1 is built, #39 shrinks to what read-only children need: linked
+  cancellation and a failed child not failing its siblings.
+
+**What #38 would still add.** Four things #57 deliberately does not do:
+
+- delegation *by the model* within one turn;
+- a result returned into the parent's context, which keeps the parent's
+  context clean;
+- capability narrowed below the parent's by construction (§5.3);
+- one trace across parent and children.
+
+**Why not now:**
+
+1. **It cannot start anyway.** The external-write readiness gate (§1) needs
+   [#35](35_commit_preparation.md)–[#37](37_pull_request_creation.md), none of
+   which is built.
+2. **The cost premise is unproven, and the nearest measurement points the other
+   way.** [#47](47_agent_working_capability/proposal.md)'s live A/B found that
+   fewer, wider rounds cost +106% tokens. Every child here carries its own
+   assembled context, so [#40](40_autonomy_evaluations.md)'s cost ratio is
+   likely above 1.
+3. **Stage 1 has an open design question.** The Code review and
+   Test/validation kinds run commands and so can hit an approval. An approval
+   today ends the turn and resumes from a snapshot
+   ([#17](17_durable_task_state_and_crash_recovery/proposal.md)). This spec
+   does not say what happens to running siblings when one child stops for
+   approval. #57 avoids the question by giving each worker its own process.
+4. **Most of what is left arrives through #57's follow-ups.** #57 §7.3's opt-in
+   result summary returns a finished worker's report to its parent. #57 §7.2's
+   `propose_worker` tool lets the model propose a handoff. A read-only worker
+   is a mode choice. What remains unique to this spec is the model delegating
+   without a click, and the user has deliberately kept that click.
+
+**Re-evaluate when** #57 has shipped, together with its result-summary
+follow-up. At that point, ask whether a read-only worker plus a result summary
+already gives what Research and Exploration subagents would. If it does, record
+Phase 6 WP1 as abandoned, as §1 allows. If not, answer point 3 first, then
+re-scope this spec to stage 1 only before splitting it into a folder.
 
 ## 1. Precondition: the readiness gates
 

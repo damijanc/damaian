@@ -291,6 +291,10 @@ pub struct Config {
     /// embedding model on first use (a one-time network fetch), which the
     /// user should opt into rather than have happen implicitly.
     pub enable_semantic_search: bool,
+    /// Off by default (spec 57 §5.0). On, every session that is not itself a
+    /// worker is told how to write a `worker-prompt` handoff block. Off, the
+    /// system prompt is byte-for-byte what it was before the setting existed.
+    pub enable_worker_sessions: bool,
     /// On by default: the filesystem watcher in `index_cache.rs` is what keeps
     /// a cached index fresh between the periodic full rescans.
     ///
@@ -836,6 +840,7 @@ impl Config {
             checkpoint_max_total_bytes,
             checkpoint_census_max_paths,
             enable_semantic_search,
+            enable_worker_sessions,
             agent_max_tool_rounds,
             agent_web_debug_max_tool_rounds,
             agent_tool_retry_limit,
@@ -908,6 +913,18 @@ impl Config {
         if let Some(value) = scoped(audit_enabled, "audit_enabled", trusted, forbidden, rejected) {
             self.audit_enabled = value;
             outcome.record(scope, "audit_enabled", None, false);
+        }
+        // Adds text to every session's system prompt, which a repository must
+        // not be able to do (spec 57 §5.8).
+        if let Some(value) = scoped(
+            enable_worker_sessions,
+            "enable_worker_sessions",
+            trusted,
+            forbidden,
+            rejected,
+        ) {
+            self.enable_worker_sessions = value;
+            outcome.record(scope, "enable_worker_sessions", None, false);
         }
         if let Some(value) = scoped(shell, "shell", trusted, forbidden, rejected) {
             self.shell = value;
@@ -1999,6 +2016,11 @@ impl Config {
         );
         push_line(
             &mut output,
+            "enable_worker_sessions",
+            &self.enable_worker_sessions.to_string(),
+        );
+        push_line(
+            &mut output,
             "agent_max_tool_rounds",
             &self.agent_max_tool_rounds.to_string(),
         );
@@ -2106,6 +2128,7 @@ impl Default for Config {
             checkpoint_max_total_bytes: 1_073_741_824,
             checkpoint_census_max_paths: 1_000,
             enable_semantic_search: false,
+            enable_worker_sessions: false,
             enable_index_watcher: true,
             agent_max_tool_rounds: 8,
             agent_web_debug_max_tool_rounds: 12,
@@ -2167,6 +2190,7 @@ pub struct ConfigOverlay {
     pub checkpoint_max_total_bytes: Option<u64>,
     pub checkpoint_census_max_paths: Option<u64>,
     pub enable_semantic_search: Option<bool>,
+    pub enable_worker_sessions: Option<bool>,
     pub agent_max_tool_rounds: Option<u32>,
     pub agent_web_debug_max_tool_rounds: Option<u32>,
     pub agent_tool_retry_limit: Option<u32>,
@@ -2291,6 +2315,8 @@ classify_overlay_fields! {
     checkpoint_max_total_bytes => Capability,
     checkpoint_census_max_paths => Capability,
     enable_semantic_search => Preference,
+    // Adds text to the user's system prompt; a clone must not (spec 57 §5.8).
+    enable_worker_sessions => Capability,
     agent_max_tool_rounds => Preference,
     agent_web_debug_max_tool_rounds => Preference,
     agent_tool_retry_limit => Preference,
@@ -2477,6 +2503,7 @@ impl ConfigOverlay {
                 self.checkpoint_census_max_paths = Some(parse_u64(key, value)?)
             }
             "enable_semantic_search" => self.enable_semantic_search = Some(parse_bool(key, value)?),
+            "enable_worker_sessions" => self.enable_worker_sessions = Some(parse_bool(key, value)?),
             "agent_max_tool_rounds" => {
                 self.agent_max_tool_rounds = Some(parse_round_count(key, value)?)
             }
@@ -2692,6 +2719,7 @@ impl ConfigOverlay {
             checkpoint_max_total_bytes,
             checkpoint_census_max_paths,
             enable_semantic_search,
+            enable_worker_sessions,
             agent_max_tool_rounds,
             agent_web_debug_max_tool_rounds,
             agent_tool_retry_limit,
@@ -2831,6 +2859,9 @@ impl ConfigOverlay {
         }
         if let Some(value) = enable_semantic_search {
             push_line(&mut output, "enable_semantic_search", &value.to_string());
+        }
+        if let Some(value) = enable_worker_sessions {
+            push_line(&mut output, "enable_worker_sessions", &value.to_string());
         }
         if let Some(value) = agent_max_tool_rounds {
             push_line(&mut output, "agent_max_tool_rounds", &value.to_string());
@@ -3767,4 +3798,25 @@ fn parse_model_api_key_reference(value: &str) -> Result<String> {
 
 fn is_keychain_reference(value: &str) -> bool {
     value.trim_start().starts_with("keychain:")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spec 57 requirement 1: the user has to turn workers on, and the user
+    /// config is the one place that can.
+    #[test]
+    fn worker_sessions_are_off_by_default() {
+        assert!(!Config::default().enable_worker_sessions);
+
+        let mut config = Config::default();
+        config.apply_overlay(ConfigOverlay::parse("enable_worker_sessions=true\n").unwrap());
+        assert!(config.enable_worker_sessions);
+        assert!(
+            config
+                .to_policy_text()
+                .contains("enable_worker_sessions=true")
+        );
+    }
 }

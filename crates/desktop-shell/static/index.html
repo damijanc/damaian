@@ -398,6 +398,23 @@
               placeholder="model_provider=openai&#10;model_name=gpt-4.1&#10;model_reasoning_level=default&#10;model_api_key_env=keychain:model-api-key&#10;model_provider.acme.label=Acme AI&#10;model_provider.acme.base_url=https://api.acme.test&#10;model_provider.acme.api_key_env=keychain:acme-ai-key&#10;model_provider.acme.models=acme-large|acme-fast"
             ></textarea>
           </section>
+          <section class="settings-section" id="repository-roots-section">
+            <div class="section-heading">
+              <h3>Repository roots</h3>
+              <div class="inline-actions">
+                <button id="roots-add-btn" class="btn-quiet" type="button">Add a root</button>
+              </div>
+            </div>
+            <p class="settings-page-hint">
+              A root is a project inside this repository. Damaian runs a command from the root
+              that owns it. Add, remove and undo write to <code>.damaian/config.conf</code> in
+              the repository — that file is in your working tree, so Git shows it.
+            </p>
+            <p id="repository-roots-status" class="settings-page-hint"></p>
+            <div id="repository-roots-list" class="repository-roots-list"></div>
+            <div id="repository-root-detail" class="repository-root-detail" hidden></div>
+            <div id="repository-roots-excluded" class="repository-roots-excluded" hidden></div>
+          </section>
           <section class="settings-section">
             <h3>Effective policy</h3>
             <label class="field">

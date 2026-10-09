@@ -596,7 +596,9 @@ impl Rendering<'_> {
     fn text(&self) -> String {
         let mut output = String::from(
             "Project roots. Paths are repository-relative and `.` is the repository root. \
-             A root's commands belong to its directory.\n",
+             A root's commands run in that root's directory: pass `working_directory` to \
+             `run_command` (or `WORKING_DIRECTORY:` in a command envelope) to run a \
+             command there.\n",
         );
         for (position, root) in self.roots.iter().enumerate() {
             if !self.shown[position] {

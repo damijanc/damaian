@@ -293,6 +293,7 @@ fn drive(
             on_token: &mut on_resume_token,
             on_progress: &mut on_progress,
             cancel: &cancel,
+            steering: None,
         };
         resumed = Some(engine.chat_orchestrator.resume_after_command_decision(
             &proposal.id,

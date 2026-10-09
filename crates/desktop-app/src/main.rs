@@ -81,7 +81,9 @@ fn main() {
 
             let options = shell_options.clone();
             let (ready_tx, ready_rx) = mpsc::channel();
-            thread::spawn(move || {
+            // The shell serves requests on this thread, so it gets the main
+            // thread's stack rather than a spawned thread's 2 MiB default.
+            let spawned = desktop_shell::spawn_with_shell_stack("damaian-shell", move || {
                 let startup_tx = ready_tx.clone();
                 if let Err(error) = run_server_with_ready(options, move |port| {
                     let _ = startup_tx.send(Ok(port));
@@ -90,6 +92,11 @@ fn main() {
                     eprintln!("Damaian shell server stopped: {error}");
                 }
             });
+            if let Err(error) = spawned {
+                // The closure, and `ready_tx` with it, is dropped, so
+                // `ready_rx` below reports the shell never became ready.
+                eprintln!("Damaian could not start its shell thread: {error}");
+            }
 
             match ready_rx.recv_timeout(Duration::from_secs(2)) {
                 Ok(Ok(port)) => {

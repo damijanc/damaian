@@ -29,6 +29,75 @@ Damaian remembers the project list and the last selected working folder in local
 
 Use the Visual Studio Code icon in the conversation header to open the selected working folder in Visual Studio Code. Damaian keeps AI orchestration, context assembly, patch preview, settings, and audit logging in the app; normal code navigation and IDE work happen outside Damaian in Visual Studio Code.
 
+## Repository Roots
+
+A repository can hold several projects: a Cargo workspace and its member crates, or `packages/api` (Node) beside `packages/web`. Damaian calls each one a *root*. Each root has its own languages, manifests, entry points, test directories, `AGENTS.md` files and commands. A root's commands run in that root's directory, so `npm test` found in `packages/api` runs in `packages/api`, where its `package.json` is.
+
+### How roots are found
+
+A directory is a root when it contains one of the manifests Damaian already knows how to run: `package.json`, `pyproject.toml`, `pytest.ini`, `pom.xml`, `build.gradle`, `go.mod` or `Cargo.toml`. The working folder itself is always a root, even with no manifest, so every repository has at least one. Nested roots are all kept: a Cargo workspace root is right for `cargo test --workspace`, and each member is right for its own `cargo test`.
+
+Some directories are never roots:
+
+- anything `.gitignore`d or matched by `ignore_patterns`, because Damaian never indexes it;
+- `node_modules`, `vendor`, `target`, `dist`, `build`, `.venv` and `venv`, wherever they appear, even if you have removed them from `ignore_patterns`;
+- anything more than six directories deep. Damaian records a manifest found there rather than ignoring it silently (see [Troubleshooting](TROUBLESHOOTING.md#repository-roots-and-the-repository-map)).
+
+When a directory holds more than one manifest, the root names the first in the list above as its evidence. A repository root with both `package.json` and `Cargo.toml` therefore reads "because `package.json` exists".
+
+A root's commands come from its manifest: `npm run <name>` for each of the scripts `test`, `lint`, `typecheck`, `build` and `format` in `package.json` (plus `npm test` when there is a `test` script), and one fixed command for each other manifest, such as `cargo test` for `Cargo.toml`. Only those exact script names count: a script called `lint:web` or `check` is not offered.
+
+### Seeing and correcting roots
+
+`Settings` › `General` has a **Repository roots** section for the selected working folder. Each row shows the root's path (`.` is the working folder itself), its languages, how many commands it has, and whether it was `detected`, `added by you` or `removed by you`. Select a row to see why it is a root ("Treated as a root because `packages/api/package.json` exists."), its instruction files, and each command with the directory it runs in.
+
+- `Add a root` makes a directory a root although it has no manifest. It must be a directory inside the repository that holds at least one indexed file, and not under a vendor directory or a `restricted_patterns` match.
+- `Remove root` stops treating a detected directory as a project. Its files then belong to the nearest enclosing root, and it proposes no commands. It stays in the list, marked `removed by you`, so the decision is visible.
+- `Undo` clears your override for that directory.
+
+The working folder itself cannot be removed.
+
+Add, remove and undo write `project_roots_added` and `project_roots_removed` to `.damaian/config.conf` **inside the repository**. That file is in your working tree, so `git status` shows it, and you can commit it to share the correction or leave it uncommitted. Damaian asks before it writes. If that file already has a line Damaian cannot parse, the write is refused with the error, so a hand-edited file is never rewritten. You can also edit the two keys by hand, as `|`-separated lists:
+
+```text
+project_roots_added=tools/scripts
+project_roots_removed=examples/legacy|examples/old
+```
+
+An entry Damaian cannot apply (a path that does not exist, a file, `..`, the working folder in `project_roots_removed`, a path in both lists) is not applied, and the section lists it under "Overrides Damaian did not apply". Overrides survive every rescan.
+
+The same keys are accepted in your user config (`config/user.conf`). There they apply to every repository you open. Nothing in Damaian writes them there.
+
+From the CLI, `damaian repo-root <repo> add|remove|clear <path>` makes the same edit, and `damaian repo-map <repo>` prints the roots.
+
+### Where a command runs
+
+A command the assistant asks for runs in the working folder unless it asks for a directory inside the repository, normally one of the roots on the map. When it does, the approval card reads **Runs in `packages/api`**. No line means the command runs in the working folder itself. A root changes only the directory. It never changes whether a command needs your approval, and never lets a command reach a path outside the repository: `cat ../web/src/index.ts` from `packages/api` is still inside the repository, and a directory outside it, behind a symlink, or under `restricted_patterns` is refused before anything is proposed.
+
+Error locations a command prints (`src/x.ts:3:5`) are matched to files relative to the directory it ran in first, then its parent directories up to the working folder. So findings from a command in `packages/api` point at `packages/api/src/x.ts`, and `cargo` output from a member crate, which prints workspace-relative paths, still resolves.
+
+Elsewhere the UI names the root when a file is not in the working folder's own root: a pinned file chip reads `index.ts · packages/api`, and each file in a patch preview is tagged with its root. A turn that touches two packages shows both.
+
+### `Allow Always` in a root
+
+`Allow Always` on a command that runs in a root other than the working folder records the grant for that root only. For `npm test` in `packages/api`, your config gets:
+
+```text
+command_allowlist.<repository_id>=cd packages/api && npm test
+```
+
+That entry lets `npm test` run unprompted in `packages/api` and nowhere else. `npm test` in `packages/web` may do something quite different, so it still asks. The entry cannot be matched by typing it as a command, because a command containing `&&` is never allowlisted.
+
+The reverse also holds. A plain `command_allowlist` entry, whether from `Allow Always` at the working folder or one you wrote yourself at user or admin scope, applies **only at the repository root**. Your machine-wide `command_allowlist=npm test` does not let `npm test` run unprompted in `packages/api`. That case did not exist before roots, because every command ran at the repository root, so nothing that ran unprompted before now asks.
+
+### The map the assistant sees
+
+Each request includes a compact *repository map*: every root with its languages and commands and, when there is room, its manifests, entry points, test directories, major directories and instruction files. The map tells the assistant where things are without searching. It sits after `AGENTS.md` instructions and before retrieved files, so under a tight context budget it can displace retrieved files but never instructions. It is secret-scanned like every other context item.
+
+The map is limited by `repository_map_max_tokens`, 800 by default. When a repository's map is larger, Damaian drops detail in a fixed order: entry points and test directories (largest root first), then major directories, then generated and vendor paths, which become a count, and finally whole roots. Whenever anything is left out, the map ends with a line saying what, such as "3 of 7 roots shown". Set the key to `0` to leave the map out of requests entirely. The roots, the `Settings` section and the CLI work either way.
+
+A repository's `.damaian/config.conf` can lower `repository_map_max_tokens` or set it to `0`, but cannot raise it above yours, because the map is repository content sent to the model on every request.
+
 ## Terminal
 
 Use the terminal icon in the conversation header to show or hide the bottom terminal panel. The terminal opens in the selected working folder. If no folder is selected yet, it opens in your home directory.
@@ -504,8 +573,8 @@ Because that file arrives with a clone, a repository can only make Damaian *more
 - `restricted_patterns`, `ignore_patterns`, and `command_blocklist` are added to yours rather than replacing them.
 - The `require_approval_for_*` flags can be turned on by a repository, not off. MCP and individual MCP servers can be turned off, not on.
 - `command_allowlist` is never taken from repository config; `Allow Always` writes to your own config instead. See [Chat](#chat).
-- Budgets and preferences — `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, and the `agent_*` round limits — apply as written.
-- The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — can be lowered by a repository but never raised. They bound how much of your repository a single tool call puts into a model request, so raising one would widen what leaves your machine. A repository that tries is told to you like any other rejected key.
+- Budgets and preferences — `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, the `agent_*` round limits, and the root overrides `project_roots_added` and `project_roots_removed` ([Repository Roots](#repository-roots)) — apply as written.
+- The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — and the repository map's `repository_map_max_tokens` (800) can be lowered by a repository but never raised. They bound how much of your repository a single tool call, or the map, puts into a model request, so raising one would widen what leaves your machine. A repository that tries is told to you like any other rejected key.
 
 ## Model Providers and API Keys
 

@@ -26,6 +26,21 @@ pub struct Session {
     pub origin: String,
 }
 
+/// What makes a session a worker (spec 57 §5.1 step 7): where it came from,
+/// where it runs, and the exact git commands that made its worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerRecord {
+    /// `None` for a worker started from the sidebar rather than from a block.
+    pub parent_session_id: Option<String>,
+    pub source_repository: PathBuf,
+    pub worktree_path: PathBuf,
+    pub branch: String,
+    pub base_commit: String,
+    pub included_uncommitted: bool,
+    pub git_commands: Vec<String>,
+}
+
 /// What a task is doing, precisely enough that a crash in it is classifiable.
 ///
 /// The old `Running` covered context preparation, the model call, tool
@@ -43,6 +58,10 @@ pub enum TaskStatus {
     WaitingForModel,
     RunningTool,
     WaitingForApproval,
+    /// Held at a round boundary by a worker's pause (spec 57 §5.4). Nothing
+    /// is in flight: the previous round finished and the next has not
+    /// started, so a crash here is as resumable as `PreparingContext`.
+    Paused,
     ApplyingPatch,
     Validating,
     Complete,
@@ -71,6 +90,7 @@ impl TaskStatus {
             Self::WaitingForModel,
             Self::RunningTool,
             Self::WaitingForApproval,
+            Self::Paused,
             Self::ApplyingPatch,
             Self::Validating,
             Self::Complete,
@@ -90,6 +110,7 @@ impl TaskStatus {
             Self::WaitingForModel => "waiting_for_model",
             Self::RunningTool => "running_tool",
             Self::WaitingForApproval => "waiting_for_approval",
+            Self::Paused => "paused",
             Self::ApplyingPatch => "applying_patch",
             Self::Validating => "validating",
             Self::Complete => "complete",
@@ -747,6 +768,102 @@ impl SessionStore {
             }
         }
         mode
+    }
+
+    /// Appends `worker_spawned` to the worker's own log: what makes a session a
+    /// worker, and the only place its worktree path is kept (spec 57 §5.1 step
+    /// 7). Sessions are keyed by repository id, so the worktree cannot be
+    /// recovered from the session itself.
+    pub fn record_worker_spawned(
+        &self,
+        worker_session_id: &str,
+        record: &WorkerRecord,
+    ) -> Result<()> {
+        let mut payload = serde_json::to_value(record)
+            .map_err(|error| crate::error::ClientError::InvalidInput(error.to_string()))?;
+        payload["sessionId"] = serde_json::Value::from(worker_session_id);
+        self.append_session_event(worker_session_id, "worker_spawned", &payload.to_string())
+    }
+
+    /// Appends `worker_spawned` to the parent's log, carrying only the worker's
+    /// session id. `workerSessionId` is what tells it apart from the worker's
+    /// own record, which has the same event type.
+    pub fn record_worker_child(
+        &self,
+        parent_session_id: &str,
+        worker_session_id: &str,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "sessionId": parent_session_id,
+            "workerSessionId": worker_session_id,
+        });
+        self.append_session_event(parent_session_id, "worker_spawned", &payload.to_string())
+    }
+
+    /// The session's own worker record, or `None` for an ordinary session.
+    ///
+    /// Reads with `parsed_events`, not `active_events`, for the reason
+    /// [`Self::session_mode`] does: being a worker is what the session is, not
+    /// conversation content, and a rewind must not turn a worker back into a
+    /// session that is offered handoffs.
+    pub fn worker_record(&self, session_id: &str) -> Result<Option<WorkerRecord>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(None);
+        };
+        Ok(parsed_events(&content)
+            .0
+            .iter()
+            .filter(|event| event.event_type == "worker_spawned")
+            .filter(|event| event.payload.get("workerSessionId").is_none())
+            .filter_map(|event| serde_json::from_value(event.payload.clone()).ok())
+            .next_back())
+    }
+
+    /// The workers started from this session, oldest first.
+    pub fn worker_children(&self, parent_session_id: &str) -> Result<Vec<String>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(parent_session_id)) else {
+            return Ok(Vec::new());
+        };
+        let mut children: Vec<String> = Vec::new();
+        for event in parsed_events(&content).0 {
+            if event.event_type != "worker_spawned" {
+                continue;
+            }
+            if let Some(child) = event.text("workerSessionId")
+                && !children.contains(&child)
+            {
+                children.push(child);
+            }
+        }
+        Ok(children)
+    }
+
+    /// Every worker session whose record names `source_repository`, across all
+    /// repository ids: each worktree is its own repository id, so the source
+    /// is the only thing a project's workers share. Compared as given, so
+    /// callers pass the same canonical form they recorded.
+    pub fn worker_sessions_for_source(&self, source_repository: &Path) -> Result<Vec<Session>> {
+        let mut workers = Vec::new();
+        for session in self.list_sessions(None)? {
+            if self
+                .worker_record(&session.id)?
+                .is_some_and(|record| record.source_repository == source_repository)
+            {
+                workers.push(session);
+            }
+        }
+        Ok(workers)
+    }
+
+    /// Marks an ordinary user message as a steering note (spec 57 §5.4). A
+    /// marker event rather than a field on `ChatMessage`: adding an origin
+    /// field would change every message's serialized form for one flag.
+    pub fn record_steering_note(&self, session_id: &str, message_id: &str) -> Result<()> {
+        let payload = serde_json::json!({
+            "sessionId": session_id,
+            "messageId": message_id,
+        });
+        self.append_session_event(session_id, "steering_note_added", &payload.to_string())
     }
 
     /// Sets [`TaskStatus::WaitingForApproval`] and records which stored
@@ -2818,5 +2935,113 @@ mod tests {
             .expect("finding_status_changed");
         assert_eq!(changed["payload"]["findingId"], recorded.id());
         assert_eq!(changed["payload"]["status"], "dismissed");
+    }
+
+    fn worker_record(parent: Option<&str>, source: &str, worktree: &str) -> WorkerRecord {
+        WorkerRecord {
+            parent_session_id: parent.map(str::to_string),
+            source_repository: PathBuf::from(source),
+            worktree_path: PathBuf::from(worktree),
+            branch: "damaian/split-the-parser".to_string(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            included_uncommitted: true,
+            git_commands: vec![
+                "git stash create".to_string(),
+                format!("git worktree add -b damaian/split-the-parser {worktree} 0123456"),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_worker_record_round_trips() {
+        let store = SessionStore::new(temp_data_dir("worker-round-trip"));
+        let worker = store
+            .create_session("repo_worktree", "Split the parser")
+            .unwrap();
+        let record = worker_record(
+            Some("ses_parent"),
+            "/code/app",
+            "/code/app/.damaian/worktrees/split-the-parser",
+        );
+
+        store.record_worker_spawned(&worker.id, &record).unwrap();
+
+        assert_eq!(store.worker_record(&worker.id).unwrap(), Some(record));
+        // A rewind discards conversation, not what the session is.
+        store.rewind_conversation(&worker.id, 0).unwrap();
+        assert!(store.worker_record(&worker.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_session_without_a_worker_record_has_none() {
+        let store = SessionStore::new(temp_data_dir("worker-none"));
+        let parent = store.create_session("repo_1", "Planner").unwrap();
+        // A parent's `worker_spawned` names a child; it does not make the
+        // parent a worker.
+        store.record_worker_child(&parent.id, "ses_child").unwrap();
+
+        assert_eq!(store.worker_record(&parent.id).unwrap(), None);
+        assert_eq!(store.worker_record("ses_missing").unwrap(), None);
+    }
+
+    #[test]
+    fn a_parent_lists_its_worker_children() {
+        let store = SessionStore::new(temp_data_dir("worker-children"));
+        let parent = store.create_session("repo_1", "Planner").unwrap();
+        let other = store.create_session("repo_1", "Unrelated").unwrap();
+
+        store.record_worker_child(&parent.id, "ses_first").unwrap();
+        store.record_worker_child(&parent.id, "ses_second").unwrap();
+
+        assert_eq!(
+            store.worker_children(&parent.id).unwrap(),
+            vec!["ses_first".to_string(), "ses_second".to_string()]
+        );
+        assert!(store.worker_children(&other.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn worker_sessions_are_found_by_source_repository_across_repository_ids() {
+        let store = SessionStore::new(temp_data_dir("worker-by-source"));
+        let first = store.create_session("repo_worktree_a", "First").unwrap();
+        let second = store.create_session("repo_worktree_b", "Second").unwrap();
+        let elsewhere = store
+            .create_session("repo_worktree_c", "Elsewhere")
+            .unwrap();
+        let ordinary = store.create_session("repo_source", "Planner").unwrap();
+        store
+            .record_worker_spawned(
+                &first.id,
+                &worker_record(
+                    Some(&ordinary.id),
+                    "/code/app",
+                    "/code/app/.damaian/worktrees/a",
+                ),
+            )
+            .unwrap();
+        store
+            .record_worker_spawned(
+                &second.id,
+                &worker_record(None, "/code/app", "/code/app/.damaian/worktrees/b"),
+            )
+            .unwrap();
+        store
+            .record_worker_spawned(
+                &elsewhere.id,
+                &worker_record(None, "/code/other", "/code/other/.damaian/worktrees/c"),
+            )
+            .unwrap();
+
+        let mut found: Vec<String> = store
+            .worker_sessions_for_source(Path::new("/code/app"))
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        found.sort();
+        let mut expected = vec![first.id, second.id];
+        expected.sort();
+
+        assert_eq!(found, expected);
     }
 }
