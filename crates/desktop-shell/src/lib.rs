@@ -47,6 +47,32 @@ pub fn run_server(options: ShellOptions) -> Result<(), String> {
     run_server_with_ready(options, |_| {})
 }
 
+/// The stack a request or a turn gets, matching the main thread's 8 MiB.
+///
+/// The standalone shell serves requests on its main thread, but the desktop
+/// app serves them on a spawned thread and every turn runs on one, and a
+/// spawned thread defaults to 2 MiB. `handle_connection`'s debug-build frame
+/// alone reached that: `/api/render-markdown` overflowed it, and one more
+/// `Config` field took the findings routes over too.
+pub const SHELL_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Spawns a thread with [`SHELL_THREAD_STACK_BYTES`]. Use it for anything that
+/// runs `handle_connection` or a turn, so a host never gets less stack than the
+/// standalone shell's main thread.
+pub fn spawn_with_shell_stack<F, T>(
+    name: &str,
+    work: F,
+) -> std::io::Result<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(SHELL_THREAD_STACK_BYTES)
+        .spawn(work)
+}
+
 /// Resolves the effective data directory and brings its schema marker up to
 /// this build's version, or refuses. Called before the shell serves anything,
 /// so a directory this build cannot read produces a startup error instead of an
@@ -1421,12 +1447,15 @@ fn run_resume_command_request(
         let _ = events.send(TurnEvent::Token(token.to_string()));
     };
     let mut on_progress = |progress: TurnProgress| {
-        let _ = events.send(turn_progress_event(progress));
+        if let Some(event) = turn_progress_event(progress) {
+            let _ = events.send(event);
+        }
     };
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
+        steering: None,
     };
     engine
         .chat_orchestrator
@@ -1478,12 +1507,15 @@ fn run_resume_plan_request(
         let _ = events.send(TurnEvent::Token(token.to_string()));
     };
     let mut on_progress = |progress: TurnProgress| {
-        let _ = events.send(turn_progress_event(progress));
+        if let Some(event) = turn_progress_event(progress) {
+            let _ = events.send(event);
+        }
     };
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
+        steering: None,
     };
     engine
         .chat_orchestrator
@@ -1522,12 +1554,15 @@ fn parse_plan_revision(raw: &str) -> Result<Vec<PlanRevisionStep>, String> {
 
 /// A send failure only means the relay has gone, and the cancel token is what
 /// stops the turn in that case, so the result is deliberately discarded.
-fn turn_progress_event(progress: TurnProgress) -> TurnEvent {
+/// `None` for progress the shell never causes: it passes no steering, so a
+/// turn it hosts never pauses or takes a note (spec 57 §5.4).
+fn turn_progress_event(progress: TurnProgress) -> Option<TurnEvent> {
     match progress {
-        TurnProgress::Session(session_id) => TurnEvent::Session(session_id),
-        TurnProgress::Phase(phase) => TurnEvent::Phase(phase),
-        TurnProgress::Plan(plan) => TurnEvent::Plan(Box::new(plan)),
-        TurnProgress::WebDiagnostic(record) => TurnEvent::WebDiagnostic(record),
+        TurnProgress::Session(session_id) => Some(TurnEvent::Session(session_id)),
+        TurnProgress::Phase(phase) => Some(TurnEvent::Phase(phase)),
+        TurnProgress::Plan(plan) => Some(TurnEvent::Plan(Box::new(plan))),
+        TurnProgress::WebDiagnostic(record) => Some(TurnEvent::WebDiagnostic(record)),
+        TurnProgress::Paused | TurnProgress::Resumed | TurnProgress::NoteAdded { .. } => None,
     }
 }
 
@@ -1566,12 +1601,15 @@ fn run_chat_request(
         let _ = events.send(TurnEvent::Token(token.to_string()));
     };
     let mut on_progress = |progress: TurnProgress| {
-        let _ = events.send(turn_progress_event(progress));
+        if let Some(event) = turn_progress_event(progress) {
+            let _ = events.send(event);
+        }
     };
     let mut sink = TurnSink {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel,
+        steering: None,
     };
     let turn_options = ChatTurnOptions {
         continue_debugging: form.get("continue_debugging").map(String::as_str) == Some("true"),
@@ -1621,6 +1659,7 @@ fn resume_chat_command(
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &never_cancelled,
+        steering: None,
     };
     engine
         .chat_orchestrator
@@ -3266,7 +3305,7 @@ where
     let (sender, receiver) = std::sync::mpsc::channel();
     let cancel = CancelToken::new();
     let worker_cancel = cancel.clone();
-    let worker = std::thread::spawn(move || {
+    let worker = spawn_with_shell_stack("damaian-turn", move || {
         let event = match turn(&worker_cancel, &sender) {
             Ok(result) => TurnEvent::Done(Box::new(result)),
             Err(error) => TurnEvent::Failed(error),
@@ -3274,7 +3313,8 @@ where
         let _ = sender.send(event);
         // `sender` drops here, which is what disconnects the channel and lets
         // the relay finish even if the terminal event could not be delivered.
-    });
+    })
+    .map_err(|error| format!("start the turn thread: {error}"))?;
 
     let outcome = relay_turn_events(stream, &cancel, receiver, KEEPALIVE_INTERVAL);
     // Joined unconditionally: the worker owns the curl child, and leaving it
@@ -3860,11 +3900,11 @@ mod tests {
         json_optional_string, keychain, mcp_browser_arguments, parse_form, parse_path_list,
         percent_decode, plan_json, plan_proposal_json, relay_turn_events, remember_model_api_key,
         render_markdown_with_optional_file_links, repository_config_review_json, require_api_token,
-        run_server, run_terminal_command, save_config_file, sweep_orphaned_processes,
-        task_states_json, task_usage_json, terminal_cwd_for_repo, turn_progress_event,
-        validate_context_files, validate_working_folder, validate_workspace_path,
-        verify_data_dir_schema_at, web_diagnostic_json, web_diagnostic_reveal_target,
-        write_basic_response, write_sse_event,
+        run_server, run_terminal_command, save_config_file, spawn_with_shell_stack,
+        sweep_orphaned_processes, task_states_json, task_usage_json, terminal_cwd_for_repo,
+        turn_progress_event, validate_context_files, validate_working_folder,
+        validate_workspace_path, verify_data_dir_schema_at, web_diagnostic_json,
+        web_diagnostic_reveal_target, write_basic_response, write_sse_event,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -4394,12 +4434,13 @@ mod tests {
         let token = options.api_token.clone();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let port = listener.local_addr().expect("local addr").port();
-        std::thread::spawn(move || {
+        spawn_with_shell_stack("test-shell", move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 let _ = handle_connection(&mut stream, &options);
             }
-        });
+        })
+        .expect("spawn the test shell");
 
         let repo = std::env::temp_dir();
         let body = format!("repo={}", repo.to_string_lossy());
@@ -4491,12 +4532,13 @@ mod tests {
         let token = options.api_token.clone();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let port = listener.local_addr().expect("local addr").port();
-        std::thread::spawn(move || {
+        spawn_with_shell_stack("test-shell", move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 let _ = handle_connection(&mut stream, &options);
             }
-        });
+        })
+        .expect("spawn the test shell");
 
         let post = |body: String| {
             let request = format!(
@@ -4604,12 +4646,13 @@ mod tests {
         let token = options.api_token.clone();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let port = listener.local_addr().expect("local addr").port();
-        std::thread::spawn(move || {
+        spawn_with_shell_stack("test-shell", move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 let _ = handle_connection(&mut stream, &options);
             }
-        });
+        })
+        .expect("spawn the test shell");
 
         let send = |request: String| {
             let mut stream =
@@ -5289,12 +5332,13 @@ mod tests {
         let token = options.api_token.clone();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let port = listener.local_addr().expect("local addr").port();
-        std::thread::spawn(move || {
+        spawn_with_shell_stack("test-shell", move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 let _ = handle_connection(&mut stream, &options);
             }
-        });
+        })
+        .expect("spawn the test shell");
 
         let body = "content=%23%20Title%0A%0A%60%60%60rust%0Afn%20main()%20%7B%7D%0A%60%60%60";
         let request = format!(
@@ -5324,7 +5368,7 @@ mod tests {
         let token = options.api_token.clone();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let port = listener.local_addr().expect("local addr").port();
-        std::thread::spawn(move || {
+        spawn_with_shell_stack("test-shell", move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 if let Err(error) = handle_connection(&mut stream, &options) {
@@ -5336,7 +5380,8 @@ mod tests {
                     );
                 }
             }
-        });
+        })
+        .expect("spawn the test shell");
         (port, token)
     }
 
@@ -5741,6 +5786,7 @@ mod tests {
             on_token: &mut on_token,
             on_progress: &mut on_progress,
             cancel: &cancel,
+            steering: None,
         };
         engine
             .chat_orchestrator
@@ -6864,12 +6910,53 @@ mod tests {
         assert!(!json.contains("webDiagnostics"), "{json}");
     }
 
+    /// Recurses until 4 MiB of stack is in use, measured from the addresses
+    /// of the first and deepest frames' locals rather than assumed from a
+    /// frame size, which debug builds inflate. 4 MiB is twice a default
+    /// spawned thread's stack and half the shell's; on a 2 MiB thread this
+    /// aborts the test process with a stack overflow.
+    fn use_stack_down_to(top: usize) -> usize {
+        let marker = std::hint::black_box([0u8; 1024]);
+        let here = marker.as_ptr() as usize;
+        // The stack grows down on every target this app builds for.
+        if top - here >= 4 * 1024 * 1024 {
+            return top - here;
+        }
+        use_stack_down_to(top).max(marker[0] as usize)
+    }
+
+    #[test]
+    fn the_shell_stack_holds_what_a_default_thread_cannot() {
+        let handle = spawn_with_shell_stack("stack-test", || {
+            let top = std::hint::black_box([0u8; 1]);
+            use_stack_down_to(top.as_ptr() as usize)
+        })
+        .unwrap();
+        let used = handle.join().expect("8 MiB holds 4 MiB of frames");
+        assert!(used >= 4 * 1024 * 1024);
+    }
+
+    /// The shell passes no steering, so these never happen in a turn it hosts;
+    /// were one to arrive, it must not become an SSE event the UI does not know.
+    #[test]
+    fn steering_progress_streams_nothing() {
+        for progress in [
+            TurnProgress::Paused,
+            TurnProgress::Resumed,
+            TurnProgress::NoteAdded {
+                message_id: "msg_1".to_string(),
+            },
+        ] {
+            assert!(turn_progress_event(progress).is_none());
+        }
+    }
+
     #[test]
     fn a_web_diagnostic_progress_event_streams_as_web_diagnostic() {
         let record = sample_web_diagnostic_record("task_1");
 
         let event = turn_progress_event(TurnProgress::WebDiagnostic(Box::new(record.clone())));
-        let TurnEvent::WebDiagnostic(streamed) = event else {
+        let Some(TurnEvent::WebDiagnostic(streamed)) = event else {
             panic!("expected TurnEvent::WebDiagnostic");
         };
         let mut out = Vec::new();

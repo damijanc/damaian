@@ -10,7 +10,7 @@
 | Task | State | Notes |
 |---|---|---|
 | 1 · Setting, worker record, handoff instruction | Done 2026-10-07 | `enable_worker_sessions` (default off) is Forbidden at repository scope and a `Capability` key in #31's partition. Beyond the planned touchpoints it needed `profile.rs::split_profile_keys`, a `weakening_cases` row, and a human name in `effective_policy.rs` (`every_rule_has_a_human_name` caught that one). `WorkerRecord` plus `record_worker_spawned`, `record_worker_child`, `worker_record`, `worker_children` and `worker_sessions_for_source` on `SessionStore`. Both `worker_spawned` events share one type; the parent's carries `workerSessionId`, which is how `worker_record` tells them apart. `worker_record` reads with `parsed_events`, so a rewind cannot turn a worker back into a session that is offered handoffs. `record_steering_note` is deferred to Task 2, which writes and tests the event. `system_prompt_for_session` and `WORKER_HANDOFF_PARAGRAPH` are in `chat.rs`, and `ask_with_session` calls it. Tests: 15 filtered tests, `repository_config_trust` (48) and `permission_profiles` all pass; fmt, clippy (`workspace-engine`) and typos are clean. **Order deviation:** a second agent started this task in the same worktree and was stopped. It had already written the config implementation, so Step 2 (fail first) was not observed. Step 6 stood in for it. Each change below was made separately and reverted, and each test it names failed: paragraph in `system_prompt` → the byte-identical test; dropping `is_none()` → `a_worker_session_never_gets_the_paragraph`; repository value applied → `repository_config_cannot_enable_worker_sessions`; by-source lookup ignoring the source → its test; default `true` → `worker_sessions_are_off_by_default`. The first breakage showed that the worker test compared only against `system_prompt(Code)`. It now also asserts that the prompt has no `worker-prompt`. |
-| 2 · `TurnSteering` and `TaskStatus::Paused` | Not started | |
+| 2 · `TurnSteering` and `TaskStatus::Paused` | Done 2026-10-09 | `steering.rs` (`TurnSteering`, 100 ms re-check), `TaskStatus::Paused` (not terminal, no side effect in flight; joins the resumable row of the crash-recovery matrix, now 45 cells), `SessionStore::record_steering_note` (deferred here from Task 1), `TurnSink.steering`, and `TurnProgress::{Paused, Resumed, NoteAdded}`. The boundary step sits at the top of the round `loop`. The pause hold runs **before** the cancel check, so a stop while paused takes the existing cancel path; the notes are drained after it. Resume restores the status the turn paused from. C5: `classify_session` withholds auto-resume for any session with a worker record. C4: 37 literals got `steering: None` (36 plus Task 1's handoff test). `turn_progress_event` now returns `Option` and drops the three new variants. **Discoveries:** (1) User prompts reach the model unredacted, which C3 did not expect. Notes are redacted anyway (stricter), and the log keeps them as written. (2) There is no composer length limit; Task 5's socket must bound note length. (3) `app.js` labels no in-flight status, so `paused` had nothing to join. (4) The `session_rewind.rs` status lists filter by property and needed no edit. **Scope addition, agreed 2026-10-08:** 7 `desktop-shell` route tests overflowed the 2 MiB stack of a spawned thread. `render_markdown_endpoint…` already overflowed before Task 1; Task 1's extra `Config` field pushed six findings-route tests over. Production had the same exposure: every turn ran on a default `thread::spawn`, and so did the desktop app's server thread. Added `desktop_shell::spawn_with_shell_stack` (8 MiB, matching the main thread) and used it for the turn worker in `stream_turn`, the `desktop-app` server thread, and the five test servers, so the tests run with the production stack. Added the test `the_shell_stack_holds_what_a_default_thread_cannot`. **Falsified:** pause moved after the model call → `pause_takes_effect_only_at_a_round_boundary` fails. That test first passed against this break; it now also asserts that round 1's tool phase precedes `Paused`. Drain dropped → both note tests fail. Stack set to 2 MiB → all 8 stack-dependent tests abort. **Checks:** `workspace-engine` 961/961; `desktop-shell` + `eval-harness` 158/158 on three consecutive runs. `a_deterministic_run_reports_the_token_figures_the_session_recorded` failed once, then passed four times: a flake, not investigated. fmt, clippy (`workspace-engine`, `desktop-shell`, `eval-harness`, `desktop-app`) and typos are clean. `app.js` is unchanged. |
 | 3 · The progress file | Not started | |
 | 4 · Worktree creation and removal | Not started | |
 | 5 · Worker process: handover, lifeline, control socket | Not started | |
@@ -129,7 +129,7 @@ Each one names the task that owns it.
 | `crates/workspace-engine/src/recovery.rs` | No auto-resume for worker sessions |
 | `crates/desktop-shell/src/worker.rs` | **New.** `--worker` host: handover, lifeline, socket, turn driver |
 | `crates/desktop-shell/src/workers.rs` | **New.** Supervisor: spawn, socket client, stop escalation, listing, shutdown-all |
-| `crates/desktop-shell/src/lib.rs` | Routes; session-delete hook; `turn_progress_event` arms |
+| `crates/desktop-shell/src/lib.rs` | Routes; session-delete hook; `turn_progress_event` arms; `spawn_with_shell_stack` (Task 2: request and turn threads get 8 MiB). A new worker or supervisor thread that runs a turn or `handle_connection` must use it |
 | `crates/desktop-shell/src/main.rs`, `crates/desktop-app/src/main.rs` | `--worker` branch; `RunEvent::Exit` |
 | `crates/desktop-shell/static/{app.js,style.css,index.html}` | Toggle, *Start worker*, dialog, sidebar, board, control strip |
 | `AGENTS.md` | Task-prompt template fence `text` → `worker-prompt` |
@@ -305,7 +305,7 @@ C4, C5. **Files:** `steering.rs` (new), `chat.rs`, `session.rs`,
 `recovery.rs`, every `TurnSink` literal,
 `desktop-shell/src/lib.rs::turn_progress_event`.
 
-- [ ] **Step 1: Write the failing tests** in `crates/workspace-engine/tests/steering.rs` (new).
+- [x] **Step 1: Write the failing tests** in `crates/workspace-engine/tests/steering.rs` (new).
       Drive a `MockModelAdapter` script of three rounds. Pause, resume and
       queue from a second thread, and gate the timing on a `TurnProgress::Phase`
       callback, not on sleeps.
@@ -322,30 +322,30 @@ C4, C5. **Files:** `steering.rs` (new), `chat.rs`, `session.rs`,
   - `a_turn_without_steering_is_unchanged`. With `steering: None`, the request
     sequence is identical to a run before this task.
   - In `steering.rs` unit tests: `wait_while_paused_returns_on_cancel_without_wake`.
-- [ ] **Step 2: Run to verify they fail**
-- [ ] **Step 3: Add `TaskStatus::Paused`.** The compiler names `as_str` and
+- [x] **Step 2: Run to verify they fail**
+- [x] **Step 3: Add `TaskStatus::Paused`.** The compiler names `as_str` and
       `tests/crash_recovery.rs:836`. Also update `all()` and the string lists
       in `tests/session_rewind.rs:435-495`. It is neither terminal nor
       side-effect-in-flight. Grep `app.js` for status strings and give
       `paused` a label wherever the others have one.
-- [ ] **Step 4: Recovery (C5).** Add
+- [x] **Step 4: Recovery (C5).** Add
       `a_worker_session_is_never_auto_resumed` to `tests/crash_recovery.rs`. A
       `Paused` or `RunningTool` task in a session with a worker record is
       classified `Interrupted` and is not auto-resumed. Implement it in
       `recovery.rs`.
-- [ ] **Step 5: Add `steering: None` to all 36 `TurnSink` literals** (C4). Do
+- [x] **Step 5: Add `steering: None` to all 36 `TurnSink` literals** (C4). Do
       this in its own step, so the diff for the behaviour change stays
       readable.
-- [ ] **Step 6: Implement** `TurnSteering` and the boundary step at
+- [x] **Step 6: Implement** `TurnSteering` and the boundary step at
       `chat.rs:1690`, in proposal §5.4's order: cancelled → paused-wait →
       drain notes → running. Add the `TurnProgress` variants. In
       `desktop-shell`'s `turn_progress_event`, map them to no SSE event: the
       shell never steers.
-- [ ] **Step 7: Falsify.** Move the pause check after the model call and
+- [x] **Step 7: Falsify.** Move the pause check after the model call and
       confirm the boundary test fails. Drop the drain and confirm the note test
       fails.
-- [ ] **Step 8: Update the proposal** for C3 (notes) and C5.
-- [ ] **Step 9: Scoped checks.** Run `cargo nextest run -p workspace-engine`
+- [x] **Step 8: Update the proposal** for C3 (notes) and C5.
+- [x] **Step 9: Scoped checks.** Run `cargo nextest run -p workspace-engine`
       (whole crate, because the literal sweep touches every test file),
       `cargo nextest run -p desktop-shell -p eval-harness`, then fmt, clippy on
       all three crates, and `node --check` if `app.js` changed. Then show and

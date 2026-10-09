@@ -28,6 +28,7 @@ use crate::path_policy::PathPolicy;
 use crate::plan::TaskPlan;
 use crate::secret_scanner::SecretScanner;
 use crate::session::{ChatMessage, Session, SessionStore, Task, TaskStatus, TaskUsage};
+use crate::steering::TurnSteering;
 use crate::validation::{
     CommandProposal, CommandStore, ValidationOrchestrator, command_approval_prompt,
 };
@@ -195,6 +196,15 @@ pub enum TurnProgress {
     /// Boxed because a record carries a whole report, several times larger
     /// than every other variant.
     WebDiagnostic(Box<WebDiagnosticRecord>),
+    /// The turn is holding at a round boundary because its steering asked it
+    /// to (spec 57 §5.4). Only a host that passed `steering` ever sees this.
+    Paused,
+    /// The paused turn continues, in the same task.
+    Resumed,
+    /// A steering note entered the conversation as this user message.
+    NoteAdded {
+        message_id: String,
+    },
 }
 
 /// The per-turn side channel: where answer tokens go, where progress goes, and
@@ -208,6 +218,10 @@ pub struct TurnSink<'a> {
     pub on_token: &'a mut dyn FnMut(&str),
     pub on_progress: &'a mut dyn FnMut(TurnProgress),
     pub cancel: &'a CancelToken,
+    /// Pause and steering notes, applied at round boundaries. `None` for every
+    /// host but a worker, and then the turn is exactly what it was before
+    /// spec 57 (§5.4).
+    pub steering: Option<&'a TurnSteering>,
 }
 
 impl TurnSink<'_> {
@@ -227,6 +241,10 @@ impl TurnSink<'_> {
 
     fn web_diagnostic(&mut self, record: WebDiagnosticRecord) {
         (self.on_progress)(TurnProgress::WebDiagnostic(Box::new(record)));
+    }
+
+    fn progress(&mut self, event: TurnProgress) {
+        (self.on_progress)(event);
     }
 }
 
@@ -634,6 +652,7 @@ impl ChatOrchestrator {
             on_token,
             on_progress: &mut discard_progress,
             cancel: &never_cancelled,
+            steering: None,
         };
         self.ask_with_session(
             repository_root,
@@ -1687,6 +1706,26 @@ impl ChatOrchestrator {
         // cap so a provider that reports no usage cannot loop forever.
         let mut round_budget_extension: u32 = 0;
         let (final_run, response, proposals, stop_reason) = loop {
+            // Spec 57 §5.4, in its order: a pause holds here, before the
+            // cancel check, so a stop that arrives while paused ends the turn
+            // through the same path as any other stop.
+            if let Some(steering) = sink.steering
+                && steering.is_paused()
+                && !sink.cancel.is_cancelled()
+            {
+                let running = task.status.clone();
+                task = self
+                    .session_store
+                    .update_task_status(&task, TaskStatus::Paused, None)?;
+                sink.progress(TurnProgress::Paused);
+                if steering.wait_while_paused(sink.cancel) {
+                    task = self
+                        .session_store
+                        .update_task_status(&task, running, None)?;
+                    sink.progress(TurnProgress::Resumed);
+                }
+            }
+
             // Checked before each round rather than only mid-stream: stopping
             // here is what saves a whole model call, and it is the only point
             // that catches a stop arriving during context assembly or a tool.
@@ -1716,6 +1755,27 @@ impl ChatOrchestrator {
                     &partial_response,
                     cancelled_run,
                 );
+            }
+
+            // Notes join the conversation as ordinary user messages, before
+            // the request they should reach. The log keeps the user's text as
+            // written, like every user message; what goes to the model is
+            // redacted (spec 57 correction C3).
+            if let Some(steering) = sink.steering {
+                for note in steering.drain_notes() {
+                    let message = self.session_store.append_message(
+                        &session.id,
+                        Some(&task.id),
+                        "user",
+                        &note,
+                    )?;
+                    self.session_store
+                        .record_steering_note(&session.id, &message.id)?;
+                    messages.push(ModelMessage::user(self.scanner.redact(&note).text));
+                    sink.progress(TurnProgress::NoteAdded {
+                        message_id: message.id,
+                    });
+                }
             }
 
             // Before the request is built, not after the response arrives.
@@ -5305,6 +5365,7 @@ mod mode_tool_list_tests {
             on_token: &mut on_token,
             on_progress: &mut on_progress,
             cancel: &cancel,
+            steering: None,
         };
         engine
             .chat_orchestrator
@@ -5754,6 +5815,7 @@ mod worker_handoff_tests {
             on_token: &mut on_token,
             on_progress: &mut on_progress,
             cancel: &cancel,
+            steering: None,
         };
         engine
             .chat_orchestrator
@@ -6029,6 +6091,7 @@ mod mode_refusal_tests {
             on_token: &mut on_token,
             on_progress: &mut on_progress,
             cancel: &cancel,
+            steering: None,
         };
         let result = engine
             .chat_orchestrator
@@ -6096,6 +6159,7 @@ mod mode_refusal_tests {
             on_token: &mut on_token,
             on_progress: &mut on_progress,
             cancel: &cancel,
+            steering: None,
         };
         let mut after = MockModelAdapter::new("Understood.");
         engine
@@ -6189,6 +6253,7 @@ done
             on_token: &mut on_token,
             on_progress: &mut on_progress,
             cancel: &cancel,
+            steering: None,
         };
         engine
             .chat_orchestrator
@@ -6208,6 +6273,7 @@ done
             on_token: &mut on_token,
             on_progress: &mut on_progress,
             cancel: &cancel,
+            steering: None,
         };
         engine
             .chat_orchestrator

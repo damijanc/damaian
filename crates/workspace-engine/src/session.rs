@@ -58,6 +58,10 @@ pub enum TaskStatus {
     WaitingForModel,
     RunningTool,
     WaitingForApproval,
+    /// Held at a round boundary by a worker's pause (spec 57 §5.4). Nothing
+    /// is in flight: the previous round finished and the next has not
+    /// started, so a crash here is as resumable as `PreparingContext`.
+    Paused,
     ApplyingPatch,
     Validating,
     Complete,
@@ -86,6 +90,7 @@ impl TaskStatus {
             Self::WaitingForModel,
             Self::RunningTool,
             Self::WaitingForApproval,
+            Self::Paused,
             Self::ApplyingPatch,
             Self::Validating,
             Self::Complete,
@@ -105,6 +110,7 @@ impl TaskStatus {
             Self::WaitingForModel => "waiting_for_model",
             Self::RunningTool => "running_tool",
             Self::WaitingForApproval => "waiting_for_approval",
+            Self::Paused => "paused",
             Self::ApplyingPatch => "applying_patch",
             Self::Validating => "validating",
             Self::Complete => "complete",
@@ -847,6 +853,17 @@ impl SessionStore {
             }
         }
         Ok(workers)
+    }
+
+    /// Marks an ordinary user message as a steering note (spec 57 §5.4). A
+    /// marker event rather than a field on `ChatMessage`: adding an origin
+    /// field would change every message's serialized form for one flag.
+    pub fn record_steering_note(&self, session_id: &str, message_id: &str) -> Result<()> {
+        let payload = serde_json::json!({
+            "sessionId": session_id,
+            "messageId": message_id,
+        });
+        self.append_session_event(session_id, "steering_note_added", &payload.to_string())
     }
 
     /// Sets [`TaskStatus::WaitingForApproval`] and records which stored

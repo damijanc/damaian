@@ -1610,6 +1610,7 @@ fn with_sink<T>(run: impl FnOnce(&mut TurnSink<'_>) -> T) -> T {
         on_token: &mut on_token,
         on_progress: &mut on_progress,
         cancel: &cancel,
+        steering: None,
     };
     run(&mut sink)
 }

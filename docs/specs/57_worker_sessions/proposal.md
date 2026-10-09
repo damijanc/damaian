@@ -1,6 +1,6 @@
 # Feature Spec: Worker Sessions
 
-Status: In progress (Task 1 of 11 done 2026-10-07; see [`tasks.md`](tasks.md))
+Status: In progress (Tasks 1–2 of 11 done, 2026-10-07 and 2026-10-09; see [`tasks.md`](tasks.md))
 Order: 57 of 57
 Plan: none. An exception to the graduation rule, like #41–#44 and #47: it came
 from describing how this repository is actually built — a planner session that
@@ -344,19 +344,30 @@ the shell, the eval harness, tests — passes `None`, so both hosts run identica
 turn code and only the worker ever pauses.
 
 At the existing round-boundary check, before the next model request
-([`chat.rs:1574`](../../../crates/workspace-engine/src/chat.rs)):
+(the top of the round `loop` in `run_agentic_turn`,
+[`chat.rs`](../../../crates/workspace-engine/src/chat.rs)):
 
 1. If cancelled, behave exactly as today.
 2. If paused: persist `TaskStatus::Paused` (new variant), emit a `status`
    progress event, and wait on the condition variable until resumed or
-   cancelled. Cancelled while paused ends the turn as `Cancelled`.
+   cancelled. Cancelled while paused ends the turn as `Cancelled`. As built,
+   the pause hold sits just before the cancel check rather than after it, so a
+   stop that arrives while paused leaves the wait and goes through the existing
+   cancel path unchanged. The progress events are `TurnProgress::Paused`,
+   `Resumed` and `NoteAdded { message_id }`.
 3. Drain the note queue. Each note is appended to the conversation and to the
    session log as an ordinary user message (`append_message`, role `user`),
    followed by a `steering_note_added` session event naming that message's id —
    `ChatMessage` has no origin field, and adding one would change every
    message's serialized form for one marker. The note is sent to the model with
-   the next request like any user message, through the same redaction and the
-   composer's length limit. Emit a `note` progress event.
+   the next request, passed through `SecretScanner::redact` first; the session
+   log keeps it as written, as it keeps every user message (correction C3 in
+   [`tasks.md`](tasks.md)). Planning assumed user messages are redacted on the
+   way to the model. The code says they are not: a user's prompt is sent as
+   typed. A note is redacted anyway, which is stricter than the prompt and
+   never weaker. There is no composer length limit to reuse; the worker's
+   socket (Task 5) is where a note's length is bounded. Emit a `note` progress
+   event.
 4. If the turn was paused, persist the running status again and continue.
 
 A pause requested during a model call or a tool takes effect at the following
@@ -366,7 +377,10 @@ apply there.
 
 `Paused` is a persisted, recoverable state. If the process dies while paused,
 #17 reports the task `Interrupted` and the queued notes are lost with it; notes
-already drained are in the session log.
+already drained are in the session log. Recovery never **auto-resumes** a task
+in a session that has a worker record, whatever its status (correction C5): its
+repository is a worktree and its host is gone, so the shell must not pick the
+turn up on its own. The user restarts the worker instead (§5.7).
 
 ### 5.5 The progress file
 

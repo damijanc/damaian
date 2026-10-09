@@ -72,6 +72,7 @@ pub fn classify_session(
     let dangling = store.dangling_actions(session_id)?;
 
     account_for_lost_model_calls(store, audit, session_id, &dangling)?;
+    let is_worker = store.worker_record(session_id)?.is_some();
 
     let mut recovered = Vec::new();
 
@@ -102,7 +103,7 @@ pub fn classify_session(
             _ => TaskStatus::Interrupted,
         };
 
-        // Requirement 6 permits auto-resume only for read-only work. Three
+        // Requirement 6 permits auto-resume only for read-only work. Five
         // conditions, each blocking on its own:
         //
         // 1. The classification must be `Interrupted` — an unknown outcome is
@@ -125,13 +126,17 @@ pub fn classify_session(
         //    recovery list across a second crash), a status that says the
         //    outcome is unknown would otherwise come back off disk and
         //    re-derive as resumable if its marker were out of reach.
+        // 5. A worker's task is never auto-resumed in the shell (spec 57
+        //    correction C5). Its repository is a worktree and its host process
+        //    is gone; the user restarts the worker instead.
         let status_allows = status
             .as_ref()
             .is_some_and(|status| !status.may_have_side_effect_in_flight());
         let auto_resume_permitted = classification == TaskStatus::Interrupted
             && status_allows
             && raw_status != "running"
-            && status != Some(TaskStatus::UnknownExternalOutcome);
+            && status != Some(TaskStatus::UnknownExternalOutcome)
+            && !is_worker;
 
         let task = RecoveredTask {
             task_id: task_id.clone(),

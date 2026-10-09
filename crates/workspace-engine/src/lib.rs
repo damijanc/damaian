@@ -35,6 +35,7 @@ pub mod repository_map;
 pub mod repository_trust;
 pub mod secret_scanner;
 pub mod session;
+pub mod steering;
 pub mod tree_walk;
 pub mod validation;
 pub mod vector_index;
@@ -134,6 +135,7 @@ pub use session::{
     Session, SessionSearchHit, SessionSearchResult, SessionStore, Task, TaskStatus, TaskUsage,
     WorkerRecord,
 };
+pub use steering::TurnSteering;
 pub use tree_walk::{WalkEvent, WalkFile, WalkSkip};
 pub use validation::{
     CommandProposal, CommandRunRecord, CommandStore, ValidationOrchestrator,
