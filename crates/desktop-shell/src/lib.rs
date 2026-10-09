@@ -178,6 +178,12 @@ impl ShellOptions {
     }
 }
 
+/// Each route's body lives in its own `handle_*` function, not inline in the
+/// match. A debug build gives every arm's locals their own stack slot, so one
+/// frame pays for all routes at once. With the bodies inline (each holding
+/// ~23 KB `WorkspaceEngine` copies) the frame reached 2.05 MiB and overflowed
+/// the 2 MiB stack of a spawned thread, which is where both the tests and the
+/// desktop app run this.
 fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(), String> {
     let request = read_request(stream)?;
     if request.method == "OPTIONS" && request.path.starts_with("/api/") {
@@ -239,56 +245,9 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
                 &format!("{{\"defaultRepo\":\"{}\"}}", escape_json(&repo)),
             )
         }
-        ("GET", "/api/web-diagnostic-artifact") => {
-            let repo = request.param("repo").unwrap_or_default();
-            let relative_path = request
-                .param("path")
-                .ok_or_else(|| "path is required".to_string())?;
-            let engine = engine_for_repo(&repo)?;
-            let path = web_diagnostic_artifact_path(&engine.config, &relative_path)?;
-            let bytes = fs::read(&path).map_err(|error| error.to_string())?;
-            write_binary_response(stream, &request, 200, content_type_for_path(&path), &bytes)
-        }
-        ("GET", "/api/config") => {
-            let repo = request.param("repo");
-            let config = Config::load_for_repository(repo.as_deref().map(Path::new))
-                .map_err(|error| error.to_string())?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"policy\":\"{}\"}}",
-                    escape_json(&config.to_policy_text())
-                ),
-            )
-        }
-        ("GET", "/api/config-file") => {
-            let scope = request.param("scope");
-            let repo = request.param("repo").unwrap_or_default();
-            let path = desktop_settings_config_path(scope.as_deref())?;
-            let content = if path.exists() {
-                fs::read_to_string(&path).map_err(|error| error.to_string())?
-            } else {
-                String::new()
-            };
-            let (effective_policy, effective_error) = effective_policy_for_repo(&repo);
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"path\":\"{}\",\"exists\":{},\"content\":\"{}\",\"effectivePolicy\":\"{}\",\"effectiveError\":\"{}\"}}",
-                    escape_json(&path.to_string_lossy()),
-                    path.exists(),
-                    escape_json(&content),
-                    escape_json(&effective_policy),
-                    escape_json(&effective_error)
-                ),
-            )
-        }
+        ("GET", "/api/web-diagnostic-artifact") => handle_web_diagnostic_artifact(stream, &request),
+        ("GET", "/api/config") => handle_config(stream, &request),
+        ("GET", "/api/config-file") => handle_get_config_file(stream, &request),
         ("GET", "/api/effective-policy") => handle_effective_policy(stream, &request),
         ("POST", "/api/permission-profile") => handle_permission_profile(stream, &request),
         ("GET", "/api/permission-profiles") => handle_permission_profiles(stream, &request),
@@ -298,412 +257,34 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/permission-profile-import") => {
             handle_permission_profile_import(stream, &request)
         }
-        ("GET", "/api/model-key-status") => {
-            let repo = request.param("repo").unwrap_or_default();
-            let model_provider = request.param("model_provider");
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &model_key_status_json(&repo, model_provider.as_deref())?,
-            )
-        }
-        ("GET", "/api/git-status") => {
-            let repo = required_param(&request, "repo")?;
-            let engine = engine_for_repo(&repo)?;
-            let status = engine
-                .git
-                .status(&repo)
-                .map_err(|error| error.to_string())?;
-            let files = status
-                .files
-                .iter()
-                .map(|file| {
-                    format!(
-                        "{{\"path\":\"{}\",\"raw\":\"{}\",\"untracked\":{},\"conflicted\":{}}}",
-                        escape_json(&file.path),
-                        escape_json(&file.raw),
-                        file.untracked,
-                        file.conflicted
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"clean\":{},\"exitCode\":{},\"files\":[{}]}}",
-                    status.clean, status.exit_code, files
-                ),
-            )
-        }
-        ("GET", "/api/terminal-cwd") => {
-            let repo = request.param("repo").unwrap_or_default();
-            let cwd = terminal_cwd_for_repo(&repo)?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!("{{\"cwd\":\"{}\"}}", escape_json(&cwd.to_string_lossy())),
-            )
-        }
-        ("POST", "/api/terminal-run") => {
-            let form = parse_form(&request.body);
-            let cwd = form.get("cwd").cloned().unwrap_or_default();
-            let command = required_form(&form, "command")?;
-            let result = run_terminal_command(&cwd, &command)?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"cwd\":\"{}\",\"exitCode\":{},\"stdout\":\"{}\",\"stderr\":\"{}\"}}",
-                    escape_json(&result.cwd.to_string_lossy()),
-                    result.exit_code,
-                    escape_json(&result.stdout),
-                    escape_json(&result.stderr)
-                ),
-            )
-        }
-        ("GET", "/api/sessions") => {
-            let repo = required_param(&request, "repo")?;
-            let engine = engine_for_repo(&repo)?;
-            let repository_id = engine
-                .indexer
-                .repository_id_for_path(&repo)
-                .map_err(|error| error.to_string())?;
-            let sessions = engine
-                .session_store
-                .list_sessions(Some(&repository_id))
-                .map_err(|error| error.to_string())?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!("{{\"sessions\":[{}]}}", sessions_json(&sessions)),
-            )
-        }
-        ("GET", "/api/session-search") => {
-            let query = required_param(&request, "query")?;
-            let whole_word = request.param("whole_word").as_deref() == Some("true");
-            let literal_phrase = request.param("literal").as_deref() != Some("false");
-            let max_results = request
-                .param("max")
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(50);
-            let (engine, repository_id) = if request.param("scope").as_deref() == Some("all") {
-                (default_engine()?, None)
-            } else {
-                let repo = required_param(&request, "repo")?;
-                let engine = engine_for_repo(&repo)?;
-                let repository_id = engine
-                    .indexer
-                    .repository_id_for_path(&repo)
-                    .map_err(|error| error.to_string())?;
-                (engine, Some(repository_id))
-            };
-            let result = engine
-                .session_store
-                .search_sessions(
-                    repository_id.as_deref(),
-                    &query,
-                    SearchOptions {
-                        whole_word,
-                        literal_phrase,
-                        max_results,
-                    },
-                    &engine.scanner,
-                )
-                .map_err(|error| error.to_string())?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &serde_json::to_string(&result).map_err(|error| error.to_string())?,
-            )
-        }
-        ("GET", "/api/session-export") => {
-            let session_id = required_param(&request, "session_id")?;
-            let format =
-                request
-                    .param("format")
-                    .as_deref()
-                    .map_or(ExportFormat::Markdown, |value| match value {
-                        "json" => ExportFormat::Json,
-                        _ => ExportFormat::Markdown,
-                    });
-            let engine = default_engine()?;
-            let content = engine
-                .session_store
-                .export_session(&session_id, format, &engine.scanner)
-                .map_err(|error| error.to_string())?;
-            let (content_type, extension) = match format {
-                ExportFormat::Markdown => ("text/markdown; charset=utf-8", "md"),
-                ExportFormat::Json => ("application/json", "json"),
-            };
-            // The browser's save dialog is the path the user chose: the export
-            // writes nowhere itself and makes no network request.
-            let filename = export_filename(&engine, &session_id, extension)?;
-            let disposition = format!("content-disposition: attachment; filename=\"{filename}\"");
-            write_response_with_extra_headers(
-                stream,
-                &request,
-                200,
-                content_type,
-                &content,
-                &disposition,
-            )
-        }
+        ("GET", "/api/model-key-status") => handle_model_key_status(stream, &request),
+        ("GET", "/api/git-status") => handle_git_status(stream, &request),
+        ("GET", "/api/terminal-cwd") => handle_terminal_cwd(stream, &request),
+        ("POST", "/api/terminal-run") => handle_terminal_run(stream, &request),
+        ("GET", "/api/sessions") => handle_sessions(stream, &request),
+        ("GET", "/api/session-search") => handle_session_search(stream, &request),
+        ("GET", "/api/session-export") => handle_session_export(stream, &request),
         // The launch sweep behind `docs/specs/45_crash_recovery_prompt.md`. It
         // runs once per process; every call after the first serves the same
         // snapshot, minus tasks the user has since dealt with.
-        ("GET", "/api/recovery") => {
-            let payload = recovery::sweep_json()?;
-            write_response(stream, &request, 200, "application/json", &payload)
-        }
+        ("GET", "/api/recovery") => handle_recovery(stream, &request),
         // Resume, mark failed, or abandon one recovered task. The decision is
         // re-classified server-side: see `recovery::decide`.
-        ("POST", "/api/recovery-decision") => {
-            let form = parse_form(&request.body);
-            let payload = recovery::decide(&form)?;
-            write_response(stream, &request, 200, "application/json", &payload)
-        }
+        ("POST", "/api/recovery-decision") => handle_recovery_decision(stream, &request),
         // Closes out a task whose reattached approval has been answered, so the
         // next launch does not offer to run the same command again.
         ("POST", "/api/recovery-approval-resolved") => {
-            let form = parse_form(&request.body);
-            let payload = recovery::resolve_reattached_approval(&form)?;
-            write_response(stream, &request, 200, "application/json", &payload)
+            handle_recovery_approval_resolved(stream, &request)
         }
-        ("GET", "/api/checkpoints") => {
-            let repo = required_param(&request, "repo")?;
-            let engine = engine_for_repo(&repo)?;
-            let repository_id = engine
-                .indexer
-                .repository_id_for_path(&repo)
-                .map_err(|error| error.to_string())?;
-            let mut checkpoints = engine
-                .checkpoint_store
-                .list_checkpoints(&repository_id)
-                .map_err(|error| error.to_string())?;
-            if let Some(session_id) = request.param("session_id") {
-                checkpoints.retain(|manifest| manifest.session_id == session_id);
-            }
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &checkpoint_list_json(&checkpoints),
-            )
-        }
+        ("GET", "/api/checkpoints") => handle_checkpoints(stream, &request),
         // Rewind. `files` and `conversation` are independent switches, and
         // `path` narrows the file half to one file, which is the fourth of the
         // restore operations rather than a fourth code path.
-        ("POST", "/api/rewind") => {
-            let form = parse_form(&request.body);
-            let repo = required_form(&form, "repo")?;
-            let checkpoint_id = required_form(&form, "checkpoint_id")?;
-            let files = form.get("files").map(String::as_str) != Some("false");
-            let conversation = form.get("conversation").map(String::as_str) == Some("true");
-            let only_path = form
-                .get("path")
-                .map(String::as_str)
-                .filter(|path| !path.is_empty());
-            if !files && !conversation {
-                return Err("Choose files, conversation, or both".to_string());
-            }
-            let engine = engine_for_repo(&repo)?;
-            let repository_id = engine
-                .indexer
-                .repository_id_for_path(&repo)
-                .map_err(|error| error.to_string())?;
-            let manifest = engine
-                .checkpoint_store
-                .read_checkpoint(&repository_id, &checkpoint_id)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("Unknown checkpoint: {checkpoint_id}"))?;
-            let result = engine
-                .checkpoint_store
-                .restore(
-                    &repo,
-                    &manifest,
-                    workspace_engine::CheckpointRestoreOptions {
-                        files,
-                        conversation,
-                        only_path,
-                    },
-                    "desktop_user",
-                )
-                .map_err(|error| error.to_string())?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &checkpoint_restore_json(&result),
-            )
-        }
-        ("GET", "/api/session") => {
-            let session_id = required_param(&request, "session_id")?;
-            let engine = default_engine()?;
-            let Some(session) = engine
-                .session_store
-                .read_session(&session_id)
-                .map_err(|error| error.to_string())?
-            else {
-                return Err(format!("Unknown session: {session_id}"));
-            };
-            let messages = engine
-                .session_store
-                .read_messages_with_seq(&session_id)
-                .map_err(|error| error.to_string())?;
-            // Message roles alone cannot say whether a turn was stopped, so the
-            // task statuses ride along and the UI joins them by `taskId`.
-            let task_statuses = engine
-                .session_store
-                .read_task_statuses(&session_id)
-                .map_err(|error| error.to_string())?;
-            // What each turn spent, joined by the same `taskId` (spec 19 §5.6).
-            let task_usage = engine
-                .session_store
-                .read_task_usage(&session_id)
-                .map_err(|error| error.to_string())?;
-            // The plan each turn worked through, joined by the same `taskId`
-            // (spec 21 §5.6). Without this the panel — and with it the
-            // completion report — would live only for the turn that produced
-            // it, so reopening a session would lose the record of what a plan
-            // came to, which is the part a user comes back for.
-            let task_plans = engine
-                .session_store
-                .read_session_plans(&session_id)
-                .map_err(|error| error.to_string())?;
-            // A named failure reason, joined by `taskId` (spec 48 §5.4), so a
-            // refused turn says *why* it failed rather than only that it did.
-            let task_failure_kinds = engine
-                .session_store
-                .read_task_failure_kinds(&session_id)
-                .map_err(|error| error.to_string())?;
-            // Each turn's browser diagnostics, joined by `taskId` (spec 12
-            // `context.md` §3.3). Already redacted when recorded. Without
-            // this the card would exist only for the turn that ran it, and a
-            // reload would fall back to bare thumbnails.
-            let task_web_diagnostics = engine
-                .session_store
-                .read_session_web_diagnostics(&session_id)
-                .map_err(|error| error.to_string())?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}]}}",
-                    session_json(&session, engine.session_store.session_mode(&session.id)),
-                    messages_json(&messages),
-                    task_states_json(
-                        &task_statuses,
-                        &task_usage,
-                        &task_plans,
-                        &task_failure_kinds,
-                        &task_web_diagnostics,
-                        &engine.config
-                    )
-                ),
-            )
-        }
-        ("POST", "/api/session-create") => {
-            let form = parse_form(&request.body);
-            let repo = required_form(&form, "repo")?;
-            let title = form
-                .get("title")
-                .filter(|value| !value.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| "New session".to_string());
-            let engine = engine_for_repo(&repo)?;
-            let repository_id = engine
-                .indexer
-                .repository_id_for_path(&repo)
-                .map_err(|error| error.to_string())?;
-            let session = engine
-                .session_store
-                .create_session(&repository_id, &title)
-                .map_err(|error| error.to_string())?;
-            let mode = engine.session_store.session_mode(&session.id);
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!("{{\"session\":{}}}", session_json(&session, mode)),
-            )
-        }
-        ("POST", "/api/session-rename") => {
-            let form = parse_form(&request.body);
-            let session_id = required_form(&form, "session_id")?;
-            let title = required_form(&form, "title")?;
-            let engine = default_engine()?;
-            let session = engine
-                .session_store
-                .rename_session(&session_id, &title)
-                .map_err(|error| error.to_string())?;
-            let mode = engine.session_store.session_mode(&session.id);
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!("{{\"session\":{}}}", session_json(&session, mode)),
-            )
-        }
-        ("POST", "/api/session-mode") => {
-            let form = parse_form(&request.body);
-            let session_id = required_form(&form, "session_id")?;
-            let requested = required_form(&form, "mode")?;
-            // Rejected, never defaulted: falling back to Code would turn a
-            // malformed request into the most permissive mode there is.
-            let mode = SessionMode::parse(&requested).ok_or_else(|| {
-                format!("Unknown mode: {requested}. Expected ask, plan, code, or review.")
-            })?;
-            let engine = default_engine()?;
-            if engine
-                .session_store
-                .read_session(&session_id)
-                .map_err(|error| error.to_string())?
-                .is_none()
-            {
-                return Err(format!("Unknown session: {session_id}"));
-            }
-            // Always "user": this endpoint is the user's own selection, and
-            // nothing the model emits reaches it (spec 20 requirement 4).
-            engine
-                .session_store
-                .set_session_mode(&session_id, mode, "user")
-                .map_err(|error| error.to_string())?;
-            let Some(session) = engine
-                .session_store
-                .read_session(&session_id)
-                .map_err(|error| error.to_string())?
-            else {
-                return Err(format!("Unknown session: {session_id}"));
-            };
-            let mode = engine.session_store.session_mode(&session.id);
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!("{{\"session\":{}}}", session_json(&session, mode)),
-            )
-        }
+        ("POST", "/api/rewind") => handle_rewind(stream, &request),
+        ("GET", "/api/session") => handle_session(stream, &request),
+        ("POST", "/api/session-create") => handle_session_create(stream, &request),
+        ("POST", "/api/session-rename") => handle_session_rename(stream, &request),
+        ("POST", "/api/session-mode") => handle_session_mode(stream, &request),
         // Spec 22 Task 10. Each findings route is its own function, so the
         // engine it builds lives in that frame rather than this one: every
         // arm's locals share `handle_connection`'s frame, and inlining three
@@ -712,612 +293,42 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("GET", "/api/findings") => handle_findings(stream, &request),
         ("POST", "/api/finding-status") => handle_finding_status(stream, &request),
         ("POST", "/api/findings-repair") => handle_findings_repair(stream, &request),
-        ("POST", "/api/session-delete") => {
-            let form = parse_form(&request.body);
-            let session_id = required_form(&form, "session_id")?;
-            let engine = default_engine()?;
-            engine
-                .session_store
-                .delete_session(&session_id)
-                .map_err(|error| error.to_string())?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"sessionId\":\"{}\",\"status\":\"deleted\"}}",
-                    escape_json(&session_id)
-                ),
-            )
-        }
-        ("POST", "/api/open-vscode") => {
-            let form = parse_form(&request.body);
-            let repo = required_form(&form, "repo")?;
-            let path = open_in_vscode(&repo)?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
-            )
-        }
-        ("POST", "/api/reveal-in-finder") => {
-            let form = parse_form(&request.body);
-            let repo = required_form(&form, "repo")?;
-            let path = reveal_in_finder(&repo)?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
-            )
-        }
+        ("POST", "/api/session-delete") => handle_session_delete(stream, &request),
+        ("POST", "/api/open-vscode") => handle_open_vscode(stream, &request),
+        ("POST", "/api/reveal-in-finder") => handle_reveal_in_finder(stream, &request),
         ("POST", "/api/reveal-web-diagnostic-artifact") => {
-            let form = parse_form(&request.body);
-            let repo = required_form(&form, "repo")?;
-            let relative_path = required_form(&form, "path")?;
-            let config = config_for_repo(&repo)?;
-            let path = reveal_web_diagnostic_artifact(&config, &relative_path)?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
-            )
+            handle_reveal_web_diagnostic_artifact(stream, &request)
         }
-        ("POST", "/api/context-file") => {
-            let form = parse_form(&request.body);
-            let repo = required_form(&form, "repo")?;
-            let path = required_form(&form, "path")?;
-            let engine = engine_for_repo(&repo)?;
-            let files = validate_context_files(&engine, &repo, &path)?;
-            let Some(path) = files.first() else {
-                return Err("context file is required".to_string());
-            };
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!("{{\"path\":\"{}\"}}", escape_json(path)),
-            )
-        }
-        ("POST", "/api/open-vscode-file") => {
-            let form = parse_form(&request.body);
-            let repo = required_form(&form, "repo")?;
-            let path = required_form(&form, "path")?;
-            let line = form.get("line").and_then(|value| value.parse::<u32>().ok());
-            let col = form.get("col").and_then(|value| value.parse::<u32>().ok());
-            let opened_path = open_workspace_path_in_vscode(&repo, &path, line, col)?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"path\":\"{}\"}}",
-                    escape_json(&opened_path.to_string_lossy())
-                ),
-            )
-        }
-        ("POST", "/api/render-markdown") => {
-            let form = parse_form(&request.body);
-            let content = required_form(&form, "content")?;
-            let html = render_markdown_with_optional_file_links(&content, form.get("repo"));
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!("{{\"html\":\"{}\"}}", escape_json(&html)),
-            )
-        }
+        ("POST", "/api/context-file") => handle_context_file(stream, &request),
+        ("POST", "/api/open-vscode-file") => handle_open_vscode_file(stream, &request),
+        ("POST", "/api/render-markdown") => handle_render_markdown(stream, &request),
         ("POST", "/api/ask-stream") => handle_ask_stream(stream, &request),
         ("POST", "/api/resume-command-stream") => handle_resume_command_stream(stream, &request),
         ("POST", "/api/resume-plan-stream") => handle_resume_plan_stream(stream, &request),
-        ("POST", "/api/ask") => {
-            let form = parse_form(&request.body);
-            // The non-streaming fallback: there is no stream for a client to
-            // abort, so nothing here can be stopped. The events go nowhere.
-            let (events, _discard) = std::sync::mpsc::channel();
-            let result = run_chat_request(&form, &CancelToken::new(), &events)?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &chat_result_json(&result),
-            )
-        }
-        ("POST", "/api/propose-edit") => {
-            let form = parse_form(&request.body);
-            let repo = required_form(&form, "repo")?;
-            let prompt = required_form(&form, "prompt")?;
-            // The chat session the prompt was typed in, so its mode governs
-            // this flow too. Absent for a caller with no session open.
-            let session_id = form
-                .get("session_id")
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty());
-            let engine = engine_for_repo_with_model_options(&repo, &form)?;
-            let context_files = form
-                .get("context_files")
-                .map(|value| validate_context_files(&engine, &repo, value))
-                .transpose()?
-                .unwrap_or_default();
-            let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
-            let transport = CurlModelTransport::new(
-                &engine.config.model_base_url,
-                api_key,
-                ProcessRegistry::open(&engine.config.data_dir)
-                    .map_err(|error| error.to_string())?,
-                &engine.config.data_dir,
-            );
-            let mut adapter = OpenAICompatibleAdapter::with_provider(
-                &engine.config.model_provider,
-                &engine.config.model_name,
-                transport,
-            );
-            let result = engine
-                .edit_orchestrator
-                .propose_edit(
-                    &repo,
-                    &prompt,
-                    &context_files,
-                    session_id.as_deref(),
-                    &mut adapter,
-                )
-                .map_err(|error| error.to_string())?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"patchId\":\"{}\",\"summary\":\"{}\",\"diff\":\"{}\",\"files\":[{}],\"contextFiles\":[{}]}}",
-                    escape_json(&result.patch.id),
-                    escape_json(&result.patch.summary),
-                    escape_json(&patch_diff_text(&result.patch)),
-                    patch_files_json(&result.patch.files),
-                    json_string_array(&result.context_files)
-                ),
-            )
-        }
-        ("POST", "/api/apply-patch") => {
-            let form = parse_form(&request.body);
-            let repo = required_form(&form, "repo")?;
-            let patch_id = required_form(&form, "patch_id")?;
-            let approved_paths = form
-                .get("paths")
-                .map(|value| parse_path_list(value))
-                .transpose()?;
-            let hunk_selection = form
-                .get("hunk_selection")
-                .map(|value| parse_hunk_selection(value).map_err(|error| error.to_string()))
-                .transpose()?;
-            // Explicit per-apply user decision, sent only after the UI has
-            // shown what the scanner found. Absent on the first attempt.
-            let allow_generated_secrets = form
-                .get("allow_secrets")
-                .is_some_and(|value| value == "1" || value == "true");
-            let engine = engine_for_repo(&repo)?;
-            // Without the override, report what would be blocked instead of
-            // failing: the user needs to see which file tripped the check to
-            // decide whether to accept it.
-            if !allow_generated_secrets && engine.config.block_generated_secrets {
-                let flagged = engine
-                    .edit_orchestrator
-                    .preview_stored_patch_secrets(
-                        &repo,
-                        &patch_id,
-                        approved_paths.as_deref(),
-                        hunk_selection.as_ref(),
-                    )
-                    .map_err(|error| error.to_string())?;
-                if !flagged.is_empty() {
-                    return write_response(
-                        stream,
-                        &request,
-                        200,
-                        "application/json",
-                        &format!(
-                            "{{\"patchId\":\"{}\",\"appliedFiles\":[],\"warningCount\":{},\"blockedBySecrets\":[{}]}}",
-                            escape_json(&patch_id),
-                            flagged.len(),
-                            generated_secret_warnings_json(&flagged)
-                        ),
-                    );
-                }
-            }
-            let result = engine
-                .edit_orchestrator
-                .apply_stored_patch(
-                    &repo,
-                    &patch_id,
-                    approved_paths.as_deref(),
-                    hunk_selection.as_ref(),
-                    "desktop_user",
-                    allow_generated_secrets,
-                )
-                .map_err(|error| error.to_string())?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"patchId\":\"{}\",\"appliedFiles\":[{}],\"warningCount\":{}}}",
-                    escape_json(&result.patch_id),
-                    json_string_array(&result.applied_files),
-                    result.warnings.len()
-                ),
-            )
-        }
-        ("POST", "/api/rollback-patch") => {
-            let form = parse_form(&request.body);
-            let repo = required_form(&form, "repo")?;
-            let patch_id = required_form(&form, "patch_id")?;
-            let selected_paths = form
-                .get("paths")
-                .map(|value| parse_path_list(value))
-                .transpose()?;
-            let engine = engine_for_repo(&repo)?;
-            let result = engine
-                .edit_orchestrator
-                .rollback_stored_patch(&repo, &patch_id, selected_paths.as_deref(), "desktop_user")
-                .map_err(|error| error.to_string())?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"patchId\":\"{}\",\"restoredFiles\":[{}],\"deletedFiles\":[{}],\"warnings\":[{}]}}",
-                    escape_json(&result.patch_id),
-                    json_string_array(&result.restored_files),
-                    json_string_array(&result.deleted_files),
-                    json_string_array(&result.warnings)
-                ),
-            )
-        }
-        ("POST", "/api/reject-patch-files") => {
-            let form = parse_form(&request.body);
-            let repo = required_form(&form, "repo")?;
-            let patch_id = required_form(&form, "patch_id")?;
-            let paths = parse_path_list(&required_form(&form, "paths")?)?;
-            let engine = engine_for_repo(&repo)?;
-            let path = engine
-                .edit_orchestrator
-                .reject_stored_patch_files(&patch_id, &paths, "desktop_user")
-                .map_err(|error| error.to_string())?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"patchId\":\"{}\",\"rejectedFiles\":[{}],\"path\":\"{}\"}}",
-                    escape_json(&patch_id),
-                    json_string_array(&paths),
-                    escape_json(&path.to_string_lossy())
-                ),
-            )
-        }
-        ("POST", "/api/reject-patch") => {
-            let form = parse_form(&request.body);
-            let patch_id = required_form(&form, "patch_id")?;
-            let engine = engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
-            let path = engine
-                .edit_orchestrator
-                .reject_stored_patch(&patch_id, "desktop_user")
-                .map_err(|error| error.to_string())?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"patchId\":\"{}\",\"status\":\"rejected\",\"path\":\"{}\"}}",
-                    escape_json(&patch_id),
-                    escape_json(&path.to_string_lossy())
-                ),
-            )
-        }
-        ("POST", "/api/propose-command") => {
-            let form = parse_form(&request.body);
-            let repo = required_form(&form, "repo")?;
-            let command = required_form(&form, "command")?;
-            let engine = engine_for_repo(&repo)?;
-            let proposal = engine
-                .validation_orchestrator
-                .propose_command(&repo, &command, "Desktop command proposal")
-                .map_err(|error| error.to_string())?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"proposalId\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"allowAlways\":{},\"allowBrowserDiagnosticsForSession\":false}}",
-                    escape_json(&proposal.id),
-                    escape_json(&command_approval_prompt(&proposal)),
-                    proposal.risk.as_str(),
-                    proposal.requires_approval,
-                    proposal.blocked,
-                    allow_always_eligible(&engine.config, &proposal.command, proposal.blocked)
-                ),
-            )
-        }
-        ("POST", "/api/run-command") => {
-            let form = parse_form(&request.body);
-            let proposal_id = required_form(&form, "proposal_id")?;
-            let mut engine =
-                engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
-
-            // Persist the permanent allowance *before* running. If the write
-            // fails the command must not run either: silently downgrading
-            // "allow always" to a one-time approval would leave the user
-            // believing they'd never be asked again.
-            let allowlist_path = if form.get("always").map(String::as_str) == Some("true") {
-                Some(
-                    engine
-                        .validation_orchestrator
-                        .allow_command_always(&proposal_id, "desktop_user")
-                        .map_err(|error| error.to_string())?,
-                )
-            } else {
-                None
-            };
-
-            if engine
-                .chat_orchestrator
-                .has_pending_chat_command(&proposal_id)
-            {
-                // This proposal paused a chat turn awaiting approval — run
-                // the command and feed the result back to the model so it
-                // can actually answer, instead of just executing it in
-                // isolation and leaving the user without a synthesized
-                // response.
-                let result = resume_chat_command(
-                    &mut engine,
-                    &proposal_id,
-                    true,
-                    resume_decision_options(&form),
-                )?;
-                write_response(
-                    stream,
-                    &request,
-                    200,
-                    "application/json",
-                    &chat_result_json(&result),
-                )
-            } else {
-                let record = {
-                    // A command run from this endpoint has no turn behind it,
-                    // so it has no stop to honour and no progress to stream.
-                    let cancel = CancelToken::new();
-                    let mut on_output = |_line: &str| {};
-                    engine.validation_orchestrator.run_proposal(
-                        &proposal_id,
-                        true,
-                        "desktop_user",
-                        None,
-                        &cancel,
-                        &mut on_output,
-                    )
-                }
-                .map_err(|error| error.to_string())?;
-                write_response(
-                    stream,
-                    &request,
-                    200,
-                    "application/json",
-                    &format!(
-                        "{{\"proposalId\":\"{}\",\"commandId\":\"{}\",\"exitCode\":{},\"stdout\":\"{}\",\"stderr\":\"{}\",\"allowlistPath\":{}}}",
-                        escape_json(&record.proposal_id),
-                        escape_json(&record.execution.id),
-                        record.execution.exit_code.unwrap_or(-1),
-                        escape_json(&record.execution.stdout),
-                        escape_json(&record.execution.stderr),
-                        json_optional_string(allowlist_path.as_deref())
-                    ),
-                )
-            }
-        }
-        ("POST", "/api/reject-command") => {
-            let form = parse_form(&request.body);
-            let proposal_id = required_form(&form, "proposal_id")?;
-            let mut engine =
-                engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
-
-            if engine
-                .chat_orchestrator
-                .has_pending_chat_command(&proposal_id)
-            {
-                let result = resume_chat_command(
-                    &mut engine,
-                    &proposal_id,
-                    false,
-                    ResumeDecisionOptions::default(),
-                )?;
-                write_response(
-                    stream,
-                    &request,
-                    200,
-                    "application/json",
-                    &chat_result_json(&result),
-                )
-            } else {
-                let path = engine
-                    .validation_orchestrator
-                    .reject_proposal(&proposal_id, "desktop_user")
-                    .map_err(|error| error.to_string())?;
-                write_response(
-                    stream,
-                    &request,
-                    200,
-                    "application/json",
-                    &format!(
-                        "{{\"proposalId\":\"{}\",\"status\":\"rejected\",\"path\":\"{}\"}}",
-                        escape_json(&proposal_id),
-                        escape_json(&path.to_string_lossy())
-                    ),
-                )
-            }
-        }
+        ("POST", "/api/ask") => handle_ask(stream, &request),
+        ("POST", "/api/propose-edit") => handle_propose_edit(stream, &request),
+        ("POST", "/api/apply-patch") => handle_apply_patch(stream, &request),
+        ("POST", "/api/rollback-patch") => handle_rollback_patch(stream, &request),
+        ("POST", "/api/reject-patch-files") => handle_reject_patch_files(stream, &request),
+        ("POST", "/api/reject-patch") => handle_reject_patch(stream, &request),
+        ("POST", "/api/propose-command") => handle_propose_command(stream, &request),
+        ("POST", "/api/run-command") => handle_run_command(stream, &request),
+        ("POST", "/api/reject-command") => handle_reject_command(stream, &request),
         ("GET", "/api/repository-map") => handle_repository_map(stream, &request),
         ("POST", "/api/repository-roots") => handle_repository_roots(stream, &request),
         ("GET", "/api/command-proposal") => handle_command_proposal(stream, &request),
         ("GET", "/api/repository-config-review") => {
-            let repo = request.param("repo").unwrap_or_default();
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &repository_config_review_json(&repo)?,
-            )
+            handle_repository_config_review(stream, &request)
         }
         ("POST", "/api/repository-config-allowlist") => {
-            let form = parse_form(&request.body);
-            let repo = required_form(&form, "repo")?;
-            // Pipe-separated, matching how `command_allowlist` is written on
-            // disk — which is also why an entry can never contain a pipe.
-            let keep = form
-                .get("keep")
-                .map(String::as_str)
-                .unwrap_or_default()
-                .split('|')
-                .map(str::trim)
-                .filter(|entry| !entry.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &resolve_repository_allowlist_migration(&repo, &keep)?,
-            )
+            handle_repository_config_allowlist(stream, &request)
         }
-        ("POST", "/api/config-set") => {
-            let form = parse_form(&request.body);
-            let scope = form.get("scope").map(String::as_str);
-            let key = required_form(&form, "key")?;
-            let value = required_form(&form, "value")?;
-            let path = desktop_settings_config_path(scope)?;
-            let path = update_config_overlay(path, &key, &value)?;
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
-            )
-        }
-        ("POST", "/api/config-file") => {
-            let form = parse_form(&request.body);
-            let scope = form.get("scope").map(String::as_str);
-            let repo = form.get("repo").cloned().unwrap_or_default();
-            let content = form.get("content").cloned().unwrap_or_default();
-            let path = desktop_settings_config_path(scope)?;
-            save_config_file(&path, &content)?;
-            let (effective_policy, effective_error) = effective_policy_for_repo(&repo);
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"path\":\"{}\",\"effectivePolicy\":\"{}\",\"effectiveError\":\"{}\"}}",
-                    escape_json(&path.to_string_lossy()),
-                    escape_json(&effective_policy),
-                    escape_json(&effective_error)
-                ),
-            )
-        }
-        ("POST", "/api/model-key") => {
-            let form = parse_form(&request.body);
-            let scope = form.get("scope").map(String::as_str);
-            let repo = form.get("repo").cloned().unwrap_or_default();
-            let account = required_form(&form, "account")?;
-            let api_key = required_form(&form, "api_key")?;
-            let reference = keychain::reference_for_account(&account)?;
-            keychain::write_password(&account, &api_key)?;
-            remember_model_api_key(&account, &api_key);
-            let path = desktop_settings_config_path(scope)?;
-            update_config_overlay(path.clone(), "model_api_key_env", &reference)?;
-            let (effective_policy, effective_error) = effective_policy_for_repo(&repo);
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"path\":\"{}\",\"reference\":\"{}\",\"account\":\"{}\",\"configured\":true,\"effectivePolicy\":\"{}\",\"effectiveError\":\"{}\"}}",
-                    escape_json(&path.to_string_lossy()),
-                    escape_json(&reference),
-                    escape_json(account.trim()),
-                    escape_json(&effective_policy),
-                    escape_json(&effective_error)
-                ),
-            )
-        }
-        ("POST", "/api/provider-key") => {
-            let form = parse_form(&request.body);
-            let account = required_form(&form, "account")?;
-            let api_key = required_form(&form, "api_key")?;
-            let reference = keychain::reference_for_account(&account)?;
-            keychain::write_password(&account, &api_key)?;
-            remember_model_api_key(&account, &api_key);
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"reference\":\"{}\",\"account\":\"{}\",\"configured\":true}}",
-                    escape_json(&reference),
-                    escape_json(account.trim())
-                ),
-            )
-        }
-        ("POST", "/api/model-key-delete") => {
-            let form = parse_form(&request.body);
-            let account = required_form(&form, "account")?;
-            let deleted = keychain::delete_password(&account)?;
-            forget_model_api_key(&account);
-            write_response(
-                stream,
-                &request,
-                200,
-                "application/json",
-                &format!(
-                    "{{\"account\":\"{}\",\"deleted\":{},\"configured\":false}}",
-                    escape_json(account.trim()),
-                    deleted
-                ),
-            )
-        }
-        ("POST", "/api/mcp-test") => {
-            let form = parse_form(&request.body);
-            let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
-            let body = match mcp_test_connection(&form, &config.data_dir) {
-                Ok(tools) => format!(
-                    "{{\"ok\":true,\"toolCount\":{},\"tools\":[{}]}}",
-                    tools.len(),
-                    json_string_array(&tools)
-                ),
-                Err(error) => {
-                    format!("{{\"ok\":false,\"error\":\"{}\"}}", escape_json(&error))
-                }
-            };
-            write_response(stream, &request, 200, "application/json", &body)
-        }
+        ("POST", "/api/config-set") => handle_config_set(stream, &request),
+        ("POST", "/api/config-file") => handle_post_config_file(stream, &request),
+        ("POST", "/api/model-key") => handle_model_key(stream, &request),
+        ("POST", "/api/provider-key") => handle_provider_key(stream, &request),
+        ("POST", "/api/model-key-delete") => handle_model_key_delete(stream, &request),
+        ("POST", "/api/mcp-test") => handle_mcp_test(stream, &request),
         _ => write_response(
             stream,
             &request,
@@ -1325,6 +336,1096 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
             "application/json",
             &json_error("not found"),
         ),
+    }
+}
+
+fn handle_config(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = request.param("repo");
+    let config = Config::load_for_repository(repo.as_deref().map(Path::new))
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"policy\":\"{}\"}}",
+            escape_json(&config.to_policy_text())
+        ),
+    )
+}
+
+fn handle_get_config_file(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let scope = request.param("scope");
+    let repo = request.param("repo").unwrap_or_default();
+    let path = desktop_settings_config_path(scope.as_deref())?;
+    let content = if path.exists() {
+        fs::read_to_string(&path).map_err(|error| error.to_string())?
+    } else {
+        String::new()
+    };
+    let (effective_policy, effective_error) = effective_policy_for_repo(&repo);
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"path\":\"{}\",\"exists\":{},\"content\":\"{}\",\"effectivePolicy\":\"{}\",\"effectiveError\":\"{}\"}}",
+            escape_json(&path.to_string_lossy()),
+            path.exists(),
+            escape_json(&content),
+            escape_json(&effective_policy),
+            escape_json(&effective_error)
+        ),
+    )
+}
+
+fn handle_model_key_status(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = request.param("repo").unwrap_or_default();
+    let model_provider = request.param("model_provider");
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &model_key_status_json(&repo, model_provider.as_deref())?,
+    )
+}
+
+fn handle_terminal_cwd(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = request.param("repo").unwrap_or_default();
+    let cwd = terminal_cwd_for_repo(&repo)?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!("{{\"cwd\":\"{}\"}}", escape_json(&cwd.to_string_lossy())),
+    )
+}
+
+fn handle_terminal_run(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let cwd = form.get("cwd").cloned().unwrap_or_default();
+    let command = required_form(&form, "command")?;
+    let result = run_terminal_command(&cwd, &command)?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"cwd\":\"{}\",\"exitCode\":{},\"stdout\":\"{}\",\"stderr\":\"{}\"}}",
+            escape_json(&result.cwd.to_string_lossy()),
+            result.exit_code,
+            escape_json(&result.stdout),
+            escape_json(&result.stderr)
+        ),
+    )
+}
+
+fn handle_session_export(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let session_id = required_param(request, "session_id")?;
+    let format = request
+        .param("format")
+        .as_deref()
+        .map_or(ExportFormat::Markdown, |value| match value {
+            "json" => ExportFormat::Json,
+            _ => ExportFormat::Markdown,
+        });
+    let engine = default_engine()?;
+    let content = engine
+        .session_store
+        .export_session(&session_id, format, &engine.scanner)
+        .map_err(|error| error.to_string())?;
+    let (content_type, extension) = match format {
+        ExportFormat::Markdown => ("text/markdown; charset=utf-8", "md"),
+        ExportFormat::Json => ("application/json", "json"),
+    };
+    // The browser's save dialog is the path the user chose: the export
+    // writes nowhere itself and makes no network request.
+    let filename = export_filename(&engine, &session_id, extension)?;
+    let disposition = format!("content-disposition: attachment; filename=\"{filename}\"");
+    write_response_with_extra_headers(stream, request, 200, content_type, &content, &disposition)
+}
+
+fn handle_recovery(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let payload = recovery::sweep_json()?;
+    write_response(stream, request, 200, "application/json", &payload)
+}
+
+fn handle_recovery_decision(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let payload = recovery::decide(&form)?;
+    write_response(stream, request, 200, "application/json", &payload)
+}
+
+fn handle_recovery_approval_resolved(
+    stream: &mut TcpStream,
+    request: &Request,
+) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let payload = recovery::resolve_reattached_approval(&form)?;
+    write_response(stream, request, 200, "application/json", &payload)
+}
+
+fn handle_session(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let session_id = required_param(request, "session_id")?;
+    let engine = default_engine()?;
+    let Some(session) = engine
+        .session_store
+        .read_session(&session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Err(format!("Unknown session: {session_id}"));
+    };
+    let messages = engine
+        .session_store
+        .read_messages_with_seq(&session_id)
+        .map_err(|error| error.to_string())?;
+    // Message roles alone cannot say whether a turn was stopped, so the
+    // task statuses ride along and the UI joins them by `taskId`.
+    let task_statuses = engine
+        .session_store
+        .read_task_statuses(&session_id)
+        .map_err(|error| error.to_string())?;
+    // What each turn spent, joined by the same `taskId` (spec 19 §5.6).
+    let task_usage = engine
+        .session_store
+        .read_task_usage(&session_id)
+        .map_err(|error| error.to_string())?;
+    // The plan each turn worked through, joined by the same `taskId`
+    // (spec 21 §5.6). Without this the panel — and with it the
+    // completion report — would live only for the turn that produced
+    // it, so reopening a session would lose the record of what a plan
+    // came to, which is the part a user comes back for.
+    let task_plans = engine
+        .session_store
+        .read_session_plans(&session_id)
+        .map_err(|error| error.to_string())?;
+    // A named failure reason, joined by `taskId` (spec 48 §5.4), so a
+    // refused turn says *why* it failed rather than only that it did.
+    let task_failure_kinds = engine
+        .session_store
+        .read_task_failure_kinds(&session_id)
+        .map_err(|error| error.to_string())?;
+    // Each turn's browser diagnostics, joined by `taskId` (spec 12
+    // `context.md` §3.3). Already redacted when recorded. Without
+    // this the card would exist only for the turn that ran it, and a
+    // reload would fall back to bare thumbnails.
+    let task_web_diagnostics = engine
+        .session_store
+        .read_session_web_diagnostics(&session_id)
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"session\":{},\"messages\":[{}],\"tasks\":[{}]}}",
+            session_json(&session, engine.session_store.session_mode(&session.id)),
+            messages_json(&messages),
+            task_states_json(
+                &task_statuses,
+                &task_usage,
+                &task_plans,
+                &task_failure_kinds,
+                &task_web_diagnostics,
+                &engine.config
+            )
+        ),
+    )
+}
+
+fn handle_session_rename(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let session_id = required_form(&form, "session_id")?;
+    let title = required_form(&form, "title")?;
+    let engine = default_engine()?;
+    let session = engine
+        .session_store
+        .rename_session(&session_id, &title)
+        .map_err(|error| error.to_string())?;
+    let mode = engine.session_store.session_mode(&session.id);
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!("{{\"session\":{}}}", session_json(&session, mode)),
+    )
+}
+
+fn handle_session_mode(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let session_id = required_form(&form, "session_id")?;
+    let requested = required_form(&form, "mode")?;
+    // Rejected, never defaulted: falling back to Code would turn a
+    // malformed request into the most permissive mode there is.
+    let mode = SessionMode::parse(&requested).ok_or_else(|| {
+        format!("Unknown mode: {requested}. Expected ask, plan, code, or review.")
+    })?;
+    let engine = default_engine()?;
+    if engine
+        .session_store
+        .read_session(&session_id)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Err(format!("Unknown session: {session_id}"));
+    }
+    // Always "user": this endpoint is the user's own selection, and
+    // nothing the model emits reaches it (spec 20 requirement 4).
+    engine
+        .session_store
+        .set_session_mode(&session_id, mode, "user")
+        .map_err(|error| error.to_string())?;
+    let Some(session) = engine
+        .session_store
+        .read_session(&session_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Err(format!("Unknown session: {session_id}"));
+    };
+    let mode = engine.session_store.session_mode(&session.id);
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!("{{\"session\":{}}}", session_json(&session, mode)),
+    )
+}
+
+fn handle_session_delete(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let session_id = required_form(&form, "session_id")?;
+    let engine = default_engine()?;
+    engine
+        .session_store
+        .delete_session(&session_id)
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"sessionId\":\"{}\",\"status\":\"deleted\"}}",
+            escape_json(&session_id)
+        ),
+    )
+}
+
+fn handle_open_vscode(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let path = open_in_vscode(&repo)?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
+    )
+}
+
+fn handle_reveal_in_finder(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let path = reveal_in_finder(&repo)?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
+    )
+}
+
+fn handle_reveal_web_diagnostic_artifact(
+    stream: &mut TcpStream,
+    request: &Request,
+) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let relative_path = required_form(&form, "path")?;
+    let config = config_for_repo(&repo)?;
+    let path = reveal_web_diagnostic_artifact(&config, &relative_path)?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
+    )
+}
+
+fn handle_open_vscode_file(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let path = required_form(&form, "path")?;
+    let line = form.get("line").and_then(|value| value.parse::<u32>().ok());
+    let col = form.get("col").and_then(|value| value.parse::<u32>().ok());
+    let opened_path = open_workspace_path_in_vscode(&repo, &path, line, col)?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"path\":\"{}\"}}",
+            escape_json(&opened_path.to_string_lossy())
+        ),
+    )
+}
+
+fn handle_render_markdown(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let content = required_form(&form, "content")?;
+    let html = render_markdown_with_optional_file_links(&content, form.get("repo"));
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!("{{\"html\":\"{}\"}}", escape_json(&html)),
+    )
+}
+
+fn handle_ask(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    // The non-streaming fallback: there is no stream for a client to
+    // abort, so nothing here can be stopped. The events go nowhere.
+    let (events, _discard) = std::sync::mpsc::channel();
+    let result = run_chat_request(&form, &CancelToken::new(), &events)?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &chat_result_json(&result),
+    )
+}
+
+fn handle_repository_config_review(
+    stream: &mut TcpStream,
+    request: &Request,
+) -> Result<(), String> {
+    let repo = request.param("repo").unwrap_or_default();
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &repository_config_review_json(&repo)?,
+    )
+}
+
+fn handle_repository_config_allowlist(
+    stream: &mut TcpStream,
+    request: &Request,
+) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    // Pipe-separated, matching how `command_allowlist` is written on
+    // disk — which is also why an entry can never contain a pipe.
+    let keep = form
+        .get("keep")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .split('|')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &resolve_repository_allowlist_migration(&repo, &keep)?,
+    )
+}
+
+fn handle_config_set(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let scope = form.get("scope").map(String::as_str);
+    let key = required_form(&form, "key")?;
+    let value = required_form(&form, "value")?;
+    let path = desktop_settings_config_path(scope)?;
+    let path = update_config_overlay(path, &key, &value)?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!("{{\"path\":\"{}\"}}", escape_json(&path.to_string_lossy())),
+    )
+}
+
+fn handle_post_config_file(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let scope = form.get("scope").map(String::as_str);
+    let repo = form.get("repo").cloned().unwrap_or_default();
+    let content = form.get("content").cloned().unwrap_or_default();
+    let path = desktop_settings_config_path(scope)?;
+    save_config_file(&path, &content)?;
+    let (effective_policy, effective_error) = effective_policy_for_repo(&repo);
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"path\":\"{}\",\"effectivePolicy\":\"{}\",\"effectiveError\":\"{}\"}}",
+            escape_json(&path.to_string_lossy()),
+            escape_json(&effective_policy),
+            escape_json(&effective_error)
+        ),
+    )
+}
+
+fn handle_model_key(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let scope = form.get("scope").map(String::as_str);
+    let repo = form.get("repo").cloned().unwrap_or_default();
+    let account = required_form(&form, "account")?;
+    let api_key = required_form(&form, "api_key")?;
+    let reference = keychain::reference_for_account(&account)?;
+    keychain::write_password(&account, &api_key)?;
+    remember_model_api_key(&account, &api_key);
+    let path = desktop_settings_config_path(scope)?;
+    update_config_overlay(path.clone(), "model_api_key_env", &reference)?;
+    let (effective_policy, effective_error) = effective_policy_for_repo(&repo);
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"path\":\"{}\",\"reference\":\"{}\",\"account\":\"{}\",\"configured\":true,\"effectivePolicy\":\"{}\",\"effectiveError\":\"{}\"}}",
+            escape_json(&path.to_string_lossy()),
+            escape_json(&reference),
+            escape_json(account.trim()),
+            escape_json(&effective_policy),
+            escape_json(&effective_error)
+        ),
+    )
+}
+
+fn handle_provider_key(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let account = required_form(&form, "account")?;
+    let api_key = required_form(&form, "api_key")?;
+    let reference = keychain::reference_for_account(&account)?;
+    keychain::write_password(&account, &api_key)?;
+    remember_model_api_key(&account, &api_key);
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"reference\":\"{}\",\"account\":\"{}\",\"configured\":true}}",
+            escape_json(&reference),
+            escape_json(account.trim())
+        ),
+    )
+}
+
+fn handle_model_key_delete(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let account = required_form(&form, "account")?;
+    let deleted = keychain::delete_password(&account)?;
+    forget_model_api_key(&account);
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"account\":\"{}\",\"deleted\":{},\"configured\":false}}",
+            escape_json(account.trim()),
+            deleted
+        ),
+    )
+}
+
+fn handle_mcp_test(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
+    let body = match mcp_test_connection(&form, &config.data_dir) {
+        Ok(tools) => format!(
+            "{{\"ok\":true,\"toolCount\":{},\"tools\":[{}]}}",
+            tools.len(),
+            json_string_array(&tools)
+        ),
+        Err(error) => {
+            format!("{{\"ok\":false,\"error\":\"{}\"}}", escape_json(&error))
+        }
+    };
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+fn handle_web_diagnostic_artifact(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = request.param("repo").unwrap_or_default();
+    let relative_path = request
+        .param("path")
+        .ok_or_else(|| "path is required".to_string())?;
+    let engine = engine_for_repo(&repo)?;
+    let path = web_diagnostic_artifact_path(&engine.config, &relative_path)?;
+    let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+    write_binary_response(stream, request, 200, content_type_for_path(&path), &bytes)
+}
+
+fn handle_git_status(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = required_param(request, "repo")?;
+    let engine = engine_for_repo(&repo)?;
+    let status = engine
+        .git
+        .status(&repo)
+        .map_err(|error| error.to_string())?;
+    let files = status
+        .files
+        .iter()
+        .map(|file| {
+            format!(
+                "{{\"path\":\"{}\",\"raw\":\"{}\",\"untracked\":{},\"conflicted\":{}}}",
+                escape_json(&file.path),
+                escape_json(&file.raw),
+                file.untracked,
+                file.conflicted
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"clean\":{},\"exitCode\":{},\"files\":[{}]}}",
+            status.clean, status.exit_code, files
+        ),
+    )
+}
+
+fn handle_sessions(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = required_param(request, "repo")?;
+    let engine = engine_for_repo(&repo)?;
+    let repository_id = engine
+        .indexer
+        .repository_id_for_path(&repo)
+        .map_err(|error| error.to_string())?;
+    let sessions = engine
+        .session_store
+        .list_sessions(Some(&repository_id))
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!("{{\"sessions\":[{}]}}", sessions_json(&sessions)),
+    )
+}
+
+fn handle_session_search(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let query = required_param(request, "query")?;
+    let whole_word = request.param("whole_word").as_deref() == Some("true");
+    let literal_phrase = request.param("literal").as_deref() != Some("false");
+    let max_results = request
+        .param("max")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50);
+    let (engine, repository_id) = if request.param("scope").as_deref() == Some("all") {
+        (default_engine()?, None)
+    } else {
+        let repo = required_param(request, "repo")?;
+        let engine = engine_for_repo(&repo)?;
+        let repository_id = engine
+            .indexer
+            .repository_id_for_path(&repo)
+            .map_err(|error| error.to_string())?;
+        (engine, Some(repository_id))
+    };
+    let result = engine
+        .session_store
+        .search_sessions(
+            repository_id.as_deref(),
+            &query,
+            SearchOptions {
+                whole_word,
+                literal_phrase,
+                max_results,
+            },
+            &engine.scanner,
+        )
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &serde_json::to_string(&result).map_err(|error| error.to_string())?,
+    )
+}
+
+fn handle_checkpoints(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = required_param(request, "repo")?;
+    let engine = engine_for_repo(&repo)?;
+    let repository_id = engine
+        .indexer
+        .repository_id_for_path(&repo)
+        .map_err(|error| error.to_string())?;
+    let mut checkpoints = engine
+        .checkpoint_store
+        .list_checkpoints(&repository_id)
+        .map_err(|error| error.to_string())?;
+    if let Some(session_id) = request.param("session_id") {
+        checkpoints.retain(|manifest| manifest.session_id == session_id);
+    }
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &checkpoint_list_json(&checkpoints),
+    )
+}
+
+fn handle_rewind(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let checkpoint_id = required_form(&form, "checkpoint_id")?;
+    let files = form.get("files").map(String::as_str) != Some("false");
+    let conversation = form.get("conversation").map(String::as_str) == Some("true");
+    let only_path = form
+        .get("path")
+        .map(String::as_str)
+        .filter(|path| !path.is_empty());
+    if !files && !conversation {
+        return Err("Choose files, conversation, or both".to_string());
+    }
+    let engine = engine_for_repo(&repo)?;
+    let repository_id = engine
+        .indexer
+        .repository_id_for_path(&repo)
+        .map_err(|error| error.to_string())?;
+    let manifest = engine
+        .checkpoint_store
+        .read_checkpoint(&repository_id, &checkpoint_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Unknown checkpoint: {checkpoint_id}"))?;
+    let result = engine
+        .checkpoint_store
+        .restore(
+            &repo,
+            &manifest,
+            workspace_engine::CheckpointRestoreOptions {
+                files,
+                conversation,
+                only_path,
+            },
+            "desktop_user",
+        )
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &checkpoint_restore_json(&result),
+    )
+}
+
+fn handle_session_create(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let title = form
+        .get("title")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| "New session".to_string());
+    let engine = engine_for_repo(&repo)?;
+    let repository_id = engine
+        .indexer
+        .repository_id_for_path(&repo)
+        .map_err(|error| error.to_string())?;
+    let session = engine
+        .session_store
+        .create_session(&repository_id, &title)
+        .map_err(|error| error.to_string())?;
+    let mode = engine.session_store.session_mode(&session.id);
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!("{{\"session\":{}}}", session_json(&session, mode)),
+    )
+}
+
+fn handle_context_file(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let path = required_form(&form, "path")?;
+    let engine = engine_for_repo(&repo)?;
+    let files = validate_context_files(&engine, &repo, &path)?;
+    let Some(path) = files.first() else {
+        return Err("context file is required".to_string());
+    };
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!("{{\"path\":\"{}\"}}", escape_json(path)),
+    )
+}
+
+fn handle_propose_edit(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let prompt = required_form(&form, "prompt")?;
+    // The chat session the prompt was typed in, so its mode governs
+    // this flow too. Absent for a caller with no session open.
+    let session_id = form
+        .get("session_id")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let engine = engine_for_repo_with_model_options(&repo, &form)?;
+    let context_files = form
+        .get("context_files")
+        .map(|value| validate_context_files(&engine, &repo, value))
+        .transpose()?
+        .unwrap_or_default();
+    let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
+    let transport = CurlModelTransport::new(
+        &engine.config.model_base_url,
+        api_key,
+        ProcessRegistry::open(&engine.config.data_dir).map_err(|error| error.to_string())?,
+        &engine.config.data_dir,
+    );
+    let mut adapter = OpenAICompatibleAdapter::with_provider(
+        &engine.config.model_provider,
+        &engine.config.model_name,
+        transport,
+    );
+    let result = engine
+        .edit_orchestrator
+        .propose_edit(
+            &repo,
+            &prompt,
+            &context_files,
+            session_id.as_deref(),
+            &mut adapter,
+        )
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"patchId\":\"{}\",\"summary\":\"{}\",\"diff\":\"{}\",\"files\":[{}],\"contextFiles\":[{}]}}",
+            escape_json(&result.patch.id),
+            escape_json(&result.patch.summary),
+            escape_json(&patch_diff_text(&result.patch)),
+            patch_files_json(&result.patch.files),
+            json_string_array(&result.context_files)
+        ),
+    )
+}
+
+fn handle_apply_patch(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let patch_id = required_form(&form, "patch_id")?;
+    let approved_paths = form
+        .get("paths")
+        .map(|value| parse_path_list(value))
+        .transpose()?;
+    let hunk_selection = form
+        .get("hunk_selection")
+        .map(|value| parse_hunk_selection(value).map_err(|error| error.to_string()))
+        .transpose()?;
+    // Explicit per-apply user decision, sent only after the UI has
+    // shown what the scanner found. Absent on the first attempt.
+    let allow_generated_secrets = form
+        .get("allow_secrets")
+        .is_some_and(|value| value == "1" || value == "true");
+    let engine = engine_for_repo(&repo)?;
+    // Without the override, report what would be blocked instead of
+    // failing: the user needs to see which file tripped the check to
+    // decide whether to accept it.
+    if !allow_generated_secrets && engine.config.block_generated_secrets {
+        let flagged = engine
+            .edit_orchestrator
+            .preview_stored_patch_secrets(
+                &repo,
+                &patch_id,
+                approved_paths.as_deref(),
+                hunk_selection.as_ref(),
+            )
+            .map_err(|error| error.to_string())?;
+        if !flagged.is_empty() {
+            return write_response(
+                stream,
+                request,
+                200,
+                "application/json",
+                &format!(
+                    "{{\"patchId\":\"{}\",\"appliedFiles\":[],\"warningCount\":{},\"blockedBySecrets\":[{}]}}",
+                    escape_json(&patch_id),
+                    flagged.len(),
+                    generated_secret_warnings_json(&flagged)
+                ),
+            );
+        }
+    }
+    let result = engine
+        .edit_orchestrator
+        .apply_stored_patch(
+            &repo,
+            &patch_id,
+            approved_paths.as_deref(),
+            hunk_selection.as_ref(),
+            "desktop_user",
+            allow_generated_secrets,
+        )
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"patchId\":\"{}\",\"appliedFiles\":[{}],\"warningCount\":{}}}",
+            escape_json(&result.patch_id),
+            json_string_array(&result.applied_files),
+            result.warnings.len()
+        ),
+    )
+}
+
+fn handle_rollback_patch(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let patch_id = required_form(&form, "patch_id")?;
+    let selected_paths = form
+        .get("paths")
+        .map(|value| parse_path_list(value))
+        .transpose()?;
+    let engine = engine_for_repo(&repo)?;
+    let result = engine
+        .edit_orchestrator
+        .rollback_stored_patch(&repo, &patch_id, selected_paths.as_deref(), "desktop_user")
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"patchId\":\"{}\",\"restoredFiles\":[{}],\"deletedFiles\":[{}],\"warnings\":[{}]}}",
+            escape_json(&result.patch_id),
+            json_string_array(&result.restored_files),
+            json_string_array(&result.deleted_files),
+            json_string_array(&result.warnings)
+        ),
+    )
+}
+
+fn handle_reject_patch_files(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let patch_id = required_form(&form, "patch_id")?;
+    let paths = parse_path_list(&required_form(&form, "paths")?)?;
+    let engine = engine_for_repo(&repo)?;
+    let path = engine
+        .edit_orchestrator
+        .reject_stored_patch_files(&patch_id, &paths, "desktop_user")
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"patchId\":\"{}\",\"rejectedFiles\":[{}],\"path\":\"{}\"}}",
+            escape_json(&patch_id),
+            json_string_array(&paths),
+            escape_json(&path.to_string_lossy())
+        ),
+    )
+}
+
+fn handle_reject_patch(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let patch_id = required_form(&form, "patch_id")?;
+    let engine = engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
+    let path = engine
+        .edit_orchestrator
+        .reject_stored_patch(&patch_id, "desktop_user")
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"patchId\":\"{}\",\"status\":\"rejected\",\"path\":\"{}\"}}",
+            escape_json(&patch_id),
+            escape_json(&path.to_string_lossy())
+        ),
+    )
+}
+
+fn handle_propose_command(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let command = required_form(&form, "command")?;
+    let engine = engine_for_repo(&repo)?;
+    let proposal = engine
+        .validation_orchestrator
+        .propose_command(&repo, &command, "Desktop command proposal")
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!(
+            "{{\"proposalId\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"allowAlways\":{},\"allowBrowserDiagnosticsForSession\":false}}",
+            escape_json(&proposal.id),
+            escape_json(&command_approval_prompt(&proposal)),
+            proposal.risk.as_str(),
+            proposal.requires_approval,
+            proposal.blocked,
+            allow_always_eligible(&engine.config, &proposal.command, proposal.blocked)
+        ),
+    )
+}
+
+fn handle_run_command(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let proposal_id = required_form(&form, "proposal_id")?;
+    let mut engine = engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
+
+    // Persist the permanent allowance *before* running. If the write
+    // fails the command must not run either: silently downgrading
+    // "allow always" to a one-time approval would leave the user
+    // believing they'd never be asked again.
+    let allowlist_path = if form.get("always").map(String::as_str) == Some("true") {
+        Some(
+            engine
+                .validation_orchestrator
+                .allow_command_always(&proposal_id, "desktop_user")
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+
+    if engine
+        .chat_orchestrator
+        .has_pending_chat_command(&proposal_id)
+    {
+        // This proposal paused a chat turn awaiting approval — run
+        // the command and feed the result back to the model so it
+        // can actually answer, instead of just executing it in
+        // isolation and leaving the user without a synthesized
+        // response.
+        let result = resume_chat_command(
+            &mut engine,
+            &proposal_id,
+            true,
+            resume_decision_options(&form),
+        )?;
+        write_response(
+            stream,
+            request,
+            200,
+            "application/json",
+            &chat_result_json(&result),
+        )
+    } else {
+        let record = {
+            // A command run from this endpoint has no turn behind it,
+            // so it has no stop to honour and no progress to stream.
+            let cancel = CancelToken::new();
+            let mut on_output = |_line: &str| {};
+            engine.validation_orchestrator.run_proposal(
+                &proposal_id,
+                true,
+                "desktop_user",
+                None,
+                &cancel,
+                &mut on_output,
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        write_response(
+            stream,
+            request,
+            200,
+            "application/json",
+            &format!(
+                "{{\"proposalId\":\"{}\",\"commandId\":\"{}\",\"exitCode\":{},\"stdout\":\"{}\",\"stderr\":\"{}\",\"allowlistPath\":{}}}",
+                escape_json(&record.proposal_id),
+                escape_json(&record.execution.id),
+                record.execution.exit_code.unwrap_or(-1),
+                escape_json(&record.execution.stdout),
+                escape_json(&record.execution.stderr),
+                json_optional_string(allowlist_path.as_deref())
+            ),
+        )
+    }
+}
+
+fn handle_reject_command(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let proposal_id = required_form(&form, "proposal_id")?;
+    let mut engine = engine_for_repo(form.get("repo").map(String::as_str).unwrap_or_default())?;
+
+    if engine
+        .chat_orchestrator
+        .has_pending_chat_command(&proposal_id)
+    {
+        let result = resume_chat_command(
+            &mut engine,
+            &proposal_id,
+            false,
+            ResumeDecisionOptions::default(),
+        )?;
+        write_response(
+            stream,
+            request,
+            200,
+            "application/json",
+            &chat_result_json(&result),
+        )
+    } else {
+        let path = engine
+            .validation_orchestrator
+            .reject_proposal(&proposal_id, "desktop_user")
+            .map_err(|error| error.to_string())?;
+        write_response(
+            stream,
+            request,
+            200,
+            "application/json",
+            &format!(
+                "{{\"proposalId\":\"{}\",\"status\":\"rejected\",\"path\":\"{}\"}}",
+                escape_json(&proposal_id),
+                escape_json(&path.to_string_lossy())
+            ),
+        )
     }
 }
 
