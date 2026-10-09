@@ -8,6 +8,8 @@ use crate::command_runner::{CommandExecution, CommandTermination};
 use crate::hash::{create_id, now_millis};
 use crate::secret_scanner::SecretScanner;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
 
 mod biome;
 mod browser;
@@ -191,6 +193,17 @@ impl Finding {
         self
     }
 
+    /// Rewrites the range's path to the repository-relative one the command's
+    /// working directory resolved to (spec 24 Task 7). Only
+    /// [`resolve_finding_path`]'s caller uses it; the parsed summary and
+    /// details are untouched, so redaction is unaffected.
+    pub(crate) fn with_range_path(mut self, path: impl Into<String>) -> Self {
+        if let Some(range) = &mut self.range {
+            range.path = path.into();
+        }
+        self
+    }
+
     pub fn set_status(&mut self, status: FindingStatus) {
         self.status = status;
     }
@@ -242,6 +255,42 @@ impl Finding {
     pub fn created_at_ms(&self) -> u128 {
         self.created_at_ms
     }
+}
+
+/// Resolves a path a command printed into the repository-relative path of an
+/// existing file (spec 24 `context.md` §8).
+///
+/// The printed path is tried against the working directory first — npm and
+/// Biome print cwd-relative paths — then against each ancestor up to and
+/// including the repository root, because cargo prints workspace-root-relative
+/// paths from a member. The first candidate that names an existing file inside
+/// the repository wins. `None` keeps today's behaviour: the range is dropped.
+pub fn resolve_finding_path(
+    repository_root: &Path,
+    working_directory: &Path,
+    printed: &str,
+) -> Option<String> {
+    let printed = printed.trim();
+    if printed.is_empty() || Path::new(printed).is_absolute() {
+        return None;
+    }
+    let root = fs::canonicalize(repository_root).unwrap_or_else(|_| repository_root.to_path_buf());
+    let working =
+        fs::canonicalize(working_directory).unwrap_or_else(|_| working_directory.to_path_buf());
+    let mut directory = Some(working.as_path());
+    while let Some(current) = directory {
+        let candidate = current.join(printed);
+        if candidate.is_file()
+            && let Ok(relative) = candidate.strip_prefix(&root)
+        {
+            return Some(relative.to_string_lossy().replace('\\', "/"));
+        }
+        if current == root {
+            break;
+        }
+        directory = current.parent().filter(|parent| parent.starts_with(&root));
+    }
+    None
 }
 
 /// Lines kept from each stream for a generic finding's details.

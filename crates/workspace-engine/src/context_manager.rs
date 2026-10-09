@@ -1,5 +1,7 @@
+use crate::command_policy::CommandPolicy;
 use crate::file_access::FileAccessController;
 use crate::indexer::RepositoryIndex;
+use crate::repository_map::RepositoryMapStore;
 use crate::secret_scanner::SecretScanner;
 use crate::vector_index::VectorIndexCache;
 use std::collections::{HashMap, HashSet};
@@ -42,6 +44,17 @@ pub struct ContextManager {
     scanner: SecretScanner,
     data_dir: PathBuf,
     enable_semantic_search: bool,
+    repository_map: RepositoryMapSource,
+}
+
+/// What the `repository_map` item is built from (spec 24 `context.md` §5).
+#[derive(Debug, Clone)]
+pub struct RepositoryMapSource {
+    pub store: RepositoryMapStore,
+    /// The policy that classifies the map's commands, the engine's own.
+    pub command_policy: CommandPolicy,
+    /// `repository_map_max_tokens`. `0` leaves the item out.
+    pub max_tokens: usize,
 }
 
 impl ContextManager {
@@ -50,12 +63,14 @@ impl ContextManager {
         scanner: SecretScanner,
         data_dir: PathBuf,
         enable_semantic_search: bool,
+        repository_map: RepositoryMapSource,
     ) -> Self {
         Self {
             file_access,
             scanner,
             data_dir,
             enable_semantic_search,
+            repository_map,
         }
     }
 
@@ -177,6 +192,20 @@ impl ContextManager {
             );
         }
 
+        // After instructions and rules, before retrieved files: under a tight
+        // budget the map displaces retrieved files, never instructions.
+        if let Some(map) = index.and_then(|index| self.repository_map_text(index)) {
+            add_text(
+                &self.scanner,
+                &mut items,
+                &mut token_estimate,
+                token_budget,
+                "repository_map",
+                None,
+                &map,
+            );
+        }
+
         if let Some(results) = search_results {
             for result in results {
                 self.add_file(
@@ -201,6 +230,21 @@ impl ContextManager {
             items,
             files,
         }
+    }
+
+    /// The rendered map, or `None` when the ceiling is `0` or the map
+    /// cannot be loaded or stored. The map is an aid: a read-only or broken
+    /// data directory leaves it out rather than failing the turn.
+    fn repository_map_text(&self, index: &RepositoryIndex) -> Option<String> {
+        let source = &self.repository_map;
+        if source.max_tokens == 0 {
+            return None;
+        }
+        let (map, _) = source
+            .store
+            .load_or_build(index, &source.command_policy)
+            .ok()?;
+        Some(map.render_for_model(source.max_tokens).text)
     }
 
     #[allow(clippy::too_many_arguments)]

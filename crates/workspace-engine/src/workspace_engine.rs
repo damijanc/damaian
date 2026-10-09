@@ -4,7 +4,7 @@ use crate::checkpoint::CheckpointStore;
 use crate::command_policy::CommandPolicy;
 use crate::command_runner::CommandRunner;
 use crate::config::Config;
-use crate::context_manager::ContextManager;
+use crate::context_manager::{ContextManager, RepositoryMapSource};
 use crate::edit::{EditOrchestrator, PatchStore};
 use crate::error::Result;
 use crate::file_access::FileAccessController;
@@ -67,13 +67,18 @@ impl WorkspaceEngine {
             scanner.clone(),
             path_policy.clone(),
         );
+        let command_policy = CommandPolicy::new(config.clone());
         let context_manager = ContextManager::new(
             file_access.clone(),
             scanner.clone(),
             config.data_dir.clone(),
             config.enable_semantic_search,
+            RepositoryMapSource {
+                store: RepositoryMapStore::new(&config.data_dir, audit_log.clone()),
+                command_policy: command_policy.clone(),
+                max_tokens: config.repository_map_max_tokens,
+            },
         );
-        let command_policy = CommandPolicy::new(config.clone());
         let command_runner = CommandRunner::new(
             config.clone(),
             command_policy.clone(),

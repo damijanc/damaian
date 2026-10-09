@@ -166,7 +166,7 @@ pub struct SearchWebInput {
 `search_web` is registered only when the user has configured a search provider —
 an endpoint and an API key in user scope, on the same footing as a model
 provider. Absent that, the tool is not in the tool list at all, for the reason
-[spec 50](50_model_initiated_clarification.md) §5.4 gives: a tool the model can
+[spec 50](50_model_initiated_clarification/proposal.md) §5.4 gives: a tool the model can
 see is a tool it plans around.
 
 `search_web` returns titles, URLs and snippets. It never returns page bodies —

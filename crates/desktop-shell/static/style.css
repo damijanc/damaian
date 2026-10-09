@@ -3859,3 +3859,137 @@ code.command-approval-command {
 .send-button.is-stopping .send-icon::after {
   display: none;
 }
+
+/* Repository roots (spec 24 Task 8). A list of the roots the map found, with
+   a detail panel; paths are repository-relative, `.` for the repository root. */
+.repository-roots-list {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfbfb;
+}
+
+.repository-root-row {
+  width: 100%;
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  background: none;
+  color: var(--ink);
+  padding: 10px 14px;
+  text-align: left;
+}
+
+.repository-root-row:last-child {
+  border-bottom: 0;
+}
+
+.repository-root-row:hover {
+  background: var(--surface-soft);
+}
+
+.repository-root-row:focus-visible {
+  box-shadow: inset 0 0 0 3px var(--accent-soft);
+}
+
+.repository-root-path {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.repository-root-meta {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.repository-root-detail {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 12px 14px;
+}
+
+.repository-root-detail[hidden] {
+  display: none;
+}
+
+.repository-root-detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.repository-root-detail-header > code {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.repository-root-evidence {
+  color: #626568;
+  font-size: 13px;
+}
+
+.repository-root-section-label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.repository-root-files,
+.repository-root-commands,
+.repository-roots-excluded ul {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding-left: 16px;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.repository-root-files code,
+.repository-root-commands code {
+  font-size: 12px;
+}
+
+.repository-roots-excluded {
+  display: grid;
+  gap: 6px;
+}
+
+.repository-roots-excluded[hidden] {
+  display: none;
+}
+
+/* "Runs in `packages/api`" on a command approval card. */
+.command-approval-location {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.command-approval-location code {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+/* A patch file's root, when it is not the repository root. Placed after the
+   path so `.diff-file-select span`'s ellipsis cannot outrank it: this is the
+   same specificity by source order but element-qualified, so it wins. */
+.diff-file-select .diff-root {
+  flex: 0 0 auto;
+  overflow: visible;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: clip;
+}

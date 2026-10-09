@@ -20,18 +20,31 @@
 //! Task 5 pins the persisted map: when a stored file is reused and when it
 //! is rebuilt, and why. It also pins validations proposed per root, each at
 //! that root's directory.
+//!
+//! Task 6 pins the map as model context: the rendering stays under
+//! `repository_map_max_tokens`, degrades in proposal §5.4's order and says
+//! what it dropped, and `build_context` places it before retrieved files.
+//! The key is lower-wins at repository scope, and a map that cannot be
+//! loaded is left out rather than failing the turn.
+//!
+//! Task 7 pins the chat loop: a `run_command` may name a repository-relative
+//! working directory, an invalid one is refused before anything is stored,
+//! findings resolve cwd-first then up the ancestors, and the resume path
+//! re-classifies a proposal at its own directory.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use workspace_engine::finding::resolve_finding_path;
 use workspace_engine::indexer::SkippedFile;
 use workspace_engine::{
-    AuditLog, CancelToken, CommandPolicy, CommandRisk, CommandStore, Config, ConfigOverlay,
-    DetectedRoot, ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH, MapLoad, PROJECT_MANIFESTS,
-    ProjectIndexer, ProjectRoot, REPOSITORY_MAP_SCHEMA_VERSION, RebuildReason, RepositoryIndex,
-    RepositoryKeyClass, RepositoryMap, RepositoryMapStore, RootCommand, RootDetection,
-    RootEvidence, RootOverride, SecretScanner, WorkspaceEngine, detect_roots,
+    AuditLog, CancelToken, ChatTurnResult, CommandPolicy, CommandRisk, CommandStore, Config,
+    ConfigOverlay, Degradation, DetectedRoot, ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH,
+    MapLoad, MockModelAdapter, ModelAdapter, PROJECT_MANIFESTS, ProjectIndexer, ProjectRoot,
+    REPOSITORY_MAP_SCHEMA_VERSION, RebuildReason, RepositoryIndex, RepositoryKeyClass,
+    RepositoryMap, RepositoryMapStore, RootCommand, RootDetection, RootEvidence, RootOverride,
+    SecretScanner, SessionMode, ToolCall, TurnProgress, TurnSink, WorkspaceEngine, detect_roots,
     repository_id_for_root, split_profile_keys,
 };
 
@@ -1615,4 +1628,682 @@ fn a_removed_root_yields_no_proposal() {
         .unwrap()
         .user_override = Some(RootOverride::Removed);
     assert_eq!(in_web(&marked), 0);
+}
+
+// Task 6: bounded rendering and the `repository_map` context item.
+
+fn project_root(path: &str, entry_points: &[&str], test_paths: &[&str]) -> ProjectRoot {
+    let under = |child: &str| {
+        if path.is_empty() {
+            child.to_string()
+        } else {
+            format!("{path}/{child}")
+        }
+    };
+    ProjectRoot {
+        path: path.to_string(),
+        detected_by: RootEvidence::Manifest {
+            path: under("package.json"),
+        },
+        languages: strings(&["json", "typescript"]),
+        manifests: vec![under("package.json")],
+        entry_points: strings(entry_points),
+        test_paths: strings(test_paths),
+        generated_paths: vec![under("dist")],
+        major_directories: vec![under("src"), under("tests")],
+        instruction_files: Vec::new(),
+        commands: vec![command("test", "npm run test", CommandRisk::Medium, path)],
+        user_override: None,
+    }
+}
+
+fn synthetic_map(roots: Vec<ProjectRoot>) -> RepositoryMap {
+    RepositoryMap {
+        repository_id: "repo_sha256:000000000".to_string(),
+        schema_version: REPOSITORY_MAP_SCHEMA_VERSION,
+        generated_at_ms: 0,
+        fingerprint: String::new(),
+        roots,
+        excluded: Vec::new(),
+    }
+}
+
+/// Three roots whose entry-point and test lines differ in size, so the
+/// largest is unambiguous, beside a removed root that must never render.
+fn three_root_map() -> RepositoryMap {
+    let mut removed = project_root("examples/legacy", &[], &[]);
+    removed.user_override = Some(RootOverride::Removed);
+    synthetic_map(vec![
+        project_root("", &["src/main.ts"], &["tests"]),
+        removed,
+        project_root(
+            "packages/api",
+            &[
+                "packages/api/src/index.ts",
+                "packages/api/src/main.ts",
+                "packages/api/index.ts",
+            ],
+            &["packages/api/tests"],
+        ),
+        project_root("packages/api/v2", &["packages/api/v2/index.ts"], &[]),
+    ])
+}
+
+fn label(degradation: &Degradation) -> String {
+    match degradation {
+        Degradation::EntryPointsAndTestPaths { root } => format!("details:{root}"),
+        Degradation::MajorDirectories => "directories".to_string(),
+        Degradation::GeneratedPathsCounted => "generated".to_string(),
+        Degradation::Roots { omitted } => format!("roots:{}", omitted.join(",")),
+    }
+}
+
+#[test]
+fn a_small_map_is_rendered_whole_with_no_degradation_line() {
+    let map = three_root_map();
+    let rendered = map.render_for_model(800);
+    assert!(rendered.dropped.is_empty(), "{:?}", rendered.dropped);
+    assert_eq!(rendered.roots_total, 3, "a removed root is not counted");
+    assert_eq!(rendered.roots_shown, 3);
+    assert_eq!(rendered.tokens, rendered.text.len().div_ceil(4));
+    for expected in [
+        "packages/api/src/main.ts",
+        "packages/api/tests",
+        "packages/api/v2/dist",
+        "npm run test",
+        "typescript",
+    ] {
+        assert!(
+            rendered.text.contains(expected),
+            "{expected}: {}",
+            rendered.text
+        );
+    }
+    assert!(
+        !rendered.text.contains("examples/legacy"),
+        "{}",
+        rendered.text
+    );
+    assert!(!rendered.text.contains("omitted"), "{}", rendered.text);
+    assert!(!rendered.text.contains("shown"), "{}", rendered.text);
+}
+
+#[test]
+fn each_degradation_step_fires_in_order_as_the_ceiling_falls() {
+    let map = three_root_map();
+    let full = map.render_for_model(usize::MAX);
+    assert!(full.dropped.is_empty());
+
+    let mut previous: Vec<String> = Vec::new();
+    let mut last_fitting = Vec::new();
+    for ceiling in (0..=full.tokens).rev() {
+        let rendered = map.render_for_model(ceiling);
+        assert!(
+            rendered.tokens <= ceiling,
+            "{} tokens at a ceiling of {ceiling}: {}",
+            rendered.tokens,
+            rendered.text
+        );
+        let labels: Vec<String> = rendered.dropped.iter().map(label).collect();
+        // A lower ceiling only ever drops more: each step extends the
+        // previous one, or omits a further root.
+        let extends = labels.starts_with(&previous)
+            || (labels.len() == previous.len()
+                && labels[..labels.len() - 1] == previous[..previous.len() - 1]
+                && labels.last().unwrap().starts_with("roots:")
+                && labels.last().unwrap().starts_with(previous.last().unwrap()));
+        assert!(extends, "{previous:?} then {labels:?} at {ceiling}");
+        if !labels.is_empty() {
+            assert!(
+                rendered.text.is_empty() || rendered.text.contains("roots shown"),
+                "a degraded map says so: {}",
+                rendered.text
+            );
+        }
+        if rendered.roots_shown > 0 {
+            last_fitting = labels.clone();
+        }
+        previous = labels;
+    }
+
+    assert_eq!(
+        last_fitting,
+        vec![
+            // Largest first, by the length of what is dropped.
+            "details:packages/api".to_string(),
+            "details:packages/api/v2".to_string(),
+            "details:".to_string(),
+            "directories".to_string(),
+            "generated".to_string(),
+            // Deepest first, and the repository root is never dropped.
+            "roots:packages/api/v2,packages/api".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn sixty_long_roots_stay_under_the_default_ceiling_and_say_what_was_dropped() {
+    let mut roots = vec![project_root("", &["src/main.ts"], &["tests"])];
+    for group in 0..6 {
+        for package in 0..10 {
+            let path = format!(
+                "packages/group-{group:02}/a-rather-long-package-directory-name-{package:02}"
+            );
+            let entry = format!("{path}/src/index.ts");
+            let tests = format!("{path}/tests");
+            roots.push(project_root(&path, &[&entry], &[&tests]));
+        }
+    }
+    let map = synthetic_map(roots);
+    let rendered = map.render_for_model(800);
+    assert!(rendered.tokens <= 800, "{} tokens", rendered.tokens);
+    assert!(rendered.text.len().div_ceil(4) <= 800);
+    assert_eq!(rendered.roots_total, 61);
+    assert!(rendered.roots_shown < 61, "{}", rendered.roots_shown);
+    assert!(rendered.roots_shown >= 1);
+    assert!(
+        rendered
+            .text
+            .contains(&format!("{} of 61 roots shown", rendered.roots_shown)),
+        "{}",
+        rendered.text
+    );
+    assert!(
+        rendered
+            .text
+            .contains("entry points and test paths omitted"),
+        "{}",
+        rendered.text
+    );
+    let Some(Degradation::Roots { omitted }) = rendered.dropped.last() else {
+        panic!("roots were dropped last: {:?}", rendered.dropped);
+    };
+    assert_eq!(omitted.len(), 61 - rendered.roots_shown);
+    assert!(
+        !omitted.contains(&String::new()),
+        "the repository root stays"
+    );
+    // Equal depth, so by path: the last package of the last group goes first.
+    assert_eq!(
+        omitted[0],
+        "packages/group-05/a-rather-long-package-directory-name-09"
+    );
+}
+
+#[test]
+fn build_context_places_one_map_item_before_retrieved_files() {
+    let repo = IndexedMonorepo::new("context-item");
+    let engine = WorkspaceEngine::new(repo.config());
+    let index = repo.index();
+    let plan = engine.context_manager.build_context(
+        &repo.root,
+        &index.repository_id,
+        "task_map",
+        "change the engine function and the api index",
+        Some(&index),
+        &[],
+        16_000,
+    );
+    let kinds: Vec<&str> = plan.items.iter().map(|item| item.kind.as_str()).collect();
+    let maps: Vec<usize> = kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| **kind == "repository_map")
+        .map(|(position, _)| position)
+        .collect();
+    assert_eq!(maps.len(), 1, "{kinds:?}");
+    let first_retrieved = kinds
+        .iter()
+        .position(|kind| *kind == "retrieved_file")
+        .expect("the prompt retrieves files, or this test proves nothing");
+    assert!(maps[0] < first_retrieved, "{kinds:?}");
+    let last_rule = kinds.iter().rposition(|kind| *kind == "project_rule");
+    assert!(last_rule.is_none_or(|rule| rule < maps[0]), "{kinds:?}");
+
+    let item = &plan.items[maps[0]];
+    assert_eq!(item.path, None);
+    assert!(item.tokens <= 800);
+    assert!(item.content.contains("packages/api"), "{}", item.content);
+    assert!(
+        !plan
+            .files
+            .iter()
+            .any(|file| file.contains("repository-map")),
+        "{:?}",
+        plan.files
+    );
+
+    let off = WorkspaceEngine::new(Config {
+        repository_map_max_tokens: 0,
+        ..repo.config()
+    });
+    let plan = off.context_manager.build_context(
+        &repo.root,
+        &index.repository_id,
+        "task_map_off",
+        "change the engine function and the api index",
+        Some(&index),
+        &[],
+        16_000,
+    );
+    assert!(
+        !plan.items.iter().any(|item| item.kind == "repository_map"),
+        "a ceiling of 0 turns the item off"
+    );
+
+    let plan = engine.context_manager.build_context(
+        &repo.root,
+        &index.repository_id,
+        "task_map_no_index",
+        "change the engine function",
+        None,
+        &[],
+        16_000,
+    );
+    assert!(!plan.items.iter().any(|item| item.kind == "repository_map"));
+}
+
+#[test]
+fn a_map_that_cannot_be_stored_is_left_out_and_the_turn_goes_on() {
+    let repo = IndexedMonorepo::new("context-item-unwritable");
+    // A file where the map directory should be, so the store cannot write.
+    fs::write(repo.data_dir.join("repository-map"), "not a directory").unwrap();
+    let engine = WorkspaceEngine::new(repo.config());
+    assert!(
+        engine.repository_map(&repo.root).is_err(),
+        "the store fails"
+    );
+
+    let index = repo.index();
+    let plan = engine.context_manager.build_context(
+        &repo.root,
+        &index.repository_id,
+        "task_map_unwritable",
+        "change the engine function and the api index",
+        Some(&index),
+        &[],
+        16_000,
+    );
+    let kinds: Vec<&str> = plan.items.iter().map(|item| item.kind.as_str()).collect();
+    assert!(!kinds.contains(&"repository_map"), "{kinds:?}");
+    assert!(kinds.contains(&"user_prompt"), "{kinds:?}");
+    assert!(kinds.contains(&"retrieved_file"), "{kinds:?}");
+}
+
+#[test]
+fn repository_config_may_lower_the_map_ceiling_but_not_raise_it() {
+    let repo = IndexedMonorepo::new("map-ceiling-config");
+    assert_eq!(repo.config().repository_map_max_tokens, 800);
+    let repository_config = Config::repository_config_path(&repo.root);
+    fs::create_dir_all(repository_config.parent().unwrap()).unwrap();
+    let load = |line: &str| {
+        fs::write(&repository_config, line).unwrap();
+        Config::load_scoped(
+            repo.config(),
+            None,
+            Some(&repository_config),
+            None,
+            Some(&repo.root),
+        )
+        .unwrap()
+    };
+
+    let (config, report) = load("repository_map_max_tokens=100000\n");
+    assert_eq!(config.repository_map_max_tokens, 800);
+    let refused = report
+        .rejected_keys
+        .iter()
+        .find(|rejected| rejected.key == "repository_map_max_tokens")
+        .unwrap_or_else(|| panic!("not refused: {:?}", report.rejected_keys));
+    assert_eq!(refused.class, RepositoryKeyClass::RestrictOnly);
+
+    let (config, report) = load("repository_map_max_tokens=50\n");
+    assert_eq!(config.repository_map_max_tokens, 50);
+    assert!(
+        report.rejected_keys.is_empty(),
+        "{:?}",
+        report.rejected_keys
+    );
+    assert!(
+        config
+            .to_policy_text()
+            .contains("repository_map_max_tokens=50\n")
+    );
+
+    let (config, _) = load("repository_map_max_tokens=0\n");
+    assert_eq!(
+        config.repository_map_max_tokens, 0,
+        "a repository may turn it off"
+    );
+
+    let overlay = ConfigOverlay::parse("repository_map_max_tokens=120\n").unwrap();
+    assert_eq!(overlay.repository_map_max_tokens, Some(120));
+    assert_eq!(
+        ConfigOverlay::parse(&overlay.to_policy_text()).unwrap(),
+        overlay
+    );
+    // A capability key: a profile carries it.
+    let (carried, refused) = split_profile_keys(overlay.clone());
+    assert_eq!(carried, overlay);
+    assert!(refused.is_empty(), "{refused:?}");
+}
+
+// -- Task 7: commands and findings in a sub-root, in the chat loop --------
+
+fn tool_call(name: &str, arguments_json: &str) -> ToolCall {
+    ToolCall {
+        id: format!("call_{name}"),
+        name: name.to_string(),
+        arguments_json: arguments_json.to_string(),
+    }
+}
+
+/// Scripted tool-call rounds, then a plain answer so the loop ends.
+fn scripted(rounds: Vec<Vec<ToolCall>>) -> MockModelAdapter {
+    let mut responses: Vec<String> = rounds.iter().map(|_| String::new()).collect();
+    let mut calls = rounds;
+    responses.push("Done.".to_string());
+    calls.push(Vec::new());
+    MockModelAdapter::new_sequence_with_tool_calls(responses, calls)
+}
+
+fn chat_turn(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let cancel = CancelToken::new();
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .ask_with_session(repo, "Go.", &[], None, adapter, &mut sink)
+        .expect("the turn should run")
+}
+
+fn approve(engine: &WorkspaceEngine, proposal_id: &str) -> ChatTurnResult {
+    let mut after = MockModelAdapter::new("Understood.");
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let cancel = CancelToken::new();
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .resume_after_command_decision(proposal_id, true, "tester", &mut after, &mut sink)
+        .expect("the resumed turn should run")
+}
+
+fn tool_messages(engine: &WorkspaceEngine, session_id: &str) -> Vec<String> {
+    engine
+        .session_store
+        .read_messages(session_id)
+        .expect("messages should read")
+        .into_iter()
+        .filter(|message| message.role == "tool")
+        .map(|message| message.content)
+        .collect()
+}
+
+fn audited(engine: &WorkspaceEngine, event_type: &str) -> usize {
+    fs::read_to_string(engine.config.data_dir.join("audit/events.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["eventType"] == event_type)
+        .count()
+}
+
+/// A command requested for a sub-root is proposed there, with the repository
+/// root kept as the boundary. A request without the argument behaves as it
+/// always did.
+#[test]
+fn a_requested_working_directory_routes_the_proposal_to_that_root() {
+    let repo = IndexedMonorepo::new("task7-subroot");
+    let engine = WorkspaceEngine::new(repo.config());
+
+    let mut adapter = scripted(vec![vec![tool_call(
+        "run_command",
+        r#"{"command":"npm test","reason":"Test it","working_directory":"packages/api"}"#,
+    )]]);
+    let requested = chat_turn(&engine, &repo.root, &mut adapter);
+    let card = requested.command_proposal.expect("npm test needs approval");
+    let proposal = engine.command_store.load_proposal(&card.id).unwrap();
+    assert!(
+        proposal.working_directory.ends_with("packages/api"),
+        "{}",
+        proposal.working_directory
+    );
+    assert_eq!(
+        proposal.repository_root,
+        repo.root.to_string_lossy(),
+        "the repository root stays the boundary"
+    );
+
+    let mut adapter = scripted(vec![vec![tool_call(
+        "run_command",
+        r#"{"command":"npm test","reason":"Test it"}"#,
+    )]]);
+    let defaulted = chat_turn(&engine, &repo.root, &mut adapter);
+    let card = defaulted.command_proposal.expect("npm test needs approval");
+    let proposal = engine.command_store.load_proposal(&card.id).unwrap();
+    assert_eq!(
+        proposal.working_directory, proposal.repository_root,
+        "no argument means the repository root, as before"
+    );
+}
+
+/// A `..`, an absolute path, a symlink out of the repository, a file and a
+/// restricted directory are each refused before anything is stored, and the
+/// tool result says why.
+#[test]
+fn a_refused_working_directory_never_stores_a_proposal() {
+    let repo = IndexedMonorepo::new("task7-invalid");
+    let outside_name = format!("damaian-task7-outside-{}", std::process::id());
+    let outside = repo.root.parent().unwrap().join(&outside_name);
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, repo.root.join("escape")).unwrap();
+    fs::create_dir_all(repo.root.join(".env")).unwrap();
+    let parent_escape = format!("../{outside_name}");
+
+    for (requested, needle) in [
+        (parent_escape.as_str(), "outside"),
+        ("/etc", "outside"),
+        ("escape", "outside"),
+        ("packages/api/package.json", "directory"),
+        (".env", "restricted"),
+    ] {
+        let engine = WorkspaceEngine::new(repo.config());
+        let arguments = serde_json::json!({
+            "command": "ls",
+            "reason": "List",
+            "working_directory": requested,
+        })
+        .to_string();
+        let mut adapter = scripted(vec![vec![tool_call("run_command", &arguments)]]);
+        let result = chat_turn(&engine, &repo.root, &mut adapter);
+
+        assert!(result.command_proposal.is_none(), "{requested}");
+        let results = tool_messages(&engine, &result.session.id);
+        let last = results.last().unwrap_or_else(|| panic!("{requested}"));
+        assert!(
+            last.to_lowercase().contains(needle),
+            "{requested}: {last:?}"
+        );
+        assert_eq!(
+            audited(&engine, "stored_command_executed"),
+            0,
+            "{requested} ran"
+        );
+    }
+    let _ = fs::remove_dir_all(&outside);
+}
+
+/// `resolve_finding_path` (`context.md` §8): the working directory first
+/// (npm), then each ancestor up to the repository root (cargo), and never a
+/// path that names no file.
+#[test]
+fn a_finding_path_resolves_from_the_working_directory_then_its_ancestors() {
+    let repo = IndexedMonorepo::new("task7-finding-paths");
+    repo.write("src/shared.ts", "export {};\n");
+    repo.write("packages/api/src/shared.ts", "export {};\n");
+    let api = repo.root.join("packages/api");
+
+    assert_eq!(
+        resolve_finding_path(&repo.root, &api, "src/index.ts"),
+        Some("packages/api/src/index.ts".to_string()),
+        "npm prints cwd-relative paths"
+    );
+    assert_eq!(
+        resolve_finding_path(
+            &repo.root,
+            &repo.root.join("crates/engine"),
+            "crates/engine/src/lib.rs"
+        ),
+        Some("crates/engine/src/lib.rs".to_string()),
+        "cargo prints workspace-root-relative paths"
+    );
+    assert_eq!(
+        resolve_finding_path(&repo.root, &api, "src/missing.ts"),
+        None,
+        "no file, no range"
+    );
+    assert_eq!(
+        resolve_finding_path(&repo.root, &api, "src/shared.ts"),
+        Some("packages/api/src/shared.ts".to_string()),
+        "the working directory wins over an ancestor"
+    );
+    assert_eq!(
+        resolve_finding_path(&repo.root, &api, "/etc/passwd"),
+        None,
+        "an absolute path is never a repository range"
+    );
+}
+
+/// A shell script that prints a rustc-shaped error and fails. It is run by
+/// the system `sh` (`sh ./cargo check`), never launched as a fresh
+/// executable: macOS XProtect can hold a newly written executable for
+/// minutes (OBSERVATIONS.md row 25), which would make this test flaky.
+const FAKE_CARGO: &str = "cat >&2 <<'EOF'\nerror[E0308]: mismatched types\n --> src/x.ts:1:1\n  |\n\nerror: could not compile `demo` (lib) due to 1 previous error\nEOF\nexit 1\n";
+
+/// A finding from a command run in `packages/api` keeps its range, rewritten
+/// to the repository-relative `packages/api/src/x.ts` and hashed from there.
+#[test]
+fn a_finding_from_a_sub_root_command_keeps_its_range_in_that_root() {
+    let repo = IndexedMonorepo::new("task7-finding-range");
+    repo.write("packages/api/src/x.ts", "export {};\n");
+    repo.write("packages/api/cargo", FAKE_CARGO);
+    let config = Config {
+        shell: "/bin/sh".to_string(),
+        ..repo.config()
+    };
+    let engine = WorkspaceEngine::new(config);
+
+    let mut adapter = scripted(vec![vec![tool_call(
+        "run_command",
+        r#"{"command":"sh ./cargo check","reason":"Check","working_directory":"packages/api"}"#,
+    )]]);
+    let stopped = chat_turn(&engine, &repo.root, &mut adapter);
+    if let Some(card) = &stopped.command_proposal {
+        approve(&engine, &card.id);
+    }
+
+    let recorded = engine
+        .session_store
+        .read_findings(&stopped.session.id, &repo.root)
+        .unwrap();
+    let kept = recorded
+        .iter()
+        .find(|finding| finding.code() == Some("E0308"))
+        .unwrap_or_else(|| panic!("the located finding was recorded: {recorded:?}"));
+    assert_eq!(
+        kept.range().map(|range| range.path.as_str()),
+        Some("packages/api/src/x.ts")
+    );
+    assert_eq!(
+        kept.file_hash(),
+        Some(
+            workspace_engine::hash::file_hash(repo.root.join("packages/api/src/x.ts"))
+                .unwrap()
+                .as_str()
+        )
+    );
+}
+
+/// A root-qualified grant authorises `npm test` in `packages/api` and nowhere
+/// else (`context.md` §2).
+#[test]
+fn a_root_qualified_grant_authorises_the_command_in_its_root_only() {
+    let repo = IndexedMonorepo::new("task7-grant");
+    let config = Config {
+        command_allowlist: vec!["cd packages/api && npm test".to_string()],
+        ..repo.config()
+    };
+    let engine = WorkspaceEngine::new(config);
+
+    let mut adapter = scripted(vec![vec![tool_call(
+        "run_command",
+        r#"{"command":"npm test","reason":"Test it","working_directory":"packages/api"}"#,
+    )]]);
+    let in_root = chat_turn(&engine, &repo.root, &mut adapter);
+    assert!(
+        in_root.command_proposal.is_none(),
+        "the grant auto-runs it in packages/api"
+    );
+    assert!(audited(&engine, "stored_command_executed") >= 1);
+
+    let mut adapter = scripted(vec![vec![tool_call(
+        "run_command",
+        r#"{"command":"npm test","reason":"Test it"}"#,
+    )]]);
+    let at_root = chat_turn(&engine, &repo.root, &mut adapter);
+    assert!(
+        at_root.command_proposal.is_some(),
+        "the grant does not apply at the repository root"
+    );
+}
+
+/// The resume path re-classifies a proposal at its own directory, so a
+/// command whose risk depends on the boundary is judged where it will run.
+#[test]
+fn a_resumed_proposal_is_re_classified_at_its_own_directory() {
+    let repo = IndexedMonorepo::new("task7-resume");
+    let engine = WorkspaceEngine::new(repo.config());
+
+    let mut adapter = scripted(vec![vec![tool_call(
+        "run_command",
+        r#"{"command":"npm test","reason":"Test it","working_directory":"packages/api"}"#,
+    )]]);
+    let stopped = chat_turn(&engine, &repo.root, &mut adapter);
+    let card = stopped.command_proposal.expect("npm test needs approval");
+
+    // Swap in a command that is low risk inside the repository but would be
+    // escalated if the boundary were taken to be `packages/api` itself.
+    let mut proposal = engine.command_store.load_proposal(&card.id).unwrap();
+    proposal.command = "ls ../web/src/index.ts".to_string();
+    proposal.requires_approval = true;
+    engine.command_store.save_proposal(&proposal).unwrap();
+    // Plan allows only a low-risk read-only command, so the classification
+    // decides whether the resumed command runs.
+    engine
+        .session_store
+        .set_session_mode(&stopped.session.id, SessionMode::Plan, "user")
+        .unwrap();
+
+    approve(&engine, &card.id);
+    assert_eq!(
+        audited(&engine, "stored_command_executed"),
+        1,
+        "re-classified at packages/api, inside the repository"
+    );
 }

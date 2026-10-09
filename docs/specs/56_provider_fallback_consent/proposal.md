@@ -3,24 +3,26 @@
 Status: Not started
 Order: 56 of 56
 Plan: none. Split out of
-[`48_provider_limits_and_backpressure`](48_provider_limits_and_backpressure/proposal.md)
+[`48_provider_limits_and_backpressure`](../48_provider_limits_and_backpressure/proposal.md)
 during its implementation, the way
-[`07_generated_secret_override.md`](07_generated_secret_override.md) split out of
+[`07_generated_secret_override.md`](../07_generated_secret_override.md) split out of
 a gap analysis: the half that was recognisably its own feature rather than a
 fragment of the spec it came from.
-Depends on: [#48](48_provider_limits_and_backpressure/proposal.md) (the refusal
+Depends on: [#48](../48_provider_limits_and_backpressure/proposal.md) (the refusal
 classification, the `failureKind` outcome, and the fail-closed default this
 offer turns into a choice) — built. Everything else named below is a
 cross-reference, not a prerequisite.
 Related implementation specs:
-[`10_persistent_command_approval.md`](10_persistent_command_approval.md) (the
+[`10_persistent_command_approval.md`](../10_persistent_command_approval.md) (the
 approval-shaped decision this reuses, and whose "always" is exactly what this
-must not have), [`45_crash_recovery_prompt.md`](45_crash_recovery_prompt.md)
+must not have), [`45_crash_recovery_prompt.md`](../45_crash_recovery_prompt.md)
 (the card that names a refused task's outcome),
-[`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md)
+[`21_task_plan_progress_and_budget/proposal.md`](../21_task_plan_progress_and_budget/proposal.md)
 (the plan that must survive a switch), and
-[`48_provider_limits_and_backpressure/proposal.md`](48_provider_limits_and_backpressure/proposal.md)
+[`48_provider_limits_and_backpressure/proposal.md`](../48_provider_limits_and_backpressure/proposal.md)
 §5.6, of which this spec is the full statement.
+Also in this spec: [`tasks.md`](tasks.md) (execution order, progress, and the
+corrections to this document found while planning).
 
 ## 1. Motivation
 

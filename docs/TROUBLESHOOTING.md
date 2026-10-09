@@ -82,6 +82,7 @@ isolated tree — that is the intended way to test without touching real data.
 | `chat/pending/<proposal-id>.json` | Suspended chat turn awaiting a command decision | [chat.rs:859](../crates/workspace-engine/src/chat.rs:859) |
 | `processes/<pid>-<start-time-us>.json` | One live child process this instance spawned, written **before** the child is returned to its caller and unlinked on clean exit | [process_registry.rs:164](../crates/workspace-engine/src/process_registry.rs:164) |
 | `web-diagnostics/<session-id>/<task-id>/run-<ms>/` | Browser diagnostic screenshots, copied out of the browser server's own output. Images are **not** secret-scanned; they show whatever the page showed | `materialize_browser_artifacts` ([desktop-shell/src/lib.rs](../crates/desktop-shell/src/lib.rs)) |
+| `repository-map/<repo-id>.json` | The repository map: roots, their evidence and commands, and excluded paths. Derived, safe to delete | `RepositoryMapStore` ([repository_map.rs](../crates/workspace-engine/src/repository_map.rs)) |
 | `vector-index/<repo-id>.bin` | Semantic-search embeddings cache | [vector_index.rs:149](../crates/workspace-engine/src/vector_index.rs:149) |
 | `models/all-MiniLM-L6-v2/` | Downloaded embedding model (semantic search only) | [embeddings.rs:27](../crates/workspace-engine/src/embeddings.rs:27) |
 
@@ -663,10 +664,123 @@ plans, so a rewind takes the findings recorded after its point with it.
 
 **A location is missing.** A finding gets a `range` only when the tool printed
 one, it is relative and inside the repository, and the file exists when the
-finding is recorded. An absolute path (the standard library, a registry
+finding is recorded. The printed path is tried against the directory the
+command ran in first, then each parent up to the repository root, and the
+first existing file wins. So a check run in a sub-root (see
+[Repository roots and the repository map](#repository-roots-and-the-repository-map))
+keeps its locations. An absolute path (the standard library, a registry
 crate) or a `..` path is dropped. A browser console location maps to a file
 only for a loopback URL whose path matches exactly one repository file outside
 `node_modules`. Percent-encoded paths are not decoded and never match.
+
+### Repository roots and the repository map
+
+The map of a repository's project roots
+([User Guide](USER_GUIDE.md#repository-roots)) is stored per repository:
+
+```text
+<data dir>/repository-map/<repository_id>.json
+```
+
+`<repository_id>` is the same `repo_…` id as `command_allowlist.<repository_id>`.
+The map is derived from the in-memory index plus config. The stored file is
+reused only while its `fingerprint` still matches the inputs: the indexed
+paths, the content of every manifest and `AGENTS.md`, the root overrides, the
+command allowlist and blocklist, and the excluded paths. Anything else
+rebuilds it: a changed manifest, a new grant, an unreadable file, or another
+schema version. **To force a rebuild, delete the file.** It is built again on
+the next request or map read. A deleted file is rebuilt silently. A stale,
+corrupt or version-mismatched one is rebuilt with an audit event.
+
+Read it without the UI. `--json` prints `{"load":{…},"map":{…}}`, the same
+shape the Settings section reads from `/api/repository-map`:
+
+```bash
+DAMAIAN_DATA_DIR=/tmp/damaian-debug cargo run -p damaian-cli -- repo-map /path/to/repo
+DAMAIAN_DATA_DIR=/tmp/damaian-debug cargo run -p damaian-cli -- repo-map /path/to/repo --json | jq '.map.roots[] | {path, detectedBy, userOverride}'
+```
+
+The first line of the summary says what happened: `map reused (inputs
+unchanged)`, `map built (none stored)`, or `map rebuilt: …` with the reason.
+In the JSON, `load.outcome` is `reused`, `built` or `rebuilt`, and a rebuild
+carries `reason` (`corrupt`, `schemaMismatch` with `foundSchemaVersion`, or
+`stale`).
+
+**Reading `detectedBy`.** Each root says why it is one:
+
+| `detectedBy.kind` | Meaning |
+|---|---|
+| `repositoryRoot` | The working folder, which is always a root, holding none of the known manifests |
+| `manifest` | `detectedBy.path` names the manifest that made it a root. With several in one directory, the first of `package.json`, `pyproject.toml`, `pytest.ini`, `pom.xml`, `build.gradle`, `go.mod`, `Cargo.toml` is named, so a root with `package.json` and `Cargo.toml` reads `package.json` |
+| `userOverride` | Added by `project_roots_added`, with no manifest of its own |
+
+`userOverride` on a root (`added` or `removed`) records a correction. A
+removed root keeps its manifest evidence. Its lists are empty, it proposes no
+commands, and it is not shown to the model. Its files belong to the nearest
+enclosing root.
+
+**Reading `excluded`.** Only three kinds of path are listed. Other ignored
+paths were never candidates and are not listed:
+
+| `reason` | Meaning |
+|---|---|
+| `vendor` | A `node_modules`, `vendor`, `target`, `dist`, `build`, `.venv` or `venv` directory. Never a root, even when indexed |
+| `belowDepthCeiling` | A manifest directory more than 6 segments deep (`packages/api` is 2). Not a root. If it should be one, add it: added roots are not held to the ceiling |
+| `invalidOverride` | A `project_roots_added` or `project_roots_removed` entry that was not applied. Possible causes: it is not a directory holding an indexed file; it is absolute or contains `..`; it is under a vendor directory or a `restricted_patterns` match; it is in both lists; it removes the repository root; or it removes a directory that is not a root. Fix or delete the entry |
+
+**A root is missing.** Check, in order:
+
+1. Does the directory hold one of the seven manifests? A `setup.py` alone is not one.
+2. Is it `.gitignore`d, under an `ignore_patterns` match, or under a vendor directory?
+3. Is it listed in `excluded`?
+4. Has an override removed it? The override can come from the repository's own
+   `.damaian/config.conf`, which may be committed, or from your
+   `config/user.conf`, where the keys apply to every repository.
+   `config-show` prints both lists.
+
+The index is in memory and updated by the file watcher. A manifest created a
+moment ago may need the watcher to catch up, or a restart.
+
+**A directory is wrongly a root.** The usual cause is a stray manifest in an
+example or a fixture. Remove it in Settings › General › Repository roots, or
+from the CLI:
+
+```bash
+cargo run -p damaian-cli -- repo-root /path/to/repo remove examples/demo
+```
+
+`add` and `clear` work the same way. All three write
+`<repo>/.damaian/config.conf`, which `git status` then shows. If that file
+already has a line the parser rejects, the write is refused with the parse
+error and the file is left alone.
+
+**A root has no commands, or not the expected ones.** Commands come only from
+the `package.json` scripts named exactly `test`, `lint`, `typecheck`, `build`
+or `format`, and from one fixed command per other manifest. A script named
+`lint:web` is not picked up. A Cargo workspace root and each member all show
+`cargo test`, each in its own directory.
+
+**A command ran in the wrong directory.** The approval card's **Runs in**
+line shows where a command runs. So do `workingDirectory` and `repositoryRoot`
+in the stored proposal (`commands/pending/<id>.dcmd`, or
+`/api/command-proposal`). A proposal written before roots existed has no
+`REPOSITORY_ROOT` line and is read as running at the repository root.
+
+**The audit event.** A rebuild of a stored map writes
+`repository_map_rebuilt` with `repositoryId`, `reason` (`corrupt`,
+`schemaMismatch` or `stale`) and, for a mismatch, `foundSchemaVersion`. A
+first build and a reuse write nothing.
+
+```bash
+jq -c 'select(.eventType=="repository_map_rebuilt")' ~/Library/Application\ Support/DamaianClient/audit/events.jsonl
+```
+
+**What the model saw.** The map reaches the model as one context item of
+kind `repository_map`. It is limited by `repository_map_max_tokens`: the
+default is 800, `0` turns it off, and a repository may only lower it. When the
+map is cut to fit, its last line starts `Abridged to fit:` and says what was
+dropped. If the map cannot be stored, for example because the data directory
+is read-only, it is left out of the request and the turn goes on.
 
 ### A turn stopped early: which budget ran out
 
@@ -984,6 +1098,8 @@ cargo run -p damaian-cli -- search /path/to/repo "some query"
 cargo run -p damaian-cli -- git-status /path/to/repo
 cargo run -p damaian-cli -- classify-command "rm -rf build"
 cargo run -p damaian-cli -- propose-command /path/to/repo "npm test"
+cargo run -p damaian-cli -- repo-map /path/to/repo --json
+cargo run -p damaian-cli -- propose-validations /path/to/repo
 DAMAIAN_MOCK_MODEL_RESPONSE="Mock answer" cargo run -p damaian-cli -- ask /path/to/repo "What does auth do?"
 cargo run -p damaian-cli -- propose-edit /path/to/repo "Make the change"
 cargo run -p damaian-cli -- show-patch /path/to/repo <patch-id>

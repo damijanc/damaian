@@ -8,7 +8,7 @@ reference is a name rather than a link; this spec is self-contained.
 Depends on: [#21](21_task_plan_progress_and_budget/proposal.md) (plan state) —
 built; [#22](22_findings_model_and_panel/proposal.md) (findings) — built;
 [#24](24_repository_map_and_monorepo_boundaries/proposal.md) (the repository map) —
-**not built**; [#25](25_symbol_and_relationship_index.md) (the symbol index) —
+built (Done 2026-10-09); [#25](25_symbol_and_relationship_index.md) (the symbol index) —
 **not built**. Everything else named below is a cross-reference, not a
 prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path

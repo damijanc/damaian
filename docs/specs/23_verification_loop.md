@@ -27,7 +27,7 @@ Damaian applies a change and stops.
 
 Every piece needed to check the change already exists — `patch_engine` applies
 it, `ValidationOrchestrator::propose_detected_validations`
-(`crates/workspace-engine/src/validation.rs:167`) knows what the project's checks
+(`crates/workspace-engine/src/validation.rs:273`) knows what the project's checks
 are, `CommandRunner` runs them, `web_diagnostics` can inspect a running page.
 Nothing sequences them. The agent finishes a patch, says what it did, and the
 question of whether it works is left to the user.
@@ -51,9 +51,11 @@ report — distinguishing what was verified from what was assumed.
   commands, `web_diagnostics.rs` inspects a running app. Nothing chains them into
   a task that knows whether it succeeded.
 - **Validation discovery already exists and should be reused.**
-  `ValidationOrchestrator::propose_detected_validations` (`validation.rs:167`)
-  maps `CommandPolicy::detect_project_commands` output into `CommandProposal`s,
-  one per detected check, each carrying the standard approval fields.
+  `ValidationOrchestrator::propose_detected_validations` (`validation.rs:273`)
+  maps each repository-map root's detected commands into `CommandProposal`s,
+  one per detected check, each carrying the standard approval fields and its
+  root's working directory
+  ([spec 24](24_repository_map_and_monorepo_boundaries/context.md) §9).
 - **Running a check is approval-gated.** `ValidationOrchestrator::run_proposal`
   (`validation.rs:186`) refuses a blocked proposal outright and returns
   `ApprovalRequired` when `requires_approval` is true and `approved` is false.
@@ -137,8 +139,11 @@ restart and what makes the plan's completion status honest.
 
 ### 5.2 Selecting checks
 
-`propose_detected_validations(working_directory)` returns every detected project
-check. The loop runs the ones relevant to what changed, where "relevant" is
+`propose_detected_validations(repository_root, &RepositoryMap)` returns every
+detected project check, one set per root of the
+[spec 24](24_repository_map_and_monorepo_boundaries/proposal.md) map, each at
+its root's working directory. Roots can overlap: a Cargo workspace root and
+each member all propose `cargo test`. The loop runs the ones relevant to what changed, where "relevant" is
 deliberately coarse:
 
 | Changed paths | Checks run |
