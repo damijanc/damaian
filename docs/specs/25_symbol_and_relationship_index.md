@@ -6,7 +6,7 @@ Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 3 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#24](24_repository_map_and_monorepo_boundaries/proposal.md) (the repository
-map) — **not built**. Everything else named below is a cross-reference, not a
+map) — built (Done 2026-10-09). Everything else named below is a cross-reference, not a
 prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.2
 (project indexer), section 19 (recommended technology direction). Related

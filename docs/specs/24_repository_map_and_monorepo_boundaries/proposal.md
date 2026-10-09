@@ -1,7 +1,12 @@
 # Feature Spec: Repository Map and Monorepo Boundaries
 
-Status: In progress. Split into a folder and planned on 2026-10-06. Design
-unchanged from the original flat spec. Corrections where it no longer matches
+Status: Done 2026-10-09. A deterministic, persisted map of a repository's
+project roots, rendered into model context under `repository_map_max_tokens`,
+with per-root commands that run in their own directory, root-qualified Allow
+Always, user overrides in repository config, and a roots view in Settings.
+§7 records what was built, what was not (frameworks and per-root permission
+restrictions), and the gate. Split into a folder and planned on 2026-10-06.
+Design unchanged from the original flat spec. Corrections where it no longer matches
 the code are in [`context.md`](context.md), not inlined here, the way specs 20,
 22 and 31 kept theirs. The most important ones:
 - commands already carry a working directory, but Allow Always and the
@@ -399,7 +404,7 @@ another file is named. Shell tests are in the `tests` module of
 | Search results and file displays qualify a basename by its root | `root_for_path_is_the_longest_root_that_is_a_segment_prefix` (the rule `app.js`'s `rootForPath` copies). Model-facing results already carry full paths (`context.md` §4) | Met, but the UI half has **no automated test**: the web UI has no JS test harness. Task 8 verified the chips (`index.ts · packages/api`), patch root tags and "Runs in" by hand in the running app |
 | A corrupt or version-mismatched map file rebuilds cleanly and reports that it did | `a_garbage_map_file_is_rebuilt_as_corrupt_and_audited`; `a_map_from_another_schema_version_is_rebuilt_as_a_mismatch`; `a_manifest_change_rebuilds_the_map_as_stale` | Met |
 | A root cannot widen `path_policy.rs` | `paths_resolve_from_the_working_directory_and_are_bounded_by_the_repository`; `a_working_directory_outside_the_repository_matches_nothing_and_needs_approval`; `a_refused_working_directory_never_stores_a_proposal`; shell `a_root_override_is_never_written_outside_the_allowed_roots` | Met |
-| Every quality-gate command passes, and the spec 18 baseline shows no regression | The Task 9 gate run, recorded in `tasks.md` | **Not met on 2026-10-09.** `cargo nextest run --workspace --locked` fails: 25 `desktop-shell` tests abort with SIGABRT at the default test-thread stack (`OBSERVATIONS.md` #26, pre-existing, being fixed separately). `token_ceiling::a_turn_stops_before_the_call_that_would_cross_the_ceiling` also failed because of this spec, and is now fixed (§7.3). The other six gate commands pass. The eval tier passes, and its token rise is exactly the one Tasks 6 and 7 recorded |
+| Every quality-gate command passes, and the spec 18 baseline shows no regression | The Task 9 gate run, recorded in `tasks.md` | Met on 2026-10-09, after the #26 stack fix landed on `main`: all seven commands pass, and `cargo nextest run --workspace --locked` runs 1118 tests with 0 failures and `RUST_MIN_STACK` unset. The first run that day failed 26 tests. 25 were `desktop-shell` stack aborts (`OBSERVATIONS.md` #26, fixed separately). One was `token_ceiling`, which this spec caused and Task 9 fixed (§7.3). The eval tier's token rise is exactly the +5,382 that Tasks 6 and 7 recorded, and every rate metric equals the baseline |
 
 Two requirements have no design in §5 and were **not built**
 (`context.md` §12):
