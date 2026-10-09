@@ -187,6 +187,13 @@ specs inherit:
   and `RepositoryMap::root_for_path` is the function #26's planned
   `ContextItem.root_path` should call.
 
+Re-checked on 2026-10-09, when [#38](38_subagent_model.md) was deferred
+rather than planned. It leaves the ready set, which is now #23, #25, #32, #50,
+#56 and #57. Nothing is promoted or demoted, because #38's only dependents,
+#39 and #40, were already blocked on it. Its stage 2 is superseded by #57's
+worktree workers, and stage 1 is re-evaluated once #57 has shipped. #38's
+Deferral section records the reasons.
+
 **#25 and #26 are the keystones now that #24 has landed.** #25 is the last
 thing in front of #26, and the whole tail waits on #26. Preferring a spec that
 unblocks nothing over one of these costs more than it looks like it does.
@@ -200,7 +207,7 @@ unblocks nothing over one of these costs more than it looks like it does.
 | 5 | #27, #54, #51 | The fan-out once #26 has landed |
 | 6 | #28 → #29 → #30 | Memory, strictly serial |
 | 7 | #35 → #36/#37; #33 → #52 | Delivery and extensibility clusters |
-| 8 | #38/#39/#40 | Last, and #40 may legitimately conclude "do not" |
+| 8 | #38/#39/#40 | Last, and #40 may legitimately conclude "do not". #38 is deferred until #57 has shipped |
 
 [#56](56_provider_fallback_consent/proposal.md) is the opportunistic one: small, ready,
 and it closes the half of #48 that shipped as only a negative guarantee.
@@ -297,7 +304,7 @@ is ready.
 | 35 | [35_commit_preparation.md](35_commit_preparation.md) | **Not started.** Roadmap Phase 5 WP1. Damaian's first write to a user's Git repository. Builds the commit through a private index so the user's staging is never touched, runs hooks rather than bypassing them, and closes a trap: `GitService::diff` redacts, so a user could approve a diff showing `[REDACTED]` and commit the real secret. |
 | 36 | [36_branch_and_worktree_delivery.md](36_branch_and_worktree_delivery.md) | **Not started.** Roadmap Phase 5 WP2. Branch suggestion, creation, ahead/behind, merge-base, and conflict prediction via `merge-tree --write-tree` so preparation provably cannot execute. Written to work with no worktree support, since its stated dependency (Phase 2 WP4) is Should-tier and unspecified. |
 | 37 | [37_pull_request_creation.md](37_pull_request_creation.md) | **Not started.** Roadmap Phase 5 WP4. Push and publication as two typed approvals that cannot substitute for each other, base branch asked for rather than inferred, force push refused rather than gated, and interrupted PR creation resolved by a duplicate search before any retry. Uses MCP rather than a bespoke client. |
-| 38 | [38_subagent_model.md](38_subagent_model.md) | **Not started.** Roadmap Phase 6 WP1, and gated on that phase's eight readiness gates being measured first. Subagents as in-process tasks whose capability can only be derived by narrowing a parent's, staged read-only-first. Corrects the roadmap's process-based framing and the flat `CancelToken`. |
+| 38 | [38_subagent_model.md](38_subagent_model.md) | **Not started; deferred 2026-10-09.** Stage 2 (editing subagents) is superseded by #57's worktree workers; stage 1 is re-evaluated once #57 and its result-summary follow-up have shipped, and may then be recorded as abandoned. Its §Deferral says why. Roadmap Phase 6 WP1, and gated on that phase's eight readiness gates being measured first. Subagents as in-process tasks whose capability can only be derived by narrowing a parent's, staged read-only-first. Corrects the roadmap's process-based framing and the flat `CancelToken`. |
 | 39 | [39_coordination_and_conflict_handling.md](39_coordination_and_conflict_handling.md) | **Not started.** Roadmap Phase 6 WP2. Exclusive file-ownership claims checked at spawn *and* before every write, serialized patch integration with `base_hash` revalidation between applies, and a combined-check rerun that catches two individually-passing patches failing together. |
 | 40 | [40_autonomy_evaluations.md](40_autonomy_evaluations.md) | **Not started.** Roadmap Phase 6 WP7. The decision instrument: same scenarios run in both execution modes, cost amplification as a ratio, and an experimental label *derived* from the recorded comparison rather than chosen. Makes abandoning Phase 6 a first-class recorded outcome. |
 | 41 | [41_ui_density_and_action_hierarchy/](41_ui_density_and_action_hierarchy/proposal.md) | **Done.** Collapsed command approval 161px → 104px, patch actions from half the conversation column to their natural width. Usability-driven, not a roadmap graduation: the shell has exactly one button style, so a one-shot `Approve Run` and a persistent `Allow Always` are visually identical, and a stray `min-height: 180px` on base `pre` makes every command approval reserve 180px of empty rationale pane. Introduces the button scale in [`../UI_STYLE_GUIDE.md`](../UI_STYLE_GUIDE.md) and applies it to the approval and patch cards. Presentation only — the approval policy from #10, #12 and #34 is untouched. Also builds `docs/ui-style-guide.html`, a specimen page that loads the shipping stylesheet so the guide has a rendered counterpart that cannot drift. First of three UI specs; the conversation column and the remaining chrome follow. |

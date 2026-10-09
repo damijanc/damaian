@@ -39,8 +39,10 @@ session with its own approvals, mode, audit trail and session log, and nothing
 flows from a worker back to the planner — the repository is the only channel,
 exactly as `AGENTS.md` already requires between task sessions. The planner is
 only where the user happened to be standing when they started it. So #38's
-readiness gates do not apply, and this spec does not make #38 more or less
-likely to be built.
+readiness gates do not apply. This spec does not depend on #38. It did,
+however, change #38's case: on 2026-10-09 #38 was deferred until this spec
+has shipped, with its stage 2 superseded by these worktree workers. #38's
+Deferral section says why.
 
 What this spec does inherit from #38 is the one rule that matters: **a worker is
 a different host for the same turn, never a different turn.** §5.2 of the
