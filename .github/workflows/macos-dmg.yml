@@ -467,3 +467,29 @@ jobs:
           # Another tag's run may have landed on main since checkout.
           git pull --rebase origin main
           git push origin HEAD:main
+
+  # The landing page (damijanc/damaian-website) links straight to the DMG, so
+  # it rebuilds from the latest release when told one exists. GITHUB_TOKEN
+  # cannot dispatch to another repository, hence a fine-grained token scoped to
+  # damaian-website with Contents: read and write. Runs beside the changelog
+  # job, not after it, so a changelog push failure cannot keep the site stale.
+  notify-website:
+    name: Notify website
+    needs: publish-release
+    runs-on: ubuntu-latest
+    permissions: {}
+
+    steps:
+      - name: Dispatch client-release to damaian-website
+        env:
+          GH_TOKEN: ${{ secrets.WEBSITE_DISPATCH_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "WEBSITE_DISPATCH_TOKEN is not set; the site picks up ${TAG_NAME} on its daily rebuild."
+            exit 0
+          fi
+          gh api repos/damijanc/damaian-website/dispatches \
+            -f event_type=client-release \
+            -f "client_payload[tag]=${TAG_NAME}"
