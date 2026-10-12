@@ -20,7 +20,7 @@ specs: [`10_persistent_command_approval.md`](10_persistent_command_approval.md),
 [`20_working_modes/proposal.md`](20_working_modes/proposal.md),
 [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md),
 [`22_findings_model_and_panel/proposal.md`](22_findings_model_and_panel/proposal.md) (hooks return
-`Finding`s), [`23_verification_loop.md`](23_verification_loop.md),
+`Finding`s), [`23_verification_loop/proposal.md`](23_verification_loop/proposal.md),
 [`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) (the profile a hook
 cannot widen).
 
@@ -114,7 +114,7 @@ context; return a structured `Finding`; run an approved local command.
 - Remote or downloaded hooks. Hooks are local executables the user configured.
 - Hooks on model requests or responses as such. `before_context` covers what is
   assembled; there is no hook that rewrites a prompt.
-- Replacing the verification loop ([spec 23](23_verification_loop.md)).
+- Replacing the verification loop ([spec 23](23_verification_loop/proposal.md)).
   `after_check` observes check results; it does not schedule checks.
 - Asynchronous or long-running hooks. §5.4 enforces short timeouts, and
   background work belongs to Phase 2 WP5.

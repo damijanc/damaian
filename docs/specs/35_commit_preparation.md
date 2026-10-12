@@ -7,7 +7,7 @@ Package 1 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#16](16_session_checkpoints_and_rewind.md) (checkpoints) — built;
 [#22](22_findings_model_and_panel/proposal.md) (findings) — built;
-[#23](23_verification_loop.md) (the verification loop) — **not built**;
+[#23](23_verification_loop/proposal.md) (the verification loop) — **not built**;
 [#31](31_permission_profiles/proposal.md) (profiles) — built. Everything else
 named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.7 (diff
@@ -20,7 +20,7 @@ warn-and-override mechanism §5.4 reuses),
 [`16_session_checkpoints_and_rewind.md`](16_session_checkpoints_and_rewind.md),
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (a commit is a side-effecting action with an unknown-outcome window),
-[`23_verification_loop.md`](23_verification_loop.md) (check evidence),
+[`23_verification_loop/proposal.md`](23_verification_loop/proposal.md) (check evidence),
 [`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) and
 [`34_repository_config_trust_boundary.md`](34_repository_config_trust_boundary.md)
 (Git mutation is a capability), [`36_branch_and_worktree_delivery.md`](36_branch_and_worktree_delivery.md).

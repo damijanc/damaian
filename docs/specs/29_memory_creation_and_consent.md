@@ -352,7 +352,7 @@ scope.
 
 Suggestions appear at the end of a task, collapsed to a count when there is more
 than one, so they do not compete with the completion report
-([spec 23](23_verification_loop.md)).
+([spec 23](23_verification_loop/proposal.md)).
 
 ### 5.8 Evals
 
