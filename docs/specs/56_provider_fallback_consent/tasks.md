@@ -3,14 +3,14 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md)
-**Started:** not yet (planned 2026-10-07)
+**Started:** 2026-10-07
 
 ## Progress
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · The offer and the decline (engine) | Not started | |
-| 2 · Approval: re-issue, record, offer once (engine) | Not started | |
+| 1 · The offer and the decline (engine) | Done 2026-10-07 | `Config::fallback_provider_for` (C2, C3) and the pause in the refusal arm, through a new `pause_for_provider_fallback`, after all of spec 48's bookkeeping. `resume_after_fallback_decision` handles decline. Approve returns `InvalidInput` and puts the offer back until Task 2. Also landed: the command-resume guard, `PausedTurns::provider_fallback_target`, `ReattachedApproval::ProviderFallback`, and two audit events, `provider_fallback_offered` and `provider_fallback_decision`. **Deviations:** (a) `TurnProposals` is unchanged: the pause returns from the refusal arm directly, so only `ChatTurnResult` gained a field. (b) `ProviderRefusal::from_code` was added in `error.rs`, because `ProviderRefusal` is not serialisable and the decline must return the refusal. (c) The config tests live in `tests/provider_limits.rs`, since `config.rs` has no inline test module. (d) `desktop-shell/src/recovery.rs` gained a minimal `ProviderFallback` arm (kind `provider_fallback`, payload `{proposalId, fallbackProvider}`) so the workspace keeps compiling. No card renders it yet; that is Task 3. (e) Two tests beyond the plan: `a_quota_exhaustion_with_only_a_shared_key_fails_closed` and `a_fallback_offer_whose_paused_turn_is_gone_fails_on_restart`. (f) The tests were written after the code, not before. As a substitute for the red step, each guard was broken and the tests watched fail: the offer turned off (7 failures), the quota key check removed (3), the command-resume guard removed (1, which ran an empty command for 7.6s). **For Task 2:** the pending turn stores the *refused* round and its messages as sent, so approval re-enters at `pending.round`. The offer text is in `ChatTurnResult.response` only and is never appended to the session. Nothing guards a second offer yet: an approved turn that is refused again would be offered again, which Task 2's `provider_fallback_used` closes. **Checks:** `provider_limits` 22/22. The scoped run (provider_limits, crash_recovery and recovery_prompt binaries, plus fallback/reattach/refusal/recovery tests in the engine and shell) 120/120. fmt, clippy on `-p workspace-engine -p desktop-shell --all-targets -D warnings`, and typos all clean. |
+| 2 · Approval: re-issue, record, offer once (engine) | Done 2026-10-09 | The approve arm of `resume_after_fallback_decision` enforces C1: an engine whose active provider is not the offered fallback gets `InvalidInput`, and the offer is put back. It then hands off to a new `reissue_through_fallback`, which audits `provider_fallback_decision` (`approved`, with the fallback's model), writes a `provider_fallback` task event via `SessionStore::record_provider_fallback`, appends a `system` transcript message (`"Switched to <fallback> (<model>) for this turn after <refused> refused it (<code>)."`), clears pending approvals, sets `PreparingContext`, and re-enters `run_agentic_turn` at `pending.round` with `provider_fallback_used = true`. The refusal arm skips the offer when that flag is set. `SessionStore::read_provider_fallbacks` reads the switches back from all events, not only active ones: a rewind does not change which model answered a billed call. **Deviations:** (a) `ChatTurnOptions.provider_fallback_used` is `pub`. A crate-private field cannot be filled by `..Default::default()` from another crate, which broke the shell's literal. Setting it can only suppress an offer, the fail-closed direction. The two existing literals (`desktop-shell/src/lib.rs`, `tests/foundation.rs`) gained `..ChatTurnOptions::default()`. That is a one-line shell edit ahead of Task 3, needed to compile. (b) The transcript marker uses role `system`. Earlier turns reach the model as plain `role: content` lines in `build_model_prompt`, so it reads as a fact, and it says "switched to" because it is written before the fallback answers. (c) `the_next_turn_uses_the_configured_provider_again` became `a_later_turn_is_offered_again_rather_than_switched`. It asserts the next turn's request goes to `primary` *and* that a refusal there gets a fresh offer, so neither the switch nor the once-per-turn flag leaks into the next turn. (d) As in Task 1, tests came after the code. The red step was replaced by breaking each guard: approving with `provider_fallback_used = false` fails `a_fallback_that_also_refuses_…`, `pending.round + 1` fails `an_approved_offer_reissues_…` (via the audited `toolRound`), and dropping the C1 check fails `an_approval_from_an_engine_still_on_the_refused_provider_…`. **For Task 3:** the shell must build the approving engine with `config_for_repo_with_provider(repo, Some(target))`. The marker is an ordinary `system` session message, which `app.js` must render on reload. **Checks:** `provider_limits` 28/28. The wider scoped run (provider_limits, crash_recovery, recovery_prompt, foundation and checkpoint_wiring binaries, plus fallback/reattach/refusal/recovery tests in the engine and shell) 290/290. Eval harness deterministic tier: 16/16 scenarios pass. fmt, clippy on `-p workspace-engine -p desktop-shell --all-targets -D warnings`, and typos all clean. |
 | 3 · Shell, frontend, docs, close the spec | Not started | |
 
 **Goal:** Turn spec 48's fail-closed refusal into a choice. On a terminal
@@ -105,7 +105,7 @@ Every task's requirements implicitly include this section.
 | Function / item | Task | Change |
 |---|---|---|
 | `struct ChatTurnOptions` (`chat.rs:366`) | 2 | Gains `#[serde(default)] pub provider_fallback_used: bool`. It is already persisted in every `PendingChatTurn`, so the "once per turn" guard survives a later command pause and a restart within the same turn. Callers that build `ChatTurnOptions` by hand get `false`. |
-| `struct TurnProposals` (`chat.rs:359`) and `pub struct ChatTurnResult` (`chat.rs:320`) | 1 | Gain `fallback: Option<AgentFallbackProposal>` / `fallback_proposal`. That is a new public struct: `id`, `refused_provider`, `refused_model`, `fallback_provider`, `fallback_model`, `refusal_code`, `message`. Every `ChatTurnResult { .. }` literal gains `fallback_proposal: None`. |
+| `pub struct ChatTurnResult` (`chat.rs:320`) | 1 | Gains `fallback_proposal: Option<AgentFallbackProposal>` (`TurnProposals` stays unchanged: the pause returns from the refusal arm directly, see the Task 1 row). That is a new public struct: `id`, `refused_provider`, `refused_model`, `fallback_provider`, `fallback_model`, `refusal_code`, `message`. Every `ChatTurnResult { .. }` literal gains `fallback_proposal: None`. |
 | `struct PendingChatTurn` (`chat.rs:3424`) | 1 | Gains `#[serde(default)] provider_fallback: Option<PendingProviderFallback>`. Every `PendingChatTurn { .. }` literal gains `provider_fallback: None`: the plan-review site (~2187) and the command/MCP/web sites (~2320, ~2650, ~2757). |
 | `run_agentic_turn` (`chat.rs:1482`), the `Err(ClientError::Provider(..))` arm (`chat.rs:1879–1928`) | 1 (pause), 2 (guard) | After the existing marker, usage and audit bookkeeping: if `!turn_options.provider_fallback_used` and `self.config.fallback_provider_for(&refusal)` is `Some`, it saves the pending turn (same `round`, `messages` as sent, no `matched_tool_call`), calls `note_pending_approvals` with kind `"provider_fallback"` and `session_store.await_approval`, and returns `Ok(ChatTurnResult)` directly, not through `terminal`. Otherwise it fails as today. Returning early also skips `seal_turn_checkpoint`, which is correct: the turn is not over. |
 | `resume_after_command_decision_with_options` (`chat.rs:805`) | 1 | A guard beside the existing `plan_review` one: a pending turn with `provider_fallback` is put back and refused with `InvalidInput`, so it can never be run as a shell command. |
@@ -126,7 +126,7 @@ Task 1), `desktop-shell/src/lib.rs`, `desktop-shell/src/recovery.rs`, and
 candidate; crash between offer and decision). **Corrections:** C2, C3, C5.
 **Files:** `config.rs`, `chat.rs`, `recovery.rs`, `tests/provider_limits.rs`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
   - `config.rs`, unit tests on `Config::fallback_provider_for(&ProviderRefusal)`:
     `no_candidate_when_only_the_active_provider_is_configured`,
     `a_provider_with_an_empty_key_env_is_not_a_candidate`,
@@ -150,33 +150,33 @@ candidate; crash between offer and decision). **Corrections:** C2, C3, C5.
     `a_pending_fallback_reattaches_on_restart` (through
     `reattach_pending_approvals`; a missing pending file fails the task as
     `Unavailable`).
-- [ ] **Step 2: Run them and confirm they fail** for the expected reason.
-- [ ] **Step 3: `Config::fallback_provider_for`** (C2, C3). It is pure, reads
+- [x] **Step 2: Run them and confirm they fail** for the expected reason.
+- [x] **Step 3: `Config::fallback_provider_for`** (C2, C3). It is pure, reads
       only `model_providers`, the active provider's entry (or its built-in
       config), and names. No key resolution.
-- [ ] **Step 4: Types.** `PendingProviderFallback`, `AgentFallbackProposal`,
+- [x] **Step 4: Types.** `PendingProviderFallback`, `AgentFallbackProposal`,
       the `PendingChatTurn` / `TurnProposals` / `ChatTurnResult` fields, and the
       literal updates listed in the table above.
-- [ ] **Step 5: Pause in the refusal arm**, after the existing bookkeeping.
+- [x] **Step 5: Pause in the refusal arm**, after the existing bookkeeping.
       Leave the `Err` path textually intact as the `else`.
-- [ ] **Step 6: `resume_after_fallback_decision`, decline arm.** The approve
+- [x] **Step 6: `resume_after_fallback_decision`, decline arm.** The approve
       arm returns `InvalidInput("not yet implemented")` until Task 2. Put the
       pending turn back before returning it, so Task 2's test can drive the
       same file.
-- [ ] **Step 7: Guards and accessor.** The command-resume guard, and
+- [x] **Step 7: Guards and accessor.** The command-resume guard, and
       `PausedTurns::provider_fallback_target`.
-- [ ] **Step 8: Recovery.** Add a `"provider_fallback"` arm to
+- [x] **Step 8: Recovery.** Add a `"provider_fallback"` arm to
       `reattach_pending_approvals` returning a new
       `ReattachedApproval::ProviderFallback { task_id, proposal_id, fallback_provider }`.
       Keep the match exhaustive and do not use a wildcard. Fix the
       `PendingApprovalRef.kind` doc comment (`session.rs:221`), which already
       omits `"plan"`.
-- [ ] **Step 9: Falsify.** Drop the quota key-env check and confirm the quota
+- [x] **Step 9: Falsify.** Drop the quota key-env check and confirm the quota
       test fails. Make the arm offer even when `provider_fallback_used`
       (temporarily hard-code `false`) and confirm nothing in Task 1 notices.
       That gap is Task 2's test. Revert both.
-- [ ] **Step 10: Update `proposal.md`** for C2, C3, C4 and C5 (§2, §5.2, §7).
-- [ ] **Step 11: Scoped checks.** Run
+- [x] **Step 10: Update `proposal.md`** for C2, C3, C4 and C5 (§2, §5.2, §7).
+- [x] **Step 11: Scoped checks.** Run
       `CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test provider_limits`,
       `CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine -E 'test(fallback) + test(reattach)'`,
       then `cargo fmt --all`,
@@ -190,7 +190,7 @@ candidate; crash between offer and decision). **Corrections:** C2, C3, C5.
 §5.1, §5.4, §5.5. **Corrections:** C1. **Files:** `chat.rs`, `session.rs`,
 `tests/provider_limits.rs`.
 
-- [ ] **Step 1: Write the failing tests** (`tests/provider_limits.rs`; each
+- [x] **Step 1: Write the failing tests** (`tests/provider_limits.rs`; each
       builds a second `WorkspaceEngine` from a config with the fallback
       provider active, the way the shell will):
   - `an_approved_offer_reissues_the_refused_call_through_the_fallback`. The
@@ -208,10 +208,10 @@ candidate; crash between offer and decision). **Corrections:** C2, C3, C5.
   - `the_plan_survives_an_approved_switch`. A plan set before the refusal is
     read back unchanged after the fallback turn (requirement 4).
   - `the_next_turn_uses_the_configured_provider_again` (not remembered).
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: `ChatTurnOptions.provider_fallback_used`**, and the guard in
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: `ChatTurnOptions.provider_fallback_used`**, and the guard in
       the refusal arm.
-- [ ] **Step 4: `SessionStore::record_provider_fallback(task, from, to)`**, a
+- [x] **Step 4: `SessionStore::record_provider_fallback(task, from, to)`**, a
       thin public wrapper appending a `provider_fallback` task event, following
       `await_approval`'s payload shape. For the transcript marker, append a
       plain session message on approval, before the re-issued call:
@@ -219,18 +219,18 @@ candidate; crash between offer and decision). **Corrections:** C2, C3, C5.
       renders it. A system-role message must not reach the model's history as
       an instruction, so check `bounded_messages`/`build_model_prompt` and use
       whatever role the existing session notes use.
-- [ ] **Step 5: Approve arm** of `resume_after_fallback_decision`: the C1
+- [x] **Step 5: Approve arm** of `resume_after_fallback_decision`: the C1
       check (put back on mismatch), then record, audit, clear pending
       approvals, set `PreparingContext`, and call `run_agentic_turn` at
       `pending.round` (not `+ 1`: the round never completed) with
       `provider_fallback_used = true`.
-- [ ] **Step 6: Falsify.** Pass `provider_fallback_used = false` on approve and
+- [x] **Step 6: Falsify.** Pass `provider_fallback_used = false` on approve and
       confirm the double-refusal test fails. Swap `pending.round` for
       `pending.round + 1` and confirm the round or budget assertion notices; if
       nothing notices, add an assertion that does. Revert both.
-- [ ] **Step 7: Eval harness.** This changes model-dependent recovery, so run
+- [x] **Step 7: Eval harness.** This changes model-dependent recovery, so run
       `CARGO_TARGET_DIR="$PWD/target" cargo run -p eval-harness -- run --tier deterministic`.
-- [ ] **Step 8: Scoped checks** as in Task 1 Step 11. Update the Progress
+- [x] **Step 8: Scoped checks** as in Task 1 Step 11. Update the Progress
       row. Then show the change and ask.
 
 ## Task 3: Shell, frontend, docs, close the spec

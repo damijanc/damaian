@@ -11,8 +11,8 @@
 |---|---|---|
 | 1 · Setting, worker record, handoff instruction | Done 2026-10-07 | `enable_worker_sessions` (default off) is Forbidden at repository scope and a `Capability` key in #31's partition. Beyond the planned touchpoints it needed `profile.rs::split_profile_keys`, a `weakening_cases` row, and a human name in `effective_policy.rs` (`every_rule_has_a_human_name` caught that one). `WorkerRecord` plus `record_worker_spawned`, `record_worker_child`, `worker_record`, `worker_children` and `worker_sessions_for_source` on `SessionStore`. Both `worker_spawned` events share one type; the parent's carries `workerSessionId`, which is how `worker_record` tells them apart. `worker_record` reads with `parsed_events`, so a rewind cannot turn a worker back into a session that is offered handoffs. `record_steering_note` is deferred to Task 2, which writes and tests the event. `system_prompt_for_session` and `WORKER_HANDOFF_PARAGRAPH` are in `chat.rs`, and `ask_with_session` calls it. Tests: 15 filtered tests, `repository_config_trust` (48) and `permission_profiles` all pass; fmt, clippy (`workspace-engine`) and typos are clean. **Order deviation:** a second agent started this task in the same worktree and was stopped. It had already written the config implementation, so Step 2 (fail first) was not observed. Step 6 stood in for it. Each change below was made separately and reverted, and each test it names failed: paragraph in `system_prompt` → the byte-identical test; dropping `is_none()` → `a_worker_session_never_gets_the_paragraph`; repository value applied → `repository_config_cannot_enable_worker_sessions`; by-source lookup ignoring the source → its test; default `true` → `worker_sessions_are_off_by_default`. The first breakage showed that the worker test compared only against `system_prompt(Code)`. It now also asserts that the prompt has no `worker-prompt`. |
 | 2 · `TurnSteering` and `TaskStatus::Paused` | Done 2026-10-09 | `steering.rs` (`TurnSteering`, 100 ms re-check), `TaskStatus::Paused` (not terminal, no side effect in flight; joins the resumable row of the crash-recovery matrix, now 45 cells), `SessionStore::record_steering_note` (deferred here from Task 1), `TurnSink.steering`, and `TurnProgress::{Paused, Resumed, NoteAdded}`. The boundary step sits at the top of the round `loop`. The pause hold runs **before** the cancel check, so a stop while paused takes the existing cancel path; the notes are drained after it. Resume restores the status the turn paused from. C5: `classify_session` withholds auto-resume for any session with a worker record. C4: 37 literals got `steering: None` (36 plus Task 1's handoff test). `turn_progress_event` now returns `Option` and drops the three new variants. **Discoveries:** (1) User prompts reach the model unredacted, which C3 did not expect. Notes are redacted anyway (stricter), and the log keeps them as written. (2) There is no composer length limit; Task 5's socket must bound note length. (3) `app.js` labels no in-flight status, so `paused` had nothing to join. (4) The `session_rewind.rs` status lists filter by property and needed no edit. **Scope addition, agreed 2026-10-08:** 7 `desktop-shell` route tests overflowed the 2 MiB stack of a spawned thread. `render_markdown_endpoint…` already overflowed before Task 1; Task 1's extra `Config` field pushed six findings-route tests over. Production had the same exposure: every turn ran on a default `thread::spawn`, and so did the desktop app's server thread. Added `desktop_shell::spawn_with_shell_stack` (8 MiB, matching the main thread) and used it for the turn worker in `stream_turn`, the `desktop-app` server thread, and the five test servers, so the tests run with the production stack. Added the test `the_shell_stack_holds_what_a_default_thread_cannot`. Merged with main on 2026-10-09, where a separate fix moved route bodies into `handle_*` functions and brought the router frame back under 2 MiB. The two are complementary. That fix covers the router frame; this one also covers the turn thread, which that fix leaves on 2 MiB. Both are kept. **Falsified:** pause moved after the model call → `pause_takes_effect_only_at_a_round_boundary` fails. That test first passed against this break; it now also asserts that round 1's tool phase precedes `Paused`. Drain dropped → both note tests fail. Stack set to 2 MiB → all 8 stack-dependent tests abort. **Checks:** `workspace-engine` 961/961; `desktop-shell` + `eval-harness` 158/158 on three consecutive runs. `a_deterministic_run_reports_the_token_figures_the_session_recorded` failed once, then passed four times: a flake, not investigated. fmt, clippy (`workspace-engine`, `desktop-shell`, `eval-harness`, `desktop-app`) and typos are clean. `app.js` is unchanged. |
-| 3 · The progress file | Not started | |
-| 4 · Worktree creation and removal | Not started | |
+| 3 · The progress file | Done 2026-10-09 | `worker_progress.rs`: `ProgressKind` (with `as_str`), `ProgressWriter::{create, append}`, `read_progress_after`, `progress_path`. `SessionStore::delete_session` also removes `<id>.progress.jsonl`. Each line is `{"seq","timestampMs","kind","payload"}`. The payload is nested, not flattened, so a caller's field cannot shadow `seq` or `kind`. Task 9 reads `event.payload.*`. `append` redacts every string in the payload at any depth (arrays and objects included), as C3 requires, and so does not depend on what the caller already redacted. `timestampMs` is `hash::now_millis()`, the session log's clock, written as a `u64`. `seq` is held in memory because the worker is the file's only writer. A missing file reads as empty. **Tests:** the six planned tests plus `a_session_without_a_progress_file_reads_as_empty` and `the_progress_file_sits_beside_the_session_log`. All 8 failed on `todo!()` stubs before the implementation. Now `worker_progress::` and `session::` 35/35, `tests/foundation.rs` 158/158 (it calls `delete_session`), fmt, clippy (`workspace-engine`) and typos are clean. **Falsified:** redaction skipped for `Tool` → the secret test fails. No recursion into arrays → it fails on the approval payload. The writer opened in append mode instead of truncating → the truncate test fails. A parse failure made fatal → the torn-line test fails. `delete_session` leaving the file → the delete test fails. All reverted. **Discovery and deviation:** a first version also cut the read at the last newline. Falsifying showed the cut did nothing. Every line ends in `}`, so a line missing only its newline is a complete object, and any shorter tear is invalid JSON that the parse-and-skip already drops. The cut was removed. A terminated line that does not parse is skipped too, because the file is a view and the audit log is the record. **For Task 6:** create the writer when the worker process starts, and pass it the session's `SecretScanner`. Text batching (about 250 ms) is the caller's job. `append` takes `&mut self`, so keep the writer on one thread or behind a `Mutex`. Two writers on one file would duplicate `seq`. |
+| 4 · Worktree creation and removal | Done 2026-10-12 | `worktree.rs`: `worker_slug`, `source_changes`/`SourceChanges`, `create_worker_worktree`/`CreatedWorktree`, `remove_worker_worktree`/`RemoveOutcome`, as the Interfaces fix them, reached as `workspace_engine::worktree::*` (not re-exported, like `worker_progress`). `checkpoint::run_user_git` is `pub(crate)`, and its doc comment says it now also runs mutating commands. Beside it is `user_git_command_line`, which renders the same argv (`git --no-optional-locks -C <root> …`, quoting arguments that contain whitespace or quotes), so a recorded command cannot drift from the one run. Every git command, read-only ones included, goes through one recording wrapper into `git_commands`. Creation follows §5.1 in order. (1) `rev-parse --show-toplevel` must equal the canonical source. (2) Base: `stash create`, else `rev-parse --verify HEAD^{commit}`. Naming uses one `for-each-ref refs/heads/damaian/` plus a `symlink_metadata` probe per candidate. (3) `.damaian`, `worktrees` and `<slug>` are each checked with `symlink_metadata`: a symlink, a non-directory or an existing `<slug>` is refused. Then `ls-files -- .damaian/worktrees/<slug>`, then containment of the deepest existing ancestor. (4) The exclude file comes from `rev-parse --git-path info/exclude`, so it also works when the source is itself a linked worktree. (5) `worktree add`. (6) Untracked files come from `ls-files --others --exclude-standard -z`. Symlinks are recreated, not followed, and a symlinked directory on the way into the worktree is refused. Removal refuses any path that is not a registered worktree directly under the source's `.damaian/worktrees/` reached through real directories. It passes `--force` only when the worktree is dirty **and** confirmed. **Tests:** 17 in `tests/worktree.rs`, all of which failed on `todo!()` stubs first; now 17/17. `tests/checkpoints.rs` + `tests/checkpoint_wiring.rs` + `worktree` 60/60, `checkpoint::` lib tests 5/5. fmt, clippy (`workspace-engine`) and typos are clean. **Falsified** (each reverted): Step 4's `path.exists()` → `refuses_a_symlink_anywhere_in_the_path` fails. Its symlinks point *inside* the repository, so only the per-component check can catch them. A symlink allowed at `.damaian/worktrees` alone → the same test fails on its second case. The outside test survives either guard on its own, because the per-component check and containment back each other up; with both removed it fails. Other breaks, each failing the test that guards it: `ls-files` check removed → the tracked test; exclude always appended → the exclude test; branch or path collisions ignored → the collision test; no `stash create` → the include test; untracked not copied → both include tests; dirty removed unconfirmed → the dirty test; exclude written before the checks → three refusal tests (their nothing-changed snapshots); `worktree add` run unrecorded → the created test; mentions matched by plain substring → `source_changes` (`data.txt` ≠ `a.txt`); top-level check removed → `refuses_a_subdirectory_of_a_repository`; removal target unchecked → `removal_refuses_a_path_that_is_not_a_worker_worktree`. **Deviations**, written into proposal §5.1: the slug comes from the first *non-blank* line; non-ASCII characters are dropped (`Ändere` → `ndere`), not used as separators; step 1 also refuses a subdirectory; removal validates its target. Added tests beyond the plan: subdirectory refusal and removal-target refusal. `mentioned` is ordered by first mention in the prompt, and the rest keep git's order. **For Task 7:** (a) With *Include*, the branch starts at the `git stash create` commit, which is a two-parent `WIP on <branch>` commit (its second parent is the index commit). Merging the worker's branch therefore carries that commit into history. This follows §5.1 as written. If that is unwanted, `commit-tree <stash>^{tree} -p HEAD` would give a single-parent base, but it needs a spec decision first. (b) A failure after step 5 (an untracked copy) leaves the worktree and branch in place and returns the error. Task 7 should still record `worker_spawned`/audit with `git_commands`, or remove the worktree. Nothing reports the partial commands yet, because the error path drops them. (c) `git_commands` holds absolute paths, which show the user's home directory. That is fine for the local audit log, but decide before showing them anywhere else. |
 | 5 · Worker process: handover, lifeline, control socket | Not started | |
 | 6 · Worker turns: steering, approvals, same-turn guarantee | Not started | |
 | 7 · Shell supervisor: spawn, lifetime, routes | Not started | |
@@ -193,7 +193,8 @@ impl TurnSteering {
 
 // worker_progress.rs
 pub enum ProgressKind { Status, Phase, Plan, Text, Tool, Approval, Note }
-pub struct ProgressWriter; // open truncates; append assigns seq from 1; redacts every value
+pub struct ProgressWriter; // open truncates; append assigns seq from 1; redacts every string in the payload
+// each line: {"seq": u64, "timestampMs": u64, "kind": ProgressKind::as_str(), "payload": <redacted value>}
 impl ProgressWriter {
     pub fn create(data_dir: &Path, session_id: &str, scanner: SecretScanner) -> Result<Self>;
     pub fn append(&mut self, kind: ProgressKind, payload: serde_json::Value) -> Result<u64>;
@@ -357,7 +358,7 @@ C4, C5. **Files:** `steering.rs` (new), `chat.rs`, `session.rs`,
 `worker_progress.rs` (new), `session.rs` (`delete_session` also deletes the
 progress file).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
   - `seq_strictly_increases_from_one`.
   - `creating_a_writer_truncates_the_previous_file`. A restarted worker starts
     again from 1.
@@ -369,26 +370,26 @@ progress file).
   - `a_torn_last_line_is_skipped_not_fatal`. The reader runs while the writer
     appends, so a partial final line is expected.
   - `deleting_a_session_deletes_its_progress_file`.
-- [ ] **Step 2: Run to verify they fail**
-- [ ] **Step 3: Implement.** Use one `write_all` of a full line per append.
+- [x] **Step 2: Run to verify they fail**
+- [x] **Step 3: Implement.** Use one `write_all` of a full line per append.
       `timestampMs` comes from the same clock helper the session log uses.
       Text batching (about 250 ms) belongs to the caller, Task 6, not to this
       writer.
-- [ ] **Step 4: Falsify.** Skip redaction for one kind and confirm the secret
+- [x] **Step 4: Falsify.** Skip redaction for one kind and confirm the secret
       test fails.
-- [ ] **Step 5: Update the proposal** for C3 (progress).
-- [ ] **Step 6: Scoped checks, then show and ask**
+- [x] **Step 5: Update the proposal** for C3 (progress).
+- [x] **Step 6: Scoped checks, then show and ask**
 
 ## Task 4: Worktree creation and removal
 
 **Requirements:** 3, 10. **Proposal:** §5.1 (Naming, Creation steps 1–6,
 Removing). **Files:** `worktree.rs` (new), and `checkpoint.rs` if
-`run_user_git` (`checkpoint.rs:1129`) is lifted to `pub(crate)`. Lift it, with
+`run_user_git` (`checkpoint.rs:1129` when planned; `:1134` after this task) is lifted to `pub(crate)`. Lift it, with
 a doc comment saying that it now also runs mutating commands, rather than
 writing a second git runner. Every command run is appended to
 `CreatedWorktree.git_commands` exactly as it was executed.
 
-- [ ] **Step 1: Write the failing tests** in `crates/workspace-engine/tests/worktree.rs` (new).
+- [x] **Step 1: Write the failing tests** in `crates/workspace-engine/tests/worktree.rs` (new).
       Each test uses a fresh `git init` fixture in a temp dir.
   - `worker_slug`: ASCII lowercase words joined by `-`, at most 40 characters,
     `worker` when empty, and non-ASCII dropped.
@@ -413,14 +414,14 @@ writing a second git runner. Every command run is appended to
   - `removing_a_clean_worktree_keeps_its_branch`.
     `removing_a_dirty_worktree_reports_paths_and_does_not_force`, and only
     `force_after_confirmation` removes it.
-- [ ] **Step 2: Run to verify they fail**
-- [ ] **Step 3: Implement.** Run the checks in proposal §5.1's order, and run
+- [x] **Step 2: Run to verify they fail**
+- [x] **Step 3: Implement.** Run the checks in proposal §5.1's order, and run
       every refusal before the first mutation. Use `symlink_metadata` per
       component, not `canonicalize` alone, because `canonicalize` follows the
       link that the check exists to catch.
-- [ ] **Step 4: Falsify.** Replace the per-component check with
+- [x] **Step 4: Falsify.** Replace the per-component check with
       `path.exists()` and confirm the symlink tests fail.
-- [ ] **Step 5: Scoped checks, then show and ask**
+- [x] **Step 5: Scoped checks, then show and ask**
 
 ## Task 5: Worker process — handover, lifeline, control socket
 

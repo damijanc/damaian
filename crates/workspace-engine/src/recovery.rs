@@ -279,6 +279,15 @@ pub enum ReattachedApproval {
         plan: TaskPlan,
         deferred_action: String,
     },
+    /// A provider-fallback offer the turn had paused on (spec 56). Like a
+    /// plan review its paused turn is on disk, so the offer is made again
+    /// rather than lost; a paused turn that is gone fails the task instead,
+    /// because approving would have nothing to re-issue.
+    ProviderFallback {
+        task_id: String,
+        proposal_id: String,
+        fallback_provider: String,
+    },
     /// The link or the proposal file is gone, so the task was failed.
     ///
     /// §5.5: never an approval card reconstructed from partial data. The user
@@ -330,6 +339,16 @@ pub fn reattach_pending_approvals(
             Some(PendingApprovalRef { kind, proposal_id }) if kind == "plan" => {
                 reattach_plan(store, paused, session_id, &task_id, proposal_id)
             }
+            Some(PendingApprovalRef { kind, proposal_id }) if kind == "provider_fallback" => paused
+                .provider_fallback_target(proposal_id)
+                .map(|fallback_provider| ReattachedApproval::ProviderFallback {
+                    task_id: task_id.clone(),
+                    proposal_id: proposal_id.clone(),
+                    fallback_provider,
+                })
+                .ok_or_else(|| {
+                    format!("the paused turn behind fallback offer {proposal_id} is gone")
+                }),
             Some(PendingApprovalRef { kind, .. }) => {
                 Err(format!("unknown pending approval kind {kind}"))
             }

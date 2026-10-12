@@ -549,6 +549,23 @@ fn describe_approval(
             ),
             unavailable_reason: None,
         },
+        // Spec 56. The card that renders this lands with the shell route in
+        // that spec's Task 3; the payload already names what it needs.
+        ReattachedApproval::ProviderFallback {
+            task_id,
+            proposal_id,
+            fallback_provider,
+        } => Approval {
+            session_id: session_id.to_string(),
+            task_id,
+            kind: "provider_fallback",
+            payload: format!(
+                "{{\"proposalId\":\"{}\",\"fallbackProvider\":\"{}\"}}",
+                escape_json(&proposal_id),
+                escape_json(&fallback_provider)
+            ),
+            unavailable_reason: None,
+        },
         ReattachedApproval::Unavailable { task_id, reason } => Approval {
             session_id: session_id.to_string(),
             task_id,

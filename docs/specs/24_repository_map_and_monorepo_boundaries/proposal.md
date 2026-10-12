@@ -31,7 +31,7 @@ Related spec sections: `ai_coding_assistant_specification.md` section 7.2
 [`11_agents_md_support.md`](../11_agents_md_support.md) (the per-root precedent this
 extends; instruction precedence is defined there and not redefined here),
 [`13_docker_command_support.md`](../13_docker_command_support.md),
-[`23_verification_loop.md`](../23_verification_loop.md) (runs the commands this
+[`23_verification_loop/proposal.md`](../23_verification_loop/proposal.md) (runs the commands this
 work package assigns to roots).
 
 ## 1. Motivation
@@ -255,7 +255,7 @@ is bounded.
 `detect_project_commands` is called once per detected root, with that root's
 path, and each resulting command records `working_directory: root.path`.
 
-The verification loop ([spec 23](../23_verification_loop.md)) and every other
+The verification loop ([spec 23](../23_verification_loop/proposal.md)) and every other
 command path use `working_directory` when executing. Requirement 5 is then a
 property of the data rather than a rule each call site must remember.
 
@@ -336,7 +336,7 @@ files, and its commands with their working directories.
 
 Requirement 4's "the UI shows which roots a task touched" is satisfied by
 grouping the task's changed files and command runs by `root_path` in the
-completion report ([spec 23](../23_verification_loop.md)).
+completion report ([spec 23](../23_verification_loop/proposal.md)).
 
 ### 5.10 Documentation
 

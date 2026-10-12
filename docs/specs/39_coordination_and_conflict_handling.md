@@ -20,7 +20,7 @@ implementation specs:
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md),
 [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md),
 [`22_findings_model_and_panel/proposal.md`](22_findings_model_and_panel/proposal.md),
-[`23_verification_loop.md`](23_verification_loop.md) (the checks §5.5 reruns),
+[`23_verification_loop/proposal.md`](23_verification_loop/proposal.md) (the checks §5.5 reruns),
 [`38_subagent_model.md`](38_subagent_model.md) (declares the agents this
 coordinates; its §5.4 staging gates when this spec's write path is needed),
 [`40_autonomy_evaluations.md`](40_autonomy_evaluations.md).
@@ -68,7 +68,7 @@ Nothing in this phase exists. What it builds on:
   (`session.rs:46-56`) gains `parent_task_id` in
   [spec 38](38_subagent_model.md) §5.9 and nothing else.
 - **The verification loop is per-task.**
-  [Spec 23](23_verification_loop.md) runs checks after a task's edits and records
+  [Spec 23](23_verification_loop/proposal.md) runs checks after a task's edits and records
   per-run file hashes, marking a run `stale_after_partial_acceptance` when the
   accepted set changes (§5.6 there) — the same staleness idea this spec needs for
   combined work.
@@ -231,10 +231,10 @@ Requirement 4, and the requirement most likely to be dropped because each child
 already ran its own checks and everything looked green.
 
 After the last patch is integrated, the verification loop
-([spec 23](23_verification_loop.md)) runs again over the **combined** state:
+([spec 23](23_verification_loop/proposal.md)) runs again over the **combined** state:
 
 - The check set is the union of the checks the children's changed paths select,
-  per [spec 23](23_verification_loop.md) §5.2's file-category targeting.
+  per [spec 23](23_verification_loop/proposal.md) §5.2's file-category targeting.
 - Every child's check runs whose recorded file hashes no longer match — the same
   `stale_after_partial_acceptance` mechanism (§5.6 there), applied to
   integration rather than partial acceptance. A child's passing `cargo test` is

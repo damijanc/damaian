@@ -242,7 +242,7 @@ pub enum ExportFormat {
 /// link back to the task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingApprovalRef {
-    /// `"command"` or `"patch"`.
+    /// `"command"`, `"patch"`, `"plan"` or `"provider_fallback"`.
     pub kind: String,
     pub proposal_id: String,
 }
@@ -558,6 +558,10 @@ impl SessionStore {
         let path = self.session_log_path(session_id);
         if path.exists() {
             fs::remove_file(path)?;
+        }
+        let progress = crate::worker_progress::progress_path(&self.data_dir, session_id);
+        if progress.exists() {
+            fs::remove_file(progress)?;
         }
         Ok(())
     }
@@ -1760,6 +1764,58 @@ impl SessionStore {
                 escape_json(approved_by)
             ),
         )
+    }
+
+    /// Records that the user let this task's refused model call be answered by
+    /// a different provider (spec 56 §5.4). Its own event, like
+    /// [`Self::approve_plan`]: a switch is a decision taken at a moment, and a
+    /// turn whose second half was answered by another model must say so after
+    /// a reload too.
+    pub fn record_provider_fallback(
+        &self,
+        task: &Task,
+        refused_provider: &str,
+        fallback_provider: &str,
+        approved_by: &str,
+    ) -> Result<()> {
+        self.append_session_event(
+            &task.session_id,
+            "provider_fallback",
+            &format!(
+                "{{\"taskId\":\"{}\",\"refusedProvider\":\"{}\",\"fallbackProvider\":\"{}\",\"approvedBy\":\"{}\"}}",
+                escape_json(&task.id),
+                escape_json(refused_provider),
+                escape_json(fallback_provider),
+                escape_json(approved_by)
+            ),
+        )
+    }
+
+    /// Every provider switch recorded on this session's tasks, as
+    /// `(task_id, refused_provider, fallback_provider)` in log order.
+    ///
+    /// All events, not only active ones, like [`Self::read_task_usage`]: a
+    /// rewind moves the conversation back, but it does not un-happen which
+    /// model answered a call that was billed.
+    pub fn read_provider_fallbacks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let Ok(content) = fs::read_to_string(self.session_log_path(session_id)) else {
+            return Ok(Vec::new());
+        };
+        Ok(parsed_events(&content)
+            .0
+            .iter()
+            .filter(|event| event.event_type == "provider_fallback")
+            .filter_map(|event| {
+                Some((
+                    event.text("taskId")?,
+                    event.text("refusedProvider")?,
+                    event.text("fallbackProvider")?,
+                ))
+            })
+            .collect())
     }
 
     /// Whether this task's plan has been approved.
@@ -3142,6 +3198,29 @@ mod tests {
         // A rewind discards conversation, not what the session is.
         store.rewind_conversation(&worker.id, 0).unwrap();
         assert!(store.worker_record(&worker.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn deleting_a_session_deletes_its_progress_file() {
+        use crate::worker_progress::{ProgressKind, ProgressWriter, progress_path};
+        let data_dir = temp_data_dir("worker-progress-delete");
+        let store = SessionStore::new(&data_dir);
+        let worker = store.create_session("repo_worktree", "Worker").unwrap();
+        let mut progress =
+            ProgressWriter::create(&data_dir, &worker.id, SecretScanner::default()).unwrap();
+        progress
+            .append(
+                ProgressKind::Status,
+                serde_json::json!({"status": "running"}),
+            )
+            .unwrap();
+        let path = progress_path(&data_dir, &worker.id);
+        assert!(path.exists());
+
+        store.delete_session(&worker.id).unwrap();
+
+        assert!(!path.exists());
+        assert!(!store.session_log_path(&worker.id).exists());
     }
 
     #[test]

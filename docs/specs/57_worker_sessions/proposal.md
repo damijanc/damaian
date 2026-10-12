@@ -1,6 +1,6 @@
 # Feature Spec: Worker Sessions
 
-Status: In progress (Tasks 1–2 of 11 done, 2026-10-07 and 2026-10-09; see [`tasks.md`](tasks.md))
+Status: In progress (Tasks 1–4 of 11 done, 2026-10-07, 2026-10-09, 2026-10-09 and 2026-10-12; see [`tasks.md`](tasks.md))
 Order: 57 of 57
 Plan: none. An exception to the graduation rule, like #41–#44 and #47: it came
 from describing how this repository is actually built — a planner session that
@@ -195,14 +195,17 @@ this is a content choice, not a consent escalation, so
 [`UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md) §5's rule against pre-selecting
 approval does not apply.
 
-**Naming.** A slug is taken from the first line of the prompt: lowercase ASCII
-words joined by `-`, at most 40 characters, `worker` if empty. The branch is
+**Naming.** A slug is taken from the first non-blank line of the prompt:
+lowercase ASCII words joined by `-`, at most 40 characters (cut at a word
+boundary), `worker` if empty. Non-ASCII characters are dropped, not treated as
+separators. The branch is
 `damaian/<slug>` and the worktree `<repo>/.damaian/worktrees/<slug>`. If either
 exists, `-2`, `-3`, … is appended to both until neither does.
 
 **Creation**, in order, refusing before any change if a check fails:
 
-1. Refuse if the source is not a git repository.
+1. Refuse if the source is not a git repository, or is a subdirectory of one
+   rather than its top level.
 2. Resolve the base. *Start from last commit*: `HEAD`. *Include*:
    `git stash create`, which records tracked changes as a commit object without
    touching the working tree or index; if it prints nothing, there were no
@@ -241,7 +244,9 @@ first entry of the worker's session. Repository configuration cannot start a
 worker, choose its location, or skip this click.
 
 **Removing a worktree** (board overflow, finished workers only):
-`git worktree remove <path>`. If the worktree has uncommitted changes, a second
+`git worktree remove <path>`, refused unless the path is a registered worktree
+directly under the source's `.damaian/worktrees/`, reached through no symlink.
+If the worktree has uncommitted changes, a second
 confirmation names the dirty paths first, following #36; `--force` is passed
 only after that confirmation. The branch is never deleted.
 
@@ -384,8 +389,11 @@ turn up on its own. The user restarts the worker instead (§5.7).
 
 ### 5.5 The progress file
 
-`<data_dir>/sessions/<id>.progress.jsonl`, one JSON object per line, each with
-`seq` (strictly increasing from 1 within the file) and `timestampMs`:
+`<data_dir>/sessions/<id>.progress.jsonl`, one JSON object per line:
+`{"seq", "timestampMs", "kind", "payload"}`. `seq` strictly increases from 1
+within the file. `timestampMs` uses the session log's clock. `payload`
+carries the columns below, nested so that a payload field can never collide
+with `seq` or `kind`:
 
 | `kind` | Carries |
 |---|---|
@@ -397,9 +405,14 @@ turn up on its own. The user restarts the worker instead (§5.7).
 | `approval` | the pending proposal, as the approval card needs it |
 | `note` | a steering note was added |
 
-Every value passes through the same secret redaction as the session log before it
-is written. The file is truncated when a worker process starts, and deleted with
-the session. The audit log stays the authoritative record of tool calls; this
+Every string in the payload, at any depth, passes through
+`SecretScanner::redact` before it is written. This is not "the same redaction
+as the session log": that log is unredacted on write and redacts at its call
+sites (correction C3), so this file redacts for itself and does not trust its
+caller. The file is truncated when a worker process starts, and deleted with
+the session (`SessionStore::delete_session`). A reader skips any line that does
+not parse, because it may read while the worker is appending. Each line is
+written whole by one `write_all`, so only the last line can be torn. The audit log stays the authoritative record of tool calls; this
 file exists so the board can show a per-session list without joining audit
 events on `taskId` (context §3.5).
 

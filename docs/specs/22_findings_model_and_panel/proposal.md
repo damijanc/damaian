@@ -23,12 +23,12 @@ Related implementation specs:
 [`05_clickable_file_references.md`](../05_clickable_file_references.md) (navigation),
 [`12_web_app_troubleshooting.md`](../12_web_app_troubleshooting/proposal.md) (the browser
 diagnostic source, extended additively in §5.4), and
-[`23_verification_loop.md`](../23_verification_loop.md), which consumes this model.
+[`23_verification_loop/proposal.md`](../23_verification_loop/proposal.md), which consumes this model.
 
 Implementation order note: the roadmap has WP3 (verification loop) requiring
 "convert failures into structured findings (WP6)" while listing WP6 as depending
 on WP3. The `Finding` type has to exist before the loop that produces them, so
-this spec is numbered ahead of [`23_verification_loop.md`](../23_verification_loop.md).
+this spec is numbered ahead of [`23_verification_loop/proposal.md`](../23_verification_loop/proposal.md).
 The panel may follow the loop; the type may not.
 
 ## 1. Motivation
@@ -50,7 +50,7 @@ diagnostics, Phase 4's hook findings, Phase 5's pull-request review findings,
 Phase 6's subagent results. Defining it late means defining it four times, and
 four incompatible definitions is the normal outcome.
 
-It is also the prerequisite for [spec 23](../23_verification_loop.md). A repair loop
+It is also the prerequisite for [spec 23](../23_verification_loop/proposal.md). A repair loop
 needs to know what to repair, and "the test output contained the word failed" is
 not a repair target.
 
@@ -104,7 +104,7 @@ not a repair target.
   for the same line are two findings from two sources; merging them is a Phase 3
   question once LSP exists.
 - Fixing findings. This spec makes a finding addressable and lets the user select
-  a subset to fix; the repair loop is [spec 23](../23_verification_loop.md).
+  a subset to fix; the repair loop is [spec 23](../23_verification_loop/proposal.md).
 - Severity normalisation across tools into a single scale with comparable
   meaning. Severity is recorded as the source reported it, mapped onto a small
   fixed set, and §5.2 is explicit that cross-source comparison is not implied.

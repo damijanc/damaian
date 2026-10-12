@@ -1718,6 +1718,7 @@ fn run_chat_request(
     };
     let turn_options = ChatTurnOptions {
         continue_debugging: form.get("continue_debugging").map(String::as_str) == Some("true"),
+        ..ChatTurnOptions::default()
     };
     engine
         .chat_orchestrator
