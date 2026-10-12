@@ -68,6 +68,10 @@ pub enum ProcessKind {
     Command,
     /// A spec 32 hook executable.
     Hook,
+    /// A spec 57 worker process. The **shell** registers it (owner = shell),
+    /// so the launch sweep kills the workers of a crashed shell; each worker
+    /// registers its own children, so its `sweep_own` kills exactly those.
+    Worker,
 }
 
 impl ProcessKind {
@@ -78,6 +82,7 @@ impl ProcessKind {
             Self::Terminal => "terminal",
             Self::Command => "command",
             Self::Hook => "hook",
+            Self::Worker => "worker",
         }
     }
 }
@@ -551,6 +556,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch data dir");
         dir
+    }
+
+    #[test]
+    fn a_worker_is_recorded_as_worker() {
+        let data_dir = scratch("worker-kind");
+        let registry = ProcessRegistry::open(&data_dir).unwrap();
+        let _handle = registry
+            .register(ProcessKind::Worker, "session_w", std::process::id())
+            .unwrap();
+        let entries = registry.entries().unwrap();
+        let entry = entries[0].1.as_ref().unwrap();
+        assert_eq!(entry.kind, "worker");
+        assert_eq!(entry.session_id, "session_w");
     }
 
     #[test]

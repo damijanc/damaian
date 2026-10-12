@@ -26,6 +26,9 @@ use workspace_engine::{
 mod keychain;
 mod recovery;
 pub mod terminal;
+mod worker;
+
+pub use worker::{WORKER_FLAG, run_worker_from_args, worker_socket_path};
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const STYLE_CSS: &str = include_str!("../static/style.css");

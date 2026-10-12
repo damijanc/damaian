@@ -1,6 +1,6 @@
 # Feature Spec: Worker Sessions
 
-Status: In progress (Tasks 1–4 of 11 done, 2026-10-07, 2026-10-09, 2026-10-09 and 2026-10-12; see [`tasks.md`](tasks.md))
+Status: In progress (Tasks 1–5 of 11 done, 2026-10-07, 2026-10-09, 2026-10-09, 2026-10-12 and 2026-10-12; see [`tasks.md`](tasks.md))
 Order: 57 of 57
 Plan: none. An exception to the graduation rule, like #41–#44 and #47: it came
 from describing how this repository is actually built — a planner session that
@@ -281,10 +281,22 @@ turns through the same `ChatOrchestrator` entry points the shell uses. Its
 Nothing in command policy, redaction, approval, mode enforcement or audit is
 reimplemented or bypassed.
 
-**Control socket.** `<data_dir>/workers/<session-id>.sock`, a Unix domain socket
-created with mode `0600` in a directory with mode `0700`. Line-delimited JSON
-requests, one response each. Every request carries the token; a wrong or
-missing token closes the connection. Commands:
+**Control socket.** `<data_dir>/workers/<hash>.sock`, where `<hash>` is the
+first 16 hex characters of the SHA-256 of the session id
+(`desktop_shell::worker_socket_path`, which the shell uses too). A Unix domain
+socket created with mode `0600` in a directory with mode `0700`. It is not named
+by the session id itself because that does not fit: macOS caps `sun_path` at 104
+bytes including its NUL, and the id-named path measured 107 bytes under the real
+`~/Library/Application Support/DamaianClient` and 132 under a `/var/folders/…`
+test directory (2026-10-12). The hashed path is 91 bytes under the real
+directory. When even that does not fit, the worker refuses to start and says
+how long the path is. A leftover socket from a crashed worker is replaced; one
+that still answers is not, because a live worker holds it. Line-delimited JSON
+requests, one response each, one connection at a time; a connection idle for 5
+seconds is closed. Every request carries the token; a wrong or missing token
+closes the connection unanswered. Requests are bounded: a line at 256 KiB, a
+note at 16 KiB. A request with an argument the table does not name is refused.
+Commands:
 
 | Command | Effect |
 |---|---|
@@ -300,8 +312,14 @@ missing token closes the connection. Commands:
 Unknown commands are rejected. The shell stays single-threaded: each exchange is
 short, and the shell never holds a socket open.
 
-**Registration.** The worker registers its PID with the #46 process registry,
-tagged with its session id, and appends a `worker_started` event.
+**Registration** (correction C6 in [`tasks.md`](tasks.md)). The #46 registry
+records the registering process as an entry's owner, so the **shell** registers
+each worker it spawns, as `ProcessKind::Worker` with the worker's session id.
+The launch sweep then kills the workers of a crashed shell, and the shell's own
+`sweep_own` reaches them on a signal. Each worker registers its own children,
+with itself as owner, so the worker's `sweep_own` kills exactly those. The
+spawn itself is recorded as `worker_spawned` (§5.1 steps 7–8); there is no
+separate `worker_started` event.
 
 ### 5.3 Lifetime: nothing survives
 
