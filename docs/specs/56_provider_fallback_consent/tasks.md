@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md)
-**Started:** 2026-10-07
+**Started:** 2026-10-07 — **Done:** 2026-10-12
 
 ## Progress
 
@@ -11,7 +11,7 @@
 |---|---|---|
 | 1 · The offer and the decline (engine) | Done 2026-10-07 | `Config::fallback_provider_for` (C2, C3) and the pause in the refusal arm, through a new `pause_for_provider_fallback`, after all of spec 48's bookkeeping. `resume_after_fallback_decision` handles decline. Approve returns `InvalidInput` and puts the offer back until Task 2. Also landed: the command-resume guard, `PausedTurns::provider_fallback_target`, `ReattachedApproval::ProviderFallback`, and two audit events, `provider_fallback_offered` and `provider_fallback_decision`. **Deviations:** (a) `TurnProposals` is unchanged: the pause returns from the refusal arm directly, so only `ChatTurnResult` gained a field. (b) `ProviderRefusal::from_code` was added in `error.rs`, because `ProviderRefusal` is not serialisable and the decline must return the refusal. (c) The config tests live in `tests/provider_limits.rs`, since `config.rs` has no inline test module. (d) `desktop-shell/src/recovery.rs` gained a minimal `ProviderFallback` arm (kind `provider_fallback`, payload `{proposalId, fallbackProvider}`) so the workspace keeps compiling. No card renders it yet; that is Task 3. (e) Two tests beyond the plan: `a_quota_exhaustion_with_only_a_shared_key_fails_closed` and `a_fallback_offer_whose_paused_turn_is_gone_fails_on_restart`. (f) The tests were written after the code, not before. As a substitute for the red step, each guard was broken and the tests watched fail: the offer turned off (7 failures), the quota key check removed (3), the command-resume guard removed (1, which ran an empty command for 7.6s). **For Task 2:** the pending turn stores the *refused* round and its messages as sent, so approval re-enters at `pending.round`. The offer text is in `ChatTurnResult.response` only and is never appended to the session. Nothing guards a second offer yet: an approved turn that is refused again would be offered again, which Task 2's `provider_fallback_used` closes. **Checks:** `provider_limits` 22/22. The scoped run (provider_limits, crash_recovery and recovery_prompt binaries, plus fallback/reattach/refusal/recovery tests in the engine and shell) 120/120. fmt, clippy on `-p workspace-engine -p desktop-shell --all-targets -D warnings`, and typos all clean. |
 | 2 · Approval: re-issue, record, offer once (engine) | Done 2026-10-09 | The approve arm of `resume_after_fallback_decision` enforces C1: an engine whose active provider is not the offered fallback gets `InvalidInput`, and the offer is put back. It then hands off to a new `reissue_through_fallback`, which audits `provider_fallback_decision` (`approved`, with the fallback's model), writes a `provider_fallback` task event via `SessionStore::record_provider_fallback`, appends a `system` transcript message (`"Switched to <fallback> (<model>) for this turn after <refused> refused it (<code>)."`), clears pending approvals, sets `PreparingContext`, and re-enters `run_agentic_turn` at `pending.round` with `provider_fallback_used = true`. The refusal arm skips the offer when that flag is set. `SessionStore::read_provider_fallbacks` reads the switches back from all events, not only active ones: a rewind does not change which model answered a billed call. **Deviations:** (a) `ChatTurnOptions.provider_fallback_used` is `pub`. A crate-private field cannot be filled by `..Default::default()` from another crate, which broke the shell's literal. Setting it can only suppress an offer, the fail-closed direction. The two existing literals (`desktop-shell/src/lib.rs`, `tests/foundation.rs`) gained `..ChatTurnOptions::default()`. That is a one-line shell edit ahead of Task 3, needed to compile. (b) The transcript marker uses role `system`. Earlier turns reach the model as plain `role: content` lines in `build_model_prompt`, so it reads as a fact, and it says "switched to" because it is written before the fallback answers. (c) `the_next_turn_uses_the_configured_provider_again` became `a_later_turn_is_offered_again_rather_than_switched`. It asserts the next turn's request goes to `primary` *and* that a refusal there gets a fresh offer, so neither the switch nor the once-per-turn flag leaks into the next turn. (d) As in Task 1, tests came after the code. The red step was replaced by breaking each guard: approving with `provider_fallback_used = false` fails `a_fallback_that_also_refuses_…`, `pending.round + 1` fails `an_approved_offer_reissues_…` (via the audited `toolRound`), and dropping the C1 check fails `an_approval_from_an_engine_still_on_the_refused_provider_…`. **For Task 3:** the shell must build the approving engine with `config_for_repo_with_provider(repo, Some(target))`. The marker is an ordinary `system` session message, which `app.js` must render on reload. **Checks:** `provider_limits` 28/28. The wider scoped run (provider_limits, crash_recovery, recovery_prompt, foundation and checkpoint_wiring binaries, plus fallback/reattach/refusal/recovery tests in the engine and shell) 290/290. Eval harness deterministic tier: 16/16 scenarios pass. fmt, clippy on `-p workspace-engine -p desktop-shell --all-targets -D warnings`, and typos all clean. |
-| 3 · Shell, frontend, docs, close the spec | Not started | |
+| 3 · Shell, frontend, docs, close the spec | Done 2026-10-12 | `POST /api/resume-fallback-stream` → `run_resume_fallback_request`, whose core `resume_fallback_decision` takes the engine and adapter builders as arguments so a test can watch what is built. It reads `PausedTurns::provider_fallback_target` first, so an unknown id errors before any key. Approve: `config_for_repo_with_provider(repo, Some(target))` (C1) and that config's key. Decline: the configured engine, no key, and a `NoModelCall` adapter that errors if called. `always` is ignored. `chat_result_json` gained `fallbackProposal` (both providers and models, `refusalCode`, `message`, no `allowAlways`). `app.js`: `createFallbackOffer` from `appendProposals` and from the recovery card (kind `provider_fallback`), with "Keep it failed" primary and focused, "Answer with <fallback>" secondary, and no always. An approval appends the marker live, in the engine's words. A reload renders the persisted `system` message through the existing transcript path, with no new code. A decline treats the stream's error event as the outcome. Docs: USER_GUIDE "Provider Limits and Retries" and a TROUBLESHOOTING section on why no offer appeared, plus the audit rows. The spec is closed: status records, README re-derivation (nothing promoted, ready set #23, #25, #32, #57), Parallel work bullet dropped, spec 48 §7 and Status pointed at the shipped behaviour, CHANGELOG Unreleased line removed. **Deviations:** (a) `switch_model_provider` was factored out of `config_for_repo_with_provider`, so the tests switch provider with the shell's own code. (b) The recovery card names only the fallback, because `PausedTurns` exposes nothing else and this task does not edit `chat.rs`. (c) The tests came after the code. The red step was replaced by making the decline resolve a key, which fails `a_declined_offer_fails_the_task_and_resolves_no_key`. (d) The browser check needed a known API token, which the standalone binary only hands out over Tauri IPC. A throwaway `examples/` binary served `run_server` with a fixed token, and it was deleted afterwards. **Browser check** (own port 4911, own `DAMAIAN_DATA_DIR`, mock provider with `primary` → 402 and `fallback` → SSE; only my PIDs were killed): the card appeared with the focus on Keep it failed. Declining failed the task with no fallback request. An open offer came back as a recovery card after a restart, and approving it continued on `fallback`. A live approval showed the marker, and a reload rendered it again. Every new turn hit `primary` first. **Found, not fixed:** (1) A declined turn leaves only the user message on reload, because the offer text was never persisted. That is the same as any spec 48 refusal. (2) `apply_model_provider_defaults` keeps the refused provider's `model_name` when the fallback lists no models and has no built-in config, so an approval would send the wrong model name. `fallback_model` is then empty in the offer. **Gate:** fmt, clippy `--workspace --all-targets -D warnings` (one `type_complexity` fixed with an `AdapterFor` alias), nextest 1191/1191 (24 skipped), `node --check`, `lint:web` (one pre-existing info in `scripts/check-spec-status.mjs`), typos, and cargo deny all pass. `specs:check` passes (57 specs). |
 
 **Goal:** Turn spec 48's fail-closed refusal into a choice. On a terminal
 refusal, when a different configured provider has its own credentials, pause
@@ -241,39 +241,39 @@ candidate; crash between offer and decision). **Corrections:** C2, C3, C5.
 `docs/TROUBLESHOOTING.md`, `CHANGELOG.md`, `docs/specs/README.md`,
 `proposal.md`. This task does not edit `chat.rs`.
 
-- [ ] **Step 1: Shell tests first** (`desktop-shell/src/lib.rs` tests):
+- [x] **Step 1: Shell tests first** (`desktop-shell/src/lib.rs` tests):
       the turn JSON carries `fallbackProposal` with both providers and no
       `always` field; `/api/resume-fallback-stream` with `approved=false`
       fails the task and builds no transport; an unknown `proposal_id` errors
       before any key is resolved.
-- [ ] **Step 2: Route `POST /api/resume-fallback-stream`**, modelled on
+- [x] **Step 2: Route `POST /api/resume-fallback-stream`**, modelled on
       `run_resume_plan_request`. Read `PausedTurns::provider_fallback_target`.
       On approve, build the engine with
       `config_for_repo_with_provider(repo, Some(target))` (C1), resolve *that*
       provider's key with `resolve_model_api_key`, and build the adapter from
       the switched config. On decline, use `engine_for_repo` and resolve no
       key. Ignore any `always` form field.
-- [ ] **Step 3: `chat_result_json`** (`lib.rs:3286`) gains `fallbackProposal`.
+- [x] **Step 3: `chat_result_json`** (`lib.rs:3286`) gains `fallbackProposal`.
       The crash-recovery card in `desktop-shell/src/recovery.rs` handles
       `ReattachedApproval::ProviderFallback`.
-- [ ] **Step 4: `app.js`.** A fallback card beside `createPlanReview`. It
+- [x] **Step 4: `app.js`.** A fallback card beside `createPlanReview`. It
       names both providers and the refusal, with a primary "Keep it failed"
       (focused by default) and a secondary "Answer with <fallback>". There is
       no "always". Add the resume call beside the `/api/resume-plan-stream`
       one, and render the transcript marker message. Run `npm run lint:web`
       and `node --check crates/desktop-shell/static/app.js`.
-- [ ] **Step 5: Verify in the browser.** Run your own shell instance on a
+- [x] **Step 5: Verify in the browser.** Run your own shell instance on a
       port other than 4765 with its own `DAMAIAN_DATA_DIR`, and track its PID.
       Drive a refusal with `DAMAIAN_MOCK_MODEL_RESPONSE` or a mock transport.
       Confirm the card, decline, approve, the marker, and reattach after a
       restart. Kill only your PID.
-- [ ] **Step 6: Docs.** `USER_GUIDE.md` "Provider Limits and Retries": the
+- [x] **Step 6: Docs.** `USER_GUIDE.md` "Provider Limits and Retries": the
       offer, that it is one-shot and declined by default, and that it never
       remembers. `TROUBLESHOOTING.md`: why no offer appeared (no candidate, an
       empty key env, a shared key env on quota, a native-tools mismatch, or
       already offered this turn) and the `provider_fallback` event and audit
       rows.
-- [ ] **Step 7: Close the spec** (AGENTS.md "When a spec becomes Done"). Fill
+- [x] **Step 7: Close the spec** (AGENTS.md "When a spec becomes Done"). Fill
       in `proposal.md` §7 Implementation Notes and set its Status to Done.
       Update the README row, remove #56 from "What to build next" and the
       ready set, and drop it from the Parallel work bullets. Point spec 48's
@@ -281,7 +281,7 @@ candidate; crash between offer and decision). **Corrections:** C2, C3, C5.
       turn…" line from `CHANGELOG.md` Unreleased. Run
       `grep -rn "56_provider_fallback_consent" docs/specs/*.md docs/specs/*/*.md`
       and `npm run specs:check`.
-- [ ] **Step 8: Full quality gate**, all seven commands from `AGENTS.md`, with
+- [x] **Step 8: Full quality gate**, all seven commands from `AGENTS.md`, with
       `CARGO_TARGET_DIR="$PWD/target"` on each cargo command. Record the
       results in the Progress row and set `**Started:** … — **Done:** …`.
       Then show the change and ask.

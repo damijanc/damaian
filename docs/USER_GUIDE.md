@@ -460,9 +460,26 @@ top up. The task keeps its plan, so you can resume the same work once the
 provider recovers or after you fix your account.
 
 Damaian never switches to a different provider on its own. If you have a second
-provider configured, the turn still fails rather than silently rerouting your
-request — changing the model is your decision, not something done behind your
-back.
+provider configured with its own API key, a refused turn instead pauses on an
+offer that names both providers: **Answer this turn with …?** Choose:
+
+- **Keep it failed** — the default, and the focused button. The turn fails
+  exactly as it would have without the offer.
+- **Answer with …** — the same request is sent to the other provider, the turn
+  continues there, and its plan carries over unchanged. A note in the
+  conversation ("Switched to … for this turn after … refused it") marks where
+  the other model took over, and it stays there after a reload.
+
+The offer is for that one turn only. There is no "always" option, nothing is
+written to your configuration, and your next turn starts on your configured
+provider again — if it refuses too, you are asked again. If the other provider
+also refuses, the turn fails; you are not offered a third choice. If Damaian
+stops while the offer is open, it is shown again under **Still waiting for
+you** when you return.
+
+Only the desktop app makes this offer. For a quota or balance refusal, the other
+provider must use a different API key, since two providers reading one key are
+the same account.
 
 ## File Changes
 

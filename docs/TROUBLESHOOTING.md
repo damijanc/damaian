@@ -421,6 +421,7 @@ Event types grouped by what they tell you:
 | Commands | `command_proposed`, `command_proposal_stored`, `command_executed`, `stored_command_executed`, `stored_command_rejected` |
 | Files & repo | `file_read`, `file_modified`, `file_restored`, `repository_indexed`, `git_status_read`, `git_diff_read` |
 | MCP | `mcp_tools_listed`, `mcp_tool_called`, `mcp_tool_call_failed`, `mcp_discovery_failed` |
+| Provider refusals | `provider_refusal`, `provider_fallback_offered`, `provider_fallback_decision` |
 | Orphan sweep | `orphan_process_killed`, `orphan_process_kill_refused`, `orphan_process_already_exited`, `process_registry_entry_unreadable` |
 
 Useful reads:
@@ -1198,6 +1199,53 @@ retries, and it is recorded as the task's `failureKind` and in the audit log.
 
 A refused task keeps its plan, so resuming it after the provider recovers (or
 after you fix your account) re-runs the same work rather than re-asking.
+
+### A refusal offered no switch to my other provider
+
+The desktop app offers to answer a refused turn with another configured
+provider only when that provider qualifies. The engine picks the **first**
+entry in `model_providers`, in configuration order, that:
+
+- has an id different from the active provider's — a second model on the same
+  provider is never offered;
+- has a non-empty `api_key_env`. Only the name is checked. A name with no key
+  behind it still gets an offer, and approving it then fails with
+  `<NAME> is required` or a Keychain error. The offer stays open, so
+  **Keep it failed** still works;
+- has the same `supports_native_tools` as the active provider, because the
+  paused turn's messages were built for that contract;
+- for `provider_quota_exhausted` only, has an `api_key_env` **different** from
+  the active provider's. Two ids reading one key are one account.
+
+There is also no offer when one was already made this turn. If the fallback
+also refuses, the turn fails with that refusal's `failureKind`, so a loop of
+offers is impossible. A transient refusal that a retry fixed never reaches the
+offer at all. The CLI never offers: its model calls do not go through a chat
+turn that could pause.
+
+To see what happened to an offer:
+
+```bash
+grep -h '"provider_fallback' ~/Library/Application\ Support/DamaianClient/audit/events.jsonl | jq -c .
+```
+
+- `provider_fallback_offered`: the turn paused. Carries `proposalId`,
+  `refusedProvider`, `fallbackProvider` and `classification`. The usual
+  `provider_refusal` row is written first, as it is for any refusal.
+- `provider_fallback_decision`: `decision` is `declined` or `approved`, and an
+  approval also carries `fallbackModel`. A decline fails the task with the
+  refusal's `failureKind`, exactly as if no offer had been made.
+
+An approved switch also leaves a `provider_fallback` event in the session log
+(`refusedProvider`, `fallbackProvider`, `approvedBy`) and a `system` message in
+the transcript ("Switched to … for this turn after … refused it (…)"). A
+rewind keeps the event: it does not change which model answered a call that
+was already billed. While an offer is open, its paused turn is stored under
+`chat/pending/<proposalId>.json`. If that file is gone after a crash, recovery
+fails the task instead of showing the offer again.
+
+Nothing records the decision for later. The next turn starts on the configured
+provider, and a refusal there gets a fresh offer.
 
 ### The assistant replies but never proposes a patch
 
