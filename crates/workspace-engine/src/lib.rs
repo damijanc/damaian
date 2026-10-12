@@ -16,6 +16,7 @@ pub mod file_access;
 pub mod finding;
 pub mod git_service;
 pub mod hash;
+pub mod hooks;
 pub mod ignore;
 pub mod index_cache;
 pub mod indexer;
@@ -82,6 +83,7 @@ pub use error::{ClientError, ProviderRefusal, Result};
 pub use file_access::{FileAccessController, FileRead, LineRange, ReadWindow};
 pub use git_service::{GitFileStatus, GitService, GitStatus};
 pub use hash::repository_id_for_root;
+pub use hooks::{HookEnvelope, HookFailureKind, HookFinding, HookResponse};
 pub use index_cache::IndexCache;
 pub use indexer::{ProjectIndexer, RepositoryIndex, SearchResult};
 pub use mcp::{
