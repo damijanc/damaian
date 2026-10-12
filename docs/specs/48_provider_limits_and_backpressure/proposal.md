@@ -5,8 +5,9 @@ via `dump-header`), classified from status first and the error object's
 `code`/`type` second — never prose — retried under two bounds with a
 cancellable, visible wait, and recorded as a named failure (`failureKind`) with
 a measured-zero cost that never inflates the reported spend. The fallback
-*offer* is deferred to [`../56_provider_fallback_consent/proposal.md`](../56_provider_fallback_consent/proposal.md);
-requirement 7's negative half — no switch without consent — ships here. The
+*offer* shipped separately as [`../56_provider_fallback_consent/proposal.md`](../56_provider_fallback_consent/proposal.md)
+(Done 2026-10-12); requirement 7's negative half — no switch without consent —
+ships here. The
 provider-behaviour items in §7 remain unmeasured (no real provider was
 exercised, per the plan to run the quality gate last).
 Order: 48 of 53
@@ -344,7 +345,13 @@ signal, shell Keychain, frontend approval, resume machinery) roughly the size of
 [spec 10](../10_persistent_command_approval.md) or patch approval, and is
 specified separately in
 [spec 56](../56_provider_fallback_consent/proposal.md). §5.6 is its requirement, not this
-spec's.
+spec's. Spec 56 shipped on 2026-10-12. A terminal refusal with a qualifying
+second provider now pauses on a one-shot, refused-by-default offer in the
+desktop app. Declining it ends in this spec's exact failure. Without a
+candidate, the refusal still fails closed as described here.
+`no_fallback_happens_without_approval` now asserts that pause, and
+`a_refusal_with_no_candidate_still_fails_closed` carries this spec's
+fail-closed assertion forward.
 
 **Defect fixed 2026-09-28: a completed 200 stream was classified as a
 refusal.** Found in spec 12's live scenario run (its `proposal.md` §8), with

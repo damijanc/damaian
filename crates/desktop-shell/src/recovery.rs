@@ -549,8 +549,11 @@ fn describe_approval(
             ),
             unavailable_reason: None,
         },
-        // Spec 56. The card that renders this lands with the shell route in
-        // that spec's Task 3; the payload already names what it needs.
+        // Spec 56. Like a plan review, the paused turn is on disk, so the card
+        // answers through the same `/api/resume-fallback-stream` the live offer
+        // uses and approving continues the turn. Only the fallback is named:
+        // that is all `PausedTurns` exposes, and the offer text was never a
+        // transcript message, so the card says less than the live one does.
         ReattachedApproval::ProviderFallback {
             task_id,
             proposal_id,

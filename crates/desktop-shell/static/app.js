@@ -4271,6 +4271,7 @@ function createReattachedApprovalCard(approval) {
     command: "A command was waiting for your approval when Damaian stopped",
     patch: "A patch was waiting for your review when Damaian stopped",
     plan: "A plan was waiting for your review when Damaian stopped",
+    provider_fallback: "An offer to switch providers was waiting when Damaian stopped",
   };
   const notes = {
     command:
@@ -4283,6 +4284,11 @@ function createReattachedApprovalCard(approval) {
     plan:
       "The turn that raised this plan was paused waiting for you, and it was saved. Approving " +
       "the plan continues that turn from where it stopped.",
+    // Saved like a plan review, so answering continues the same turn.
+    provider_fallback:
+      "A provider refused this turn, and the turn was saved while you decided. Keeping it " +
+      "failed closes the turn; answering with the other provider continues it, for this turn " +
+      "only.",
   };
   headline.textContent = headlines[approval.kind];
   note.textContent = notes[approval.kind];
@@ -4302,6 +4308,9 @@ function createReattachedApprovalCard(approval) {
     // which reaches a terminal status on its own. Closing it out here would
     // cancel a task that is about to run.
     wrapper.append(createPlanReview(approval.payload, repo()));
+  } else if (approval.kind === "provider_fallback") {
+    // No `onResolved`, for the plan's reason: either answer ends the task.
+    wrapper.append(createFallbackOffer(approval.payload, repo()));
   } else {
     wrapper.append(
       createPatchPreview(approval.payload, repo(), {
@@ -6044,6 +6053,161 @@ function appendProposals(message, payload, repo) {
   if (payload.planProposal) {
     message.body.append(createPlanReview(payload.planProposal, repo));
   }
+  if (payload.fallbackProposal) {
+    message.body.append(createFallbackOffer(payload.fallbackProposal, repo));
+  }
+}
+
+// What a refusal code means, for the fallback offer's heading. An unknown code
+// is shown as it stands rather than hidden.
+const REFUSAL_LABELS = {
+  provider_rate_limited: "rate limited",
+  provider_overloaded: "overloaded",
+  provider_quota_exhausted: "out of quota",
+};
+
+function providerWithModel(provider, model) {
+  return model ? `${provider} (${model})` : provider;
+}
+
+// Spec 56: a provider refused this turn and another configured provider could
+// answer it. The offer is one-shot and refused by default, so "Keep it failed"
+// is the primary, focused action, and there is deliberately no "always": the
+// next turn goes back to the configured provider whatever is chosen here.
+//
+// A reattached offer (after a restart) knows only the fallback's name, so the
+// refusal fields are optional.
+function createFallbackOffer(proposal, proposalRepo) {
+  const fallback = providerWithModel(proposal.fallbackProvider, proposal.fallbackModel);
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "command-approval fallback-offer";
+
+  const header = document.createElement("div");
+  header.className = "command-approval-header";
+  const title = document.createElement("strong");
+  title.textContent = `Answer this turn with ${proposal.fallbackProvider}?`;
+  header.append(title);
+  if (proposal.refusalCode) {
+    const meta = document.createElement("span");
+    meta.className = "command-approval-risk";
+    meta.dataset.blocked = "true";
+    meta.textContent = REFUSAL_LABELS[proposal.refusalCode] || proposal.refusalCode;
+    header.append(meta);
+  }
+
+  const note = document.createElement("p");
+  note.className = "plan-review-note";
+  // Says nothing about the refusal itself: a live offer sits under the
+  // engine's account of it, and a reattached one under the recovery card's.
+  note.textContent =
+    `Answering sends the same request to ${fallback}, for this turn only. Your next turn ` +
+    "uses the configured provider again.";
+
+  const actions = document.createElement("div");
+  actions.className = "command-approval-actions";
+  const keepButton = document.createElement("button");
+  keepButton.type = "button";
+  keepButton.className = "btn-sm btn-primary";
+  keepButton.textContent = "Keep it failed";
+  const switchButton = document.createElement("button");
+  switchButton.type = "button";
+  switchButton.className = "btn-sm btn-quiet";
+  switchButton.textContent = `Answer with ${proposal.fallbackProvider}`;
+  actions.append(keepButton, switchButton);
+
+  const output = document.createElement("pre");
+  output.className = "command-approval-output";
+  output.hidden = true;
+
+  async function decide(approved) {
+    keepButton.disabled = true;
+    switchButton.disabled = true;
+    output.hidden = false;
+    output.textContent = approved ? `Asking ${proposal.fallbackProvider}…` : "Keeping it failed…";
+
+    // The engine writes the marker into the transcript, which is what a reload
+    // renders; this shows it now, above the answer it introduces. A reattached
+    // offer does not know who refused, so its version is shorter.
+    if (approved) {
+      const after = proposal.refusedProvider
+        ? ` after ${proposal.refusedProvider} refused it (${proposal.refusalCode})`
+        : "";
+      appendChatMessage("system", `Switched to ${fallback} for this turn${after}.`);
+    }
+    const assistantMessage = approved ? appendChatMessage("assistant", "") : null;
+    let assistantText = "";
+    let streamError = null;
+    await streamResumeFallbackRequest(
+      {
+        repo: proposalRepo,
+        proposal_id: proposal.proposalId,
+        approved: approved ? "true" : "false",
+      },
+      {
+        plan(planPayload) {
+          if (assistantMessage) renderPlanPanel(assistantMessage, planPayload);
+        },
+        webDiagnostic(record) {
+          sessionHasRecordedDiagnostics = true;
+          if (assistantMessage) renderWebDiagnosticCard(assistantMessage, record);
+        },
+        token(token) {
+          if (!assistantMessage) return;
+          assistantText += token;
+          updateChatMessage(assistantMessage, assistantText);
+          setChatStatus("Streaming", "running");
+        },
+        done(payload) {
+          if (!assistantMessage) return;
+          if (payload.response && payload.response !== assistantText) {
+            assistantText = payload.response;
+            updateChatMessage(assistantMessage, assistantText);
+          }
+          appendProposals(assistantMessage, payload, proposalRepo);
+          if (payload.sessionId) {
+            currentSessionId = payload.sessionId;
+            localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+          }
+          appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+          markMessageUsage(assistantMessage, payload.usage);
+          markMessageTurnStop(assistantMessage, payload);
+          const status = chatCompletionStatus(payload);
+          setChatStatus(status.label, status.tone);
+        },
+        error(payload) {
+          streamError = payload.error || "The provider decision failed";
+        },
+      },
+    );
+    if (approved) {
+      // The fallback refusing too is an ordinary failure, not a second offer.
+      if (streamError) {
+        updateChatMessage(assistantMessage, streamError);
+        setChatStatus("Failed", "error");
+      }
+      output.textContent = streamError
+        ? `${proposal.fallbackProvider} could not answer either. The turn has failed.`
+        : `Answered by ${fallback} — see the answer below.`;
+    } else {
+      // A decline fails the task exactly as the refusal would have, and the
+      // engine reports it as that refusal: an error here is the expected outcome.
+      output.textContent = streamError ? `Kept failed: ${streamError}` : "Kept failed.";
+      setChatStatus("Failed", "error");
+    }
+    await loadSessions(currentSessionId, false);
+  }
+
+  keepButton.addEventListener("click", () => decide(false).catch((error) => toast(error.message)));
+  switchButton.addEventListener("click", () => decide(true).catch((error) => toast(error.message)));
+
+  wrapper.append(header, note, actions, output);
+  // Focus once the caller has put the card in the document: the default
+  // answer is the one a stray Enter should give.
+  requestAnimationFrame(() => {
+    if (wrapper.isConnected && !keepButton.disabled) keepButton.focus();
+  });
+  return wrapper;
 }
 
 // The plan review gate, per spec 21 §5.5: the turn has stopped before its
@@ -6951,6 +7115,12 @@ async function streamResumeCommandRequest(data, handlers) {
 // rather than posting the decision somewhere that would not carry it.
 async function streamResumePlanRequest(data, handlers) {
   return streamRequest("/api/resume-plan-stream", null, data, handlers);
+}
+
+// Like a plan decision, answering a fallback offer *is* a turn, so there is no
+// one-shot endpoint to fall back to.
+async function streamResumeFallbackRequest(data, handlers) {
+  return streamRequest("/api/resume-fallback-stream", null, data, handlers);
 }
 
 async function streamRequest(streamPath, fallbackPath, data, handlers, signal) {

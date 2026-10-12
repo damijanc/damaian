@@ -1,6 +1,6 @@
 # Feature Spec: Provider Fallback Consent
 
-Status: In progress — Tasks 1 and 2 of 3 (the engine: offer, decline, approval) done 2026-10-09; Task 3 (shell, frontend, docs) remains. See [`tasks.md`](tasks.md).
+Status: Done 2026-10-12. The engine half (offer, decline, approval) landed 2026-10-09; the shell route, the desktop card, the recovery card and the docs landed 2026-10-12. See [`tasks.md`](tasks.md).
 Order: 56 of 56
 Plan: none. Split out of
 [`48_provider_limits_and_backpressure`](../48_provider_limits_and_backpressure/proposal.md)
@@ -218,6 +218,39 @@ approved `provider_fallback_decision` audit row naming the fallback's model.
 later pause in the same turn. A fallback that also refuses fails the task with
 its own `failureKind` instead of offering again. The flag does not reach the
 next turn, which starts on the configured provider and is offered afresh.
+
+**Task 3 (shell, frontend, docs), 2026-10-12.** `POST /api/resume-fallback-stream`
+reads `PausedTurns::provider_fallback_target` before it resolves anything, so
+an unknown id fails without touching a key. An approval builds the engine
+from `config_for_repo_with_provider(repo, Some(target))` and resolves *that*
+provider's key from the switched config. A decline stays on the configured
+engine and resolves no key. Its adapter is a `NoModelCall` that errors if the
+engine ever calls it. An `always` form field is ignored. The route's core,
+`resume_fallback_decision`, takes the engine and adapter builders as
+arguments, so the shell tests can show that neither a decline nor an unknown
+offer reaches a key. `chat_result_json` gained `fallbackProposal` with both
+providers, both models, the refusal code and the provider's message. It has
+no `allowAlways`.
+
+In `app.js`, `createFallbackOffer` sits beside `createPlanReview` and is
+raised from `appendProposals`. "Keep it failed" is the primary button and is
+focused once the card is in the document. "Answer with <fallback>" is
+secondary. There is no third button. An approval appends the switch marker
+live, in the same words the engine persists, and a reload renders the
+persisted `system` message through the ordinary transcript path. A decline
+expects the stream's error event, because the engine reports a decline as the
+refusal, and shows it as "Kept failed: …". The crash-recovery card handles
+kind `provider_fallback` with the same component. Its payload names only the
+fallback, because that is all `PausedTurns` exposes and the offer text was
+never a transcript message.
+
+Checked in a browser against a shell on port 4911 with its own
+`DAMAIAN_DATA_DIR` and a local mock provider (`primary` answering 402,
+`fallback` streaming). The card appeared with the focus on "Keep it failed".
+Declining failed the task with no request to the fallback. An open offer came
+back as a recovery card after a restart, and approving it continued the turn
+on `fallback`. A live approval showed the marker, and a reload rendered it
+again. Every new turn went to `primary` first.
 
 **Spec 48's pinning test inverted.** `no_fallback_happens_without_approval`
 used to assert that a refusal with a second provider configured *fails*. It now

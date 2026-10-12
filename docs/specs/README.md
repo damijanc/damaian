@@ -228,6 +228,12 @@ and #57. Three facts about pairing it, from its
 - **Its Task 6 edits `edit.rs`'s `apply_stored_patch` and
   `context_manager.rs`**, which #26 rewrites. Same rule.
 
+Re-derived on 2026-10-12, when [#56](56_provider_fallback_consent/proposal.md)
+was finished. No `Depends on:` line names #56, so nothing is promoted. Spec
+48's cross-reference now points at the shipped behaviour. #56 leaves the ready
+set, which is now #23, #25 and #57. Its `chat.rs` work is finished, so the
+"not with #56" clauses above no longer constrain anything.
+
 **#25 and #26 are the keystones now that #24 has landed.** #25 is the last
 thing in front of #26, and the whole tail waits on #26. Preferring a spec that
 unblocks nothing over one of these costs more than it looks like it does.
@@ -243,8 +249,9 @@ unblocks nothing over one of these costs more than it looks like it does.
 | 7 | #35 → #36/#37; #33 → #52 | Delivery and extensibility clusters |
 | 8 | #38/#39/#40 | Last, and #40 may legitimately conclude "do not". #38 is deferred until #57 has shipped |
 
-[#56](56_provider_fallback_consent/proposal.md) is the opportunistic one: small, ready,
-and it closes the half of #48 that shipped as only a negative guarantee.
+[#56](56_provider_fallback_consent/proposal.md), the opportunistic one, is done
+(2026-10-12): it closed the half of #48 that had shipped as only a negative
+guarantee.
 [#50](50_model_initiated_clarification/proposal.md) is ready too and unblocks nothing,
 which is why it sits off the table rather than above #25.
 [#57](57_worker_sessions/proposal.md), added on 2026-10-03, sits off the table
@@ -253,8 +260,8 @@ depends on it. It is in progress (Tasks 1–2 of 11 done). It touches `chat.rs`'
 and the shell's routes, so check it against the parallel rule below before
 running it beside another spec.
 [#49](49_prompt_cache_accounting_and_reuse/proposal.md)'s accounting slice is
-done, off this table for the same reason #56 will be once it ships: nothing
-left in it is unbuilt. Its reuse slice re-enters this table once #55 or #26
+done, off this table for the same reason #56 is: nothing left in it is
+unbuilt. Its reuse slice re-enters this table once #55 or #26
 unblocks it.
 
 ### Parallel work
@@ -271,8 +278,6 @@ the dependency graph, it is that file.
   it changed no request and touched only `model.rs`, `config.rs`, `session.rs`,
   `app.js` and the harness, so it could pair with #20, which lives in `chat.rs`
   and the UI.
-- **Not together:** #20 and #56 — both touch approval and resume in `chat.rs`.
-  #20 is done (2026-09-25), so #56 no longer waits on it.
 - **Never together:** #26, #55 and #49's reuse slice. All three rewrite
   `build_model_prompt` and the assembly around it; that shared function is why
   #49's second slice is blocked in the first place. #54 and #55 also both
@@ -356,7 +361,7 @@ is ready.
 | 53 | [53_session_search_and_export/proposal.md](53_session_search_and_export/proposal.md) | **Done.** Roadmap Phase 1 WP9. A rescope, not greenfield: listing, renaming and deleting already work end to end, and what is missing is finding anything and getting anything out. A bounded scan through #17's parse-first reader rather than a second index, anchored on `seq` because it survives rewinds. Its sharp edge is inherited from #16: `append_message` stores content verbatim and deliberately does not redact, so that a rewind restores what was actually said — which makes export a display path that writes a file, and redaction on the way out mandatory, with the redaction count stated rather than silently applied. |
 | 54 | [54_image_input.md](54_image_input.md) | **Not started.** Roadmap Phase 3 WP9. Damaian takes screenshots it cannot look at: #12's diagnostics capture them as artifacts carrying a path and dimensions, and the model that asked receives the report text and a file reference. From the other side `ModelMessage.content` is a `String` and the composer offers "Add file" and a disabled "Add folder", so a user cannot paste a picture of the bug they are reporting. Its hard part is that **an image defeats `SecretScanner`** — a screenshot of a terminal can carry a key and no rule can match a pixel. OCR is rejected on three independent grounds, one being that a guarantee holding most of the time is worse than a stated limitation, because the user stops checking. The guarantee becomes informed consent plus one asymmetry: a user-attached image was chosen by the person accountable for it, an agent-captured screenshot was framed by Damaian, so no unseen image is ever sent and no setting can make screenshot inclusion automatic. |
 | 55 | [55_conversation_compaction.md](55_conversation_compaction.md) | **Not started.** Roadmap Phase 3 WP6 (Must, and in that phase's minimum slice). Corrects the work package's premise: conversations do not grow until a provider refuses, they are **clipped to the last eight messages, each cut to 2,000 characters**, by two literals in `build_model_prompt` with no configuration behind them. So the defect is silent unmarked loss, not growth — a constraint stated in the first message is gone from the model's view at the ninth, with nothing on screen saying so, which is a worse failure than the loud one the plan describes. Its load-bearing rule is that **a model never writes a field the engine can compute**: files changed, plan steps, approvals and validation status are read from the session log, and only objective, constraints, decisions, failed approaches and uncertainty come from a model — because a summary is re-sent every turn, so an invented fact becomes a false belief the agent holds for the rest of the session. Compaction appends a `conversation_compacted` event rather than rewriting anything, which makes #16's rewind work with no special case and keeps #17's append-only rule intact.
-| 56 | [56_provider_fallback_consent/](56_provider_fallback_consent/proposal.md) | **In progress.** Planned 2026-10-07 in three tasks; Tasks 1–2 (the engine: offer, decline, approval) done 2026-10-09; Task 3 (shell, frontend, docs) remains, see its `tasks.md`. Split out of #48 during its implementation: the fallback *offer* — a one-shot, refused-by-default approval that re-issues a refused turn through a configured second provider — was recognisably its own feature (engine pause + shell Keychain + frontend approval + resume), the size of #10 or patch approval. #48 shipped only requirement 7's negative half (no switch without consent, fail closed); this spec is the positive half. Depends on #48's classification and `failureKind`, and reuses the pending-approval and resume machinery rather than building a second one.
+| 56 | [56_provider_fallback_consent/](56_provider_fallback_consent/proposal.md) | **Done** 2026-10-12. A terminal refusal with a qualifying second provider pauses on a one-shot, refused-by-default offer in the desktop app ("Keep it failed" or "Answer with …", no "always"). Approval re-issues the refused call through the fallback and records the switch on the task and in the transcript. Decline fails exactly as #48 does. The offer reattaches after a restart. Split out of #48 during its implementation: the fallback *offer* — a one-shot, refused-by-default approval that re-issues a refused turn through a configured second provider — was recognisably its own feature (engine pause + shell Keychain + frontend approval + resume), the size of #10 or patch approval. #48 shipped only requirement 7's negative half (no switch without consent, fail closed); this spec is the positive half. Depends on #48's classification and `failureKind`, and reuses the pending-approval and resume machinery rather than building a second one.
 | 57 | [57_worker_sessions/proposal.md](57_worker_sessions/proposal.md) | **In progress.** Tasks 1–4 of 11 done (2026-10-07, 2026-10-09, 2026-10-09, 2026-10-12): the setting, the worker record, the handoff instruction, pause and steering notes at the round boundary, the redacted progress file, and checked worktree creation and removal; see `tasks.md`. Exception to the graduation rule (see above). Hosts the planner-and-workers workflow behind one user setting, off by default and forbidden to repository config. When on, Damaian itself tells the model to write handoffs as `worker-prompt` blocks — so it works without any `AGENTS.md` — and a *Start worker* button on exactly those blocks opens a prompt-only dialog pre-filled with it — no copy and paste — and the worker runs in its own new git worktree under `.damaian/worktrees/`, hosted by its own process — the app's own executable re-launched in worker mode — because the shell serves one request at a time. A per-project Workers board, a control strip with pause, resume and stop, and steering notes that enter the conversation at the next round boundary. Its two load-bearing rules: a worker is a different *host* for the same turn, proven by an audit-sequence comparison against the shell, and **nothing survives** — a stdin lifeline makes every worker and its process group exit when the shell dies for any reason, including `SIGKILL`. The API key reaches the worker on stdin from the shell's existing in-memory cache, so a worker never reads the Keychain and never prompts, and never sees the key in its environment. Loop detection, a structured `propose_worker` tool and a planner reading results are named follow-ups, not part of it. |
 
 **Ordering exception.** Numbers are assigned in creation order, so #34 is last in
