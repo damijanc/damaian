@@ -1,6 +1,12 @@
 use workspace_engine::{Config, ProcessRegistry};
 
 fn main() {
+    // Worker mode first: it loads config from its own `--data-dir` and
+    // installs its own shutdown handler, so nothing below may run for it.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(desktop_shell::WORKER_FLAG) {
+        std::process::exit(desktop_shell::run_worker_from_args(args));
+    }
     if let Err(error) = install_shutdown_handler() {
         eprintln!("{error}");
         std::process::exit(1);

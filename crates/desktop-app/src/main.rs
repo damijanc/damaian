@@ -34,6 +34,12 @@ struct DesktopBootstrap {
 }
 
 fn main() {
+    // A worker is this same executable re-entered (spec 57 §5.2). It never
+    // opens a window or starts the shell, so it branches before Tauri.
+    let args: Vec<String> = env::args().collect();
+    if args.get(1).map(String::as_str) == Some(desktop_shell::WORKER_FLAG) {
+        std::process::exit(desktop_shell::run_worker_from_args(args));
+    }
     let shell_port = shell_port().unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(1);
