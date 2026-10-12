@@ -1,27 +1,44 @@
 # Feature Spec: Hooks
 
-Status: Not started
+Status: In progress (Task 1 started 2026-10-07). Split into a folder and planned on 2026-10-07. Design
+unchanged from the original flat spec. Corrections where it no longer matches
+the code, and the decisions it leaves open, are in [`context.md`](context.md),
+not inlined here, the way specs 20, 22, 24 and 31 kept theirs. The most
+important ones:
+- `CommandRunner` already has a deadline, a process-group kill and a PID
+  registry entry, so §2 and §5.4's "no timeout mechanism" is stale;
+- `before_patch_apply`, `after_patch_apply` and `session_end` are not in
+  `chat.rs`, and there is no session teardown, so `session_end` fires on
+  deletion and only observes;
+- what each verdict means at each event, including `request_approval` on an
+  action that has no approval step (it denies);
+- how hook definitions are classified per config scope, which §5.8 states
+  only as an outcome.
+
+The work is in ten tasks ([`tasks.md`](tasks.md)). Only Tasks 7 and 8 edit
+`chat.rs`.
 Order: 32 of 33
 Plan: `docs/PLAN/04_phase_4_customization_and_extensibility.md`, Phase 4,
 Work Package 2 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#17](17_durable_task_state_and_crash_recovery/proposal.md)
-(durable state) — built; [#22](22_findings_model_and_panel/proposal.md) (hook findings)
-— built; [#31](31_permission_profiles/proposal.md) (the profile hooks cannot
-widen) — built. Everything else named below is a cross-reference, not a
-prerequisite.
+Depends on: [#17](../17_durable_task_state_and_crash_recovery/proposal.md)
+(durable state) — built; [#22](../22_findings_model_and_panel/proposal.md) (hook findings)
+— built; [#31](../31_permission_profiles/proposal.md) (the profile hooks cannot
+widen) — built; [#46](../46_process_registry_and_orphan_sweep/proposal.md)
+(the PID registry §5.4 attributes to #17, which moved there) — built.
+Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 (command approval), section 7.6 (tool and action orchestrator), section 7.8 (risk
 classification and approval), section 11 (error handling). Related implementation
-specs: [`10_persistent_command_approval.md`](10_persistent_command_approval.md),
-[`13_docker_command_support.md`](13_docker_command_support.md),
-[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
+specs: [`10_persistent_command_approval.md`](../10_persistent_command_approval.md),
+[`13_docker_command_support.md`](../13_docker_command_support.md),
+[`17_durable_task_state_and_crash_recovery/proposal.md`](../17_durable_task_state_and_crash_recovery/proposal.md)
 (the PID registry hook processes use, and the action markers hooks sit between),
-[`20_working_modes/proposal.md`](20_working_modes/proposal.md),
-[`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md),
-[`22_findings_model_and_panel/proposal.md`](22_findings_model_and_panel/proposal.md) (hooks return
-`Finding`s), [`23_verification_loop/proposal.md`](23_verification_loop/proposal.md),
-[`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) (the profile a hook
+[`20_working_modes/proposal.md`](../20_working_modes/proposal.md),
+[`21_task_plan_progress_and_budget/proposal.md`](../21_task_plan_progress_and_budget/proposal.md),
+[`22_findings_model_and_panel/proposal.md`](../22_findings_model_and_panel/proposal.md) (hooks return
+`Finding`s), [`23_verification_loop/proposal.md`](../23_verification_loop/proposal.md),
+[`31_permission_profiles/proposal.md`](../31_permission_profiles/proposal.md) (the profile a hook
 cannot widen).
 
 ## 1. Motivation
@@ -37,7 +54,7 @@ user's own check can run and say no.
 
 The alternatives users are left with are all worse. `AGENTS.md` can *ask* the
 agent to follow a rule, but an instruction is a request the model may forget or
-reason around; [spec 20](20_working_modes/proposal.md) §5.5 is explicit that repository
+reason around; [spec 20](../20_working_modes/proposal.md) §5.5 is explicit that repository
 instructions are data, not capability. A `restricted_patterns` entry can block a
 path but cannot express "not without asking me" or "only if the tests pass".
 
@@ -68,14 +85,14 @@ be the phase's required work rather than its risky work.
   there is no timeout mechanism, which §5.4 has to supply.
 - **Child-process spawning has two precedents**: MCP stdio transport
   (`mcp.rs:288-345`) and the `curl` model child wrapped in `KillOnDrop`
-  (`model.rs:400-406`). [Spec 17](17_durable_task_state_and_crash_recovery/proposal.md)
+  (`model.rs:400-406`). [Spec 17](../17_durable_task_state_and_crash_recovery/proposal.md)
   §5.7 defines the session-scoped PID registry both should use.
-- **`Finding`** ([spec 22](22_findings_model_and_panel/proposal.md)) is the structured
+- **`Finding`** ([spec 22](../22_findings_model_and_panel/proposal.md)) is the structured
   type a hook returns, with `SecretScanner` redaction applied at construction.
 - **`AuditLog::record`** (`audit.rs:42`) redacts every field on the way in and is
   the mechanism to reuse rather than extend.
 - **Config layering and its scope trust boundary** are defined in
-  [spec 31](31_permission_profiles/proposal.md) §5.2-5.3. Hook configuration is subject to
+  [spec 31](../31_permission_profiles/proposal.md) §5.2-5.3. Hook configuration is subject to
   it.
 - **The output truncation and redaction path** for command output already exists
   and is what hook output should reuse.
@@ -114,7 +131,7 @@ context; return a structured `Finding`; run an approved local command.
 - Remote or downloaded hooks. Hooks are local executables the user configured.
 - Hooks on model requests or responses as such. `before_context` covers what is
   assembled; there is no hook that rewrites a prompt.
-- Replacing the verification loop ([spec 23](23_verification_loop/proposal.md)).
+- Replacing the verification loop ([spec 23](../23_verification_loop/proposal.md)).
   `after_check` observes check results; it does not schedule checks.
 - Asynchronous or long-running hooks. §5.4 enforces short timeouts, and
   background work belongs to Phase 2 WP5.
@@ -177,13 +194,13 @@ blocking it outright. It can only move an action from automatic to gated, never
 the reverse — there is deliberately no `approve` verdict, because that would be a
 hook granting permission, which is precisely the widening requirement 6 forbids.
 
-`findings` are `Finding` values ([spec 22](22_findings_model_and_panel/proposal.md)),
+`findings` are `Finding` values ([spec 22](../22_findings_model_and_panel/proposal.md)),
 which puts hook output in the same panel as compiler and test output and makes it
 navigable and repairable. `context` additions are bounded strings that enter
 context assembly as ordinary `ContextItem`s in a dedicated category
-([spec 26](26_context_assembly.md)) — not a privileged channel, subject to the
+([spec 26](../26_context_assembly.md)) — not a privileged channel, subject to the
 same budget and the same visibility in the inspector
-([spec 27](27_context_inspector.md)).
+([spec 27](../27_context_inspector.md)).
 
 ### 5.3 Hooks return verdicts, not edits
 
@@ -193,7 +210,7 @@ obvious next request.
 
 A hook that rewrites a patch would produce a diff the user never previewed and
 the model never proposed, applied under the user's approval of something else.
-Every guarantee in [spec 04](04_hunk_level_patch_apply.md) and
+Every guarantee in [spec 04](../04_hunk_level_patch_apply.md) and
 `patch_engine.rs:291`'s hash check assumes the applied content is the previewed
 content. A hook that wants a change made asks for it: `deny` with a reason feeds
 the reason back to the model, which proposes a new patch through the normal
@@ -207,7 +224,7 @@ exits with no deadline. A hook that hangs would hang the turn.
 
 So hook invocation spawns with piped stdio and waits with a deadline, killing the
 child by PID on expiry — registered in the
-[spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7 PID registry with its
+[spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) §5.7 PID registry with its
 start time, so a crash mid-hook does not leave the process behind and a recycled
 PID is never killed by mistake.
 
@@ -284,7 +301,7 @@ Requirement 6, enforced in three places:
 - **`context` additions are ordinary context items**, budgeted and visible, not
   instructions. A hook returning "you may edit any file" adds a sentence to the
   context window and changes no policy — the same property that makes memory
-  safe in [spec 30](30_memory_retrieval_and_lifecycle.md) §5.2.
+  safe in [spec 30](../30_memory_retrieval_and_lifecycle.md) §5.2.
 - **A hook's own command runs under the session's mode and profile**, evaluated
   at execution as any other command is. A `before_tool` hook cannot run a
   command Code mode would refuse, and cannot run one in Ask mode at all.
@@ -294,11 +311,11 @@ permission — is audited as a widening attempt, per the roadmap's acceptance
 criterion, and treated as malformed output under §5.5.
 
 Hook configuration is capability configuration, so it lives under
-[spec 31](31_permission_profiles/proposal.md) §5.1's capability keys: a repository cannot
+[spec 31](../31_permission_profiles/proposal.md) §5.1's capability keys: a repository cannot
 add a hook that the user has not reviewed, and it cannot disable a user's hook.
 A repository *can* add a hook once reviewed — which is a useful thing for a
 repository to ship, and is exactly why the review gate in
-[spec 31](31_permission_profiles/proposal.md) §5.3 is itemised rather than global.
+[spec 31](../31_permission_profiles/proposal.md) §5.3 is itemised rather than global.
 
 ### 5.9 Output bounding and redaction
 
@@ -308,7 +325,7 @@ whose output is quietly truncated into valid-looking JSON.
 
 `reason` strings, `findings`, and `context` additions pass through
 `SecretScanner` before display, persistence, or entry into context. `Finding`
-already redacts at construction ([spec 22](22_findings_model_and_panel/proposal.md) §5.6),
+already redacts at construction ([spec 22](../22_findings_model_and_panel/proposal.md) §5.6),
 and hook output uses that path rather than a parallel one.
 
 A hook's stderr is captured, bounded, and redacted for diagnostics, and is never
@@ -361,7 +378,7 @@ report means.
   persistence, and entry into context.
 - Hook output exceeding the byte ceiling is a failure, not a truncation.
 - `context` additions appear in the context inspector
-  ([spec 27](27_context_inspector.md)) within a bounded category, not as
+  ([spec 27](../27_context_inspector.md)) within a bounded category, not as
   instructions.
 - Hook configuration is a capability key: a repository cannot add a hook without
   review, nor disable a user's hook.
@@ -369,7 +386,7 @@ report means.
 - An extension failure does not corrupt session state — asserted by failing a
   hook at each event.
 - Every quality-gate command from `AGENTS.md` passes, and the
-  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  [spec 18](../18_local_evaluation_harness/proposal.md) baseline shows no
   regression.
 
 ## 7. Implementation Notes

@@ -355,6 +355,13 @@ pub struct Config {
     /// only listed servers are offered even if the user enabled others.
     pub mcp_server_allowlist: Vec<String>,
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Lifecycle hooks (spec 32). A repository may define one of its own but
+    /// never touch a user's or an admin's, and a profile may carry none.
+    pub hooks: Vec<HookConfig>,
+    /// The user's reviews of repository-defined hooks, keyed by repository id
+    /// and then hook id. User-owned, like `Allow Always`: a repository cannot
+    /// approve its own hook.
+    pub hook_reviews_by_repository: BTreeMap<String, BTreeMap<String, HookReview>>,
 }
 
 // No `Eq`: the price rates are `Option<f64>`.
@@ -538,6 +545,225 @@ pub struct McpServerConfigOverlay {
     pub auth_token_env: Option<String>,
     pub enabled: Option<bool>,
     pub require_approval: Option<bool>,
+}
+
+/// Longest a hook may run before it is killed and counted as failed (spec 32
+/// `context.md` §7). A hook on `before_tool` runs on every tool call, so a
+/// minute is already generous; past it the hook is not a check, it is a job.
+pub const MAX_HOOK_TIMEOUT_MS: u64 = 60_000;
+
+/// A lifecycle point a hook can run at (spec 32 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HookEvent {
+    SessionStart,
+    BeforeContext,
+    BeforeTool,
+    AfterTool,
+    BeforePatchApply,
+    AfterPatchApply,
+    AfterCheck,
+    BeforeTaskComplete,
+    SessionEnd,
+}
+
+impl HookEvent {
+    /// Every event, in lifecycle order.
+    pub const ALL: [HookEvent; 9] = [
+        HookEvent::SessionStart,
+        HookEvent::BeforeContext,
+        HookEvent::BeforeTool,
+        HookEvent::AfterTool,
+        HookEvent::BeforePatchApply,
+        HookEvent::AfterPatchApply,
+        HookEvent::AfterCheck,
+        HookEvent::BeforeTaskComplete,
+        HookEvent::SessionEnd,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookEvent::SessionStart => "session_start",
+            HookEvent::BeforeContext => "before_context",
+            HookEvent::BeforeTool => "before_tool",
+            HookEvent::AfterTool => "after_tool",
+            HookEvent::BeforePatchApply => "before_patch_apply",
+            HookEvent::AfterPatchApply => "after_patch_apply",
+            HookEvent::AfterCheck => "after_check",
+            HookEvent::BeforeTaskComplete => "before_task_complete",
+            HookEvent::SessionEnd => "session_end",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|event| event.as_str() == value)
+    }
+
+    /// How long a hook at this event may run when it sets no `timeout_ms`
+    /// (spec 32 `context.md` §7). Short where the hook sits on every tool
+    /// call or in front of the turn; longer where it runs once per action
+    /// that already took a while.
+    pub fn default_timeout_ms(self) -> u64 {
+        match self {
+            HookEvent::SessionStart | HookEvent::BeforeContext | HookEvent::BeforeTool => 2_000,
+            HookEvent::SessionEnd => 5_000,
+            HookEvent::BeforePatchApply
+            | HookEvent::AfterTool
+            | HookEvent::AfterPatchApply
+            | HookEvent::AfterCheck
+            | HookEvent::BeforeTaskComplete => 10_000,
+        }
+    }
+}
+
+/// What a hook's failure does to the action (spec 32 §5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HookMode {
+    /// A failure blocks the action. The default, because a user who wrote a
+    /// hook to enforce a rule wants it enforced when the hook is broken.
+    #[default]
+    Mandatory,
+    /// A failure is a warning and the action proceeds.
+    Optional,
+}
+
+impl HookMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookMode::Mandatory => "mandatory",
+            HookMode::Optional => "optional",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "mandatory" => Some(HookMode::Mandatory),
+            "optional" => Some(HookMode::Optional),
+            _ => None,
+        }
+    }
+}
+
+/// Which config file defined a hook. A repository-defined hook does not run
+/// until the user has reviewed it (spec 32 `context.md` §7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookSource {
+    User,
+    Repository,
+    Admin,
+}
+
+impl HookSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookSource::User => "user",
+            HookSource::Repository => "repository",
+            HookSource::Admin => "admin",
+        }
+    }
+}
+
+/// A configured hook: an executable Damaian runs at its events, which can
+/// only answer with a verdict (spec 32 §5.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookConfig {
+    pub id: String,
+    /// Run directly with `args`, never through `shell`.
+    pub command: String,
+    pub args: Vec<String>,
+    pub events: Vec<HookEvent>,
+    pub mode: HookMode,
+    /// Hooks for one event run by `order`, then by id (spec 32 §5.6).
+    pub order: i64,
+    /// `None` takes the event's default.
+    pub timeout_ms: Option<u64>,
+    pub enabled: bool,
+    pub source: HookSource,
+}
+
+impl HookConfig {
+    /// The deadline this hook runs under at `event`.
+    pub fn deadline_ms(&self, event: HookEvent) -> u64 {
+        self.timeout_ms
+            .unwrap_or_else(|| event.default_timeout_ms())
+            .min(MAX_HOOK_TIMEOUT_MS)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookConfigOverlay {
+    pub id: String,
+    pub command: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub events: Option<Vec<HookEvent>>,
+    pub mode: Option<HookMode>,
+    pub order: Option<i64>,
+    pub timeout_ms: Option<u64>,
+    pub enabled: Option<bool>,
+}
+
+impl HookConfigOverlay {
+    /// The fields this overlay sets, by the names `to_policy_text` prints
+    /// after `hook.<id>.`.
+    pub(crate) fn present_fields(&self) -> Vec<&'static str> {
+        let Self {
+            id: _,
+            command,
+            args,
+            events,
+            mode,
+            order,
+            timeout_ms,
+            enabled,
+        } = self;
+        [
+            ("command", command.is_some()),
+            ("args", args.is_some()),
+            ("events", events.is_some()),
+            ("mode", mode.is_some()),
+            ("order", order.is_some()),
+            ("timeout_ms", timeout_ms.is_some()),
+            ("enabled", enabled.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(field, present)| present.then_some(field))
+        .collect()
+    }
+}
+
+/// The user's decision about one repository-defined hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookReview {
+    /// Approved at this definition hash. A hook whose hash has changed since
+    /// is not the hook the user approved.
+    Approved {
+        hash: String,
+    },
+    Declined,
+}
+
+impl HookReview {
+    pub fn parse(value: &str) -> Result<Self> {
+        if value == "declined" {
+            return Ok(HookReview::Declined);
+        }
+        match value.strip_prefix("sha256:") {
+            Some(hex) if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) => {
+                Ok(HookReview::Approved {
+                    hash: value.to_string(),
+                })
+            }
+            _ => Err(ClientError::InvalidInput(
+                "a hook review must be sha256:<hex> or declined".to_string(),
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            HookReview::Approved { hash } => hash,
+            HookReview::Declined => "declined",
+        }
+    }
 }
 
 impl ModelProviderConfigOverlay {
@@ -748,6 +974,19 @@ impl Config {
                 config.apply_overlay_scoped(ConfigOverlay::load(path)?, ConfigScope::Admin);
             report.applied.extend(outcome.applied);
         }
+        // User and admin config are the user's own files, so a hook they
+        // left without a command or events is a mistake to report, as a bad
+        // key in them is. Repository hooks never get here incomplete.
+        if let Some(hook) = config
+            .hooks
+            .iter()
+            .find(|hook| hook.command.is_empty() || hook.events.is_empty())
+        {
+            return Err(ClientError::InvalidInput(format!(
+                "hook {} needs both hook.{}.command and hook.{}.events",
+                hook.id, hook.id, hook.id
+            )));
+        }
         // Last and restrict-only (spec 31, `context.md` §4), so admin can
         // widen the base but cannot undo a narrower profile the user chose.
         // With no selection nothing is applied, which is Full: the empty
@@ -858,6 +1097,8 @@ impl Config {
             mcp_enabled,
             mcp_server_allowlist,
             mcp_servers,
+            hooks,
+            hook_reviews_by_repository,
         } = overlay;
 
         let mut outcome = OverlayOutcome::default();
@@ -1188,6 +1429,87 @@ impl Config {
             let (id, fields) = fields;
             for (field, loosened) in fields {
                 outcome.record(scope, format!("mcp_server.{id}.{field}"), None, loosened);
+            }
+        }
+        // Spec 32 `context.md` §7.1. A repository may define a hook of its
+        // own, which runs only once the user has reviewed it, but may not
+        // touch one a user or admin defined in any field: disabling,
+        // softening or retiming a user's hook is how a clone would switch off
+        // the rule the hook enforces. A profile defines and changes nothing.
+        for hook in hooks {
+            let id = hook.id.clone();
+            let fields = hook.present_fields();
+            let refuse_all = |class: RepositoryKeyClass, rejected: &mut Vec<RejectedConfigKey>| {
+                for field in &fields {
+                    rejected.push(RejectedConfigKey::new(format!("hook.{id}.{field}"), class));
+                }
+            };
+            let source = match scope {
+                ConfigScope::User => HookSource::User,
+                ConfigScope::Admin => HookSource::Admin,
+                ConfigScope::Repository => {
+                    if self.hook(&id).is_some() {
+                        refuse_all(forbidden, rejected);
+                        continue;
+                    }
+                    // Repository config is parsed line by line, so a hook it
+                    // left half-defined is skipped here rather than failing
+                    // the load the way an incomplete user hook does.
+                    if hook.command.is_none() || hook.events.is_none() {
+                        refuse_all(RepositoryKeyClass::Unparsable, rejected);
+                        continue;
+                    }
+                    HookSource::Repository
+                }
+                ConfigScope::Profile => {
+                    refuse_all(forbidden, rejected);
+                    continue;
+                }
+            };
+            // Only admin can overrule a hook another scope defined, and when
+            // it loosens one the policy view says so.
+            let loosened = |field: &str| {
+                let Some(before) = self.hook(&id) else {
+                    return false;
+                };
+                match field {
+                    "enabled" => hook.enabled == Some(false) && before.enabled,
+                    "mode" => {
+                        hook.mode == Some(HookMode::Optional) && before.mode == HookMode::Mandatory
+                    }
+                    "timeout_ms" => hook.timeout_ms.is_some_and(|after| {
+                        before
+                            .events
+                            .iter()
+                            .any(|event| after > before.deadline_ms(*event))
+                    }),
+                    _ => false,
+                }
+            };
+            let recorded: Vec<_> = fields
+                .iter()
+                .map(|field| (*field, loosened(field)))
+                .collect();
+            self.upsert_hook(hook, source);
+            for (field, loosened) in recorded {
+                outcome.record(scope, format!("hook.{id}.{field}"), None, loosened);
+            }
+        }
+        // User-owned, like the other per-repository decisions: a repository
+        // cannot approve its own hook, and a profile cannot either.
+        for (repository_id, reviews) in hook_reviews_by_repository {
+            for (hook_id, review) in reviews {
+                if trusted {
+                    self.hook_reviews_by_repository
+                        .entry(repository_id.clone())
+                        .or_default()
+                        .insert(hook_id, review);
+                } else {
+                    rejected.push(RejectedConfigKey::new(
+                        format!("hook_review.{repository_id}.{hook_id}"),
+                        RepositoryKeyClass::UserOwned,
+                    ));
+                }
             }
         }
 
@@ -1667,6 +1989,10 @@ impl Config {
         });
     }
 
+    pub fn hook(&self, id: &str) -> Option<&HookConfig> {
+        self.hooks.iter().find(|hook| hook.id == id)
+    }
+
     pub fn mcp_server_config(&self, id: &str) -> Option<&McpServerConfig> {
         self.mcp_servers.iter().find(|server| server.id == id)
     }
@@ -1737,6 +2063,60 @@ impl Config {
             require_approval: overlay.require_approval.unwrap_or(true),
             id,
         });
+    }
+
+    /// Upserts a hook by id. `source` is kept only for a new hook: admin
+    /// changing a user's hook does not make it an admin hook.
+    fn upsert_hook(&mut self, overlay: HookConfigOverlay, source: HookSource) {
+        let HookConfigOverlay {
+            id,
+            command,
+            args,
+            events,
+            mode,
+            order,
+            timeout_ms,
+            enabled,
+        } = overlay;
+        let index = match self.hooks.iter().position(|hook| hook.id == id) {
+            Some(index) => index,
+            None => {
+                self.hooks.push(HookConfig {
+                    id,
+                    command: String::new(),
+                    args: Vec::new(),
+                    events: Vec::new(),
+                    mode: HookMode::default(),
+                    order: 0,
+                    timeout_ms: None,
+                    enabled: true,
+                    source,
+                });
+                self.hooks.len() - 1
+            }
+        };
+        let hook = &mut self.hooks[index];
+        if let Some(value) = command {
+            hook.command = value;
+        }
+        if let Some(value) = args {
+            hook.args = value;
+        }
+        if let Some(value) = events {
+            hook.events = value;
+        }
+        if let Some(value) = mode {
+            hook.mode = value;
+        }
+        if let Some(value) = order {
+            hook.order = value;
+        }
+        if let Some(value) = timeout_ms {
+            hook.timeout_ms = Some(value);
+        }
+        if let Some(value) = enabled {
+            hook.enabled = value;
+        }
     }
 
     /// Upserts a repository-supplied MCP server. A repository may *suggest* a
@@ -2080,6 +2460,11 @@ impl Config {
         for server in &self.mcp_servers {
             push_mcp_server_config(&mut output, server);
         }
+        // Not the reviews: like the other per-repository maps, they are the
+        // user's decisions about every checkout, not policy of this one.
+        for hook in &self.hooks {
+            push_hook_config(&mut output, hook);
+        }
         output
     }
 }
@@ -2150,6 +2535,8 @@ impl Default for Config {
             mcp_enabled: true,
             mcp_server_allowlist: Vec::new(),
             mcp_servers: Vec::new(),
+            hooks: Vec::new(),
+            hook_reviews_by_repository: BTreeMap::new(),
         }
     }
 }
@@ -2208,6 +2595,10 @@ pub struct ConfigOverlay {
     pub mcp_enabled: Option<bool>,
     pub mcp_server_allowlist: Option<Vec<String>>,
     pub mcp_servers: Vec<McpServerConfigOverlay>,
+    pub hooks: Vec<HookConfigOverlay>,
+    /// `hook_review.<repository_id>.<hook_id>` entries, from user or admin
+    /// config.
+    pub hook_reviews_by_repository: BTreeMap<String, BTreeMap<String, HookReview>>,
 }
 
 /// Which commands a permission profile lets run at all, narrowest first, so
@@ -2337,6 +2728,11 @@ classify_overlay_fields! {
     mcp_enabled => Capability,
     mcp_server_allowlist => Capability,
     mcp_servers => Capability,
+    // A hook is an executable Damaian runs, so its definition is capability
+    // whatever it can answer, and a review is the user's own decision about
+    // one repository (spec 32, context.md §7.1).
+    hooks => Capability,
+    hook_reviews_by_repository => Capability,
 }
 
 impl ConfigOverlay {
@@ -2433,6 +2829,12 @@ impl ConfigOverlay {
         }
         if let Some(server_key) = key.strip_prefix("mcp_server.") {
             return self.set_mcp_server_config(server_key, value);
+        }
+        if let Some(hook_key) = key.strip_prefix("hook.") {
+            return self.set_hook_config(hook_key, value);
+        }
+        if let Some(review_key) = key.strip_prefix("hook_review.") {
+            return self.set_hook_review(review_key, value);
         }
         if let Some(repository_id) = key.strip_prefix("command_allowlist.") {
             return self.set_repository_command_allowlist(repository_id, value);
@@ -2681,6 +3083,128 @@ impl ConfigOverlay {
         Ok(())
     }
 
+    /// `hook.<id>.<field>=value`. Whether the scope may set it is decided
+    /// when the overlay is applied.
+    fn set_hook_config(&mut self, hook_key: &str, value: &str) -> Result<()> {
+        let Some((id, field)) = hook_key.rsplit_once('.') else {
+            return Err(ClientError::InvalidInput(format!(
+                "Invalid hook config key: hook.{hook_key}"
+            )));
+        };
+        let id = validate_hook_id(id)?;
+        // Parsed before the entry is created, so a bad value leaves nothing
+        // behind even outside `parse_untrusted`'s rollback.
+        let mut parsed = HookConfigOverlay::default();
+        match field {
+            "command" => {
+                if value.is_empty() {
+                    return Err(ClientError::InvalidInput(format!(
+                        "hook.{id}.command must name an executable"
+                    )));
+                }
+                parsed.command = Some(value.to_string());
+            }
+            "args" => parsed.args = Some(split_list(value)),
+            "events" => {
+                let events = split_list(value)
+                    .iter()
+                    .map(|name| {
+                        HookEvent::parse(name).ok_or_else(|| {
+                            ClientError::InvalidInput(format!(
+                                "hook.{id}.events: unknown event {name}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if events.is_empty() {
+                    return Err(ClientError::InvalidInput(format!(
+                        "hook.{id}.events must name at least one event"
+                    )));
+                }
+                parsed.events = Some(events);
+            }
+            "mode" => {
+                parsed.mode = Some(HookMode::parse(value).ok_or_else(|| {
+                    ClientError::InvalidInput(format!(
+                        "hook.{id}.mode must be mandatory or optional"
+                    ))
+                })?)
+            }
+            "order" => {
+                parsed.order = Some(value.parse::<i64>().map_err(|_| {
+                    ClientError::InvalidInput(format!("hook.{id}.order must be an integer"))
+                })?)
+            }
+            "timeout_ms" => {
+                let timeout = parse_u64(field, value)?;
+                if timeout == 0 || timeout > MAX_HOOK_TIMEOUT_MS {
+                    return Err(ClientError::InvalidInput(format!(
+                        "hook.{id}.timeout_ms must be between 1 and {MAX_HOOK_TIMEOUT_MS}"
+                    )));
+                }
+                parsed.timeout_ms = Some(timeout);
+            }
+            "enabled" => parsed.enabled = Some(parse_bool(field, value)?),
+            _ => {
+                return Err(ClientError::InvalidInput(format!(
+                    "Unknown hook config key: hook.{hook_key}"
+                )));
+            }
+        }
+        let index = match self.hooks.iter().position(|hook| hook.id == id) {
+            Some(index) => index,
+            None => {
+                self.hooks.push(HookConfigOverlay {
+                    id: id.clone(),
+                    ..HookConfigOverlay::default()
+                });
+                self.hooks.len() - 1
+            }
+        };
+        let hook = &mut self.hooks[index];
+        let HookConfigOverlay {
+            id: _,
+            command,
+            args,
+            events,
+            mode,
+            order,
+            timeout_ms,
+            enabled,
+        } = parsed;
+        hook.command = command.or(hook.command.take());
+        hook.args = args.or(hook.args.take());
+        hook.events = events.or(hook.events.take());
+        hook.mode = mode.or(hook.mode);
+        hook.order = order.or(hook.order);
+        hook.timeout_ms = timeout_ms.or(hook.timeout_ms);
+        hook.enabled = enabled.or(hook.enabled);
+        Ok(())
+    }
+
+    /// `hook_review.<repository_id>.<hook_id>=sha256:<hex>|declined` — the
+    /// user's decision about one repository-defined hook. Refused at
+    /// repository scope when the overlay is applied.
+    fn set_hook_review(&mut self, review_key: &str, value: &str) -> Result<()> {
+        let Some((repository_id, hook_id)) = review_key.rsplit_once('.') else {
+            return Err(ClientError::InvalidInput(format!(
+                "Invalid hook review key: hook_review.{review_key}"
+            )));
+        };
+        if !repository_id.starts_with("repo_") {
+            return Err(ClientError::InvalidInput(format!(
+                "Invalid repository id in config key: hook_review.{review_key}"
+            )));
+        }
+        let hook_id = validate_hook_id(hook_id)?;
+        let review = HookReview::parse(value)?;
+        self.hook_reviews_by_repository
+            .entry(repository_id.to_string())
+            .or_default()
+            .insert(hook_id, review);
+        Ok(())
+    }
+
     pub fn to_policy_text(&self) -> String {
         // Exhaustive destructuring, deliberately without `..`: a field added to
         // `ConfigOverlay` fails to compile here, and one bound but never written
@@ -2737,6 +3261,8 @@ impl ConfigOverlay {
             mcp_enabled,
             mcp_server_allowlist,
             mcp_servers,
+            hooks,
+            hook_reviews_by_repository,
         } = self;
         let mut output = String::new();
         if let Some(value) = data_dir {
@@ -2918,7 +3444,88 @@ impl ConfigOverlay {
         for server in mcp_servers {
             push_mcp_server_overlay(&mut output, server);
         }
+        for hook in hooks {
+            push_hook_overlay(&mut output, hook);
+        }
+        for (repository_id, reviews) in hook_reviews_by_repository {
+            for (hook_id, review) in reviews {
+                push_line(
+                    &mut output,
+                    &format!("hook_review.{repository_id}.{hook_id}"),
+                    review.as_str(),
+                );
+            }
+        }
         output
+    }
+}
+
+fn hook_events_text(events: &[HookEvent]) -> String {
+    events
+        .iter()
+        .map(|event| event.as_str())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn push_hook_config(output: &mut String, hook: &HookConfig) {
+    let id = &hook.id;
+    push_line(output, &format!("hook.{id}.command"), &hook.command);
+    if !hook.args.is_empty() {
+        push_line(output, &format!("hook.{id}.args"), &join_list(&hook.args));
+    }
+    push_line(
+        output,
+        &format!("hook.{id}.events"),
+        &hook_events_text(&hook.events),
+    );
+    push_line(output, &format!("hook.{id}.mode"), hook.mode.as_str());
+    push_line(output, &format!("hook.{id}.order"), &hook.order.to_string());
+    if let Some(value) = hook.timeout_ms {
+        push_line(output, &format!("hook.{id}.timeout_ms"), &value.to_string());
+    }
+    push_line(
+        output,
+        &format!("hook.{id}.enabled"),
+        &hook.enabled.to_string(),
+    );
+}
+
+fn push_hook_overlay(output: &mut String, hook: &HookConfigOverlay) {
+    let HookConfigOverlay {
+        id,
+        command,
+        args,
+        events,
+        mode,
+        order,
+        timeout_ms,
+        enabled,
+    } = hook;
+    if let Some(value) = command {
+        push_line(output, &format!("hook.{id}.command"), value);
+    }
+    if let Some(value) = args {
+        push_line(output, &format!("hook.{id}.args"), &join_list(value));
+    }
+    if let Some(value) = events {
+        push_line(
+            output,
+            &format!("hook.{id}.events"),
+            &hook_events_text(value),
+        );
+    }
+    if let Some(value) = mode {
+        push_line(output, &format!("hook.{id}.mode"), value.as_str());
+    }
+    if let Some(value) = order {
+        push_line(output, &format!("hook.{id}.order"), &value.to_string());
+    }
+    if let Some(value) = timeout_ms {
+        push_line(output, &format!("hook.{id}.timeout_ms"), &value.to_string());
+    }
+    if let Some(value) = enabled {
+        push_line(output, &format!("hook.{id}.enabled"), &value.to_string());
     }
 }
 
@@ -3303,6 +3910,23 @@ pub fn normalize_mcp_server_id(value: &str) -> Result<String> {
     } else {
         Err(ClientError::InvalidInput(
             "mcp server id can contain only letters, numbers, dots, and dashes".to_string(),
+        ))
+    }
+}
+
+/// A hook id is the custom-profile id rule, `[a-z0-9_]{1,40}`: it is printed
+/// in the policy view and in audit events, so it stays short and plain.
+fn validate_hook_id(id: &str) -> Result<String> {
+    if !id.is_empty()
+        && id.len() <= 40
+        && id
+            .chars()
+            .all(|character| matches!(character, 'a'..='z' | '0'..='9' | '_'))
+    {
+        Ok(id.to_string())
+    } else {
+        Err(ClientError::InvalidInput(
+            "a hook id is 1 to 40 lowercase letters, digits or underscores".to_string(),
         ))
     }
 }
