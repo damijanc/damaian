@@ -1,16 +1,29 @@
 //! Hooks (spec 32): external programs that see a lifecycle event and answer
 //! with a verdict.
 //!
-//! This part is the contract alone (`context.md` §5, §6, §12): what a hook
-//! is sent, what it may answer, how an answer is checked, the order hooks
-//! run in and how their verdicts combine. Nothing here spawns a process or
-//! reads a file.
+//! The contract (`context.md` §5, §6, §12): what a hook is sent, what it may
+//! answer, how an answer is checked, the order hooks run in and how their
+//! verdicts combine. That part is pure.
+//!
+//! The runner (`context.md` §2, §8): `run_hook` starts one hook with a
+//! cleared environment, hands it the envelope, and kills it at its deadline
+//! or at the output ceiling. It does not read the answer; that is
+//! `parse_response`'s job.
 
+use crate::command_runner::kill_process_group;
 use crate::finding::Severity;
+use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
+use crate::secret_scanner::SecretScanner;
 use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 use std::fmt;
-use std::path::PathBuf;
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 pub use crate::config::{HookConfig, HookEvent, HookMode, HookSource, MAX_HOOK_TIMEOUT_MS};
 
@@ -458,4 +471,352 @@ fn parse_finding(value: &Value) -> Result<HookFinding, ResponseError> {
         path: optional_string(finding, "path")?,
         line,
     })
+}
+
+/// The variables a hook inherits from Damaian, by name (`context.md` §8).
+/// Nothing else is passed on: not the model key's variable, not an MCP
+/// server's token, so a hook cannot be a way to read the user's API key.
+const HOOK_INHERITED_ENV: [&str; 5] = ["PATH", "HOME", "USER", "LANG", "TMPDIR"];
+
+/// How often the runner checks on a running hook. Shorter than
+/// `CommandRunner`'s 50 ms because a `before_tool` hook runs on every tool
+/// call, and a hook that finishes just after a poll waits out the interval.
+const HOOK_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// How much of stderr is held while the hook runs. More than is returned,
+/// so the redaction that runs before the cut sees a secret whole even if it
+/// straddles the last 8 KiB.
+const HOOK_STDERR_HELD_BYTES: usize = 4 * MAX_HOOK_STDERR_BYTES;
+
+/// One hook run, before its answer is read.
+#[derive(Debug)]
+pub struct HookRun {
+    /// Raw stdout, at most `MAX_HOOK_STDOUT_BYTES + 1` bytes: reading stops
+    /// one byte past the ceiling, which is how `OutputTooLarge` is known.
+    pub stdout: Vec<u8>,
+    /// Redacted, and only the last `MAX_HOOK_STDERR_BYTES`. For the user
+    /// debugging their hook; never for the model (proposal §5.9).
+    pub stderr: String,
+    /// `None` when the hook never started.
+    pub exit: Option<ExitStatus>,
+    /// Why the run cannot be taken as an answer. `None` means the hook
+    /// exited 0 within its deadline and its bounds.
+    pub failure: Option<HookFailureKind>,
+    pub duration: Duration,
+}
+
+/// Runs one hook to completion, its deadline, or its output ceiling.
+///
+/// The same shape as `CommandRunner::run_at` but not a call to it
+/// (`context.md` §2): the hook is executed directly, not through the user's
+/// login shell; it gets the envelope on stdin; and oversized output is a
+/// failure rather than a truncation. The child runs in its own process
+/// group, registered as `ProcessKind::Hook` under `registry_owner` (the task
+/// or session id), so a crash mid-hook leaves it for the sweep.
+///
+/// `timeout` is the caller's `HookConfig::deadline_ms(event)`.
+pub fn run_hook(
+    hook: &HookConfig,
+    envelope: &HookEnvelope,
+    repository_root: &Path,
+    data_dir: &Path,
+    registry_owner: &str,
+    scanner: &SecretScanner,
+    timeout: Duration,
+) -> HookRun {
+    let started = Instant::now();
+    let (mut child, mut guard) = match spawn_hook(
+        hook,
+        envelope.event,
+        repository_root,
+        data_dir,
+        registry_owner,
+    ) {
+        Ok(spawned) => spawned,
+        Err(why) => {
+            return HookRun {
+                stdout: Vec::new(),
+                stderr: scanner.redact(&why).text,
+                exit: None,
+                failure: Some(HookFailureKind::SpawnFailed),
+                duration: started.elapsed(),
+            };
+        }
+    };
+
+    // On its own thread, so a hook that never reads stdin cannot hold the
+    // runner in a blocked write past its deadline. A write that fails because
+    // the hook exited without reading is not a failure: it may answer
+    // without looking.
+    let input = serde_json::to_vec(envelope).unwrap_or_default();
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let stdout_reader = spawn_reader(
+        child.stdout.take().expect("stdout was piped"),
+        Arc::clone(&stdout),
+        keep_up_to_the_ceiling,
+    );
+    let stderr_reader = spawn_reader(
+        child.stderr.take().expect("stderr was piped"),
+        Arc::clone(&stderr),
+        keep_the_tail,
+    );
+
+    let deadline = started + timeout;
+    let mut status: Option<ExitStatus> = None;
+    let mut failure = loop {
+        if lock(&stdout).len() > MAX_HOOK_STDOUT_BYTES {
+            break Some(HookFailureKind::OutputTooLarge);
+        }
+        if status.is_none()
+            && let Ok(Some(exit)) = child.try_wait()
+        {
+            status = Some(exit);
+        }
+        // Exited is not enough: the answer is whatever reached stdout, so the
+        // pipes must have closed too.
+        if status.is_some() && stdout_reader.is_finished() && stderr_reader.is_finished() {
+            break None;
+        }
+        if Instant::now() >= deadline {
+            break Some(HookFailureKind::Timeout);
+        }
+        std::thread::sleep(HOOK_POLL_INTERVAL);
+    };
+
+    if status.is_none() {
+        kill_process_group(child.id());
+        // Reap so the guard does not kill a pid that could have been reused.
+        status = child.wait().ok();
+    }
+    // Reaped, so the pid is free and its group may already be someone
+    // else's. A leader that exited while something it started still holds a
+    // pipe is not killed here for that reason; the reader is abandoned
+    // instead, as `CommandGuard` does.
+    guard.armed = false;
+    drop(guard);
+    for reader in [stdout_reader, stderr_reader] {
+        if reader.is_finished() {
+            let _ = reader.join();
+        }
+    }
+
+    let stdout = std::mem::take(&mut *lock(&stdout));
+    if failure.is_none() && stdout.len() > MAX_HOOK_STDOUT_BYTES {
+        failure = Some(HookFailureKind::OutputTooLarge);
+    }
+    if failure.is_none() && !status.is_some_and(|exit| exit.success()) {
+        failure = Some(HookFailureKind::NonZeroExit);
+    }
+    let stderr = String::from_utf8_lossy(&lock(&stderr)).into_owned();
+    HookRun {
+        stdout,
+        stderr: last_bytes(&scanner.redact(&stderr).text, MAX_HOOK_STDERR_BYTES).to_string(),
+        exit: status,
+        failure,
+        duration: started.elapsed(),
+    }
+}
+
+/// Starts the hook and registers it. The error is the message the user sees
+/// for a `SpawnFailed` hook.
+fn spawn_hook(
+    hook: &HookConfig,
+    event: HookEvent,
+    repository_root: &Path,
+    data_dir: &Path,
+    registry_owner: &str,
+) -> Result<(Child, HookGuard), String> {
+    let mut command = Command::new(&hook.command);
+    command.args(&hook.args).env_clear();
+    for name in HOOK_INHERITED_ENV {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let mut child = command
+        .env("DAMAIAN_HOOK_ID", &hook.id)
+        .env("DAMAIAN_HOOK_EVENT", event.as_str())
+        .env("DAMAIAN_REPOSITORY_ROOT", repository_root)
+        .current_dir(repository_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| format!("could not start `{}`: {error}", hook.command))?;
+    let registration = ProcessRegistry::open(data_dir)
+        .and_then(|registry| registry.register(ProcessKind::Hook, registry_owner, child.id()));
+    match registration {
+        Ok(registration) => {
+            let guard = HookGuard {
+                pid: child.id(),
+                armed: true,
+                _registration: registration,
+            };
+            Ok((child, guard))
+        }
+        Err(error) => {
+            // An unregistered hook could not be swept after a crash, so it
+            // does not get to run.
+            kill_process_group(child.id());
+            let _ = child.wait();
+            Err(format!("could not register `{}`: {error}", hook.command))
+        }
+    }
+}
+
+/// `CommandGuard`'s counterpart: kills the hook's group if the runner
+/// unwinds before reaping it, and removes the registry entry on every path.
+struct HookGuard {
+    pid: u32,
+    armed: bool,
+    _registration: RegistrationHandle,
+}
+
+impl Drop for HookGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            kill_process_group(self.pid);
+        }
+    }
+}
+
+fn lock(buffer: &Mutex<Vec<u8>>) -> MutexGuard<'_, Vec<u8>> {
+    buffer.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Reads a pipe into `buffer` until EOF, or until `append` says stop.
+fn spawn_reader<R: Read + Send + 'static>(
+    mut pipe: R,
+    buffer: Arc<Mutex<Vec<u8>>>,
+    append: fn(&mut Vec<u8>, &[u8]) -> bool,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut chunk = [0_u8; 8 * 1024];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if !append(&mut lock(&buffer), &chunk[..read]) {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+/// Stdout: one byte past the ceiling is enough to know it was exceeded, and
+/// reading on would only let an endless writer run to its deadline.
+fn keep_up_to_the_ceiling(buffer: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    buffer.extend_from_slice(chunk);
+    if buffer.len() > MAX_HOOK_STDOUT_BYTES {
+        buffer.truncate(MAX_HOOK_STDOUT_BYTES + 1);
+        return false;
+    }
+    true
+}
+
+/// Stderr: read to the end so the hook never blocks on a full pipe, keeping
+/// only the tail.
+fn keep_the_tail(buffer: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    buffer.extend_from_slice(chunk);
+    if buffer.len() > 2 * HOOK_STDERR_HELD_BYTES {
+        buffer.drain(..buffer.len() - HOOK_STDERR_HELD_BYTES);
+    }
+    true
+}
+
+/// The last `max` bytes of `text`, starting on a character boundary.
+fn last_bytes(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::AuditLog;
+    use crate::config::{HookMode, HookSource};
+
+    /// The crash half of "leaves no process behind" (Task 3): a hook whose
+    /// runner died without reaping it is found by spec 46's sweep through its
+    /// registry entry. In-crate because simulating the crash needs
+    /// `spawn_hook`'s guard, which `run_hook` never hands out.
+    ///
+    /// It spawns `/bin/sh` on a script and kills it, the same as the runner's
+    /// own timeout test, and the sweep only reaches entries in its own scratch
+    /// data directory, so it is not `#[ignore]`d.
+    #[test]
+    fn a_hook_left_running_by_a_crash_is_killed_by_the_sweep() {
+        let root = std::env::temp_dir().join(format!(
+            "damaian-hook-sweep-{}-{}",
+            std::process::id(),
+            crate::hash::now_millis()
+        ));
+        let data_dir = root.join(".damaian-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let script = root.join("hang.sh");
+        std::fs::write(&script, "sleep 30\n").unwrap();
+        let hook = HookConfig {
+            id: "hangs".to_string(),
+            command: "/bin/sh".to_string(),
+            args: vec![script.to_string_lossy().to_string()],
+            events: vec![HookEvent::BeforeTool],
+            mode: HookMode::Mandatory,
+            order: 0,
+            timeout_ms: None,
+            enabled: true,
+            source: HookSource::User,
+        };
+
+        let (mut child, guard) =
+            spawn_hook(&hook, HookEvent::BeforeTool, &root, &data_dir, "task_1").unwrap();
+        // The crash: nothing reaps the hook, kills its group or removes its
+        // registry entry.
+        std::mem::forget(guard);
+
+        let registry = ProcessRegistry::open(&data_dir).unwrap();
+        let entries = registry.entries().unwrap();
+        assert_eq!(entries.len(), 1, "the hook was not registered");
+        let entry = entries[0].1.clone().expect("a parsable entry");
+        assert_eq!(entry.kind, "hook");
+        assert_eq!(entry.pid, child.id());
+        assert_eq!(entry.session_id, "task_1");
+
+        let audit = AuditLog::new(&data_dir, true, SecretScanner::new(Vec::new()));
+        let report = registry.sweep_own(&audit).unwrap();
+
+        let settle = Instant::now() + Duration::from_secs(2);
+        let exited = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() > settle {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if exited.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(report.killed(), 1);
+        assert!(exited.is_some(), "the sweep left the hook running");
+    }
 }
