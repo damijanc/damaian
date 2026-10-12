@@ -17,7 +17,7 @@ Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 bespoke API client),
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (`unknown_external_outcome` — the central mechanism here),
-[`23_verification_loop.md`](23_verification_loop.md) (the check evidence the PR
+[`23_verification_loop/proposal.md`](23_verification_loop/proposal.md) (the check evidence the PR
 body quotes), [`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md),
 [`33_mcp_management_and_deferred_discovery.md`](33_mcp_management_and_deferred_discovery.md)
 (per-tool approval, and the rule that a remote read-only claim is an assertion),
@@ -82,7 +82,7 @@ bespoke GitHub client would duplicate all of that and add a credential path.
   [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.1 and §5.3, including
   the rule that nothing with an unknown outcome is ever automatically repeated.
 - **Check evidence is structured.**
-  [Spec 23](23_verification_loop.md) §5.7 defines a completion report whose
+  [Spec 23](23_verification_loop/proposal.md) §5.7 defines a completion report whose
   passed list contains only checks that ran and exited zero, derived from
   `CommandExit` evidence.
 - **Credentials have an established convention**: Keychain via
@@ -107,7 +107,7 @@ action and target branch → **request push approval** → show the final PR pay
 and status.
 
 Draft contents: title; summary; changes by area; validation evidence from
-[spec 23](23_verification_loop.md); screenshots or artifacts the user selected;
+[spec 23](23_verification_loop/proposal.md); screenshots or artifacts the user selected;
 known limitations; linked issue references.
 
 ## 4. Non-goals
@@ -281,7 +281,7 @@ already exists" is a precondition, not a best effort.
 ### 5.6 The PR body, and not overstating it
 
 Requirement 4. The validation section is generated from
-[spec 23](23_verification_loop.md)'s completion report, whose passed list already
+[spec 23](23_verification_loop/proposal.md)'s completion report, whose passed list already
 contains only checks that ran and exited zero (§5.7 there, derived from
 `CommandExit` evidence with `exit_code == Some(0)`).
 
@@ -291,7 +291,7 @@ Three rules carried through to the body:
   `declined_by_user`, `no_running_target`, no detected check. Silence would read
   as "nothing to report", and a reviewer reads a PR body as a claim about what
   was verified.
-- **`stale_after_partial_acceptance`** ([spec 23](23_verification_loop.md) §5.6)
+- **`stale_after_partial_acceptance`** ([spec 23](23_verification_loop/proposal.md) §5.6)
   is stated. A check that passed against five files when three were accepted did
   not verify what is in the PR, and saying so is the difference between evidence
   and decoration.

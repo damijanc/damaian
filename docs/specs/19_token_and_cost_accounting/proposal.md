@@ -373,7 +373,7 @@ append is guarded by marker id, because the sweep runs at every launch and an
 unguarded one would grow the reported spend each time the app opened.
 
 **Requirement 2's completion report does not exist yet.** It is
-[spec 23](../23_verification_loop.md) §5.7, not started. The task-state surface
+[spec 23](../23_verification_loop/proposal.md) §5.7, not started. The task-state surface
 is built; the report reads `read_task_usage` when spec 23 builds it, rather
 than growing a second accounting path.
 

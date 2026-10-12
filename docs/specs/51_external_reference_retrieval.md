@@ -37,7 +37,7 @@ Every task touching a third-party API therefore runs on whatever the model
 remembers, and what a model remembers about a fast-moving library is a mixture
 of several versions with no marker saying which. The failure is not that the
 agent says "I don't know" — it is that it writes a confident call against an API
-that changed, and the user finds out at `cargo build`. [Spec 23](23_verification_loop.md)
+that changed, and the user finds out at `cargo build`. [Spec 23](23_verification_loop/proposal.md)
 will catch a compile error; it will not catch a semantically valid call to a
 deprecated endpoint.
 

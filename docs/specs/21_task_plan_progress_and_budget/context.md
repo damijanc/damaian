@@ -187,7 +187,7 @@ favour of the reference should read this paragraph first.
   it in Task 8, beside the `CommandExit` it explains. It is informational and
   never decides status (spec 22 `context.md` §13.3).
 - **The spec-23 acceptance criterion** — "the end-to-end fixture from
-  [spec 23](../23_verification_loop.md) exercises a plan through to a completion
+  [spec 23](../23_verification_loop/proposal.md) exercises a plan through to a completion
   report" — is unsatisfiable: spec 23 is Not started. It is **restated** against
   [spec 18](../18_local_evaluation_harness/proposal.md)'s harness, which is Done,
   runs in CI deterministically, and has run against a live provider. That is a

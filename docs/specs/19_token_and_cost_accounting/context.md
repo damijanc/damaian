@@ -98,7 +98,7 @@ already written before the call, already read back by `dangling_actions`, and
 already the evidence recovery classifies from.
 
 **5. The "completion report" of §5.6 does not exist yet.** It is defined by
-[spec 23](../23_verification_loop.md) §5.7, which is Not started. Requirement 2
+[spec 23](../23_verification_loop/proposal.md) §5.7, which is Not started. Requirement 2
 therefore lands as the task-state surface — a per-turn usage line that survives
 reload — and spec 23's report reads `read_task_usage` when it is built, rather
 than growing a second accounting path.
