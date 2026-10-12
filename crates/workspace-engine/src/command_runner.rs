@@ -154,7 +154,7 @@ fn drain_output(
     }
 }
 
-fn kill_process_group(pid: u32) {
+pub(crate) fn kill_process_group(pid: u32) {
     // SAFETY: `kill` takes two integers by value and touches no memory. The
     // group id is the child's own pid, because it was spawned with
     // `process_group(0)`.

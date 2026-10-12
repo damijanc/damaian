@@ -9,22 +9,27 @@
 //! names, the closed response schema with every unknown field a widening
 //! attempt, the bounds as failures, the order hooks run in, and resolution
 //! by `deny` > `request_approval` > `warn` > `allow` whatever that order.
+//!
+//! Task 3 pins the runner (`context.md` §2, §8): the envelope goes in on
+//! stdin, the environment is cleared, a hook past its deadline or over the
+//! output ceiling is killed with its group and fails, and stderr comes back
+//! redacted and bounded.
 
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use workspace_engine::finding::Severity;
 use workspace_engine::hooks::{
-    self, HOOK_API_VERSION, HookEnvelope, HookFailureKind, MAX_HOOK_COMMANDS,
+    self, HOOK_API_VERSION, HookEnvelope, HookFailureKind, HookRun, MAX_HOOK_COMMANDS,
     MAX_HOOK_CONTEXT_CHARS, MAX_HOOK_CONTEXT_ENTRIES, MAX_HOOK_FINDINGS, MAX_HOOK_REASON_CHARS,
     MAX_HOOK_STDERR_BYTES, MAX_HOOK_STDOUT_BYTES, ResponseError, Verdict, WideningAttempt,
 };
 use workspace_engine::{
     Config, ConfigOverlay, ConfigScope, EffectivePolicy, HookConfig, HookEvent, HookMode,
-    HookReview, HookSource, MAX_HOOK_TIMEOUT_MS, RepositoryConfigReport, RepositoryKeyClass,
-    SourceKind, split_profile_keys,
+    HookReview, HookSource, MAX_HOOK_TIMEOUT_MS, ProcessRegistry, RepositoryConfigReport,
+    RepositoryKeyClass, SecretScanner, SourceKind, split_profile_keys,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1010,4 +1015,389 @@ fn null_optional_fields_count_as_absent() {
     )
     .unwrap();
     assert!(response.findings[0].path.is_none());
+}
+
+// Task 3: the runner. Every hook here is `/bin/sh <script>`, never an
+// executable written by the test (freshly written executables stall on this
+// Mac) and never a login shell.
+
+fn runner_fixture(name: &str) -> (PathBuf, PathBuf) {
+    let root = temp_dir(name);
+    let data_dir = root.join(".damaian-data");
+    fs::create_dir_all(&data_dir).unwrap();
+    (root, data_dir)
+}
+
+fn script(root: &Path, name: &str, body: &str) -> PathBuf {
+    let path = root.join("hooks").join(format!("{name}.sh"));
+    write(&path, body);
+    path
+}
+
+fn sh_hook(id: &str, script: &Path) -> HookConfig {
+    HookConfig {
+        args: vec![script.to_string_lossy().to_string()],
+        ..hook(id, 0, &[HookEvent::BeforeTool], true)
+    }
+}
+
+fn runner_envelope(root: &Path, payload: serde_json::Value) -> HookEnvelope {
+    HookEnvelope {
+        event: HookEvent::BeforeTool,
+        hook_api_version: HOOK_API_VERSION,
+        session_id: Some("session_1".to_string()),
+        task_id: Some("task_1".to_string()),
+        mode: "code".to_string(),
+        profile: "default".to_string(),
+        repository_root: root.to_path_buf(),
+        hook_depth: 0,
+        payload,
+    }
+}
+
+fn run(
+    hook: &HookConfig,
+    envelope: &HookEnvelope,
+    root: &Path,
+    data_dir: &Path,
+    timeout: Duration,
+) -> HookRun {
+    hooks::run_hook(
+        hook,
+        envelope,
+        root,
+        data_dir,
+        "task_1",
+        &SecretScanner::new(Vec::new()),
+        timeout,
+    )
+}
+
+fn registry_entries(data_dir: &Path) -> usize {
+    ProcessRegistry::open(data_dir)
+        .unwrap()
+        .entries()
+        .unwrap()
+        .len()
+}
+
+/// Prints stdin back as the one `context` entry, JSON-escaped, so the test
+/// can compare what arrived with what was sent.
+const ECHO_STDIN: &str = r#"input=$(cat)
+escaped=$(printf '%s' "$input" | sed 's/\\/\\\\/g; s/"/\\"/g')
+printf '{"hookApiVersion":1,"context":["%s"]}' "$escaped"
+"#;
+
+#[test]
+fn the_envelope_reaches_the_hook_on_stdin() {
+    let (root, data_dir) = runner_fixture("runner-stdin");
+    let hook = sh_hook("echo_stdin", &script(&root, "echo", ECHO_STDIN));
+    let envelope = runner_envelope(&root, json!({ "tool": "read_file", "path": "src/lib.rs" }));
+
+    let run = run(&hook, &envelope, &root, &data_dir, Duration::from_secs(10));
+
+    assert_eq!(run.failure, None, "stderr: {}", run.stderr);
+    assert!(run.exit.expect("the hook exited").success());
+    let response = hooks::parse_response(&run.stdout).unwrap();
+    let received: serde_json::Value = serde_json::from_str(&response.context[0]).unwrap();
+    assert_eq!(received, serde_json::to_value(&envelope).unwrap());
+    assert_eq!(
+        registry_entries(&data_dir),
+        0,
+        "a finished hook leaves no registry entry"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_hook_environment_is_cleared_to_the_named_variables() {
+    // SAFETY: nextest runs each test in its own process, so no other thread
+    // reads the environment while this writes it.
+    unsafe { std::env::set_var("MODEL_TEST_KEY", "sk-hook-must-not-see-this") };
+    let (root, data_dir) = runner_fixture("runner-env");
+    let hook = sh_hook(
+        "print_env",
+        &script(
+            &root,
+            "env",
+            r#"names=$(env | cut -d= -f1 | tr '\n' ' ')
+printf '{"hookApiVersion":1,"context":["%s","%s|%s|%s","%s"]}' \
+  "$names" "$DAMAIAN_HOOK_ID" "$DAMAIAN_HOOK_EVENT" "$DAMAIAN_REPOSITORY_ROOT" "$(pwd -P)"
+"#,
+        ),
+    );
+
+    let run = run(
+        &hook,
+        &runner_envelope(&root, json!({})),
+        &root,
+        &data_dir,
+        Duration::from_secs(10),
+    );
+
+    assert_eq!(run.failure, None, "stderr: {}", run.stderr);
+    let response = hooks::parse_response(&run.stdout).unwrap();
+    let names: Vec<&str> = response.context[0].split_whitespace().collect();
+    assert!(
+        !names.contains(&"MODEL_TEST_KEY"),
+        "the model key's variable reached the hook: {names:?}"
+    );
+    // `context.md` §8's list, plus what `/bin/sh` exports itself on start.
+    let allowed = [
+        "PATH",
+        "HOME",
+        "USER",
+        "LANG",
+        "TMPDIR",
+        "DAMAIAN_HOOK_ID",
+        "DAMAIAN_HOOK_EVENT",
+        "DAMAIAN_REPOSITORY_ROOT",
+        "PWD",
+        "OLDPWD",
+        "SHLVL",
+        "_",
+    ];
+    for name in &names {
+        assert!(allowed.contains(name), "`{name}` was inherited by the hook");
+    }
+    assert!(names.contains(&"PATH"), "PATH is passed on: {names:?}");
+    assert_eq!(
+        response.context[1],
+        format!("print_env|before_tool|{}", root.to_string_lossy())
+    );
+    assert_eq!(
+        PathBuf::from(&response.context[2]),
+        root.canonicalize().unwrap(),
+        "the hook runs at the repository root"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn is_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the pid exists; nothing is sent.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[test]
+fn a_hook_past_its_deadline_is_killed_with_its_group_and_unregistered() {
+    let (root, data_dir) = runner_fixture("runner-timeout");
+    let pids = root.join("pids");
+    // A background child as well as the shell, so killing only the shell's
+    // pid would leave a `sleep` behind and fail the last assertion.
+    let hook = sh_hook(
+        "hangs",
+        &script(
+            &root,
+            "hang",
+            &format!(
+                "sleep 30 &\necho $$ $! > '{}'\nwait\n",
+                pids.to_string_lossy()
+            ),
+        ),
+    );
+
+    let run = run(
+        &hook,
+        &runner_envelope(&root, json!({})),
+        &root,
+        &data_dir,
+        Duration::from_millis(300),
+    );
+
+    assert_eq!(run.failure, Some(HookFailureKind::Timeout));
+    assert!(
+        run.duration < Duration::from_secs(1),
+        "the deadline was not enforced: {:?}",
+        run.duration
+    );
+    assert_eq!(registry_entries(&data_dir), 0);
+    let recorded = fs::read_to_string(&pids).expect("the hook recorded its pids");
+    let pids: Vec<i32> = recorded
+        .split_whitespace()
+        .map(|pid| pid.parse().unwrap())
+        .collect();
+    assert_eq!(pids.len(), 2);
+    assert!(!is_alive(pids[0]), "the hook was reaped");
+    // The orphaned `sleep` is reaped by launchd, which may take a moment.
+    let settle = Instant::now() + Duration::from_secs(1);
+    while is_alive(pids[1]) && Instant::now() < settle {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !is_alive(pids[1]),
+        "the hook's child outlived its group kill"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn output_over_the_ceiling_fails_and_reading_stops() {
+    let (root, data_dir) = runner_fixture("runner-too-large");
+    let envelope = runner_envelope(&root, json!({}));
+    let just_over = sh_hook(
+        "too_large",
+        &script(&root, "large", "head -c 66560 /dev/zero | tr '\\0' a\n"),
+    );
+    let run_once = run(
+        &just_over,
+        &envelope,
+        &root,
+        &data_dir,
+        Duration::from_secs(10),
+    );
+    assert_eq!(run_once.failure, Some(HookFailureKind::OutputTooLarge));
+    assert!(run_once.stdout.len() <= MAX_HOOK_STDOUT_BYTES + 1);
+
+    // Endless output is cut off at the ceiling, not run to its deadline.
+    let endless = sh_hook("endless", &script(&root, "endless", "yes\n"));
+    let run_endless = run(
+        &endless,
+        &envelope,
+        &root,
+        &data_dir,
+        Duration::from_secs(10),
+    );
+    assert_eq!(run_endless.failure, Some(HookFailureKind::OutputTooLarge));
+    assert!(run_endless.stdout.len() <= MAX_HOOK_STDOUT_BYTES + 1);
+    assert!(
+        run_endless.duration < Duration::from_secs(2),
+        "reading did not stop at the ceiling: {:?}",
+        run_endless.duration
+    );
+    assert_eq!(registry_entries(&data_dir), 0);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_non_zero_exit_is_a_failure() {
+    let (root, data_dir) = runner_fixture("runner-exit");
+    let hook = sh_hook(
+        "exits",
+        &script(
+            &root,
+            "exit",
+            "printf '{\"hookApiVersion\":1,\"verdict\":\"allow\"}'\nexit 3\n",
+        ),
+    );
+    let run = run(
+        &hook,
+        &runner_envelope(&root, json!({})),
+        &root,
+        &data_dir,
+        Duration::from_secs(10),
+    );
+    assert_eq!(
+        run.failure,
+        Some(HookFailureKind::NonZeroExit),
+        "an `allow` printed before a failing exit is still a failure"
+    );
+    assert_eq!(run.exit.and_then(|status| status.code()), Some(3));
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_missing_command_fails_to_spawn() {
+    let (root, data_dir) = runner_fixture("runner-spawn");
+    let hook = HookConfig {
+        command: root.join("no-such-hook").to_string_lossy().to_string(),
+        args: Vec::new(),
+        ..hook("missing", 0, &[HookEvent::BeforeTool], true)
+    };
+    let run = run(
+        &hook,
+        &runner_envelope(&root, json!({})),
+        &root,
+        &data_dir,
+        Duration::from_secs(10),
+    );
+    assert_eq!(run.failure, Some(HookFailureKind::SpawnFailed));
+    assert!(run.exit.is_none());
+    assert!(run.stdout.is_empty());
+    assert_eq!(registry_entries(&data_dir), 0);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_hook_that_never_reads_its_stdin_still_completes() {
+    let (root, data_dir) = runner_fixture("runner-no-stdin");
+    // Far larger than a pipe buffer, so the write cannot finish before the
+    // hook exits, and then fails with a broken pipe.
+    let envelope = runner_envelope(&root, json!({ "blob": "x".repeat(1024 * 1024) }));
+    let hook = sh_hook(
+        "ignores_stdin",
+        &script(
+            &root,
+            "ignore",
+            "printf '{\"hookApiVersion\":1,\"verdict\":\"warn\"}'\n",
+        ),
+    );
+
+    let answered = run(&hook, &envelope, &root, &data_dir, Duration::from_secs(10));
+
+    assert_eq!(answered.failure, None, "stderr: {}", answered.stderr);
+    assert_eq!(
+        hooks::parse_response(&answered.stdout).unwrap().verdict,
+        Verdict::Warn
+    );
+    assert!(
+        answered.duration < Duration::from_secs(2),
+        "{:?}",
+        answered.duration
+    );
+
+    // One that neither reads nor exits: a write blocked on its full stdin
+    // must not keep the runner from its deadline.
+    let hangs = sh_hook(
+        "ignores_and_hangs",
+        &script(&root, "hang", "exec sleep 30\n"),
+    );
+    let hung = run(
+        &hangs,
+        &envelope,
+        &root,
+        &data_dir,
+        Duration::from_millis(300),
+    );
+    assert_eq!(hung.failure, Some(HookFailureKind::Timeout));
+    assert!(
+        hung.duration < Duration::from_secs(1),
+        "{:?}",
+        hung.duration
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn stderr_is_redacted_and_keeps_only_its_last_8_kib() {
+    let (root, data_dir) = runner_fixture("runner-stderr");
+    let hook = sh_hook(
+        "noisy",
+        &script(
+            &root,
+            "noisy",
+            "echo 'aws key AKIAIOSFODNN7EXAMPLE' >&2\n\
+             head -c 20000 /dev/zero | tr '\\0' n >&2\n\
+             echo >&2\n\
+             echo 'second AKIAIOSFODNN7EXAMPLE end-of-stderr' >&2\n",
+        ),
+    );
+    let run = run(
+        &hook,
+        &runner_envelope(&root, json!({})),
+        &root,
+        &data_dir,
+        Duration::from_secs(10),
+    );
+    assert_eq!(run.failure, None);
+    assert!(
+        !run.stderr.contains("AKIAIOSFODNN7EXAMPLE"),
+        "stderr kept a secret"
+    );
+    assert!(run.stderr.trim_end().ends_with("end-of-stderr"));
+    assert!(
+        run.stderr.len() <= MAX_HOOK_STDERR_BYTES,
+        "stderr is {} bytes",
+        run.stderr.len()
+    );
+    let _ = fs::remove_dir_all(&root);
 }

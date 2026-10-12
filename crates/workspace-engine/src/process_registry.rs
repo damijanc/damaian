@@ -66,6 +66,8 @@ pub enum ProcessKind {
     ModelCall,
     Terminal,
     Command,
+    /// A spec 32 hook executable.
+    Hook,
 }
 
 impl ProcessKind {
@@ -75,6 +77,7 @@ impl ProcessKind {
             Self::ModelCall => "model_call",
             Self::Terminal => "terminal",
             Self::Command => "command",
+            Self::Hook => "hook",
         }
     }
 }
