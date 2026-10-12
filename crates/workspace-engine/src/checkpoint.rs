@@ -1123,10 +1123,15 @@ fn plan_for(file: &CheckpointFile, current: Option<&[u8]>) -> PlannedRestore {
     }
 }
 
-/// Runs git in the user's repository, read-only. `--no-optional-locks` is what
-/// makes that true: without it `git status` may refresh and rewrite the user's
-/// index, which §5.1 promises Damaian never does.
-fn run_user_git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+/// Runs git in the user's repository. `--no-optional-locks` keeps the read-only
+/// commands read-only: without it `git status` may refresh and rewrite the
+/// user's index, which §5.1 promises Damaian never does.
+///
+/// It now also runs mutating commands: spec 57's worker worktrees
+/// (`worktree.rs`) create a branch and a worktree through it. Those take the
+/// locks they need regardless of the flag; it only suppresses optional ones.
+/// [`user_git_command_line`] renders exactly this argv for the record.
+pub(crate) fn run_user_git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .arg("--no-optional-locks")
         .arg("-C")
@@ -1145,6 +1150,26 @@ fn run_user_git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
         )));
     }
     Ok(output.stdout)
+}
+
+/// The command [`run_user_git`] runs for `root` and `args`, as one line. Kept
+/// beside the runner so that a recorded command cannot drift from the one
+/// executed. An argument with whitespace or a quote is single-quoted.
+pub(crate) fn user_git_command_line(root: &Path, args: &[&str]) -> String {
+    let root = root.to_string_lossy();
+    ["git", "--no-optional-locks", "-C", root.as_ref()]
+        .into_iter()
+        .chain(args.iter().copied())
+        .map(|arg| {
+            if arg.is_empty() || arg.contains(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+            {
+                format!("'{}'", arg.replace('\'', r"'\''"))
+            } else {
+                arg.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn directory_bytes(root: &Path) -> u64 {

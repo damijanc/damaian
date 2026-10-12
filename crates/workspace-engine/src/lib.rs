@@ -44,6 +44,7 @@ pub mod vector_index;
 pub mod web_diagnostics;
 pub mod worker_progress;
 pub mod workspace_engine;
+pub mod worktree;
 
 pub use audit::AuditLog;
 pub use cancel::CancelToken;
