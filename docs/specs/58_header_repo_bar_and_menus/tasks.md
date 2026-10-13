@@ -2,7 +2,7 @@
 
 **Implements:** [`proposal.md`](proposal.md) · background in [`context.md`](context.md)
 **Style reference:** [`../../UI_STYLE_GUIDE.md`](../../UI_STYLE_GUIDE.md) · rendered at `docs/ui-style-guide.html`
-**Started:** —
+**Started:** 2026-10-13
 
 ## Global constraints
 
@@ -35,7 +35,7 @@
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · Git summary in the engine | Not started | |
+| 1 · Git summary in the engine | Done | 2026-10-13. `git_service.rs`: `GitSummary`, `GitHubRepo` (`owner()`, `name()`, `url()`), pure `parse_github_remote`, `GitService::summary(root) -> Result<GitSummary>`; all four re-exported from the crate root. **Non-git folder → `Ok(GitSummary::default())`** (all `None`/0), not an error, so Task 2 can map the summary straight onto `null`/0 fields with no error branch; it is still audited as `git_status_read` with `status: failed` and git's exit code, as `status` records it. Audit fields add `scope: summary` and never include the remote. **Deviations:** `GitHubRepo`'s fields are private (getters instead), so the only way to get one, and so a `url()`, is `parse_github_remote`; Task 2's test must build one through that function. The parser also rejects `.`/`..` as owner or name, a trailing `/`, ports, and any whitespace (it does not trim; `summary` trims git's output). `head` uses `rev-parse --short --verify -q HEAD`; numstat runs with `--no-ext-diff --no-textconv`; untracked symlinks count 0. With no commits, `ls-files --cached --others` is counted, so staged-but-uncommitted files are included. Tests: 16 in `git_service::tests` (9 `github_remote_*` parser tests, 6 `git_service_summary_*` temp-repo tests, plus `github_remote_url_is_rebuilt_from_the_parsed_parts`), confirmed red against stubs first; `cargo nextest run -p workspace-engine -E 'test(git_service) + test(github)'` 16/16 pass; clippy `-p workspace-engine` clean; `cargo fmt --check` and `typos` clean. The temp-repo tests build a `GitService` directly (no `WorkspaceEngine`, so no watcher). |
 | 2 · Shell: git-status fields and open-github | Not started | |
 | 3 · One ⋮ menu component, vertical everywhere | Not started | |
 | 4 · Sidebar session menu and search | Not started | |
@@ -47,11 +47,11 @@
 
 Proposal §1 req 11–12, §3.4. File: `crates/workspace-engine/src/git_service.rs`.
 
-- [ ] Add `GitSummary { branch: Option<String>, head: Option<String>, insertions: u64, deletions: u64, github: Option<GitHubRepo> }`, where `GitHubRepo { owner, name }` has `fn url(&self) -> String`.
-- [ ] Add `parse_github_remote(url: &str) -> Option<GitHubRepo>` as a pure function. Write the tests first:
+- [x] Add `GitSummary { branch: Option<String>, head: Option<String>, insertions: u64, deletions: u64, github: Option<GitHubRepo> }`, where `GitHubRepo { owner, name }` has `fn url(&self) -> String`.
+- [x] Add `parse_github_remote(url: &str) -> Option<GitHubRepo>` as a pure function. Write the tests first:
   - the three accepted forms, with and without `.git`;
   - rejects another host, `github.com.evil.example`, `https://user:pw@github.com/o/r`, an extra path segment, an empty owner, and characters outside `[A-Za-z0-9_.-]`.
-- [ ] Add `GitService::summary(root)`:
+- [x] Add `GitService::summary(root)`:
   - branch from `git symbolic-ref --short -q HEAD`, with `None` when detached;
   - head from `git rev-parse --short HEAD`, with `None` when there are no commits;
   - counts from `git diff --numstat HEAD`, skipping binary `-\t-` rows;
@@ -60,8 +60,8 @@ Proposal §1 req 11–12, §3.4. File: `crates/workspace-engine/src/git_service.
   - origin from `git remote get-url origin`.
 
   Audit the read as `git_status_read`, as `status` does.
-- [ ] Add temp-repo tests: a branch with edits and an untracked file, detached HEAD, no commits, not a git repo (an error or an empty summary; pick one and record it), a binary file skipped. Use the existing temp-repo helpers.
-- [ ] Run scoped checks and update this row.
+- [x] Add temp-repo tests: a branch with edits and an untracked file, detached HEAD, no commits, not a git repo (an error or an empty summary; pick one and record it), a binary file skipped. Use the existing temp-repo helpers.
+- [x] Run scoped checks and update this row.
 
 ## Task 2 · Shell: git-status fields and open-github
 
