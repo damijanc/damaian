@@ -103,7 +103,7 @@ scale.
 | `.btn-primary` | Accent fill, white text | The single most likely action on a surface |
 | `.btn-quiet` | Transparent border and background, `--muted` text | Dismiss, cancel, reject |
 | `.btn-danger` | Transparent, `--danger` text | Delete, remove, revoke |
-| `.btn-icon` | Transparent, `5px 8px`, glyph only | Overflow `⋯`, close, small toggles |
+| `.btn-icon` | Transparent, `5px 8px`, glyph only | Overflow (vertical `.dots-icon`), close, small toggles |
 | `.btn-trigger` | 12px / 600 / `5px 6px`, transparent, `--muted` label, caret | Opens a popover from an action row; the label is the current value |
 
 **Rules**
@@ -120,6 +120,11 @@ scale.
   the action, and a setting must not outweigh it. Its label never wraps, and a
   trigger whose value can be arbitrarily long caps its width and truncates
   rather than pushing the row around.
+- **The overflow trigger is a vertical ⋮, always.** It is a `.btn-icon` containing
+  `<span class="dots-icon" aria-hidden="true"></span>`, with an `aria-label` that
+  names what the menu is for ("More approval options", not "More"). Never a
+  text glyph: not `⋯`, not `…`, not `⋮` typed as a character, because a glyph's
+  weight and baseline vary by font and it drifts out of line with the drawn one.
 - Every interactive control is at least 24×24 CSS px. `.btn-sm` at 12px text
   computes to roughly 29px tall — do not shrink its padding further.
   `.btn-trigger` computes to 27px on the same arithmetic.
@@ -143,7 +148,7 @@ Every group of actions resolves into three tiers:
 
 - **Primary** — the expected action. One, filled.
 - **Secondary** — the other reasonable answer, usually the negative one. Quiet.
-- **Overflow** — behind `⋯`. Everything that is rare, destructive, or
+- **Overflow** — behind the vertical ⋮ trigger (§3). Everything that is rare, destructive, or
   **persistent beyond the current interaction.**
 
 The overflow rule is the important one. A choice that changes state after this
@@ -267,6 +272,7 @@ Each of these existed in the shell and was removed. Do not reintroduce them.
 | Horizontally scrolled command under review | User approves what they cannot see |
 | Escalating and one-shot actions at equal weight | Mis-click cost is not symmetric |
 | Controls positioned over the field they displace | The field then pays for them in padding it cannot use. The composer's textarea reserved 70px of height and 58px of *every line* to keep text clear of three floating controls — 41px of text inside a 111px field, and text stopping 59px short of the edge on every row. The `@media` block holding that layout together at narrow widths was three rules whose only job was to stop it colliding. Controls belong in a row of their own |
+| Horizontal `⋯` or a text-glyph overflow trigger | Vertical ⋮ was asked for and applied to one control while this guide still said `⋯`; the approval and recovery overflows were then built from the guide and came out horizontal. The trigger is `.dots-icon` (§3), and the guide is what gets fixed first |
 | Two values sharing one truncating label | Whichever is last is the one that disappears. `model + effort` in one 220px pill rendered `claude-3-5-sonnet-202…` — the effort still in force and readable nowhere but the popover. One trigger per value |
 
 ---

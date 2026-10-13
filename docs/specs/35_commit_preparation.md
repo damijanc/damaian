@@ -13,6 +13,8 @@ named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.7 (diff
 and patch engine), section 7.4 (command approval), section 7.10 (secret
 detection). Related implementation specs:
+[`58_header_repo_bar_and_menus/proposal.md`](58_header_repo_bar_and_menus/proposal.md)
+(its §3.5 contextual-action slot is where *Commit…* appears in the desktop app),
 [`04_hunk_level_patch_apply.md`](04_hunk_level_patch_apply.md) (the per-file and
 per-hunk acceptance this commits),
 [`07_generated_secret_override.md`](07_generated_secret_override.md) (the

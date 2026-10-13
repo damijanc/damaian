@@ -276,6 +276,8 @@ button:disabled {
   color: var(--muted);
   font-size: 13px;
   padding: 5px 8px;
+  /* A 3px `.dots-icon` alone would leave the button 21px wide. */
+  min-width: 24px;
 }
 
 .btn-icon:hover {
@@ -446,8 +448,12 @@ button:disabled {
   padding: 0;
 }
 
+/* inline-block so it keeps its size inside any button, not only the grid ones;
+   the ±6px dots need about 15px of height, which `.btn-icon` provides. */
 .dots-icon {
   position: relative;
+  display: inline-block;
+  vertical-align: middle;
   width: 3px;
   height: 3px;
   border-radius: 50%;
