@@ -660,178 +660,312 @@ async function forgetProject(projectPath) {
   renderProjectList();
 }
 
-// A single reusable popover shared by every project row (rows are fully
-// re-rendered on every `renderProjectList()` call, so per-row popovers
-// would never keep stable open/closed state). Anchored via `position:
-// fixed` against the trigger button's own rect rather than a CSS-relative
-// ancestor, since rows live inside a scrollable list.
-let projectMenuEl = null;
-let projectMenuTargetPath = null;
+// The one ⋮ menu component (spec 58 §3.1). Every overflow menu is an instance:
+// a single `position: fixed` popover on `document.body`, anchored to its
+// trigger's rect rather than to a CSS ancestor, because triggers live inside
+// scrolling lists (sidebar rows, `#chat-log`) and are often re-rendered while
+// the menu is open.
+//
+// `sections` is an array of arrays of entries; a divider is drawn between
+// non-empty sections. An entry is
+//   { label, action?, hint?, danger?, hidden?, disabled?, className?,
+//     onSelect?(context), items? }
+// where `items` (itself sections) makes the row drill into a panel with a back
+// row, and `onSelect` wins over the menu's `onAction(action, context)`.
+// Danger rows are moved to the end of their panel, whatever order they were
+// given in, so "danger last" cannot drift per menu.
+const openContextMenus = new Set();
 
-function ensureProjectMenu() {
-  if (projectMenuEl) return projectMenuEl;
-  const el = document.createElement("div");
-  el.className = "context-menu-popover";
-  el.setAttribute("role", "menu");
-  el.hidden = true;
-  el.innerHTML = `
-    <div class="context-menu-panel" data-panel="root">
-      <button type="button" class="context-menu-row" data-action="open-in">
-        <span>Open in</span>
-        <span class="context-menu-caret" aria-hidden="true"></span>
-      </button>
-      <button type="button" class="context-menu-row" data-action="rename">Rename</button>
-      <button type="button" class="context-menu-row context-menu-row-danger" data-action="delete">Delete</button>
-    </div>
-    <div class="context-menu-panel" data-panel="open-in" hidden>
-      <button type="button" class="context-menu-back" data-action="back">Open in</button>
-      <button type="button" class="context-menu-row" data-action="open-vscode">VS Code</button>
-      <button type="button" class="context-menu-row" data-action="open-finder">Finder</button>
-    </div>
-  `;
-  el.addEventListener("click", (event) => {
+function closeAllContextMenus(options = {}) {
+  for (const menu of [...openContextMenus]) menu.close(options);
+}
+
+function createContextMenu({ className = "", align = "end", placement = "below", onAction } = {}) {
+  let el = null;
+  let anchor = null;
+  let openKey = null;
+  let context = null;
+  let rootPanel = null;
+
+  const menu = { toggle, open, close, isOpen: () => openContextMenus.has(menu) };
+
+  function ensureEl() {
+    if (el) return el;
+    el = document.createElement("div");
+    el.className = `context-menu-popover ${className}`.trim();
+    el.setAttribute("role", "menu");
+    el.hidden = true;
+    // Clicks inside (drill-in, back) must not reach the document handler that
+    // closes every open menu.
+    el.addEventListener("click", (event) => event.stopPropagation());
+    el.addEventListener("keydown", handleKeydown);
+    document.body.append(el);
+    return el;
+  }
+
+  function orderedEntries(sections) {
+    const flat = [];
+    sections.forEach((section) => {
+      const visible = section.filter((entry) => !entry.hidden);
+      if (!visible.length) return;
+      if (flat.length) flat.push({ divider: true });
+      flat.push(...visible);
+    });
+    const ordered = [
+      ...flat.filter((entry) => !entry.danger),
+      ...flat.filter((entry) => entry.danger),
+    ];
+    // Moving a danger row can leave a divider leading, trailing or doubled.
+    return ordered.filter(
+      (entry, index) =>
+        !entry.divider || (index > 0 && index < ordered.length - 1 && !ordered[index - 1].divider),
+    );
+  }
+
+  function buildPanel(sections, back) {
+    const panel = document.createElement("div");
+    panel.className = "context-menu-panel";
+    panel.hidden = true;
+    if (back) {
+      const backRow = document.createElement("button");
+      backRow.type = "button";
+      backRow.className = "context-menu-back";
+      backRow.dataset.action = "back";
+      backRow.setAttribute("role", "menuitem");
+      backRow.textContent = back.label;
+      backRow.addEventListener("click", () => showPanel(back.parent, back.opener));
+      panel.append(backRow);
+    }
+    orderedEntries(sections).forEach((entry) => {
+      if (entry.divider) {
+        const divider = document.createElement("div");
+        divider.className = "context-menu-divider";
+        divider.setAttribute("role", "separator");
+        panel.append(divider);
+        return;
+      }
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = [
+        "context-menu-row",
+        entry.danger && "context-menu-row-danger",
+        entry.className,
+      ]
+        .filter(Boolean)
+        .join(" ");
+      row.setAttribute("role", "menuitem");
+      if (entry.action) row.dataset.action = entry.action;
+      row.disabled = entry.disabled === true;
+      const label = document.createElement("span");
+      label.textContent = entry.label;
+      row.append(label);
+      if (entry.hint) {
+        const hint = document.createElement("small");
+        hint.textContent = entry.hint;
+        row.append(hint);
+      }
+      if (entry.items) {
+        const caret = document.createElement("span");
+        caret.className = "context-menu-caret";
+        caret.setAttribute("aria-hidden", "true");
+        row.append(caret);
+        row.setAttribute("aria-haspopup", "menu");
+        const subpanel = buildPanel(entry.items, {
+          label: entry.label,
+          parent: panel,
+          opener: row,
+        });
+        row.addEventListener("click", () => showPanel(subpanel));
+      } else {
+        row.addEventListener("click", () => select(entry));
+      }
+      panel.append(row);
+    });
+    el.append(panel);
+    return panel;
+  }
+
+  function currentPanel() {
+    return el ? [...el.children].find((panel) => !panel.hidden) : null;
+  }
+
+  function focusableRows(panel) {
+    return panel ? [...panel.querySelectorAll("button:not(:disabled)")] : [];
+  }
+
+  // Drilling in focuses the panel's first real row; going back focuses the row
+  // that drilled in, so a keyboard user lands where they left.
+  function showPanel(panel, focusTarget) {
+    [...el.children].forEach((child) => {
+      child.hidden = child !== panel;
+    });
+    position();
+    const rows = focusableRows(panel);
+    const target =
+      focusTarget || rows.find((row) => !row.classList.contains("context-menu-back")) || rows[0];
+    target?.focus();
+  }
+
+  function select(entry) {
+    const selectedContext = context;
+    close({ restoreFocus: true });
+    if (entry.onSelect) {
+      entry.onSelect(selectedContext);
+    } else if (onAction && entry.action) {
+      onAction(entry.action, selectedContext);
+    }
+  }
+
+  function handleKeydown(event) {
+    const panel = currentPanel();
+    const rows = focusableRows(panel);
+    const index = rows.indexOf(document.activeElement);
+    const focusAt = (next) => rows[(next + rows.length) % rows.length]?.focus();
+    switch (event.key) {
+      case "ArrowDown":
+        focusAt(index + 1);
+        break;
+      case "ArrowUp":
+        focusAt(index < 0 ? rows.length - 1 : index - 1);
+        break;
+      case "Home":
+        focusAt(0);
+        break;
+      case "End":
+        focusAt(rows.length - 1);
+        break;
+      case "ArrowRight":
+        if (document.activeElement?.getAttribute("aria-haspopup") === "menu") {
+          document.activeElement.click();
+        }
+        break;
+      case "ArrowLeft":
+        panel?.querySelector(".context-menu-back")?.click();
+        break;
+      case "Escape":
+      case "Tab":
+        close({ restoreFocus: true });
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
     event.stopPropagation();
-    handleProjectMenuAction(event);
-  });
-  document.body.append(el);
-  projectMenuEl = el;
-  return el;
+  }
+
+  // Below the trigger, flipping above when the space below cannot hold the
+  // menu and the space above is larger; `placement: "above"` prefers above
+  // (the repo bar sits at the bottom of the window). `align: "end"` lines the
+  // menu's right edge up with the trigger's, `"start"` its left edge.
+  function position() {
+    if (!anchor || el.hidden) return;
+    const rect = anchor.getBoundingClientRect();
+    const width = el.offsetWidth;
+    const height = el.offsetHeight;
+    const gap = 4;
+    const margin = 8;
+    const clamp = (value, max) => Math.max(margin, Math.min(value, max));
+    const roomBelow = window.innerHeight - rect.bottom - gap - margin;
+    const roomAbove = rect.top - gap - margin;
+    const above =
+      placement === "above"
+        ? height <= roomAbove || roomAbove > roomBelow
+        : height > roomBelow && roomAbove > roomBelow;
+    const left = align === "start" ? rect.left : rect.right - width;
+    const top = above ? rect.top - gap - height : rect.bottom + gap;
+    el.style.left = `${clamp(left, window.innerWidth - width - margin)}px`;
+    el.style.top = `${clamp(top, window.innerHeight - height - margin)}px`;
+    el.dataset.placement = above ? "above" : "below";
+  }
+
+  // `key` identifies what the menu is open for (a project path, a proposal),
+  // so clicking the same trigger again closes it even after a re-render
+  // replaced the trigger element.
+  function open(anchorEl, { sections, key = anchorEl, context: menuContext = null }) {
+    closeAllContextMenus();
+    ensureEl();
+    el.replaceChildren();
+    anchor = anchorEl;
+    openKey = key;
+    context = menuContext;
+    rootPanel = buildPanel(sections, null);
+    el.hidden = false;
+    openContextMenus.add(menu);
+    anchor.setAttribute("aria-expanded", "true");
+    showPanel(rootPanel);
+  }
+
+  function toggle(anchorEl, options) {
+    if (menu.isOpen() && openKey === (options.key ?? anchorEl)) {
+      close({ restoreFocus: true });
+      return;
+    }
+    open(anchorEl, options);
+  }
+
+  function close({ restoreFocus = false } = {}) {
+    if (!el || !menu.isOpen()) return;
+    el.hidden = true;
+    openContextMenus.delete(menu);
+    anchor?.setAttribute("aria-expanded", "false");
+    if (restoreFocus && anchor?.isConnected) anchor.focus();
+    anchor = null;
+    openKey = null;
+    context = null;
+  }
+
+  return menu;
 }
 
-function showProjectMenuPanel(panel) {
-  const el = ensureProjectMenu();
-  el.querySelectorAll(".context-menu-panel").forEach((panelEl) => {
-    panelEl.hidden = panelEl.dataset.panel !== panel;
-  });
-}
+document.addEventListener("click", () => closeAllContextMenus());
+// Focus is normally inside the menu and its own handler wins; this catches an
+// Escape while focus sits elsewhere (the trigger, after a mouse open).
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && openContextMenus.size) {
+    closeAllContextMenus({ restoreFocus: true });
+  }
+});
+
+// The project row menu. Rows are fully re-rendered on every
+// `renderProjectList()`, so the project path, not the button, keys the menu.
+const projectMenu = createContextMenu({
+  onAction: (action, projectPath) => void handleProjectMenuAction(action, projectPath),
+});
 
 function toggleProjectMenu(projectPath, anchorEl) {
-  const el = ensureProjectMenu();
-  const alreadyOpenForThisRow = !el.hidden && projectMenuTargetPath === projectPath;
-  if (alreadyOpenForThisRow) {
-    closeProjectMenu();
-    return;
-  }
-  projectMenuTargetPath = projectPath;
-  showProjectMenuPanel("root");
-  el.hidden = false;
-  positionProjectMenu(anchorEl);
-}
-
-function positionProjectMenu(anchorEl) {
-  const el = ensureProjectMenu();
-  const rect = anchorEl.getBoundingClientRect();
-  const width = el.offsetWidth || 200;
-  const left = Math.min(Math.max(8, rect.right - width), window.innerWidth - width - 8);
-  const top = Math.min(rect.bottom + 4, window.innerHeight - el.offsetHeight - 8);
-  el.style.left = `${left}px`;
-  el.style.top = `${top}px`;
-}
-
-function closeProjectMenu() {
-  if (!projectMenuEl) return;
-  projectMenuEl.hidden = true;
-  projectMenuTargetPath = null;
-}
-
-// The approval overflow menu. Same shape and the same reasoning as the project
-// row menu above: one shared `position: fixed` popover on `document.body`,
-// anchored to the trigger's rect. Approval cards live inside the scrolling
-// `#chat-log` and a turn can leave more than one behind, so a popover anchored
-// by CSS to an ancestor would detach as the log scrolls.
-let approvalMenuEl = null;
-
-function ensureApprovalMenu() {
-  if (approvalMenuEl) return approvalMenuEl;
-  const el = document.createElement("div");
-  el.className = "context-menu-popover approval-menu-popover";
-  el.setAttribute("role", "menu");
-  el.hidden = true;
-  el.addEventListener("click", (event) => event.stopPropagation());
-  document.body.append(el);
-  approvalMenuEl = el;
-  return el;
-}
-
-// `items` is [{ label, hint, onSelect }], rebuilt on every open because the
-// grants a proposal offers differ from one to the next.
-function toggleApprovalMenu(items, anchorEl) {
-  const el = ensureApprovalMenu();
-  if (!el.hidden && el.dataset.anchorId === anchorEl.dataset.menuId) {
-    closeApprovalMenu();
-    return;
-  }
-  el.innerHTML = "";
-  const panel = document.createElement("div");
-  panel.className = "context-menu-panel";
-  items.forEach((item) => {
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = "context-menu-row approval-menu-row";
-    row.setAttribute("role", "menuitem");
-    const label = document.createElement("span");
-    label.textContent = item.label;
-    row.append(label);
-    if (item.hint) {
-      const hint = document.createElement("small");
-      hint.textContent = item.hint;
-      row.append(hint);
-    }
-    row.addEventListener("click", () => {
-      closeApprovalMenu();
-      item.onSelect();
-    });
-    panel.append(row);
+  projectMenu.toggle(anchorEl, {
+    key: projectPath,
+    context: projectPath,
+    sections: [
+      [
+        {
+          label: "Open in",
+          action: "open-in",
+          items: [
+            [
+              { label: "VS Code", action: "open-vscode" },
+              { label: "Finder", action: "open-finder" },
+            ],
+          ],
+        },
+        { label: "Rename", action: "rename" },
+        { label: "Delete", action: "delete", danger: true },
+      ],
+    ],
   });
-  el.append(panel);
-  el.dataset.anchorId = anchorEl.dataset.menuId || "";
-  el.hidden = false;
-  positionApprovalMenu(anchorEl);
 }
 
-function positionApprovalMenu(anchorEl) {
-  const el = ensureApprovalMenu();
-  const rect = anchorEl.getBoundingClientRect();
-  const width = el.offsetWidth || 272;
-  const left = Math.min(Math.max(8, rect.left), window.innerWidth - width - 8);
-  const top = Math.min(rect.bottom + 4, window.innerHeight - el.offsetHeight - 8);
-  el.style.left = `${left}px`;
-  el.style.top = `${top}px`;
-}
-
-function closeApprovalMenu() {
-  if (!approvalMenuEl) return;
-  approvalMenuEl.hidden = true;
-  approvalMenuEl.dataset.anchorId = "";
-}
-
-async function handleProjectMenuAction(event) {
-  const button = event.target.closest("button[data-action]");
-  if (!button) return;
-  const action = button.dataset.action;
-  const projectPath = projectMenuTargetPath;
-
-  if (action === "open-in") {
-    showProjectMenuPanel("open-in");
-    return;
-  }
-  if (action === "back") {
-    showProjectMenuPanel("root");
-    return;
-  }
+async function handleProjectMenuAction(action, projectPath) {
   if (!projectPath) return;
   if (action === "rename") {
-    closeProjectMenu();
     await renameProject(projectPath);
     return;
   }
   if (action === "delete") {
-    closeProjectMenu();
     await forgetProject(projectPath);
     return;
   }
   if (action === "open-vscode") {
-    closeProjectMenu();
     try {
       const payload = await api("/api/open-vscode", form({ repo: projectPath }));
       toast(`Opened ${payload.path}`);
@@ -841,7 +975,6 @@ async function handleProjectMenuAction(event) {
     return;
   }
   if (action === "open-finder") {
-    closeProjectMenu();
     try {
       const payload = await api("/api/reveal-in-finder", form({ repo: projectPath }));
       toast(`Revealed ${payload.path}`);
@@ -851,16 +984,30 @@ async function handleProjectMenuAction(event) {
   }
 }
 
-document.addEventListener("click", () => {
-  closeProjectMenu();
-  closeApprovalMenu();
-});
-document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") {
-    closeProjectMenu();
-    closeApprovalMenu();
-  }
-});
+// The approval and crash-recovery overflow menu. Approval cards live inside
+// the scrolling `#chat-log` and a turn can leave more than one behind; the
+// trigger's `data-menu-id` keys which card the menu is open for.
+const approvalMenu = createContextMenu({ className: "approval-menu-popover", align: "start" });
+
+// `items` is [{ label, hint, onSelect }], rebuilt on every open because the
+// grants a proposal offers differ from one to the next.
+function toggleApprovalMenu(items, anchorEl) {
+  approvalMenu.toggle(anchorEl, {
+    key: anchorEl.dataset.menuId || anchorEl,
+    sections: [
+      items.map((item) => ({
+        label: item.label,
+        hint: item.hint,
+        className: "approval-menu-row",
+        onSelect: () => item.onSelect(),
+      })),
+    ],
+  });
+}
+
+function closeApprovalMenu() {
+  approvalMenu.close();
+}
 
 function setProjectsCollapsed(collapsed, persist = true) {
   projectsCollapsed = collapsed;
@@ -4120,6 +4267,7 @@ function createRecoveryCard(task) {
   overflow.className = "btn-icon";
   overflow.dataset.menuId = `recovery-${task.taskId}`;
   overflow.setAttribute("aria-haspopup", "menu");
+  overflow.setAttribute("aria-expanded", "false");
   overflow.setAttribute("aria-label", "More recovery options");
   overflow.title = "More recovery options";
   overflow.innerHTML = '<span class="dots-icon" aria-hidden="true"></span>';
@@ -5593,6 +5741,7 @@ function renderProjectList() {
     menuButton.title = "More options";
     menuButton.setAttribute("aria-label", `More options for ${projectName(projectPath)}`);
     menuButton.setAttribute("aria-haspopup", "menu");
+    menuButton.setAttribute("aria-expanded", "false");
     menuButton.innerHTML = '<span class="dots-icon" aria-hidden="true"></span>';
     menuButton.addEventListener("click", (event) => {
       event.stopPropagation();
@@ -6879,6 +7028,7 @@ function createCommandApprovalPreview(
     overflowButton.className = "btn-icon";
     overflowButton.dataset.menuId = `approval-${proposal.proposalId}`;
     overflowButton.setAttribute("aria-haspopup", "menu");
+    overflowButton.setAttribute("aria-expanded", "false");
     overflowButton.setAttribute("aria-label", "More approval options");
     overflowButton.title = "More approval options";
     overflowButton.innerHTML = '<span class="dots-icon" aria-hidden="true"></span>';
