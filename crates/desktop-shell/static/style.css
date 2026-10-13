@@ -1881,14 +1881,31 @@ button:disabled {
   color: var(--danger);
 }
 
+/* Arrow keys move focus row to row, so the focused row must read as the
+   current one, the way hover does. */
+.context-menu-row:focus-visible,
+.context-menu-back:focus-visible {
+  background: #f4f4f1;
+}
+
+.context-menu-divider {
+  height: 1px;
+  margin: 4px 2px;
+  background: #eeeeeb;
+}
+
 /* Approval overflow rows carry a hint line, since what separates the two
    grants is how long they last rather than what they do. */
 .approval-menu-popover {
   width: min(272px, calc(100vw - 32px));
 }
 
+/* One column, so the hint sits under the label: `.context-menu-row`'s three
+   columns otherwise put it beside the label and squeeze the label to a word
+   per line. */
 .approval-menu-row {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 1px;
   text-align: left;
 }
