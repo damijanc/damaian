@@ -327,6 +327,8 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/session-delete") => handle_session_delete(stream, &request),
         ("POST", "/api/open-vscode") => handle_open_vscode(stream, &request),
         ("POST", "/api/reveal-in-finder") => handle_reveal_in_finder(stream, &request),
+        // Spec 58: takes `repo` only and opens the URL derived from `origin`.
+        ("POST", "/api/open-github") => handle_open_github(stream, &request),
         ("POST", "/api/reveal-web-diagnostic-artifact") => {
             handle_reveal_web_diagnostic_artifact(stream, &request)
         }
@@ -677,6 +679,18 @@ fn handle_reveal_in_finder(stream: &mut TcpStream, request: &Request) -> Result<
     )
 }
 
+fn handle_open_github(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let url = open_github_for_form(&form, open_url_in_browser)?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &format!("{{\"url\":\"{}\"}}", escape_json(&url)),
+    )
+}
+
 fn handle_reveal_web_diagnostic_artifact(
     stream: &mut TcpStream,
     request: &Request,
@@ -934,16 +948,38 @@ fn handle_git_status(stream: &mut TcpStream, request: &Request) -> Result<(), St
         })
         .collect::<Vec<_>>()
         .join(",");
+    // Spec 58 requirement 11: the repo-bar fields follow the original three,
+    // which stay byte-identical. A non-git folder's summary is the default,
+    // so it serves `null`/0 here rather than an error.
+    let summary = engine
+        .git
+        .summary(&repo)
+        .map_err(|error| error.to_string())?;
+    let github_url = summary.github.as_ref().map(|github| github.url());
     write_response(
         stream,
         request,
         200,
         "application/json",
         &format!(
-            "{{\"clean\":{},\"exitCode\":{},\"files\":[{}]}}",
-            status.clean, status.exit_code, files
+            "{{\"clean\":{},\"exitCode\":{},\"files\":[{}],\"branch\":{},\"head\":{},\"insertions\":{},\"deletions\":{},\"githubUrl\":{}}}",
+            status.clean,
+            status.exit_code,
+            files,
+            json_nullable_str(summary.branch.as_deref()),
+            json_nullable_str(summary.head.as_deref()),
+            summary.insertions,
+            summary.deletions,
+            json_nullable_str(github_url.as_deref()),
         ),
     )
+}
+
+fn json_nullable_str(value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("\"{}\"", escape_json(value)),
+        None => "null".to_string(),
+    }
 }
 
 fn handle_sessions(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
@@ -2629,6 +2665,43 @@ fn reveal_in_finder(repo: &str) -> Result<PathBuf, String> {
         Ok(path)
     } else {
         Err(format!("Finder launch failed with status {status}"))
+    }
+}
+
+/// Spec 58 requirement 13. Only `repo` is read from the form: the URL is
+/// rebuilt from the validated `origin` (`GitHubRepo::url`), never taken from
+/// the client or from the raw remote. `open` is injected so tests can see the
+/// URL without launching a browser.
+fn open_github_for_form(
+    form: &HashMap<String, String>,
+    open: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<String, String> {
+    let repo = required_form(form, "repo")?;
+    let path = validate_working_folder(&repo)?;
+    let path = path.to_string_lossy();
+    let summary = engine_for_repo(&path)?
+        .git
+        .summary(path.as_ref())
+        .map_err(|error| error.to_string())?;
+    let url = summary
+        .github
+        .ok_or_else(|| "this folder has no GitHub origin remote".to_string())?
+        .url();
+    open(&url)?;
+    Ok(url)
+}
+
+/// Opens `url` in the default browser, the way `reveal_in_finder` opens a
+/// folder.
+fn open_url_in_browser(url: &str) -> Result<(), String> {
+    let status = Command::new("open")
+        .arg(url)
+        .status()
+        .map_err(|error| format!("failed to open the browser: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("browser launch failed with status {status}"))
     }
 }
 
@@ -7872,6 +7945,190 @@ mod tests {
             registry.entries().unwrap().is_empty(),
             "requirement 4: closing a terminal is a clean exit and leaves no entry"
         );
+    }
+
+    /// Runs git in `repo` with a fixed identity, so a commit works on a
+    /// machine with no global `user.name`.
+    fn git_for_test(repo: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A repository on `main` with one commit, a modified tracked file and
+    /// an untracked one, and `origin` set to `remote`.
+    fn repo_bar_fixture(name: &str, remote: Option<&str>) -> PathBuf {
+        let repo = temp_path(name);
+        fs::create_dir_all(&repo).unwrap();
+        git_for_test(&repo, &["init", "-q", "-b", "main"]);
+        fs::write(repo.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        git_for_test(&repo, &["add", "a.txt"]);
+        git_for_test(&repo, &["commit", "-q", "-m", "initial"]);
+        // Replaces one line and appends one: +2 −1 against HEAD.
+        fs::write(repo.join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+        // Untracked text counts as insertions: +3.
+        fs::write(repo.join("new.txt"), "x\ny\nz\n").unwrap();
+        if let Some(remote) = remote {
+            git_for_test(&repo, &["remote", "add", "origin", remote]);
+        }
+        repo
+    }
+
+    fn git_status_for_test(repo: &std::path::Path) -> String {
+        isolated_data_dir();
+        let (port, token) = serve_for_test();
+        get_for_test(
+            port,
+            &token,
+            &format!(
+                "/api/git-status?repo={}",
+                percent_encode_for_test(&repo.to_string_lossy())
+            ),
+        )
+    }
+
+    /// Spec 58 requirement 11. The prefix assertion is what keeps the old
+    /// fields byte-identical: it is the exact string the route served before.
+    #[test]
+    fn git_status_adds_branch_head_counts_and_github_url() {
+        let repo = repo_bar_fixture("repobar-github", Some("git@github.com:acme/widget.git"));
+        let head = git_for_test(&repo, &["rev-parse", "--short", "HEAD"]);
+
+        let response = git_status_for_test(&repo);
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let body = response.split("\r\n\r\n").nth(1).unwrap();
+        assert!(
+            body.starts_with(
+                "{\"clean\":false,\"exitCode\":0,\"files\":[\
+                 {\"path\":\"a.txt\",\"raw\":\" M a.txt\",\"untracked\":false,\"conflicted\":false},\
+                 {\"path\":\"new.txt\",\"raw\":\"?? new.txt\",\"untracked\":true,\"conflicted\":false}],"
+            ),
+            "{body}"
+        );
+        let payload = json_of(&response);
+        assert_eq!(payload["branch"], "main", "{payload}");
+        assert_eq!(payload["head"], head.as_str(), "{payload}");
+        assert_eq!(payload["insertions"], 5, "{payload}");
+        assert_eq!(payload["deletions"], 1, "{payload}");
+        assert_eq!(
+            payload["githubUrl"], "https://github.com/acme/widget",
+            "{payload}"
+        );
+    }
+
+    /// Requirement 12: an origin that is not github.com yields `null`, never
+    /// the raw remote.
+    #[test]
+    fn git_status_reports_a_non_github_origin_as_null() {
+        let repo = repo_bar_fixture("repobar-gitlab", Some("https://gitlab.com/acme/widget.git"));
+
+        let response = git_status_for_test(&repo);
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(!response.contains("gitlab"), "{response}");
+        let payload = json_of(&response);
+        assert_eq!(payload["branch"], "main", "{payload}");
+        assert!(payload["githubUrl"].is_null(), "{payload}");
+    }
+
+    /// Requirement 14: a plain folder is the old payload plus `null`/0, not
+    /// an error.
+    #[test]
+    fn git_status_of_a_non_git_folder_has_null_repo_fields() {
+        let folder = temp_path("repobar-plain");
+        fs::create_dir_all(&folder).unwrap();
+
+        let response = git_status_for_test(&folder);
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let payload = json_of(&response);
+        assert_eq!(payload["clean"], false, "{payload}");
+        assert_ne!(payload["exitCode"], 0, "{payload}");
+        assert_eq!(payload["files"], serde_json::json!([]), "{payload}");
+        assert!(payload["branch"].is_null(), "{payload}");
+        assert!(payload["head"].is_null(), "{payload}");
+        assert_eq!(payload["insertions"], 0, "{payload}");
+        assert_eq!(payload["deletions"], 0, "{payload}");
+        assert!(payload["githubUrl"].is_null(), "{payload}");
+    }
+
+    /// Requirement 13: the client never supplies the URL. A `url` field in
+    /// the form is ignored and the opener sees only the derived one.
+    #[test]
+    fn open_github_opens_the_derived_url_and_ignores_a_supplied_one() {
+        isolated_data_dir();
+        let repo = repo_bar_fixture("repobar-open", Some("https://github.com/acme/widget"));
+        let form = HashMap::from([
+            ("repo".to_string(), repo.to_string_lossy().to_string()),
+            ("url".to_string(), "https://evil.example/".to_string()),
+        ]);
+        let mut opened = Vec::new();
+
+        let url = super::open_github_for_form(&form, |url| {
+            opened.push(url.to_string());
+            Ok(())
+        })
+        .expect("open github");
+
+        assert_eq!(url, "https://github.com/acme/widget");
+        assert_eq!(opened, vec!["https://github.com/acme/widget".to_string()]);
+    }
+
+    /// No GitHub origin, no repository, or no folder: an error, and nothing
+    /// is opened.
+    #[test]
+    fn open_github_refuses_without_a_github_origin() {
+        isolated_data_dir();
+        let gitlab = repo_bar_fixture("repobar-open-gitlab", Some("https://gitlab.com/a/b"));
+        let no_origin = repo_bar_fixture("repobar-open-none", None);
+        let plain = temp_path("repobar-open-plain");
+        fs::create_dir_all(&plain).unwrap();
+        let missing = temp_path("repobar-open-missing");
+
+        for folder in [&gitlab, &no_origin, &plain, &missing] {
+            let form = HashMap::from([("repo".to_string(), folder.to_string_lossy().to_string())]);
+            let mut opened = false;
+            let result = super::open_github_for_form(&form, |_| {
+                opened = true;
+                Ok(())
+            });
+            assert!(result.is_err(), "{folder:?}: {result:?}");
+            assert!(!opened, "{folder:?} opened something");
+        }
+    }
+
+    /// The route exists and requires `repo`. Without one it fails before
+    /// anything could be opened, so this never launches a browser.
+    #[test]
+    fn open_github_route_requires_a_repo() {
+        let (port, token) = serve_for_test();
+
+        let response = post_fields_for_test(
+            port,
+            &token,
+            "/api/open-github",
+            &[("url", "https://evil.example/")],
+        );
+
+        assert!(response.starts_with("HTTP/1.1 500"), "{response}");
+        assert!(response.contains("missing form field: repo"), "{response}");
     }
 }
 

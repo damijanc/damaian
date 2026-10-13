@@ -88,10 +88,10 @@ new capability (§2).
     - `head`: the short SHA;
     - `insertions` and `deletions`: working tree against `HEAD`, with untracked
       text files counted as insertions;
-    - `github_url`: a string or `null`.
+    - `githubUrl`: a string or `null`.
 
     Existing fields are unchanged.
-12. `github_url` is built only from the `origin` remote, only when its host is
+12. `githubUrl` is built only from the `origin` remote, only when its host is
     exactly `github.com`, and always as `https://github.com/<owner>/<repo>`
     from the parsed owner and repository name. The raw remote string is never
     returned or opened, because the remote is repository-controlled input.
@@ -307,7 +307,7 @@ gone.
    deletion counts that match `git diff --numstat HEAD` plus untracked lines.
 6. On a non-git folder, the bar shows the folder only and its menu works. On a
    detached HEAD it shows the short SHA.
-7. Unit tests cover `github_url` for the three accepted remote forms. They also
+7. Unit tests cover `githubUrl` for the three accepted remote forms. They also
    cover rejection of a non-GitHub host, of `github.com.evil.example`, of an
    extra path segment, and of a missing `origin`.
 8. Open repository on GitHub opens the reconstructed URL. A request that sends
