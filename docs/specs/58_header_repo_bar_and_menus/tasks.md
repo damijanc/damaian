@@ -39,7 +39,7 @@
 | 2 · Shell: git-status fields and open-github | Not started | |
 | 3 · One ⋮ menu component, vertical everywhere | Not started | |
 | 4 · Sidebar session menu and search | Not started | |
-| 5 · Header ⋮ menu and turn indicator | Not started | |
+| 5 · Header ⋮ menu, turn state into the conversation | Not started | |
 | 6 · Repo bar, contextual action, mode pill | Not started | |
 | 7 · Style guide, docs and close-out | Not started | |
 
@@ -92,13 +92,28 @@ Proposal §1 req 3, 4 and 8.
 - [ ] Browser check: rename, export (a file is saved and carries the redaction line) and delete (confirm, then gone) from the menu; search from the sidebar.
 - [ ] Run scoped checks and update this row.
 
-## Task 5 · Header ⋮ menu and turn indicator
+## Task 5 · Header ⋮ menu, turn state into the conversation
 
-Proposal §1 req 5–7, §3.2.
+Proposal §1 req 5–7, §3.2 (including its table).
 
-- [ ] Inventory every state `#chat-status` shows today and record the list in this row. Map each one to the turn indicator or to the existing place that already says it. Nothing may be lost silently.
-- [ ] Remove `#chat-status`, `#open-vscode-btn` and `#thread-repo` from the header (`#thread-repo`'s content moves to the repo bar in Task 6; until then it may stay hidden). Add the turn indicator next to the title and the header ⋮: Open in › (VS Code, Finder, Terminal) / Rename session / Export as Markdown / — / Delete session.
-- [ ] Browser check: each header ⋮ item, keyboard only, and the indicator during a running turn.
+- [ ] Give every turn path the in-bubble `startTurnIndicator`:
+  - the resumes in `createCommandApprovalPreview`, `createPlanReview` and
+    `createFallbackOffer`;
+  - `proposePatchFromChat`.
+
+  Pass a stop handler only where that path already cancels. Otherwise draw no
+  Stop. Record which paths got Stop.
+- [ ] Add the Incomplete mark on the message. Add the "Desktop API
+  unavailable" banner above `#chat-log`. Check whether the budget-exhausted
+  marks survive a session reload, and record the answer.
+- [ ] Remove `#chat-status`, `setChatStatus` and every caller. Remove
+  `#open-vscode-btn` and `#thread-repo` from the header. `#thread-repo`'s
+  content moves to the repo bar in Task 6, so until then it may stay hidden.
+  Add the header ⋮: Open in › (VS Code, Finder, Terminal) / Rename session /
+  Export as Markdown / — / Delete session.
+- [ ] Browser check: each header ⋮ item, keyboard only; the indicator on a chat
+  turn and on a command-approval resume; Stop; a failed turn (bad key); the
+  Incomplete mark.
 - [ ] Run scoped checks and update this row.
 
 ## Task 6 · Repo bar, contextual action, mode pill

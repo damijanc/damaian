@@ -55,7 +55,16 @@ All paths are under `crates/desktop-shell/` unless stated.
     and `conflicted` per file.
   - It has no branch and no line counts.
   - Every read is audited as `git_status_read`.
-- **Opening things.** `open_in_vscode` and `reveal_in_finder` (`src/lib.rs`)
+- **Turn status** (`app.js`, `setChatStatus`, `startTurnIndicator`,
+  `chatCompletionStatus`, `markMessageTurnStop`).
+  - The header badge cycles through: Starting, Thinking, Streaming, Generating
+    patch, Patch ready, Complete, Incomplete, Tool budget exhausted, Token
+    budget exhausted, Stopped, Failed, Loaded, Idle and Desktop API
+    unavailable.
+  - The chat send already draws an in-bubble turn indicator. The resumes
+    after a command, plan or fallback-offer approval, and patch generation, do
+    not. For those, the badge is the only progress signal.
+- - **Opening things.** `open_in_vscode` and `reveal_in_finder` (`src/lib.rs`)
   validate the folder, then run `open`. There is no route that opens a URL.
   The PTY terminal (`desktop-app/src/main.rs`, `terminal_open`) always starts
   in `terminal_cwd_for_repo(repo)`.

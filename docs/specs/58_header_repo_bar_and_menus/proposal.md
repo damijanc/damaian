@@ -51,17 +51,29 @@ new capability (§2).
 4. The ⋮ is visible on the active row and on hover or focus-within for other
    rows. Every row, including those whose ⋮ is hidden, is reachable by
    keyboard.
-5. The thread header holds only the session title, a turn indicator, the
-   terminal toggle and a header ⋮ menu. The mode select, the Findings button,
-   the VS Code button, the search button and the "Idle" status badge leave the
-   header.
+5. The thread header holds only the session title, the terminal toggle and a
+   header ⋮ menu. The mode select, the Findings button, the VS Code button, the
+   search button and the `#chat-status` badge leave the header. The header
+   shows no turn state at all.
 6. The header ⋮ menu has an **Open in** section first (VS Code, Finder,
    Terminal), then Rename session and Export as Markdown, then Delete session
    (danger). Each item calls the same function its old control called.
-7. The turn indicator is hidden when idle and shows a pulsing dot with
-   "Working…" while a turn runs. Every state the old badge expressed beyond
-   "idle" and "running" is still shown somewhere. Task 5 inventories those
-   states.
+7. **Turn state lives in the conversation, not in chrome.** Every state
+   `#chat-status` shows today moves to where the user is already looking
+   (§3.2):
+   - **Running.** Every path that runs a turn shows the existing in-bubble
+     turn indicator (`startTurnIndicator`): phase label, elapsed time, and Stop
+     where the path supports stopping. These paths are the chat send, a
+     resumed turn after a command, plan or fallback-offer approval, and patch
+     generation. Today only the chat send uses it.
+   - **Ended other than complete.** Each end state is marked on that turn's
+     message: Stopped, Failed, Tool budget exhausted, Token budget exhausted,
+     and Incomplete. Incomplete has no mark today. Complete adds no mark.
+   - **Patch ready.** The patch review card already says this.
+   - **Desktop API unavailable.** This is a persistent error banner above the
+     conversation, because it is the app failing, not a turn.
+   - **Starting, Loaded, Idle.** These are dropped. They describe nothing the
+     user can act on.
 8. Session search opens from an icon in the sidebar header, next to the
    new-session `+`. The panel and its behaviour are unchanged.
 9. A **repo bar** sits inside the composer, directly above the prompt box. On
@@ -146,10 +158,10 @@ folder menus all become instances of it. The factory owns:
 fly-out shown in the mockup. One behaviour for every menu matters more than
 the fly-out, and the drill-in already exists and has been verified.
 
-### 3.2 Header
+### 3.2 Header and turn state
 
 ```
-[Session title  ● Working…]                                    [>_] [⋮]
+[Session title]                                                 [>_] [⋮]
 ```
 
 The title keeps its ellipsis. The terminal toggle keeps its id, so the existing
@@ -157,6 +169,41 @@ listener and `aria-pressed` handling are untouched. The header ⋮ menu's
 **Open in → Terminal** opens the terminal panel, which the folder menu's
 **Open in terminal** also does: `setTerminalOpen(true)`. The PTY already
 starts at the repo root through `terminal_cwd_for_repo`.
+
+**Why turn state left the header.** The mockup first put a small "● Working…"
+next to the title. In review it went unnoticed: during a turn the user is
+looking at the reply and the prompt, not the header. The conversation already
+has the right element. `startTurnIndicator` (`app.js`) draws a row inside the
+assistant bubble with a phase label ("Waiting for model", a tool's own label,
+"Streaming", "round 2/8"), an elapsed clock and a Stop button. It finishes as
+"Stopped by you" or removes itself.
+
+Before this spec, the header badge was the *only* progress signal for these
+paths:
+- `createCommandApprovalPreview`'s resume;
+- `createPlanReview`'s resume;
+- `createFallbackOffer`'s resume;
+- `proposePatchFromChat`.
+
+Removing the badge without giving those paths the indicator would leave
+those turns with no visible progress. Each of them gets `startTurnIndicator`
+on the message it streams into. Stop is offered only where that path already
+has a working cancel. Otherwise the indicator is passed no stop handler and
+draws no button.
+
+End states are marked on the message:
+
+| Badge today | After |
+|---|---|
+| Starting, Thinking, Streaming, Generating patch | Turn indicator phase label |
+| Patch ready | The patch review card (unchanged) |
+| Complete | Nothing: the turn indicator removes itself |
+| Incomplete | **New** quiet mark on the message: "Stopped before finishing" |
+| Tool / Token budget exhausted | Existing `markMessageToolBudgetExhausted` / `markMessageTokenBudgetExhausted` |
+| Stopped | Existing "Stopped by you" row |
+| Failed | Existing `renderChatMessageError` in the bubble, plus the toast |
+| Desktop API unavailable | **New** persistent error banner above `#chat-log` |
+| Loaded, Idle | Dropped |
 
 ### 3.3 Repo bar
 
@@ -223,7 +270,8 @@ specs get a cross-reference line in this change.
 
 From `index.html`:
 - `#session-mode-select`
-- `#chat-status`, replaced by the turn indicator
+- `#chat-status`, plus `setChatStatus` and its callers; §3.2 gives each
+  state's new home
 - `#findings-toggle-btn`
 - `#session-search-btn`, which moves to the sidebar
 - `#open-vscode-btn`
@@ -248,7 +296,12 @@ gone.
    component.
 2. A session can be renamed, exported and deleted from both its sidebar ⋮ and
    the header ⋮. Delete asks for confirmation.
-3. The header contains exactly: title, turn indicator, terminal toggle, ⋮.
+3. The header contains exactly: title, terminal toggle, ⋮. `setChatStatus`
+   no longer exists. A turn resumed after approving a command, a plan and a
+   fallback offer, and a patch generation, each shows the in-bubble turn
+   indicator while running. A turn ending Incomplete, Failed, Stopped or
+   budget-exhausted carries a mark on its message after a reload as well as
+   live, or says in `tasks.md` which marks are live-only today and why.
 4. Session search opens from the sidebar and finds sessions as before.
 5. On this repository, the repo bar shows the folder, `main`, and insertion and
    deletion counts that match `git diff --numstat HEAD` plus untracked lines.
