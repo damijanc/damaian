@@ -13,6 +13,8 @@ not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.4
 (command approval), section 7.8 (risk classification and approval), section 7.10
 (secret detection). Related implementation specs:
+[`58_header_repo_bar_and_menus/proposal.md`](58_header_repo_bar_and_menus/proposal.md)
+(its §3.5 contextual-action slot is where *Create PR* appears in the desktop app),
 [`06_mcp_support.md`](06_mcp_support.md) (the transport this uses instead of a
 bespoke API client),
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)

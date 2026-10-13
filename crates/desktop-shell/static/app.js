@@ -4122,7 +4122,7 @@ function createRecoveryCard(task) {
   overflow.setAttribute("aria-haspopup", "menu");
   overflow.setAttribute("aria-label", "More recovery options");
   overflow.title = "More recovery options";
-  overflow.textContent = "⋯";
+  overflow.innerHTML = '<span class="dots-icon" aria-hidden="true"></span>';
   overflow.addEventListener("click", (event) => {
     event.stopPropagation();
     toggleApprovalMenu(menuItems, overflow);
@@ -6881,7 +6881,7 @@ function createCommandApprovalPreview(
     overflowButton.setAttribute("aria-haspopup", "menu");
     overflowButton.setAttribute("aria-label", "More approval options");
     overflowButton.title = "More approval options";
-    overflowButton.textContent = "⋯";
+    overflowButton.innerHTML = '<span class="dots-icon" aria-hidden="true"></span>';
     // Without `stopPropagation` the document click handler that dismisses the
     // menu fires in the same tick and closes it as it opens.
     overflowButton.addEventListener("click", (event) => {
