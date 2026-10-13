@@ -415,8 +415,6 @@ button:disabled {
 }
 
 .project-session-add-btn,
-.project-session-delete,
-.project-session-export,
 .project-menu-btn {
   width: 26px;
   height: 26px;
@@ -431,21 +429,29 @@ button:disabled {
 }
 
 .project-session-add-btn:hover,
-.project-session-delete:hover,
-.project-session-export:hover,
 .project-menu-btn:hover {
   background: rgba(255, 255, 255, 0.85);
   color: var(--ink);
-}
-
-.project-session-export {
-  font-size: 16px;
 }
 
 .project-menu-btn {
   display: grid;
   place-items: center;
   padding: 0;
+}
+
+/* Hidden by opacity only, never `display`/`visibility`, so the ⋮ of a row
+   that is neither active nor hovered stays in the tab order; `:focus-within`
+   then reveals it the moment Tab lands on it. */
+.project-session-menu-btn {
+  opacity: 0;
+}
+
+.project-session-item.active .project-session-menu-btn,
+.project-session-item:hover .project-session-menu-btn,
+.project-session-item:focus-within .project-session-menu-btn,
+.project-session-menu-btn[aria-expanded="true"] {
+  opacity: 1;
 }
 
 /* inline-block so it keeps its size inside any button, not only the grid ones;
@@ -511,7 +517,7 @@ button:disabled {
   width: 100%;
   min-height: 32px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 26px 26px;
+  grid-template-columns: minmax(0, 1fr) 26px;
   align-items: center;
   gap: 2px;
   border-radius: 9px;
@@ -754,6 +760,8 @@ button:disabled {
 .search-button {
   width: 30px;
   height: 30px;
+  display: inline-grid;
+  place-items: center;
   padding: 0;
 }
 
@@ -778,10 +786,13 @@ button:disabled {
   content: "";
 }
 
+/* Its trigger sits in the sidebar header, so the panel opens at the
+   conversation's left edge, beside the sidebar, rather than under the header's
+   right-hand actions. */
 .session-search-panel {
   position: absolute;
   top: 48px;
-  right: 16px;
+  left: 16px;
   z-index: 40;
   width: min(420px, calc(100% - 32px));
   max-height: 420px;
