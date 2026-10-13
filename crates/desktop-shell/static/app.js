@@ -5836,38 +5836,64 @@ function renderProjectSession(projectPath, session) {
     }
   });
 
-  const deleteButton = document.createElement("button");
-  deleteButton.type = "button";
-  deleteButton.className = "project-session-delete";
-  deleteButton.textContent = "-";
-  deleteButton.title = `Delete ${session.title}`;
-  deleteButton.setAttribute("aria-label", `Delete ${session.title}`);
-  deleteButton.addEventListener("click", async (event) => {
+  const menuButton = document.createElement("button");
+  menuButton.type = "button";
+  menuButton.className = "project-menu-btn project-session-menu-btn";
+  menuButton.title = "More options";
+  menuButton.setAttribute("aria-label", `More options for ${session.title}`);
+  menuButton.setAttribute("aria-haspopup", "menu");
+  menuButton.setAttribute("aria-expanded", "false");
+  menuButton.innerHTML = '<span class="dots-icon" aria-hidden="true"></span>';
+  menuButton.addEventListener("click", (event) => {
     event.stopPropagation();
-    try {
-      await deleteSessionForProject(projectPath, session);
-    } catch (error) {
-      toast(error.message);
-    }
+    toggleSessionMenu(projectPath, session, menuButton);
   });
 
-  const exportButton = document.createElement("button");
-  exportButton.type = "button";
-  exportButton.className = "project-session-export";
-  exportButton.textContent = "↓";
-  exportButton.title = `Export ${session.title}`;
-  exportButton.setAttribute("aria-label", `Export ${session.title}`);
-  exportButton.addEventListener("click", async (event) => {
-    event.stopPropagation();
-    try {
-      await exportSessionDownload(session);
-    } catch (error) {
-      toast(error.message);
-    }
-  });
-
-  row.append(button, deleteButton, exportButton);
+  row.append(button, menuButton);
   return row;
+}
+
+// The session row menu. Rows are re-rendered by `renderProjectList()`, so the
+// session id, not the button, keys the menu.
+const sessionMenu = createContextMenu();
+
+// Runs a session action and toasts its error, as the old row buttons did.
+function runSessionAction(task) {
+  return async () => {
+    try {
+      await task();
+    } catch (error) {
+      toast(error.message);
+    }
+  };
+}
+
+function toggleSessionMenu(projectPath, session, anchorEl) {
+  sessionMenu.toggle(anchorEl, {
+    key: `${projectPath}\n${session.id}`,
+    sections: [
+      [
+        {
+          label: "Rename",
+          action: "rename",
+          onSelect: runSessionAction(() => renameSessionForProject(projectPath, session)),
+        },
+        {
+          label: "Export as Markdown",
+          action: "export",
+          onSelect: runSessionAction(() => exportSessionDownload(session)),
+        },
+      ],
+      [
+        {
+          label: "Delete",
+          action: "delete",
+          danger: true,
+          onSelect: runSessionAction(() => deleteSessionForProject(projectPath, session)),
+        },
+      ],
+    ],
+  });
 }
 
 function renderSessionOptions(sessions = []) {
