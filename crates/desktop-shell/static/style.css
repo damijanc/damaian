@@ -128,14 +128,6 @@ label span {
   gap: 8px;
 }
 
-.eyebrow {
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0;
-  text-transform: uppercase;
-}
-
 .field {
   display: grid;
   gap: 6px;
@@ -621,6 +613,13 @@ button:disabled {
     0 2px 7px rgba(31, 36, 40, 0.08);
 }
 
+/* The header and the app-level error banner share the conversation grid's
+   first row, so a banner that comes and goes never moves `#chat-log` out of
+   the one row that is allowed to grow. */
+.thread-top {
+  min-width: 0;
+}
+
 .thread-header {
   display: flex;
   align-items: center;
@@ -713,16 +712,29 @@ button:disabled {
   left: 4px;
 }
 
-.vscode-button {
+/* The header's overflow trigger, at the header's 30px control height. */
+.thread-menu-btn {
   width: 30px;
   height: 30px;
+  display: inline-grid;
+  place-items: center;
   padding: 0;
 }
 
-.vscode-icon {
-  display: block;
-  width: 22px;
-  height: 22px;
+/* The app failing rather than a turn (spec 58 §3.2). Unlike the toast that
+   accompanies it, it stays until an API call succeeds. */
+.app-error-banner {
+  margin: 0;
+  border-bottom: 1px solid var(--line);
+  background: #fbe9e7;
+  color: var(--danger);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 22px;
+}
+
+.app-error-banner[hidden] {
+  display: none;
 }
 
 .terminal-button {
@@ -848,36 +860,6 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.status-badge {
-  flex: 0 0 auto;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-  padding: 4px 9px;
-}
-
-.status-badge[data-state="running"] {
-  border-color: #8ba8b3;
-  color: var(--accent);
-}
-
-.status-badge[data-state="ok"] {
-  border-color: #8dbda5;
-  color: var(--ok);
-}
-
-.status-badge[data-state="warn"] {
-  border-color: #d7a66d;
-  color: var(--warn);
-}
-
-.status-badge[data-state="error"] {
-  border-color: #d89999;
-  color: var(--danger);
 }
 
 .chat-log {

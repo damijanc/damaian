@@ -77,75 +77,59 @@
         <div id="chat-drop-overlay" class="chat-drop-overlay" hidden aria-hidden="true">
           <div class="chat-drop-overlay-inner">Drop to add as context</div>
         </div>
-        <header class="thread-header">
-          <div class="thread-identity">
-            <p id="thread-repo" class="eyebrow">No repository selected</p>
-            <h2 id="thread-session"></h2>
-          </div>
-          <div class="thread-actions">
-            <select
-              id="session-mode-select"
-              class="mode-select"
-              aria-label="Working mode"
-              title="Working mode: what the assistant may do in this session"
-              disabled
-            >
-              <option value="ask">Ask</option>
-              <option value="plan">Plan</option>
-              <option value="code" selected>Code</option>
-              <option value="review">Review</option>
-            </select>
-            <span id="chat-status" class="status-badge">Idle</span>
-            <button
-              id="findings-toggle-btn"
-              class="topbar-button"
-              type="button"
-              aria-controls="findings-panel"
-              aria-expanded="false"
-              hidden
-            >
-              Findings
-            </button>
-            <button
-              id="open-vscode-btn"
-              class="topbar-button vscode-button"
-              type="button"
-              aria-label="Open selected folder in Visual Studio Code"
-              title="Open selected folder in Visual Studio Code"
-            >
-              <svg
-                class="vscode-icon"
-                viewBox="0 0 64 64"
-                aria-hidden="true"
-                focusable="false"
+        <div class="thread-top">
+          <header class="thread-header">
+            <div class="thread-identity">
+              <h2 id="thread-session"></h2>
+            </div>
+            <div class="thread-actions">
+              <select
+                id="session-mode-select"
+                class="mode-select"
+                aria-label="Working mode"
+                title="Working mode: what the assistant may do in this session"
+                disabled
               >
-                <path
-                  fill="#0078d4"
-                  d="M48 4 60 9.9v44.2L48 60 26.3 40.8 13 52 4 47V17l9-5 13.3 11.2L48 4Z"
-                />
-                <path
-                  fill="#ffffff"
-                  d="M17 24.4 25.9 32 17 39.6V24.4Zm30.7-7.2v29.6L31.2 32l16.5-14.8Z"
-                />
-                <path
-                  fill="#005a9e"
-                  d="M48 4 60 9.9v44.2L48 60V4ZM13 12v40l-9-5V17l9-5Z"
-                  opacity=".32"
-                />
-              </svg>
-            </button>
-            <button
-              id="terminal-toggle-btn"
-              class="topbar-button terminal-button"
-              type="button"
-              aria-label="Show terminal"
-              aria-pressed="false"
-              title="Show terminal"
-            >
-              <span class="terminal-icon" aria-hidden="true"></span>
-            </button>
-          </div>
-        </header>
+                <option value="ask">Ask</option>
+                <option value="plan">Plan</option>
+                <option value="code" selected>Code</option>
+                <option value="review">Review</option>
+              </select>
+              <button
+                id="findings-toggle-btn"
+                class="topbar-button"
+                type="button"
+                aria-controls="findings-panel"
+                aria-expanded="false"
+                hidden
+              >
+                Findings
+              </button>
+              <button
+                id="terminal-toggle-btn"
+                class="topbar-button terminal-button"
+                type="button"
+                aria-label="Show terminal"
+                aria-pressed="false"
+                title="Show terminal"
+              >
+                <span class="terminal-icon" aria-hidden="true"></span>
+              </button>
+              <button
+                id="thread-menu-btn"
+                class="btn-icon thread-menu-btn"
+                type="button"
+                aria-label="More session options"
+                aria-haspopup="menu"
+                aria-expanded="false"
+                title="More session options"
+              >
+                <span class="dots-icon" aria-hidden="true"></span>
+              </button>
+            </div>
+          </header>
+          <div id="desktop-api-banner" class="app-error-banner" role="alert" hidden></div>
+        </div>
 
         <div id="session-search-panel" class="session-search-panel" hidden>
           <input

@@ -175,7 +175,20 @@ async function api(path, options = {}, retriedAuth = false) {
   if (!response.ok || payload.error) {
     throw new Error(payload.error || response.statusText);
   }
+  // An answer from the API is proof it is available, whichever way the token
+  // arrived.
+  setDesktopApiBanner(null);
   return payload;
+}
+
+// "Desktop API unavailable" is the app failing, not a turn, so it is a
+// persistent banner above the conversation rather than a turn mark (spec 58
+// §3.2). `null` clears it.
+function setDesktopApiBanner(message) {
+  const banner = $("desktop-api-banner");
+  if (!banner) return;
+  banner.textContent = message || "";
+  banner.hidden = !message;
 }
 
 function isProtectedApiPath(path) {
@@ -226,6 +239,7 @@ function startBootstrap() {
       const token = bootstrap?.apiToken || "";
       if (!token) throw new Error("Desktop API token missing from Tauri bootstrap");
       apiToken = token;
+      setDesktopApiBanner(null);
       if (!chatSubmitting) $("ask-btn").disabled = false;
       loadProjectState();
       const lastRepo = localStorage.getItem(lastRepoStorageKey);
@@ -245,7 +259,7 @@ function startBootstrap() {
     .catch((error) => {
       bootstrapError = error;
       if (!chatSubmitting) $("ask-btn").disabled = false;
-      setChatStatus("Desktop API unavailable", "error");
+      setDesktopApiBanner(`Desktop API unavailable: ${error.message}`);
       toast(`Desktop API unavailable: ${error.message}`);
     });
 }
@@ -273,39 +287,37 @@ function setRepoState(message) {
   renderThreadHeader();
 }
 
-// The thread header used to caption the screen you were already looking at
-// ("Workspace Agent / Conversation", both hardcoded). It now carries the two
-// things that actually change and that you would otherwise hunt for in the
-// sidebar: which folder is active and which session is open.
+// The thread header names the open session; nothing else in it is state (spec
+// 58 §3.2). The folder it used to show above the title moves to the composer's
+// repo bar.
 //
-// Driven off `setRepoState` and `syncSessionListActive`, which between them
-// already fire on every project switch, session switch, load and rename.
+// Driven off `setRepoState`, `syncSessionListActive` and `loadSessions`, which
+// between them fire on every project switch, session switch, load and rename.
 function renderThreadHeader() {
   const repoPath = repo();
-  const repoLine = $("thread-repo");
   const sessionLine = $("thread-session");
   renderModeControl();
 
   if (!repoPath) {
-    repoLine.textContent = "No repository selected";
-    repoLine.removeAttribute("title");
     sessionLine.textContent = "";
     sessionLine.removeAttribute("title");
     return;
   }
 
-  // Basename only — a deep path would crowd the row and push the actions off.
-  // The full path stays reachable as a tooltip.
-  const name = repoPath.replace(/\/+$/, "").split("/").pop() || repoPath;
-  repoLine.textContent = name;
-  repoLine.title = repoPath;
-
-  const session = (projectSessionsByPath.get(repoPath) || []).find(
-    (entry) => entry.id === currentSessionId,
-  );
+  const session = currentSession();
   sessionLine.textContent = session ? session.title : "New session";
   if (session) sessionLine.title = session.title;
   else sessionLine.removeAttribute("title");
+}
+
+// The open session's list entry, or null for a new session or no folder.
+function currentSession() {
+  const repoPath = repo();
+  if (!repoPath || !currentSessionId) return null;
+  return (
+    (projectSessionsByPath.get(repoPath) || []).find((entry) => entry.id === currentSessionId) ||
+    null
+  );
 }
 
 // A mode belongs to a session that exists, so the control is disabled until
@@ -3543,13 +3555,6 @@ function clearChat() {
   // Every caller means "no conversation": a new, deleted or unselected
   // session. The findings belong to the conversation that just left.
   clearFindings();
-  setChatStatus("Idle");
-}
-
-function setChatStatus(message, state = "") {
-  const el = $("chat-status");
-  el.textContent = message;
-  el.dataset.state = state;
 }
 
 function escapeHtml(value) {
@@ -3774,11 +3779,12 @@ const TURN_PHASE_LABELS = {
 };
 
 // A live "something is happening" row inside an assistant bubble: the phase, an
-// elapsed clock, and a Stop button.
+// elapsed clock, and a Stop button when `onStop` is given. A path with no
+// working cancel passes none, and gets no button that would do nothing.
 //
 // Owns its DOM, its interval, and its teardown so nothing outside has to track
 // them. `finish` is idempotent, which lets error paths call it blindly.
-function startTurnIndicator(target, onStop) {
+function startTurnIndicator(target, onStop = null) {
   const row = document.createElement("p");
   row.className = "turn-indicator";
   row.dataset.state = "running";
@@ -3805,13 +3811,16 @@ function startTurnIndicator(target, onStop) {
   elapsed.className = "turn-indicator-elapsed";
   elapsed.setAttribute("aria-hidden", "true");
 
-  const stop = document.createElement("button");
-  stop.type = "button";
-  stop.className = "turn-indicator-stop";
-  stop.textContent = "Stop";
-  stop.addEventListener("click", () => onStop());
-
-  row.append(dot, label, output, elapsed, stop);
+  row.append(dot, label, output, elapsed);
+  let stop = null;
+  if (onStop) {
+    stop = document.createElement("button");
+    stop.type = "button";
+    stop.className = "turn-indicator-stop";
+    stop.textContent = "Stop";
+    stop.addEventListener("click", () => onStop());
+    row.append(stop);
+  }
   target.body.after(row);
 
   const startedAt = Date.now();
@@ -3860,7 +3869,7 @@ function startTurnIndicator(target, onStop) {
         row.dataset.state = "stopped";
         label.textContent = "Stopped by you";
         elapsed.remove();
-        stop.remove();
+        stop?.remove();
         return;
       }
       row.remove();
@@ -4923,20 +4932,37 @@ function markMessageTurnStop(target, payload, sessionId = currentSessionId) {
     markMessageToolBudgetExhausted(target, payload.sessionId || sessionId);
   } else if (payload.taskStatus === "token_budget_exhausted") {
     markMessageTokenBudgetExhausted(target);
+  } else if (payload.incomplete) {
+    markMessageIncomplete(target);
   }
 }
 
-function chatCompletionStatus(payload) {
-  if (payload.taskStatus === "tool_budget_exhausted") {
-    return { label: "Tool budget exhausted", tone: "warn", indicator: "incomplete" };
-  }
-  if (payload.taskStatus === "token_budget_exhausted") {
-    return { label: "Token budget exhausted", tone: "warn", indicator: "incomplete" };
-  }
-  if (payload.incomplete) {
-    return { label: "Incomplete", tone: "warn", indicator: "incomplete" };
-  }
-  return { label: "Complete", tone: "ok", indicator: "complete" };
+// A turn whose model run ended early for a reason no budget names (spec 58
+// §3.2). Quiet on purpose: there is nothing to press, only something to know.
+//
+// Live-only. The run's `incomplete` flag is not stored on the task, so a reload
+// cannot tell this turn from a complete one; and the engine sets it only on
+// cancellation, whose task is stored as `cancelled` and reloads as "Stopped by
+// you" instead.
+function markMessageIncomplete(target) {
+  if (target.body.nextElementSibling?.dataset?.state === "incomplete") return;
+  const row = document.createElement("p");
+  row.className = "turn-indicator";
+  row.dataset.state = "incomplete";
+  const label = document.createElement("span");
+  label.className = "turn-indicator-label";
+  label.textContent = "Stopped before finishing";
+  row.append(label);
+  target.body.after(row);
+}
+
+// How a finished turn's indicator ends: "incomplete" for every end that
+// `markMessageTurnStop` marks, "complete" otherwise.
+function chatCompletionState(payload) {
+  const exhausted =
+    payload.taskStatus === "tool_budget_exhausted" ||
+    payload.taskStatus === "token_budget_exhausted";
+  return exhausted || payload.incomplete ? "incomplete" : "complete";
 }
 
 // The files a turn read, folded into that turn rather than a strip docked above
@@ -6311,64 +6337,76 @@ function createFallbackOffer(proposal, proposalRepo) {
       appendChatMessage("system", `Switched to ${fallback} for this turn${after}.`);
     }
     const assistantMessage = approved ? appendChatMessage("assistant", "") : null;
+    // No Stop: this stream is sent without an abort signal, so nothing on this
+    // path can cancel it.
+    const indicator = assistantMessage ? startTurnIndicator(assistantMessage) : null;
     let assistantText = "";
     let streamError = null;
-    await streamResumeFallbackRequest(
-      {
-        repo: proposalRepo,
-        proposal_id: proposal.proposalId,
-        approved: approved ? "true" : "false",
-      },
-      {
-        plan(planPayload) {
-          if (assistantMessage) renderPlanPanel(assistantMessage, planPayload);
+    try {
+      await streamResumeFallbackRequest(
+        {
+          repo: proposalRepo,
+          proposal_id: proposal.proposalId,
+          approved: approved ? "true" : "false",
         },
-        webDiagnostic(record) {
-          sessionHasRecordedDiagnostics = true;
-          if (assistantMessage) renderWebDiagnosticCard(assistantMessage, record);
-        },
-        token(token) {
-          if (!assistantMessage) return;
-          assistantText += token;
-          updateChatMessage(assistantMessage, assistantText);
-          setChatStatus("Streaming", "running");
-        },
-        done(payload) {
-          if (!assistantMessage) return;
-          if (payload.response && payload.response !== assistantText) {
-            assistantText = payload.response;
+        {
+          phase(payload) {
+            if (indicator) indicator.phase(payload);
+          },
+          plan(planPayload) {
+            if (assistantMessage) renderPlanPanel(assistantMessage, planPayload);
+          },
+          webDiagnostic(record) {
+            sessionHasRecordedDiagnostics = true;
+            if (assistantMessage) renderWebDiagnosticCard(assistantMessage, record);
+          },
+          token(token) {
+            if (!assistantMessage) return;
+            assistantText += token;
             updateChatMessage(assistantMessage, assistantText);
-          }
-          appendProposals(assistantMessage, payload, proposalRepo);
-          if (payload.sessionId) {
-            currentSessionId = payload.sessionId;
-            localStorage.setItem(lastSessionStorageKey(), currentSessionId);
-          }
-          appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
-          markMessageUsage(assistantMessage, payload.usage);
-          markMessageTurnStop(assistantMessage, payload);
-          const status = chatCompletionStatus(payload);
-          setChatStatus(status.label, status.tone);
+            if (indicator) indicator.streaming();
+          },
+          done(payload) {
+            if (!assistantMessage) return;
+            if (payload.response && payload.response !== assistantText) {
+              assistantText = payload.response;
+              updateChatMessage(assistantMessage, assistantText);
+            }
+            appendProposals(assistantMessage, payload, proposalRepo);
+            if (payload.sessionId) {
+              currentSessionId = payload.sessionId;
+              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+            }
+            appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+            markMessageUsage(assistantMessage, payload.usage);
+            if (indicator) indicator.finish(chatCompletionState(payload));
+            markMessageTurnStop(assistantMessage, payload);
+          },
+          error(payload) {
+            streamError = payload.error || "The provider decision failed";
+          },
         },
-        error(payload) {
-          streamError = payload.error || "The provider decision failed";
-        },
-      },
-    );
+      );
+    } catch (error) {
+      // The request itself failed, not the provider: record it in the bubble
+      // and let the caller's toast say it too.
+      renderChatMessageError(assistantMessage, error);
+      throw error;
+    } finally {
+      if (indicator) indicator.finish("failed");
+    }
     if (approved) {
       // The fallback refusing too is an ordinary failure, not a second offer.
-      if (streamError) {
-        updateChatMessage(assistantMessage, streamError);
-        setChatStatus("Failed", "error");
-      }
+      // The error text in the bubble is that failure's mark.
+      if (streamError) updateChatMessage(assistantMessage, streamError);
       output.textContent = streamError
         ? `${proposal.fallbackProvider} could not answer either. The turn has failed.`
         : `Answered by ${fallback} — see the answer below.`;
     } else {
       // A decline fails the task exactly as the refusal would have, and the
       // engine reports it as that refusal: an error here is the expected outcome.
+      // This card's own line is the only record a decline needs.
       output.textContent = streamError ? `Kept failed: ${streamError}` : "Kept failed.";
-      setChatStatus("Failed", "error");
     }
     await loadSessions(currentSessionId, false);
   }
@@ -6524,50 +6562,65 @@ function createPlanReview(proposal, proposalRepo) {
 
     const revision = approved ? revisionOrNull() : null;
     const assistantMessage = appendChatMessage("assistant", "");
+    // No Stop: this stream is sent without an abort signal, so nothing on this
+    // path can cancel it.
+    const indicator = startTurnIndicator(assistantMessage);
     let assistantText = "";
     let streamError = null;
-    await streamResumePlanRequest(
-      {
-        repo: proposalRepo,
-        proposal_id: proposal.proposalId,
-        approved: approved ? "true" : "false",
-        steps: revision ? JSON.stringify(revision) : "",
-      },
-      {
-        plan(planPayload) {
-          renderPlanPanel(assistantMessage, planPayload);
+    try {
+      await streamResumePlanRequest(
+        {
+          repo: proposalRepo,
+          proposal_id: proposal.proposalId,
+          approved: approved ? "true" : "false",
+          steps: revision ? JSON.stringify(revision) : "",
         },
-        webDiagnostic(record) {
-          sessionHasRecordedDiagnostics = true;
-          renderWebDiagnosticCard(assistantMessage, record);
-        },
-        token(token) {
-          assistantText += token;
-          updateChatMessage(assistantMessage, assistantText);
-          setChatStatus("Streaming", "running");
-        },
-        done(payload) {
-          if (payload.response && payload.response !== assistantText) {
-            assistantText = payload.response;
+        {
+          phase(payload) {
+            indicator.phase(payload);
+          },
+          plan(planPayload) {
+            renderPlanPanel(assistantMessage, planPayload);
+          },
+          webDiagnostic(record) {
+            sessionHasRecordedDiagnostics = true;
+            renderWebDiagnosticCard(assistantMessage, record);
+          },
+          token(token) {
+            assistantText += token;
             updateChatMessage(assistantMessage, assistantText);
-          }
-          appendProposals(assistantMessage, payload, proposalRepo);
-          if (payload.sessionId) {
-            currentSessionId = payload.sessionId;
-            localStorage.setItem(lastSessionStorageKey(), currentSessionId);
-          }
-          appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
-          markMessageUsage(assistantMessage, payload.usage);
-          markMessageTurnStop(assistantMessage, payload);
-          const status = chatCompletionStatus(payload);
-          setChatStatus(status.label, status.tone);
+            indicator.streaming();
+          },
+          done(payload) {
+            if (payload.response && payload.response !== assistantText) {
+              assistantText = payload.response;
+              updateChatMessage(assistantMessage, assistantText);
+            }
+            appendProposals(assistantMessage, payload, proposalRepo);
+            if (payload.sessionId) {
+              currentSessionId = payload.sessionId;
+              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+            }
+            appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+            markMessageUsage(assistantMessage, payload.usage);
+            indicator.finish(chatCompletionState(payload));
+            markMessageTurnStop(assistantMessage, payload);
+          },
+          error(payload) {
+            streamError = new Error(payload.error || "Plan decision failed");
+          },
         },
-        error(payload) {
-          streamError = new Error(payload.error || "Plan decision failed");
-        },
-      },
-    );
-    if (streamError) throw streamError;
+      );
+    } catch (error) {
+      streamError = error;
+    } finally {
+      indicator.finish("failed");
+    }
+    if (streamError) {
+      // The bubble is the failure's record; the caller's toast goes away.
+      renderChatMessageError(assistantMessage, streamError);
+      throw streamError;
+    }
     output.textContent = approved
       ? revision
         ? "Plan revised and approved — see the assistant's answer above."
@@ -7113,51 +7166,68 @@ function createCommandApprovalPreview(
     }
 
     const assistantMessage = appendChatMessage("assistant", "");
+    // No Stop: this stream is sent without an abort signal, so nothing on this
+    // path can cancel it.
+    const indicator = startTurnIndicator(assistantMessage);
     let assistantText = "";
     let streamError = null;
-    await streamResumeCommandRequest(
-      {
-        repo: proposalRepo,
-        proposal_id: proposal.proposalId,
-        approved: approved ? "true" : "false",
-        always: always ? "true" : "false",
-        allow_browser_diagnostics_for_session: allowBrowserDiagnosticsForSession ? "true" : "false",
-      },
-      {
-        plan(planPayload) {
-          renderPlanPanel(assistantMessage, planPayload);
+    try {
+      await streamResumeCommandRequest(
+        {
+          repo: proposalRepo,
+          proposal_id: proposal.proposalId,
+          approved: approved ? "true" : "false",
+          always: always ? "true" : "false",
+          allow_browser_diagnostics_for_session: allowBrowserDiagnosticsForSession
+            ? "true"
+            : "false",
         },
-        webDiagnostic(record) {
-          sessionHasRecordedDiagnostics = true;
-          renderWebDiagnosticCard(assistantMessage, record);
-        },
-        token(token) {
-          assistantText += token;
-          updateChatMessage(assistantMessage, assistantText);
-          setChatStatus("Streaming", "running");
-        },
-        done(payload) {
-          if (payload.response && payload.response !== assistantText) {
-            assistantText = payload.response;
+        {
+          phase(payload) {
+            indicator.phase(payload);
+          },
+          plan(planPayload) {
+            renderPlanPanel(assistantMessage, planPayload);
+          },
+          webDiagnostic(record) {
+            sessionHasRecordedDiagnostics = true;
+            renderWebDiagnosticCard(assistantMessage, record);
+          },
+          token(token) {
+            assistantText += token;
             updateChatMessage(assistantMessage, assistantText);
-          }
-          appendProposals(assistantMessage, payload, proposalRepo);
-          if (payload.sessionId) {
-            currentSessionId = payload.sessionId;
-            localStorage.setItem(lastSessionStorageKey(), currentSessionId);
-          }
-          appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
-          markMessageUsage(assistantMessage, payload.usage);
-          markMessageTurnStop(assistantMessage, payload);
-          const status = chatCompletionStatus(payload);
-          setChatStatus(status.label, status.tone);
+            indicator.streaming();
+          },
+          done(payload) {
+            if (payload.response && payload.response !== assistantText) {
+              assistantText = payload.response;
+              updateChatMessage(assistantMessage, assistantText);
+            }
+            appendProposals(assistantMessage, payload, proposalRepo);
+            if (payload.sessionId) {
+              currentSessionId = payload.sessionId;
+              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+            }
+            appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+            markMessageUsage(assistantMessage, payload.usage);
+            indicator.finish(chatCompletionState(payload));
+            markMessageTurnStop(assistantMessage, payload);
+          },
+          error(payload) {
+            streamError = new Error(payload.error || "Command resume failed");
+          },
         },
-        error(payload) {
-          streamError = new Error(payload.error || "Command resume failed");
-        },
-      },
-    );
-    if (streamError) throw streamError;
+      );
+    } catch (error) {
+      streamError = error;
+    } finally {
+      indicator.finish("failed");
+    }
+    if (streamError) {
+      // The bubble is the failure's record; the caller's toast goes away.
+      renderChatMessageError(assistantMessage, streamError);
+      throw streamError;
+    }
     if (!approved) {
       output.textContent = isBrowserDiagnostic
         ? "Diagnostic rejected — see the assistant's answer above."
@@ -7242,6 +7312,9 @@ async function loadSessions(preferredSessionId = "", reloadSelected = false) {
     : "";
   $("session-select").value = currentSessionId;
   renderProjectList();
+  // The list just changed under the header: a rename of the open session, from
+  // either ⋮ or a double-click, lands here and nowhere else.
+  renderThreadHeader();
   if (currentSessionId) {
     localStorage.setItem(lastSessionStorageKey(repoPath), currentSessionId);
     if (reloadSelected) {
@@ -7274,7 +7347,6 @@ async function loadSession(sessionId) {
   // After the conversation, because `renderMessages` clears the log and the
   // cards sit above what it renders.
   await renderRecoveryPrompts(currentSessionId);
-  setChatStatus("Loaded");
 }
 
 async function streamChatRequest(data, handlers, signal) {
@@ -7428,13 +7500,74 @@ document.addEventListener("click", (event) => {
   }
 });
 
-$("open-vscode-btn").addEventListener("click", async () => {
-  try {
-    const payload = await api("/api/open-vscode", form({ repo: requireRepo() }));
-    toast(`Opened ${payload.path}`);
-  } catch (error) {
-    toast(error.message);
-  }
+// The header ⋮ (spec 58 §1 req 6): Open in first, then the open session's own
+// actions, which call exactly what its sidebar row ⋮ calls. Built on every
+// open, so the session items follow whichever session is open now.
+const threadMenu = createContextMenu();
+
+function toggleThreadMenu(anchorEl) {
+  const projectPath = repo();
+  const session = currentSession();
+  const noRepo = !projectPath;
+  const noSession = !session;
+  threadMenu.toggle(anchorEl, {
+    sections: [
+      [
+        {
+          label: "Open in",
+          action: "open-in",
+          disabled: noRepo,
+          items: [
+            [
+              {
+                label: "VS Code",
+                action: "open-vscode",
+                onSelect: () => void handleProjectMenuAction("open-vscode", projectPath),
+              },
+              {
+                label: "Finder",
+                action: "open-finder",
+                onSelect: () => void handleProjectMenuAction("open-finder", projectPath),
+              },
+              {
+                label: "Terminal",
+                action: "open-terminal",
+                onSelect: () => setTerminalOpen(true),
+              },
+            ],
+          ],
+        },
+      ],
+      [
+        {
+          label: "Rename session",
+          action: "rename",
+          disabled: noSession,
+          onSelect: runSessionAction(() => renameSessionForProject(projectPath, session)),
+        },
+        {
+          label: "Export as Markdown",
+          action: "export",
+          disabled: noSession,
+          onSelect: runSessionAction(() => exportSessionDownload(session)),
+        },
+      ],
+      [
+        {
+          label: "Delete session",
+          action: "delete",
+          danger: true,
+          disabled: noSession,
+          onSelect: runSessionAction(() => deleteSessionForProject(projectPath, session)),
+        },
+      ],
+    ],
+  });
+}
+
+$("thread-menu-btn").addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleThreadMenu(event.currentTarget);
 });
 
 $("terminal-toggle-btn").addEventListener("click", () => {
@@ -7565,20 +7698,31 @@ function looksLikeEditRequest(prompt) {
 
 async function proposePatchFromChat(prompt, assistantMessage) {
   setChatMessagePlaceholder(assistantMessage, "Generating a patch preview...");
-  setChatStatus("Generating patch", "running");
+  // No Stop: this is a plain request with no abort signal, so `currentTurn` is
+  // never set and nothing could cancel it. No phase events either, so the
+  // label stays put while the clock runs.
+  const indicator = startTurnIndicator(assistantMessage);
+  indicator.phase({ phase: "tool", label: "Generating patch" });
   const patchRepo = requireRepo();
-  const payload = await api(
-    "/api/propose-edit",
-    form({
-      repo: patchRepo,
-      prompt,
-      // The open session's mode governs this flow too; the server refuses the
-      // proposal, before any model call, when that mode forbids patches.
-      session_id: currentSessionId,
-      context_files: pinnedContextFiles.join("\n"),
-      ...chatModelFormFields(),
-    }),
-  );
+  let payload;
+  try {
+    payload = await api(
+      "/api/propose-edit",
+      form({
+        repo: patchRepo,
+        prompt,
+        // The open session's mode governs this flow too; the server refuses the
+        // proposal, before any model call, when that mode forbids patches.
+        session_id: currentSessionId,
+        context_files: pinnedContextFiles.join("\n"),
+        ...chatModelFormFields(),
+      }),
+    );
+  } finally {
+    // Removes itself either way: the patch card below says "ready", and the
+    // caller writes a failure into the bubble.
+    indicator.finish(payload ? "complete" : "failed");
+  }
   updateChatMessage(
     assistantMessage,
     `Prepared a patch preview for \`${payload.patchId}\`. Review the diff and apply selected files when ready.`,
@@ -7586,7 +7730,6 @@ async function proposePatchFromChat(prompt, assistantMessage) {
   assistantMessage.body.append(createPatchPreview(payload, patchRepo));
   appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
   markMessageUsage(assistantMessage, payload.usage);
-  setChatStatus("Patch ready", "warn");
 }
 
 // The turn currently in flight, so Stop (button or Escape) can reach its
@@ -7669,7 +7812,6 @@ async function sendChatPrompt(options = {}) {
     indicator = startTurnIndicator(assistantMessage, stopCurrentTurn);
 
     let assistantText = "";
-    setChatStatus("Thinking", "running");
 
     await streamChatRequest(
       {
@@ -7701,7 +7843,6 @@ async function sendChatPrompt(options = {}) {
           assistantText += token;
           updateChatMessage(assistantMessage, assistantText);
           if (indicator) indicator.streaming();
-          setChatStatus("Streaming", "running");
         },
         async done(payload) {
           currentSessionId = payload.sessionId;
@@ -7718,13 +7859,10 @@ async function sendChatPrompt(options = {}) {
           markMessageUsage(assistantMessage, payload.usage);
           if (payload.cancelled) {
             if (indicator) indicator.finish("stopped");
-            setChatStatus("Stopped", "warn");
             return;
           }
-          const status = chatCompletionStatus(payload);
-          if (indicator) indicator.finish(status.indicator);
+          if (indicator) indicator.finish(chatCompletionState(payload));
           markMessageTurnStop(assistantMessage, payload);
-          setChatStatus(status.label, status.tone);
         },
         error(payload) {
           streamError = new Error(payload.error || "Model request failed");
@@ -7748,13 +7886,11 @@ async function sendChatPrompt(options = {}) {
     // and write an error into the bubble the user just chose to keep.
     if (currentTurn?.stopped || error.name === "AbortError") {
       if (indicator) indicator.finish("stopped");
-      setChatStatus("Stopped", "warn");
       if (restoreSubmittedPrompt) restorePrompt(prompt);
       await loadSessions(currentSessionId, false);
       await refreshFindings();
     } else {
       if (indicator) indicator.finish("failed");
-      setChatStatus("Failed", "error");
       toast(error.message);
       renderChatMessageError(assistantMessage, error);
       if (restoreSubmittedPrompt) restorePrompt(prompt);
@@ -7983,7 +8119,6 @@ $("update-app-btn").addEventListener("click", () => {
 });
 
 $("ask-btn").disabled = true;
-setChatStatus("Starting", "running");
 syncProviderCatalogFromPolicy("");
 applyChatModelOptions(modelOptionsFromPolicy(""));
 renderProviderConfigSelect();
