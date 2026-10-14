@@ -356,6 +356,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         agent_max_tool_rounds,
         agent_web_debug_max_tool_rounds,
         agent_tool_retry_limit,
+        agent_max_questions_per_turn,
         agent_max_task_tokens,
         agent_max_turn_messages,
         project_roots_added,
@@ -413,6 +414,10 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
             agent_web_debug_max_tool_rounds.is_some(),
         ),
         ("agent_tool_retry_limit", agent_tool_retry_limit.is_some()),
+        (
+            "agent_max_questions_per_turn",
+            agent_max_questions_per_turn.is_some(),
+        ),
         ("project_roots_added", project_roots_added.is_some()),
         ("project_roots_removed", project_roots_removed.is_some()),
     ] {

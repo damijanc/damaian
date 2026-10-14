@@ -1,3 +1,4 @@
+use crate::clarification::MAX_QUESTIONS_PER_TURN_CEILING;
 use crate::error::{ClientError, Result};
 use crate::hash::repository_id_for_root;
 use crate::model::TokenUsage;
@@ -314,6 +315,9 @@ pub struct Config {
     /// How many substantially identical failed tool calls may be retried before
     /// the model is told to change approach.
     pub agent_tool_retry_limit: u32,
+    /// How many `ask_user` questions one turn may ask (spec 50). `0` means the
+    /// tool is not offered at all, rather than offered and always refused.
+    pub agent_max_questions_per_turn: u32,
     /// Total tokens one task may spend before it is stopped at a step boundary.
     ///
     /// `None` means no ceiling, which is the default so that upgrading cannot
@@ -1083,6 +1087,7 @@ impl Config {
             agent_max_tool_rounds,
             agent_web_debug_max_tool_rounds,
             agent_tool_retry_limit,
+            agent_max_questions_per_turn,
             agent_max_task_tokens,
             agent_max_turn_messages,
             project_roots_added,
@@ -1693,6 +1698,16 @@ impl Config {
         ) {
             self.agent_tool_retry_limit = value;
             outcome.record(scope, "agent_tool_retry_limit", None, false);
+        }
+        // Parsing already refused anything over the ceiling, at every scope.
+        if let Some(value) = preference(
+            agent_max_questions_per_turn,
+            "agent_max_questions_per_turn",
+            scope,
+            rejected,
+        ) {
+            self.agent_max_questions_per_turn = value;
+            outcome.record(scope, "agent_max_questions_per_turn", None, false);
         }
         if let Some(value) = preference(project_roots_added, "project_roots_added", scope, rejected)
         {
@@ -2414,6 +2429,11 @@ impl Config {
             "agent_tool_retry_limit",
             &self.agent_tool_retry_limit.to_string(),
         );
+        push_line(
+            &mut output,
+            "agent_max_questions_per_turn",
+            &self.agent_max_questions_per_turn.to_string(),
+        );
         // Only when set. Printing `0` for "no ceiling" would read as a ceiling
         // of zero, which is a different and much worse configuration than the
         // default — and `config-show` is one of the two touch points the
@@ -2518,6 +2538,7 @@ impl Default for Config {
             agent_max_tool_rounds: 8,
             agent_web_debug_max_tool_rounds: 12,
             agent_tool_retry_limit: 2,
+            agent_max_questions_per_turn: 2,
             // No ceiling by default: this must not change what an existing
             // configuration does on upgrade (§5.4).
             agent_max_task_tokens: None,
@@ -2581,6 +2602,7 @@ pub struct ConfigOverlay {
     pub agent_max_tool_rounds: Option<u32>,
     pub agent_web_debug_max_tool_rounds: Option<u32>,
     pub agent_tool_retry_limit: Option<u32>,
+    pub agent_max_questions_per_turn: Option<u32>,
     pub agent_max_task_tokens: Option<u64>,
     pub agent_max_turn_messages: Option<usize>,
     pub project_roots_added: Option<Vec<String>>,
@@ -2711,6 +2733,9 @@ classify_overlay_fields! {
     agent_max_tool_rounds => Preference,
     agent_web_debug_max_tool_rounds => Preference,
     agent_tool_retry_limit => Preference,
+    // Asking widens no capability; validation holds it under a hard ceiling
+    // (spec 50 `context.md` §8).
+    agent_max_questions_per_turn => Preference,
     agent_max_task_tokens => Capability,
     agent_max_turn_messages => Capability,
     // A root changes which directory an approved command runs in, never
@@ -2914,6 +2939,9 @@ impl ConfigOverlay {
             }
             "agent_tool_retry_limit" => {
                 self.agent_tool_retry_limit = Some(parse_retry_limit(key, value)?)
+            }
+            "agent_max_questions_per_turn" => {
+                self.agent_max_questions_per_turn = Some(parse_question_cap(key, value)?)
             }
             "agent_max_task_tokens" => {
                 self.agent_max_task_tokens = Some(parse_task_token_ceiling(key, value)?)
@@ -3247,6 +3275,7 @@ impl ConfigOverlay {
             agent_max_tool_rounds,
             agent_web_debug_max_tool_rounds,
             agent_tool_retry_limit,
+            agent_max_questions_per_turn,
             agent_max_task_tokens,
             agent_max_turn_messages,
             project_roots_added,
@@ -3404,6 +3433,13 @@ impl ConfigOverlay {
         }
         if let Some(value) = agent_tool_retry_limit {
             push_line(&mut output, "agent_tool_retry_limit", &value.to_string());
+        }
+        if let Some(value) = agent_max_questions_per_turn {
+            push_line(
+                &mut output,
+                "agent_max_questions_per_turn",
+                &value.to_string(),
+            );
         }
         if let Some(value) = agent_max_turn_messages {
             push_line(&mut output, "agent_max_turn_messages", &value.to_string());
@@ -4383,6 +4419,21 @@ fn parse_retry_limit(key: &str, value: &str) -> Result<u32> {
     } else {
         Err(ClientError::InvalidInput(format!(
             "{key} must be between 1 and 8"
+        )))
+    }
+}
+
+/// `0` is valid: it means `ask_user` is not offered. Above the ceiling is an
+/// error, never a clamp, so a repository that asks for more is refused and
+/// reported instead of quietly getting the most allowed (spec 50
+/// `context.md` §8).
+fn parse_question_cap(key: &str, value: &str) -> Result<u32> {
+    let parsed = parse_u64(key, value)?;
+    if parsed <= u64::from(MAX_QUESTIONS_PER_TURN_CEILING) {
+        Ok(parsed as u32)
+    } else {
+        Err(ClientError::InvalidInput(format!(
+            "{key} must be between 0 and {MAX_QUESTIONS_PER_TURN_CEILING}"
         )))
     }
 }

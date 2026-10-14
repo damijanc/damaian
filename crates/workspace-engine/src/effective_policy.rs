@@ -155,6 +155,7 @@ pub fn rule_label(key: &str) -> Option<String> {
         "agent_max_tool_rounds" => "Tool rounds per turn",
         "agent_web_debug_max_tool_rounds" => "Tool rounds per browser-debugging turn",
         "agent_tool_retry_limit" => "Retries of a failing tool call",
+        "agent_max_questions_per_turn" => "Questions the model may ask per turn",
         "agent_max_task_tokens" => "Token limit per turn",
         "agent_max_turn_messages" => "Messages sent per model request",
         "project_roots_added" => "Folders you made project roots",

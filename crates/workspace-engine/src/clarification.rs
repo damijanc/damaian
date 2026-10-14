@@ -23,6 +23,11 @@ pub const OPTIONS_MAX: usize = 4;
 pub const OPTION_MAX_CHARS: usize = 60;
 /// Longest free-text answer, in characters.
 pub const ANSWER_MAX_CHARS: usize = 2_000;
+/// Most questions `agent_max_questions_per_turn` may allow. It is a Preference,
+/// so a repository may set it; the ceiling stops a repository from turning the
+/// tool into an interrogation. A value above it is refused, never clamped
+/// (`context.md` §8).
+pub const MAX_QUESTIONS_PER_TURN_CEILING: u32 = 4;
 
 /// What the model supplies to `ask_user`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

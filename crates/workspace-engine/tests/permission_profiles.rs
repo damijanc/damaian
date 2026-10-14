@@ -109,6 +109,9 @@ fn the_preference_keys_are_exactly_spec_34s_free_keys() {
         "agent_max_tool_rounds",
         "agent_web_debug_max_tool_rounds",
         "agent_tool_retry_limit",
+        // Spec 50: asking widens no capability, and validation holds it under
+        // a hard ceiling (50 context.md §8).
+        "agent_max_questions_per_turn",
         // Spec 24: a root changes where an approved command runs, never
         // whether it needs approval (24 context.md §6).
         "project_roots_added",
@@ -501,6 +504,11 @@ fn every_preference_key_applies_from_repository_scope() {
             field: "agent_tool_retry_limit",
             repository: "agent_tool_retry_limit=1\n",
             applied: |c| c.agent_tool_retry_limit == 1,
+        },
+        PreferenceCase {
+            field: "agent_max_questions_per_turn",
+            repository: "agent_max_questions_per_turn=3\n",
+            applied: |c| c.agent_max_questions_per_turn == 3,
         },
         PreferenceCase {
             field: "project_roots_added",
@@ -2477,6 +2485,7 @@ const EVERY_PREFERENCE: &str = concat!(
     "agent_max_tool_rounds=4\n",
     "agent_web_debug_max_tool_rounds=6\n",
     "agent_tool_retry_limit=1\n",
+    "agent_max_questions_per_turn=3\n",
 );
 
 /// Every field a profile may carry, each with a narrowing value, plus the
