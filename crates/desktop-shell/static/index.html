@@ -83,28 +83,6 @@
               <h2 id="thread-session"></h2>
             </div>
             <div class="thread-actions">
-              <select
-                id="session-mode-select"
-                class="mode-select"
-                aria-label="Working mode"
-                title="Working mode: what the assistant may do in this session"
-                disabled
-              >
-                <option value="ask">Ask</option>
-                <option value="plan">Plan</option>
-                <option value="code" selected>Code</option>
-                <option value="review">Review</option>
-              </select>
-              <button
-                id="findings-toggle-btn"
-                class="topbar-button"
-                type="button"
-                aria-controls="findings-panel"
-                aria-expanded="false"
-                hidden
-              >
-                Findings
-              </button>
               <button
                 id="terminal-toggle-btn"
                 class="topbar-button terminal-button"
@@ -143,42 +121,79 @@
 
         <section id="chat-log" class="chat-log" aria-live="polite"></section>
 
-        <section id="findings-panel" class="findings-panel" aria-label="Findings" hidden>
-          <div class="findings-header">
-            <strong>Findings</strong>
-            <span id="findings-count" class="findings-count"></span>
-            <select
-              id="findings-severity-filter"
-              class="mode-select"
-              aria-label="Severity filter"
-            >
-              <option value="error" selected>Errors</option>
-              <option value="warning">Errors and warnings</option>
-              <option value="all">All severities</option>
-            </select>
-            <select id="findings-status-filter" class="mode-select" aria-label="Status filter">
-              <option value="open" selected>Open</option>
-              <option value="open_stale">Open and stale</option>
-              <option value="all">All statuses</option>
-            </select>
-            <button
-              id="findings-close-btn"
-              class="btn-icon"
-              type="button"
-              aria-label="Hide findings"
-            >
-              ×
-            </button>
-          </div>
-          <div id="findings-list" class="findings-list"></div>
-          <div class="findings-footer">
-            <button id="findings-fix-btn" class="btn-primary btn-sm" type="button" disabled>
-              Fix selected
-            </button>
-          </div>
-        </section>
-
         <footer class="composer">
+          <div id="repo-bar" class="repo-bar" hidden>
+            <div class="repo-bar-start">
+              <button
+                id="repo-folder-btn"
+                class="btn-trigger repo-folder-btn"
+                type="button"
+                aria-haspopup="menu"
+                aria-expanded="false"
+              >
+                <span class="folder-icon" aria-hidden="true"></span>
+                <span id="repo-folder-name" class="repo-folder-name"></span>
+                <span class="menu-caret" aria-hidden="true"></span>
+              </button>
+              <span id="repo-branch" class="repo-branch" hidden></span>
+            </div>
+            <div class="repo-bar-end">
+              <span id="repo-changes" class="repo-changes" hidden>
+                <span id="repo-insertions" class="repo-insertions"></span>
+                <span id="repo-deletions" class="repo-deletions"></span>
+              </span>
+              <div id="repo-action" class="repo-action" hidden>
+                <button id="repo-action-main" class="btn-sm repo-action-main" type="button"></button>
+                <button
+                  id="repo-action-more"
+                  class="btn-sm repo-action-more"
+                  type="button"
+                  aria-expanded="false"
+                >
+                  <span class="menu-caret" aria-hidden="true"></span>
+                </button>
+              </div>
+            </div>
+            <section
+              id="findings-panel"
+              class="model-popover findings-panel"
+              aria-label="Findings"
+              hidden
+            >
+              <div class="findings-header">
+                <strong>Findings</strong>
+                <span id="findings-count" class="findings-count"></span>
+                <select
+                  id="findings-severity-filter"
+                  class="mode-select"
+                  aria-label="Severity filter"
+                >
+                  <option value="error" selected>Errors</option>
+                  <option value="warning">Errors and warnings</option>
+                  <option value="all">All severities</option>
+                </select>
+                <select id="findings-status-filter" class="mode-select" aria-label="Status filter">
+                  <option value="open" selected>Open</option>
+                  <option value="open_stale">Open and stale</option>
+                  <option value="all">All statuses</option>
+                </select>
+                <button
+                  id="findings-close-btn"
+                  class="btn-icon"
+                  type="button"
+                  aria-label="Hide findings"
+                >
+                  ×
+                </button>
+              </div>
+              <div id="findings-list" class="findings-list"></div>
+              <div class="findings-footer">
+                <button id="findings-fix-btn" class="btn-primary btn-sm" type="button" disabled>
+                  Fix selected
+                </button>
+              </div>
+            </section>
+          </div>
           <div class="prompt-box">
             <div id="composer-context" class="composer-context" hidden>
               <div id="pinned-context-files" class="pinned-context-files"></div>
@@ -222,6 +237,18 @@
                 </button>
               </div>
             </div>
+            <button
+              id="session-mode-btn"
+              class="btn-trigger mode-trigger"
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded="false"
+              title="Working mode: what the assistant may do in this session"
+              disabled
+            >
+              <span id="session-mode-label">Code</span>
+              <span class="menu-caret" aria-hidden="true"></span>
+            </button>
             <div id="chat-model-menu" class="model-menu">
               <button
                 id="chat-model-menu-btn"

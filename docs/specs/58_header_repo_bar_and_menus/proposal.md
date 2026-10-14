@@ -1,6 +1,6 @@
 # Feature Spec: Header, Repo Bar and Menus
 
-Status: In progress. Specified 2026-10-13; Tasks 1–5 of 7 done 2026-10-13 (see `tasks.md`).
+Status: In progress. Specified 2026-10-13; Tasks 1–6 of 7 done by 2026-10-14 (see `tasks.md`).
 Order: 58 of 58
 Also in this spec: [`context.md`](context.md) (motivation, current state with
 file references, where the design came from), [`tasks.md`](tasks.md) (execution
