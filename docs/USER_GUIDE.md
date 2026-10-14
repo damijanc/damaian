@@ -9,7 +9,7 @@ This build is a developer preview. It is usable for local workflows and can offe
 1. Open `Damaian.app`.
 2. Select `+` beside `Projects`.
 3. Pick the local Git repository or working folder you want Damaian to inspect.
-4. Select the Visual Studio Code icon when you want to open the same folder in Visual Studio Code, or the terminal icon to open the bottom terminal panel.
+4. Use the conversation header's ⋮ menu, **Open in › VS Code**, when you want to open the same folder in Visual Studio Code, or the terminal icon beside it to open the bottom terminal panel.
 
 ## Updates
 
@@ -27,7 +27,18 @@ Select a project folder in the sidebar to switch the active working folder.
 
 Damaian remembers the project list and the last selected working folder in local app storage. The last folder is restored when the app restarts. Launch-time defaults such as `DAMAIAN_REPO` are used only when no previous selection has been saved.
 
-Use the Visual Studio Code icon in the conversation header to open the selected working folder in Visual Studio Code. Damaian keeps AI orchestration, context assembly, patch preview, settings, and audit logging in the app; normal code navigation and IDE work happen outside Damaian in Visual Studio Code.
+The conversation header holds only the session title, the terminal toggle and a ⋮ menu. The ⋮ menu's **Open in** submenu opens the selected working folder in **VS Code**, reveals it in **Finder**, or opens the **Terminal** panel there. Below it are **Rename session**, **Export as Markdown** and, last, **Delete session**, which asks for confirmation. Damaian keeps AI orchestration, context assembly, patch preview, settings, and audit logging in the app; normal code navigation and IDE work happen outside Damaian in Visual Studio Code.
+
+### The repo bar
+
+A strip directly above the prompt shows where the next turn will work:
+
+- **The folder button** names the working folder. It opens a menu: **Show in Finder**, **Open repository on GitHub**, **Copy path**, **Change folder…** (the same folder picker as the `+` beside `Projects`) and **Open in terminal**. **Open repository on GitHub** appears only when the folder's `origin` remote is on github.com. Damaian rebuilds the address as `https://github.com/<owner>/<repo>` from the remote rather than opening the remote's text as it stands, because a cloned repository controls that text.
+- **The branch** follows it in grey. On a detached HEAD it shows the short commit hash instead.
+- **The change count**, `+N −M` on the right, is the working tree's lines added and removed against the last commit, with new untracked text files counted as added lines. It is hidden when there is nothing to count. It is information only; clicking it does nothing yet.
+- **A contextual action** may appear at the far right. Today that is **Fix N errors** or **Fix N warnings** ([Findings](#fix-n-errors-and-the-findings-list)).
+
+In a folder that is not a Git repository, the bar shows the folder button alone, and its menu still works. The bar refreshes when you open a session, after every turn, after you apply or roll back a patch, after a rewind, and when you return to the window (at most once every five seconds). It never polls on a timer.
 
 ## Repository Roots
 
@@ -100,7 +111,7 @@ A repository's `.damaian/config.conf` can lower `repository_map_max_tokens` or s
 
 ## Terminal
 
-Use the terminal icon in the conversation header to show or hide the bottom terminal panel. The terminal opens in the selected working folder. If no folder is selected yet, it opens in your home directory.
+Use the terminal icon in the conversation header to show or hide the bottom terminal panel. **Open in › Terminal** in the header's ⋮ menu and **Open in terminal** in the repo bar's folder menu open the same panel. The terminal opens in the selected working folder. If no folder is selected yet, it opens in your home directory.
 
 Commands are entered manually by the user and run directly on the local machine. Use `cd` to change the panel's working directory, and `clear` to clear the panel output.
 
@@ -134,7 +145,15 @@ The decision is stored in your config rather than in the repository because Dama
 
 `Allow Always` is not offered for commands blocked by policy, for commands containing shell control syntax such as `|`, `&&`, or `>`, or when `require_approval_for_all_commands` is set — in each of those cases an allowlist entry would have no effect, so the app does not offer to write one.
 
-Sessions are shown under their project folder in the sidebar. Select an existing session to reload its conversation. Double-click a session to rename it, or use the `-` beside a session to delete it.
+Sessions are shown under their project folder in the sidebar. Select an existing session to reload its conversation. Each session has a ⋮ menu, shown on the open session and when you hover over or tab to a row, with **Rename**, **Export as Markdown** and **Delete** (which asks for confirmation). Double-clicking a session also renames it. The header's ⋮ menu offers the same three actions for the open session.
+
+### While a turn runs, and how it ended
+
+Progress is shown inside the reply, not in the header. While a turn runs, a line in the assistant's message shows what it is doing ("Waiting for model", a tool's own label, "Streaming", "round 2/8", or "Generating patch" for a file-change request), how long it has been running, and **Stop** when that kind of turn can be stopped. A chat message you send can be stopped. A turn that resumes after you approve a command, a plan or a fallback offer, and a patch being generated, show the line without Stop. When a turn finishes normally, the line disappears.
+
+A turn that ends any other way leaves a mark on its message: **Stopped by you**, **Tool budget exhausted**, **Token budget exhausted**, **Stopped before finishing**, or the error itself when the request failed. The stop and budget marks are still there when you reopen the session. **Stopped before finishing** and a failure's error are shown only in the window where the turn ran; after a reload, a stopped turn reads **Stopped by you** and a failed one has no mark.
+
+If the app cannot reach its own background service, a red banner above the conversation says **Desktop API unavailable**. It stays until a request succeeds again.
 
 Context file buttons open the referenced file in Visual Studio Code.
 
@@ -206,8 +225,12 @@ MCP tools are read-only only when their server says so. Most servers don't mark
 their tools at all, and an unmarked tool counts as able to change things, so it
 is only offered in Code.
 
-**Switching modes.** The mode control sits in the conversation header, next to
-the session's other actions. Pick a mode and it takes effect from the next turn.
+**Switching modes.** The mode is the pill below the prompt, after the `+`
+attach button and before the model, labelled with the current mode (**Code**,
+for example). Click it, or tab to it and press Enter, and pick a mode; the
+current one is marked **Current**. It takes effect from the next turn. If the
+change cannot be saved, the pill goes back to the mode still in force and the
+error is shown.
 A turn that is already running finishes in the mode it started with. The control
 is disabled until a session is open, and a new session starts in Code. No
 confirmation is asked in either direction. A plan made in Plan mode stays as it
@@ -526,9 +549,9 @@ A rewind never rewrites history you can audit. The conversation moves back by ap
 
 ## Search and Export
 
-The search button in the top bar opens a search box that finds text across the sessions of the current working folder; Escape, the button again, or a click elsewhere closes it. Type and matches appear live, each with the session title and a short snippet. Choosing one opens that session and scrolls to the matching message. Search is a plain text search — it is not code search and it is not semantic — and it defaults to the current folder, because a session from another folder can contain that folder's file contents. Search only ever reads the session log; it never changes a session.
+The search icon in the sidebar, beside the `+` next to `Projects`, opens a search box that finds text across the sessions of the current working folder; Escape, the button again, or a click elsewhere closes it. Type and matches appear live, each with the session title and a short snippet. Choosing one opens that session and scrolls to the matching message. Search is a plain text search — it is not code search and it is not semantic — and it defaults to the current folder, because a session from another folder can contain that folder's file contents. Search only ever reads the session log; it never changes a session.
 
-Each session in the folder list has an export button (↓) that saves the conversation as Markdown. Exports contain the title, the time range, the conversation in order, what each task came to, the plan steps and their evidence, and token and cost totals.
+**Export as Markdown**, in a session's ⋮ menu in the sidebar or in the conversation header's ⋮ menu for the open session, saves the conversation as Markdown. Exports contain the title, the time range, the conversation in order, what each task came to, the plan steps and their evidence, and token and cost totals.
 
 **Exports are redacted.** A session stores exactly what was said, so that a rewind can restore it faithfully; that same fidelity is why the stored log is not safe to copy out as-is. Every export runs the secret scanner over the conversation and states at the top how many secrets it removed. The number is not silently applied: if a transcript says it removed three secrets, three secrets were replaced with `[REDACTED_…]` and are not in the file. Searching finds a secret-shaped string without showing it — the snippet is redacted too.
 
@@ -825,21 +848,36 @@ or a whole check that failed in a way Damaian could not take apart. Findings
 come from the checks the assistant runs during a conversation and from its
 browser diagnostics. They belong to the session.
 
-### The Findings panel
+### Fix N errors, and the findings list
 
-A **Findings** button appears in the conversation's top bar once the session
-has any findings. Its label counts the open errors, for example
-**Findings 2**. Click it to open the panel above the composer.
+When the session has open findings, the [repo bar](#the-repo-bar) above the
+prompt offers to fix them. With open errors it reads **Fix 2 errors** (in red);
+with no open errors but open warnings, **Fix 1 warning** (in amber); otherwise
+there is no button. Pressing it starts one repair turn covering every open
+finding of that severity, exactly as if you had ticked them all and pressed
+**Fix selected** below. It is disabled while a turn is running.
 
-The panel groups findings by source (Compiler, Tests, Lint, Browser console,
+The chevron beside it opens the findings list, upward over the conversation.
+Escape, the chevron again, or a click elsewhere closes it. Opened from **Fix N
+warnings**, the list shows errors and warnings rather than only errors, so it
+is never empty.
+
+**The list is reachable only while there are open errors or warnings.** With
+nothing open (every finding dismissed, fixed, stale, or only informational)
+there is no button and no chevron, so a dismissed finding cannot be restored
+from the app until a check reports something new. The findings are still in
+the session; [TROUBLESHOOTING.md](TROUBLESHOOTING.md#findings) shows how to
+read them from the session log.
+
+The list groups findings by source (Compiler, Tests, Lint, Browser console,
 Network, Browser scenario, Unparsed checks), then by file. Two filters choose
 what is shown:
 
 - **Severity:** Errors (the default), Errors and warnings, or All severities.
 - **Status:** Open (the default), Open and stale, or All statuses.
 
-The default is open errors, because a panel that opens on forty warnings is a
-panel you close. "Showing 2 of 5" tells you how much the filters hide.
+The default is open errors, because a list that opens on forty warnings is a
+list you close. "Showing 2 of 5" tells you how much the filters hide.
 
 Each row shows the summary, the location when the tool reported one, and a
 collapsed **Details** with the tool's own excerpt. Click the location to open
@@ -849,7 +887,8 @@ finding whose tool gave no location has none. Damaian does not guess one.
 ### Dismiss and Restore
 
 **Dismiss** hides a finding you have decided not to act on. It stays in the
-session, and **Restore** (under the *All statuses* filter) brings it back.
+session, and **Restore** (under the *All statuses* filter) brings it back,
+as long as the list can still be opened (see above).
 Dismissing is not suppression: if a later check reports the same problem, it
 is a new finding and it appears again.
 

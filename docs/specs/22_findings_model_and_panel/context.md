@@ -872,7 +872,10 @@ line references are `crates/desktop-shell/static/…`.
   has no findings, so the chrome earns its pixels (§1) only when there is
   something to show. Its label carries the count of open errors, following
   §7's "the label carries a count". `.conversation`'s `grid-template-rows`
-  gains a row for it.
+  gains a row for it. *Placement superseded by
+  [#58](../58_header_repo_bar_and_menus/proposal.md): the toggle and the dock
+  row are gone; the panel is a popover opened from the repo bar's "Fix N
+  errors/warnings" chevron.*
 - **"Fix selected" must bypass the edit heuristic.** `sendChatPrompt`
   (`app.js:~6296`) sends any prompt that `looksLikeEditRequest` (`~6217`)
   matches to the one-shot `/api/propose-edit` patch flow. The repair prompt

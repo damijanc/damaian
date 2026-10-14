@@ -325,8 +325,26 @@
       <h2>Composer action row</h2>
       <p class="sg-hint">
         The standard footer control row: quiet triggers and glyphs left, the one filled action
-        right. Nothing is positioned over the field above it.
+        right. Nothing is positioned over the field above it. The working mode is the first
+        trigger after attach and carries the left group's <code>margin-right: auto</code>. The
+        repo bar sits directly above the prompt box; its states are in their own section further
+        down.
       </p>
+      <div class="repo-bar">
+        <div class="repo-bar-start">
+          <button type="button" class="btn-trigger repo-folder-btn" aria-haspopup="menu" aria-expanded="false" title="/Users/you/development/damaian-client">
+            <span class="folder-icon" aria-hidden="true"></span>
+            <span class="repo-folder-name">damaian-client</span>
+            <span class="menu-caret" aria-hidden="true"></span>
+          </button>
+          <span class="repo-branch">main</span>
+        </div>
+        <div class="repo-bar-end">
+          <span class="repo-changes">
+            <span class="repo-insertions">+128</span><span class="repo-deletions">−41</span>
+          </span>
+        </div>
+      </div>
       <div class="prompt-box">
         <textarea rows="2" placeholder="Ask a question or request a file change"></textarea>
       </div>
@@ -336,6 +354,10 @@
             <span class="attach-icon" aria-hidden="true"></span>
           </button>
         </div>
+        <button type="button" class="btn-trigger mode-trigger" aria-haspopup="menu" aria-expanded="false">
+          <span>Code</span>
+          <span class="menu-caret" aria-hidden="true"></span>
+        </button>
         <div class="model-menu">
           <button type="button" class="btn-trigger model-trigger" title="gpt-4.1">
             <span class="bolt-icon" aria-hidden="true"></span>
@@ -361,6 +383,10 @@
             <span class="attach-icon" aria-hidden="true"></span>
           </button>
         </div>
+        <button type="button" class="btn-trigger mode-trigger" aria-haspopup="menu" aria-expanded="false">
+          <span>Code</span>
+          <span class="menu-caret" aria-hidden="true"></span>
+        </button>
         <div class="model-menu">
           <button type="button" class="btn-trigger model-trigger" title="gpt-4.1">
             <span class="bolt-icon" aria-hidden="true"></span>
@@ -644,12 +670,12 @@
     <section class="sg-section">
       <h2>Findings panel</h2>
       <p class="sg-hint">
-        A session dock between the chat log and the composer, opened from a
-        <em>Findings n</em> toggle that is hidden while the session has none (spec 22). Grouped by
+        A popover opening upward from the repo bar, behind the contextual action's chevron (spec
+        58; it was a dock above the composer in spec 22). Grouped by
         source, then file; file paths truncate from the left. Only an open finding can be
         selected. A stale one keeps a disabled checkbox and says why. One filled action,
-        <em>Fix selected (n)</em>; Dismiss and Restore are quiet. In the app the panel is capped at
-        <code>min(320px, 36vh)</code> and its list scrolls; the cap is lifted here so both rows show.
+        <em>Fix selected (n)</em>; Dismiss and Restore are quiet. In the app the popover is capped at
+        <code>min(420px, 50vh)</code> and its list scrolls; the cap is lifted here so both rows show.
       </p>
       <div class="sg-card" style="padding: 0; overflow: hidden">
         <section class="findings-panel" aria-label="Findings" style="max-height: none">
@@ -786,9 +812,10 @@ error[E0308]: mismatched types
     <section class="sg-section">
       <h2>Overflow menu</h2>
       <p class="sg-hint">
-        Shown inline here for inspection. In the app it is a single shared
-        <code>position: fixed</code> popover on <code>document.body</code>, anchored to the
-        trigger's rect, because approval cards live inside the scrolling log.
+        Shown inline here for inspection. In the app it is a <code>createContextMenu</code>
+        instance: one <code>position: fixed</code> popover on <code>document.body</code>, anchored
+        to the trigger's rect, because approval cards live inside the scrolling log. Its rows add a
+        hint line under the label (<code>.approval-menu-row</code>).
       </p>
       <div class="context-menu-popover approval-menu-popover" style="position: static">
         <div class="context-menu-panel">
@@ -802,6 +829,150 @@ error[E0308]: mismatched types
           </button>
         </div>
       </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>⋮ menu</h2>
+      <p class="sg-hint">
+        One component for every menu (<code>createContextMenu</code>, guide §4): sections separated
+        by dividers, a drill-in panel with a back row instead of a fly-out, and the danger row last.
+        Shown inline here; in the app each is a <code>position: fixed</code> popover anchored to its
+        trigger, below it or flipped above. Tab onto a row to see its focus state; the arrow keys,
+        Escape and placement live in <code>app.js</code>, not on this page.
+      </p>
+      <div class="sg-pair">
+        <div>
+          <div class="sg-row">
+            <button type="button" class="btn-icon" aria-label="More options for this session" aria-haspopup="menu" aria-expanded="true"><span class="dots-icon" aria-hidden="true"></span></button>
+          </div>
+          <div class="context-menu-popover" role="menu" style="position: static; margin-top: 4px">
+            <div class="context-menu-panel">
+              <button type="button" class="context-menu-row" role="menuitem" aria-haspopup="menu">
+                <span>Open in</span><span class="context-menu-caret" aria-hidden="true"></span>
+              </button>
+              <div class="context-menu-divider" role="separator"></div>
+              <button type="button" class="context-menu-row" role="menuitem"><span>Rename session</span></button>
+              <button type="button" class="context-menu-row" role="menuitem"><span>Export as Markdown</span></button>
+              <div class="context-menu-divider" role="separator"></div>
+              <button type="button" class="context-menu-row context-menu-row-danger" role="menuitem"><span>Delete session</span></button>
+            </div>
+          </div>
+          <p class="sg-note">The thread header's ⋮: Open in first, danger last.</p>
+        </div>
+        <div>
+          <div class="context-menu-popover" role="menu" style="position: static; margin-top: 34px">
+            <div class="context-menu-panel">
+              <button type="button" class="context-menu-back" role="menuitem">Open in</button>
+              <button type="button" class="context-menu-row" role="menuitem"><span>VS Code</span></button>
+              <button type="button" class="context-menu-row" role="menuitem"><span>Finder</span></button>
+              <button type="button" class="context-menu-row" role="menuitem"><span>Terminal</span></button>
+            </div>
+          </div>
+          <p class="sg-note">Its Open in panel after drilling in. The back row names the panel.</p>
+        </div>
+        <div>
+          <div class="context-menu-popover repo-folder-menu" role="menu" style="position: static; margin-top: 34px">
+            <div class="context-menu-panel">
+              <button type="button" class="context-menu-row" role="menuitem"><span>Show in Finder</span></button>
+              <button type="button" class="context-menu-row" role="menuitem"><span>Open repository on GitHub</span></button>
+              <div class="context-menu-divider" role="separator"></div>
+              <button type="button" class="context-menu-row" role="menuitem"><span>Copy path</span></button>
+              <button type="button" class="context-menu-row" role="menuitem"><span>Change folder…</span></button>
+              <div class="context-menu-divider" role="separator"></div>
+              <button type="button" class="context-menu-row" role="menuitem"><span>Open in terminal</span></button>
+            </div>
+          </div>
+          <p class="sg-note">
+            The repo bar's folder menu, which opens above its trigger. The GitHub row is
+            <code>hidden</code> unless <code>origin</code> is on github.com.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>Repo bar</h2>
+      <p class="sg-hint">
+        Inside the composer, directly above the prompt box (guide §4). Folder button and branch
+        left; change count and the contextual-action slot right. The action is a split button,
+        tinted by <code>data-tone</code> and never filled: the send button stays the one filled
+        control. Its chevron opens the findings list as a popover upward from the bar. Shown in its
+        three action states.
+      </p>
+      <div style="display: grid; gap: 14px; max-width: 720px">
+        <div class="repo-bar">
+          <div class="repo-bar-start">
+            <button type="button" class="btn-trigger repo-folder-btn" aria-haspopup="menu" aria-expanded="false">
+              <span class="folder-icon" aria-hidden="true"></span>
+              <span class="repo-folder-name">damaian-client</span>
+              <span class="menu-caret" aria-hidden="true"></span>
+            </button>
+            <span class="repo-branch">main</span>
+          </div>
+          <div class="repo-bar-end">
+            <span class="repo-changes">
+              <span class="repo-insertions">+12,882</span><span class="repo-deletions">−416</span>
+            </span>
+            <div class="repo-action" data-tone="danger">
+              <button type="button" class="btn-sm repo-action-main">Fix 3 errors</button>
+              <button type="button" class="btn-sm repo-action-more" aria-label="Show findings" aria-expanded="false">
+                <span class="menu-caret" aria-hidden="true"></span>
+              </button>
+            </div>
+          </div>
+        </div>
+        <div class="repo-bar">
+          <div class="repo-bar-start">
+            <button type="button" class="btn-trigger repo-folder-btn" aria-haspopup="menu" aria-expanded="false">
+              <span class="folder-icon" aria-hidden="true"></span>
+              <span class="repo-folder-name">damaian-client</span>
+              <span class="menu-caret" aria-hidden="true"></span>
+            </button>
+            <span class="repo-branch" title="Detached HEAD at f36d9c3">f36d9c3</span>
+          </div>
+          <div class="repo-bar-end">
+            <span class="repo-changes">
+              <span class="repo-insertions">+6</span><span class="repo-deletions">−3</span>
+            </span>
+            <div class="repo-action" data-tone="warning">
+              <button type="button" class="btn-sm repo-action-main">Fix 1 warning</button>
+              <button type="button" class="btn-sm repo-action-more" aria-label="Show findings" aria-expanded="false">
+                <span class="menu-caret" aria-hidden="true"></span>
+              </button>
+            </div>
+          </div>
+        </div>
+        <div class="repo-bar">
+          <div class="repo-bar-start">
+            <button type="button" class="btn-trigger repo-folder-btn" aria-haspopup="menu" aria-expanded="false">
+              <span class="folder-icon" aria-hidden="true"></span>
+              <span class="repo-folder-name">damaian-client</span>
+              <span class="menu-caret" aria-hidden="true"></span>
+            </button>
+            <span class="repo-branch">feature/retry</span>
+          </div>
+          <div class="repo-bar-end">
+            <span class="repo-changes">
+              <span class="repo-insertions">+34</span><span class="repo-deletions">−6</span>
+            </span>
+            <div class="repo-action" hidden></div>
+          </div>
+        </div>
+        <div class="repo-bar">
+          <div class="repo-bar-start">
+            <button type="button" class="btn-trigger repo-folder-btn" aria-haspopup="menu" aria-expanded="false">
+              <span class="folder-icon" aria-hidden="true"></span>
+              <span class="repo-folder-name">scratch-notes</span>
+              <span class="menu-caret" aria-hidden="true"></span>
+            </button>
+          </div>
+        </div>
+      </div>
+      <p class="sg-note">
+        Open errors; then only warnings (here on a detached HEAD, shown as the short SHA); then
+        nothing to fix, so the slot is hidden. The last bar is a folder that is not a repository:
+        the folder button alone.
+      </p>
     </section>
 
     <section class="sg-section">

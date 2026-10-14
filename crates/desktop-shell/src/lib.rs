@@ -5410,7 +5410,9 @@ mod tests {
         println!("  recorded web diagnostic session = {diagnosed_session}");
         println!("    card header should read: {expected_card_header}");
         println!("  legacy web diagnostic session (regex thumbnails) = {legacy_session}");
-        println!("  findings session (toggle should read \"Findings 2\") = {findings_session}");
+        println!(
+            "  findings session (the composer's repo bar should offer \"Fix 2 errors\") = {findings_session}"
+        );
         println!("  data_dir = {}", data_dir.display());
         run_server(options).expect("serve the UI");
     }

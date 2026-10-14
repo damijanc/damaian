@@ -18,6 +18,8 @@ engine rather than trusted to the shell. Two new routes in
 `crates/desktop-shell/src/lib.rs` expose them; the thread header gains a search
 entry point and each session row an export button.
 
+> **Placement superseded by [#58](../58_header_repo_bar_and_menus/proposal.md):** the search button moved to the sidebar header, and export moved into the session row's ⋮ menu and the thread header's ⋮ menu.
+
 ## Global Constraints
 
 - **Read [`proposal.md`](proposal.md) §5 before starting.** §5.4 is the one that
