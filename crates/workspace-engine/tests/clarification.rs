@@ -7,16 +7,21 @@
 //! chat loop writes these yet.
 //!
 //! Task 2 pins the per-turn cap, `agent_max_questions_per_turn`.
+//!
+//! Task 3 pins where the tool is offered: only with a user present and a cap
+//! above zero, in every mode, and refused as a tool result anywhere else.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    ANSWER_MAX_CHARS, AskUserInput, Config, ConfigOverlay, MAX_QUESTIONS_PER_TURN_CEILING,
-    OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN, PendingApprovalRef, PendingDecision,
-    PendingQuestionRef, QUESTION_MAX_CHARS, RepositoryConfigReport, RepositoryKeyClass,
-    SessionStore, Task, TaskStatus, validate_answer,
+    ANSWER_MAX_CHARS, AskUserInput, CancelToken, ChatTurnOptions, ChatTurnResult, Config,
+    ConfigOverlay, MAX_QUESTIONS_PER_TURN_CEILING, MockModelAdapter, ModelAdapter,
+    ModelProviderConfig, OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN, PendingApprovalRef,
+    PendingDecision, PendingQuestionRef, QUESTION_MAX_CHARS, RepositoryConfigReport,
+    RepositoryKeyClass, SessionMode, SessionStore, Task, TaskStatus, ToolCall, TurnProgress,
+    TurnSink, WorkspaceEngine, validate_answer,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -640,4 +645,302 @@ fn a_profile_may_not_carry_the_cap() {
     assert_eq!(refused.len(), 1);
     assert_eq!(refused[0].key, "agent_max_questions_per_turn");
     assert_eq!(refused[0].class, RepositoryKeyClass::Forbidden);
+}
+
+// Task 3: `ask_user` is offered only where a user can answer it, and refused
+// as a tool result everywhere else. Nothing pauses yet; that is Task 4.
+
+fn temp_repo(name: &str) -> PathBuf {
+    let repo = temp_data_dir(&format!("repo-{name}"));
+    fs::write(repo.join("README.md"), "# Clarification test\n").expect("a file to read");
+    repo
+}
+
+/// The active provider with native tools on: `ask_user` is a native tool, and
+/// without them no tool list is sent at all.
+fn native_provider(id: &str) -> ModelProviderConfig {
+    ModelProviderConfig {
+        id: id.to_string(),
+        label: id.to_string(),
+        base_url: String::new(),
+        api_key_env: String::new(),
+        models: Vec::new(),
+        supports_native_tools: true,
+        max_output_tokens: None,
+        context_token_budget: None,
+        provider_reports_usage: true,
+        price_per_million_input_tokens: None,
+        price_per_million_output_tokens: None,
+        price_per_million_cached_input_tokens: None,
+        supports_explicit_cache_breakpoints: false,
+    }
+}
+
+fn engine_for(repo: &Path, max_questions: u32) -> WorkspaceEngine {
+    let mut config = Config {
+        data_dir: repo.join(".damaian"),
+        // Throwaway repository: a watcher would only cost FSEvents registration.
+        enable_index_watcher: false,
+        agent_max_questions_per_turn: max_questions,
+        ..Config::default()
+    };
+    config
+        .model_providers
+        .push(native_provider(&config.model_provider));
+    assert!(config.supports_native_tools());
+    WorkspaceEngine::new(config)
+}
+
+fn turn(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    session_id: Option<&str>,
+    user_present: bool,
+    adapter: &mut dyn ModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .ask_with_session_with_options(
+            repo,
+            "Clean this up.",
+            &[],
+            session_id,
+            adapter,
+            &mut sink,
+            ChatTurnOptions {
+                user_present,
+                ..ChatTurnOptions::default()
+            },
+        )
+        .expect("the turn should run")
+}
+
+/// The tool names the first model request of a turn offered, in a session set
+/// to `mode` beforehand.
+fn offered_tools(repo: &Path, mode: SessionMode, user_present: bool, cap: u32) -> Vec<String> {
+    let engine = engine_for(repo, cap);
+    let mut warm = MockModelAdapter::new("Ready.");
+    let session = turn(&engine, repo, None, user_present, &mut warm)
+        .session
+        .id;
+    engine
+        .session_store
+        .set_session_mode(&session, mode, "user")
+        .unwrap();
+    let mut adapter = MockModelAdapter::new("Done.");
+    turn(&engine, repo, Some(&session), user_present, &mut adapter);
+    adapter.requests[0]
+        .tools
+        .as_ref()
+        .expect("the default provider offers native tools")
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect()
+}
+
+fn ask_user_call(arguments_json: &str) -> ToolCall {
+    ToolCall {
+        id: "call_ask".to_string(),
+        name: "ask_user".to_string(),
+        arguments_json: arguments_json.to_string(),
+    }
+}
+
+const CLI_OR_SHELL_CALL: &str =
+    r#"{"question":"Did you mean the CLI or the shell?","options":["The CLI","The shell"]}"#;
+
+/// The model asks once, then answers in plain text.
+fn asks_then_answers(arguments_json: &str) -> MockModelAdapter {
+    MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Assuming the CLI.".to_string()],
+        vec![vec![ask_user_call(arguments_json)], Vec::new()],
+    )
+}
+
+fn tool_results(engine: &WorkspaceEngine, session_id: &str) -> Vec<String> {
+    engine
+        .session_store
+        .read_messages(session_id)
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.role == "tool")
+        .map(|message| message.content)
+        .collect()
+}
+
+#[test]
+fn ask_user_is_offered_when_a_user_is_present() {
+    let repo = temp_repo("offered");
+    let names = offered_tools(&repo, SessionMode::Code, true, 2);
+    let ask = names.iter().position(|name| name == "ask_user");
+    let complete = names.iter().position(|name| name == "complete_step");
+    assert!(ask.is_some(), "{names:?}");
+    assert_eq!(
+        ask,
+        complete.map(|index| index + 1),
+        "after complete_step: {names:?}"
+    );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn ask_user_is_not_offered_without_a_user() {
+    let repo = temp_repo("headless");
+    let names = offered_tools(&repo, SessionMode::Code, false, 2);
+    assert!(!names.iter().any(|name| name == "ask_user"), "{names:?}");
+    // The rest of the list is still there: this is not an empty offer.
+    assert!(names.iter().any(|name| name == "read_file"), "{names:?}");
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_cap_of_zero_means_ask_user_is_not_offered() {
+    let repo = temp_repo("cap-zero");
+    let names = offered_tools(&repo, SessionMode::Code, true, 0);
+    assert!(!names.iter().any(|name| name == "ask_user"), "{names:?}");
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn ask_user_is_offered_in_every_mode() {
+    for mode in [
+        SessionMode::Ask,
+        SessionMode::Plan,
+        SessionMode::Code,
+        SessionMode::Review,
+    ] {
+        let repo = temp_repo(mode.as_str());
+        let names = offered_tools(&repo, mode, true, 2);
+        assert!(
+            names.iter().any(|name| name == "ask_user"),
+            "{mode:?}: {names:?}"
+        );
+        fs::remove_dir_all(repo).unwrap();
+    }
+}
+
+#[test]
+fn an_unoffered_ask_user_call_is_refused_as_a_tool_result_and_the_turn_continues() {
+    let repo = temp_repo("unoffered");
+    let engine = engine_for(&repo, 2);
+    let mut adapter = asks_then_answers(CLI_OR_SHELL_CALL);
+    let result = turn(&engine, &repo, None, false, &mut adapter);
+
+    let results = tool_results(&engine, &result.session.id);
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].contains("No user can answer"), "{results:?}");
+    assert!(results[0].contains("assumption"), "{results:?}");
+    // The turn went on to a second model call and finished on its answer.
+    assert_eq!(adapter.requests.len(), 2);
+    assert_eq!(result.response, "Assuming the CLI.");
+    assert_eq!(result.task.status, TaskStatus::Complete);
+    assert!(
+        engine
+            .session_store
+            .pending_decision_for(&result.session.id, &result.task.id)
+            .unwrap()
+            .is_none()
+    );
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Until Task 4 builds the pause, an offered call is refused the same way, so
+/// nothing waits on an answer no route can deliver. Task 4 replaces this test.
+#[test]
+fn an_offered_ask_user_call_does_not_pause_yet() {
+    let repo = temp_repo("offered-no-pause");
+    let engine = engine_for(&repo, 2);
+    let mut adapter = asks_then_answers(CLI_OR_SHELL_CALL);
+    let result = turn(&engine, &repo, None, true, &mut adapter);
+
+    let results = tool_results(&engine, &result.session.id);
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].contains("No user can answer"), "{results:?}");
+    assert_eq!(result.task.status, TaskStatus::Complete);
+    assert!(result.command_proposal.is_none() && result.plan_proposal.is_none());
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn an_ask_user_call_over_a_bound_is_a_tool_error_naming_the_bound() {
+    let repo = temp_repo("over-bound");
+    let engine = engine_for(&repo, 2);
+    let long = "x".repeat(QUESTION_MAX_CHARS + 1);
+    let arguments = format!(r#"{{"question":"{long}","options":["a","b"]}}"#);
+    let mut adapter = asks_then_answers(&arguments);
+    let result = turn(&engine, &repo, None, true, &mut adapter);
+
+    let results = tool_results(&engine, &result.session.id);
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(
+        results[0].contains(&format!("the limit is {QUESTION_MAX_CHARS}")),
+        "{results:?}"
+    );
+    // A rejection, not a silent drop: the model was told and answered after.
+    assert_eq!(result.response, "Assuming the CLI.");
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn an_ask_user_call_with_malformed_arguments_is_a_tool_error_not_a_drop() {
+    let repo = temp_repo("malformed");
+    let engine = engine_for(&repo, 2);
+    let mut adapter = asks_then_answers(r#"{"question":"Which one?"}"#);
+    let result = turn(&engine, &repo, None, true, &mut adapter);
+
+    let results = tool_results(&engine, &result.session.id);
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(
+        results[0].contains("rejected before execution"),
+        "{results:?}"
+    );
+    assert!(results[0].contains("options"), "{results:?}");
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Spec 21 §5.5's gate holds back the first step that changes anything until
+/// the plan is reviewed. Asking changes nothing, so it must not raise a plan
+/// review: the turn has a plan, it is not yet approved, and the call goes
+/// through to its (for now, refusing) arm.
+#[test]
+fn asking_does_not_wait_for_plan_review() {
+    let repo = temp_repo("plan-gate");
+    let engine = engine_for(&repo, 2);
+    let plan = ToolCall {
+        id: "call_plan".to_string(),
+        name: "propose_plan".to_string(),
+        arguments_json: r#"{"steps":[{"title":"Look"},{"title":"Change"}]}"#.to_string(),
+    };
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            String::new(),
+            "Assuming the CLI.".to_string(),
+        ],
+        vec![
+            vec![plan],
+            vec![ask_user_call(CLI_OR_SHELL_CALL)],
+            Vec::new(),
+        ],
+    );
+    let result = turn(&engine, &repo, None, true, &mut adapter);
+
+    assert!(result.plan_proposal.is_none(), "{:?}", result.plan_proposal);
+    let results = tool_results(&engine, &result.session.id);
+    assert!(
+        results
+            .iter()
+            .any(|text| text.contains("No user can answer")),
+        "{results:?}"
+    );
+    fs::remove_dir_all(repo).unwrap();
 }

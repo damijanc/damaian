@@ -1718,6 +1718,10 @@ fn run_chat_request(
     };
     let turn_options = ChatTurnOptions {
         continue_debugging: form.get("continue_debugging").map(String::as_str) == Some("true"),
+        // Not yet: nothing can deliver an answer until spec 50's answer route
+        // exists, so offering `ask_user` here would only ever refuse it. Spec
+        // 50 Task 6 sets this to `true`.
+        user_present: false,
         ..ChatTurnOptions::default()
     };
     engine

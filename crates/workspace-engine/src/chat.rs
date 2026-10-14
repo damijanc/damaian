@@ -3,6 +3,9 @@ use crate::cancel::CancelToken;
 use crate::checkpoint::{
     CheckpointConversation, CheckpointRequest, CheckpointStore, CommandCensus, PendingApproval,
 };
+use crate::clarification::{
+    AskUserInput, OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN, QUESTION_MAX_CHARS,
+};
 use crate::command_policy::{CommandClassification, CommandRisk, allow_always_eligible};
 use crate::command_runner::{CommandExecution, CommandTermination};
 use crate::config::{Config, CostEstimate, McpTransport};
@@ -424,6 +427,13 @@ pub struct ChatTurnOptions {
     /// offer, which is the fail-closed direction, never cause a switch.
     #[serde(default)]
     pub provider_fallback_used: bool,
+    /// Someone can answer a question mid-turn (spec 50 `context.md` §4). Only
+    /// then is `ask_user` offered; otherwise the system prompt tells the model
+    /// to proceed under a stated assumption. It defaults to `false`, so a
+    /// driver that never sets it — the CLI, the eval harness, anything added
+    /// later — fails safe: nothing waits forever for an answer.
+    #[serde(default)]
+    pub user_present: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -824,7 +834,11 @@ impl ChatOrchestrator {
         let offer_handoffs = self.config.enable_worker_sessions
             && self.session_store.worker_record(&session.id)?.is_none();
         let messages = vec![
-            ModelMessage::system(system_prompt_for_session(mode, offer_handoffs)),
+            ModelMessage::system(system_prompt_for_session(
+                mode,
+                options.user_present,
+                offer_handoffs,
+            )),
             ModelMessage::user(model_prompt),
         ];
 
@@ -1722,6 +1736,25 @@ impl ChatOrchestrator {
         // The profile's capabilities are captured with it: this engine loaded
         // config when the turn began (spec 31 `context.md` §6).
         let capabilities = self.config.profile_capabilities();
+        // Spec 50 `context.md` §4: `ask_user` exists only where someone can
+        // answer it and the cap allows at least one question. A cap of 0 means
+        // "not offered", never "offered and always refused". Decided once, so
+        // the offer and Layer 3's refusal below cannot disagree.
+        let ask_user_offered = self.config.supports_native_tools()
+            && turn_options.user_present
+            && self.config.agent_max_questions_per_turn > 0
+            && permits(
+                mode,
+                &capabilities,
+                &ToolAction::AskUser(AskUserInput {
+                    question: String::new(),
+                    options: Vec::new(),
+                    allow_free_text: false,
+                }),
+                None,
+                None,
+            )
+            .is_allowed();
         let native_tools = self.config.supports_native_tools().then(|| {
             // `permits` decides per `ToolAction` variant, so each definition
             // is asked about a placeholder action of its kind — only the
@@ -1774,6 +1807,9 @@ impl ChatOrchestrator {
             if offered(&ToolAction::ProposePlan(Vec::new())) {
                 tools.push(propose_plan_tool_definition());
                 tools.push(complete_step_tool_definition());
+            }
+            if ask_user_offered {
+                tools.push(ask_user_tool_definition());
             }
             if offered(&ToolAction::ReadFile {
                 path: String::new(),
@@ -2602,6 +2638,15 @@ impl ChatOrchestrator {
                         error.to_string(),
                         ActionOutcome::Failed,
                     )
+                } else if matches!(tool_action, ToolAction::AskUser(_)) && !ask_user_offered {
+                    // Layer 3 for spec 50: a model that asks anyway, with
+                    // nobody to answer, is told to proceed rather than left
+                    // waiting on a reply that cannot come.
+                    (
+                        "Attempted to ask the user a question.".to_string(),
+                        NO_USER_CAN_ANSWER.to_string(),
+                        ActionOutcome::Failed,
+                    )
                 } else if action_is_batchable_read_only(&tool_action) {
                     match precomputed.as_ref() {
                         // Precomputed by the concurrent batch, indexed by the
@@ -3137,6 +3182,14 @@ impl ChatOrchestrator {
                                 };
                             (summary, content, outcome)
                         }
+                        // Nothing can deliver an answer until spec 50 Task 4 builds
+                        // the pause, so even an offered call is refused the same
+                        // way rather than waiting.
+                        ToolAction::AskUser(_) => (
+                            "Attempted to ask the user a question.".to_string(),
+                            NO_USER_CAN_ANSWER.to_string(),
+                            ActionOutcome::Failed,
+                        ),
                         other => {
                             unreachable!("read-only action reached the sequential match: {other:?}")
                         }
@@ -4065,8 +4118,12 @@ pub const WORKER_HANDOFF_PARAGRAPH: &str = "When work should continue in a separ
 /// [`system_prompt`] plus the handoff paragraph when the session is offered
 /// handoffs. `system_prompt` itself never changes, which is how the setting
 /// being off stays byte-for-byte off (spec 57 requirement 1).
-fn system_prompt_for_session(mode: SessionMode, offer_handoffs: bool) -> String {
-    let prompt = system_prompt(mode);
+fn system_prompt_for_session(
+    mode: SessionMode,
+    user_present: bool,
+    offer_handoffs: bool,
+) -> String {
+    let prompt = system_prompt(mode, user_present);
     if offer_handoffs {
         format!("{prompt}\n\n{WORKER_HANDOFF_PARAGRAPH}")
     } else {
@@ -4074,7 +4131,25 @@ fn system_prompt_for_session(mode: SessionMode, offer_handoffs: bool) -> String 
     }
 }
 
-fn system_prompt(mode: SessionMode) -> String {
+/// The tool result for an `ask_user` call nobody can answer.
+const NO_USER_CAN_ANSWER: &str = "No user can answer a question in this context, so the question was not asked. Proceed under an explicitly stated assumption, and say in your answer what you assumed and why.";
+
+/// What a turn with nobody to ask is told instead of being offered `ask_user`
+/// (spec 50 `context.md` §4). Where a user is present the prompt carries no
+/// word about asking: the tool's own description does that, and the prompt
+/// stays byte-identical to what it was before spec 50.
+const HEADLESS_PARAGRAPH: &str = "No user is available to answer questions during this task. Where the request is ambiguous, do not stop to ask: proceed under an explicitly stated assumption, and say in your answer what you assumed and why.";
+
+fn system_prompt(mode: SessionMode, user_present: bool) -> String {
+    let prompt = mode_system_prompt(mode);
+    if user_present {
+        prompt
+    } else {
+        format!("{prompt}\n\n{HEADLESS_PARAGRAPH}")
+    }
+}
+
+fn mode_system_prompt(mode: SessionMode) -> String {
     const PREFIX: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.";
     match mode {
         // Ask is reads-and-explanations only: no command envelope at all, so
@@ -4275,6 +4350,9 @@ pub(crate) enum ToolAction {
         tool_name: String,
         arguments_json: String,
     },
+    /// One bounded question for the user (spec 50). Already validated against
+    /// the bounds when it is decoded; not yet redacted.
+    AskUser(AskUserInput),
 }
 
 /// What dispatching a tool can change beyond its own result.
@@ -4307,7 +4385,10 @@ fn action_effect(action: &ToolAction) -> ActionEffect {
         ToolAction::ProposePatch(_)
         | ToolAction::ProposePlan(_)
         | ToolAction::CompleteStep
-        | ToolAction::EditFile { .. } => ActionEffect::ShapesTurn,
+        | ToolAction::EditFile { .. }
+        // Writes only the session log, and waits on the user rather than
+        // running beside another call (spec 50 Task 4 pauses the turn here).
+        | ToolAction::AskUser(_) => ActionEffect::ShapesTurn,
         ToolAction::ReadFile { .. }
         | ToolAction::ListDirectory { .. }
         | ToolAction::SearchContent { .. }
@@ -4342,6 +4423,9 @@ fn tool_action_marker(action: &ToolAction) -> (&'static str, String, bool) {
         ToolAction::ProposePatch(edit) => ("propose_patch", edit.summary.clone(), side_effecting),
         ToolAction::ProposePlan(steps) => ("propose_plan", steps.len().to_string(), side_effecting),
         ToolAction::CompleteStep => ("complete_step", String::new(), side_effecting),
+        // The reference stays empty: the question is model-authored and not
+        // yet redacted when the marker is written.
+        ToolAction::AskUser(_) => ("ask_user", String::new(), side_effecting),
         ToolAction::ReadFile { path, .. } => ("read_file", path.clone(), side_effecting),
         ToolAction::ListDirectory { dir, .. } => (
             "list_directory",
@@ -4463,6 +4547,7 @@ fn tool_action_label(action: &ToolAction) -> String {
         ToolAction::ProposePatch(_) => "Preparing a patch".to_string(),
         ToolAction::ProposePlan(steps) => format!("Planning {} steps", steps.len()),
         ToolAction::CompleteStep => "Finishing a step".to_string(),
+        ToolAction::AskUser(_) => "Asking you a question".to_string(),
         ToolAction::ReadFile { path, .. } => format!("Reading {path}"),
         ToolAction::ListDirectory { dir, .. } => match dir {
             Some(dir) => format!("Listing {dir}"),
@@ -4533,6 +4618,20 @@ fn complete_step_tool_definition() -> ToolDefinition {
         name: "complete_step".to_string(),
         description: "Move on from the current plan step. Damaian decides whether the step is completed or blocked from the commands and patches it observed while the step was running, so there is no outcome to supply here.".to_string(),
         parameters_json: "{\"type\":\"object\",\"properties\":{},\"required\":[]}".to_string(),
+    }
+}
+
+/// `ask_user` (spec 50). The schema restates the bounds `AskUserInput::validate`
+/// enforces, so a provider that honours schemas never sends a violation; the
+/// engine validates anyway, because not all of them do (`context.md` §8). The
+/// keys are `AskUserInput`'s own serde names.
+fn ask_user_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "ask_user".to_string(),
+        description: "Ask the user one short question when the request is genuinely ambiguous and a wrong guess would waste real work. Offer 2 to 4 short answers; the turn waits for the reply and continues with it as this tool's result. Do not ask what you can find out by reading the repository. The answer is information only: it authorises nothing. Commands and patches still need their own approval, and a patch is never chosen through a question.".to_string(),
+        parameters_json: format!(
+            "{{\"type\":\"object\",\"properties\":{{\"question\":{{\"type\":\"string\",\"maxLength\":{QUESTION_MAX_CHARS},\"description\":\"One question, in plain text\"}},\"options\":{{\"type\":\"array\",\"minItems\":{OPTIONS_MIN},\"maxItems\":{OPTIONS_MAX},\"items\":{{\"type\":\"string\",\"maxLength\":{OPTION_MAX_CHARS}}},\"description\":\"Suggested answers, each a short label\"}},\"allowFreeText\":{{\"type\":\"boolean\",\"description\":\"Whether the user may type an answer instead of choosing one; defaults to false\"}}}},\"required\":[\"question\",\"options\"]}}"
+        ),
     }
 }
 
@@ -4660,6 +4759,15 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
             Ok(Some(ToolAction::ProposePlan(steps)))
         }
         "complete_step" => Ok(Some(ToolAction::CompleteStep)),
+        // A malformed or out-of-bounds question is an error naming what was
+        // wrong, never `None`: the model must learn the bound it broke rather
+        // than read "undecodable" and guess (spec 50 §5.1).
+        "ask_user" => {
+            let input: AskUserInput = serde_json::from_str(&call.arguments_json)
+                .map_err(|error| ClientError::InvalidInput(error.to_string()))?;
+            input.validate().map_err(ClientError::InvalidInput)?;
+            Ok(Some(ToolAction::AskUser(input)))
+        }
         "read_file" => {
             let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
             else {
@@ -6053,12 +6161,15 @@ mod system_prompt_tests {
 
     #[test]
     fn code_mode_system_prompt_is_byte_identical_to_todays() {
-        assert_eq!(system_prompt(SessionMode::Code), TODAYS_CODE_SYSTEM_PROMPT);
+        assert_eq!(
+            system_prompt(SessionMode::Code, true),
+            TODAYS_CODE_SYSTEM_PROMPT
+        );
     }
 
     #[test]
     fn ask_mode_system_prompt_has_no_command_envelope() {
-        let prompt = system_prompt(SessionMode::Ask);
+        let prompt = system_prompt(SessionMode::Ask, true);
         assert!(
             !prompt.contains("DAMAIAN_COMMAND_V1"),
             "Ask must teach no command envelope at all: {prompt}"
@@ -6071,7 +6182,7 @@ mod system_prompt_tests {
 
     #[test]
     fn plan_mode_system_prompt_keeps_the_envelope_with_restricted_wording() {
-        let prompt = system_prompt(SessionMode::Plan);
+        let prompt = system_prompt(SessionMode::Plan, true);
         assert!(
             prompt.contains("DAMAIAN_COMMAND_V1"),
             "Plan still offers read-only commands, so the envelope stays: {prompt}"
@@ -6086,8 +6197,8 @@ mod system_prompt_tests {
     #[test]
     fn review_mode_system_prompt_matches_plan_modes_restricted_wording() {
         assert_eq!(
-            system_prompt(SessionMode::Review),
-            system_prompt(SessionMode::Plan),
+            system_prompt(SessionMode::Review, true),
+            system_prompt(SessionMode::Plan, true),
             "Review's command capability is identical to Plan's"
         );
     }
@@ -6102,7 +6213,7 @@ mod system_prompt_tests {
                 .join("\n\n")
         }
 
-        let ask = system_prompt(SessionMode::Ask);
+        let ask = system_prompt(SessionMode::Ask, true);
         assert_eq!(
             first_two_paragraphs(&ask),
             ask,
@@ -6116,7 +6227,7 @@ mod system_prompt_tests {
             SessionMode::Review,
         ] {
             assert_eq!(
-                first_two_paragraphs(&system_prompt(mode)),
+                first_two_paragraphs(&system_prompt(mode, true)),
                 ask,
                 "only the third paragraph may vary with mode; {mode:?} changed the prefix"
             );
@@ -6124,7 +6235,7 @@ mod system_prompt_tests {
 
         for mode in [SessionMode::Plan, SessionMode::Code, SessionMode::Review] {
             assert!(
-                system_prompt(mode).len() > ask.len(),
+                system_prompt(mode, true).len() > ask.len(),
                 "{mode:?} keeps a mode-dependent third paragraph"
             );
         }
@@ -6157,22 +6268,26 @@ mod worker_handoff_tests {
         assert_eq!(WORKER_HANDOFF_PARAGRAPH, from_the_spec);
 
         for mode in ALL_MODES {
-            assert_eq!(
-                system_prompt_for_session(mode, true),
-                format!("{}\n\n{from_the_spec}", system_prompt(mode)),
-                "{mode:?}"
-            );
+            for user_present in [true, false] {
+                assert_eq!(
+                    system_prompt_for_session(mode, user_present, true),
+                    format!("{}\n\n{from_the_spec}", system_prompt(mode, user_present)),
+                    "{mode:?}"
+                );
+            }
         }
     }
 
     #[test]
     fn no_mode_changes_when_handoffs_are_not_offered() {
         for mode in ALL_MODES {
-            assert_eq!(
-                system_prompt_for_session(mode, false),
-                system_prompt(mode),
-                "{mode:?}"
-            );
+            for user_present in [true, false] {
+                assert_eq!(
+                    system_prompt_for_session(mode, user_present, false),
+                    system_prompt(mode, user_present),
+                    "{mode:?}"
+                );
+            }
         }
     }
 
@@ -6282,9 +6397,121 @@ mod worker_handoff_tests {
             "a worker must not be invited to hand off: {}",
             system_message(&adapter)
         );
-        assert_eq!(system_message(&adapter), system_prompt(SessionMode::Code));
+        assert_eq!(
+            system_message(&adapter),
+            system_prompt(SessionMode::Code, false)
+        );
 
         fs::remove_dir_all(repo).unwrap();
+    }
+}
+
+/// Spec 50 (`docs/specs/50_model_initiated_clarification`): the parts of
+/// offering `ask_user` that need `chat.rs`-private items. Engine-level tests
+/// live in `tests/clarification.rs`.
+#[cfg(test)]
+mod clarification_tests {
+    use super::*;
+    use crate::mode::SessionMode;
+
+    // The four prompts exactly as `system_prompt` produced them before spec
+    // 50, copied from the live source. Where a user is present the prompt must
+    // not move by a byte: the tool's own description carries its guidance,
+    // and spec 49's cache prefix depends on `messages[0]` staying put.
+    const PREFIX_BEFORE_SPEC_50: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.";
+    const CODE_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.";
+    const READ_ONLY_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. In this mode only read-only commands that need no approval are available; a command with side effects, network access, Docker access, shell control, or unknown risk is refused outright, not queued for approval. Do not request one.";
+
+    fn prompt_before_spec_50(mode: SessionMode) -> String {
+        match mode {
+            SessionMode::Ask => PREFIX_BEFORE_SPEC_50.to_string(),
+            SessionMode::Code => {
+                format!("{PREFIX_BEFORE_SPEC_50}\n\n{CODE_PARAGRAPH_BEFORE_SPEC_50}")
+            }
+            SessionMode::Plan | SessionMode::Review => {
+                format!("{PREFIX_BEFORE_SPEC_50}\n\n{READ_ONLY_PARAGRAPH_BEFORE_SPEC_50}")
+            }
+        }
+    }
+
+    const ALL_MODES: [SessionMode; 4] = [
+        SessionMode::Ask,
+        SessionMode::Plan,
+        SessionMode::Code,
+        SessionMode::Review,
+    ];
+
+    #[test]
+    fn with_a_user_present_every_modes_prompt_is_byte_identical_to_before() {
+        for mode in ALL_MODES {
+            assert_eq!(
+                system_prompt(mode, true),
+                prompt_before_spec_50(mode),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_user_the_prompt_gains_only_the_headless_paragraph() {
+        assert!(HEADLESS_PARAGRAPH.contains("assumption"));
+        for mode in ALL_MODES {
+            assert_eq!(
+                system_prompt(mode, false),
+                format!("{}\n\n{HEADLESS_PARAGRAPH}", prompt_before_spec_50(mode)),
+                "{mode:?}"
+            );
+        }
+    }
+
+    fn cli_or_shell() -> ToolAction {
+        ToolAction::AskUser(AskUserInput {
+            question: "Did you mean the CLI or the shell?".to_string(),
+            options: vec!["The CLI".to_string(), "The shell".to_string()],
+            allow_free_text: false,
+        })
+    }
+
+    /// Asking writes nothing outside the session log and is never run beside
+    /// another call: it can end the turn's progress until answered (Task 4).
+    #[test]
+    fn asking_shapes_the_turn_and_has_no_side_effect() {
+        let action = cli_or_shell();
+        assert_eq!(action_effect(&action), ActionEffect::ShapesTurn);
+        assert!(!action_is_batchable_read_only(&action));
+        assert_eq!(tool_action_marker(&action).0, "ask_user");
+        assert!(!tool_action_marker(&action).2);
+    }
+
+    /// An answer authorises nothing, so asking is not a step that changes
+    /// anything and must not raise spec 21's plan review.
+    #[test]
+    fn asking_never_awaits_plan_review() {
+        assert!(!action_awaits_plan_review(&cli_or_shell(), |_| true));
+    }
+
+    #[test]
+    fn the_definition_restates_the_bounds() {
+        let definition = ask_user_tool_definition();
+        let schema: serde_json::Value = serde_json::from_str(&definition.parameters_json).unwrap();
+        let properties = &schema["properties"];
+        assert_eq!(properties["question"]["maxLength"], QUESTION_MAX_CHARS);
+        assert_eq!(properties["options"]["minItems"], OPTIONS_MIN);
+        assert_eq!(properties["options"]["maxItems"], OPTIONS_MAX);
+        assert_eq!(
+            properties["options"]["items"]["maxLength"],
+            OPTION_MAX_CHARS
+        );
+        // The schema's keys are the ones the parser reads.
+        let parsed: AskUserInput = serde_json::from_value(serde_json::json!({
+            "question": "Which?",
+            "options": ["a", "b"],
+            "allowFreeText": true,
+        }))
+        .unwrap();
+        assert!(parsed.allow_free_text);
+        assert!(properties.get("allowFreeText").is_some());
+        assert!(definition.description.contains("authorises nothing"));
     }
 }
 

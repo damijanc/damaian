@@ -168,7 +168,10 @@ pub(crate) fn profile_permits(
         | ToolAction::ReadGitStatus
         | ToolAction::ReadGitDiff { .. }
         | ToolAction::ProposePlan(_)
-        | ToolAction::CompleteStep => None,
+        | ToolAction::CompleteStep
+        // No capability key covers asking: it reads nothing, writes nothing
+        // outside the session log, and its answer authorises nothing.
+        | ToolAction::AskUser(_) => None,
         ToolAction::ProposePatch(_) | ToolAction::EditFile { .. } => {
             (!capabilities.allow_file_edits).then_some(ProfileLimit::FileEdits)
         }
@@ -240,6 +243,10 @@ pub(crate) fn mode_permits(
         | ToolAction::SearchCodebase { .. }
         | ToolAction::ReadGitStatus
         | ToolAction::ReadGitDiff { .. } => Permission::Allowed,
+
+        // Spec 50: asking is allowed in every mode. Whether anyone can answer
+        // narrows the offer in `chat.rs`; it never widens a mode.
+        ToolAction::AskUser(_) => Permission::Allowed,
 
         ToolAction::ProposePatch(_) | ToolAction::EditFile { .. } => {
             if mode == Code {
@@ -508,6 +515,20 @@ mod tests {
                 None,
                 None,
                 [F, T, T, F],
+                [T, T, T, T],
+            ),
+            // Spec 50: asking is offered in every mode and under every
+            // profile. Whether a user is present narrows the offer in
+            // `chat.rs`, never here.
+            (
+                ToolAction::AskUser(crate::clarification::AskUserInput {
+                    question: "x".into(),
+                    options: vec!["a".into(), "b".into()],
+                    allow_free_text: false,
+                }),
+                None,
+                None,
+                [T, T, T, T],
                 [T, T, T, T],
             ),
             (
