@@ -94,6 +94,7 @@ pub use hash::repository_id_for_root;
 pub use hooks::{HookEnvelope, HookFailureKind, HookFinding, HookResponse};
 pub use index_cache::IndexCache;
 pub use indexer::{ProjectIndexer, RepositoryIndex, SearchResult};
+pub use language::{Declaration, SymbolKind, extract_declarations};
 pub use mcp::{
     McpClient, McpRuntime, McpServerRuntime, McpTool, McpToolResult, namespaced_tool_name,
     parse_namespaced_tool_name,

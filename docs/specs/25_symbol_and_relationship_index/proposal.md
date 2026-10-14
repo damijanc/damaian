@@ -1,6 +1,7 @@
 # Feature Spec: Symbol and Relationship Index
 
-Status: Not started. Split into a folder and planned on 2026-10-09, re-checked
+Status: In progress. Task 1 of 11 done (started 2026-10-13); see
+[`tasks.md`](tasks.md). Split into a folder and planned on 2026-10-09, re-checked
 against `main` on 2026-10-12. Design unchanged from the original flat spec. Corrections where it no
 longer matches the code are in [`context.md`](context.md), not inlined here,
 the way specs 22, 24 and 31 kept theirs. The most important ones:

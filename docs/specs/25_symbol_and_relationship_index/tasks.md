@@ -5,13 +5,13 @@
 **Implements:** [`proposal.md`](proposal.md), except the three `chat.rs` items
 [`context.md`](context.md) §12 defers · corrections and the decisions it left
 open in [`context.md`](context.md)
-**Started:** not yet (planned 2026-10-09)
+**Started:** 2026-10-13 (planned 2026-10-09)
 
 ## Progress
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · Structured heuristic declarations | Not started | |
+| 1 · Structured heuristic declarations | Done 2026-10-14 | **Landed:** `SymbolKind` (serde, `snake_case`), `Declaration` and `extract_declarations` in `language.rs`, re-exported from `lib.rs`; `extract_symbols` is now the deduplicated names of `extract_declarations`, and `indexer.rs` is unchanged. A per-language mask blanks comments and strings, carried across lines: line comments, block comments (nested for Rust and Kotlin), `"`/`'`/`` ` `` strings, Python `"""`/`'''`, Java and Kotlin `"""`, Rust raw strings, and Rust char literals told apart from lifetimes. Matching runs on the masked line and keeps its columns. Fixtures are in `tests/fixtures/symbols/`, one per language. Their tables in `tests/symbol_index.rs` record every declaration as `Found`, `Missed`, `Inexact` (right name, wrong kind or container) or `FalsePositive`. Remaining gaps are pinned, not left out. **Accuracy, by name** (true = distinct true names, extra = names that are not declarations). **Before** (Step 2, today's `extract_symbols`): rust 11/22 found, 4 extra, P 0.73 R 0.50 · typescript 8/12, 5 extra, P 0.62 R 0.67 · javascript 8/10, 5 extra, P 0.62 R 0.80 · python 4/6, 3 extra, P 0.57 R 0.67 · go 4/7, 2 extra, P 0.67 R 0.57 · java 1/4, 2 extra, P 0.33 R 0.25 · kotlin 3/5, 2 extra, P 0.60 R 0.60 · php 3/4, 2 extra, P 0.60 R 0.75. After that run, the Rust fixture gained a `macro_rules!` body, which the old `fn ` prefix also matches. Against the final fixture, Rust before is therefore 11/22, 5 extra, P 0.69 R 0.50 (derived, not re-run). **After** (Step 5): rust 22/22, 1 extra, P 0.96 R 1.00 · typescript 8/12, 0 extra, P 1.00 R 0.67 · javascript 8/10, 0, P 1.00 R 0.80 · python 4/6, 0, P 1.00 R 0.67 · go 4/7, 0, P 1.00 R 0.57 · java 1/4, 0, P 1.00 R 0.25 · kotlin 3/5, 0, P 1.00 R 0.60 · php 3/4, 0, P 1.00 R 0.75. Every found Rust declaration has the right kind, line and container. Python, Kotlin and PHP methods are found by name but recorded as `Function` with no container (`Inexact`), because only Rust tracks containers. **For proposal §7:** comment and string skipping took precision to 1.00 in every language. The Rust changes moved Rust recall materially, 0.50 → 1.00, through visibility, qualifiers, the new keywords and `impl` tracking. Recall in the other languages did not move. Their remaining misses are prefix gaps, not parsing problems: modifiers (`public class`, `private fun`, `data class`), `async def`/`async function`, TS `type`/`enum`, Go receivers, and class methods. **Tests:** `symbol_index` 12/12; `language.rs` unit tests 4/4; workspace-engine `--lib` + `semantic_search` + `repository_map` + `symbol_index`: 465 passed, 4 skipped; `cargo fmt --check`, `cargo clippy -p workspace-engine --all-targets -D warnings` and `typos` clean. Deterministic eval tier: all 16 scenarios pass. Tokens are 108,592 against 107,345 for the same tree with HEAD's `language.rs` (+1,247, +1.2%). That comes from keyword scoring seeing different names. `evals/baseline.json`'s 101,963 (2026-09-18) predates other specs' drift. **Mutations** (each failed, then reverted): block comments not skipped → 7 fixture tests and the column test fail; `impl`/`trait` containers not pushed → rust fixture fails; JS depth check off → TS and JS fixtures fail; `extract_symbols` not deduplicated → the equality test (and the accuracy test's sanity assert) fail; raw strings not recognised → rust fixture fails; char literals not recognised → rust fixture fails. The raw-string fixture held an even number of quotes, so a plain `"` scanner masked the same lines. It now holds one quote, which makes the raw-string mutation fail. **Deviations:** a Rust `trait` body is a container too (`fn put` in `trait Store` → `Method`, container `Store`), because rust-analyzer reports trait methods under the trait and Task 6 merges against that. Associated `const`/`type` inside an `impl` or `trait` get the container. `static` maps to `Variable` and `mod` to `Module`. Go `type` takes its kind from what follows (`struct` → `Struct`, `interface` → `Interface`, otherwise `Type`). A declaration after an inline block comment (`/* x */ fn y`) now matches. **Known limits, for later tasks:** a `fn` inside a `macro_rules!` body is still a declaration (pinned as `FalsePositive`, name `$name`); JS regex literals, PHP heredocs and PHP `#[…]` attributes are not lexed; only Rust tracks containers. |
 | 2 · `SymbolIndex::build`: symbols, relations, lookup | Not started | |
 | 3 · Persistence, rebuild reporting, engine API, CLI | Not started | |
 | 4 · LSP framing and protocol, without a process | Not started | |
@@ -242,7 +242,7 @@ pub fn extract_declarations(content: &str, language: &str) -> Vec<Declaration>;
 re-exported. Task 2 moves nothing. It gains `#[derive(Serialize, Deserialize)]`
 with `rename_all = "snake_case"` here, so Task 3 does not touch it.
 
-- [ ] **Step 1: Write the accuracy fixtures first.** One file per language
+- [x] **Step 1: Write the accuracy fixtures first.** One file per language
   (`rust.rs`, `typescript.ts`, `javascript.js`, `python.py`, `go.go`,
   `java.java`, `kotlin.kt`, `php.php`). Each holds the declarations
   `extract_symbols` finds today, plus the known misses and false positives:
@@ -252,16 +252,16 @@ with `rename_all = "snake_case"` here, so Task 3 does not touch it.
   `trait`, `type` and `const`; for JS/TS, a `const` local inside a function
   body. Each fixture has an expected list `(name, kind, line, container)`
   beside it as a Rust table in the test.
-- [ ] **Step 2: Record the "before" accuracy.** Run today's `extract_symbols`
+- [x] **Step 2: Record the "before" accuracy.** Run today's `extract_symbols`
   over each fixture. Record, per language, how many expected names it found,
   how many it found that are not expected, and the precision and recall. This
   is proposal §7's "before" number. Record it in the progress row now, because
   Step 4 destroys it.
-- [ ] **Step 3: Write the failing tests** in `tests/symbol_index.rs`: each
+- [x] **Step 3: Write the failing tests** in `tests/symbol_index.rs`: each
   fixture's expected list equals `extract_declarations`' output. Also, for
   every fixture, `extract_symbols` equals the deduplicated names of
   `extract_declarations`, which pins Task 1's "no caller changes" claim.
-- [ ] **Step 4: Implement** `extract_declarations`:
+- [x] **Step 4: Implement** `extract_declarations`:
   - a per-language lexical state carried across lines: in a line comment, in
     a block comment (`/* */`, Python `"""` docstrings), or in a string (`"`,
     `'`, `` ` ``, Rust `r#"…"#`). Declaration matching runs only on code
@@ -276,19 +276,19 @@ with `rename_all = "snake_case"` here, so Task 3 does not touch it.
   - JS/TS: `const`/`let` count only at brace depth 0, so locals are not
     declarations;
   - `extract_symbols` becomes `dedupe(names of extract_declarations)`.
-- [ ] **Step 5: Record the "after" accuracy** in the same form as Step 2. If
+- [x] **Step 5: Record the "after" accuracy** in the same form as Step 2. If
   comment skipping and `impl` handling do not move Rust materially, say so
   (proposal §7).
-- [ ] **Step 6: Scoped checks.**
+- [x] **Step 6: Scoped checks.**
   `CARGO_TARGET_DIR="$PWD/target" cargo nextest run -p workspace-engine --test symbol_index --locked`,
   the `language.rs` unit tests, `cargo fmt --all -- --check`,
   `CARGO_TARGET_DIR="$PWD/target" cargo clippy -p workspace-engine --all-targets --locked -- -D warnings`
   and `typos`.
-- [ ] **Step 7: Falsify.** At least: comment skipping off (the comment
+- [x] **Step 7: Falsify.** At least: comment skipping off (the comment
   fixture fails); `impl` tracking off (the method has no container);
   brace-depth check off for JS (the local appears); `extract_symbols` not
   deduplicated (the equality test fails).
-- [ ] **Step 8: Update the progress row, show the change, and ask before
+- [x] **Step 8: Update the progress row, show the change, and ask before
   committing.**
 
 ## Task 2: `SymbolIndex::build`: symbols, relations, lookup
