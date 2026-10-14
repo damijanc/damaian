@@ -5,7 +5,7 @@ was walked in the running app on the inspection harness, by keyboard where it
 says so: every ⋮ menu is one component, the header holds title, terminal and ⋮,
 the repo bar matched `git diff --numstat HEAD` on this repository, and Open on
 GitHub opened `https://github.com/damijanc/damaian` from the parsed `origin`.
-The full seven-check gate deferred to CI at the user's request on 2026-10-14; scoped checks passed locally: `cargo fmt --all -- --check`, `node --check crates/desktop-shell/static/app.js`, `npm run lint:web`, `typos` and `npm run specs:check`. Task 7's only Rust change is one `println!` string in the ignored inspection harness; it compiled in an interrupted local `cargo nextest run --workspace`, whose one reported failure was in a `hooks` test outside spec 58 and was not investigated.
+The full seven-check gate passed in CI on 2026-10-14; it was run there rather than locally at the user's request. Scoped checks also passed locally: `cargo fmt --all -- --check`, `node --check crates/desktop-shell/static/app.js`, `npm run lint:web`, `typos` and `npm run specs:check`. An interrupted local `cargo nextest run --workspace` had reported one failure in a `hooks` test outside spec 58; CI did not reproduce it.
 Deviations and limits are in `tasks.md` (Result
 and the progress rows). Two marks are live-only: "Stopped before finishing" and
 a failed turn's error do not survive a reload. The findings list can be opened
