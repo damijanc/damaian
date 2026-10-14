@@ -291,6 +291,8 @@ The active mode appears in the conversation header as a control, always visible 
 not in a settings panel. Switching to a more permissive mode is an explicit
 selection; switching to a more restrictive one needs no confirmation.
 
+> **Placement superseded by [#58](../58_header_repo_bar_and_menus/proposal.md):** the mode control is now a pill in the composer's action row, with the same behaviour.
+
 Moving from Plan to Code is the common transition and the one worth making
 smooth: a plan produced in Plan mode stays intact when the user switches to Code
 to execute it ([spec 21](../21_task_plan_progress_and_budget/proposal.md) owns the plan).
@@ -389,7 +391,9 @@ re-reading those rows.
   `POST /api/session-mode`, and `"mode"` on the single-session payloads. The
   session *list* deliberately does not carry the mode, since that would read
   every session log twice. A refusal reaches the user as the existing grey
-  tool-result bubble; no new element was needed.
+  tool-result bubble; no new element was needed. *Placement superseded by
+  [#58](../58_header_repo_bar_and_menus/proposal.md): the `<select>` became
+  the composer's mode pill (`#session-mode-btn`).*
 
 ### 7.2 Two real bugs this planning pass found and fixed
 

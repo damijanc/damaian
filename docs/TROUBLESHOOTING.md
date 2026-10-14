@@ -444,6 +444,14 @@ Useful reads:
   `DAMAIAN_EDIT_V1` envelope. An `edit_model_request_prepared` with *neither*
   `edit_failed` nor `edit_patch_ready_for_approval` means the process died
   mid-request.
+- `git_status_read` rows come in pairs: every `/api/git-status` request (each
+  repo-bar refresh) runs `git status` and then the repo-bar summary, which is
+  marked `scope: summary`. The summary row never records the remote URL. In a
+  folder that is not a repository both rows read `status: failed` with git's
+  exit code, and the bar shows the folder alone; that is expected, not an
+  error. To check the bar's `+N −M`, compare it with
+  `git diff --numstat HEAD` plus the line counts of untracked text files
+  (files over 1 MiB or with a NUL byte in the first 8 KiB are not counted).
 
 ### Session logs
 
@@ -662,6 +670,14 @@ or fixed finding keeps its status whatever happens to the file, and a finding
 with no `fileHash` is never stale. Setting `stale` through
 `/api/finding-status` is refused. Reads use the same active-event window as
 plans, so a rewind takes the findings recorded after its point with it.
+
+**The findings list cannot be opened.** The list is reached from the repo
+bar's **Fix N errors** / **Fix N warnings** chevron, which exists only while
+the session has an open error or warning. With every finding dismissed, fixed,
+stale or informational there is nothing to open, so a dismissed finding cannot
+be restored from the UI until a check records a new open one. Nothing is lost:
+the `finding_recorded` and `finding_status_changed` events above still list
+every finding and its status.
 
 **A location is missing.** A finding gets a `range` only when the tool printed
 one, it is relative and inside the repository, and the file exists when the
@@ -1135,8 +1151,9 @@ Error-surfacing behaviour worth knowing:
 
 - A `401` on a protected path triggers exactly one automatic re-bootstrap and
   retry (`app.js:157`). A second failure surfaces to the user.
-- Failures reach the user as a toast and a `Desktop API unavailable` chat
-  status; the underlying message is in the console.
+- Failures reach the user as a toast and a `Desktop API unavailable` banner
+  above the conversation (`#desktop-api-banner`), which clears on the next
+  successful `/api/*` response; the underlying message is in the console.
 - The CSP in [tauri.conf.json](../crates/desktop-app/tauri.conf.json) restricts
   `connect-src` to `http://127.0.0.1:4765`. A shell on any other port cannot be
   reached from the packaged webview — this is why the app refuses to fall back

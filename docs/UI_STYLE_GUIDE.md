@@ -173,9 +173,80 @@ There are two popover implementations and they are not interchangeable:
   Correct for anything inside a scrolling region, and for repeated rows where
   per-row popovers could not hold stable state.
 
-Anything in the conversation log or the project list uses the second. Dismissal
-(document click, `Escape`) is already wired globally — register with it rather
-than adding listeners. Do not introduce a third implementation.
+Anything in the conversation log or the project list uses the second, built
+with `createContextMenu` (below). Dismissal (document click, `Escape`) is
+already wired by that factory — do not add document-level listeners of your
+own. Do not introduce a third implementation.
+
+### The ⋮ menu
+
+Every overflow and folder menu is an instance of one factory in `app.js`,
+`createContextMenu({ className, align, placement, onAction })`
+([spec 58](specs/58_header_repo_bar_and_menus/proposal.md) §3.1). The project
+row, session row, thread header and repo-bar folder menus use it, as do the
+approval and crash-recovery overflows and the composer's mode pill. Build the
+menu once at module level and call `menu.toggle(trigger, { sections, key,
+context })` from the trigger's click handler, stopping propagation.
+
+- **Sections, not rows.** `sections` is an array of arrays; the factory draws a
+  `.context-menu-divider` between non-empty sections. Group by kind — *Open in*,
+  then actions on the item, then destruction — rather than placing dividers by
+  hand.
+- **Drill-in, not fly-out.** An entry with `items` becomes a row with a
+  `.context-menu-caret` that swaps the panel for a sub-panel headed by a
+  `.context-menu-back` row named after it. One behaviour for every menu
+  matters more than a fly-out's speed.
+- **Danger is last, always.** An entry with `danger: true` renders as
+  `.context-menu-row-danger` and is moved to the end of its panel whatever
+  order it was given in, so no menu can drift. It keeps its confirm dialog
+  (§3).
+- **Conditional rows are `hidden`, not absent from one caller.** A row that
+  depends on state (the folder menu's GitHub item) passes `hidden: true`; one
+  that is momentarily unavailable passes `disabled: true` and stays visible.
+- **Keyboard.** Opening focuses the first row. ArrowUp/ArrowDown move and wrap,
+  Home/End jump, ArrowRight drills in, ArrowLeft goes back, Escape and Tab
+  close and return focus to the trigger. Choosing a row closes the menu and
+  returns focus to the trigger *before* the action runs, so a dialog it opens
+  takes focus from there. Opening one menu closes any other.
+- **Trigger.** A `.btn-icon` with `.dots-icon` (§3), or a `.btn-trigger` when
+  its label is a value (the folder name, the mode). It carries
+  `aria-haspopup="menu"` and starts at `aria-expanded="false"`; the factory
+  keeps that attribute current.
+- **Placement.** Below the trigger, flipping above when it does not fit below
+  and there is more room above. `placement: "above"` prefers above, which
+  anything in the composer needs because it sits at the bottom of the window.
+  `align: "start"` lines up the left edges; the default lines up the right.
+
+A row whose ⋮ only shows on hover hides it with `opacity`, never `display` or
+`visibility`, and shows it on `.active`, `:hover`, `:focus-within` and
+`[aria-expanded="true"]`, so every row stays reachable by Tab.
+
+### The repo bar
+
+`.repo-bar` is the strip inside the composer directly above the prompt box
+(spec 58 §3.3): one control-height tall, the prompt box's width, on
+`--sidebar`. It holds state about the open folder, never per-turn state.
+
+- **Left:** `.repo-folder-btn`, a `.btn-trigger` with the folder glyph, the
+  folder name and a caret, opening the folder menu above it; then
+  `.repo-branch`, the branch in muted monospace, or the short SHA on a detached
+  HEAD.
+- **Right:** `.repo-changes`, the working tree's `+N −M` in monospace,
+  `.repo-insertions` in `--ok` and `.repo-deletions` in `--danger`,
+  display-only and hidden when both are zero; then the contextual-action slot
+  `.repo-action`.
+- **A folder that is not a repository** shows the folder button alone.
+- **The contextual action is one slot with a priority list**, not a row of
+  buttons. The first applicable entry wins and the slot is hidden when none
+  applies: open error findings (*Fix N errors*), then open warnings (*Fix N
+  warnings*), then (once built) uncommitted changes (*Commit…*, spec 35), then a
+  branch ahead of its base (*Create PR*, spec 37). New entries join the list in
+  `repoActionProviders`; they never add a second control to the bar.
+- **The action is a split button**: `.repo-action-main` runs it,
+  `.repo-action-more` (a chevron) opens its detail as a `.model-popover`
+  anchored to the bar and opening upward. It is tinted by `data-tone`
+  (`danger`, `warning`) and **never filled** — the composer's send button stays
+  the one filled control. It is disabled while a turn runs.
 
 `.inline-actions` is the shared action row: a content-sized flex row, the same
 shape as `.command-approval-actions` and `.patch-actions`. Use it anywhere a
@@ -272,6 +343,7 @@ Each of these existed in the shell and was removed. Do not reintroduce them.
 | Horizontally scrolled command under review | User approves what they cannot see |
 | Escalating and one-shot actions at equal weight | Mis-click cost is not symmetric |
 | Controls positioned over the field they displace | The field then pays for them in padding it cannot use. The composer's textarea reserved 70px of height and 58px of *every line* to keep text clear of three floating controls — 41px of text inside a 111px field, and text stopping 59px short of the edge on every row. The `@media` block holding that layout together at narrow widths was three rules whose only job was to stop it colliding. Controls belong in a row of their own |
+| Turn state in a header badge | Nobody looks at the header during a turn; they look at the reply. `#chat-status` was the only progress signal for four turn paths. Running state is the in-bubble turn indicator; an end state is a mark on that turn's message (spec 58 §3.2) |
 | Horizontal `⋯` or a text-glyph overflow trigger | Vertical ⋮ was asked for and applied to one control while this guide still said `⋯`; the approval and recovery overflows were then built from the guide and came out horizontal. The trigger is `.dots-icon` (§3), and the guide is what gets fixed first |
 | Two values sharing one truncating label | Whichever is last is the one that disappears. `model + effort` in one 220px pill rendered `claude-3-5-sonnet-202…` — the effort still in force and readable nowhere but the popover. One trigger per value |
 

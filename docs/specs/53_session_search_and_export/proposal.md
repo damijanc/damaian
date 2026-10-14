@@ -17,7 +17,9 @@ Related implementation specs:
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (owns the session log format and the parse-first reader this reuses),
 [`42_conversation_column_density/proposal.md`](42_conversation_column_density/proposal.md)
-(owns the thread header a search entry point sits in),
+(owns the thread header a search entry point sits in; placement superseded by
+[#58](../58_header_repo_bar_and_menus/proposal.md), which moved search to the
+sidebar header and export into the session ⋮ menus),
 [`52_mcp_server_mode.md`](52_mcp_server_mode.md) (creates sessions this must not
 mix into the user's own).
 
