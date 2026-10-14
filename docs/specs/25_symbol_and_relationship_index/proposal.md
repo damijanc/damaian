@@ -1,21 +1,37 @@
 # Feature Spec: Symbol and Relationship Index
 
-Status: Not started
+Status: In progress. Task 1 of 11 done (started 2026-10-13); see
+[`tasks.md`](tasks.md). Split into a folder and planned on 2026-10-09, re-checked
+against `main` on 2026-10-12. Design unchanged from the original flat spec. Corrections where it no
+longer matches the code are in [`context.md`](context.md), not inlined here,
+the way specs 22, 24 and 31 kept theirs. The most important ones:
+- the process registry this spec needs is spec 46's, and it is built; the MCP
+  stdio transport is the model for spawning and teardown but not for framing,
+  because LSP frames with `Content-Length` and MCP with newlines;
+- heuristic symbols are already extracted in the index pass, so persistence
+  pays off for language-server results, not for re-extraction;
+- sessions have no close event, so a language server lives for the Damaian
+  process (or an idle timeout) rather than "until the last session closes";
+- `chat.rs` is out of bounds for this spec, so the model reaches symbols
+  through a context item, not a new tool, and two pieces that need the chat
+  loop are deferred and named (`context.md` §12).
+
+Read `context.md` before starting any task in [`tasks.md`](tasks.md).
 Order: 25 of 27
 Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 3 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#24](24_repository_map_and_monorepo_boundaries/proposal.md) (the repository
+Depends on: [#24](../24_repository_map_and_monorepo_boundaries/proposal.md) (the repository
 map) — built (Done 2026-10-09). Everything else named below is a cross-reference, not a
 prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.2
 (project indexer), section 19 (recommended technology direction). Related
-implementation specs: [`02_semantic_search.md`](02_semantic_search.md),
-[`05_clickable_file_references.md`](05_clickable_file_references.md)
-(navigation), [`22_findings_model_and_panel/proposal.md`](22_findings_model_and_panel/proposal.md)
+implementation specs: [`02_semantic_search.md`](../02_semantic_search.md),
+[`05_clickable_file_references.md`](../05_clickable_file_references.md)
+(navigation), [`22_findings_model_and_panel/proposal.md`](../22_findings_model_and_panel/proposal.md)
 (LSP diagnostics land as an additional `Finding` source here — this is where
 Phase 2's deferred LSP dependency is satisfied),
-[`24_repository_map_and_monorepo_boundaries/`](24_repository_map_and_monorepo_boundaries/proposal.md)
+[`24_repository_map_and_monorepo_boundaries/`](../24_repository_map_and_monorepo_boundaries/proposal.md)
 (supplies the roots symbols are namespaced by).
 
 ## 1. Motivation
@@ -67,7 +83,7 @@ existing heuristics are a reasonable floor and a poor ceiling.
 - **`detect_language`** (`language.rs:3`) maps path to language name.
 - **Search is keyword overlap plus embeddings.** `RepositoryIndex::keyword_search`
   (`indexer.rs:61`) scores over `FileRecord.terms`; semantic search is
-  [spec 02](02_semantic_search.md)'s embedding index.
+  [spec 02](../02_semantic_search.md)'s embedding index.
 - **`FileRecord.symbols` is searchable only as text**, through the same term
   scoring as file content. There is no symbol lookup by name.
 - **No language server exists.** No LSP client, no server process management, no
@@ -80,10 +96,10 @@ existing heuristics are a reasonable floor and a poor ceiling.
 - **The keyword index is in-memory only** and rebuilt per launch; persistence is
   Phase 3 WP1, which is Should-tier and **not in this phase's minimum slice**.
 - **Process tracking for spawned children is specified but not built.**
-  [Spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7 defines the
+  [Spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) §5.7 defines the
   session-scoped PID registry, driven by MCP stdio servers and the `curl` model
   child. Language servers are a third client of it.
-- **`Finding`** ([spec 22](22_findings_model_and_panel/proposal.md)) declares
+- **`Finding`** ([spec 22](../22_findings_model_and_panel/proposal.md)) declares
   `FindingSource::LanguageServer` already, unused until this work package.
 
 ## 3. Requirements
@@ -101,8 +117,8 @@ existing heuristics are a reasonable floor and a poor ceiling.
    never block a task.
 6. Symbol data is local and versioned.
 7. Symbol results integrate with search and with the clickable file references
-   from [spec 05](05_clickable_file_references.md).
-8. LSP diagnostics feed [spec 22](22_findings_model_and_panel/proposal.md)'s `Finding`
+   from [spec 05](../05_clickable_file_references.md).
+8. LSP diagnostics feed [spec 22](../22_findings_model_and_panel/proposal.md)'s `Finding`
    model as an additional source.
 9. Language server processes are tracked by PID and terminated by PID, per
    `AGENTS.md`.
@@ -222,7 +238,7 @@ configuration, which §4 rules out; an unresolved specifier is recorded, not
 guessed at.
 
 **`TestOf`** is derived from the test paths in
-[spec 24](24_repository_map_and_monorepo_boundaries/proposal.md)'s map plus naming
+[spec 24](../24_repository_map_and_monorepo_boundaries/proposal.md)'s map plus naming
 convention (`upload.rs` ↔ `tests/upload.rs`, `foo.ts` ↔ `foo.test.ts`). It is
 always `Heuristic`, because a naming convention is a convention.
 
@@ -317,19 +333,19 @@ satisfied in neither:
 - **UI**: a heuristic symbol or relationship is marked — an icon or a "likely"
   qualifier — and hovering explains that it was derived from source text rather
   than a language server. Clickable references
-  ([spec 05](05_clickable_file_references.md)) work for both, since a heuristic
+  ([spec 05](../05_clickable_file_references.md)) work for both, since a heuristic
   line number is still a line number.
 - **Model context**: heuristic items are labelled in the rendered context, e.g.
   `upload_retry (function, src/upload.rs:42, heuristic — may be inaccurate)`.
   This is the part most likely to be skipped, and it is the part that matters:
   an agent told a relationship is certain will act on it, and a wrong `Implements`
-  edge sends it to rewrite the wrong type. [Spec 26](26_context_assembly.md)
+  edge sends it to rewrite the wrong type. [Spec 26](../26_context_assembly.md)
   carries the label through as provenance on the context item.
 
 ### 5.8 Process lifetime
 
 Language servers are long-lived children, so requirement 9 uses the registry
-from [spec 17](17_durable_task_state_and_crash_recovery/proposal.md) §5.7: PID and start
+from [spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) §5.7: PID and start
 time recorded at spawn, killed by PID, with the start-time check before killing
 so a recycled PID is never someone else's process.
 
@@ -346,7 +362,7 @@ editor process, and killing it by name would kill their editor.
 ### 5.9 Diagnostics as findings
 
 `publishDiagnostics` notifications map to `Finding`
-([spec 22](22_findings_model_and_panel/proposal.md)) with
+([spec 22](../22_findings_model_and_panel/proposal.md)) with
 `source: FindingSource::LanguageServer`, severity from the LSP severity, and
 `range` from the LSP range. This satisfies requirement 8 and Phase 2's deferred
 LSP dependency.
@@ -357,7 +373,7 @@ source, which are produced by a command Damaian ran. Two rules follow:
 - Diagnostics are attributed to the task active when they arrive, or to no task
   when none is. A diagnostic with no task is still shown in the panel.
 - They do not, on their own, block a plan step
-  ([spec 21](21_task_plan_progress_and_budget/proposal.md)). A step is blocked by a check
+  ([spec 21](../21_task_plan_progress_and_budget/proposal.md)). A step is blocked by a check
   that ran and failed; a language server reporting an error mid-edit is normal
   and transient, and treating it as a blocking failure would stall the loop on
   every intermediate state.
@@ -388,7 +404,7 @@ A symbol lookup path: exact name match, then prefix, then fuzzy, returning
 acceptance criterion — a symbol search returns a definition with an exact file
 and line — is satisfied by this path, in both tiers.
 
-Symbol hits also feed [spec 26](26_context_assembly.md) as a distinct context
+Symbol hits also feed [spec 26](../26_context_assembly.md) as a distinct context
 category with its own budget, so symbol results do not crowd out file content.
 
 ## 6. Acceptance Criteria
@@ -422,7 +438,7 @@ category with its own budget, so symbol results do not crowd out file content.
 - A corrupt or version-mismatched symbol index rebuilds cleanly and reports it.
 - Symbol accuracy fixtures pass for each supported language.
 - Every quality-gate command from `AGENTS.md` passes, and the
-  [spec 18](18_local_evaluation_harness/proposal.md) baseline shows no
+  [spec 18](../18_local_evaluation_harness/proposal.md) baseline shows no
   regression.
 
 ## 7. Implementation Notes
