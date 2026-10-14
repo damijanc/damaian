@@ -158,7 +158,7 @@ Three things this rendering makes visible that nothing does today:
 - **The limit's source** — declared, observed, or default
   ([spec 26](26_context_assembly.md) §5.7) — so conservative context is
   attributable rather than mysterious.
-- **Heuristic counts**, carrying [spec 25](25_symbol_and_relationship_index.md)'s
+- **Heuristic counts**, carrying [spec 25](25_symbol_and_relationship_index/proposal.md)'s
   provenance through to the surface. "12 symbols (4 heuristic)" tells the user
   how much of the structural information is a guess.
 

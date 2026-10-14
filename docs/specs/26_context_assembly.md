@@ -8,7 +8,7 @@ reference is a name rather than a link; this spec is self-contained.
 Depends on: [#21](21_task_plan_progress_and_budget/proposal.md) (plan state) —
 built; [#22](22_findings_model_and_panel/proposal.md) (findings) — built;
 [#24](24_repository_map_and_monorepo_boundaries/proposal.md) (the repository map) —
-built (Done 2026-10-09); [#25](25_symbol_and_relationship_index.md) (the symbol index) —
+built (Done 2026-10-09); [#25](25_symbol_and_relationship_index/proposal.md) (the symbol index) —
 **not built**. Everything else named below is a cross-reference, not a
 prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
@@ -20,7 +20,7 @@ precedence), [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progr
 (plan state as a context category),
 [`22_findings_model_and_panel/proposal.md`](22_findings_model_and_panel/proposal.md) (findings as a
 category), [`24_repository_map_and_monorepo_boundaries/`](24_repository_map_and_monorepo_boundaries/proposal.md),
-[`25_symbol_and_relationship_index.md`](25_symbol_and_relationship_index.md),
+[`25_symbol_and_relationship_index/`](25_symbol_and_relationship_index/proposal.md),
 [`27_context_inspector.md`](27_context_inspector.md) (renders the manifest this
 spec produces).
 
@@ -108,7 +108,7 @@ current model — they require ranges to exist first.
 
 - Choosing *what* is relevant. Retrieval quality is search
   ([spec 02](02_semantic_search.md)) and symbols
-  ([spec 25](25_symbol_and_relationship_index.md)); this spec allocates budget
+  ([spec 25](25_symbol_and_relationship_index/proposal.md)); this spec allocates budget
   among what they return and records what it did.
 - Conversation compaction — Phase 3 WP6, Should-tier. The pipeline reserves a
   category for a conversation summary and tolerates its absence.

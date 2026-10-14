@@ -33,7 +33,7 @@ and [`34_repository_config_trust_boundary.md`](../34_repository_config_trust_bou
 [`21_task_plan_progress_and_budget/proposal.md`](../21_task_plan_progress_and_budget/proposal.md)
 (own the budget this defers to),
 [`24_repository_map_and_monorepo_boundaries/`](../24_repository_map_and_monorepo_boundaries/proposal.md),
-[`25_symbol_and_relationship_index.md`](../25_symbol_and_relationship_index.md) and
+[`25_symbol_and_relationship_index/`](../25_symbol_and_relationship_index/proposal.md) and
 [`26_context_assembly.md`](../26_context_assembly.md) (the durable versions of the
 navigation and ranged-read floor this establishes).
 
@@ -80,7 +80,7 @@ diagnostics runner is attached, plus discovered MCP tools.
 Two of these gaps have durable successors already specified — ranged context
 belongs to [#26](../26_context_assembly.md), which adds line ranges to
 `ContextItem`, and structural navigation to [#24](../24_repository_map_and_monorepo_boundaries/proposal.md)
-and [#25](../25_symbol_and_relationship_index.md). **This spec is the cheap
+and [#25](../25_symbol_and_relationship_index/proposal.md). **This spec is the cheap
 deterministic floor beneath them, not a substitute.** It is specified first
 because those three cannot be built by an agent that lacks it.
 
@@ -120,7 +120,7 @@ because those three cannot be built by an agent that lacks it.
   scope rules of [#34](../34_repository_config_trust_boundary.md). Requirement 3 is
   a constraint on the design, not an invitation to revisit them.
 - Replacing [#24](../24_repository_map_and_monorepo_boundaries/proposal.md),
-  [#25](../25_symbol_and_relationship_index.md) or
+  [#25](../25_symbol_and_relationship_index/proposal.md) or
   [#26](../26_context_assembly.md). Those stay as specified.
 - Removing the tool-round cap. Requirement 6 replaces a fixed count with a
   bounded budget; an unbounded turn is not the goal, and the enforced ceiling
