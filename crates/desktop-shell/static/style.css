@@ -582,7 +582,7 @@ button:disabled {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto auto auto;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
   background: var(--surface);
 }
 
@@ -650,8 +650,8 @@ button:disabled {
   gap: 8px;
 }
 
-/* Sized to the header's 30px buttons, not the form-field default, so the row
-   keeps its height. */
+/* A compact select, not the form-field default; now only the findings
+   filters use it. */
 .mode-select {
   width: auto;
   height: 30px;
@@ -1300,16 +1300,161 @@ button:disabled {
   color: var(--ink);
 }
 
-/* The findings dock (spec 22 Task 11): session-scoped, between the chat log
-   and the composer, hidden until opened. Modelled on the terminal dock. */
-.findings-panel {
+/* The repo bar (spec 58 §3.3): one control-height strip, the prompt box's
+   width, on a surface a step darker than `--bg`. Folder and branch on the
+   left; the change count and the contextual action on the right. It is the
+   positioning ancestor of the findings popover, which opens upward from it. */
+.repo-bar {
+  position: relative;
+  z-index: 20;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  border-radius: 8px;
+  background: var(--sidebar);
+  padding: 2px 4px;
+}
+
+.repo-bar[hidden] {
+  display: none;
+}
+
+.repo-bar-start,
+.repo-bar-end {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.repo-bar-end {
+  flex: 0 0 auto;
+}
+
+.repo-folder-btn {
+  max-width: 280px;
+  color: var(--ink);
+}
+
+.repo-folder-btn:hover,
+.repo-folder-btn[aria-expanded="true"] {
+  background: rgba(31, 36, 40, 0.06);
+}
+
+/* The sidebar's folder glyph, scaled to the 12px trigger text; its tab's
+   fill matches this strip's `--sidebar` surface, as it does in the sidebar. */
+.repo-folder-btn .folder-icon {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 11px;
+  border-width: 1.4px;
+}
+
+.repo-folder-btn .folder-icon::before {
+  top: -4px;
+  width: 7px;
+  height: 4px;
+  border-width: 1.4px;
+}
+
+.repo-folder-name,
+.repo-branch {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repo-branch,
+.repo-changes {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.repo-branch {
+  color: var(--muted);
+}
+
+.repo-changes {
+  display: inline-flex;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.repo-changes[hidden],
+.repo-branch[hidden],
+.repo-action[hidden] {
+  display: none;
+}
+
+.repo-insertions {
+  color: var(--ok);
+}
+
+.repo-deletions {
+  color: var(--danger);
+}
+
+/* A split button: the action, then a chevron joined to it. Tinted, never
+   filled: send stays the one filled control in the composer (guide §3). */
+.repo-action {
+  display: inline-flex;
+  align-items: stretch;
+}
+
+.repo-action-main {
+  border-radius: 8px 0 0 8px;
+}
+
+.repo-action-more {
+  display: inline-grid;
+  place-items: center;
+  min-width: 26px;
+  margin-left: -1px;
+  border-radius: 0 8px 8px 0;
+  padding: 5px 7px;
+}
+
+.repo-action-more[hidden] {
+  display: none;
+}
+
+.repo-action-main:only-child {
+  border-radius: 8px;
+}
+
+.repo-action[data-tone="danger"] button {
+  border-color: #e3b9b4;
+  color: var(--danger);
+}
+
+.repo-action[data-tone="danger"] button:hover:not(:disabled) {
+  background: #fbe9e7;
+}
+
+.repo-action[data-tone="warning"] button {
+  border-color: #e6c9a6;
+  color: var(--warn);
+}
+
+.repo-action[data-tone="warning"] button:hover:not(:disabled) {
+  background: #fbf1e5;
+}
+
+/* The findings list (spec 22 Task 11), now a popover off the repo bar's
+   action chevron, opening upward over the conversation (spec 58 §1 req 17).
+   `.model-popover` positions it against `.repo-bar`; this sizes it, scoped so
+   it outranks that rule's 264px width. */
+.repo-bar .findings-panel {
+  width: min(560px, 100%);
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 8px;
-  max-height: min(320px, 36vh);
-  border-top: 1px solid var(--line);
-  background: var(--surface);
-  padding: 10px clamp(18px, 5vw, 72px);
+  max-height: min(420px, 50vh);
+  padding: 10px 12px;
   font-size: 12px;
 }
 
@@ -1618,10 +1763,9 @@ button:disabled {
   box-shadow: none;
 }
 
-/* Controls sit below the box, not over it. Attach takes `margin-right: auto`
-   directly — there is no wrapper — which is what pushes the model group and
-   send to the right edge. A working-mode control (spec 31) becomes attach's
-   sibling here, and the auto margin moves to whichever is last in the group. */
+/* Controls sit below the box, not over it. The left group is attach, then the
+   mode pill (spec 58); the pill, last in that group, takes `margin-right:
+   auto`, which is what pushes the model group and send to the right edge. */
 .composer-actions {
   display: flex;
   align-items: center;
@@ -1631,8 +1775,12 @@ button:disabled {
 
 .attach-menu {
   position: relative;
-  margin-right: auto;
   z-index: 20;
+}
+
+.mode-trigger {
+  flex: 0 0 auto;
+  margin-right: auto;
 }
 
 .attach-menu-button {
@@ -1887,6 +2035,11 @@ button:disabled {
   background: #eeeeeb;
 }
 
+/* Wide enough for "Open repository on GitHub" on one line. */
+.repo-folder-menu {
+  width: min(232px, calc(100vw - 32px));
+}
+
 /* Approval overflow rows carry a hint line, since what separates the two
    grants is how long they last rather than what they do. */
 .approval-menu-popover {
@@ -1903,10 +2056,17 @@ button:disabled {
   text-align: left;
 }
 
-.approval-menu-row small {
+.approval-menu-row small,
+.context-menu-row-current small {
   color: var(--muted);
   font-size: 11px;
   font-weight: 400;
+}
+
+/* The mode menu's current mode: the label carries the weight, the hint says
+   why. */
+.context-menu-row-current {
+  font-weight: 600;
 }
 
 .context-menu-caret {

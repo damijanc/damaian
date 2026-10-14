@@ -297,6 +297,9 @@ function renderThreadHeader() {
   const repoPath = repo();
   const sessionLine = $("thread-session");
   renderModeControl();
+  // From the last status, no request: this only keeps the folder's display
+  // name (a project rename) and the bar's visibility current.
+  renderRepoBar();
 
   if (!repoPath) {
     sessionLine.textContent = "";
@@ -320,18 +323,31 @@ function currentSession() {
   );
 }
 
-// A mode belongs to a session that exists, so the control is disabled until
-// the first message creates one; that session starts in Code, which is what
-// the disabled control shows. Also how a failed switch snaps back: the select
-// is re-set from the last mode the server confirmed.
-function renderModeControl() {
-  const select = $("session-mode-select");
+const sessionModeLabels = { ask: "Ask", plan: "Plan", code: "Code", review: "Review" };
+
+// The mode the pill shows: the last one the server confirmed for the open
+// session, or Code when there is none.
+function displayedSessionMode() {
   const hasSession = Boolean(repo() && currentSessionId);
-  select.disabled = !hasSession;
-  select.value =
-    hasSession && currentSessionMode.sessionId === currentSessionId
-      ? currentSessionMode.mode
-      : "code";
+  return hasSession && currentSessionMode.sessionId === currentSessionId
+    ? currentSessionMode.mode
+    : "code";
+}
+
+// A mode belongs to a session that exists, so the pill is disabled until the
+// first message creates one; that session starts in Code, which is what the
+// disabled pill shows. Also how a failed switch snaps back: the pill is
+// redrawn from the last mode the server confirmed.
+function renderModeControl() {
+  const button = $("session-mode-btn");
+  const hasSession = Boolean(repo() && currentSessionId);
+  const mode = displayedSessionMode();
+  const label = sessionModeLabels[mode] || mode;
+  button.disabled = !hasSession;
+  button.dataset.mode = mode;
+  $("session-mode-label").textContent = label;
+  button.setAttribute("aria-label", `Working mode: ${label}`);
+  if (!hasSession) sessionModeMenu.close();
 }
 
 function normalizeProjectPath(value) {
@@ -1017,6 +1033,271 @@ function toggleApprovalMenu(items, anchorEl) {
   });
 }
 
+// The composer's mode pill (spec 58 §1 req 18). It sits at the bottom of the
+// window, so its menu prefers to open above.
+const sessionModeMenu = createContextMenu({ align: "start", placement: "above" });
+
+function toggleSessionModeMenu(anchorEl) {
+  const current = displayedSessionMode();
+  sessionModeMenu.toggle(anchorEl, {
+    sections: [
+      Object.entries(sessionModeLabels).map(([mode, label]) => ({
+        label,
+        action: mode,
+        hint: mode === current ? "Current" : "",
+        className: mode === current ? "context-menu-row-current" : "",
+        onSelect: () => void selectSessionMode(mode),
+      })),
+    ],
+  });
+}
+
+// The selection itself is the explicit user action spec 20 §5.6 asks for, in
+// either direction, so there is no confirmation step. A turn already running
+// keeps the mode it started with; the change applies from the next turn.
+async function selectSessionMode(mode) {
+  const sessionId = currentSessionId;
+  if (!sessionId || mode === displayedSessionMode()) return;
+  try {
+    const payload = await api("/api/session-mode", form({ session_id: sessionId, mode }));
+    currentSessionMode = { sessionId: payload.session.id, mode: payload.session.mode };
+  } catch (error) {
+    toast(error.message);
+  }
+  renderModeControl();
+}
+
+// ---------------------------------------------------------------------------
+// Repo bar (spec 58 §3.3): the open folder, its branch and change count, and
+// the contextual-action slot, inside the composer above the prompt box.
+
+// The last `/api/git-status` answer for the open folder. `payload` is null
+// until one arrives, and stays null when the request fails, which draws the
+// folder alone, as for a folder that is not a repository.
+let repoBarStatus = { repoPath: "", payload: null };
+let repoBarRefreshSeq = 0;
+let repoBarRefreshedAt = 0;
+// Focus refreshes are at least this far apart (§1 req 15). There is no timer:
+// the bar only ever refreshes because something happened.
+const repoBarFocusThrottleMs = 5000;
+
+async function refreshRepoBar() {
+  const repoPath = repo();
+  const seq = ++repoBarRefreshSeq;
+  repoBarRefreshedAt = Date.now();
+  if (repoBarStatus.repoPath !== repoPath) {
+    // Another folder: never show the previous one's branch while this loads.
+    repoBarStatus = { repoPath, payload: null };
+    renderRepoBar();
+  }
+  if (!repoPath) return;
+  let payload = null;
+  try {
+    payload = await api(`/api/git-status?repo=${encodeURIComponent(repoPath)}`);
+  } catch {
+    // The folder menu still works without a status; the bar shows the folder.
+  }
+  // A later refresh, or a folder switch, owns the bar now.
+  if (seq !== repoBarRefreshSeq || repoPath !== repo()) return;
+  applyRepoBarStatus(repoPath, payload);
+}
+
+function applyRepoBarStatus(repoPath, payload) {
+  if (repoPath !== repo()) return;
+  // Newer than anything still in flight.
+  repoBarRefreshSeq += 1;
+  repoBarRefreshedAt = Date.now();
+  repoBarStatus = { repoPath, payload };
+  renderRepoBar();
+}
+
+function renderRepoBar() {
+  const bar = $("repo-bar");
+  const repoPath = repo();
+  bar.hidden = !repoPath;
+  if (!repoPath) {
+    repoFolderMenu.close();
+    closeFindingsPopover();
+    return;
+  }
+  $("repo-folder-name").textContent = projectName(repoPath);
+  const folderButton = $("repo-folder-btn");
+  folderButton.title = repoPath;
+  folderButton.setAttribute("aria-label", `Folder ${projectName(repoPath)}: more options`);
+
+  const payload = repoBarStatus.repoPath === repoPath ? repoBarStatus.payload : null;
+  // A folder that is not a repository answers with a non-zero `exitCode` and
+  // null repo fields (spec 58 Task 2), not an error.
+  const isGit = Boolean(payload && payload.exitCode === 0);
+  const branch = $("repo-branch");
+  const branchText = isGit ? payload.branch || payload.head || "" : "";
+  branch.textContent = branchText;
+  branch.hidden = !branchText;
+  if (isGit && !payload.branch && payload.head) {
+    branch.title = `Detached HEAD at ${payload.head}`;
+  } else if (branchText) {
+    branch.title = `Branch ${branchText}`;
+  } else {
+    branch.removeAttribute("title");
+  }
+
+  // Display-only in this spec; the diff spec makes it open the diff (§2).
+  const insertions = isGit ? Number(payload.insertions) || 0 : 0;
+  const deletions = isGit ? Number(payload.deletions) || 0 : 0;
+  const changes = $("repo-changes");
+  changes.hidden = !isGit || (insertions === 0 && deletions === 0);
+  $("repo-insertions").textContent = `+${insertions.toLocaleString("en-US")}`;
+  $("repo-deletions").textContent = `−${deletions.toLocaleString("en-US")}`;
+  changes.title = `${insertions} inserted, ${deletions} deleted against HEAD, untracked files included`;
+}
+
+window.addEventListener("focus", () => {
+  if (!repo() || Date.now() - repoBarRefreshedAt < repoBarFocusThrottleMs) return;
+  void refreshRepoBar();
+});
+
+const repoFolderMenu = createContextMenu({
+  className: "repo-folder-menu",
+  align: "start",
+  placement: "above",
+});
+
+function toggleRepoFolderMenu(anchorEl) {
+  const repoPath = repo();
+  if (!repoPath) return;
+  const payload = repoBarStatus.repoPath === repoPath ? repoBarStatus.payload : null;
+  repoFolderMenu.toggle(anchorEl, {
+    sections: [
+      [
+        {
+          label: "Show in Finder",
+          action: "open-finder",
+          onSelect: () => void handleProjectMenuAction("open-finder", repoPath),
+        },
+        {
+          label: "Open repository on GitHub",
+          action: "open-github",
+          // Only ever the URL the server derived from `origin` (§1 req 12–13).
+          hidden: !payload?.githubUrl,
+          onSelect: () => void openRepositoryOnGitHub(repoPath),
+        },
+      ],
+      [
+        {
+          label: "Copy path",
+          action: "copy-path",
+          onSelect: () => void copyRepoPath(repoPath),
+        },
+        {
+          label: "Change folder…",
+          action: "change-folder",
+          onSelect: () => void pickWorkingFolder(),
+        },
+      ],
+      [
+        {
+          label: "Open in terminal",
+          action: "open-terminal",
+          onSelect: () => setTerminalOpen(true),
+        },
+      ],
+    ],
+  });
+}
+
+// The client never sends a URL: the server rebuilds it from `origin`.
+async function openRepositoryOnGitHub(repoPath) {
+  try {
+    const payload = await api("/api/open-github", form({ repo: repoPath }));
+    toast(`Opened ${payload.url}`);
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function copyRepoPath(repoPath) {
+  try {
+    await navigator.clipboard.writeText(repoPath);
+    toast("Copied path");
+  } catch {
+    // No clipboard access (an unfocused or insecure context): show the path so
+    // it can still be copied by hand.
+    toast(repoPath, { duration: 7000 });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The contextual-action slot (spec 58 §3.5): one split button, filled by the
+// first provider in this list that has an action. Each provider returns null
+// or { key, label, tone, run, more }; `more` (optional) is { label, toggle,
+// isOpen } for the chevron. Order is priority; nothing else in the bar
+// changes when an entry is added.
+const repoActionProviders = [
+  findingsRepairAction("error"),
+  findingsRepairAction("warning"),
+  // #35: uncommitted accepted changes → Commit…
+  // #37: branch ahead of its base → Create PR
+];
+
+let repoActionCurrent = null;
+// Covers the `/api/findings-repair` request before `sendChatPrompt` sets
+// `chatSubmitting`, so a double click cannot start two repairs.
+let findingsRepairPending = false;
+
+function openFindingIds(severity) {
+  return sessionFindings
+    .filter((finding) => finding.status === "open" && finding.severity === severity)
+    .map((finding) => finding.id);
+}
+
+function findingsRepairAction(severity) {
+  return () => {
+    const ids = openFindingIds(severity);
+    if (!ids.length) return null;
+    const noun = severity === "error" ? "error" : "warning";
+    return {
+      key: `fix-${severity}`,
+      label: `Fix ${ids.length} ${noun}${ids.length === 1 ? "" : "s"}`,
+      tone: severity === "error" ? "danger" : "warning",
+      run: () => repairFindings(ids),
+      more: {
+        label: "Show findings",
+        toggle: (anchorEl) => toggleFindingsPopover(anchorEl, severity),
+        isOpen: () => findingsPanelOpen,
+      },
+    };
+  };
+}
+
+function currentRepoAction() {
+  if (!repo()) return null;
+  for (const provider of repoActionProviders) {
+    const action = provider();
+    if (action) return action;
+  }
+  return null;
+}
+
+function renderRepoAction() {
+  const action = currentRepoAction();
+  repoActionCurrent = action;
+  const slot = $("repo-action");
+  slot.hidden = !action;
+  if (!action) return;
+  slot.dataset.action = action.key;
+  slot.dataset.tone = action.tone || "";
+  const main = $("repo-action-main");
+  main.textContent = action.label;
+  main.disabled = chatSubmitting || findingsRepairPending;
+  const more = $("repo-action-more");
+  more.hidden = !action.more;
+  if (action.more) {
+    more.setAttribute("aria-label", action.more.label);
+    more.title = action.more.label;
+    more.setAttribute("aria-expanded", String(action.more.isOpen()));
+  }
+}
+
 function closeApprovalMenu() {
   approvalMenu.close();
 }
@@ -1381,6 +1662,7 @@ function applyRepositoryState(value, persist = true) {
   }
   currentSessionId = "";
   loadPinnedContextFiles("");
+  void refreshRepoBar();
   // Refresh the roots cache so chips and patch files can qualify by root. A
   // failure here is not fatal: the UI simply shows unqualified names.
   void refreshRepositoryRoots(projectPath).catch(() => {});
@@ -5525,16 +5807,38 @@ function groupFindings(findings, key) {
   return groups;
 }
 
+// The findings list is a popover off the repo bar's action chevron (spec 58
+// §1 req 17), so it is reachable only while that action is showing.
+function toggleFindingsPopover(anchorEl, severity) {
+  if (findingsPanelOpen) {
+    closeFindingsPopover({ restoreFocus: true });
+    return;
+  }
+  closeAllContextMenus();
+  // Opened from "Fix N warnings", the default Errors filter would show none of
+  // the findings the action counts.
+  const severityFilter = $("findings-severity-filter");
+  if (severity === "warning" && severityFilter.value === "error") severityFilter.value = "warning";
+  findingsPanelOpen = true;
+  renderFindingsPanel();
+  anchorEl.setAttribute("aria-expanded", "true");
+  $("findings-severity-filter").focus();
+}
+
+function closeFindingsPopover({ restoreFocus = false } = {}) {
+  if (!findingsPanelOpen) return;
+  findingsPanelOpen = false;
+  renderFindingsPanel();
+  if (restoreFocus) $("repo-action-more").focus();
+}
+
 function renderFindingsPanel() {
-  const toggle = $("findings-toggle-btn");
+  renderRepoAction();
   const panel = $("findings-panel");
-  const openErrors = sessionFindings.filter(
-    (finding) => finding.status === "open" && finding.severity === "error",
-  ).length;
-  toggle.hidden = sessionFindings.length === 0;
-  toggle.textContent = openErrors > 0 ? `Findings ${openErrors}` : "Findings";
+  // Its anchor went away (no open errors or warnings left, or no folder).
+  if (findingsPanelOpen && !repoActionCurrent?.key.startsWith("fix-")) findingsPanelOpen = false;
   panel.hidden = !findingsPanelOpen || sessionFindings.length === 0;
-  toggle.setAttribute("aria-expanded", String(!panel.hidden));
+  $("repo-action-more").setAttribute("aria-expanded", String(!panel.hidden));
   if (panel.hidden) return;
 
   const visible = sessionFindings.filter(findingVisible);
@@ -5682,12 +5986,20 @@ async function setFindingStatus(findingId, status) {
 }
 
 async function fixSelectedFindings() {
-  if (chatSubmitting) {
+  await repairFindings([...findingsSelection]);
+}
+
+// One repair turn for exactly `ids`, through spec 22's path: the server builds
+// the prompt, and the agentic chat turn runs it. Shared by Fix selected and the
+// repo bar's Fix N errors / warnings.
+async function repairFindings(ids) {
+  if (chatSubmitting || findingsRepairPending) {
     toast("A turn is already running");
     return;
   }
-  const ids = [...findingsSelection];
   if (!ids.length) return;
+  findingsRepairPending = true;
+  renderFindingsPanel();
   try {
     const payload = await api(
       "/api/findings-repair",
@@ -5700,14 +6012,21 @@ async function fixSelectedFindings() {
     // Nothing left to repair: the server built no prompt (§15). Redraw, so
     // the panel shows why.
     if (!payload.prompt) {
+      findingsRepairPending = false;
       await refreshFindings();
       return;
     }
     findingsSelection.clear();
-    renderFindingsPanel();
+    // `sendChatPrompt` sets `chatSubmitting` before its first await, which
+    // keeps the buttons disabled from here.
+    findingsRepairPending = false;
+    closeFindingsPopover();
     await sendChatPrompt({ prompt: payload.prompt, restorePrompt: false, agentic: true });
   } catch (error) {
     toast(error.message);
+  } finally {
+    findingsRepairPending = false;
+    renderFindingsPanel();
   }
 }
 
@@ -6227,13 +6546,12 @@ function renderGitStatusText(payload) {
   return `Git status: ${files.length} changed path(s).\n${visible}${suffix}`;
 }
 
+// After a patch apply or rollback. The same answer feeds the repo bar, which
+// replaced the "N changed" suffix this used to write into the sidebar's
+// `#repo-state` (spec 58 §3.3); that line now always names the folder alone.
 async function appendGitStatusAfterChange(repoPath) {
   const payload = await api(`/api/git-status?repo=${encodeURIComponent(repoPath)}`);
-  setRepoState(
-    payload.clean
-      ? projectName(repoPath)
-      : `${projectName(repoPath)} - ${payload.files.length} changed`,
-  );
+  applyRepoBarStatus(repoPath, payload);
   appendChatMessage("system", renderGitStatusText(payload));
 }
 
@@ -6409,6 +6727,7 @@ function createFallbackOffer(proposal, proposalRepo) {
       output.textContent = streamError ? `Kept failed: ${streamError}` : "Kept failed.";
     }
     await loadSessions(currentSessionId, false);
+    void refreshRepoBar();
   }
 
   keepButton.addEventListener("click", () => decide(false).catch((error) => toast(error.message)));
@@ -6628,6 +6947,7 @@ function createPlanReview(proposal, proposalRepo) {
       : "Plan declined — see the assistant's answer above.";
     await loadSessions(currentSessionId, false);
     await refreshFindings();
+    void refreshRepoBar();
   }
 
   approveButton.addEventListener("click", async () => {
@@ -7162,6 +7482,7 @@ function createCommandApprovalPreview(
       if (onResolved) await onResolved(approved);
       await loadSessions(currentSessionId, false);
       await refreshFindings();
+      void refreshRepoBar();
       return;
     }
 
@@ -7245,6 +7566,7 @@ function createCommandApprovalPreview(
     }
     await loadSessions(currentSessionId, false);
     await refreshFindings();
+    void refreshRepoBar();
   }
 
   // Re-enable after a failure so the user can retry or pick a different
@@ -7332,8 +7654,11 @@ async function loadSession(sessionId) {
     loadPinnedContextFiles("");
     sessionCheckpoints = [];
     clearChat();
+    void refreshRepoBar();
     return;
   }
+  // A rewind reloads the session through here, so it refreshes the bar too.
+  void refreshRepoBar();
   const payload = await api(`/api/session?session_id=${encodeURIComponent(sessionId)}`);
   currentSessionId = payload.session.id;
   currentSessionMode = { sessionId: payload.session.id, mode: payload.session.mode || "code" };
@@ -7451,7 +7776,10 @@ $("projects-toggle-btn").addEventListener("click", () => {
   setProjectsCollapsed(!projectsCollapsed);
 });
 
-$("pick-folder-btn").addEventListener("click", async () => {
+$("pick-folder-btn").addEventListener("click", () => void pickWorkingFolder());
+
+// The sidebar's "Add working folder" and the repo bar's "Change folder…".
+async function pickWorkingFolder() {
   try {
     const open = tauriDialogOpen();
     if (!open) throw new Error("Folder picker is available in the desktop app");
@@ -7467,7 +7795,7 @@ $("pick-folder-btn").addEventListener("click", async () => {
   } catch (error) {
     toast(error.message);
   }
-});
+}
 
 $("composer-attach-btn").addEventListener("click", (event) => {
   event.stopPropagation();
@@ -7574,14 +7902,39 @@ $("terminal-toggle-btn").addEventListener("click", () => {
   setTerminalOpen(!terminalOpen);
 });
 
-$("findings-toggle-btn").addEventListener("click", () => {
-  findingsPanelOpen = !findingsPanelOpen;
-  renderFindingsPanel();
+$("repo-folder-btn").addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleRepoFolderMenu(event.currentTarget);
 });
+
+$("repo-action-main").addEventListener("click", () => {
+  if (repoActionCurrent) void repoActionCurrent.run();
+});
+
+$("repo-action-more").addEventListener("click", (event) => {
+  event.stopPropagation();
+  repoActionCurrent?.more?.toggle(event.currentTarget);
+});
+
+$("session-mode-btn").addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleSessionModeMenu(event.currentTarget);
+});
+
 $("findings-close-btn").addEventListener("click", () => {
-  findingsPanelOpen = false;
-  renderFindingsPanel();
-  $("findings-toggle-btn").focus();
+  closeFindingsPopover({ restoreFocus: true });
+});
+// `composedPath`, not `contains`: Dismiss and the checkboxes redraw the list,
+// so by the time this runs the clicked element may no longer be in the panel.
+document.addEventListener("click", (event) => {
+  if (!findingsPanelOpen) return;
+  const path = event.composedPath();
+  if (path.includes($("findings-panel")) || path.includes($("repo-action-more"))) return;
+  closeFindingsPopover();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !findingsPanelOpen) return;
+  closeFindingsPopover({ restoreFocus: true });
 });
 $("findings-severity-filter").addEventListener("change", renderFindingsPanel);
 $("findings-status-filter").addEventListener("change", renderFindingsPanel);
@@ -7635,24 +7988,6 @@ $("session-select").addEventListener("change", async () => {
   } catch (error) {
     toast(error.message);
   }
-});
-
-// The selection itself is the explicit user action spec 20 §5.6 asks for, in
-// either direction, so there is no confirmation step. A turn already running
-// keeps the mode it started with; the change applies from the next turn.
-$("session-mode-select").addEventListener("change", async () => {
-  const sessionId = currentSessionId;
-  if (!sessionId) return;
-  try {
-    const payload = await api(
-      "/api/session-mode",
-      form({ session_id: sessionId, mode: $("session-mode-select").value }),
-    );
-    currentSessionMode = { sessionId: payload.session.id, mode: payload.session.mode };
-  } catch (error) {
-    toast(error.message);
-  }
-  renderModeControl();
 });
 
 // Like the mode, the selection is the explicit user action, so there is no
@@ -7749,7 +8084,8 @@ function setComposerBusy(busy) {
   button.setAttribute("aria-label", busy ? "Stop generating" : "Send message");
   // Deliberately left enabled while busy: it is the Stop control now.
   button.disabled = false;
-  // "Fix selected" follows `chatSubmitting`, which callers set before this.
+  // "Fix selected" and the repo bar's action follow `chatSubmitting`, which
+  // callers set before this.
   renderFindingsPanel();
 }
 
@@ -7899,6 +8235,8 @@ async function sendChatPrompt(options = {}) {
     chatSubmitting = false;
     currentTurn = null;
     setComposerBusy(false);
+    // Whatever the outcome, an agentic turn may have changed files.
+    void refreshRepoBar();
   }
 }
 
