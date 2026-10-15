@@ -1,24 +1,33 @@
 //! The `--worker` host: the same executable re-entered to serve one worker
 //! session, per `docs/specs/57_worker_sessions/proposal.md` §5.2 and §5.3.
 //!
-//! This module owns the process half only: the stdin handover, the lifeline,
-//! the control socket and the shutdown path. It runs no turns; Task 6 of
-//! `tasks.md` puts the turn in it.
+//! It owns the stdin handover, the lifeline, the control socket and the
+//! shutdown path, and hosts the session's turns on one turn thread. A turn runs
+//! through the same `ChatOrchestrator` entry points and the same engine and
+//! adapter construction as the shell's (`crate::chat_engine`,
+//! `crate::chat_model_adapter`); only where progress goes and what drives
+//! pause, notes and cancel differ (§5.2 "Same turn").
 //!
 //! The API key arrives on one stdin line and lives only in memory. Nothing here
 //! writes it to the environment, argv, disk or any message: every error below
 //! is a fixed string, so no input can be echoed through one.
 
+use std::cell::RefCell;
 use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
-use workspace_engine::{CancelToken, Config, ProcessRegistry};
+use workspace_engine::worker_progress::{ProgressKind, ProgressWriter};
+use workspace_engine::{
+    CancelToken, ChatTurnOptions, ChatTurnResult, Config, ModelAdapter, PhaseKind, ProcessRegistry,
+    SecretScanner, TaskStatus, TurnProgress, TurnSink, TurnSteering,
+};
 
 /// The first argument that selects worker mode, in both `main`s.
 pub const WORKER_FLAG: &str = "--worker";
@@ -63,7 +72,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     } = parse_worker_args(args)?;
     refuse_terminal_stdin(std::io::stdin().is_terminal())?;
     let Handover { api_key, token } = read_handover(&mut std::io::stdin().lock())?;
-    let config = load_worker_config(&data_dir)?;
+    let config = load_worker_config(&data_dir, None)?;
     let (registry, audit) =
         ProcessRegistry::open_with_audit(&config).map_err(|error| error.to_string())?;
 
@@ -82,10 +91,16 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
 
     let (listener, socket_path) = bind_control_socket(&data_dir, &session_id)?;
-    let host = Arc::new(WorkerHost::new(session_id, api_key, Arc::clone(&shutdown)));
+    let host = Arc::new(WorkerHost::new(session_id.clone(), Arc::clone(&shutdown)));
+    // The key is moved into the adapter builder and goes nowhere else: not
+    // the environment of anything this worker runs, not a file, not a log.
+    let driver = TurnDriver::new(
+        &session_id,
+        &data_dir,
+        Box::new(move |config: &Config| crate::chat_model_adapter(config, || Ok(api_key.clone()))),
+    )?;
+    start_turn_thread(&host, driver)?;
     let served = Arc::clone(&host);
-    // Task 6 starts turns from this thread's commands, so it gets the shell's
-    // stack from the start.
     crate::spawn_with_shell_stack("damaian-worker-control", move || {
         serve_control(listener, &token, &served);
     })
@@ -93,7 +108,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
 
     shutdown.wait();
     host.set_state(WorkerState::ShuttingDown);
-    host.cancel.cancel();
+    host.cancel_turn();
     let swept = registry.sweep_own(&audit);
     let _ = fs::remove_file(&socket_path);
     swept.map(|_| ()).map_err(|error| error.to_string())
@@ -184,8 +199,6 @@ fn refuse_terminal_stdin(is_terminal: bool) -> Result<(), String> {
 /// What the shell writes on the worker's stdin. `Debug` never prints either
 /// value.
 struct Handover {
-    // Read by Task 6's turn driver, which builds the adapter with it.
-    #[allow(dead_code)]
     api_key: String,
     token: String,
 }
@@ -307,16 +320,26 @@ fn bind_control_socket(
 /// The worker's config comes from the data directory the shell named, never
 /// from `Config::default_data_dir()`, so a worker can never read or write a
 /// different instance's state.
-fn load_worker_config(data_dir: &Path) -> Result<Config, String> {
+///
+/// With `repository`, its `.damaian/config.conf` is applied at repository
+/// scope, exactly as `Config::load_for_repository` applies it for the shell's
+/// turns: it may tighten, and cannot loosen (#34).
+fn load_worker_config(data_dir: &Path, repository: Option<&Path>) -> Result<Config, String> {
     let base = Config {
         data_dir: data_dir.to_path_buf(),
         ..Config::default()
     };
     let user_path = base.user_config_path();
     let admin_path = base.admin_config_path();
-    let (mut config, _) =
-        Config::load_scoped(base, Some(&user_path), None, Some(&admin_path), None)
-            .map_err(|error| error.to_string())?;
+    let repo_path = repository.map(Config::repository_config_path);
+    let (mut config, _) = Config::load_scoped(
+        base,
+        Some(&user_path),
+        repo_path.as_deref(),
+        Some(&admin_path),
+        repository,
+    )
+    .map_err(|error| error.to_string())?;
     // The shell passed its effective directory, which already reflects any
     // `data_dir` its own config named. Following that key again from here
     // would move the worker away from the shell it serves.
@@ -326,9 +349,7 @@ fn load_worker_config(data_dir: &Path) -> Result<Config, String> {
 
 /// A control request, validated against proposal §5.2's table.
 #[derive(Debug, Clone, PartialEq, Eq)]
-// The arguments are read by Task 6's turn driver; this task validates them.
-#[allow(dead_code)]
-enum ControlCommand {
+pub(crate) enum ControlCommand {
     Message { text: String },
     Pause,
     Resume { note: Option<String> },
@@ -420,15 +441,23 @@ fn tokens_match(offered: &str, expected: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkerState {
+pub(crate) enum WorkerState {
     Idle,
+    Running,
+    /// Held at a round boundary (§5.4). Set when the turn reports it, not
+    /// when `pause` is asked for: a pause waits for the next boundary.
+    Paused,
+    WaitingForApproval,
     ShuttingDown,
 }
 
 impl WorkerState {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::WaitingForApproval => "waiting_for_approval",
             Self::ShuttingDown => "shutting_down",
         }
     }
@@ -468,71 +497,568 @@ impl ShutdownSignal {
     }
 }
 
-struct WorkerHost {
+/// Which resume a pending approval takes (§5.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecisionKind {
+    Command,
+    Plan,
+}
+
+/// The turn the host holds. The cancel token and the steering belong to the
+/// turn in flight and are made fresh for each, so a `stop` that arrives late
+/// cannot cancel the next turn.
+struct TurnSlot {
+    state: WorkerState,
+    cancel: CancelToken,
+    steering: Arc<TurnSteering>,
+    pending: Option<(String, DecisionKind)>,
+}
+
+/// What the control thread hands the turn thread.
+enum TurnJob {
+    Message(String),
+    Decide {
+        proposal_id: String,
+        kind: DecisionKind,
+        approved: bool,
+    },
+}
+
+pub(crate) struct WorkerHost {
     session_id: String,
     pid: u32,
-    state: Mutex<WorkerState>,
-    // The current turn's token. Task 6 replaces it per turn.
-    cancel: CancelToken,
+    turn: Mutex<TurnSlot>,
     shutdown: Arc<ShutdownSignal>,
-    // Read by Task 6's turn driver, which builds the adapter with it.
-    #[allow(dead_code)]
-    api_key: String,
+    /// `None` until a turn thread is attached; the socket tests serve without
+    /// one.
+    jobs: Mutex<Option<Sender<TurnJob>>>,
 }
 
 impl WorkerHost {
-    fn new(session_id: String, api_key: String, shutdown: Arc<ShutdownSignal>) -> Self {
+    fn new(session_id: String, shutdown: Arc<ShutdownSignal>) -> Self {
         Self {
             session_id,
             pid: std::process::id(),
-            state: Mutex::new(WorkerState::Idle),
-            cancel: CancelToken::new(),
+            turn: Mutex::new(TurnSlot {
+                state: WorkerState::Idle,
+                cancel: CancelToken::new(),
+                steering: Arc::new(TurnSteering::new()),
+                pending: None,
+            }),
             shutdown,
-            api_key,
+            jobs: Mutex::new(None),
         }
     }
 
-    fn set_state(&self, state: WorkerState) {
-        *self
-            .state
+    fn slot(&self) -> std::sync::MutexGuard<'_, TurnSlot> {
+        self.turn
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = state;
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn set_state(&self, state: WorkerState) {
+        self.slot().state = state;
+    }
+
+    /// Stops the turn in flight at its next safe point, and lets a paused
+    /// one leave its wait to see the cancel.
+    fn cancel_turn(&self) {
+        let slot = self.slot();
+        slot.cancel.cancel();
+        slot.steering.wake();
+    }
+
+    fn turn_handles(&self) -> (CancelToken, Arc<TurnSteering>) {
+        let slot = self.slot();
+        (slot.cancel.clone(), Arc::clone(&slot.steering))
+    }
+
+    /// The turn reached a round boundary and held, or left it.
+    fn set_paused(&self, paused: bool) {
+        let mut slot = self.slot();
+        if matches!(slot.state, WorkerState::Running | WorkerState::Paused) {
+            slot.state = if paused {
+                WorkerState::Paused
+            } else {
+                WorkerState::Running
+            };
+        }
+    }
+
+    /// The turn thread finished a job: idle, or holding an approval.
+    fn settle(&self, pending: Option<(String, DecisionKind)>) {
+        let mut slot = self.slot();
+        if slot.state == WorkerState::ShuttingDown {
+            return;
+        }
+        slot.state = if pending.is_some() {
+            WorkerState::WaitingForApproval
+        } else {
+            WorkerState::Idle
+        };
+        slot.pending = pending;
     }
 
     /// Answers one command. The flag says whether to close the connection.
-    fn dispatch(&self, command: ControlCommand) -> (Value, bool) {
+    pub(crate) fn dispatch(&self, command: ControlCommand) -> (Value, bool) {
         match command {
             ControlCommand::Status => (self.snapshot(), false),
             ControlCommand::Shutdown => {
                 self.set_state(WorkerState::ShuttingDown);
+                self.cancel_turn();
                 self.shutdown.trigger();
                 (json!({"ok": true}), true)
             }
-            // Task 6 hosts the turn these drive.
-            ControlCommand::Message { .. } => {
-                (refusal("this worker cannot start turns yet"), false)
+            ControlCommand::Message { text } => (self.start(TurnJob::Message(text)), false),
+            ControlCommand::Approve { proposal_id } => (self.decide(proposal_id, true), false),
+            ControlCommand::Reject { proposal_id } => (self.decide(proposal_id, false), false),
+            ControlCommand::Pause => (self.steer(|slot| slot.steering.pause()), false),
+            ControlCommand::Resume { note } => (
+                self.steer(|slot| {
+                    if let Some(note) = note {
+                        slot.steering.queue_note(note);
+                    }
+                    slot.steering.resume();
+                }),
+                false,
+            ),
+            ControlCommand::Note { text } => {
+                (self.steer(|slot| slot.steering.queue_note(text)), false)
             }
-            ControlCommand::Pause
-            | ControlCommand::Resume { .. }
-            | ControlCommand::Note { .. }
-            | ControlCommand::Approve { .. }
-            | ControlCommand::Reject { .. }
-            | ControlCommand::Stop => (refusal("no turn is running"), false),
+            ControlCommand::Stop => (
+                self.steer(|slot| {
+                    slot.cancel.cancel();
+                    slot.steering.wake();
+                }),
+                false,
+            ),
         }
     }
 
-    fn snapshot(&self) -> Value {
-        let state = *self
-            .state
+    /// Pause, resume, notes and stop act on a running turn only. A turn
+    /// waiting for approval has already left its loop, so they do not apply
+    /// there (§5.4); it is resolved with `approve` or `reject`.
+    fn steer(&self, apply: impl FnOnce(&TurnSlot)) -> Value {
+        let slot = self.slot();
+        match slot.state {
+            WorkerState::Running | WorkerState::Paused => {
+                apply(&slot);
+                json!({"ok": true})
+            }
+            WorkerState::WaitingForApproval => {
+                refusal("the turn is waiting for approval; approve or reject it")
+            }
+            WorkerState::Idle => refusal("no turn is running"),
+            WorkerState::ShuttingDown => refusal("the worker is shutting down"),
+        }
+    }
+
+    /// `message`: refused unless idle (§5.2).
+    fn start(&self, job: TurnJob) -> Value {
+        let mut slot = self.slot();
+        match slot.state {
+            WorkerState::Idle => {}
+            WorkerState::Running | WorkerState::Paused => {
+                return refusal("a turn is already running");
+            }
+            WorkerState::WaitingForApproval => {
+                return refusal("the turn is waiting for approval; approve or reject it");
+            }
+            WorkerState::ShuttingDown => return refusal("the worker is shutting down"),
+        }
+        self.hand_over(&mut slot, job)
+    }
+
+    fn decide(&self, proposal_id: String, approved: bool) -> Value {
+        let mut slot = self.slot();
+        let kind = match &slot.pending {
+            Some((pending, kind))
+                if slot.state == WorkerState::WaitingForApproval && *pending == proposal_id =>
+            {
+                *kind
+            }
+            _ => return refusal("no approval with that id is pending"),
+        };
+        let answer = self.hand_over(
+            &mut slot,
+            TurnJob::Decide {
+                proposal_id,
+                kind,
+                approved,
+            },
+        );
+        if answer["ok"] == true {
+            slot.pending = None;
+        }
+        answer
+    }
+
+    /// Gives the turn thread a job with a fresh cancel token and steering.
+    fn hand_over(&self, slot: &mut TurnSlot, job: TurnJob) -> Value {
+        let jobs = self
+            .jobs
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        json!({
+        let Some(jobs) = jobs.as_ref() else {
+            return refusal("this worker hosts no turns");
+        };
+        slot.cancel = CancelToken::new();
+        slot.steering = Arc::new(TurnSteering::new());
+        let previous = slot.state;
+        slot.state = WorkerState::Running;
+        if jobs.send(job).is_err() {
+            slot.state = previous;
+            return refusal("the worker's turn thread has stopped");
+        }
+        json!({"ok": true})
+    }
+
+    pub(crate) fn snapshot(&self) -> Value {
+        let slot = self.slot();
+        let mut snapshot = json!({
             "ok": true,
             "sessionId": self.session_id,
             "pid": self.pid,
-            "state": state.as_str(),
+            "state": slot.state.as_str(),
+        });
+        if let (WorkerState::WaitingForApproval, Some((proposal_id, _))) =
+            (slot.state, &slot.pending)
+        {
+            snapshot["proposalId"] = json!(proposal_id);
+        }
+        snapshot
+    }
+}
+
+/// How often streamed model text is written to the progress file (§5.5).
+const TEXT_BATCH_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Builds a turn's model adapter from its config. A worker's builds the
+/// shell's adapter with the handed-over key (`crate::chat_model_adapter`); a
+/// test scripts one.
+pub(crate) type WorkerAdapterFor =
+    dyn FnMut(&Config) -> Result<Box<dyn ModelAdapter>, String> + Send;
+
+/// Runs the session's turns, one job at a time, on the turn thread. It alone
+/// holds the progress writer (Task 3: one writer per worker, on one thread).
+pub(crate) struct TurnDriver {
+    session_id: String,
+    data_dir: PathBuf,
+    /// The worktree, read from the session's worker record on first use.
+    repository: Option<PathBuf>,
+    adapter_for: Box<WorkerAdapterFor>,
+    progress: ProgressWriter,
+}
+
+impl TurnDriver {
+    /// Truncates the session's progress file: a restarted worker starts again
+    /// from `seq` 1 (§5.5).
+    pub(crate) fn new(
+        session_id: &str,
+        data_dir: &Path,
+        adapter_for: Box<WorkerAdapterFor>,
+    ) -> Result<Self, String> {
+        let config = load_worker_config(data_dir, None)?;
+        let progress = ProgressWriter::create(
+            data_dir,
+            session_id,
+            SecretScanner::new(config.secret_patterns.clone()),
+        )
+        .map_err(|error| format!("could not create the progress file: {error}"))?;
+        Ok(Self {
+            session_id: session_id.to_string(),
+            data_dir: data_dir.to_path_buf(),
+            repository: None,
+            adapter_for,
+            progress,
         })
     }
+
+    fn serve(mut self, host: &WorkerHost, jobs: Receiver<TurnJob>) {
+        for job in jobs {
+            self.run(host, job);
+        }
+    }
+
+    fn run(&mut self, host: &WorkerHost, job: TurnJob) {
+        let (cancel, steering) = host.turn_handles();
+        append_progress(
+            &mut self.progress,
+            ProgressKind::Status,
+            json!({"state": WorkerState::Running.as_str()}),
+        );
+        match self.take_turn(host, job, &cancel, &steering) {
+            Ok(result) => {
+                let pending = pending_decision(&result);
+                if let Some(approval) = approval_payload(&result) {
+                    append_progress(&mut self.progress, ProgressKind::Approval, approval);
+                }
+                let state = if pending.is_some() {
+                    WorkerState::WaitingForApproval
+                } else {
+                    WorkerState::Idle
+                };
+                append_progress(
+                    &mut self.progress,
+                    ProgressKind::Status,
+                    json!({"state": state.as_str(), "taskStatus": result.task.status.as_str()}),
+                );
+                host.settle(pending);
+            }
+            Err(error) => {
+                append_progress(
+                    &mut self.progress,
+                    ProgressKind::Status,
+                    json!({"state": WorkerState::Idle.as_str(), "error": error}),
+                );
+                host.settle(None);
+            }
+        }
+    }
+
+    /// One turn through the shell's own entry points, engine and adapter.
+    fn take_turn(
+        &mut self,
+        host: &WorkerHost,
+        job: TurnJob,
+        cancel: &CancelToken,
+        steering: &TurnSteering,
+    ) -> Result<ChatTurnResult, String> {
+        let repository = self.repository()?;
+        let engine = crate::chat_engine(load_worker_config(&self.data_dir, Some(&repository))?);
+        let mut adapter = (self.adapter_for)(&engine.config)?;
+        let progress = RefCell::new(ProgressSink {
+            writer: &mut self.progress,
+            text: String::new(),
+            last_flush: Instant::now(),
+        });
+        let mut on_token = |token: &str| progress.borrow_mut().token(token);
+        let mut on_progress = |event: TurnProgress| progress.borrow_mut().event(host, event);
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel,
+            steering: Some(steering),
+        };
+        let chat = &engine.chat_orchestrator;
+        let result = match job {
+            TurnJob::Message(text) => chat.ask_with_session_with_options(
+                &repository,
+                &text,
+                &[],
+                Some(&self.session_id),
+                adapter.as_mut(),
+                &mut sink,
+                ChatTurnOptions::default(),
+            ),
+            TurnJob::Decide {
+                proposal_id,
+                kind: DecisionKind::Command,
+                approved,
+            } => chat.resume_after_command_decision(
+                &proposal_id,
+                approved,
+                "desktop_user",
+                adapter.as_mut(),
+                &mut sink,
+            ),
+            TurnJob::Decide {
+                proposal_id,
+                kind: DecisionKind::Plan,
+                approved,
+            } => chat.resume_after_plan_decision(
+                &proposal_id,
+                approved,
+                None,
+                "desktop_user",
+                adapter.as_mut(),
+                &mut sink,
+            ),
+        };
+        progress.borrow_mut().flush();
+        result.map_err(|error| error.to_string())
+    }
+
+    /// The worktree this session works in, from its worker record. A session
+    /// without one is not a worker's, and gets no turns here.
+    fn repository(&mut self) -> Result<PathBuf, String> {
+        if let Some(repository) = &self.repository {
+            return Ok(repository.clone());
+        }
+        let record = workspace_engine::SessionStore::new(&self.data_dir)
+            .worker_record(&self.session_id)
+            .map_err(|_| "could not read this session's worker record".to_string())?
+            .ok_or_else(|| "this session is not a worker session".to_string())?;
+        self.repository = Some(record.worktree_path.clone());
+        Ok(record.worktree_path)
+    }
+}
+
+/// Starts the turn thread and attaches it to `host`, which then accepts
+/// `message`. The thread gets the shell's stack, as every thread that runs a
+/// turn does (Task 2).
+pub(crate) fn start_turn_thread(host: &Arc<WorkerHost>, driver: TurnDriver) -> Result<(), String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    *host
+        .jobs
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(sender);
+    let host = Arc::clone(host);
+    crate::spawn_with_shell_stack("damaian-worker-turn", move || {
+        driver.serve(&host, receiver);
+    })
+    .map(|_| ())
+    .map_err(|error| format!("could not start the turn thread: {error}"))
+}
+
+/// A worker host with its turn thread, on this process: what `run_worker`
+/// builds, without the handover, the lifeline or the socket.
+#[cfg(test)]
+pub(crate) fn host_in_process(
+    session_id: &str,
+    data_dir: &Path,
+    adapter_for: Box<WorkerAdapterFor>,
+) -> Result<Arc<WorkerHost>, String> {
+    let host = Arc::new(WorkerHost::new(
+        session_id.to_string(),
+        Arc::new(ShutdownSignal::default()),
+    ));
+    start_turn_thread(&host, TurnDriver::new(session_id, data_dir, adapter_for)?)?;
+    Ok(host)
+}
+
+/// The progress file is a view, and the audit log is the record (§5.5), so a
+/// failed write does not stop the turn.
+fn append_progress(writer: &mut ProgressWriter, kind: ProgressKind, payload: Value) {
+    let _ = writer.append(kind, payload);
+}
+
+/// The turn's `TurnSink`, written to the progress file instead of SSE.
+struct ProgressSink<'a> {
+    writer: &'a mut ProgressWriter,
+    text: String,
+    last_flush: Instant,
+}
+
+impl ProgressSink<'_> {
+    /// Model text is batched (§5.5): a line per token would be most of the
+    /// file.
+    fn token(&mut self, token: &str) {
+        self.text.push_str(token);
+        if self.last_flush.elapsed() >= TEXT_BATCH_INTERVAL {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if !self.text.is_empty() {
+            let text = std::mem::take(&mut self.text);
+            append_progress(self.writer, ProgressKind::Text, json!({ "text": text }));
+        }
+        self.last_flush = Instant::now();
+    }
+
+    /// Text batched so far goes first, so the file keeps the turn's order.
+    fn event(&mut self, host: &WorkerHost, event: TurnProgress) {
+        self.flush();
+        match event {
+            TurnProgress::Phase(phase) => {
+                append_progress(
+                    self.writer,
+                    ProgressKind::Phase,
+                    parsed(&crate::phase_json(&phase)),
+                );
+                if phase.kind == PhaseKind::Tool {
+                    append_progress(
+                        self.writer,
+                        ProgressKind::Tool,
+                        json!({ "label": phase.label }),
+                    );
+                }
+            }
+            TurnProgress::Plan(plan) => {
+                append_progress(
+                    self.writer,
+                    ProgressKind::Plan,
+                    parsed(&crate::plan_json(&plan)),
+                );
+            }
+            TurnProgress::Paused => {
+                host.set_paused(true);
+                append_progress(
+                    self.writer,
+                    ProgressKind::Status,
+                    json!({
+                        "state": WorkerState::Paused.as_str(),
+                        "taskStatus": TaskStatus::Paused.as_str(),
+                    }),
+                );
+            }
+            TurnProgress::Resumed => {
+                host.set_paused(false);
+                append_progress(
+                    self.writer,
+                    ProgressKind::Status,
+                    json!({"state": WorkerState::Running.as_str()}),
+                );
+            }
+            TurnProgress::NoteAdded { message_id } => {
+                append_progress(
+                    self.writer,
+                    ProgressKind::Note,
+                    json!({ "messageId": message_id }),
+                );
+            }
+            // The session is the worker's own, and diagnostics are in the
+            // session log; neither is a board column.
+            TurnProgress::Session(_) | TurnProgress::WebDiagnostic(_) => {}
+        }
+    }
+}
+
+/// The shell's SSE payloads are built as JSON text; the progress file takes
+/// values.
+fn parsed(json_text: &str) -> Value {
+    serde_json::from_str(json_text).unwrap_or(Value::Null)
+}
+
+/// A command or plan approval keeps the worker waiting on the socket (§5.6).
+/// A patch or a provider fallback offer ends the turn, and is answered through
+/// the shell's own routes with the worktree as `repo`.
+fn pending_decision(result: &ChatTurnResult) -> Option<(String, DecisionKind)> {
+    if result.task.status != TaskStatus::WaitingForApproval {
+        return None;
+    }
+    if let Some(plan) = &result.plan_proposal {
+        return Some((plan.id.clone(), DecisionKind::Plan));
+    }
+    result
+        .command_proposal
+        .as_ref()
+        .map(|command| (command.id.clone(), DecisionKind::Command))
+}
+
+/// The pending proposal, as the approval card needs it: the same JSON the
+/// shell sends.
+fn approval_payload(result: &ChatTurnResult) -> Option<Value> {
+    let (kind, proposal) = if result.plan_proposal.is_some() {
+        (
+            "plan",
+            crate::plan_proposal_json(result.plan_proposal.as_ref()),
+        )
+    } else if result.command_proposal.is_some() {
+        ("command", crate::command_proposal_json(result))
+    } else if result.patch_proposal.is_some() {
+        ("patch", crate::patch_proposal_json(result))
+    } else if result.fallback_proposal.is_some() {
+        (
+            "fallback",
+            crate::fallback_proposal_json(result.fallback_proposal.as_ref()),
+        )
+    } else {
+        return None;
+    };
+    Some(json!({ "kind": kind, "proposal": parsed(&proposal) }))
 }
 
 fn refusal(error: &str) -> Value {
@@ -728,7 +1254,7 @@ mod tests {
             "audit_enabled=false\n",
         )
         .unwrap();
-        let config = load_worker_config(&data_dir).unwrap();
+        let config = load_worker_config(&data_dir, None).unwrap();
         assert_eq!(config.data_dir, data_dir);
         assert!(
             !config.audit_enabled,
@@ -945,7 +1471,6 @@ mod tests {
             let (listener, path) = bind_control_socket(&data_dir, SESSION).unwrap();
             let host = Arc::new(WorkerHost::new(
                 SESSION.to_string(),
-                KEY.to_string(),
                 Arc::new(ShutdownSignal::default()),
             ));
             let served = Arc::clone(&host);
