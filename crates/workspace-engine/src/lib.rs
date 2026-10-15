@@ -72,10 +72,11 @@ pub use command_runner::{CommandExecution, CommandRunOptions, CommandRunner, Com
 pub use config::{
     AppliedKey, CommandAccess, Config, ConfigKeyKind, ConfigOverlay, ConfigScope, CostEstimate,
     DEFAULT_CONTEXT_TOKEN_BUDGET, HookConfig, HookConfigOverlay, HookEvent, HookMode, HookReview,
-    HookSource, MAX_HOOK_TIMEOUT_MS, McpServerConfig, McpServerConfigOverlay, McpTransport,
-    ModelProviderConfig, ModelProviderConfigOverlay, OverlayOutcome, RejectedConfigKey,
-    RepositoryConfigReport, RepositoryKeyClass, normalize_mcp_server_id, normalize_model_provider,
-    normalize_model_reasoning_level, overlay_field_kinds, parse_mcp_transport,
+    HookSource, LANGUAGE_SERVER_LANGUAGES, MAX_HOOK_TIMEOUT_MS, McpServerConfig,
+    McpServerConfigOverlay, McpTransport, ModelProviderConfig, ModelProviderConfigOverlay,
+    OverlayOutcome, RejectedConfigKey, RepositoryConfigReport, RepositoryKeyClass,
+    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
+    overlay_field_kinds, parse_mcp_transport,
 };
 pub use context_manager::{ContextItem, ContextManager, ContextPlan, RepositoryMapSource};
 pub use data_schema::{
@@ -101,9 +102,12 @@ pub use index_cache::IndexCache;
 pub use indexer::{ProjectIndexer, RepositoryIndex, SearchResult};
 pub use language::{Declaration, SymbolKind, extract_declarations};
 pub use lsp::{
-    FileDiagnostics, LspClient, LspEvent, LspRequest, MAX_LSP_MESSAGE_BYTES, Position,
-    RepositoryUris, findings_from_diagnostics, read_message, symbol_kind_from_lsp,
-    symbol_refs_from_locations, symbols_from_document_symbols, write_message,
+    FileDiagnostics, LANGUAGE_SERVER_IDLE_SECS, LANGUAGE_SERVER_REQUEST_TIMEOUT,
+    LANGUAGE_SERVER_SHUTDOWN_GRACE, LanguageServerError, LanguageServerHub, LanguageServerLaunch,
+    LanguageServerLimits, LanguageServerState, LanguageServerStatus, LspClient, LspEvent,
+    LspRequest, MAX_LSP_MESSAGE_BYTES, Position, RepositoryUris, findings_from_diagnostics,
+    read_message, symbol_kind_from_lsp, symbol_refs_from_locations, symbols_from_document_symbols,
+    write_message,
 };
 pub use mcp::{
     McpClient, McpRuntime, McpServerRuntime, McpTool, McpToolResult, namespaced_tool_name,

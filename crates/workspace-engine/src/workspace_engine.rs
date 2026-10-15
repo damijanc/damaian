@@ -11,6 +11,7 @@ use crate::file_access::FileAccessController;
 use crate::git_service::GitService;
 use crate::index_cache::IndexCache;
 use crate::indexer::ProjectIndexer;
+use crate::lsp::{LanguageServerHub, LanguageServerLaunch};
 use crate::navigation::NavigationController;
 use crate::patch_engine::PatchEngine;
 use crate::path_policy::PathPolicy;
@@ -193,6 +194,29 @@ impl WorkspaceEngine {
     ) -> Result<Vec<SymbolMatch>> {
         let (index, _) = self.symbol_index(repository_root)?;
         Ok(index.find(query, limit))
+    }
+
+    /// The process-wide language-server hub (spec 25 `context.md` §3).
+    pub fn language_servers(&self) -> &'static LanguageServerHub {
+        LanguageServerHub::global()
+    }
+
+    /// What the hub needs to start `language`'s server for this repository,
+    /// or `None` when this config names none. The config is the one loaded
+    /// for the repository, so a server its own config tried to name was
+    /// already refused.
+    pub fn language_server_launch(
+        &self,
+        repository_root: impl AsRef<Path>,
+        language: &str,
+        session_id: &str,
+    ) -> Option<LanguageServerLaunch> {
+        LanguageServerLaunch::from_config(
+            &self.config,
+            repository_root.as_ref(),
+            language,
+            session_id,
+        )
     }
 }
 

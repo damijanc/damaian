@@ -413,6 +413,14 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "hook_review.repo_0123456789abcdef.lint=sha256:abc\n",
             Reported("hook_review.repo_0123456789abcdef.lint"),
         ),
+        // Spec 25: a language server is a program Damaian spawns, like the
+        // shell (25 context.md §6).
+        case(
+            "language_servers",
+            "language_server.rust=/usr/local/bin/rust-analyzer\n",
+            "language_server.rust=/bin/sh\n",
+            Reported("language_server.rust"),
+        ),
     ]
 }
 
@@ -1224,6 +1232,51 @@ fn profile_refusals_stay_out_of_the_repository_notice_and_are_audited_once() {
         !events.contains("repository_config_key_rejected"),
         "{events}"
     );
+
+    fixture.cleanup();
+}
+
+/// Spec 25 `context.md` §6: a language server is not a profile key. A
+/// profile that carries one is refused as Forbidden, the user's server
+/// stands, and an export of that profile does not name it.
+#[test]
+fn a_profile_cannot_carry_a_language_server() {
+    let fixture = profile_fixture("profile-language-server");
+    fixture.write_user(&format!(
+        "language_server.rust=/usr/local/bin/rust-analyzer\n{}",
+        fixture.select("mine")
+    ));
+    fixture.write_custom_profile(
+        "mine",
+        "command_access=read_only\nlanguage_server.rust=/tmp/evil-server\n\
+         language_server.go=/tmp/evil-gopls\n",
+    );
+
+    let (config, report) = fixture.load();
+
+    assert_eq!(
+        config.language_servers.get("rust").map(String::as_str),
+        Some("/usr/local/bin/rust-analyzer")
+    );
+    assert_eq!(config.language_servers.get("go"), None);
+    assert_eq!(config.command_access, CommandAccess::ReadOnly);
+    let refused: Vec<_> = report
+        .profile_rejected_keys
+        .iter()
+        .map(|r| (r.key.as_str(), r.class))
+        .collect();
+    assert_eq!(
+        refused,
+        vec![
+            ("language_server.go", RepositoryKeyClass::Forbidden),
+            ("language_server.rust", RepositoryKeyClass::Forbidden),
+        ]
+    );
+    let export =
+        workspace_engine::export_profile(&ProfileId::parse("mine").unwrap(), &fixture.data_dir)
+            .unwrap();
+    assert!(!export.contains("language_server"), "{export}");
+    assert!(export.contains("command_access=read_only"), "{export}");
 
     fixture.cleanup();
 }
@@ -2117,11 +2170,13 @@ fn every_rule_has_a_human_name() {
         "mcp_server.remote.transport=http\n",
         "mcp_server.remote.url=https://mcp.example.com\n",
         "mcp_server.remote.auth_token_env=REMOTE_TOKEN\n",
+        "language_server.rust=/usr/local/bin/rust-analyzer\n",
     );
     let repository = concat!(
         "shell=./tools/sh\n",
         "command_allowlist=make\n",
         "model_provider.attacker.base_url=http://127.0.0.1:9\n",
+        "language_server.python=./tools/pyls\n",
     );
     let (config, report) = load("human-names", user, repository);
     let policy = EffectivePolicy::from_load(&config, &report, None);
@@ -2132,6 +2187,7 @@ fn every_rule_has_a_human_name() {
         "model_provider.deepseek.context_token_budget",
         "mcp_server.local.env",
         "mcp_server.remote.auth_token_env",
+        "language_server.rust",
     ] {
         assert!(policy.rule(key).is_some(), "the fixture lost {key}");
     }
@@ -2149,6 +2205,10 @@ fn every_rule_has_a_human_name() {
             .label,
         "MCP server remote: where its token is read from"
     );
+    assert_eq!(
+        policy.rule("language_server.rust").unwrap().label,
+        "Language server for rust"
+    );
 
     let refused: Vec<_> = policy
         .rules
@@ -2161,6 +2221,7 @@ fn every_rule_has_a_human_name() {
         ("shell", "Shell that runs commands"),
         ("command_allowlist", "Commands that run without asking"),
         ("model_provider.attacker", "Model provider attacker"),
+        ("language_server.python", "Language server for python"),
     ] {
         assert!(
             refused.contains(&expected),
