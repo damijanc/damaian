@@ -13,19 +13,28 @@
 //!
 //! Task 3 pins `SymbolIndexStore`: rebuilds and their audit, reuse, per-file
 //! reuse across both tiers, and the engine's `find_symbols`.
+//!
+//! Task 5 pins `language_server.<language>` at every scope and the hub's
+//! process lifetime, against a fake server that is this test binary
+//! re-executed (context.md §2): registration before `initialize`, shutdown,
+//! idle expiry, an unanswered `initialize`, one restart and no more, and the
+//! sweep's start-time check over a `language_server` entry.
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use workspace_engine::language::extract_symbols;
 use workspace_engine::{
-    AuditLog, CommandPolicy, Config, Declaration, MatchQuality, PathPolicy, ProjectIndexer,
-    Provenance, RebuildReason, RelationKind, RelationTarget, RepositoryIndex, RepositoryMap,
-    SYMBOL_INDEX_SCHEMA_VERSION, SecretScanner, SymbolIndex, SymbolIndexStore, SymbolKind,
-    SymbolLoad, WorkspaceEngine, extract_declarations,
+    AuditLog, CommandPolicy, Config, ConfigOverlay, Declaration, LANGUAGE_SERVER_LANGUAGES,
+    LanguageServerError, LanguageServerHub, LanguageServerLaunch, LanguageServerLimits,
+    LanguageServerState, MatchQuality, PathPolicy, ProcessIdentity, ProcessKind, ProcessRegistry,
+    ProjectIndexer, Provenance, RebuildReason, RegisteredProcess, RelationKind, RelationTarget,
+    RepositoryIndex, RepositoryKeyClass, RepositoryMap, RepositoryTrustStore,
+    SYMBOL_INDEX_SCHEMA_VERSION, SecretScanner, SweepScope, SymbolIndex, SymbolIndexStore,
+    SymbolKind, SymbolLoad, WorkspaceEngine, extract_declarations, read_message, write_message,
 };
 
 use SymbolKind::{
@@ -1272,4 +1281,490 @@ fn a_reused_file_takes_its_root_from_the_current_map() {
         .find(|symbol| symbol.name == "web")
         .expect("the symbol is kept");
     assert_eq!(web.root_path, "packages/web");
+}
+
+// ---- Task 5: configuration, the hub and process lifetime ----
+//
+// The fake server is this test binary, re-executed into
+// `fake_language_server_helper` (context.md §2). libtest prints its own
+// header on stdout before the helper runs, so the helper speaks LSP on fd 3,
+// and the command line moves fd 3 onto the pipe the hub reads and sends
+// stdout to /dev/null. `/bin/sh -c` does that, and only that: it `exec`s the
+// test binary, so the PID the hub records is the helper's own.
+
+const FAKE_MODE: &str = "DAMAIAN_FAKE_LSP_MODE";
+const FAKE_LOG: &str = "DAMAIAN_FAKE_LSP_LOG";
+const FAKE_REGISTRY: &str = "DAMAIAN_FAKE_LSP_REGISTRY";
+
+/// A temp repository with a data directory, a fake server log, and the
+/// config that names the fake server for Rust.
+struct ServerFixture {
+    repo: Repo,
+    log: PathBuf,
+}
+
+impl ServerFixture {
+    fn new(name: &str) -> Self {
+        let repo = Repo::new(name, &[("src/lib.rs", "pub fn alpha() {}\n")]);
+        let log = repo.data_dir.join("fake-server.log");
+        Self { repo, log }
+    }
+
+    /// The `language_server.rust` command line for a fake server in `mode`.
+    fn command(&self, mode: &str) -> String {
+        let binary = std::env::current_exe().expect("test binary path");
+        format!(
+            "/bin/sh -c \"export {FAKE_MODE}={mode} {FAKE_LOG}='{}' {FAKE_REGISTRY}='{}'; \
+             exec \\\"\\$0\\\" --ignored --exact fake_language_server_helper 3>&1 1>/dev/null\" '{}'",
+            self.log.display(),
+            self.repo.data_dir.join("processes").display(),
+            binary.display(),
+        )
+    }
+
+    fn launch(&self, mode: &str) -> LanguageServerLaunch {
+        let mut config = self.repo.config();
+        config
+            .language_servers
+            .insert("rust".to_string(), self.command(mode));
+        LanguageServerLaunch::from_config(&config, &self.repo.root, "rust", "ses_task5")
+            .expect("rust is configured")
+    }
+
+    fn registry_entries(&self) -> Vec<RegisteredProcess> {
+        ProcessRegistry::open(&self.repo.data_dir)
+            .unwrap()
+            .entries()
+            .unwrap()
+            .into_iter()
+            .map(|(path, entry)| entry.unwrap_or_else(|| panic!("unreadable entry {path:?}")))
+            .collect()
+    }
+
+    fn log_lines(&self) -> Vec<String> {
+        fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn spawns(&self) -> usize {
+        self.log_lines()
+            .iter()
+            .filter(|line| line.starts_with("start "))
+            .count()
+    }
+}
+
+fn limits(request_timeout: Duration, idle: Duration) -> LanguageServerLimits {
+    LanguageServerLimits {
+        request_timeout,
+        idle,
+        shutdown_grace: Duration::from_millis(500),
+    }
+}
+
+/// Generous: a process launch on the development Mac can stall for seconds
+/// (`AGENTS.md`), and a fake server's `initialize` is one launch away.
+const START_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn document_symbol(
+    hub: &LanguageServerHub,
+    launch: &LanguageServerLaunch,
+) -> Result<serde_json::Value, LanguageServerError> {
+    hub.request(launch, |client, uris| {
+        client.document_symbol(&uris.uri_for("src/lib.rs"))
+    })
+}
+
+fn wait_until(what: &str, limit: Duration, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + limit;
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn is_running(pid: u32) -> bool {
+    ProcessIdentity::of(pid).is_some()
+}
+
+#[test]
+fn with_no_language_server_configured_nothing_is_launched_or_recorded() {
+    let fixture = ServerFixture::new("lsp-none");
+    let engine = WorkspaceEngine::new(fixture.repo.config());
+    for language in LANGUAGE_SERVER_LANGUAGES {
+        assert_eq!(
+            engine.language_server_launch(&fixture.repo.root, language, "ses_task5"),
+            None,
+            "{language}"
+        );
+    }
+    // Configuring one language starts nothing for another.
+    let mut config = fixture.repo.config();
+    config
+        .language_servers
+        .insert("rust".to_string(), fixture.command("normal"));
+    assert!(
+        LanguageServerLaunch::from_config(&config, &fixture.repo.root, "python", "ses").is_none()
+    );
+
+    let hub = LanguageServerHub::with_limits(LanguageServerLimits::default());
+    let repository_id = workspace_engine::repository_id_for_root(&fixture.repo.root);
+    assert!(hub.status(&repository_id).is_empty());
+    assert!(fixture.registry_entries().is_empty());
+    assert_eq!(fixture.spawns(), 0);
+}
+
+#[test]
+fn a_repository_cannot_name_a_language_server_and_the_users_stands() {
+    let fixture = ServerFixture::new("lsp-repo-config");
+    let user_config = fixture.repo.data_dir.join("config").join("user.conf");
+    fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    fs::write(
+        &user_config,
+        "language_server.rust=/usr/local/bin/rust-analyzer\n",
+    )
+    .unwrap();
+    let repository_config = Config::repository_config_path(&fixture.repo.root);
+    fs::create_dir_all(repository_config.parent().unwrap()).unwrap();
+    fs::write(
+        &repository_config,
+        "language_server.rust=/bin/sh\nlanguage_server.python=./tools/pyls\n",
+    )
+    .unwrap();
+
+    let (config, report) = Config::load_scoped(
+        fixture.repo.config(),
+        Some(&user_config),
+        Some(&repository_config),
+        None,
+        Some(&fixture.repo.root),
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.language_servers.get("rust").map(String::as_str),
+        Some("/usr/local/bin/rust-analyzer")
+    );
+    assert_eq!(config.language_servers.get("python"), None);
+    let refused: Vec<_> = report
+        .rejected_keys
+        .iter()
+        .map(|rejected| (rejected.key.as_str(), rejected.class))
+        .collect();
+    assert!(
+        refused.contains(&("language_server.rust", RepositoryKeyClass::Forbidden)),
+        "{refused:?}"
+    );
+    assert!(
+        refused.contains(&("language_server.python", RepositoryKeyClass::Forbidden)),
+        "{refused:?}"
+    );
+
+    let audit = AuditLog::new(&fixture.repo.data_dir, true, SecretScanner::new(Vec::new()));
+    RepositoryTrustStore::new(&fixture.repo.data_dir)
+        .review(&report, &audit)
+        .unwrap()
+        .expect("the refusal is surfaced");
+    let events =
+        fs::read_to_string(fixture.repo.data_dir.join("audit").join("events.jsonl")).unwrap();
+    assert!(
+        events.contains("repository_config_key_rejected"),
+        "{events}"
+    );
+    assert!(events.contains("language_server.rust"), "{events}");
+    assert!(
+        !events.contains("./tools/pyls"),
+        "a refused value was logged"
+    );
+}
+
+#[test]
+fn an_unknown_language_is_a_parse_error() {
+    let error = ConfigOverlay::parse("language_server.cobol=/usr/bin/cobol-ls\n").unwrap_err();
+    assert!(
+        error.to_string().contains("language_server.cobol"),
+        "{error}"
+    );
+    assert!(ConfigOverlay::parse("language_server.rust=\n").is_err());
+    let overlay = ConfigOverlay::parse("language_server.rust=rust-analyzer\n").unwrap();
+    assert_eq!(
+        overlay.to_policy_text(),
+        "language_server.rust=rust-analyzer\n"
+    );
+}
+
+#[test]
+fn a_running_server_has_one_registry_entry_until_shutdown_all() {
+    let fixture = ServerFixture::new("lsp-normal");
+    let launch = fixture.launch("normal");
+    let hub = LanguageServerHub::with_limits(limits(START_TIMEOUT, Duration::from_secs(600)));
+
+    let answer = document_symbol(&hub, &launch).expect("the fake server answers");
+    assert_eq!(answer, serde_json::json!([]));
+
+    let entries = fixture.registry_entries();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].kind, "language_server");
+    assert_eq!(entries[0].session_id, "ses_task5");
+    let status = hub.status(&launch.repository_id);
+    assert_eq!(status.len(), 1);
+    assert_eq!(status[0].state, LanguageServerState::Ready);
+    assert_eq!(status[0].language, "rust");
+    let pid = status[0].pid.expect("a ready server has a pid");
+    assert_eq!(entries[0].pid, pid);
+    assert!(is_running(pid));
+    // The entry exists by the time the server reads `initialize`. That alone
+    // does not prove the order: the parent wins the race even when it writes
+    // first. `lsp.rs`'s `a_server_is_registered_before_anything_is_written_to_it`
+    // does.
+    assert!(
+        fixture
+            .log_lines()
+            .contains(&"initialize registered=true".to_string()),
+        "{:?}",
+        fixture.log_lines()
+    );
+
+    hub.shutdown_all();
+
+    assert!(fixture.registry_entries().is_empty());
+    assert!(!is_running(pid), "the server outlived shutdown_all");
+    assert!(hub.status(&launch.repository_id).is_empty());
+    let log = fixture.log_lines();
+    assert!(
+        log.contains(&"shutdown".to_string()) && log.contains(&"exit".to_string()),
+        "the polite path was not taken: {log:?}"
+    );
+    assert_eq!(fixture.spawns(), 1);
+}
+
+#[test]
+fn an_idle_server_is_stopped_and_its_entry_removed() {
+    let fixture = ServerFixture::new("lsp-idle");
+    let launch = fixture.launch("normal");
+    let hub = LanguageServerHub::with_limits(limits(START_TIMEOUT, Duration::from_millis(300)));
+
+    document_symbol(&hub, &launch).expect("the fake server answers");
+    assert_eq!(fixture.registry_entries().len(), 1);
+    let pid = fixture.registry_entries()[0].pid;
+
+    // Nothing asks the hub anything from here: the reaper alone stops it.
+    wait_until("the idle server to stop", Duration::from_secs(20), || {
+        fixture.registry_entries().is_empty() && !is_running(pid)
+    });
+    assert!(hub.status(&launch.repository_id).is_empty());
+}
+
+#[test]
+fn a_server_that_never_answers_initialize_is_unavailable_and_then_answers_at_once() {
+    let fixture = ServerFixture::new("lsp-silent");
+    let launch = fixture.launch("silent");
+    let timeout = Duration::from_secs(2);
+    let hub = LanguageServerHub::with_limits(limits(timeout, Duration::from_secs(600)));
+
+    let started = Instant::now();
+    let first = document_symbol(&hub, &launch);
+    let waited = started.elapsed();
+    let Err(LanguageServerError::Unavailable { reason }) = first else {
+        panic!("expected unavailable, got {first:?}");
+    };
+    assert!(reason.contains("initialize"), "{reason}");
+    assert!(waited >= timeout, "gave up before the timeout: {waited:?}");
+    // The timeout, plus one process launch and a kill.
+    assert!(waited < timeout + START_TIMEOUT, "{waited:?}");
+    assert!(matches!(
+        hub.status(&launch.repository_id)[0].state,
+        LanguageServerState::Unavailable { .. }
+    ));
+
+    let started = Instant::now();
+    let second = document_symbol(&hub, &launch);
+    assert!(
+        matches!(second, Err(LanguageServerError::Unavailable { .. })),
+        "{second:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "an unavailable server must answer at once: {:?}",
+        started.elapsed()
+    );
+    assert!(fixture.registry_entries().is_empty());
+    assert_eq!(fixture.spawns(), 1, "an unavailable server is not retried");
+}
+
+#[test]
+fn a_server_that_crashes_twice_is_restarted_once_and_then_left_down() {
+    let fixture = ServerFixture::new("lsp-crash");
+    let launch = fixture.launch("exit_after_1");
+    let hub = LanguageServerHub::with_limits(limits(START_TIMEOUT, Duration::from_secs(600)));
+
+    let results: Vec<_> = (0..6).map(|_| document_symbol(&hub, &launch)).collect();
+
+    let answered = results.iter().filter(|result| result.is_ok()).count();
+    assert_eq!(answered, 2, "one answer per process: {results:?}");
+    assert_eq!(fixture.spawns(), 2, "{:?}", fixture.log_lines());
+    let status = hub.status(&launch.repository_id);
+    assert_eq!(
+        status[0].state,
+        LanguageServerState::Crashed { restarts: 1 },
+        "{status:?}"
+    );
+    assert_eq!(status[0].pid, None);
+    assert!(fixture.registry_entries().is_empty());
+    for result in &results[results.len() - 2..] {
+        assert!(
+            matches!(result, Err(LanguageServerError::Unavailable { .. })),
+            "{result:?}"
+        );
+    }
+
+    // And no third process, however often it is asked.
+    let started = Instant::now();
+    assert!(document_symbol(&hub, &launch).is_err());
+    assert!(started.elapsed() < Duration::from_millis(200));
+    assert_eq!(fixture.spawns(), 2);
+}
+
+/// Spec 46's start-time check, over a `LanguageServer` entry (context.md §1):
+/// the recorded PID is alive, but its start time is not the one recorded, so
+/// the launch sweep refuses to kill it. The PID is this test process, which
+/// is why the kill is injected: if the check failed, the sweep would kill the
+/// test runner rather than report it.
+#[test]
+fn a_language_server_entry_whose_start_time_does_not_match_is_not_killed() {
+    let fixture = ServerFixture::new("lsp-sweep");
+    let config = fixture.repo.config();
+    let (registry, audit) = ProcessRegistry::open_with_audit(&config).unwrap();
+    let ours = ProcessIdentity::of(std::process::id()).unwrap();
+    let entry = RegisteredProcess {
+        pid: ours.pid,
+        start_time_us: ours.start_time_us - 1,
+        pgid: ours.pid,
+        kind: ProcessKind::LanguageServer.as_str().to_string(),
+        session_id: "ses_task5".to_string(),
+        registered_at_ms: 0,
+        // An owner that is provably gone, as after a crash.
+        owner_pid: 99_999_999,
+        owner_start_time_us: 1,
+    };
+    let processes = fixture.repo.data_dir.join("processes");
+    fs::write(
+        processes.join(entry.file_name()),
+        serde_json::to_string(&entry).unwrap(),
+    )
+    .unwrap();
+
+    let mut killed = Vec::new();
+    let report = registry
+        .sweep_with(
+            &audit,
+            SweepScope::CrashedOwners,
+            &|pid| ProcessIdentity::of(pid),
+            &mut |entry: &RegisteredProcess| killed.push(entry.pid),
+        )
+        .unwrap();
+
+    assert!(killed.is_empty(), "a recycled PID was killed");
+    assert_eq!(report.refused(), 1, "{report:?}");
+    let events =
+        fs::read_to_string(fixture.repo.data_dir.join("audit").join("events.jsonl")).unwrap();
+    assert!(events.contains("orphan_process_kill_refused"), "{events}");
+    assert!(events.contains("\"kind\":\"language_server\""), "{events}");
+    assert!(
+        fixture.registry_entries().is_empty(),
+        "the refused entry is removed"
+    );
+}
+
+/// The fake language server. Never run on its own: a test re-executes the
+/// test binary into it through `ServerFixture::command`, and run directly it
+/// returns at once. Its behaviour is `DAMAIAN_FAKE_LSP_MODE`:
+///
+/// - `normal`: answers `initialize`, `shutdown`, and every other request with
+///   an empty result;
+/// - `silent`: never answers `initialize`;
+/// - `exit_after_<n>`: answers `n` requests after `initialize`, then exits;
+/// - `exit_at_once`: exits before reading anything.
+///
+/// It appends what happened to `DAMAIAN_FAKE_LSP_LOG`, and on `initialize`
+/// records whether its own registry entry already existed.
+#[test]
+#[ignore = "the fake language server; re-executed by the Task 5 tests"]
+fn fake_language_server_helper() {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+
+    let Ok(mode) = std::env::var(FAKE_MODE) else {
+        return;
+    };
+    let log_path = std::env::var(FAKE_LOG).expect("a log path");
+    let registry = PathBuf::from(std::env::var(FAKE_REGISTRY).expect("a registry path"));
+    let log = |line: &str| {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    };
+    let pid = std::process::id();
+    log(&format!("start {pid}"));
+    if mode == "exit_at_once" {
+        std::process::exit(0);
+    }
+    let exit_after = mode
+        .strip_prefix("exit_after_")
+        .map(|count| count.parse::<usize>().unwrap());
+
+    // SAFETY: fd 3 is the pipe the command line moved there, and nothing
+    // else in this process owns it.
+    let mut output = unsafe { fs::File::from_raw_fd(3) };
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut answered = 0;
+    let mut reply = |id: &serde_json::Value, result: serde_json::Value| {
+        let message = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+        write_message(&mut output, &message).unwrap();
+    };
+    loop {
+        let Ok(Some(message)) = read_message(&mut input) else {
+            std::process::exit(0);
+        };
+        let method = message["method"].as_str().unwrap_or_default().to_string();
+        let id = message.get("id").cloned();
+        match (method.as_str(), id) {
+            ("initialize", Some(id)) => {
+                let prefix = format!("{pid}-");
+                let registered = fs::read_dir(&registry).is_ok_and(|entries| {
+                    entries
+                        .filter_map(|entry| entry.ok())
+                        .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+                });
+                log(&format!("initialize registered={registered}"));
+                if mode != "silent" {
+                    reply(&id, serde_json::json!({ "capabilities": {} }));
+                }
+            }
+            ("shutdown", Some(id)) => {
+                log("shutdown");
+                reply(&id, serde_json::Value::Null);
+            }
+            ("exit", None) => {
+                log("exit");
+                std::process::exit(0);
+            }
+            (method, Some(id)) => {
+                log(&format!("request {method}"));
+                reply(&id, serde_json::json!([]));
+                answered += 1;
+                if exit_after.is_some_and(|limit| answered >= limit) {
+                    std::process::exit(0);
+                }
+            }
+            (_, None) => {}
+        }
+    }
 }

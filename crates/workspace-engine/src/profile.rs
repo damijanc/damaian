@@ -373,6 +373,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         mcp_servers,
         hooks,
         hook_reviews_by_repository,
+        language_servers,
     } = overlay;
 
     let mut refused = Vec::new();
@@ -467,6 +468,14 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
                 RepositoryKeyClass::Forbidden,
             );
         }
+    }
+    // A language server is a program to run, like a hook (spec 25 context.md
+    // §6).
+    for language in language_servers.keys() {
+        refuse(
+            format!("language_server.{language}"),
+            RepositoryKeyClass::Forbidden,
+        );
     }
     // A profile may disable or gate a server the user has, never define one:
     // the definition is where `auth_token_env` lives.

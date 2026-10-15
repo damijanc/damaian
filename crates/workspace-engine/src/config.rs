@@ -366,7 +366,25 @@ pub struct Config {
     /// and then hook id. User-owned, like `Allow Always`: a repository cannot
     /// approve its own hook.
     pub hook_reviews_by_repository: BTreeMap<String, BTreeMap<String, HookReview>>,
+    /// `language_server.<language>=<command line>` (spec 25 `context.md` §6),
+    /// keyed by language. A program Damaian spawns, so it is set by user or
+    /// admin config only, like `shell`.
+    pub language_servers: BTreeMap<String, String>,
 }
+
+/// The languages `language_server.<language>` accepts: the names
+/// `detect_language` returns for which `extract_declarations` has a tier to
+/// improve on. Each is also the server's LSP language id.
+pub const LANGUAGE_SERVER_LANGUAGES: [&str; 8] = [
+    "go",
+    "java",
+    "javascript",
+    "kotlin",
+    "php",
+    "python",
+    "rust",
+    "typescript",
+];
 
 // No `Eq`: the price rates are `Option<f64>`.
 #[derive(Debug, Clone, PartialEq)]
@@ -1104,6 +1122,7 @@ impl Config {
             mcp_servers,
             hooks,
             hook_reviews_by_repository,
+            language_servers,
         } = overlay;
 
         let mut outcome = OverlayOutcome::default();
@@ -1175,6 +1194,16 @@ impl Config {
         if let Some(value) = scoped(shell, "shell", trusted, forbidden, rejected) {
             self.shell = value;
             outcome.record(scope, "shell", None, false);
+        }
+        // A program Damaian starts unprompted, with the repository as its
+        // working directory: the same power as `shell`, so a clone may not name
+        // one and a profile does not carry one (spec 25 `context.md` §6).
+        for (language, command) in language_servers {
+            let key = format!("language_server.{language}");
+            if let Some(command) = scoped(Some(command), &key, trusted, forbidden, rejected) {
+                self.language_servers.insert(language, command);
+                outcome.record(scope, key, None, false);
+            }
         }
         for provider in model_providers {
             let key = format!("model_provider.{}", provider.id);
@@ -2485,6 +2514,9 @@ impl Config {
         for hook in &self.hooks {
             push_hook_config(&mut output, hook);
         }
+        for (language, command) in &self.language_servers {
+            push_line(&mut output, &format!("language_server.{language}"), command);
+        }
         output
     }
 }
@@ -2558,6 +2590,9 @@ impl Default for Config {
             mcp_servers: Vec::new(),
             hooks: Vec::new(),
             hook_reviews_by_repository: BTreeMap::new(),
+            // None: with nothing configured no server is ever spawned, and the
+            // heuristic tier stands alone (proposal §5.4).
+            language_servers: BTreeMap::new(),
         }
     }
 }
@@ -2621,6 +2656,8 @@ pub struct ConfigOverlay {
     /// `hook_review.<repository_id>.<hook_id>` entries, from user or admin
     /// config.
     pub hook_reviews_by_repository: BTreeMap<String, BTreeMap<String, HookReview>>,
+    /// `language_server.<language>` entries, by language.
+    pub language_servers: BTreeMap<String, String>,
 }
 
 /// Which commands a permission profile lets run at all, narrowest first, so
@@ -2758,6 +2795,9 @@ classify_overlay_fields! {
     // one repository (spec 32, context.md §7.1).
     hooks => Capability,
     hook_reviews_by_repository => Capability,
+    // A program Damaian spawns in the background, like `shell` (spec 25,
+    // context.md §6).
+    language_servers => Capability,
 }
 
 impl ConfigOverlay {
@@ -2866,6 +2906,9 @@ impl ConfigOverlay {
         }
         if let Some(repository_id) = key.strip_prefix("permission_profile.") {
             return self.set_repository_permission_profile(repository_id, value);
+        }
+        if let Some(language) = key.strip_prefix("language_server.") {
+            return self.set_language_server(language, value);
         }
         match key {
             "data_dir" => self.data_dir = Some(PathBuf::from(value)),
@@ -3010,6 +3053,27 @@ impl ConfigOverlay {
         }
         self.permission_profile_by_repository
             .insert(repository_id.to_string(), ProfileId::parse(value)?);
+        Ok(())
+    }
+
+    /// `language_server.<language>=<command line>`. An unknown language is an
+    /// error rather than an entry that is never used, so a typo is reported.
+    /// Whether the scope may set it is decided when the overlay is applied.
+    fn set_language_server(&mut self, language: &str, value: &str) -> Result<()> {
+        let language = language.trim();
+        if !LANGUAGE_SERVER_LANGUAGES.contains(&language) {
+            return Err(ClientError::InvalidInput(format!(
+                "Unknown language in config key: language_server.{language} (expected one of {})",
+                LANGUAGE_SERVER_LANGUAGES.join(", ")
+            )));
+        }
+        if value.trim().is_empty() {
+            return Err(ClientError::InvalidInput(format!(
+                "language_server.{language} must name a command"
+            )));
+        }
+        self.language_servers
+            .insert(language.to_string(), value.to_string());
         Ok(())
     }
 
@@ -3292,6 +3356,7 @@ impl ConfigOverlay {
             mcp_servers,
             hooks,
             hook_reviews_by_repository,
+            language_servers,
         } = self;
         let mut output = String::new();
         if let Some(value) = data_dir {
@@ -3491,6 +3556,9 @@ impl ConfigOverlay {
                     review.as_str(),
                 );
             }
+        }
+        for (language, command) in language_servers {
+            push_line(&mut output, &format!("language_server.{language}"), command);
         }
         output
     }

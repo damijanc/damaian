@@ -180,6 +180,7 @@ pub fn rule_label(key: &str) -> Option<String> {
         "command_allowlist" => return rule_label(prefix),
         "permission_profile" => return Some("Permission profile".to_string()),
         "hook_review" => return Some("Your review of a repository hook".to_string()),
+        "language_server" => return Some(format!("Language server for {rest}")),
         "model_provider" => "Model provider",
         "mcp_server" => "MCP server",
         "hook" => "Hook",

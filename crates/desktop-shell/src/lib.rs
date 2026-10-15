@@ -159,6 +159,9 @@ where
             Err(error) => eprintln!("connection failed: {error}"),
         }
     }
+    // A normal exit: servers get `shutdown` and `exit` before they are
+    // killed. A signal goes through `sweep_own` instead (spec 25 context.md §3).
+    workspace_engine::LanguageServerHub::shutdown_global();
     Ok(())
 }
 

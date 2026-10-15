@@ -72,6 +72,10 @@ pub enum ProcessKind {
     /// so the launch sweep kills the workers of a crashed shell; each worker
     /// registers its own children, so its `sweep_own` kills exactly those.
     Worker,
+    /// A spec 25 language server, owned by the process-wide hub. Often the
+    /// same program as the user's own editor's server, which is why it is
+    /// only ever stopped by PID.
+    LanguageServer,
 }
 
 impl ProcessKind {
@@ -83,6 +87,7 @@ impl ProcessKind {
             Self::Command => "command",
             Self::Hook => "hook",
             Self::Worker => "worker",
+            Self::LanguageServer => "language_server",
         }
     }
 }

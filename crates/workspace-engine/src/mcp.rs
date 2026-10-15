@@ -56,7 +56,7 @@ pub fn parse_namespaced_tool_name(name: &str) -> Option<(String, String)> {
 /// backslash escape) group a token so paths with spaces survive. Not a full
 /// POSIX parser — just enough to let a pasted `python /path/server.py` line be
 /// launched correctly.
-fn shell_split(input: &str) -> Vec<String> {
+pub(crate) fn shell_split(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut has_token = false;

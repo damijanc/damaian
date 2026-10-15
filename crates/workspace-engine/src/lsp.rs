@@ -1,4 +1,5 @@
-//! Spec 25, Task 4: the language-server protocol, without a process.
+//! Spec 25, Tasks 4 and 5: the language-server protocol, and the processes
+//! that speak it.
 //!
 //! LSP frames every message with a `Content-Length:` header and a blank line,
 //! and a body may contain newlines, so the MCP transport's line framing does
@@ -13,16 +14,32 @@
 //! (`initialize`, `initialized`, `shutdown`, `exit`), `didOpen`/`didClose`,
 //! `documentSymbol`, `definition`, `references`, `implementation`, and the
 //! `publishDiagnostics` notification.
+//!
+//! Task 5 adds the process layer: [`LanguageServerHub`] owns one child per
+//! `(repository_id, language)`, spawned the way `StdioTransport` spawns an MCP
+//! server and registered with spec 46's registry, and puts its pipes under
+//! [`LspClient`].
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::config::Config;
 use crate::error::{ClientError, Result};
 use crate::finding::{FindingDraft, FindingSource, Severity, SourceRange};
+use crate::hash::repository_id_for_root;
 use crate::language::SymbolKind;
+use crate::mcp::shell_split;
+use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
 use crate::secret_scanner::SecretScanner;
 use crate::symbol_index::{Provenance, Symbol, SymbolRef};
 
@@ -861,6 +878,736 @@ fn diagnostic_draft(diagnostic: &Value, path: &str) -> FindingDraft {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The process layer (Task 5)
+// ---------------------------------------------------------------------------
+
+/// How long one request, `initialize` included, may take before it is given
+/// up on (`context.md` §8). A timed-out request leaves the server running.
+pub const LANGUAGE_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A server with no request for this long is shut down (`context.md` §3).
+pub const LANGUAGE_SERVER_IDLE_SECS: u64 = 600;
+
+/// How long a server is given to act on `shutdown` and `exit` before
+/// `Child::kill`.
+pub const LANGUAGE_SERVER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+
+/// A crashed server is restarted this many times per hub entry, and then left
+/// down: a server that crashes on one file would otherwise be restarted in a
+/// loop (proposal §5.8), and the heuristic tier covers its absence.
+const LANGUAGE_SERVER_MAX_RESTARTS: u32 = 1;
+
+/// The hub's timings. [`LanguageServerHub::global`] uses the defaults; tests
+/// lower them through [`LanguageServerHub::with_limits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanguageServerLimits {
+    pub request_timeout: Duration,
+    pub idle: Duration,
+    pub shutdown_grace: Duration,
+}
+
+impl Default for LanguageServerLimits {
+    fn default() -> Self {
+        Self {
+            request_timeout: LANGUAGE_SERVER_REQUEST_TIMEOUT,
+            idle: Duration::from_secs(LANGUAGE_SERVER_IDLE_SECS),
+            shutdown_grace: LANGUAGE_SERVER_SHUTDOWN_GRACE,
+        }
+    }
+}
+
+/// Where a hub entry stands. Only `Ready` answers requests; every other state
+/// answers "unavailable" at once, and the heuristic tier stands alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum LanguageServerState {
+    /// Spawned, and `initialize` not yet answered.
+    Starting,
+    Ready,
+    /// The spawn failed, or `initialize` failed or timed out. Down for the
+    /// life of the entry.
+    Unavailable {
+        reason: String,
+    },
+    /// The server exited or its output broke. `restarts` is how many restarts
+    /// the entry has used; once it reaches the limit the entry stays down.
+    Crashed {
+        restarts: u32,
+    },
+}
+
+/// One entry of [`LanguageServerHub::status`], for the shell (Task 10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LanguageServerStatus {
+    pub language: String,
+    pub command: String,
+    #[serde(flatten)]
+    pub state: LanguageServerState,
+    /// The running server's PID, while there is one.
+    pub pid: Option<u32>,
+}
+
+/// Why a hub request returned nothing. None of these is an error state for
+/// the caller: each means "use the heuristic tier" (proposal §5.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LanguageServerError {
+    /// Not `Ready`: starting, unavailable, crashed, or just crashed now.
+    Unavailable { reason: String },
+    /// No response within the request timeout. The server stays up.
+    TimedOut { method: &'static str },
+    /// The server answered with an error response.
+    Refused { message: String },
+}
+
+impl std::fmt::Display for LanguageServerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable { reason } => {
+                write!(formatter, "Language server unavailable: {reason}")
+            }
+            Self::TimedOut { method } => {
+                write!(formatter, "Language server did not answer {method} in time")
+            }
+            Self::Refused { message } => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for LanguageServerError {}
+
+/// What the hub needs to start one server: which entry it is, the program,
+/// and where to record it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageServerLaunch {
+    pub repository_id: String,
+    pub language: String,
+    /// The repository root, canonical, as the engine uses it everywhere: the
+    /// server's working directory and `rootUri` (Task 4's note on
+    /// `RepositoryUris`).
+    pub root: PathBuf,
+    /// The configured command line, shell-split like an MCP `command`.
+    pub command: String,
+    /// The registry the spawn is recorded in.
+    pub data_dir: PathBuf,
+    /// The session whose request caused the spawn, for the audit trail only
+    /// (`context.md` §3).
+    pub session_id: String,
+}
+
+impl LanguageServerLaunch {
+    /// `None` when `config` names no server for `language`, and then nothing
+    /// is ever spawned for it.
+    pub fn from_config(
+        config: &Config,
+        root: &Path,
+        language: &str,
+        session_id: &str,
+    ) -> Option<Self> {
+        let command = config.language_servers.get(language)?;
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        Some(Self {
+            repository_id: repository_id_for_root(&root),
+            language: language.to_string(),
+            root,
+            command: command.clone(),
+            data_dir: config.data_dir.clone(),
+            session_id: session_id.to_string(),
+        })
+    }
+
+    fn key(&self) -> (String, String) {
+        (self.repository_id.clone(), self.language.clone())
+    }
+}
+
+/// How a wait on a running server ended, when it did not end in a result.
+enum Interrupted {
+    TimedOut {
+        method: &'static str,
+    },
+    /// The server is gone or its stream is unusable: a crash.
+    Gone(String),
+    Refused(String),
+}
+
+/// A running server: the child, the JSON-RPC client over its stdin, and the
+/// channel its stdout reader thread feeds.
+struct ServerProcess {
+    child: Child,
+    client: LspClient<ChildStdin>,
+    messages: Receiver<Value>,
+    uris: RepositoryUris,
+    /// Removes the registry entry when dropped. Declared last, and the child
+    /// is always reaped before it drops, so a live server is never
+    /// unrecorded.
+    _registration: RegistrationHandle,
+}
+
+impl ServerProcess {
+    /// [`spawn_registered`], then `initialize` under the request timeout. The
+    /// error is the reason the entry is unavailable.
+    fn start(
+        launch: &LanguageServerLaunch,
+        timeout: Duration,
+    ) -> std::result::Result<Self, String> {
+        let (mut child, registration) = spawn_registered(launch)?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("could not open the server's stdin and stdout".to_string());
+        };
+        let (sender, messages) = mpsc::channel();
+        // A framing error ends the thread like an end of stream: the stream
+        // cannot be resynchronised, so the disconnect is read as a crash.
+        let reader = thread::Builder::new()
+            .name("damaian-lsp-reader".to_string())
+            .spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                while let Ok(Some(message)) = read_message(&mut reader) {
+                    if sender.send(message).is_err() {
+                        break;
+                    }
+                }
+            });
+        let mut process = Self {
+            child,
+            client: LspClient::new(stdin),
+            messages,
+            uris: RepositoryUris::new(&launch.root),
+            _registration: registration,
+        };
+        if let Err(error) = reader {
+            process.kill();
+            return Err(format!("could not start the reader thread: {error}"));
+        }
+        let initialized = process
+            .client
+            .initialize(&process.uris, std::process::id())
+            .map_err(|error| Interrupted::Gone(error.to_string()))
+            .and_then(|id| process.await_response(id, timeout))
+            .and_then(|_| {
+                process
+                    .client
+                    .initialized()
+                    .map_err(|error| Interrupted::Gone(error.to_string()))
+            });
+        match initialized {
+            Ok(()) => Ok(process),
+            Err(interrupted) => {
+                process.kill();
+                Err(match interrupted {
+                    Interrupted::TimedOut { .. } => format!(
+                        "did not answer initialize within {} ms",
+                        timeout.as_millis()
+                    ),
+                    Interrupted::Gone(reason) => format!("exited during initialize: {reason}"),
+                    Interrupted::Refused(message) => message,
+                })
+            }
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Task 4's `await_response`, with `next` a `recv_timeout` on the reader
+    /// thread's channel. A timed-out request is forgotten, so its late answer
+    /// is `Unmatched`.
+    fn await_response(
+        &mut self,
+        id: u64,
+        timeout: Duration,
+    ) -> std::result::Result<Value, Interrupted> {
+        let deadline = Instant::now() + timeout;
+        let mut timed_out = false;
+        let mut disconnected = false;
+        let Self {
+            client, messages, ..
+        } = self;
+        let result = client.await_response(
+            id,
+            || {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match messages.recv_timeout(remaining) {
+                    Ok(message) => Ok(Some(message)),
+                    Err(RecvTimeoutError::Timeout) => {
+                        timed_out = true;
+                        Err(ClientError::Io("timed out".to_string()))
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        disconnected = true;
+                        Ok(None)
+                    }
+                }
+            },
+            // Diagnostics and the rest are routed by Task 7; until then a
+            // notification that arrives during a wait is dropped.
+            |_event| {},
+        );
+        match result {
+            Ok(value) => Ok(value),
+            Err(_) if timed_out => Err(Interrupted::TimedOut {
+                method: client.forget(id).map_or("a request", LspRequest::method),
+            }),
+            Err(error) if disconnected => Err(Interrupted::Gone(error.to_string())),
+            // Still pending: `receive` failed on a message that is not
+            // JSON-RPC, or a reply could not be written. Either way the
+            // connection is not usable.
+            Err(error) if client.forget(id).is_some() => Err(Interrupted::Gone(error.to_string())),
+            Err(error) => Err(Interrupted::Refused(error.to_string())),
+        }
+    }
+
+    /// `shutdown`, then `exit`, a grace period, then `Child::kill` and `wait`.
+    fn stop(mut self, grace: Duration) {
+        if let Ok(id) = self.client.shutdown() {
+            let _ = self.await_response(id, grace);
+        }
+        let _ = self.client.exit();
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        self.kill();
+    }
+
+    /// By the owned handle, so by PID: an unreaped child cannot have had its
+    /// PID recycled (`context.md` §1). The registration drops after the wait.
+    fn kill(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The spawn `StdioTransport::spawn` makes (`context.md` §2): shell split,
+/// piped stdin and stdout, null stderr, its own process group. It returns
+/// only once the child is recorded, and touches nothing else, so no byte
+/// reaches a server that is running unrecorded (spec 46).
+fn spawn_registered(
+    launch: &LanguageServerLaunch,
+) -> std::result::Result<(Child, RegistrationHandle), String> {
+    let mut tokens = shell_split(&launch.command).into_iter();
+    let Some(program) = tokens.next() else {
+        return Err("the configured command is empty".to_string());
+    };
+    // Opened before the spawn, so a registry that cannot be written means no
+    // process rather than an unrecorded one.
+    let registry = ProcessRegistry::open(&launch.data_dir)
+        .map_err(|error| format!("cannot open the process registry: {error}"))?;
+    let mut child = Command::new(&program)
+        .args(tokens)
+        .current_dir(&launch.root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // A server's log channel. Discarded so a chatty server cannot fill the
+        // pipe and block.
+        .stderr(Stdio::null())
+        // Its own group, as for MCP servers, so the sweep can reach what the
+        // server itself spawns.
+        .process_group(0)
+        .spawn()
+        .map_err(|error| format!("could not start '{}': {error}", launch.command))?;
+    match registry.register(ProcessKind::LanguageServer, &launch.session_id, child.id()) {
+        Ok(registration) => Ok((child, registration)),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(format!("could not record the server's process: {error}"))
+        }
+    }
+}
+
+struct SlotMeta {
+    state: LanguageServerState,
+    /// Whether a request has claimed the first start.
+    started: bool,
+    restarts: u32,
+    last_used: Instant,
+    pid: Option<u32>,
+}
+
+/// One `(repository_id, language)` entry. `meta` is only ever held briefly,
+/// so a caller can read the state without waiting behind a request; `process`
+/// is held for the length of one request. Lock order: never wait for
+/// `process` while holding `meta`.
+struct Slot {
+    launch: LanguageServerLaunch,
+    meta: Mutex<SlotMeta>,
+    process: Mutex<Option<ServerProcess>>,
+}
+
+impl Slot {
+    fn meta(&self) -> MutexGuard<'_, SlotMeta> {
+        self.meta
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn process(&self) -> MutexGuard<'_, Option<ServerProcess>> {
+        self.process
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn status(&self) -> LanguageServerStatus {
+        let meta = self.meta();
+        LanguageServerStatus {
+            language: self.launch.language.clone(),
+            command: self.launch.command.clone(),
+            state: meta.state.clone(),
+            pid: meta.pid,
+        }
+    }
+
+    /// Marks the entry crashed and kills what is left of the process.
+    fn crashed(&self, process: &mut Option<ServerProcess>) {
+        if let Some(process) = process.take() {
+            process.kill();
+        }
+        let mut meta = self.meta();
+        meta.state = LanguageServerState::Crashed {
+            restarts: meta.restarts,
+        };
+        meta.pid = None;
+    }
+
+    fn shut_down(&self, grace: Duration) {
+        let taken = self.process().take();
+        if let Some(process) = taken {
+            process.stop(grace);
+        }
+        self.meta().pid = None;
+    }
+}
+
+type SlotKey = (String, String);
+
+struct HubInner {
+    limits: LanguageServerLimits,
+    slots: Mutex<BTreeMap<SlotKey, Arc<Slot>>>,
+    /// The reaper's stop channel. Started with the first entry, so a hub that
+    /// never starts a server never starts a thread either.
+    reaper: Mutex<Option<Sender<()>>>,
+}
+
+impl HubInner {
+    fn slots(&self) -> MutexGuard<'_, BTreeMap<SlotKey, Arc<Slot>>> {
+        self.slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Removes the entries that had no request for the idle limit. The caller
+    /// stops them.
+    fn take_expired(&self) -> Vec<Arc<Slot>> {
+        let mut slots = self.slots();
+        let expired: Vec<SlotKey> = slots
+            .iter()
+            .filter(|(_, slot)| slot.meta().last_used.elapsed() >= self.limits.idle)
+            .map(|(key, _)| key.clone())
+            .collect();
+        expired.iter().filter_map(|key| slots.remove(key)).collect()
+    }
+
+    fn stop_all(&self, slots: Vec<Arc<Slot>>) {
+        // In parallel, so stopping many costs one grace period, not one each.
+        thread::scope(|scope| {
+            for slot in &slots {
+                scope.spawn(|| slot.shut_down(self.limits.shutdown_grace));
+            }
+        });
+    }
+}
+
+/// The process-wide owner of language servers, keyed by
+/// `(repository_id, language)` (`context.md` §3). A server starts on the
+/// first request for its entry and stops after `LANGUAGE_SERVER_IDLE_SECS`
+/// without one, on [`Self::shutdown_all`], or when the hub is dropped. On a
+/// signal, spec 46's `sweep_own` kills every registered server by PID.
+///
+/// A request blocks its caller for at most the request timeout, plus one
+/// `initialize` when it starts or restarts the server. Callers are the hub's
+/// own background work and explicit on-demand lookups, never a turn or a
+/// shell handler (`context.md` §8).
+pub struct LanguageServerHub {
+    inner: Arc<HubInner>,
+}
+
+static GLOBAL_HUB: OnceLock<LanguageServerHub> = OnceLock::new();
+
+impl LanguageServerHub {
+    /// The hub this process uses. A worker (spec 57) is its own process, so
+    /// it has its own hub.
+    pub fn global() -> &'static Self {
+        GLOBAL_HUB.get_or_init(|| Self::with_limits(LanguageServerLimits::default()))
+    }
+
+    /// Stops the global hub's servers, if it was ever used. The desktop shell
+    /// calls this on its way out.
+    pub fn shutdown_global() {
+        if let Some(hub) = GLOBAL_HUB.get() {
+            hub.shutdown_all();
+        }
+    }
+
+    /// A hub with its own timings, for tests. Its servers stop when it drops.
+    pub fn with_limits(limits: LanguageServerLimits) -> Self {
+        Self {
+            inner: Arc::new(HubInner {
+                limits,
+                slots: Mutex::new(BTreeMap::new()),
+                reaper: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Sends one request, starting or restarting the server first if the
+    /// entry allows, and waits for its response under the request timeout.
+    /// `issue` writes the request and returns its id, e.g.
+    /// `|client, uris| client.document_symbol(&uris.uri_for(path))`.
+    pub fn request(
+        &self,
+        launch: &LanguageServerLaunch,
+        issue: impl FnOnce(&mut LspClient<ChildStdin>, &RepositoryUris) -> Result<u64>,
+    ) -> std::result::Result<Value, LanguageServerError> {
+        let timeout = self.inner.limits.request_timeout;
+        self.with_ready(launch, |process| {
+            let id = issue(&mut process.client, &process.uris)
+                .map_err(|error| Interrupted::Gone(error.to_string()))?;
+            process.await_response(id, timeout)
+        })
+        .map_err(|error| match error {
+            Wrapped::Hub(error) => error,
+            Wrapped::Server(interrupted) => interrupted.into(),
+        })
+    }
+
+    /// Sends one notification (`didOpen`, `didClose`) to a `Ready` server,
+    /// starting it first like [`Self::request`].
+    pub fn notify(
+        &self,
+        launch: &LanguageServerLaunch,
+        send: impl FnOnce(&mut LspClient<ChildStdin>, &RepositoryUris) -> Result<()>,
+    ) -> std::result::Result<(), LanguageServerError> {
+        self.with_ready(launch, |process| {
+            send(&mut process.client, &process.uris)
+                .map_err(|error| Interrupted::Gone(error.to_string()))
+        })
+        .map_err(|error| match error {
+            Wrapped::Hub(error) => error,
+            Wrapped::Server(interrupted) => interrupted.into(),
+        })
+    }
+
+    /// Every entry of `repository_id`, by language.
+    pub fn status(&self, repository_id: &str) -> Vec<LanguageServerStatus> {
+        self.expire_in_background();
+        self.inner
+            .slots()
+            .iter()
+            .filter(|((repository, _), _)| repository == repository_id)
+            .map(|(_, slot)| slot.status())
+            .collect()
+    }
+
+    /// Stops every server: `shutdown`, `exit`, a grace period, then a kill.
+    pub fn shutdown_all(&self) {
+        let slots: Vec<Arc<Slot>> = std::mem::take(&mut *self.inner.slots())
+            .into_values()
+            .collect();
+        self.inner.stop_all(slots);
+    }
+
+    /// Runs `work` against a `Ready` server. A crash found on the way in, or
+    /// caused by `work`, marks the entry `Crashed`; the next request restarts
+    /// it once.
+    fn with_ready<T>(
+        &self,
+        launch: &LanguageServerLaunch,
+        work: impl FnOnce(&mut ServerProcess) -> std::result::Result<T, Interrupted>,
+    ) -> std::result::Result<T, Wrapped> {
+        self.expire_in_background();
+        let slot = self.slot(launch);
+        // At most twice: once more after a crash found on the way in.
+        loop {
+            let claim = {
+                let mut meta = slot.meta();
+                meta.last_used = Instant::now();
+                if !meta.started {
+                    meta.started = true;
+                    true
+                } else {
+                    match &meta.state {
+                        LanguageServerState::Ready => false,
+                        LanguageServerState::Crashed { restarts }
+                            if *restarts < LANGUAGE_SERVER_MAX_RESTARTS =>
+                        {
+                            meta.restarts += 1;
+                            meta.state = LanguageServerState::Starting;
+                            true
+                        }
+                        other => {
+                            return Err(Wrapped::Hub(LanguageServerError::Unavailable {
+                                reason: unavailable_reason(other),
+                            }));
+                        }
+                    }
+                }
+            };
+            let mut process = slot.process();
+            if claim {
+                let started = ServerProcess::start(&slot.launch, self.inner.limits.request_timeout);
+                let mut meta = slot.meta();
+                match started {
+                    Ok(started) => {
+                        meta.state = LanguageServerState::Ready;
+                        meta.pid = Some(started.pid());
+                        *process = Some(started);
+                    }
+                    Err(reason) => {
+                        meta.state = LanguageServerState::Unavailable {
+                            reason: reason.clone(),
+                        };
+                        return Err(Wrapped::Hub(LanguageServerError::Unavailable { reason }));
+                    }
+                }
+            }
+            let Some(running) = process.as_mut() else {
+                // Stopped by idle expiry or `shutdown_all` after this request
+                // found the entry.
+                return Err(Wrapped::Hub(LanguageServerError::Unavailable {
+                    reason: "the server was stopped".to_string(),
+                }));
+            };
+            // A server that exited while idle is a crash, and this request is
+            // the next one, so it may restart it.
+            if !matches!(running.child.try_wait(), Ok(None)) {
+                slot.crashed(&mut process);
+                continue;
+            }
+            return work(running).map_err(|interrupted| {
+                if matches!(interrupted, Interrupted::Gone(_)) {
+                    slot.crashed(&mut process);
+                }
+                Wrapped::Server(interrupted)
+            });
+        }
+    }
+
+    fn slot(&self, launch: &LanguageServerLaunch) -> Arc<Slot> {
+        let slot = self
+            .inner
+            .slots()
+            .entry(launch.key())
+            .or_insert_with(|| {
+                Arc::new(Slot {
+                    launch: launch.clone(),
+                    meta: Mutex::new(SlotMeta {
+                        state: LanguageServerState::Starting,
+                        started: false,
+                        restarts: 0,
+                        last_used: Instant::now(),
+                        pid: None,
+                    }),
+                    process: Mutex::new(None),
+                })
+            })
+            .clone();
+        self.ensure_reaper();
+        slot
+    }
+
+    /// The access-time half of idle expiry. Stopping takes a grace period, so
+    /// it happens off the caller's thread.
+    fn expire_in_background(&self) {
+        let expired = self.inner.take_expired();
+        if expired.is_empty() {
+            return;
+        }
+        let inner = Arc::clone(&self.inner);
+        let _ = thread::Builder::new()
+            .name("damaian-lsp-stop".to_string())
+            .spawn(move || inner.stop_all(expired));
+    }
+
+    /// The hub's own reaper, so an idle server stops even when nothing asks
+    /// the hub anything. It holds the hub weakly and ends when the hub drops.
+    fn ensure_reaper(&self) {
+        let mut reaper = self
+            .inner
+            .reaper
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reaper.is_some() {
+            return;
+        }
+        let (stop, stopped) = mpsc::channel::<()>();
+        let inner = Arc::downgrade(&self.inner);
+        let interval =
+            (self.inner.limits.idle / 2).clamp(Duration::from_millis(10), Duration::from_secs(30));
+        let spawned = thread::Builder::new()
+            .name("damaian-lsp-reaper".to_string())
+            .spawn(move || {
+                while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(interval) {
+                    let Some(inner) = inner.upgrade() else {
+                        return;
+                    };
+                    let expired = inner.take_expired();
+                    inner.stop_all(expired);
+                }
+            });
+        if spawned.is_ok() {
+            *reaper = Some(stop);
+        }
+    }
+}
+
+impl Drop for LanguageServerHub {
+    fn drop(&mut self) {
+        self.shutdown_all();
+        // Dropping the sender ends the reaper.
+        self.inner
+            .reaper
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+    }
+}
+
+/// A failure of the hub itself, or of the server during the work.
+enum Wrapped {
+    Hub(LanguageServerError),
+    Server(Interrupted),
+}
+
+impl From<Interrupted> for LanguageServerError {
+    fn from(interrupted: Interrupted) -> Self {
+        match interrupted {
+            Interrupted::TimedOut { method } => Self::TimedOut { method },
+            Interrupted::Gone(reason) => Self::Unavailable { reason },
+            Interrupted::Refused(message) => Self::Refused { message },
+        }
+    }
+}
+
+fn unavailable_reason(state: &LanguageServerState) -> String {
+    match state {
+        LanguageServerState::Starting => "the server is starting".to_string(),
+        LanguageServerState::Ready => "the server was stopped".to_string(),
+        LanguageServerState::Unavailable { reason } => reason.clone(),
+        LanguageServerState::Crashed { restarts } => format!(
+            "the server crashed {} time(s) and is not restarted again",
+            restarts + 1
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1551,5 +2298,65 @@ mod tests {
                 findings: Vec::new(),
             })
         );
+    }
+
+    /// The order spec 46 requires, checked where it can be seen: the entry is
+    /// on disk when `spawn_registered` returns, and the child's pipes are
+    /// still untouched, so `initialize` cannot have been written yet. A check
+    /// from inside the server races the parent by microseconds and passes
+    /// even when the order is wrong (Task 5's progress row).
+    #[test]
+    fn a_server_is_registered_before_anything_is_written_to_it() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "damaian-lsp-spawn-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let binary = std::env::current_exe().unwrap();
+        let launch = LanguageServerLaunch {
+            repository_id: "repo_0123456789abcdef".to_string(),
+            language: "rust".to_string(),
+            root: std::env::temp_dir(),
+            command: format!(
+                "/bin/sh -c \"export DAMAIAN_LSP_UNIT_HELPER=1; exec \\\"\\$0\\\" --ignored \
+                 --exact lsp::tests::stdin_reader_helper\" '{}'",
+                binary.display()
+            ),
+            data_dir: data_dir.clone(),
+            session_id: "ses_unit".to_string(),
+        };
+
+        let (mut child, registration) = spawn_registered(&launch).unwrap();
+
+        let entries = ProcessRegistry::open(&data_dir).unwrap().entries().unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let entry = entries[0].1.as_ref().unwrap();
+        assert_eq!(entry.pid, child.id());
+        assert_eq!(entry.kind, "language_server");
+        assert!(child.stdin.is_some() && child.stdout.is_some());
+
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(registration);
+        assert!(
+            ProcessRegistry::open(&data_dir)
+                .unwrap()
+                .entries()
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Re-executed by the test above; reads stdin to its end. Run directly,
+    /// it returns at once.
+    #[test]
+    #[ignore = "a child for a_server_is_registered_before_anything_is_written_to_it"]
+    fn stdin_reader_helper() {
+        if std::env::var("DAMAIAN_LSP_UNIT_HELPER").is_err() {
+            return;
+        }
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
     }
 }
