@@ -3,7 +3,9 @@ use crate::config::{Config, DEFAULT_IGNORE_PATTERNS};
 use crate::error::Result;
 use crate::hash::{now_millis, repository_id_for_root, sha256};
 use crate::ignore::{is_ignored_by_rules, parse_ignore_patterns};
-use crate::language::{detect_language, extract_imports, extract_symbols};
+use crate::language::{
+    Declaration, detect_language, extract_declarations, extract_imports, extract_symbols,
+};
 use crate::secret_scanner::SecretScanner;
 use std::collections::HashSet;
 use std::fs;
@@ -27,6 +29,11 @@ pub struct FileRecord {
     pub modified_time_ms: u128,
     pub content_hash: String,
     pub symbols: Vec<String>,
+    /// Extracted from the original content, not the redacted text, so a
+    /// multi-line secret collapsed by redaction cannot shift the lines after
+    /// it. A declaration whose name or container the scanner flags is left
+    /// out, so nothing unscanned is kept (spec 25 `context.md` §4.2).
+    pub declarations: Vec<Declaration>,
     pub imports: Vec<String>,
     pub terms: Vec<String>,
     pub chunks: Vec<TextChunk>,
@@ -286,6 +293,16 @@ impl ProjectIndexer {
 
         let language = detect_language(relative_path).to_string();
         let symbols = extract_symbols(&indexed_content, &language);
+        let declarations = extract_declarations(&content, &language)
+            .into_iter()
+            .filter(|declaration| {
+                !self.scanner.contains_secrets(&declaration.name)
+                    && !declaration
+                        .container
+                        .as_deref()
+                        .is_some_and(|container| self.scanner.contains_secrets(container))
+            })
+            .collect();
         let imports = extract_imports(&indexed_content, &language);
         let modified_time_ms = metadata
             .modified()
@@ -302,6 +319,7 @@ impl ProjectIndexer {
             modified_time_ms,
             content_hash: sha256(&bytes),
             symbols,
+            declarations,
             imports,
             terms: tokenize(&format!("{relative_path} {indexed_content}")),
             chunks: chunk_text(&indexed_content, 2400),

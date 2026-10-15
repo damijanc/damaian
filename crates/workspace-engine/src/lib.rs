@@ -38,6 +38,7 @@ pub mod repository_trust;
 pub mod secret_scanner;
 pub mod session;
 pub mod steering;
+pub mod symbol_index;
 pub mod tree_walk;
 pub mod validation;
 pub mod vector_index;
@@ -150,6 +151,10 @@ pub use session::{
     WorkerRecord,
 };
 pub use steering::TurnSteering;
+pub use symbol_index::{
+    MatchQuality, Provenance, Relation, RelationKind, RelationTarget, Symbol, SymbolIndex,
+    SymbolMatch, SymbolRef,
+};
 pub use tree_walk::{WalkEvent, WalkFile, WalkSkip};
 pub use validation::{
     CommandProposal, CommandRunRecord, CommandStore, ValidationOrchestrator,
