@@ -9,11 +9,17 @@
 //! [`SymbolIndexStore`] persists it per repository, keyed by each file's
 //! content hash, so an unchanged file keeps what is stored for it from either
 //! tier, and only a changed or new file is taken from the index pass again.
+//!
+//! [`merge`] folds one file's language-server symbols into its heuristic ones
+//! (proposal §5.6), and [`SymbolIndexStore::merge_language_server`] writes
+//! that file's result into the stored index as soon as it arrives, so a
+//! reader sees whatever the eager pass (Task 6) has covered so far.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -28,6 +34,25 @@ use crate::repository_map::{RebuildReason, RepositoryMap, write_replacing};
 /// The stored index's layout. A stored index of another version is rebuilt,
 /// never migrated: everything in it can be derived again.
 pub const SYMBOL_INDEX_SCHEMA_VERSION: u32 = 1;
+
+/// How many lines a language-server symbol may sit from a heuristic one of
+/// the same name in the same file and still be the same declaration
+/// (`context.md` §8). The server's line is its name's, so the two differ
+/// only where the heuristic misreads a multi-line signature.
+pub const MERGE_LINE_TOLERANCE: u32 = 3;
+
+/// Serialises every read-modify-write of a stored index in this process: the
+/// eager pass merges one file at a time while readers may rebuild, and
+/// neither may write over the other's change. It is held for one file read,
+/// an in-memory merge and one write, never across a language-server request,
+/// so a reader that meets it waits milliseconds, not on a server.
+static STORE_WRITES: Mutex<()> = Mutex::new(());
+
+fn store_writes() -> MutexGuard<'static, ()> {
+    STORE_WRITES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// How a symbol or relationship was derived. Requirement 3.
 ///
@@ -170,6 +195,16 @@ pub struct SymbolIndex {
 pub struct SymbolFile {
     pub path: String,
     pub content_hash: String,
+    /// Whether a language server's symbols for this content are merged in.
+    /// The eager pass skips such a file; a server that reports nothing for a
+    /// file still sets it, so the file is not asked about again. Absent in
+    /// an index written before Task 6, which reads as `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub language_server: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The extensions a relative JavaScript or TypeScript specifier may omit, in
@@ -207,12 +242,12 @@ impl SymbolIndex {
         records.sort_by(|left, right| left.path.cmp(&right.path));
         let paths: BTreeSet<&str> = records.iter().map(|record| record.path.as_str()).collect();
 
-        let stored_hashes: BTreeMap<&str, &str> = stored
+        let stored_files: BTreeMap<&str, &SymbolFile> = stored
             .map(|stored| {
                 stored
                     .files
                     .iter()
-                    .map(|file| (file.path.as_str(), file.content_hash.as_str()))
+                    .map(|file| (file.path.as_str(), file))
                     .collect()
             })
             .unwrap_or_default();
@@ -226,7 +261,9 @@ impl SymbolIndex {
         let unchanged: BTreeSet<&str> = records
             .iter()
             .filter(|record| {
-                stored_hashes.get(record.path.as_str()) == Some(&record.content_hash.as_str())
+                stored_files
+                    .get(record.path.as_str())
+                    .is_some_and(|file| file.content_hash == record.content_hash)
             })
             .map(|record| record.path.as_str())
             .collect();
@@ -302,22 +339,7 @@ impl SymbolIndex {
                 .cloned(),
         );
 
-        symbols.sort_by(|left, right| {
-            (
-                &left.path,
-                left.line,
-                left.column,
-                &left.name,
-                &left.container,
-            )
-                .cmp(&(
-                    &right.path,
-                    right.line,
-                    right.column,
-                    &right.name,
-                    &right.container,
-                ))
-        });
+        sort_symbols(&mut symbols);
         relations.sort_by(|left, right| {
             (&left.from, left.kind, &left.to).cmp(&(&right.from, right.kind, &right.to))
         });
@@ -328,6 +350,12 @@ impl SymbolIndex {
             .map(|record| SymbolFile {
                 path: record.path.clone(),
                 content_hash: record.content_hash.clone(),
+                // A changed file's server results were dropped with its
+                // symbols, so only an unchanged file keeps the mark.
+                language_server: unchanged.contains(record.path.as_str())
+                    && stored_files
+                        .get(record.path.as_str())
+                        .is_some_and(|file| file.language_server),
             })
             .collect();
         let index = Self {
@@ -432,6 +460,7 @@ impl SymbolIndexStore {
     ) -> Result<(SymbolIndex, SymbolLoad)> {
         let started = Instant::now();
         let path = Self::path(&self.data_dir, &index.repository_id);
+        let _writes = store_writes();
         let (stored, unusable) = match fs::read(&path) {
             Ok(bytes) => match stored_index(&bytes, &index.repository_id) {
                 Ok(stored) => (Some(stored), None),
@@ -467,6 +496,107 @@ impl SymbolIndexStore {
         self.audit_log.record("symbol_index_rebuilt", &fields)?;
         Ok((symbols, SymbolLoad::Rebuilt { reason }))
     }
+
+    /// Merges a language server's symbols for one file into the stored
+    /// index, and marks the file covered, as one write. `content_hash` is the
+    /// content the server was sent: if the stored file has another hash by
+    /// now (a reader rebuilt it after an edit), or is gone, or the stored
+    /// index cannot be read, nothing is written and this returns `false`,
+    /// because the result describes text the index no longer holds. Only the
+    /// stored heuristic symbols take part, so merging a file again replaces
+    /// its earlier server result rather than stacking on it.
+    pub fn merge_language_server(
+        &self,
+        repository_id: &str,
+        path: &str,
+        content_hash: &str,
+        language_server: Vec<Symbol>,
+    ) -> Result<bool> {
+        let index_path = Self::path(&self.data_dir, repository_id);
+        let _writes = store_writes();
+        let bytes = match fs::read(&index_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let Ok(mut stored) = stored_index(&bytes, repository_id) else {
+            return Ok(false);
+        };
+        let Some(file) = stored
+            .files
+            .iter_mut()
+            .find(|file| file.path == path && file.content_hash == content_hash)
+        else {
+            return Ok(false);
+        };
+        file.language_server = true;
+        let (this_file, mut others): (Vec<Symbol>, Vec<Symbol>) =
+            std::mem::take(&mut stored.symbols)
+                .into_iter()
+                .partition(|symbol| symbol.path == path);
+        let heuristic = this_file
+            .into_iter()
+            .filter(|symbol| symbol.provenance == Provenance::Heuristic)
+            .collect();
+        others.extend(merge(heuristic, language_server));
+        sort_symbols(&mut others);
+        stored.symbols = others;
+        let json = serde_json::to_vec_pretty(&stored).map_err(|error| {
+            ClientError::Io(format!("Failed to serialise the symbol index: {error}"))
+        })?;
+        write_replacing(&index_path, &json)?;
+        Ok(true)
+    }
+}
+
+/// One file's two tiers as one list (proposal §5.6, `context.md` §8). A
+/// heuristic symbol is dropped only when a language-server symbol has the
+/// same name and path and a line within [`MERGE_LINE_TOLERANCE`]. Every other
+/// heuristic symbol is kept, so a server that reports part of a file, or
+/// nothing, never makes a symbol disappear.
+///
+/// Kinds are not compared. The heuristic tier's kind is a guess (Task 1
+/// records Python, Kotlin and PHP methods as `Function`), and LSP has no
+/// `Trait`, so rust-analyzer reports a Rust trait as `Interface`; requiring
+/// equal kinds would list each such declaration twice. The server's kind
+/// wins, which also makes `Interface` and `Trait` compatible.
+pub fn merge(heuristic: Vec<Symbol>, language_server: Vec<Symbol>) -> Vec<Symbol> {
+    let mut merged: Vec<Symbol> = heuristic
+        .into_iter()
+        .filter(|guess| {
+            !language_server.iter().any(|reported| {
+                reported.name == guess.name
+                    && reported.path == guess.path
+                    && reported.line.abs_diff(guess.line) <= MERGE_LINE_TOLERANCE
+            })
+        })
+        .collect();
+    merged.extend(language_server);
+    sort_symbols(&mut merged);
+    merged
+}
+
+/// The stored order: by place, then by name, with `Provenance`'s `Ord` (the
+/// server first) breaking any remaining tie.
+fn sort_symbols(symbols: &mut [Symbol]) {
+    symbols.sort_by(|left, right| {
+        (
+            &left.path,
+            left.line,
+            left.column,
+            &left.name,
+            &left.container,
+            left.provenance,
+        )
+            .cmp(&(
+                &right.path,
+                right.line,
+                right.column,
+                &right.name,
+                &right.container,
+                right.provenance,
+            ))
+    });
 }
 
 /// Parses a stored index, or says why it cannot be used. The version is read
