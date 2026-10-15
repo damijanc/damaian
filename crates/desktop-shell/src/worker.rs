@@ -171,7 +171,7 @@ fn parse_worker_args(args: &[String]) -> Result<WorkerArgs, String> {
 }
 
 /// Session ids are `create_id` output; anything else is not one of ours.
-fn validate_session_id(session_id: &str) -> Result<(), String> {
+pub(crate) fn validate_session_id(session_id: &str) -> Result<(), String> {
     let well_formed = !session_id.is_empty()
         && session_id.len() <= MAX_SESSION_ID_BYTES
         && session_id

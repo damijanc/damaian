@@ -28,8 +28,10 @@ mod keychain;
 mod recovery;
 pub mod terminal;
 mod worker;
+pub mod workers;
 
 pub use worker::{WORKER_FLAG, run_worker_from_args, worker_socket_path};
+pub use workers::shutdown_all_workers;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const STYLE_CSS: &str = include_str!("../static/style.css");
@@ -366,6 +368,14 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/provider-key") => handle_provider_key(stream, &request),
         ("POST", "/api/model-key-delete") => handle_model_key_delete(stream, &request),
         ("POST", "/api/mcp-test") => handle_mcp_test(stream, &request),
+        ("GET", "/api/workers-enabled")
+        | ("GET", "/api/worker-source-status")
+        | ("POST", "/api/workers")
+        | ("GET", "/api/workers")
+        | ("GET", "/api/worker-progress")
+        | ("POST", "/api/worker-control")
+        | ("POST", "/api/worker-restart")
+        | ("POST", "/api/worker-remove-worktree") => handle_worker_route(stream, &request),
         _ => write_response(
             stream,
             &request,
@@ -636,10 +646,44 @@ fn handle_session_mode(stream: &mut TcpStream, request: &Request) -> Result<(), 
     )
 }
 
+/// Spec 57's routes. Each answers from files or one short socket exchange
+/// with a worker this shell started (`workers.rs`), and every one but
+/// `GET /api/workers` and `GET /api/workers-enabled` refuses while
+/// `enable_worker_sessions` is off.
+fn handle_worker_route(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
+    let form = parse_form(&request.body);
+    let answer = workers::route(
+        workers::global(),
+        &config,
+        &|config: &Config| resolve_model_api_key(&config.model_api_key_env),
+        &workers::WorkerRequest {
+            method: &request.method,
+            path: &request.path,
+            query: &request.query,
+            form: &form,
+        },
+    );
+    match answer {
+        Ok(body) => write_response(stream, request, 200, "application/json", &body),
+        Err(refusal) => write_response(
+            stream,
+            request,
+            refusal.status,
+            "application/json",
+            &json_error(&refusal.message),
+        ),
+    }
+}
+
 fn handle_session_delete(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let session_id = required_form(&form, "session_id")?;
     let engine = default_engine()?;
+    // Before the delete: the children are recorded in the log it removes.
+    for worker in workers::workers_to_stop_for_deleted_session(&engine.session_store, &session_id) {
+        workers::global().shutdown(&worker);
+    }
     engine
         .session_store
         .delete_session(&session_id)
@@ -3409,9 +3453,11 @@ fn status_text(status: u16) -> &'static str {
     match status {
         200 => "OK",
         204 => "No Content",
+        400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        409 => "Conflict",
         500 => "Internal Server Error",
         _ => "OK",
     }
@@ -8868,6 +8914,1242 @@ mod tests {
                 statuses.last().unwrap()["taskStatus"],
                 "complete",
                 "{statuses:?}"
+            );
+        }
+    }
+
+    /// Spec 57 Task 7: the shell-side supervisor and its routes.
+    ///
+    /// The supervisor starts a stub instead of the real worker: a shell script
+    /// that records its argv, its environment and the shape of its handover
+    /// line, then holds its stdin like a worker and exits when the shell lets
+    /// go of it. Where a test needs the socket protocol, it serves the worker's
+    /// socket itself (`fake_socket`). Neither is a real worker, and nothing
+    /// here kills a process: every stub ends by its lifeline. The tests that
+    /// start the real worker binary or signal a process are `#[ignore]`d in
+    /// `tests/workers.rs`.
+    mod worker_supervisor {
+        use super::*;
+        use crate::workers::{
+            Refusal, SpawnRequest, SpawnedWorker, StopNext, StopOutcome, StopTarget, Supervisor,
+            WorkerRequest, WorkerTimeouts, begin_stop, finish_stop, route,
+            workers_to_stop_for_deleted_session,
+        };
+        use crate::{remember_model_api_key, resolve_model_api_key};
+        use serde_json::{Value, json};
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        use std::path::Path;
+        use std::process::Command;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+        use workspace_engine::worker_progress::{ProgressKind, ProgressWriter};
+        use workspace_engine::{ProcessRegistry, SessionStore};
+
+        /// Plain on purpose: the secret scanner leaves it alone, so a leak
+        /// would show (Task 6 found that an `sk-…` key is redacted on its way
+        /// to disk, which would hide one). Checked in `Fixture::new`.
+        const KEY: &str = "plain-worker-handover-key";
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+        /// Records argv, the environment, and the handover line's length and
+        /// shape with the key masked, so the key itself never reaches disk.
+        /// Then it holds stdin open as a worker does, and ends at EOF.
+        const STUB: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+printf '%s\n' "$@" > "$d/argv.out"
+/usr/bin/env -0 > "$d/env.out"
+IFS= read -r line
+printf '%s' "${#line}" > "$d/len.out"
+printf '%s' "$line" | /usr/bin/sed -E 's/"apiKey":"[^"]*"/"apiKey":"<masked>"/' > "$d/handover.out"
+: > "$d/ready.out"
+exec /bin/cat > /dev/null
+"#;
+
+        /// Short and not canonicalized: a worker's socket path must fit in
+        /// 104 bytes, and `/private` would add 8.
+        fn scratch() -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "dws-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn git(dir: &Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .args(["-c", "user.name=Fixture", "-c", "user.email=f@example.test"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+            String::from_utf8_lossy(&output.stdout).to_string()
+        }
+
+        /// A committed one-file repository, canonical as the spawn records it.
+        fn repository(root: &Path, name: &str) -> PathBuf {
+            let repo = root.join(name);
+            fs::create_dir_all(&repo).unwrap();
+            fs::write(repo.join("README.md"), "# Fixture\n").unwrap();
+            git(&repo, &["init", "-q"]);
+            git(&repo, &["add", "."]);
+            git(&repo, &["commit", "-qm", "init"]);
+            fs::canonicalize(&repo).unwrap()
+        }
+
+        fn timeouts() -> WorkerTimeouts {
+            WorkerTimeouts {
+                ready: Duration::from_secs(10),
+                exchange: Duration::from_secs(2),
+                stop_to_shutdown: Duration::from_millis(300),
+                // Long enough that a stub always ends by its lifeline first:
+                // nothing in this module may signal a process.
+                shutdown_to_sigterm: Duration::from_secs(10),
+                poll: Duration::from_millis(20),
+            }
+        }
+
+        struct Fixture {
+            root: PathBuf,
+            repo: PathBuf,
+            config: Config,
+            supervisor: Supervisor,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                let root = scratch();
+                let repo = repository(&root, "r");
+                let stub_dir = root.join("stub");
+                fs::create_dir_all(&stub_dir).unwrap();
+                let stub = stub_dir.join("worker");
+                fs::write(&stub, STUB).unwrap();
+                fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+                // The key comes from `resolve_model_api_key`'s in-memory cache,
+                // as in the app: an account of this test's own, so no Keychain
+                // is ever asked.
+                let account = format!(
+                    "damaian-worker-test-{}-{}",
+                    std::process::id(),
+                    COUNTER.fetch_add(1, Ordering::Relaxed)
+                );
+                remember_model_api_key(&account, KEY);
+                let config = Config {
+                    data_dir: root.join("d"),
+                    enable_worker_sessions: true,
+                    enable_index_watcher: false,
+                    model_api_key_env: format!("keychain:{account}"),
+                    ..Config::default()
+                };
+                let scanner = SecretScanner::new(config.secret_patterns.clone());
+                assert_eq!(
+                    scanner.redact(KEY).text,
+                    KEY,
+                    "the test key must survive redaction, or a leak would be hidden"
+                );
+                Self {
+                    supervisor: Supervisor::new(stub, timeouts()),
+                    root,
+                    repo,
+                    config,
+                }
+            }
+
+            fn store(&self) -> SessionStore {
+                SessionStore::new(&self.config.data_dir)
+            }
+
+            fn spawn_from(&self, repo: &Path, prompt: &str, parent: Option<&str>) -> SpawnedWorker {
+                self.supervisor
+                    .spawn(
+                        &self.config,
+                        SpawnRequest {
+                            repo: repo.to_path_buf(),
+                            prompt: prompt.to_string(),
+                            include_uncommitted: false,
+                            parent_session_id: parent.map(str::to_string),
+                        },
+                        KEY,
+                    )
+                    .expect("the worker should spawn")
+            }
+
+            fn spawn(&self, prompt: &str, parent: Option<&str>) -> SpawnedWorker {
+                self.spawn_from(&self.repo, prompt, parent)
+            }
+
+            fn parent(&self, title: &str) -> String {
+                self.store()
+                    .create_session(
+                        &workspace_engine::hash::repository_id_for_root(&self.repo),
+                        title,
+                    )
+                    .unwrap()
+                    .id
+            }
+
+            /// One worker route, with `config` (on or off) and form fields
+            /// encoded the way the browser sends them.
+            fn route_with(
+                &self,
+                config: &Config,
+                method: &str,
+                path: &str,
+                query: &[(&str, &str)],
+                form: &[(&str, &str)],
+            ) -> Result<Value, Refusal> {
+                let query: HashMap<String, String> = query
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect();
+                let form = parse_form(&form_body_for_test(form));
+                route(
+                    &self.supervisor,
+                    config,
+                    &|config: &Config| resolve_model_api_key(&config.model_api_key_env),
+                    &WorkerRequest {
+                        method,
+                        path,
+                        query: &query,
+                        form: &form,
+                    },
+                )
+                .map(|body| serde_json::from_str(&body).expect("a JSON answer"))
+            }
+
+            fn route(
+                &self,
+                method: &str,
+                path: &str,
+                query: &[(&str, &str)],
+                form: &[(&str, &str)],
+            ) -> Result<Value, Refusal> {
+                self.route_with(&self.config, method, path, query, form)
+            }
+
+            fn wait_for_exit(&self, session: &str) {
+                wait_until("the worker to exit", || !self.supervisor.is_alive(session));
+            }
+        }
+
+        fn wait_until(what: &str, done: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// The stub's record of its start, once it has written all of it.
+        fn stub_output(fixture: &Fixture, name: &str) -> String {
+            let dir = fixture.root.join("stub");
+            wait_until("the stub to record its start", || {
+                dir.join("ready.out").exists()
+            });
+            fs::read_to_string(dir.join(name)).unwrap()
+        }
+
+        /// Serves the worker's socket in the test, recording every request and
+        /// answering with `answer`. Stands in for the worker's protocol.
+        fn fake_socket(
+            data_dir: &Path,
+            session: &str,
+            answer: fn(&Value) -> Value,
+        ) -> Arc<Mutex<Vec<Value>>> {
+            let path = crate::worker_socket_path(data_dir, session).unwrap();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let listener = UnixListener::bind(&path).unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&requests);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { return };
+                    let Ok(mut writer) = stream.try_clone() else {
+                        return;
+                    };
+                    for line in BufReader::new(stream).lines() {
+                        let Ok(line) = line else { break };
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let reply = answer(&request);
+                        seen.lock().unwrap().push(request);
+                        if writeln!(writer, "{reply}").is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            requests
+        }
+
+        fn echo(request: &Value) -> Value {
+            match request["command"].as_str() {
+                Some("status") => json!({"ok": true, "state": "idle"}),
+                command => json!({"ok": true, "echo": command}),
+            }
+        }
+
+        fn audit_events(data_dir: &Path, event_type: &str) -> Vec<Value> {
+            fs::read_to_string(data_dir.join("audit").join("events.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|event| event["eventType"] == event_type)
+                .collect()
+        }
+
+        fn files_under(dir: &Path) -> Vec<PathBuf> {
+            let mut files = Vec::new();
+            let Ok(entries) = fs::read_dir(dir) else {
+                return files;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.is_dir() {
+                    files.extend(files_under(&path));
+                } else if meta.is_file() {
+                    files.push(path);
+                }
+            }
+            files
+        }
+
+        /// §5.1 steps 7–8: one `worker_spawned` on the worker's log, one on the
+        /// parent's, one in the audit log, and the worker's and the audit's
+        /// carry the exact git commands that created the worktree.
+        #[test]
+        fn spawn_records_worker_spawned_on_worker_parent_and_audit() {
+            let fixture = Fixture::new();
+            let parent = fixture.parent("Planner");
+            let spawned =
+                fixture.spawn("\n  Fix the parser\n\nRead src/a.rs first.", Some(&parent));
+
+            assert_eq!(spawned.title, "Fix the parser");
+            assert_eq!(spawned.branch, "damaian/fix-the-parser");
+            assert_eq!(
+                spawned.worktree,
+                fixture.repo.join(".damaian/worktrees/fix-the-parser")
+            );
+            let store = fixture.store();
+            let record = store.worker_record(&spawned.session_id).unwrap().unwrap();
+            assert_eq!(record.parent_session_id.as_deref(), Some(parent.as_str()));
+            assert_eq!(record.source_repository, fixture.repo);
+            assert_eq!(record.worktree_path, spawned.worktree);
+            assert_eq!(record.branch, spawned.branch);
+            assert!(!record.included_uncommitted);
+            assert!(
+                record
+                    .git_commands
+                    .iter()
+                    .any(|command| command.contains("worktree add -b damaian/fix-the-parser")),
+                "{:?}",
+                record.git_commands
+            );
+            assert_eq!(
+                store.worker_children(&parent).unwrap(),
+                vec![spawned.session_id.clone()]
+            );
+            let session = store.read_session(&spawned.session_id).unwrap().unwrap();
+            assert_eq!(session.title, "Fix the parser");
+            assert_eq!(
+                session.repository_id,
+                workspace_engine::hash::repository_id_for_root(&spawned.worktree),
+                "the worker session belongs to its worktree"
+            );
+            assert_eq!(store.session_mode(&spawned.session_id), SessionMode::Code);
+
+            let audited = audit_events(&fixture.config.data_dir, "worker_spawned");
+            assert_eq!(audited.len(), 1, "{audited:?}");
+            let audited = &audited[0];
+            assert_eq!(audited["sessionId"], spawned.session_id);
+            assert_eq!(audited["parentSessionId"], parent);
+            assert_eq!(audited["branch"], spawned.branch);
+            assert_eq!(audited["baseCommit"], record.base_commit);
+            assert_eq!(audited["includedUncommitted"], "false");
+            let commands: Vec<String> =
+                serde_json::from_str(audited["gitCommands"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                commands, record.git_commands,
+                "the exact commands, in order"
+            );
+
+            fixture.supervisor.shutdown_all();
+        }
+
+        /// Requirement 9: the key reaches the worker on stdin only, from
+        /// `resolve_model_api_key`'s cache. Its argv carries neither key nor
+        /// token, its environment is the shell's own, and the key is in no
+        /// file the spawn wrote and not in the route's answer.
+        #[test]
+        fn spawn_hands_over_the_cached_key_on_stdin_only() {
+            let fixture = Fixture::new();
+            let answer = fixture
+                .route(
+                    "POST",
+                    "/api/workers",
+                    &[],
+                    &[
+                        ("repo", fixture.repo.to_str().unwrap()),
+                        ("prompt", "Write the docs"),
+                    ],
+                )
+                .expect("the spawn route answers");
+            let session = answer["sessionId"].as_str().unwrap().to_string();
+
+            let argv: Vec<String> = stub_output(&fixture, "argv.out")
+                .lines()
+                .map(str::to_string)
+                .collect();
+            assert_eq!(
+                argv,
+                vec![
+                    "--worker".to_string(),
+                    "--session".to_string(),
+                    session.clone(),
+                    "--data-dir".to_string(),
+                    fixture.config.data_dir.to_string_lossy().to_string(),
+                ]
+            );
+
+            let handover: Value =
+                serde_json::from_str(&stub_output(&fixture, "handover.out")).unwrap();
+            let token = handover["token"].as_str().unwrap().to_string();
+            assert_eq!(handover["apiKey"], "<masked>");
+            assert_eq!(handover.as_object().unwrap().len(), 2, "{handover}");
+            assert!(
+                token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "a 256-bit token in hex"
+            );
+            let expected = json!({"apiKey": KEY, "token": token}).to_string();
+            assert_eq!(
+                stub_output(&fixture, "len.out"),
+                expected.len().to_string(),
+                "the line on stdin is the handover with this key"
+            );
+            assert!(!argv.join(" ").contains(KEY) && !argv.join(" ").contains(&token));
+
+            let child_env: HashMap<String, String> = stub_output(&fixture, "env.out")
+                .split('\0')
+                .filter_map(|pair| pair.split_once('='))
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            // What the stub's `/bin/sh` changes on its own: it manages these
+            // four, and macOS's System Integrity Protection strips `DYLD_*`
+            // when it runs a protected binary. The real worker is neither.
+            let set_by_sh = |name: &str| {
+                matches!(name, "PWD" | "OLDPWD" | "SHLVL" | "_") || name.starts_with("DYLD_")
+            };
+            for (name, value) in std::env::vars().filter(|(name, _)| !set_by_sh(name)) {
+                assert_eq!(
+                    child_env.get(&name),
+                    Some(&value),
+                    "the worker gets the shell's environment unchanged: {name}"
+                );
+            }
+            let added: Vec<&String> = child_env
+                .keys()
+                .filter(|name| std::env::var(name.as_str()).is_err() && !set_by_sh(name))
+                .collect();
+            assert!(added.is_empty(), "added to the environment: {added:?}");
+            assert!(child_env.values().all(|value| !value.contains(KEY)));
+
+            assert!(!answer.to_string().contains(KEY));
+            // Everything the spawn wrote: the data directory (session logs,
+            // audit, registry) and the repository with its new worktree. The
+            // stub's own files are left out; they hold the token by design.
+            let written = files_under(&fixture.config.data_dir)
+                .into_iter()
+                .chain(files_under(&fixture.repo));
+            for file in written {
+                let bytes = fs::read(&file).unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(!text.contains(KEY), "the key reached {}", file.display());
+                assert!(
+                    !text.contains(&token),
+                    "the token reached {}",
+                    file.display()
+                );
+            }
+
+            fixture.supervisor.shutdown_all();
+        }
+
+        /// C6: the shell registers the worker as `worker`, under the worker's
+        /// session id, with the shell as owner, so the launch sweep and the
+        /// shell's own `sweep_own` both reach it.
+        #[test]
+        fn the_shell_registers_the_worker_as_process_kind_worker() {
+            let fixture = Fixture::new();
+            let spawned = fixture.spawn("Register me", None);
+            let pid = fixture.supervisor.pid(&spawned.session_id).unwrap();
+
+            let registry = ProcessRegistry::open(&fixture.config.data_dir).unwrap();
+            let entries: Vec<_> = registry
+                .entries()
+                .unwrap()
+                .into_iter()
+                .filter_map(|(_, entry)| entry)
+                .collect();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            let entry = &entries[0];
+            assert_eq!(entry.kind, "worker");
+            assert_eq!(entry.session_id, spawned.session_id);
+            assert_eq!(entry.pid, pid);
+            assert_eq!(entry.pgid, pid, "in its own process group");
+            assert_eq!(entry.owner_pid, std::process::id(), "owned by the shell");
+
+            fixture.supervisor.shutdown_all();
+            assert!(
+                registry.entries().unwrap().is_empty(),
+                "the entry goes with the worker"
+            );
+        }
+
+        /// §5.3 step 5: deleting a parent sends `shutdown` to its workers, and
+        /// the workers' worktrees and session logs stay.
+        #[test]
+        fn deleting_a_parent_sends_shutdown_to_its_workers_and_keeps_their_worktrees() {
+            let fixture = Fixture::new();
+            let parent = fixture.parent("Planner");
+            let other = fixture.parent("Someone else");
+            let spawned = fixture.spawn("Child task", Some(&parent));
+            let unrelated = fixture.spawn("Unrelated task", Some(&other));
+            let requests = fake_socket(&fixture.config.data_dir, &spawned.session_id, echo);
+            let store = fixture.store();
+
+            let stopping = workers_to_stop_for_deleted_session(&store, &parent);
+            assert_eq!(stopping, vec![spawned.session_id.clone()]);
+            for worker in &stopping {
+                assert!(fixture.supervisor.shutdown(worker));
+            }
+            store.delete_session(&parent).unwrap();
+
+            fixture.wait_for_exit(&spawned.session_id);
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request["command"] == "shutdown"),
+                "{:?}",
+                requests.lock().unwrap()
+            );
+            assert!(fixture.supervisor.is_alive(&unrelated.session_id));
+            assert!(spawned.worktree.is_dir(), "the worktree is kept");
+            assert!(
+                store.read_session(&spawned.session_id).unwrap().is_some(),
+                "the worker's session is kept"
+            );
+            // Deleting a worker's own session stops that worker too.
+            assert_eq!(
+                workers_to_stop_for_deleted_session(&store, &unrelated.session_id),
+                vec![unrelated.session_id.clone()]
+            );
+
+            fixture.supervisor.shutdown_all();
+        }
+
+        /// §5.1 "One worker per worktree": *Restart worker* is refused while a
+        /// live worker holds the session's worktree, and works once it is gone.
+        #[test]
+        fn restart_is_refused_while_a_live_worker_holds_the_worktree() {
+            let fixture = Fixture::new();
+            let spawned = fixture.spawn("Restartable", None);
+            let first = fixture.supervisor.pid(&spawned.session_id).unwrap();
+            let restart = |fixture: &Fixture| {
+                fixture.route(
+                    "POST",
+                    "/api/worker-restart",
+                    &[],
+                    &[("session_id", spawned.session_id.as_str())],
+                )
+            };
+
+            let refused = restart(&fixture).unwrap_err();
+            assert_eq!(refused.status, 409, "{refused:?}");
+            assert_eq!(fixture.supervisor.pid(&spawned.session_id), Some(first));
+
+            assert!(fixture.supervisor.shutdown(&spawned.session_id));
+            fixture.wait_for_exit(&spawned.session_id);
+            assert_eq!(
+                restart(&fixture).unwrap(),
+                json!({"status": "started"}),
+                "restarted once the worktree is free"
+            );
+            let second = fixture.supervisor.pid(&spawned.session_id).unwrap();
+            assert_ne!(first, second, "a new process for the same session");
+
+            // An ordinary session has no worktree to restart in.
+            let ordinary = fixture.parent("Not a worker");
+            assert_eq!(
+                fixture
+                    .route(
+                        "POST",
+                        "/api/worker-restart",
+                        &[],
+                        &[("session_id", ordinary.as_str())],
+                    )
+                    .unwrap_err()
+                    .status,
+                400
+            );
+
+            fixture.supervisor.shutdown_all();
+        }
+
+        /// #36 via §5.1: a dirty worktree is removed only after the second
+        /// confirmation, the branch is never deleted, and a live worker's
+        /// worktree is not removed at all.
+        #[test]
+        fn remove_worktree_requires_the_second_confirmation_when_dirty() {
+            let fixture = Fixture::new();
+            let spawned = fixture.spawn("Leave a mess", None);
+            let remove = |confirmed: Option<&str>| {
+                let mut form = vec![("session_id", spawned.session_id.as_str())];
+                if let Some(confirmed) = confirmed {
+                    form.push(("confirmed_dirty", confirmed));
+                }
+                fixture.route("POST", "/api/worker-remove-worktree", &[], &form)
+            };
+
+            assert_eq!(
+                remove(Some("true")).unwrap_err().status,
+                409,
+                "not while the worker runs"
+            );
+            assert!(fixture.supervisor.shutdown(&spawned.session_id));
+            fixture.wait_for_exit(&spawned.session_id);
+            fs::write(spawned.worktree.join("scratch.txt"), "unsaved\n").unwrap();
+
+            assert_eq!(
+                remove(None).unwrap(),
+                json!({"status": "dirty", "paths": ["scratch.txt"]})
+            );
+            assert!(spawned.worktree.join("scratch.txt").exists());
+            assert_eq!(
+                remove(Some("false")).unwrap()["status"],
+                "dirty",
+                "only `true` confirms"
+            );
+
+            assert_eq!(remove(Some("true")).unwrap(), json!({"status": "removed"}));
+            assert!(!spawned.worktree.exists());
+            assert!(
+                git(&fixture.repo, &["branch", "--list", &spawned.branch])
+                    .contains(&spawned.branch),
+                "the branch is never deleted"
+            );
+            assert_eq!(
+                audit_events(&fixture.config.data_dir, "worker_worktree_removed").len(),
+                1
+            );
+        }
+
+        /// C7: `/api/worker-control` takes form fields and relays exactly the
+        /// socket's names to the worker; the first message a spawn sends is the
+        /// prompt.
+        #[test]
+        fn worker_control_takes_form_fields() {
+            let fixture = Fixture::new();
+            let spawned = fixture.spawn("First prompt\nwith two lines", None);
+            let requests = fake_socket(&fixture.config.data_dir, &spawned.session_id, echo);
+            let control = |form: &[(&str, &str)]| {
+                let mut fields = vec![("session_id", spawned.session_id.as_str())];
+                fields.extend_from_slice(form);
+                fixture.route("POST", "/api/worker-control", &[], &fields)
+            };
+            wait_until("the first message", || !requests.lock().unwrap().is_empty());
+
+            assert_eq!(
+                control(&[("command", "note"), ("text", "check the tests & docs")]).unwrap(),
+                json!({"ok": true, "echo": "note"}),
+                "the socket's own answer"
+            );
+            control(&[("command", "approve"), ("proposal_id", "prop_1")]).unwrap();
+            control(&[("command", "resume"), ("note", "carry on")]).unwrap();
+            control(&[("command", "resume")]).unwrap();
+            control(&[("command", "pause")]).unwrap();
+
+            let seen = requests.lock().unwrap().clone();
+            let token = seen[0]["token"].as_str().unwrap().to_string();
+            assert_eq!(token.len(), 64);
+            let without_token: Vec<Value> = seen
+                .iter()
+                .map(|request| {
+                    assert_eq!(request["token"], token.as_str(), "one token throughout");
+                    let mut request = request.clone();
+                    request.as_object_mut().unwrap().remove("token");
+                    request
+                })
+                .collect();
+            assert_eq!(
+                without_token,
+                vec![
+                    json!({"command": "message", "text": "First prompt\nwith two lines"}),
+                    json!({"command": "note", "text": "check the tests & docs"}),
+                    json!({"command": "approve", "proposalId": "prop_1"}),
+                    json!({"command": "resume", "note": "carry on"}),
+                    json!({"command": "resume"}),
+                    json!({"command": "pause"}),
+                ]
+            );
+
+            let unknown = control(&[("command", "self_destruct")]).unwrap_err();
+            assert_eq!(unknown.status, 400, "{unknown:?}");
+            // A JSON body, as §5.7 first described it, is not a form.
+            let json_body = route(
+                &fixture.supervisor,
+                &fixture.config,
+                &|_: &Config| Ok(KEY.to_string()),
+                &WorkerRequest {
+                    method: "POST",
+                    path: "/api/worker-control",
+                    query: &HashMap::new(),
+                    form: &parse_form(&format!(
+                        r#"{{"sessionId":"{}","command":"status"}}"#,
+                        spawned.session_id
+                    )),
+                },
+            )
+            .unwrap_err();
+            assert_eq!(json_body.status, 400, "{json_body:?}");
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                seen.len(),
+                "neither reached it"
+            );
+
+            fixture.supervisor.shutdown_all();
+        }
+
+        /// §5.7: a project's board lists the workers whose source is that
+        /// repository, in Needs you / Running / Finished, newest first, and
+        /// only finished rows carry files changed and commits ahead.
+        #[test]
+        fn workers_list_groups_by_source_repository() {
+            let fixture = Fixture::new();
+            let other_repo = repository(&fixture.root, "o");
+            let parent = fixture.parent("Planner");
+            let waiting = fixture.spawn("Waiting one", Some(&parent));
+            let running = fixture.spawn("Running one", None);
+            let done = fixture.spawn("Done one", None);
+            let gone = fixture.spawn("Gone one", None);
+            let elsewhere = fixture.spawn_from(&other_repo, "Elsewhere", None);
+            let progress = |session: &str, lines: &[(ProgressKind, Value)]| {
+                let mut writer = ProgressWriter::create(
+                    &fixture.config.data_dir,
+                    session,
+                    SecretScanner::new(Vec::new()),
+                )
+                .unwrap();
+                for (kind, payload) in lines {
+                    writer.append(*kind, payload.clone()).unwrap();
+                }
+            };
+            progress(
+                &waiting.session_id,
+                &[(
+                    ProgressKind::Status,
+                    json!({"state": "waiting_for_approval"}),
+                )],
+            );
+            progress(
+                &running.session_id,
+                &[
+                    (ProgressKind::Status, json!({"state": "running"})),
+                    (
+                        ProgressKind::Phase,
+                        json!({"phase": "tool", "label": "Running cargo test", "round": 2, "maxRounds": 8}),
+                    ),
+                ],
+            );
+            progress(
+                &done.session_id,
+                &[(
+                    ProgressKind::Status,
+                    json!({"state": "idle", "taskStatus": "complete"}),
+                )],
+            );
+            progress(
+                &gone.session_id,
+                &[(ProgressKind::Status, json!({"state": "running"}))],
+            );
+            assert!(fixture.supervisor.shutdown(&gone.session_id));
+            fixture.wait_for_exit(&gone.session_id);
+
+            let list = || {
+                fixture
+                    .route(
+                        "GET",
+                        "/api/workers",
+                        &[("repo", fixture.repo.to_str().unwrap())],
+                        &[],
+                    )
+                    .unwrap()["workers"]
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            };
+            let rows = list();
+            let summary: Vec<(String, String, String)> = rows
+                .iter()
+                .map(|row| {
+                    (
+                        row["title"].as_str().unwrap().to_string(),
+                        row["group"].as_str().unwrap().to_string(),
+                        row["state"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            let row = |title: &str, group: &str, state: &str| {
+                (title.to_string(), group.to_string(), state.to_string())
+            };
+            assert_eq!(
+                summary,
+                vec![
+                    row("Waiting one", "needs_you", "waiting_for_approval"),
+                    row("Running one", "running", "running"),
+                    row("Gone one", "finished", "exited"),
+                    row("Done one", "finished", "idle"),
+                ],
+                "grouped, newest first in each group, and only this repository's"
+            );
+            assert!(
+                rows.iter()
+                    .all(|row| row["sessionId"] != elsewhere.session_id)
+            );
+
+            let by_title = |rows: &[Value], title: &str| {
+                rows.iter()
+                    .find(|row| row["title"] == title)
+                    .unwrap()
+                    .clone()
+            };
+            let waiting_row = by_title(&rows, "Waiting one");
+            assert_eq!(waiting_row["parentSessionId"], parent);
+            assert_eq!(waiting_row["parentTitle"], "Planner");
+            assert_eq!(waiting_row["alive"], true);
+            assert_eq!(waiting_row["filesChanged"], Value::Null);
+            let running_row = by_title(&rows, "Running one");
+            assert_eq!(running_row["parentTitle"], Value::Null);
+            assert_eq!(running_row["round"], 2);
+            assert_eq!(running_row["maxRounds"], 8);
+            assert_eq!(running_row["doing"], "Running cargo test");
+            assert_eq!(running_row["branch"], running.branch);
+            let gone_row = by_title(&rows, "Gone one");
+            assert_eq!(gone_row["alive"], false);
+            assert_eq!(gone_row["filesChanged"], 0);
+            assert_eq!(gone_row["commitsAhead"], 0);
+            assert_eq!(by_title(&rows, "Done one")["taskStatus"], "complete");
+
+            fs::write(gone.worktree.join("README.md"), "# Changed\n").unwrap();
+            git(&gone.worktree, &["commit", "-qam", "one ahead"]);
+            fs::write(gone.worktree.join("new.txt"), "uncommitted\n").unwrap();
+            git(&gone.worktree, &["add", "new.txt"]);
+            let gone_row = by_title(&list(), "Gone one");
+            assert_eq!(gone_row["commitsAhead"], 1);
+            assert_eq!(
+                gone_row["filesChanged"], 2,
+                "committed and staged, against the base"
+            );
+
+            fixture.supervisor.shutdown_all();
+        }
+
+        /// `after=` pages exactly, `alive` says whether this shell still holds
+        /// the worker, and a session id that is not one is refused before any
+        /// path is built from it.
+        #[test]
+        fn worker_progress_pages_with_after() {
+            let fixture = Fixture::new();
+            let spawned = fixture.spawn("Make progress", None);
+            let mut writer = ProgressWriter::create(
+                &fixture.config.data_dir,
+                &spawned.session_id,
+                SecretScanner::new(Vec::new()),
+            )
+            .unwrap();
+            for text in ["one", "two", "three"] {
+                writer
+                    .append(ProgressKind::Text, json!({"text": text}))
+                    .unwrap();
+            }
+            let page = |after: &str| {
+                fixture.route(
+                    "GET",
+                    "/api/worker-progress",
+                    &[("session", spawned.session_id.as_str()), ("after", after)],
+                    &[],
+                )
+            };
+
+            let answer = page("1").unwrap();
+            let seqs: Vec<u64> = answer["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| event["seq"].as_u64().unwrap())
+                .collect();
+            assert_eq!(seqs, vec![2, 3]);
+            assert_eq!(answer["events"][1]["payload"]["text"], "three");
+            assert_eq!(answer["alive"], true);
+            assert_eq!(page("3").unwrap()["events"], json!([]));
+            assert_eq!(page("0").unwrap()["events"].as_array().unwrap().len(), 3);
+
+            assert!(fixture.supervisor.shutdown(&spawned.session_id));
+            fixture.wait_for_exit(&spawned.session_id);
+            assert_eq!(page("0").unwrap()["alive"], false);
+
+            let traversal = fixture
+                .route(
+                    "GET",
+                    "/api/worker-progress",
+                    &[("session", "../../etc/x"), ("after", "0")],
+                    &[],
+                )
+                .unwrap_err();
+            assert_eq!(traversal.status, 400);
+            assert_eq!(page("not-a-number").unwrap_err().status, 400);
+        }
+
+        /// Requirement 1 and §5.0: with the setting off, every worker route
+        /// refuses, except the list (a running worker stays reachable) and
+        /// the setting's own read.
+        #[test]
+        fn every_worker_route_refuses_when_the_setting_is_off() {
+            let fixture = Fixture::new();
+            let spawned = fixture.spawn("Started while on", None);
+            let off = Config {
+                enable_worker_sessions: false,
+                ..fixture.config.clone()
+            };
+            let repo = fixture.repo.to_str().unwrap();
+            let session = spawned.session_id.as_str();
+            type Case<'a> = (
+                &'a str,
+                &'a str,
+                Vec<(&'a str, &'a str)>,
+                Vec<(&'a str, &'a str)>,
+            );
+            let refused: Vec<Case> = vec![
+                (
+                    "GET",
+                    "/api/worker-source-status",
+                    vec![("repo", repo), ("prompt", "x")],
+                    vec![],
+                ),
+                (
+                    "POST",
+                    "/api/workers",
+                    vec![],
+                    vec![("repo", repo), ("prompt", "x")],
+                ),
+                (
+                    "GET",
+                    "/api/worker-progress",
+                    vec![("session", session), ("after", "0")],
+                    vec![],
+                ),
+                (
+                    "POST",
+                    "/api/worker-control",
+                    vec![],
+                    vec![("session_id", session), ("command", "status")],
+                ),
+                (
+                    "POST",
+                    "/api/worker-restart",
+                    vec![],
+                    vec![("session_id", session)],
+                ),
+                (
+                    "POST",
+                    "/api/worker-remove-worktree",
+                    vec![],
+                    vec![("session_id", session)],
+                ),
+            ];
+            for (method, path, query, form) in refused {
+                let refusal = fixture
+                    .route_with(&off, method, path, &query, &form)
+                    .expect_err(path);
+                assert_eq!(refusal.status, 403, "{path}: {refusal:?}");
+            }
+            assert_eq!(
+                fixture
+                    .store()
+                    .worker_sessions_for_source(&fixture.repo)
+                    .unwrap()
+                    .len(),
+                1,
+                "the refused spawn created nothing"
+            );
+
+            let listed = fixture
+                .route_with(&off, "GET", "/api/workers", &[("repo", repo)], &[])
+                .unwrap();
+            assert_eq!(listed["workers"][0]["sessionId"], session);
+            assert_eq!(listed["workers"][0]["alive"], true);
+            assert_eq!(
+                fixture
+                    .route_with(&off, "GET", "/api/workers-enabled", &[], &[])
+                    .unwrap(),
+                json!({"enabled": false})
+            );
+            assert_eq!(
+                fixture
+                    .route("GET", "/api/workers-enabled", &[], &[])
+                    .unwrap(),
+                json!({"enabled": true})
+            );
+
+            fixture.supervisor.shutdown_all();
+        }
+
+        /// The routes are served by `handle_connection`, through the global
+        /// supervisor and the shell's own config, which is off by default.
+        #[test]
+        fn the_shell_serves_the_worker_routes_and_they_refuse_while_off() {
+            isolated_data_dir();
+            let repo = scratch();
+            let (port, token) = serve_for_test();
+
+            let control = post_fields_for_test(
+                port,
+                &token,
+                "/api/worker-control",
+                &[("session_id", "session_x"), ("command", "status")],
+            );
+            assert!(control.starts_with("HTTP/1.1 403"), "{control}");
+            let enabled = get_for_test(port, &token, "/api/workers-enabled");
+            assert!(enabled.starts_with("HTTP/1.1 200"), "{enabled}");
+            assert_eq!(json_of(&enabled), json!({"enabled": false}));
+            let listed = get_for_test(
+                port,
+                &token,
+                &format!("/api/workers?repo={}", repo.display()),
+            );
+            assert_eq!(json_of(&listed), json!({"workers": []}), "{listed}");
+        }
+
+        /// Every stub here ends by its lifeline: `shutdown_all` lets go of
+        /// each worker's stdin and waits for it, and no signal is needed.
+        #[test]
+        fn shutdown_all_ends_every_worker_and_waits_for_it() {
+            let fixture = Fixture::new();
+            let first = fixture.spawn("First", None);
+            let second = fixture.spawn("Second", None);
+            let pids = [
+                fixture.supervisor.pid(&first.session_id).unwrap(),
+                fixture.supervisor.pid(&second.session_id).unwrap(),
+            ];
+
+            fixture.supervisor.shutdown_all();
+
+            for pid in pids {
+                assert!(
+                    workspace_engine::ProcessIdentity::of(pid).is_none(),
+                    "{pid} is still running after shutdown_all returned"
+                );
+            }
+            assert!(!fixture.supervisor.is_alive(&first.session_id));
+            assert!(!fixture.supervisor.is_alive(&second.session_id));
+            assert!(
+                ProcessRegistry::open(&fixture.config.data_dir)
+                    .unwrap()
+                    .entries()
+                    .unwrap()
+                    .is_empty(),
+                "every registration went with its worker"
+            );
+            assert!(
+                audit_events(&fixture.config.data_dir, "worker_terminated").is_empty(),
+                "the lifeline ended them; no signal was needed"
+            );
+        }
+
+        /// A scripted worker for the stop escalation: what it answers, whether
+        /// a stop ends its turn, and whether `shutdown` makes it exit.
+        struct FakeTarget {
+            state: &'static str,
+            answers: bool,
+            stop_ends_turn: bool,
+            exits_on_shutdown: bool,
+            exited: bool,
+            terminated: bool,
+            sent: Vec<String>,
+        }
+
+        impl FakeTarget {
+            fn new(state: &'static str) -> Self {
+                Self {
+                    state,
+                    answers: true,
+                    stop_ends_turn: false,
+                    exits_on_shutdown: false,
+                    exited: false,
+                    terminated: false,
+                    sent: Vec::new(),
+                }
+            }
+        }
+
+        impl StopTarget for FakeTarget {
+            fn send(&mut self, command: &str) -> Option<Value> {
+                self.sent.push(command.to_string());
+                if !self.answers || self.exited {
+                    return None;
+                }
+                Some(match command {
+                    "status" => json!({"ok": true, "state": self.state}),
+                    "stop" => match self.state {
+                        "running" | "paused" => {
+                            if self.stop_ends_turn {
+                                self.state = "idle";
+                            }
+                            json!({"ok": true})
+                        }
+                        "waiting_for_approval" => {
+                            json!({"ok": false, "error": "approve or reject it"})
+                        }
+                        _ => json!({"ok": false, "error": "no turn is running"}),
+                    },
+                    "shutdown" => {
+                        if self.exits_on_shutdown {
+                            self.exited = true;
+                        }
+                        json!({"ok": true})
+                    }
+                    _ => json!({"ok": false, "error": "unexpected"}),
+                })
+            }
+
+            fn has_exited(&mut self) -> bool {
+                self.exited
+            }
+
+            fn terminate(&mut self) {
+                self.terminated = true;
+                self.exited = true;
+            }
+        }
+
+        fn short() -> WorkerTimeouts {
+            WorkerTimeouts {
+                stop_to_shutdown: Duration::from_millis(150),
+                shutdown_to_sigterm: Duration::from_millis(150),
+                poll: Duration::from_millis(10),
+                ..WorkerTimeouts::default()
+            }
+        }
+
+        /// §5.3: `stop`; the turn has not ended in time, so `shutdown`; the
+        /// process has not exited in time, so `SIGTERM` by registry identity.
+        /// The real-process half is `tests/workers.rs`'s
+        /// `stop_escalates_to_shutdown_then_sigterm_by_registry_pid`.
+        #[test]
+        fn the_stop_escalation_sends_shutdown_then_sigterm_after_its_timeouts() {
+            let mut target = FakeTarget::new("running");
+            let (answer, next) = begin_stop(&mut target);
+            assert_eq!(answer, json!({"ok": true}), "the stop's own answer");
+            assert_eq!(next, StopNext::AwaitTurnEnd);
+
+            let started = Instant::now();
+            assert_eq!(
+                finish_stop(&mut target, next, &short()),
+                StopOutcome::Terminated
+            );
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= Duration::from_millis(300) && elapsed < Duration::from_secs(5),
+                "waited both timeouts and no longer: {elapsed:?}"
+            );
+            assert!(target.terminated);
+            assert_eq!(&target.sent[..2], ["status", "stop"]);
+            assert_eq!(
+                target
+                    .sent
+                    .iter()
+                    .filter(|sent| *sent == "shutdown")
+                    .count(),
+                1,
+                "{:?}",
+                target.sent
+            );
+        }
+
+        #[test]
+        fn a_stop_that_ends_the_turn_goes_no_further() {
+            let mut target = FakeTarget::new("paused");
+            target.stop_ends_turn = true;
+            let (_, next) = begin_stop(&mut target);
+            assert_eq!(
+                finish_stop(&mut target, next, &short()),
+                StopOutcome::TurnEnded
+            );
+            assert!(!target.sent.contains(&"shutdown".to_string()));
+            assert!(!target.terminated);
+        }
+
+        #[test]
+        fn a_worker_that_exits_on_shutdown_is_not_signalled() {
+            let mut target = FakeTarget::new("running");
+            target.exits_on_shutdown = true;
+            let (_, next) = begin_stop(&mut target);
+            assert_eq!(
+                finish_stop(&mut target, next, &short()),
+                StopOutcome::ExitedAfterShutdown
+            );
+            assert!(!target.terminated);
+        }
+
+        /// Task 6 (d): `stop` is refused while waiting for approval, so the
+        /// escalation does not send it and goes straight to `shutdown`.
+        #[test]
+        fn a_stop_while_waiting_for_approval_goes_straight_to_shutdown() {
+            let mut target = FakeTarget::new("waiting_for_approval");
+            target.exits_on_shutdown = true;
+            let (answer, next) = begin_stop(&mut target);
+            assert_eq!(next, StopNext::Shutdown);
+            assert_eq!(answer["ok"], true, "{answer}");
+            assert_eq!(target.sent, ["status"]);
+            assert_eq!(
+                finish_stop(&mut target, next, &short()),
+                StopOutcome::ExitedAfterShutdown
+            );
+            assert_eq!(target.sent, ["status", "shutdown"]);
+        }
+
+        /// An idle worker has no turn to stop and is left running.
+        #[test]
+        fn an_idle_worker_is_not_escalated() {
+            let mut target = FakeTarget::new("idle");
+            let (answer, next) = begin_stop(&mut target);
+            assert_eq!(next, StopNext::Done);
+            assert_eq!(answer["ok"], false, "the worker's own refusal: {answer}");
+            assert_eq!(finish_stop(&mut target, next, &short()), StopOutcome::Done);
+            assert!(!target.sent.contains(&"shutdown".to_string()));
+        }
+
+        /// A worker that does not answer at all is shut down, then signalled.
+        #[test]
+        fn a_silent_worker_is_shut_down_then_signalled() {
+            let mut target = FakeTarget::new("running");
+            target.answers = false;
+            let (answer, next) = begin_stop(&mut target);
+            assert_eq!(next, StopNext::Shutdown);
+            assert_eq!(answer["ok"], false);
+            assert_eq!(
+                finish_stop(&mut target, next, &short()),
+                StopOutcome::Terminated
             );
         }
     }

@@ -56,6 +56,22 @@ impl ProcessIdentity {
             start_time_us: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
         })
     }
+
+    /// `SIGTERM` to this process, only while its pid still names it. Returns
+    /// whether the signal was sent.
+    ///
+    /// For a registered process the caller stops directly, such as a spec 57
+    /// worker whose stop escalation ran out of time. A dead pid, a zombie and a
+    /// recycled pid all read as "not this process" and are left alone.
+    pub fn send_sigterm(&self) -> bool {
+        if Self::of(self.pid) != Some(*self) {
+            return false;
+        }
+        // SAFETY: `kill` takes two integers by value and touches no memory.
+        // The pid is signalled alone, never its group, because only the pid's
+        // identity was matched.
+        unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGTERM) == 0 }
+    }
 }
 
 /// What a registry entry describes, so an audited sweep says what it killed
@@ -561,6 +577,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch data dir");
         dir
+    }
+
+    /// Never signals a process whose start time differs from the one given,
+    /// so a recycled pid is safe. Our own pid with a wrong start time stands in
+    /// for one: a signal sent anyway would end this test binary.
+    #[test]
+    fn sigterm_is_refused_for_a_pid_that_no_longer_names_the_process() {
+        let own = ProcessIdentity::of(std::process::id()).unwrap();
+        let recycled = ProcessIdentity {
+            start_time_us: own.start_time_us + 1,
+            ..own
+        };
+        assert!(!recycled.send_sigterm());
+        // Above macOS's pid limit and still positive as a `pid_t`, so even a
+        // broken check could not signal a process group by accident.
+        let dead = ProcessIdentity {
+            pid: 9_999_999,
+            start_time_us: 1,
+        };
+        assert!(!dead.send_sigterm());
     }
 
     #[test]
