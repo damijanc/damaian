@@ -1169,7 +1169,7 @@ fn handle_propose_edit(stream: &mut TcpStream, request: &Request) -> Result<(), 
         .get("session_id")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let engine = engine_for_repo_with_model_options(&repo, &form)?;
+    let engine = WorkspaceEngine::new(config_for_repo_with_model_options(&repo, &form)?);
     let context_files = form
         .get("context_files")
         .map(|value| validate_context_files(&engine, &repo, value))
@@ -1566,8 +1566,7 @@ fn run_resume_command_request(
     let repo = required_form(form, "repo")?;
     let proposal_id = required_form(form, "proposal_id")?;
     let approved = form.get("approved").map(String::as_str) == Some("true");
-    let mut engine = engine_for_repo(&repo)?;
-    configure_chat_integrations(&mut engine);
+    let engine = chat_engine(config_for_repo(&repo)?);
 
     if !engine
         .chat_orchestrator
@@ -1588,18 +1587,9 @@ fn run_resume_command_request(
             .map_err(|error| error.to_string())?;
     }
 
-    let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
-    let transport = CurlModelTransport::new(
-        &engine.config.model_base_url,
-        api_key,
-        ProcessRegistry::open(&engine.config.data_dir).map_err(|error| error.to_string())?,
-        &engine.config.data_dir,
-    );
-    let mut adapter = OpenAICompatibleAdapter::with_provider(
-        &engine.config.model_provider,
-        &engine.config.model_name,
-        transport,
-    );
+    let mut adapter = chat_model_adapter(&engine.config, || {
+        resolve_model_api_key(&engine.config.model_api_key_env)
+    })?;
     let mut on_token = |token: &str| {
         let _ = events.send(TurnEvent::Token(token.to_string()));
     };
@@ -1620,7 +1610,7 @@ fn run_resume_command_request(
             &proposal_id,
             approved,
             "desktop_user",
-            &mut adapter,
+            adapter.as_mut(),
             &mut sink,
             resume_decision_options(form),
         )
@@ -1645,21 +1635,11 @@ fn run_resume_plan_request(
         Some(raw) => Some(parse_plan_revision(raw)?),
         None => None,
     };
-    let mut engine = engine_for_repo(&repo)?;
-    configure_chat_integrations(&mut engine);
+    let engine = chat_engine(config_for_repo(&repo)?);
 
-    let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
-    let transport = CurlModelTransport::new(
-        &engine.config.model_base_url,
-        api_key,
-        ProcessRegistry::open(&engine.config.data_dir).map_err(|error| error.to_string())?,
-        &engine.config.data_dir,
-    );
-    let mut adapter = OpenAICompatibleAdapter::with_provider(
-        &engine.config.model_provider,
-        &engine.config.model_name,
-        transport,
-    );
+    let mut adapter = chat_model_adapter(&engine.config, || {
+        resolve_model_api_key(&engine.config.model_api_key_env)
+    })?;
     let mut on_token = |token: &str| {
         let _ = events.send(TurnEvent::Token(token.to_string()));
     };
@@ -1681,7 +1661,7 @@ fn run_resume_plan_request(
             approved,
             revised,
             "desktop_user",
-            &mut adapter,
+            adapter.as_mut(),
             &mut sink,
         )
         .map_err(|error| error.to_string())
@@ -1847,32 +1827,34 @@ fn run_chat_request(
     cancel: &CancelToken,
     events: &std::sync::mpsc::Sender<TurnEvent>,
 ) -> Result<ChatTurnResult, String> {
+    run_chat_request_with(form, cancel, events, &mut |config| {
+        chat_model_adapter(config, || resolve_model_api_key(&config.model_api_key_env))
+    })
+}
+
+/// [`run_chat_request`] with how the adapter is built passed in, so a test can
+/// script the model and compare this host's turn with a worker's (spec 57
+/// requirement 4).
+fn run_chat_request_with(
+    form: &HashMap<String, String>,
+    cancel: &CancelToken,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
+    adapter_for: &mut AdapterFor<'_>,
+) -> Result<ChatTurnResult, String> {
     let repo = required_form(form, "repo")?;
     let prompt = required_form(form, "prompt")?;
     let session_id = form
         .get("session_id")
         .map(String::as_str)
         .filter(|value| !value.is_empty());
-    let mut engine = engine_for_repo_with_model_options(&repo, form)?;
-    configure_chat_integrations(&mut engine);
+    let engine = chat_engine(config_for_repo_with_model_options(&repo, form)?);
     let context_files = form
         .get("context_files")
         .map(|value| validate_context_files(&engine, &repo, value))
         .transpose()?
         .unwrap_or_default();
 
-    let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
-    let transport = CurlModelTransport::new(
-        &engine.config.model_base_url,
-        api_key,
-        ProcessRegistry::open(&engine.config.data_dir).map_err(|error| error.to_string())?,
-        &engine.config.data_dir,
-    );
-    let mut adapter = OpenAICompatibleAdapter::with_provider(
-        &engine.config.model_provider,
-        &engine.config.model_name,
-        transport,
-    );
+    let mut adapter = adapter_for(&engine.config)?;
     let mut on_token = |token: &str| {
         let _ = events.send(TurnEvent::Token(token.to_string()));
     };
@@ -1902,11 +1884,46 @@ fn run_chat_request(
             &prompt,
             &context_files,
             session_id,
-            &mut adapter,
+            adapter.as_mut(),
             &mut sink,
             turn_options,
         )
         .map_err(|error| error.to_string())
+}
+
+/// The engine a chat turn runs on. The shell's turns and a worker's both build
+/// it here (spec 57 §5.2, "same turn"), so neither host can configure a turn
+/// the other would not.
+fn chat_engine(config: Config) -> WorkspaceEngine {
+    let mut engine = WorkspaceEngine::new(config);
+    configure_chat_integrations(&mut engine);
+    engine
+}
+
+/// The model adapter a chat turn calls, for both hosts. `api_key` is asked only
+/// when a real adapter is built: the shell resolves it, and a worker hands over
+/// the key it was given on stdin, so a worker never reaches the Keychain.
+///
+/// `DAMAIAN_MOCK_MODEL_RESPONSE` answers every model call with its text, as it
+/// does for the CLI, and then no key is asked for at all.
+fn chat_model_adapter(
+    config: &Config,
+    api_key: impl FnOnce() -> Result<String, String>,
+) -> Result<Box<dyn ModelAdapter>, String> {
+    if let Ok(response) = env::var("DAMAIAN_MOCK_MODEL_RESPONSE") {
+        return Ok(Box::new(workspace_engine::MockModelAdapter::new(response)));
+    }
+    let transport = CurlModelTransport::new(
+        &config.model_base_url,
+        api_key()?,
+        ProcessRegistry::open(&config.data_dir).map_err(|error| error.to_string())?,
+        &config.data_dir,
+    );
+    Ok(Box::new(OpenAICompatibleAdapter::with_provider(
+        &config.model_provider,
+        &config.model_name,
+        transport,
+    )))
 }
 
 /// Continues a chat turn that paused on a command approval, once the user
@@ -3063,13 +3080,13 @@ fn engine_for_repo(repo: &str) -> Result<WorkspaceEngine, String> {
     Ok(WorkspaceEngine::new(config))
 }
 
-fn engine_for_repo_with_model_options(
+fn config_for_repo_with_model_options(
     repo: &str,
     form: &HashMap<String, String>,
-) -> Result<WorkspaceEngine, String> {
+) -> Result<Config, String> {
     let mut config = config_for_repo(repo)?;
     apply_model_form_options(&mut config, form)?;
-    Ok(WorkspaceEngine::new(config))
+    Ok(config)
 }
 
 fn config_for_repo(repo: &str) -> Result<Config, String> {
@@ -8138,6 +8155,721 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 500"), "{response}");
         assert!(response.contains("missing form field: repo"), "{response}");
+    }
+
+    /// Spec 57 Task 6: a worker's turns, hosted on this process by the same
+    /// turn thread `--worker` runs. Its data directory is the shell's
+    /// (`isolated_data_dir`), as it is in the app.
+    mod worker_turns {
+        use super::*;
+        use crate::run_chat_request_with;
+        use crate::worker::{ControlCommand, WorkerHost, host_in_process};
+        use std::path::Path;
+        use std::process::Command;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+        use workspace_engine::worker_progress::read_progress_after;
+        use workspace_engine::{
+            ModelAdapter, ModelRequest, ModelRun, SessionStore, TaskStatus, WorkerRecord,
+        };
+
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+        /// A committed one-file repository. Canonical, because the session's
+        /// repository id is taken from the canonical root.
+        fn fixture(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "dwt-{}-{tag}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("README.md"), "# Worker fixture\n").unwrap();
+            for args in [
+                &["init", "-q"][..],
+                &["add", "."][..],
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.test",
+                    "commit",
+                    "-qm",
+                    "init",
+                ][..],
+            ] {
+                let status = Command::new("git")
+                    .args(args)
+                    .current_dir(&dir)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "git {args:?}");
+            }
+            fs::canonicalize(&dir).unwrap()
+        }
+
+        fn store() -> SessionStore {
+            SessionStore::new(isolated_data_dir())
+        }
+
+        /// A session for `repo`; with `worker`, one whose worker record names
+        /// `repo` as its worktree, as Task 7's spawn will write it.
+        fn session_for(repo: &Path, worker: bool) -> String {
+            let store = store();
+            let session = store
+                .create_session(
+                    &workspace_engine::hash::repository_id_for_root(repo),
+                    "fixture",
+                )
+                .unwrap();
+            if worker {
+                store
+                    .record_worker_spawned(
+                        &session.id,
+                        &WorkerRecord {
+                            parent_session_id: None,
+                            source_repository: repo.to_path_buf(),
+                            worktree_path: repo.to_path_buf(),
+                            branch: "damaian/fixture".to_string(),
+                            base_commit: "HEAD".to_string(),
+                            included_uncommitted: false,
+                            git_commands: Vec::new(),
+                        },
+                    )
+                    .unwrap();
+            }
+            session.id
+        }
+
+        fn call(name: &str, arguments_json: &str) -> ToolCall {
+            ToolCall {
+                id: format!("call_{name}"),
+                name: name.to_string(),
+                arguments_json: arguments_json.to_string(),
+            }
+        }
+
+        /// One tool call, then a final answer.
+        fn calls_then(name: &str, arguments_json: &str, answer: &str) -> Scripted {
+            Scripted::new(MockModelAdapter::new_sequence_with_tool_calls(
+                vec![String::new(), answer.to_string()],
+                vec![vec![call(name, arguments_json)], Vec::new()],
+            ))
+        }
+
+        const PWD: &str = r#"{"command":"pwd","reason":"See where the turn runs"}"#;
+        const TOUCH: &str = r#"{"command":"touch approved.txt","reason":"Mark the tree"}"#;
+
+        /// The worker builds an adapter per job; sharing one script across
+        /// them lets a turn and its resume read one sequence, as one turn.
+        #[derive(Clone)]
+        struct Scripted(Arc<Mutex<MockModelAdapter>>);
+
+        impl Scripted {
+            fn new(adapter: MockModelAdapter) -> Self {
+                Self(Arc::new(Mutex::new(adapter)))
+            }
+        }
+
+        impl ModelAdapter for Scripted {
+            fn stream_response(
+                &mut self,
+                request: &ModelRequest,
+                cancel: &CancelToken,
+                on_token: &mut dyn FnMut(&str),
+                on_wait: &mut dyn FnMut(u64),
+            ) -> workspace_engine::Result<ModelRun> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .stream_response(request, cancel, on_token, on_wait)
+            }
+        }
+
+        /// Holds the turn's first model call until opened, so a test can act
+        /// while a turn is certainly running.
+        #[derive(Clone)]
+        struct Gated {
+            inner: Scripted,
+            first: Arc<AtomicBool>,
+            gate: Arc<(Mutex<(bool, bool)>, Condvar)>,
+        }
+
+        impl Gated {
+            fn new(inner: Scripted) -> Self {
+                Self {
+                    inner,
+                    first: Arc::new(AtomicBool::new(true)),
+                    gate: Arc::new((Mutex::new((false, false)), Condvar::new())),
+                }
+            }
+
+            fn wait_entered(&self) {
+                let (lock, changed) = &*self.gate;
+                let (state, timeout) = changed
+                    .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(30), |state| {
+                        !state.0
+                    })
+                    .unwrap();
+                assert!(
+                    state.0 && !timeout.timed_out(),
+                    "the turn never called the model"
+                );
+            }
+
+            fn open(&self) {
+                let (lock, changed) = &*self.gate;
+                lock.lock().unwrap().1 = true;
+                changed.notify_all();
+            }
+        }
+
+        impl ModelAdapter for Gated {
+            fn stream_response(
+                &mut self,
+                request: &ModelRequest,
+                cancel: &CancelToken,
+                on_token: &mut dyn FnMut(&str),
+                on_wait: &mut dyn FnMut(u64),
+            ) -> workspace_engine::Result<ModelRun> {
+                if self.first.swap(false, Ordering::SeqCst) {
+                    let (lock, changed) = &*self.gate;
+                    let mut state = lock.lock().unwrap();
+                    state.0 = true;
+                    changed.notify_all();
+                    while !state.1 {
+                        state = changed.wait(state).unwrap();
+                    }
+                }
+                self.inner
+                    .stream_response(request, cancel, on_token, on_wait)
+            }
+        }
+
+        fn hosted<A>(repo: &Path, adapter: A) -> (Arc<WorkerHost>, String)
+        where
+            A: ModelAdapter + Clone + Send + 'static,
+        {
+            let session = session_for(repo, true);
+            let host = host_in_process(
+                &session,
+                isolated_data_dir(),
+                Box::new(move |_config: &Config| {
+                    Ok(Box::new(adapter.clone()) as Box<dyn ModelAdapter>)
+                }),
+            )
+            .unwrap();
+            (host, session)
+        }
+
+        fn send(host: &WorkerHost, command: ControlCommand) -> serde_json::Value {
+            host.dispatch(command).0
+        }
+
+        fn message(text: &str) -> ControlCommand {
+            ControlCommand::Message {
+                text: text.to_string(),
+            }
+        }
+
+        fn wait_for(host: &WorkerHost, done: impl Fn(&str) -> bool) -> serde_json::Value {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let snapshot = host.snapshot();
+                if done(snapshot["state"].as_str().unwrap()) {
+                    return snapshot;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the worker never settled: {snapshot}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// Idle or waiting for approval: the turn thread has finished its job.
+        fn settle(host: &WorkerHost) -> serde_json::Value {
+            wait_for(host, |state| !matches!(state, "running" | "paused"))
+        }
+
+        fn session_event_types(session: &str, after: u64) -> Vec<String> {
+            let log = isolated_data_dir()
+                .join("sessions")
+                .join(format!("{session}.jsonl"));
+            fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|event| event["seq"].as_u64().unwrap() > after)
+                .map(|event| event["eventType"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        /// This session's audit events, in order. The audit log is shared by
+        /// every test in the binary, so it is filtered by the session and its
+        /// tasks.
+        fn audit_event_types(session: &str) -> Vec<String> {
+            let tasks: Vec<String> = store()
+                .read_tasks(session)
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect();
+            fs::read_to_string(isolated_data_dir().join("audit").join("events.jsonl"))
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|event| {
+                    event["sessionId"] == session
+                        || event["taskId"]
+                            .as_str()
+                            .is_some_and(|task| tasks.iter().any(|id| id == task))
+                })
+                .map(|event| event["eventType"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        fn progress(session: &str) -> Vec<serde_json::Value> {
+            read_progress_after(isolated_data_dir(), session, 0).unwrap()
+        }
+
+        fn payloads(lines: &[serde_json::Value], kind: &str) -> Vec<serde_json::Value> {
+            lines
+                .iter()
+                .filter(|line| line["kind"] == kind)
+                .map(|line| line["payload"].clone())
+                .collect()
+        }
+
+        /// Requirement 4, the load-bearing test of spec 57: one scripted turn
+        /// through the shell's `run_chat_request` and through the worker host
+        /// writes the same session-log events and the same audit events, in the
+        /// same order. Ids and timestamps differ and are not compared.
+        #[test]
+        fn a_turn_through_the_worker_host_matches_the_shell_host() {
+            isolated_data_dir();
+            let prompt = "Where does this run?";
+            let script = || calls_then("run_command", PWD, "It runs in the fixture.");
+
+            let shell_repo = fixture("sh");
+            let shell_session = session_for(&shell_repo, false);
+            let shell_after = store().latest_event_seq(&shell_session).unwrap();
+            let form = HashMap::from([
+                ("repo".to_string(), shell_repo.to_string_lossy().to_string()),
+                ("prompt".to_string(), prompt.to_string()),
+                ("session_id".to_string(), shell_session.clone()),
+            ]);
+            let (events, _discard) = std::sync::mpsc::channel();
+            let shell_adapter = script();
+            let shell_result =
+                run_chat_request_with(&form, &CancelToken::new(), &events, &mut |_| {
+                    Ok(Box::new(shell_adapter.clone()))
+                })
+                .unwrap();
+            assert_eq!(shell_result.task.status, TaskStatus::Complete);
+
+            let worker_repo = fixture("wk");
+            let (host, worker_session) = hosted(&worker_repo, script());
+            let worker_after = store().latest_event_seq(&worker_session).unwrap();
+            assert_eq!(send(&host, message(prompt))["ok"], true);
+            assert_eq!(settle(&host)["state"], "idle");
+
+            let shell_audit = audit_event_types(&shell_session);
+            assert!(
+                shell_audit.iter().any(|event| event == "command_proposed"),
+                "the scripted turn must run its command, or this compares too little: {shell_audit:?}"
+            );
+            assert_eq!(
+                session_event_types(&worker_session, worker_after),
+                session_event_types(&shell_session, shell_after),
+                "session-log events differ between the hosts"
+            );
+            assert_eq!(
+                audit_event_types(&worker_session),
+                shell_audit,
+                "audit events differ between the hosts"
+            );
+        }
+
+        /// The engine half of "same turn": the worker's engine gets the
+        /// shell's chat integrations (`chat_engine`). They change nothing a
+        /// turn records unless an integration is configured, so the
+        /// comparison above cannot see them; with a browser MCP server
+        /// configured, the runner they install is what offers the model
+        /// `inspect_web_page`. Its own data directory, because the server is
+        /// set in user config.
+        #[test]
+        fn a_worker_turn_gets_the_shells_chat_integrations() {
+            let data_dir = std::env::temp_dir().join(format!(
+                "dwt-{}-integ-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&data_dir);
+            fs::create_dir_all(data_dir.join("config")).unwrap();
+            // Never started: the turn only lists its tools, which it offers
+            // natively only to a provider configured for it.
+            fs::write(
+                data_dir.join("config").join("user.conf"),
+                "model_provider.openai.supports_native_tools=true\n\
+                 mcp_server.browser.transport=stdio\n\
+                 mcp_server.browser.command=/usr/bin/false\n\
+                 mcp_server.browser.enabled=true\n",
+            )
+            .unwrap();
+            let repo = fixture("integ");
+            let store = SessionStore::new(&data_dir);
+            let session = store
+                .create_session(
+                    &workspace_engine::hash::repository_id_for_root(&repo),
+                    "fixture",
+                )
+                .unwrap();
+            store
+                .record_worker_spawned(
+                    &session.id,
+                    &WorkerRecord {
+                        parent_session_id: None,
+                        source_repository: repo.clone(),
+                        worktree_path: repo.clone(),
+                        branch: "damaian/fixture".to_string(),
+                        base_commit: "HEAD".to_string(),
+                        included_uncommitted: false,
+                        git_commands: Vec::new(),
+                    },
+                )
+                .unwrap();
+            let script = Scripted::new(MockModelAdapter::new("Nothing to inspect."));
+            let recorded = script.clone();
+            let host = host_in_process(
+                &session.id,
+                &data_dir,
+                Box::new(move |_config: &Config| {
+                    Ok(Box::new(script.clone()) as Box<dyn ModelAdapter>)
+                }),
+            )
+            .unwrap();
+            assert_eq!(send(&host, message("Look at the page."))["ok"], true);
+            assert_eq!(settle(&host)["state"], "idle");
+
+            let requests = &recorded.0.lock().unwrap().requests;
+            let offered: Vec<String> = requests[0]
+                .tools
+                .iter()
+                .flatten()
+                .map(|tool| tool.name.clone())
+                .collect();
+            assert!(
+                offered.iter().any(|name| name == "inspect_web_page"),
+                "the worker's engine was built without the shell's integrations: {offered:?}"
+            );
+        }
+
+        /// §5.5: `phase` carries round and maxRounds, `tool` the tool label,
+        /// `text` is batched, and `status` marks each transition.
+        #[test]
+        fn progress_lines_mirror_the_turn() {
+            let answer =
+                "A long answer, streamed in many small pieces, so batching has something to batch.";
+            let (host, session) = hosted(&fixture("prog"), calls_then("run_command", PWD, answer));
+            assert_eq!(send(&host, message("Where?"))["ok"], true);
+            assert_eq!(settle(&host)["state"], "idle");
+
+            let lines = progress(&session);
+            let statuses = payloads(&lines, "status");
+            assert_eq!(
+                statuses.first().unwrap()["state"],
+                "running",
+                "{statuses:?}"
+            );
+            let last = statuses.last().unwrap();
+            assert_eq!(last["state"], "idle", "{statuses:?}");
+            assert_eq!(last["taskStatus"], "complete", "{statuses:?}");
+
+            let phases = payloads(&lines, "phase");
+            assert!(!phases.is_empty());
+            for phase in &phases {
+                assert!(
+                    phase["round"].is_u64() && phase["maxRounds"].is_u64(),
+                    "{phase}"
+                );
+            }
+            let tool_phases: Vec<_> = phases
+                .iter()
+                .filter(|phase| phase["phase"] == "tool")
+                .collect();
+            let tools = payloads(&lines, "tool");
+            assert!(!tools.is_empty(), "{lines:?}");
+            assert_eq!(
+                tools
+                    .iter()
+                    .map(|tool| tool["label"].clone())
+                    .collect::<Vec<_>>(),
+                tool_phases
+                    .iter()
+                    .map(|phase| phase["label"].clone())
+                    .collect::<Vec<_>>()
+            );
+
+            let texts = payloads(&lines, "text");
+            let streamed: String = texts
+                .iter()
+                .map(|text| text["text"].as_str().unwrap())
+                .collect();
+            assert_eq!(streamed, answer);
+            // The mock streams 24-byte tokens; one line per token is no batch.
+            assert!(
+                texts.len() < answer.len().div_ceil(24),
+                "text was not batched: {texts:?}"
+            );
+        }
+
+        /// §5.4: a turn waiting for approval has left its loop, so notes,
+        /// pause and stop do not apply, and no second turn starts over it.
+        #[test]
+        fn a_note_while_waiting_for_approval_is_refused() {
+            let (host, _session) =
+                hosted(&fixture("note"), calls_then("run_command", TOUCH, "Done."));
+            assert_eq!(send(&host, message("Mark it."))["ok"], true);
+            assert_eq!(settle(&host)["state"], "waiting_for_approval");
+
+            for command in [
+                ControlCommand::Note {
+                    text: "also this".to_string(),
+                },
+                ControlCommand::Pause,
+                ControlCommand::Stop,
+                message("another"),
+            ] {
+                let answer = send(&host, command.clone());
+                assert_eq!(answer["ok"], false, "{command:?}");
+                assert!(
+                    answer["error"].as_str().unwrap().contains("approval"),
+                    "{command:?}: {answer}"
+                );
+            }
+            assert_eq!(host.snapshot()["state"], "waiting_for_approval");
+        }
+
+        #[test]
+        fn message_is_refused_while_a_turn_runs() {
+            let gated = Gated::new(Scripted::new(MockModelAdapter::new("First.")));
+            let (host, _session) = hosted(&fixture("busy"), gated.clone());
+            assert_eq!(send(&host, message("one"))["ok"], true);
+            gated.wait_entered();
+
+            let refused = send(&host, message("two"));
+            assert_eq!(refused["ok"], false);
+            assert!(
+                refused["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("already running"),
+                "{refused}"
+            );
+            assert_eq!(host.snapshot()["state"], "running");
+
+            gated.open();
+            assert_eq!(settle(&host)["state"], "idle");
+            assert_eq!(
+                send(&host, message("two"))["ok"],
+                true,
+                "idle takes the next message"
+            );
+            assert_eq!(settle(&host)["state"], "idle");
+        }
+
+        /// §5.6: the turn stops on the snapshot as in the shell, and `approve`
+        /// resumes it in this process, through the same resume, once.
+        #[test]
+        fn a_command_approval_continues_in_process() {
+            let repo = fixture("appr");
+            let (host, session) = hosted(&repo, calls_then("run_command", TOUCH, "Done."));
+            assert_eq!(send(&host, message("Mark it."))["ok"], true);
+            let waiting = settle(&host);
+            assert_eq!(waiting["state"], "waiting_for_approval", "{waiting}");
+            let proposal_id = waiting["proposalId"].as_str().unwrap().to_string();
+            let snapshot = isolated_data_dir()
+                .join("chat")
+                .join("pending")
+                .join(format!("{proposal_id}.json"));
+            assert!(
+                snapshot.is_file(),
+                "the pending snapshot is written as in the shell"
+            );
+
+            let approvals = payloads(&progress(&session), "approval");
+            assert_eq!(approvals.len(), 1, "{approvals:?}");
+            assert_eq!(approvals[0]["kind"], "command");
+            assert_eq!(approvals[0]["proposal"]["proposalId"], proposal_id.as_str());
+            assert_eq!(approvals[0]["proposal"]["command"], "touch approved.txt");
+
+            let wrong = send(
+                &host,
+                ControlCommand::Approve {
+                    proposal_id: "chatcmd_not_this_one".to_string(),
+                },
+            );
+            assert_eq!(wrong["ok"], false, "{wrong}");
+            assert!(!repo.join("approved.txt").exists());
+
+            assert_eq!(
+                send(
+                    &host,
+                    ControlCommand::Approve {
+                        proposal_id: proposal_id.clone()
+                    }
+                )["ok"],
+                true
+            );
+            let done = settle(&host);
+            assert_eq!(done["state"], "idle", "{done}");
+            assert_eq!(
+                done["pid"],
+                std::process::id(),
+                "the same process resumed it"
+            );
+            assert!(!snapshot.exists(), "the resume took the snapshot");
+            assert!(
+                repo.join("approved.txt").is_file(),
+                "the approved command ran"
+            );
+            let tasks = store().read_tasks(&session).unwrap();
+            assert_eq!(tasks.len(), 1, "one turn, resumed, not a second one");
+            assert_eq!(tasks[0].status, TaskStatus::Complete);
+            assert_eq!(
+                send(&host, ControlCommand::Approve { proposal_id })["ok"],
+                false,
+                "a decision resumes once"
+            );
+        }
+
+        /// §5.6: a patch ends the turn; the worker stays alive and idle, and
+        /// the shell's own `/api/apply-patch` applies it with the worktree as
+        /// `repo`.
+        #[test]
+        fn a_patch_proposal_leaves_the_worker_idle_and_alive() {
+            let repo = fixture("ptch");
+            let (host, session) = hosted(
+                &repo,
+                calls_then(
+                    "propose_patch",
+                    r#"{"summary":"Add a file","files":[{"path":"new.txt","content":"hello\n"}]}"#,
+                    "Proposed.",
+                ),
+            );
+            assert_eq!(send(&host, message("Add a file."))["ok"], true);
+            assert_eq!(settle(&host)["state"], "idle");
+
+            let approvals = payloads(&progress(&session), "approval");
+            assert_eq!(approvals.len(), 1, "{approvals:?}");
+            assert_eq!(approvals[0]["kind"], "patch");
+            let patch_id = approvals[0]["proposal"]["patchId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(!repo.join("new.txt").exists(), "a proposal applies nothing");
+
+            let (port, token) = serve_for_test();
+            let response = post_form_for_test(
+                port,
+                &token,
+                "/api/apply-patch",
+                &format!(
+                    "repo={}&patch_id={patch_id}",
+                    percent_encode_for_test(&repo.to_string_lossy())
+                ),
+            );
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert_eq!(fs::read_to_string(repo.join("new.txt")).unwrap(), "hello\n");
+
+            assert_eq!(
+                send(&host, message("Thanks."))["ok"],
+                true,
+                "the worker is still alive"
+            );
+            assert_eq!(settle(&host)["state"], "idle");
+        }
+
+        /// `pause` holds the turn at the next round boundary, a note queued
+        /// there reaches the conversation, and `resume` continues the turn.
+        #[test]
+        fn pause_holds_the_turn_and_a_note_reaches_it() {
+            let gated = Gated::new(calls_then("run_command", PWD, "Done."));
+            let (host, session) = hosted(&fixture("paus"), gated.clone());
+            assert_eq!(send(&host, message("Where?"))["ok"], true);
+            gated.wait_entered();
+            assert_eq!(send(&host, ControlCommand::Pause)["ok"], true);
+            assert_eq!(
+                host.snapshot()["state"],
+                "running",
+                "a pause takes effect at the boundary, not mid-call"
+            );
+            gated.open();
+            wait_for(&host, |state| state == "paused");
+            assert_eq!(
+                send(
+                    &host,
+                    ControlCommand::Note {
+                        text: "Mind the README.".to_string()
+                    }
+                )["ok"],
+                true
+            );
+            assert_eq!(
+                send(&host, ControlCommand::Resume { note: None })["ok"],
+                true
+            );
+            assert_eq!(settle(&host)["state"], "idle");
+
+            let messages = store().read_messages(&session).unwrap();
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.role == "user" && message.content == "Mind the README."),
+                "the note is a user message in the session"
+            );
+            let lines = progress(&session);
+            let states: Vec<_> = payloads(&lines, "status")
+                .iter()
+                .map(|status| status["state"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                states,
+                ["running", "paused", "running", "idle"],
+                "{lines:?}"
+            );
+            assert_eq!(payloads(&lines, "note").len(), 1, "{lines:?}");
+        }
+
+        #[test]
+        fn stop_ends_the_running_turn_cancelled() {
+            let gated = Gated::new(calls_then("run_command", PWD, "Done."));
+            let (host, session) = hosted(&fixture("stop"), gated.clone());
+            assert_eq!(send(&host, message("Where?"))["ok"], true);
+            gated.wait_entered();
+            assert_eq!(send(&host, ControlCommand::Stop)["ok"], true);
+            gated.open();
+            assert_eq!(settle(&host)["state"], "idle");
+            let statuses = payloads(&progress(&session), "status");
+            assert_eq!(
+                statuses.last().unwrap()["taskStatus"],
+                "cancelled",
+                "{statuses:?}"
+            );
+            // The next turn has its own cancel token.
+            assert_eq!(send(&host, message("Again."))["ok"], true);
+            let statuses = {
+                settle(&host);
+                payloads(&progress(&session), "status")
+            };
+            assert_eq!(
+                statuses.last().unwrap()["taskStatus"],
+                "complete",
+                "{statuses:?}"
+            );
+        }
     }
 }
 

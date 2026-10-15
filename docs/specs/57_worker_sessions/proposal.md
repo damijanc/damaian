@@ -1,6 +1,6 @@
 # Feature Spec: Worker Sessions
 
-Status: In progress (Tasks 1–5 of 11 done, 2026-10-07, 2026-10-09, 2026-10-09, 2026-10-12 and 2026-10-12; see [`tasks.md`](tasks.md))
+Status: In progress (Tasks 1–6 of 11 done, 2026-10-07, 2026-10-09, 2026-10-09, 2026-10-12, 2026-10-12 and 2026-10-15; see [`tasks.md`](tasks.md))
 Order: 57 of 57
 Plan: none. An exception to the graduation rule, like #41–#44 and #47: it came
 from describing how this repository is actually built — a planner session that
@@ -279,7 +279,15 @@ turns through the same `ChatOrchestrator` entry points the shell uses. Its
 `TurnSink` sends progress to the progress file (§5.5) instead of SSE, and its
 `TurnSteering` (§5.4) and its cancel token are driven by the control socket instead of a connection.
 Nothing in command policy, redaction, approval, mode enforcement or audit is
-reimplemented or bypassed.
+reimplemented or bypassed. Both hosts build a turn's engine and adapter with
+the same two functions in `desktop-shell` (`chat_engine` and
+`chat_model_adapter`); the shell passes the key it resolves and the worker
+passes the handed-over one. Like the CLI, `chat_model_adapter` answers from
+`DAMAIAN_MOCK_MODEL_RESPONSE` when it is set, for both hosts. The worktree is
+the worker record's `worktree_path`, and its repository config applies at
+repository scope exactly as it does for the shell. Each turn gets a fresh
+cancel token and `TurnSteering`, and runs on one turn thread, which alone writes
+the progress file. The worker takes the configured provider and model.
 
 **Control socket.** `<data_dir>/workers/<hash>.sock`, where `<hash>` is the
 first 16 hex characters of the SHA-256 of the session id
@@ -300,14 +308,14 @@ Commands:
 
 | Command | Effect |
 |---|---|
-| `message {text}` | Starts a turn with this user message. Refused while a turn runs. |
+| `message {text}` | Starts a turn with this user message. Refused unless idle: while a turn runs or waits for approval. |
 | `pause` | Sets the pause flag (§5.4). |
 | `resume {note?}` | Clears it, optionally queuing a note first. |
 | `note {text}` | Queues a steering note. Refused while waiting for approval. |
 | `approve {proposalId}` / `reject {proposalId}` | Resolves a pending command or plan approval (§5.6). |
-| `stop` | Cancels the current turn at the next safe point. |
+| `stop` | Cancels the current turn at the next safe point. Refused while waiting for approval: reject the approval, or `shutdown`. |
 | `shutdown` | Stops any turn, kills child processes, exits. |
-| `status` | Returns the current snapshot. |
+| `status` | Returns `{sessionId, pid, state}`, `state` being `idle`, `running`, `paused`, `waiting_for_approval` or `shutting_down`, plus `proposalId` while waiting. |
 
 Unknown commands are rejected. The shell stays single-threaded: each exchange is
 short, and the shell never holds a socket open.
@@ -415,12 +423,12 @@ with `seq` or `kind`:
 
 | `kind` | Carries |
 |---|---|
-| `status` | `TaskStatus` |
+| `status` | `{state, taskStatus?, error?}`: the worker's state (as `status` reports it), the turn's `TaskStatus` when known, and the error of a turn that failed to run. Written when a job starts, on pause and resume, and when a job ends |
 | `phase` | `phase`, `label`, `round`, `maxRounds` — today's SSE payload |
 | `plan` | today's `plan` payload |
 | `text` | model output text, batched about every 250 ms |
 | `tool` | the tool label of a `phase` event of kind `tool` — what the shell already shows while a tool runs. Durations are the gaps between events; outcome is not recorded here (the audit log has it) |
-| `approval` | the pending proposal, as the approval card needs it |
+| `approval` | `{kind, proposal}`: `kind` is `command`, `plan`, `patch` or `fallback`, and `proposal` is the shell's own JSON for it |
 | `note` | a steering note was added |
 
 Every string in the payload, at any depth, passes through
@@ -454,6 +462,10 @@ events on `taskId` (context §3.5).
   on whatever repository it is given. No turn is running while it applies, so
   nothing races the worker. Continuing a turn after a patch is applied would be new turn
   semantics; if wanted, it belongs in the engine for both hosts, not here.
+- **Provider fallback offers** (#56) end the turn the same way, with the
+  worker idle. The worker holds only the configured provider's key, so the
+  offer is answered through the shell's existing route with the worktree as
+  `repo`.
 
 ### 5.7 UI
 
