@@ -1,6 +1,6 @@
 # Feature Spec: Worker Sessions
 
-Status: In progress (Tasks 1–6 of 11 done, 2026-10-07, 2026-10-09, 2026-10-09, 2026-10-12, 2026-10-12 and 2026-10-15; see [`tasks.md`](tasks.md))
+Status: In progress (Tasks 1–7 of 11 done, 2026-10-07, 2026-10-09, 2026-10-09, 2026-10-12, 2026-10-12, 2026-10-15 and 2026-10-15; see [`tasks.md`](tasks.md))
 Order: 57 of 57
 Plan: none. An exception to the graduation rule, like #41–#44 and #47: it came
 from describing how this repository is actually built — a planner session that
@@ -233,8 +233,19 @@ exists, `-2`, `-3`, … is appended to both until neither does.
    worker's `worker_spawned` record. `worker_record`, `worker_children` and
    `worker_sessions_for_source` read them back (correction C2 in
    [`tasks.md`](tasks.md)).
-8. Record the same facts as a `worker_spawned` audit event.
-9. Start the worker process (§5.2) with the prompt as its first message.
+8. Record the same facts as a `worker_spawned` audit event. Its
+   `gitCommands` field is the JSON array of the commands, in order.
+9. Start the worker process (§5.2) with the prompt as its first message. The
+   route answers once the process is started and registered; the prompt is
+   sent as `message` from a thread of its own once the worker's socket
+   answers, so a slow worker start never holds the shell's one request
+   thread. The session's title is the prompt's first non-blank line, at most
+   80 characters.
+
+A creation that fails is recorded as a `worker_spawn_failed` audit event with
+the error. A failure after step 5 leaves the worktree and its branch in place,
+and the commands run so far are not in that event, because
+`create_worker_worktree` does not return them on an error.
 
 **Approval.** #36 requires action-specific approval for git mutations. Clicking
 *Start worker* is that approval: the user initiated the action and the dialog
@@ -248,7 +259,9 @@ worker, choose its location, or skip this click.
 directly under the source's `.damaian/worktrees/`, reached through no symlink.
 If the worktree has uncommitted changes, a second
 confirmation names the dirty paths first, following #36; `--force` is passed
-only after that confirmation. The branch is never deleted.
+only after that confirmation. The branch is never deleted. It is refused while
+a live worker holds the worktree, and a removal is audited as
+`worker_worktree_removed`.
 
 **One worker per worktree.** Spawning always makes a new worktree, so the rule
 is enforced where it can still be broken: *Restart worker* (§5.7) refuses if a
@@ -324,10 +337,19 @@ short, and the shell never holds a socket open.
 records the registering process as an entry's owner, so the **shell** registers
 each worker it spawns, as `ProcessKind::Worker` with the worker's session id.
 The launch sweep then kills the workers of a crashed shell, and the shell's own
-`sweep_own` reaches them on a signal. Each worker registers its own children,
-with itself as owner, so the worker's `sweep_own` kills exactly those. The
-spawn itself is recorded as `worker_spawned` (§5.1 steps 7–8); there is no
-separate `worker_started` event.
+`sweep_own` reaches them on a signal: the standalone shell's
+`install_shutdown_handler` records `orphan_process_killed` with kind `worker`
+for them, which a test confirms
+(`the_shells_signal_handler_reaches_workers_through_sweep_own`). Each worker
+registers its own children, with itself as owner, so the worker's `sweep_own`
+kills exactly those. The spawn itself is recorded as `worker_spawned` (§5.1
+steps 7–8); there is no separate `worker_started` event.
+
+The shell starts the worker with `process_group(0)`, piped stdin, stdout to
+`/dev/null` and stderr inherited, so a worker's refusals reach the shell's own
+log. It keeps the worker's stdin beside the registration handle for the
+worker's whole life (`desktop-shell/src/workers.rs`), and both go when the
+shell sees the worker exit.
 
 ### 5.3 Lifetime: nothing survives
 
@@ -347,12 +369,18 @@ separate `worker_started` event.
    `install_shutdown_handler`, so `SIGTERM`/`SIGINT`/`SIGHUP` take the same
    path.
 4. **Clean quit.** When the application quits normally, the shell sends
-   `shutdown` to every worker, waits up to 5 seconds, then `SIGTERM`s any that
-   remain by registry PID. Never by name. The Tauri host has no exit hook
-   today; this adds one (`RunEvent::Exit`).
+   `shutdown` to every worker, lets go of every lifeline, waits up to 5
+   seconds, then `SIGTERM`s any that remain by registry PID after an identity
+   check. Never by name. The Tauri host had no exit hook; it now ends in
+   `.build(ctx)…run(..)` and calls `desktop_shell::shutdown_all_workers` on
+   `RunEvent::Exit` (correction C11 in [`tasks.md`](tasks.md)). The standalone
+   shell has no such hook: its signal handler's `sweep_own` reaches the workers
+   (§5.2, Registration).
 5. **Parent removed.** Deleting a session sends `shutdown` to every worker
-   whose parent it is. (There is no archive action in the shell today; if one
-   is added, it does the same.) Their worktrees and session logs are kept, and
+   whose parent it is, and to the session's own worker if it is one; each
+   also loses its lifeline and is `SIGTERM`ed by identity if it has not exited
+   5 seconds later. (There is no archive action in the shell today; if one is
+   added, it does the same.) Their worktrees and session logs are kept, and
    their sessions remain in the sidebar.
 6. **Backstop.** #46's orphan sweep at the next launch kills any registered
    worker or worker child still alive.
@@ -364,7 +392,15 @@ worker* (§5.7).
 
 **Stop escalation** from the UI: `stop`; if the turn has not ended within 10
 seconds, `shutdown`; if the process has not exited 5 seconds later, `SIGTERM` to
-its registry PID.
+its registry PID. As built (`Supervisor::stop`), the shell asks `status`
+first. A worker waiting for approval refuses `stop`, so it goes straight to
+`shutdown`; an idle worker has no turn to stop, so the worker's own refusal
+is the answer and nothing follows; a worker that does not answer goes
+straight to `shutdown`. The route answers after these first exchanges, and the
+waiting runs on a thread of its own, so the shell's one request thread is
+never held for the 15 seconds. The signal is sent only while the pid still has
+the registered start time (`ProcessIdentity::send_sigterm`), and is audited as
+`worker_terminated` with that identity.
 
 ### 5.4 Pause and steering notes
 
@@ -493,8 +529,9 @@ that project's repository as the source.
   *Remove worktree* (finished only, §5.1), *Dismiss from board* (finished only;
   the session stays in the sidebar).
 - Finished rows show files changed and commits ahead of the base.
-- The board polls `GET /api/workers?repository=<id>` about once a second while
-  visible.
+- The board polls `GET /api/workers?repo=<path>` about once a second while
+  visible. The source repository is compared by its canonical path, as the
+  worker record stores it.
 
 **Worker session.** The ordinary session view with two additions:
 
@@ -517,11 +554,32 @@ worker, so a second click is a visible, deliberate second worker rather than an
 accident. A one-line, quiet entry is appended where the worker was spawned:
 "Spawned worker *‹title›* →". No live card.
 
-**Shell routes:** `POST /api/workers` (spawn), `GET /api/workers`,
-`GET /api/worker-progress`, `POST /api/worker-control`
-(`{sessionId, command, ...}`, relayed to the socket),
-`POST /api/worker-restart`, `POST /api/worker-remove-worktree`. Each answers
-from files or one short socket exchange.
+**Shell routes** (the table is in [`tasks.md`](tasks.md), Interfaces):
+`GET /api/workers-enabled`, `GET /api/worker-source-status`,
+`POST /api/workers` (spawn), `GET /api/workers`, `GET /api/worker-progress`,
+`POST /api/worker-control`, `POST /api/worker-restart`,
+`POST /api/worker-remove-worktree`. Each answers from files or one short
+socket exchange. Like every shell route they take url-encoded form fields,
+not JSON (correction C7): `/api/worker-control` takes `session_id`,
+`command`, and `text`, `note` or `proposal_id` as the command needs, and
+forwards only the fields the command takes, under the socket's names (`text`,
+`note`, `proposalId`). Only the socket speaks JSON lines. `stop` runs the
+escalation (§5.3) and `shutdown` the parent-removed path; every other command
+is relayed and the socket's answer returned as it is.
+
+With `enable_worker_sessions` off, every route refuses (403) except
+`GET /api/workers`, which keeps running workers reachable (§5.0), and
+`GET /api/workers-enabled`, which is how the UI reads the setting. A session
+id is checked against the worker's own id rules before any path is built from
+it. A `GET /api/workers` row carries `sessionId`, `title`, `parentSessionId`,
+`parentTitle`, `branch`, `worktree`, `alive`, `state` (the worker's last
+reported state, or `exited`), `taskStatus` (`interrupted` when the process
+ended part way through a turn), `group` (`needs_you`, `running` or
+`finished`), `round`, `maxRounds`, `doing`, `createdAtMs`, `updatedAtMs`, and
+for finished rows `filesChanged` (`git diff --name-only <base>`) and
+`commitsAhead` (`git rev-list --count <base>..HEAD`), one `git -C <worktree>`
+call each. A live worker that is idle before its first turn has finished is
+*Running*; one idle after a finished turn is *Finished*.
 
 ### 5.8 Trust boundary
 

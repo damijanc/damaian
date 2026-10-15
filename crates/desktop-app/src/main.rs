@@ -132,8 +132,15 @@ fn main() {
             terminal_resize,
             terminal_close
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Damaian desktop app");
+        .build(tauri::generate_context!())
+        .expect("error while building Damaian desktop app")
+        .run(|_app, event| {
+            // A normal quit (spec 57 §5.3 step 4). A crash or `SIGKILL` never
+            // gets here; each worker's lifeline covers that.
+            if let tauri::RunEvent::Exit = event {
+                desktop_shell::shutdown_all_workers();
+            }
+        });
 }
 
 #[tauri::command]
