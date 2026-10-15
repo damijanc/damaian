@@ -22,6 +22,7 @@ pub mod ignore;
 pub mod index_cache;
 pub mod indexer;
 pub mod language;
+pub mod lsp;
 pub mod mcp;
 pub mod mode;
 pub mod model;
@@ -99,6 +100,11 @@ pub use hooks::{HookEnvelope, HookFailureKind, HookFinding, HookResponse};
 pub use index_cache::IndexCache;
 pub use indexer::{ProjectIndexer, RepositoryIndex, SearchResult};
 pub use language::{Declaration, SymbolKind, extract_declarations};
+pub use lsp::{
+    FileDiagnostics, LspClient, LspEvent, LspRequest, MAX_LSP_MESSAGE_BYTES, Position,
+    RepositoryUris, findings_from_diagnostics, read_message, symbol_kind_from_lsp,
+    symbol_refs_from_locations, symbols_from_document_symbols, write_message,
+};
 pub use mcp::{
     McpClient, McpRuntime, McpServerRuntime, McpTool, McpToolResult, namespaced_tool_name,
     parse_namespaced_tool_name,
