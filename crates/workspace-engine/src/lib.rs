@@ -102,12 +102,12 @@ pub use index_cache::IndexCache;
 pub use indexer::{ProjectIndexer, RepositoryIndex, SearchResult};
 pub use language::{Declaration, SymbolKind, extract_declarations};
 pub use lsp::{
-    FileDiagnostics, LANGUAGE_SERVER_IDLE_SECS, LANGUAGE_SERVER_REQUEST_TIMEOUT,
-    LANGUAGE_SERVER_SHUTDOWN_GRACE, LanguageServerError, LanguageServerHub, LanguageServerLaunch,
-    LanguageServerLimits, LanguageServerState, LanguageServerStatus, LspClient, LspEvent,
-    LspRequest, MAX_LSP_MESSAGE_BYTES, Position, RepositoryUris, findings_from_diagnostics,
-    read_message, symbol_kind_from_lsp, symbol_refs_from_locations, symbols_from_document_symbols,
-    write_message,
+    DefinitionPass, DefinitionPassReport, FileDiagnostics, LANGUAGE_SERVER_IDLE_SECS,
+    LANGUAGE_SERVER_REQUEST_TIMEOUT, LANGUAGE_SERVER_SHUTDOWN_GRACE, LanguageServerError,
+    LanguageServerHub, LanguageServerLaunch, LanguageServerLimits, LanguageServerState,
+    LanguageServerStatus, LspClient, LspEvent, LspRequest, MAX_LSP_MESSAGE_BYTES, Position,
+    RepositoryUris, findings_from_diagnostics, read_message, run_definition_pass,
+    symbol_kind_from_lsp, symbol_refs_from_locations, symbols_from_document_symbols, write_message,
 };
 pub use mcp::{
     McpClient, McpRuntime, McpServerRuntime, McpTool, McpToolResult, namespaced_tool_name,
@@ -162,9 +162,9 @@ pub use session::{
 };
 pub use steering::TurnSteering;
 pub use symbol_index::{
-    MatchQuality, Provenance, Relation, RelationKind, RelationTarget, SYMBOL_INDEX_SCHEMA_VERSION,
-    Symbol, SymbolFile, SymbolIndex, SymbolIndexStore, SymbolLoad, SymbolMatch, SymbolRef,
-    symbol_matches_json,
+    MERGE_LINE_TOLERANCE, MatchQuality, Provenance, Relation, RelationKind, RelationTarget,
+    SYMBOL_INDEX_SCHEMA_VERSION, Symbol, SymbolFile, SymbolIndex, SymbolIndexStore, SymbolLoad,
+    SymbolMatch, SymbolRef, merge, symbol_matches_json,
 };
 pub use tree_walk::{WalkEvent, WalkFile, WalkSkip};
 pub use validation::{

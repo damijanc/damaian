@@ -11,7 +11,9 @@ use crate::file_access::FileAccessController;
 use crate::git_service::GitService;
 use crate::index_cache::IndexCache;
 use crate::indexer::ProjectIndexer;
-use crate::lsp::{LanguageServerHub, LanguageServerLaunch};
+use crate::lsp::{
+    DefinitionPass, LanguageServerHub, LanguageServerLaunch, PassClaim, run_definition_pass,
+};
 use crate::navigation::NavigationController;
 use crate::patch_engine::PatchEngine;
 use crate::path_policy::PathPolicy;
@@ -21,6 +23,8 @@ use crate::secret_scanner::SecretScanner;
 use crate::session::SessionStore;
 use crate::symbol_index::{SymbolIndex, SymbolIndexStore, SymbolLoad, SymbolMatch};
 use crate::validation::{CommandStore, ValidationOrchestrator};
+use std::collections::BTreeMap;
+use std::ops::Deref;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -199,6 +203,70 @@ impl WorkspaceEngine {
     /// The process-wide language-server hub (spec 25 `context.md` §3).
     pub fn language_servers(&self) -> &'static LanguageServerHub {
         LanguageServerHub::global()
+    }
+
+    /// Starts the eager definition pass for this repository on the global
+    /// hub (spec 25 `context.md` §8). See
+    /// [`Self::start_definition_pass_with`].
+    pub fn start_definition_pass(
+        &self,
+        repository_root: impl AsRef<Path>,
+        session_id: &str,
+    ) -> Result<Option<DefinitionPass>> {
+        self.start_definition_pass_with(LanguageServerHub::global(), repository_root, session_id)
+    }
+
+    /// Starts [`run_definition_pass`] on a thread of its own and returns at
+    /// once. `None` when no language server is configured, or while a pass
+    /// for this repository is already running in this process. Nothing waits
+    /// for it: [`Self::find_symbols`] and every other reader take the stored
+    /// index as the pass leaves it, a mixture of both tiers until it is done.
+    pub fn start_definition_pass_with<H>(
+        &self,
+        hub: H,
+        repository_root: impl AsRef<Path>,
+        session_id: &str,
+    ) -> Result<Option<DefinitionPass>>
+    where
+        H: Deref<Target = LanguageServerHub> + Send + 'static,
+    {
+        let root = repository_root.as_ref().to_path_buf();
+        let launches: BTreeMap<String, LanguageServerLaunch> = self
+            .config
+            .language_servers
+            .keys()
+            .filter_map(|language| {
+                self.language_server_launch(&root, language, session_id)
+                    .map(|launch| (language.clone(), launch))
+            })
+            .collect();
+        let Some(repository_id) = launches.values().next().map(|launch| &launch.repository_id)
+        else {
+            return Ok(None);
+        };
+        let Some(claim) = PassClaim::claim(repository_id) else {
+            return Ok(None);
+        };
+        let indexer = self.indexer.clone();
+        let maps = RepositoryMapStore::new(&self.config.data_dir, self.audit_log.clone());
+        let command_policy = self.command_policy.clone();
+        let path_policy = self.path_policy.clone();
+        let store = SymbolIndexStore::new(&self.config.data_dir, self.audit_log.clone());
+        let scanner = self.scanner.clone();
+        DefinitionPass::spawn(claim, move || {
+            let index = IndexCache::get_or_build(&indexer, &root)?;
+            let (map, _) = maps.load_or_build(&index, &command_policy)?;
+            run_definition_pass(
+                &hub,
+                &launches,
+                &index,
+                &map,
+                &path_policy,
+                &store,
+                &scanner,
+            )
+        })
+        .map(Some)
     }
 
     /// What the hub needs to start `language`'s server for this repository,

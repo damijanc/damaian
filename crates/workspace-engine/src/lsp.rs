@@ -19,8 +19,12 @@
 //! `(repository_id, language)`, spawned the way `StdioTransport` spawns an MCP
 //! server and registered with spec 46's registry, and puts its pipes under
 //! [`LspClient`].
+//!
+//! Task 6 adds [`run_definition_pass`], the eager `documentSymbol` pass that
+//! merges each file's result into the stored symbol index, on a thread of its
+//! own ([`DefinitionPass`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -36,12 +40,15 @@ use serde_json::{Value, json};
 use crate::config::Config;
 use crate::error::{ClientError, Result};
 use crate::finding::{FindingDraft, FindingSource, Severity, SourceRange};
-use crate::hash::repository_id_for_root;
+use crate::hash::{repository_id_for_root, sha256};
+use crate::indexer::RepositoryIndex;
 use crate::language::SymbolKind;
 use crate::mcp::shell_split;
+use crate::path_policy::PathPolicy;
 use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
+use crate::repository_map::RepositoryMap;
 use crate::secret_scanner::SecretScanner;
-use crate::symbol_index::{Provenance, Symbol, SymbolRef};
+use crate::symbol_index::{Provenance, Symbol, SymbolIndexStore, SymbolRef};
 
 /// The largest body [`read_message`] accepts. A `documentSymbol` response for
 /// a very large file is well under this; a claim above it is refused before
@@ -1605,6 +1612,196 @@ fn unavailable_reason(state: &LanguageServerState) -> String {
             "the server crashed {} time(s) and is not restarted again",
             restarts + 1
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The eager definition pass (Task 6)
+// ---------------------------------------------------------------------------
+
+/// What one eager pass did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DefinitionPassReport {
+    /// Files whose server symbols were merged into the stored index, in the
+    /// order they completed.
+    pub covered: Vec<String>,
+    /// Files already covered at their current content, not asked about.
+    pub skipped: usize,
+    /// Files whose `documentSymbol` timed out or was refused. They stay
+    /// heuristic, and the next pass asks again.
+    pub missed: Vec<String>,
+    /// Languages whose server became unavailable during the pass, with the
+    /// reason. Their remaining files were not sent and stay heuristic.
+    pub stopped: BTreeMap<String, String>,
+}
+
+/// Fetches definitions for every indexed, non-restricted file of a language
+/// in `launches`, in index order, and merges each file's result into the
+/// stored index as soon as it arrives (`context.md` §8), so the work done
+/// survives a restart and a reader sees it at once. A file already covered
+/// at its current content is skipped. Each file is `didOpen` →
+/// `documentSymbol` → `didClose`, each under the hub's request timeout. A
+/// timeout or an error response moves on to the next file; an unavailable
+/// server ends the pass for its language.
+///
+/// It blocks for as long as the servers take, so it runs on a thread of its
+/// own ([`DefinitionPass`]), never on a request thread or a turn.
+pub fn run_definition_pass(
+    hub: &LanguageServerHub,
+    launches: &BTreeMap<String, LanguageServerLaunch>,
+    index: &RepositoryIndex,
+    map: &RepositoryMap,
+    policy: &PathPolicy,
+    store: &SymbolIndexStore,
+    scanner: &SecretScanner,
+) -> Result<DefinitionPassReport> {
+    let (snapshot, _) = store.load_or_build(index, map, policy)?;
+    let covered: BTreeMap<&str, &str> = snapshot
+        .files
+        .iter()
+        .filter(|file| file.language_server)
+        .map(|file| (file.path.as_str(), file.content_hash.as_str()))
+        .collect();
+    let mut report = DefinitionPassReport::default();
+    for record in &index.files {
+        let Some(launch) = launches.get(&record.language) else {
+            continue;
+        };
+        let path = record.path.as_str();
+        // Restricted files are indexed (context.md §7), so the policy is
+        // asked here too: a restricted file is never sent to a server.
+        if report.stopped.contains_key(&record.language) || policy.is_restricted(path, false) {
+            continue;
+        }
+        if covered.get(path) == Some(&record.content_hash.as_str()) {
+            report.skipped += 1;
+            continue;
+        }
+        // The server is sent the text the index hashed, or nothing: a file
+        // edited since the index pass is left to the next pass.
+        let Ok(bytes) = std::fs::read(launch.root.join(path)) else {
+            continue;
+        };
+        if sha256(&bytes) != record.content_hash {
+            continue;
+        }
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+
+        let language = launch.language.as_str();
+        let opened = hub.notify(launch, |client, uris| {
+            client.did_open(&uris.uri_for(path), language, 1, &text)
+        });
+        if let Err(error) = opened {
+            report
+                .stopped
+                .insert(language.to_string(), error.to_string());
+            continue;
+        }
+        let answer = hub.request(launch, |client, uris| {
+            client.document_symbol(&uris.uri_for(path))
+        });
+        match answer {
+            Ok(result) => {
+                let symbols = symbols_from_document_symbols(
+                    &result,
+                    &RepositoryUris::new(&launch.root),
+                    path,
+                    map.root_for_path(path),
+                    scanner,
+                );
+                if store.merge_language_server(
+                    &index.repository_id,
+                    path,
+                    &record.content_hash,
+                    symbols,
+                )? {
+                    report.covered.push(path.to_string());
+                }
+            }
+            Err(LanguageServerError::TimedOut { .. } | LanguageServerError::Refused { .. }) => {
+                report.missed.push(path.to_string());
+            }
+            Err(error @ LanguageServerError::Unavailable { .. }) => {
+                report
+                    .stopped
+                    .insert(language.to_string(), error.to_string());
+                continue;
+            }
+        }
+        let closed = hub.notify(launch, |client, uris| client.did_close(&uris.uri_for(path)));
+        if let Err(error) = closed {
+            report
+                .stopped
+                .insert(language.to_string(), error.to_string());
+        }
+    }
+    Ok(report)
+}
+
+/// Repositories with a pass running in this process, so a second request to
+/// start one while it runs starts nothing.
+static RUNNING_PASSES: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+fn running_passes() -> MutexGuard<'static, BTreeSet<String>> {
+    RUNNING_PASSES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A repository's claim on [`RUNNING_PASSES`], released when the pass's
+/// thread ends, however it ends.
+pub(crate) struct PassClaim(String);
+
+impl PassClaim {
+    /// `None` while another pass for `repository_id` runs.
+    pub(crate) fn claim(repository_id: &str) -> Option<Self> {
+        running_passes()
+            .insert(repository_id.to_string())
+            .then(|| Self(repository_id.to_string()))
+    }
+}
+
+impl Drop for PassClaim {
+    fn drop(&mut self) {
+        running_passes().remove(&self.0);
+    }
+}
+
+/// An eager pass running on its own thread. Nothing has to wait for it:
+/// readers take the stored snapshot whether it is running or not.
+#[derive(Debug)]
+pub struct DefinitionPass {
+    handle: thread::JoinHandle<Result<DefinitionPassReport>>,
+}
+
+impl DefinitionPass {
+    pub(crate) fn spawn(
+        claim: PassClaim,
+        work: impl FnOnce() -> Result<DefinitionPassReport> + Send + 'static,
+    ) -> Result<Self> {
+        let handle = thread::Builder::new()
+            .name("damaian-lsp-definitions".to_string())
+            .spawn(move || {
+                let _claim = claim;
+                work()
+            })
+            .map_err(|error| {
+                ClientError::Io(format!("could not start the definition pass: {error}"))
+            })?;
+        Ok(Self { handle })
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    /// Waits for the pass. For tests and shutdown paths, not for readers.
+    pub fn join(self) -> Result<DefinitionPassReport> {
+        self.handle
+            .join()
+            .unwrap_or_else(|_| Err(ClientError::Io("the definition pass panicked".to_string())))
     }
 }
 

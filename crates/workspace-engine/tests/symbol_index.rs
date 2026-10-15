@@ -19,10 +19,15 @@
 //! re-executed (context.md §2): registration before `initialize`, shutdown,
 //! idle expiry, an unanswered `initialize`, one restart and no more, and the
 //! sweep's start-time check over a `language_server` entry.
+//!
+//! Task 6 pins the eager definition pass against the same fake server, in
+//! modes that answer some files only, never answer, or exit halfway, and the
+//! merge of the two tiers on its own.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,11 +35,12 @@ use workspace_engine::language::extract_symbols;
 use workspace_engine::{
     AuditLog, CommandPolicy, Config, ConfigOverlay, Declaration, LANGUAGE_SERVER_LANGUAGES,
     LanguageServerError, LanguageServerHub, LanguageServerLaunch, LanguageServerLimits,
-    LanguageServerState, MatchQuality, PathPolicy, ProcessIdentity, ProcessKind, ProcessRegistry,
-    ProjectIndexer, Provenance, RebuildReason, RegisteredProcess, RelationKind, RelationTarget,
-    RepositoryIndex, RepositoryKeyClass, RepositoryMap, RepositoryTrustStore,
-    SYMBOL_INDEX_SCHEMA_VERSION, SecretScanner, SweepScope, SymbolIndex, SymbolIndexStore,
-    SymbolKind, SymbolLoad, WorkspaceEngine, extract_declarations, read_message, write_message,
+    LanguageServerState, MERGE_LINE_TOLERANCE, MatchQuality, MockModelAdapter, PathPolicy,
+    ProcessIdentity, ProcessKind, ProcessRegistry, ProjectIndexer, Provenance, RebuildReason,
+    RegisteredProcess, RelationKind, RelationTarget, RepositoryIndex, RepositoryKeyClass,
+    RepositoryMap, RepositoryTrustStore, SYMBOL_INDEX_SCHEMA_VERSION, SecretScanner, SweepScope,
+    Symbol, SymbolIndex, SymbolIndexStore, SymbolKind, SymbolLoad, WorkspaceEngine,
+    extract_declarations, merge, read_message, run_definition_pass, write_message,
 };
 
 use SymbolKind::{
@@ -1295,6 +1301,7 @@ fn a_reused_file_takes_its_root_from_the_current_map() {
 const FAKE_MODE: &str = "DAMAIAN_FAKE_LSP_MODE";
 const FAKE_LOG: &str = "DAMAIAN_FAKE_LSP_LOG";
 const FAKE_REGISTRY: &str = "DAMAIAN_FAKE_LSP_REGISTRY";
+const FAKE_SYMBOLS: &str = "DAMAIAN_FAKE_LSP_SYMBOLS";
 
 /// A temp repository with a data directory, a fake server log, and the
 /// config that names the fake server for Rust.
@@ -1305,7 +1312,11 @@ struct ServerFixture {
 
 impl ServerFixture {
     fn new(name: &str) -> Self {
-        let repo = Repo::new(name, &[("src/lib.rs", "pub fn alpha() {}\n")]);
+        Self::with_files(name, &[("src/lib.rs", "pub fn alpha() {}\n")])
+    }
+
+    fn with_files(name: &str, files: &[(&str, &str)]) -> Self {
+        let repo = Repo::new(name, files);
         let log = repo.data_dir.join("fake-server.log");
         Self { repo, log }
     }
@@ -1314,12 +1325,53 @@ impl ServerFixture {
     fn command(&self, mode: &str) -> String {
         let binary = std::env::current_exe().expect("test binary path");
         format!(
-            "/bin/sh -c \"export {FAKE_MODE}={mode} {FAKE_LOG}='{}' {FAKE_REGISTRY}='{}'; \
+            "/bin/sh -c \"export {FAKE_MODE}={mode} {FAKE_LOG}='{}' {FAKE_REGISTRY}='{}' \
+             {FAKE_SYMBOLS}='{}'; \
              exec \\\"\\$0\\\" --ignored --exact fake_language_server_helper 3>&1 1>/dev/null\" '{}'",
             self.log.display(),
             self.repo.data_dir.join("processes").display(),
+            self.symbols_file().display(),
             binary.display(),
         )
+    }
+
+    /// Where the fake server reads its `documentSymbol` answers from.
+    fn symbols_file(&self) -> PathBuf {
+        self.repo.data_dir.join("fake-symbols.json")
+    }
+
+    /// The fake server answers `documentSymbol` for these files only.
+    fn answer_symbols(&self, answers: serde_json::Value) {
+        fs::write(self.symbols_file(), answers.to_string()).unwrap();
+    }
+
+    /// An engine whose config names the fake server in `mode` for Rust.
+    fn engine(&self, mode: &str) -> WorkspaceEngine {
+        let mut config = self.repo.config();
+        config
+            .language_servers
+            .insert("rust".to_string(), self.command(mode));
+        WorkspaceEngine::new(config)
+    }
+
+    /// The `documentSymbol` requests the fake servers saw, as the path each
+    /// asked about.
+    fn symbol_requests(&self) -> Vec<String> {
+        self.requested("request textDocument/documentSymbol ")
+    }
+
+    fn requested(&self, prefix: &str) -> Vec<String> {
+        let root = format!("{}/", fs::canonicalize(&self.repo.root).unwrap().display());
+        self.log_lines()
+            .iter()
+            .filter_map(|line| line.strip_prefix(prefix))
+            .map(|uri| {
+                uri.strip_prefix("file://")
+                    .and_then(|path| path.strip_prefix(&root))
+                    .unwrap_or(uri)
+                    .to_string()
+            })
+            .collect()
     }
 
     fn launch(&self, mode: &str) -> LanguageServerLaunch {
@@ -1679,20 +1731,622 @@ fn a_language_server_entry_whose_start_time_does_not_match_is_not_killed() {
     );
 }
 
+// ---- Task 6: the eager definition pass and merging the tiers ----
+
+/// A `DocumentSymbol` as a server reports it: `line` is 1-based here and
+/// sent 0-based, and `range` starts two lines earlier, where a doc comment
+/// would be, so a test that read `range` would see another line.
+fn reported(name: &str, lsp_kind: u64, line: u32) -> serde_json::Value {
+    let zero_based = line - 1;
+    serde_json::json!({
+        "name": name,
+        "kind": lsp_kind,
+        "range": {
+            "start": { "line": zero_based.saturating_sub(2), "character": 0 },
+            "end": { "line": zero_based + 1, "character": 0 }
+        },
+        "selectionRange": {
+            "start": { "line": zero_based, "character": 7 },
+            "end": { "line": zero_based, "character": 7 + name.len() }
+        }
+    })
+}
+
+const LSP_FUNCTION: u64 = 12;
+
+fn symbol(name: &str, kind: SymbolKind, path: &str, line: u32, provenance: Provenance) -> Symbol {
+    Symbol {
+        name: name.to_string(),
+        kind,
+        path: path.to_string(),
+        line,
+        column: Some(1),
+        container: None,
+        root_path: String::new(),
+        provenance,
+    }
+}
+
+/// `(path, line, provenance)` of every match for `query`, through the
+/// engine's reader.
+fn found(engine: &WorkspaceEngine, root: &PathBuf, query: &str) -> Vec<(String, u32, Provenance)> {
+    engine
+        .find_symbols(root, query, 50)
+        .expect("find_symbols never fails on a server's account")
+        .into_iter()
+        .filter(|found| found.symbol.name == query)
+        .map(|found| {
+            (
+                found.symbol.path,
+                found.symbol.line,
+                found.symbol.provenance,
+            )
+        })
+        .collect()
+}
+
+/// The stored files the pass has covered so far, read from disk as a reader
+/// would see them.
+fn covered_files(repo: &Repo) -> Vec<String> {
+    let Ok(bytes) = fs::read(repo.index_file()) else {
+        return Vec::new();
+    };
+    let stored: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    stored["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|file| file["languageServer"] == true)
+        .map(|file| file["path"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn a_server_that_covers_one_file_supersedes_it_and_heuristics_elsewhere_survive() {
+    let fixture = ServerFixture::with_files(
+        "pass-partial",
+        &[
+            (
+                "src/upload.rs",
+                "// Uploads.\n\npub fn upload_once() {}\n\npub fn upload_retry(\n    attempts: u32,\n) {}\n",
+            ),
+            ("src/other.rs", "pub fn upload_retry() {}\n"),
+            ("src/main.rs", "fn main() {}\n"),
+            ("src/private.rs", "pub fn private_key_loader() {}\n"),
+            ("tools/upload.py", "def upload_retry():\n    pass\n"),
+        ],
+    );
+    // The server places `upload_retry` on line 6, the heuristic on line 5:
+    // the same declaration, within the tolerance. It does not report
+    // `upload_once`, and it knows nothing about any other file.
+    fixture.answer_symbols(serde_json::json!({
+        "src/upload.rs": [reported("upload_retry", LSP_FUNCTION, 6)]
+    }));
+    let mut engine = fixture.engine("normal");
+    engine
+        .config
+        .restricted_patterns
+        .push("src/private.rs".to_string());
+    let engine = WorkspaceEngine::new(engine.config);
+    let hub = Arc::new(LanguageServerHub::with_limits(limits(
+        START_TIMEOUT,
+        Duration::from_secs(600),
+    )));
+
+    let report = engine
+        .start_definition_pass_with(Arc::clone(&hub), &fixture.repo.root, "ses_task6")
+        .unwrap()
+        .expect("rust is configured")
+        .join()
+        .unwrap();
+
+    assert!(
+        report.stopped.is_empty() && report.missed.is_empty(),
+        "{report:?}"
+    );
+    let mut asked = fixture.symbol_requests();
+    asked.sort();
+    assert_eq!(
+        asked,
+        ["src/main.rs", "src/other.rs", "src/upload.rs"],
+        "every Rust file, once; not the Python file, and never the restricted one"
+    );
+    assert!(
+        fixture
+            .log_lines()
+            .iter()
+            .all(|line| !line.contains("private.rs")),
+        "a restricted file was sent: {:?}",
+        fixture.log_lines()
+    );
+    let mut covered = report.covered.clone();
+    covered.sort();
+    assert_eq!(covered, asked);
+
+    let root = fixture.repo.root.clone();
+    assert_eq!(
+        found(&engine, &root, "upload_retry"),
+        [
+            ("src/upload.rs".to_string(), 6, Provenance::LanguageServer),
+            ("src/other.rs".to_string(), 1, Provenance::Heuristic),
+            ("tools/upload.py".to_string(), 1, Provenance::Heuristic),
+        ],
+        "one server symbol at the server's line, ranked first; the heuristics in \
+         other files stay"
+    );
+    assert_eq!(
+        found(&engine, &root, "upload_once"),
+        [("src/upload.rs".to_string(), 3, Provenance::Heuristic)],
+        "a heuristic symbol the server did not report is kept, even in a covered file"
+    );
+    assert_eq!(
+        found(&engine, &root, "main"),
+        [("src/main.rs".to_string(), 1, Provenance::Heuristic)],
+        "a file the server knows nothing about keeps its heuristics"
+    );
+
+    // Every covered file is skipped by the next pass: no request is sent.
+    let again = engine
+        .start_definition_pass_with(Arc::clone(&hub), &fixture.repo.root, "ses_task6")
+        .unwrap()
+        .expect("the first pass has finished")
+        .join()
+        .unwrap();
+    assert_eq!(again.skipped, 3, "{again:?}");
+    assert!(again.covered.is_empty(), "{again:?}");
+    assert_eq!(fixture.symbol_requests().len(), 3);
+    hub.shutdown_all();
+}
+
+#[test]
+fn the_same_name_in_another_file_is_not_superseded() {
+    let merged = merge(
+        vec![
+            symbol(
+                "upload_retry",
+                Function,
+                "src/a.rs",
+                5,
+                Provenance::Heuristic,
+            ),
+            symbol(
+                "upload_retry",
+                Function,
+                "src/b.rs",
+                5,
+                Provenance::Heuristic,
+            ),
+        ],
+        vec![symbol(
+            "upload_retry",
+            Function,
+            "src/a.rs",
+            5,
+            Provenance::LanguageServer,
+        )],
+    );
+    let entries: Vec<_> = merged
+        .iter()
+        .map(|symbol| (symbol.path.as_str(), symbol.provenance))
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("src/a.rs", Provenance::LanguageServer),
+            ("src/b.rs", Provenance::Heuristic),
+        ]
+    );
+}
+
+#[test]
+fn a_server_line_within_the_tolerance_supersedes_and_one_further_away_does_not() {
+    let path = "src/upload.rs";
+    let one = |heuristic_line: u32, server_line: u32| {
+        merge(
+            vec![symbol(
+                "upload_retry",
+                Function,
+                path,
+                heuristic_line,
+                Provenance::Heuristic,
+            )],
+            vec![symbol(
+                "upload_retry",
+                Function,
+                path,
+                server_line,
+                Provenance::LanguageServer,
+            )],
+        )
+        .iter()
+        .map(|symbol| (symbol.line, symbol.provenance))
+        .collect::<Vec<_>>()
+    };
+
+    assert_eq!(one(41, 42), [(42, Provenance::LanguageServer)]);
+    assert_eq!(
+        one(41, 51),
+        [
+            (41, Provenance::Heuristic),
+            (51, Provenance::LanguageServer)
+        ]
+    );
+    // The edges of MERGE_LINE_TOLERANCE, in both directions.
+    assert_eq!(MERGE_LINE_TOLERANCE, 3);
+    assert_eq!(one(41, 44), [(44, Provenance::LanguageServer)]);
+    assert_eq!(one(44, 41), [(41, Provenance::LanguageServer)]);
+    assert_eq!(
+        one(41, 45),
+        [
+            (41, Provenance::Heuristic),
+            (45, Provenance::LanguageServer)
+        ]
+    );
+}
+
+#[test]
+fn a_heuristic_trait_is_superseded_by_the_servers_interface() {
+    let merged = merge(
+        vec![
+            symbol("Store", Trait, "src/store.rs", 10, Provenance::Heuristic),
+            symbol("put", Method, "src/store.rs", 11, Provenance::Heuristic),
+        ],
+        vec![symbol(
+            "Store",
+            Interface,
+            "src/store.rs",
+            10,
+            Provenance::LanguageServer,
+        )],
+    );
+    let entries: Vec<_> = merged
+        .iter()
+        .map(|symbol| (symbol.name.as_str(), symbol.kind, symbol.provenance))
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("Store", Interface, Provenance::LanguageServer),
+            ("put", Method, Provenance::Heuristic),
+        ]
+    );
+}
+
+#[test]
+fn a_file_edited_after_its_pass_is_asked_about_again_and_only_it() {
+    let fixture = ServerFixture::with_files(
+        "pass-edit",
+        &[
+            ("src/alpha.rs", "pub fn alpha() {}\n"),
+            ("src/beta.rs", "pub fn beta() {}\n"),
+        ],
+    );
+    fixture.answer_symbols(serde_json::json!({
+        "src/alpha.rs": [reported("alpha", LSP_FUNCTION, 1)],
+        "src/beta.rs": [reported("beta", LSP_FUNCTION, 1)],
+    }));
+    let mut config = fixture.repo.config();
+    config
+        .language_servers
+        .insert("rust".to_string(), fixture.command("normal"));
+    let launch = LanguageServerLaunch::from_config(&config, &fixture.repo.root, "rust", "ses")
+        .expect("rust is configured");
+    let launches = BTreeMap::from([("rust".to_string(), launch)]);
+    let hub = LanguageServerHub::with_limits(limits(START_TIMEOUT, Duration::from_secs(600)));
+    let scanner = SecretScanner::new(Vec::new());
+    let policy = PathPolicy::new(&config);
+    let pass = |index: &RepositoryIndex| {
+        let map = RepositoryMap::build(index, &CommandPolicy::new(config.clone()));
+        run_definition_pass(
+            &hub,
+            &launches,
+            index,
+            &map,
+            &policy,
+            &fixture.repo.store(),
+            &scanner,
+        )
+        .unwrap()
+    };
+
+    let first = pass(&fixture.repo.index());
+    assert_eq!(first.covered.len(), 2, "{first:?}");
+    let second = pass(&fixture.repo.index());
+    assert_eq!((second.covered.len(), second.skipped), (0, 2), "{second:?}");
+
+    fixture.repo.write("src/beta.rs", "\npub fn beta() {}\n");
+    // A reader rebuilds first: the edited file's server symbols are dropped
+    // with its old hash, and it is heuristic again until the pass reaches it.
+    let (rebuilt, _) = fixture.repo.load();
+    assert_eq!(
+        entries(&rebuilt),
+        [
+            (
+                "alpha".into(),
+                "src/alpha.rs".into(),
+                1,
+                Provenance::LanguageServer
+            ),
+            (
+                "beta".into(),
+                "src/beta.rs".into(),
+                2,
+                Provenance::Heuristic
+            ),
+        ]
+    );
+    let third = pass(&fixture.repo.index());
+    assert_eq!(third.covered, ["src/beta.rs"], "{third:?}");
+    assert_eq!(third.skipped, 1);
+    assert_eq!(
+        fixture.symbol_requests(),
+        ["src/alpha.rs", "src/beta.rs", "src/beta.rs"].map(String::from)
+    );
+}
+
+/// A result for content the store no longer holds is not written.
+#[test]
+fn a_result_for_an_outdated_hash_is_not_merged() {
+    let repo = two_file_repo("store-merge-outdated");
+    let (built, _) = repo.load();
+    let store = repo.store();
+    let server = vec![symbol(
+        "alpha",
+        Function,
+        "src/alpha.rs",
+        1,
+        Provenance::LanguageServer,
+    )];
+
+    assert!(
+        !store
+            .merge_language_server(
+                &built.repository_id,
+                "src/alpha.rs",
+                "not-the-hash",
+                server.clone()
+            )
+            .unwrap()
+    );
+    assert!(covered_files(&repo).is_empty());
+
+    let hash = &built.files[0].content_hash;
+    assert!(
+        store
+            .merge_language_server(&built.repository_id, "src/alpha.rs", hash, server)
+            .unwrap()
+    );
+    assert_eq!(covered_files(&repo), ["src/alpha.rs"]);
+    let (reused, outcome) = repo.load();
+    assert_eq!(
+        outcome,
+        SymbolLoad::Reused,
+        "a merged index is the current one"
+    );
+    assert_eq!(
+        entries(&reused)[0],
+        (
+            "alpha".into(),
+            "src/alpha.rs".into(),
+            1,
+            Provenance::LanguageServer
+        )
+    );
+}
+
+#[test]
+fn a_server_that_exits_halfway_stops_the_pass_and_nothing_else() {
+    let files: Vec<(String, String)> = (1..=6)
+        .map(|n| (format!("src/f{n}.rs"), format!("pub fn f{n}() {{}}\n")))
+        .collect();
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_str()))
+        .collect();
+    let fixture = ServerFixture::with_files("pass-crash", &borrowed);
+    // Each file's function, one line below the heuristic's, so a covered file
+    // is told apart by its line as well as its provenance.
+    fixture.answer_symbols(serde_json::Value::Object(
+        (1..=6)
+            .map(|n| {
+                (
+                    format!("src/f{n}.rs"),
+                    serde_json::json!([reported(&format!("f{n}"), LSP_FUNCTION, 2)]),
+                )
+            })
+            .collect(),
+    ));
+    // Slow enough that a reader certainly runs while the pass does; the
+    // fourth `documentSymbol` kills the server.
+    let engine = fixture.engine("delay_1000,crash_on_symbol_4");
+    let root = fixture.repo.root.clone();
+    engine.find_symbols(&root, "f1", 10).unwrap();
+    let hub = Arc::new(LanguageServerHub::with_limits(limits(
+        START_TIMEOUT,
+        Duration::from_secs(600),
+    )));
+
+    let pass = engine
+        .start_definition_pass_with(Arc::clone(&hub), &root, "ses_task6")
+        .unwrap()
+        .expect("rust is configured");
+    assert!(
+        engine
+            .start_definition_pass_with(Arc::clone(&hub), &root, "ses_task6")
+            .unwrap()
+            .is_none(),
+        "one pass per repository at a time"
+    );
+
+    // A turn runs while the pass does, through the engine alone.
+    assert!(!pass.is_finished());
+    let mut model = MockModelAdapter::new("f1 is defined in src/f1.rs.");
+    let turn = engine
+        .chat_orchestrator
+        .ask(&root, "Where is f1 defined?", &[], &mut model, &mut |_| {})
+        .expect("a turn does not depend on the language server");
+    assert_eq!(turn.response, "f1 is defined in src/f1.rs.");
+
+    // A reader in the middle of the pass sees both tiers.
+    wait_until("the first covered file", START_TIMEOUT, || {
+        !covered_files(&fixture.repo).is_empty()
+    });
+    let started = Instant::now();
+    let during: Vec<Provenance> = engine
+        .find_symbols(&root, "f", 50)
+        .expect("a reader never fails on the pass's account")
+        .into_iter()
+        .map(|found| found.symbol.provenance)
+        .collect();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        !pass.is_finished(),
+        "the read did not happen during the pass"
+    );
+    assert!(during.contains(&Provenance::LanguageServer), "{during:?}");
+    assert!(during.contains(&Provenance::Heuristic), "{during:?}");
+
+    let report = pass.join().unwrap();
+    assert!(report.stopped.contains_key("rust"), "{report:?}");
+    assert_eq!(report.covered.len(), 3, "{report:?}");
+    assert_eq!(fixture.symbol_requests().len(), 4);
+    assert_eq!(fixture.spawns(), 1, "the pass does not restart the server");
+    let mut covered = covered_files(&fixture.repo);
+    covered.sort();
+    let mut expected = report.covered.clone();
+    expected.sort();
+    assert_eq!(covered, expected);
+
+    for n in 1..=6 {
+        let path = format!("src/f{n}.rs");
+        let after = found(&engine, &root, &format!("f{n}"));
+        let want = if report.covered.contains(&path) {
+            (path, 2, Provenance::LanguageServer)
+        } else {
+            (path, 1, Provenance::Heuristic)
+        };
+        assert_eq!(after, [want]);
+    }
+    assert!(matches!(
+        hub.status(&workspace_engine::repository_id_for_root(
+            fs::canonicalize(&root).unwrap()
+        ))[0]
+            .state,
+        LanguageServerState::Crashed { restarts: 0 }
+    ));
+    assert!(fixture.registry_entries().is_empty());
+}
+
+#[test]
+fn a_server_that_never_answers_costs_one_timeout_per_file_and_never_delays_a_reader() {
+    let fixture = ServerFixture::with_files(
+        "pass-silent",
+        &[
+            ("src/a.rs", "pub fn a() {}\n"),
+            ("src/b.rs", "pub fn b() {}\n"),
+            ("src/c.rs", "pub fn c() {}\n"),
+        ],
+    );
+    let timeout = Duration::from_secs(2);
+    let engine = fixture.engine("no_document_symbol");
+    let root = fixture.repo.root.clone();
+    engine.find_symbols(&root, "a", 10).unwrap();
+    let hub = Arc::new(LanguageServerHub::with_limits(limits(
+        timeout,
+        Duration::from_secs(600),
+    )));
+
+    let started = Instant::now();
+    let pass = engine
+        .start_definition_pass_with(Arc::clone(&hub), &root, "ses_task6")
+        .unwrap()
+        .expect("rust is configured");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "starting the pass waited: {:?}",
+        started.elapsed()
+    );
+
+    wait_until("the first request", START_TIMEOUT, || {
+        !fixture.symbol_requests().is_empty()
+    });
+    let reading = Instant::now();
+    assert_eq!(
+        found(&engine, &root, "a"),
+        [("src/a.rs".to_string(), 1, Provenance::Heuristic)]
+    );
+    assert!(
+        reading.elapsed() < timeout / 2,
+        "a reader waited on the server: {:?}",
+        reading.elapsed()
+    );
+    assert!(
+        !pass.is_finished(),
+        "the read did not happen during the pass"
+    );
+
+    let report = pass.join().unwrap();
+    let took = started.elapsed();
+    let mut missed = report.missed.clone();
+    missed.sort();
+    assert_eq!(missed, ["src/a.rs", "src/b.rs", "src/c.rs"], "{report:?}");
+    assert!(
+        report.covered.is_empty() && report.stopped.is_empty(),
+        "{report:?}"
+    );
+    assert_eq!(
+        fixture.symbol_requests().len(),
+        3,
+        "one request per file, no retry"
+    );
+    assert!(took >= timeout * 3, "{took:?}");
+    // Three timeouts, plus one launch of the server.
+    assert!(took < timeout * 3 + START_TIMEOUT, "{took:?}");
+    let opened = fixture.requested("notify textDocument/didOpen ");
+    let closed = fixture.requested("notify textDocument/didClose ");
+    assert_eq!(opened.len(), 3, "{opened:?}");
+    assert_eq!(opened, closed, "every opened file is closed again");
+    assert!(covered_files(&fixture.repo).is_empty());
+    assert_eq!(
+        hub.status(&workspace_engine::repository_id_for_root(
+            fs::canonicalize(&root).unwrap()
+        ))[0]
+            .state,
+        LanguageServerState::Ready,
+        "a timeout leaves the server up"
+    );
+    hub.shutdown_all();
+}
+
 /// The fake language server. Never run on its own: a test re-executes the
 /// test binary into it through `ServerFixture::command`, and run directly it
-/// returns at once. Its behaviour is `DAMAIAN_FAKE_LSP_MODE`:
+/// returns at once. Its behaviour is `DAMAIAN_FAKE_LSP_MODE`, a
+/// comma-separated list of:
 ///
 /// - `normal`: answers `initialize`, `shutdown`, and every other request with
 ///   an empty result;
 /// - `silent`: never answers `initialize`;
 /// - `exit_after_<n>`: answers `n` requests after `initialize`, then exits;
-/// - `exit_at_once`: exits before reading anything.
+/// - `exit_at_once`: exits before reading anything;
+/// - `no_document_symbol`: never answers `documentSymbol` (Task 6);
+/// - `crash_on_symbol_<n>`: exits on reading its `n`-th `documentSymbol`,
+///   without answering it (Task 6);
+/// - `delay_<ms>`: waits that long before answering `documentSymbol`
+///   (Task 6).
+///
+/// When the file `DAMAIAN_FAKE_LSP_SYMBOLS` exists, it is a JSON object from
+/// repository-relative path to `documentSymbol` result: a listed file gets
+/// its result, and every other file `null`, as from a server that indexes
+/// part of the repository.
 ///
 /// It appends what happened to `DAMAIAN_FAKE_LSP_LOG`, and on `initialize`
 /// records whether its own registry entry already existed.
 #[test]
-#[ignore = "the fake language server; re-executed by the Task 5 tests"]
+#[ignore = "the fake language server; re-executed by the Task 5 and 6 tests"]
 fn fake_language_server_helper() {
     use std::io::Write;
     use std::os::fd::FromRawFd;
@@ -1700,8 +2354,19 @@ fn fake_language_server_helper() {
     let Ok(mode) = std::env::var(FAKE_MODE) else {
         return;
     };
+    let flags: Vec<&str> = mode.split(',').collect();
+    let number = |prefix: &str| {
+        flags.iter().find_map(|flag| {
+            flag.strip_prefix(prefix)
+                .map(|count| count.parse::<u64>().unwrap())
+        })
+    };
     let log_path = std::env::var(FAKE_LOG).expect("a log path");
     let registry = PathBuf::from(std::env::var(FAKE_REGISTRY).expect("a registry path"));
+    let symbols: Option<serde_json::Map<String, serde_json::Value>> = std::env::var(FAKE_SYMBOLS)
+        .ok()
+        .and_then(|path| fs::read(path).ok())
+        .map(|bytes| serde_json::from_slice(&bytes).unwrap());
     let log = |line: &str| {
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -1712,12 +2377,13 @@ fn fake_language_server_helper() {
     };
     let pid = std::process::id();
     log(&format!("start {pid}"));
-    if mode == "exit_at_once" {
+    if flags.contains(&"exit_at_once") {
         std::process::exit(0);
     }
-    let exit_after = mode
-        .strip_prefix("exit_after_")
-        .map(|count| count.parse::<usize>().unwrap());
+    let exit_after = number("exit_after_");
+    let crash_on_symbol = number("crash_on_symbol_");
+    let delay = number("delay_").map(Duration::from_millis);
+    let mut symbol_requests = 0;
 
     // SAFETY: fd 3 is the pipe the command line moved there, and nothing
     // else in this process owns it.
@@ -1744,7 +2410,7 @@ fn fake_language_server_helper() {
                         .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
                 });
                 log(&format!("initialize registered={registered}"));
-                if mode != "silent" {
+                if !flags.contains(&"silent") {
                     reply(&id, serde_json::json!({ "capabilities": {} }));
                 }
             }
@@ -1756,6 +2422,36 @@ fn fake_language_server_helper() {
                 log("exit");
                 std::process::exit(0);
             }
+            ("textDocument/documentSymbol", Some(id)) => {
+                let uri = message["params"]["textDocument"]["uri"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                log(&format!("request textDocument/documentSymbol {uri}"));
+                symbol_requests += 1;
+                if crash_on_symbol == Some(symbol_requests) {
+                    log("crash");
+                    std::process::exit(1);
+                }
+                if flags.contains(&"no_document_symbol") {
+                    continue;
+                }
+                if let Some(delay) = delay {
+                    std::thread::sleep(delay);
+                }
+                let result = match &symbols {
+                    Some(symbols) => symbols
+                        .iter()
+                        .find(|(path, _)| uri.ends_with(&format!("/{path}")))
+                        .map_or(serde_json::Value::Null, |(_, result)| result.clone()),
+                    None => serde_json::json!([]),
+                };
+                reply(&id, result);
+                answered += 1;
+                if exit_after.is_some_and(|limit| answered >= limit) {
+                    std::process::exit(0);
+                }
+            }
             (method, Some(id)) => {
                 log(&format!("request {method}"));
                 reply(&id, serde_json::json!([]));
@@ -1764,7 +2460,12 @@ fn fake_language_server_helper() {
                     std::process::exit(0);
                 }
             }
-            (_, None) => {}
+            (method, None) => {
+                let uri = message["params"]["textDocument"]["uri"]
+                    .as_str()
+                    .unwrap_or_default();
+                log(&format!("notify {method} {uri}"));
+            }
         }
     }
 }
