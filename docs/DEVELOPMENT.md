@@ -119,6 +119,13 @@ npm run lint:web                                             # app.js / style.cs
 cargo deny check                                             # advisories + licenses
 ```
 
+The two workspace-wide commands are left to CI on the development Mac, where
+they can take over an hour; run the fast checks and scoped clippy and tests
+locally instead (`scripts/quality-gate.sh fmt node lint typos deny`, then
+`-p <crate>`). [AGENTS.md](../AGENTS.md) "The full gate runs on CI, not
+locally" has the policy, and [Troubleshooting](TROUBLESHOOTING.md#the-quality-gate-is-slow-locally)
+the reason.
+
 `npm run lint:web:fix` applies the web-asset fixes automatically. `npm ci` first
 if you have not installed the Node dev dependencies; Biome is the only one, and
 it is pinned in `package-lock.json`.

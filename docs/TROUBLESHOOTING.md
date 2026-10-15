@@ -1504,6 +1504,87 @@ Expected, not a bug. The developer preview is ad-hoc signed, not Developer ID
 signed or notarized, so Gatekeeper blocks first launch. The workaround is in
 [macOS Installation](MACOS_INSTALLATION.md). Do not try to "fix" it in code.
 
+### The quality gate is slow locally
+
+CI runs the whole gate in a few minutes. On this project's development Mac the
+same runs have ranged from that to well over an hour, on the same code, minutes
+apart. A fresh worktree's cold `target/` is not the cause: on 2026-10-14 a
+clippy run into an empty target directory took 45s, and
+`cargo nextest run --workspace` 33s for 1186 tests. When a gate step runs past
+about ten minutes, stop waiting and find out why.
+
+**Measure it with `scripts/quality-gate.sh`.** It runs the same seven checks
+(or the ones named, e.g. `scripts/quality-gate.sh clippy nextest`), times each
+step, and samples load, swap, power source, concurrent cargo processes and the
+top CPU consumers every 30 seconds into
+`$CARGO_TARGET_DIR/gate-logs/<timestamp>/` (`target/` when unset). It warns
+on stderr once a step passes `GATE_SLOW_SECS` (default 600). Read the
+summary's `cpu/wall` column first: well above 1 means the step was compiling
+on several cores, well below 1 means it was mostly *waiting*, and no build
+cache or linker change will help a waiting step.
+
+**A waiting test step is most likely endpoint security software stalling
+process launches.** The tests that dominate a slow run are the ones that start
+many processes — the checkpoint store's `git` calls, the eval-harness
+scenarios, the mode-refusal tests that run commands and MCP servers. On
+2026-10-15 a full `nextest` took 457s–690s at `cpu/wall` 0.1, and the
+hundred-turn checkpoint test alone took 196s and then 49s a few minutes later.
+Timing every `git` call that test made showed two clusters: the median call
+took 14 ms, but about 9% took a fixed ~280 ms each and accounted for 68% of all
+`git` time. A plain launch of `/usr/bin/true` took 2 ms and of `git` 8 ms
+when measured in isolation. That shape — most launches fast, a share held for a
+fixed interval, worse at some moments than others, absent on CI — is what an
+agent that inspects every launch before letting it run produces. The Mac in
+question runs two, installed by its administrators: Sophos (`SophosAntiVirus`,
+`SophosCBR`) and SentinelOne (`sentineld`). Which of them is responsible has
+not been isolated; that needs their admin consoles.
+
+Check for the signature with `scripts/time-git-calls.sh`, which runs a command
+with every `git` call timed and prints the distribution:
+
+```bash
+scripts/time-git-calls.sh cargo nextest run -p workspace-engine --test checkpoints --locked \
+  -E 'test(a_hundred_turn_session_stays_within_its_documented_storage_bound)'
+```
+
+A healthy machine shows p99 within a few times p50 and no `>=150 ms` cluster.
+The remedy is outside this repository: ask the administrators for scanning
+exclusions covering the repositories (`~/development`), `~/.cargo`,
+`~/.rustup`, the `git` binary (`/opt/homebrew/bin/git`), the per-user temp
+directory the tests create repositories in (`$TMPDIR`, under `/var/folders`),
+and the target directories. Re-run the check afterwards; the slow cluster should
+be gone. Do not try to fix this in code — a test that is slow only on one
+machine is not a code defect.
+
+**Ruled out, with measurements, on 2026-10-14 and 2026-10-15:**
+
+- **The Developer Tools exemption** (System Settings → Privacy & Security →
+  Developer Tools). Gatekeeper's `syspolicyd` was often busy during slow runs,
+  but back-to-back runs launched from exempt Terminal.app and from an exempt
+  Claude Code process were equally slow (690s and 457s). One fast run after
+  adding an exemption was coincidence. If you try it anyway, note that the
+  exemption follows the *responsible* process, which is not always the parent
+  you see — `sudo launchctl procinfo $$ | grep -i responsible` names it.
+- **`git` itself and raw file I/O.** A checkpoint-style turn (five `git` calls)
+  cost about 55 ms in `$TMPDIR`, in a scratch directory and under
+  `~/development` alike.
+- **Parallel contention.** The hundred-turn test was as slow running alone as
+  inside the full suite.
+
+**Other causes to rule out, in the sampler log:**
+
+- **Concurrent builds.** The cargo/rustc process count covers every worktree.
+  Two gates at once compete for the same eight cores, and runs sharing one
+  target directory serialise on its lock (`Blocking waiting for file lock`).
+  Give each worktree its own `CARGO_TARGET_DIR`; never kill another session's
+  build to free the machine.
+- **Swap.** `vm.swapusage` close to its total while `rustc` processes are large
+  means the build is paging.
+- **Battery.** A run on battery or in Low Power Mode is slower by design.
+
+If none of these shows up, `sample <pid> 5` on the slowest process names the
+call it is blocked in; record what you find before changing anything.
+
 ## Resetting state
 
 Ordered least to most destructive. **Look at what you are deleting first** —

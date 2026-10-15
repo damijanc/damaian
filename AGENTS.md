@@ -491,15 +491,37 @@ and:
 cargo clippy -p <crate> --all-targets --locked -- -D warnings
 ```
 
-Run the complete quality gate once the feature reaches its final integrated state.
+The complete quality gate runs once the feature reaches its final integrated state — on CI, as the next section requires.
 
 This changes **when** the complete gate runs, not whether it runs.
 
 Nothing is complete until all seven checks pass.
 
-Measured on a developer Mac (2026-09-18): `cargo clippy --workspace --all-targets` cold takes about 18m20s, `cargo clippy -p workspace-engine --all-targets` warm takes about 75s, and `cargo nextest run --workspace --locked` takes about 5 minutes, mostly idle on the checkpoint store's `git` subprocesses. A multi-task plan that runs the unscoped pair after every task burns hours waiting on nothing.
+### The full gate runs on CI, not locally
 
-Do not read that ~5 minute local nextest figure as a regression against the 28s in [docs/specs/09_release_quality_gate.md](docs/specs/09_release_quality_gate.md) §7 — that number is CI-runner only and has never described a developer machine.
+Policy since 2026-10-15: do not run the full seven-check gate locally. The workspace-wide `cargo clippy --workspace` and `cargo nextest run --workspace` take minutes on CI and anywhere from minutes to over an hour on the development Mac, because its endpoint security software stalls process launches and file writes (see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#the-quality-gate-is-slow-locally)). Waiting on them locally buys nothing CI does not already give.
+
+This overrides any task in a `tasks.md` that says to run the full gate locally, including final close-out tasks.
+
+Before handing work back, run locally:
+
+* the fast checks: `scripts/quality-gate.sh fmt node lint typos deny`;
+* scoped clippy for every crate the change touches: `cargo clippy -p <crate> --all-targets --locked -- -D warnings`;
+* scoped tests for the behavior the change touches: `cargo nextest run -p <crate> --test <test-file>`, or `-p <crate>` when the change is crate-wide.
+
+Then report which local checks ran and passed, and say plainly that the workspace clippy and test suite are left to CI. Do not describe the work as having passed the quality gate until CI's **Quality** workflow is green on the commit. The user pushes; agents never push.
+
+When CI passes, record it where the work is tracked, the way spec 58 did: "The full seven-check gate passed in CI on YYYY-MM-DD; scoped checks passed locally: …". When CI fails, the fix is ordinary work: reproduce the failing check with a scoped local command, fix it, and hand it back for another CI run.
+
+The user may still ask for a local full run, for example to diagnose the machine. Then run it with `scripts/quality-gate.sh` and follow the next section if it is slow.
+
+Local timings vary far more than the work does. On the developer Mac (2026-10-14), at a good moment, `cargo clippy --workspace --all-targets` into an empty target directory took about 45s and `cargo nextest run --workspace --locked` about 33s — close to CI. The same suite has also taken 8–12 minutes, and runs of an hour or more have been seen, because process launches stall intermittently (most likely the machine's endpoint security software; see below). Do not budget from either extreme, and do not treat a slow local run as a regression in the code.
+
+### When the gate is slow
+
+`scripts/quality-gate.sh` runs the seven checks, or the ones named, with per-step timing and a machine-state sampler, and warns once a step passes ten minutes. Prefer it to running the commands by hand.
+
+If any local check or scoped test run takes longer than ten minutes, do not keep waiting and do not treat it as normal. Find out why first, following [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#the-quality-gate-is-slow-locally): read the step's `cpu/wall` ratio and the sampler log, check for concurrent builds from other worktrees, and when the step is waiting rather than computing, check for stalled process launches with `scripts/time-git-calls.sh`. Report what you found to the user. Security software and system settings are the user's (and their administrators') to change, not yours.
 
 ### Web linting
 
