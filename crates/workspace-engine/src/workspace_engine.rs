@@ -18,6 +18,7 @@ use crate::repository_map::{MapLoad, RepositoryMap, RepositoryMapStore};
 use crate::repository_trust::RepositoryTrustStore;
 use crate::secret_scanner::SecretScanner;
 use crate::session::SessionStore;
+use crate::symbol_index::{SymbolIndex, SymbolIndexStore, SymbolLoad, SymbolMatch};
 use crate::validation::{CommandStore, ValidationOrchestrator};
 use std::path::Path;
 
@@ -164,6 +165,34 @@ impl WorkspaceEngine {
         let index = IndexCache::get_or_build(&self.indexer, repository_root)?;
         RepositoryMapStore::new(&self.config.data_dir, self.audit_log.clone())
             .load_or_build(&index, &self.command_policy)
+    }
+
+    /// The repository's symbol index, from the cached index and the stored
+    /// map: the stored index where files are unchanged, and the index pass's
+    /// heuristics for the rest (spec 25 §5.10).
+    pub fn symbol_index(
+        &self,
+        repository_root: impl AsRef<Path>,
+    ) -> Result<(SymbolIndex, SymbolLoad)> {
+        let index = IndexCache::get_or_build(&self.indexer, repository_root)?;
+        let (map, _) = RepositoryMapStore::new(&self.config.data_dir, self.audit_log.clone())
+            .load_or_build(&index, &self.command_policy)?;
+        SymbolIndexStore::new(&self.config.data_dir, self.audit_log.clone()).load_or_build(
+            &index,
+            &map,
+            &self.path_policy,
+        )
+    }
+
+    /// [`SymbolIndex::find`] over [`Self::symbol_index`].
+    pub fn find_symbols(
+        &self,
+        repository_root: impl AsRef<Path>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SymbolMatch>> {
+        let (index, _) = self.symbol_index(repository_root)?;
+        Ok(index.find(query, limit))
     }
 }
 

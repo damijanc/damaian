@@ -5,15 +5,29 @@
 //! labelled with its [`Provenance`]. It is a pure function of the index, the
 //! repository map and the path policy, so the same inputs always give the
 //! same, sorted output.
+//!
+//! [`SymbolIndexStore`] persists it per repository, keyed by each file's
+//! content hash, so an unchanged file keeps what is stored for it from either
+//! tier, and only a changed or new file is taken from the index pass again.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+use crate::audit::AuditLog;
+use crate::error::{ClientError, Result};
 use crate::indexer::{FileRecord, RepositoryIndex};
 use crate::language::SymbolKind;
 use crate::path_policy::PathPolicy;
-use crate::repository_map::RepositoryMap;
+use crate::repository_map::{RebuildReason, RepositoryMap, write_replacing};
+
+/// The stored index's layout. A stored index of another version is rebuilt,
+/// never migrated: everything in it can be derived again.
+pub const SYMBOL_INDEX_SCHEMA_VERSION: u32 = 1;
 
 /// How a symbol or relationship was derived. Requirement 3.
 ///
@@ -28,6 +42,16 @@ pub enum Provenance {
     LanguageServer,
     /// Derived from source text by Damaian's own matching. A guess.
     Heuristic,
+}
+
+impl Provenance {
+    /// The serde name, for surfaces that print rather than serialise.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::LanguageServer => "language_server",
+            Self::Heuristic => "heuristic",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,11 +153,23 @@ pub struct SymbolMatch {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SymbolIndex {
+    pub schema_version: u32,
     pub repository_id: String,
+    /// Every file the symbols and relations were taken from, sorted by path:
+    /// the indexed files the policy does not restrict.
+    pub files: Vec<SymbolFile>,
     /// Sorted by path, line, column and name.
     pub symbols: Vec<Symbol>,
     /// Sorted, with no duplicates.
     pub relations: Vec<Relation>,
+}
+
+/// One source file and the hash of the content its symbols describe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolFile {
+    pub path: String,
+    pub content_hash: String,
 }
 
 /// The extensions a relative JavaScript or TypeScript specifier may omit, in
@@ -146,27 +182,84 @@ impl SymbolIndex {
     /// as import sources or targets, or as tests or subjects (`context.md`
     /// §7), because the index itself does not filter them.
     pub fn build(index: &RepositoryIndex, map: &RepositoryMap, policy: &PathPolicy) -> Self {
-        let records: Vec<&FileRecord> = index
+        Self::assemble(index, map, policy, None).0
+    }
+
+    /// [`Self::build`], except that a file `stored` holds at the same content
+    /// hash keeps its stored symbols, from either tier, and so do the stored
+    /// language-server relations between such files. Every other file is
+    /// taken from the index pass as heuristics, and heuristic relations are
+    /// always derived again, because whether an import resolves depends on
+    /// which other files exist. Root paths come from `map`, not from `stored`,
+    /// since a new manifest moves a file into another root without changing
+    /// it. Also returns how many files were taken from the index pass.
+    fn assemble(
+        index: &RepositoryIndex,
+        map: &RepositoryMap,
+        policy: &PathPolicy,
+        stored: Option<&SymbolIndex>,
+    ) -> (Self, usize) {
+        let mut records: Vec<&FileRecord> = index
             .files
             .iter()
             .filter(|record| !policy.is_restricted(&record.path, false))
             .collect();
+        records.sort_by(|left, right| left.path.cmp(&right.path));
         let paths: BTreeSet<&str> = records.iter().map(|record| record.path.as_str()).collect();
+
+        let stored_hashes: BTreeMap<&str, &str> = stored
+            .map(|stored| {
+                stored
+                    .files
+                    .iter()
+                    .map(|file| (file.path.as_str(), file.content_hash.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut stored_symbols: BTreeMap<&str, Vec<&Symbol>> = BTreeMap::new();
+        for symbol in stored.iter().flat_map(|stored| &stored.symbols) {
+            stored_symbols
+                .entry(symbol.path.as_str())
+                .or_default()
+                .push(symbol);
+        }
+        let unchanged: BTreeSet<&str> = records
+            .iter()
+            .filter(|record| {
+                stored_hashes.get(record.path.as_str()) == Some(&record.content_hash.as_str())
+            })
+            .map(|record| record.path.as_str())
+            .collect();
 
         let mut symbols = Vec::new();
         let mut relations = Vec::new();
+        let mut extracted = 0;
         for record in &records {
             let root_path = map.root_for_path(&record.path);
-            symbols.extend(record.declarations.iter().map(|declaration| Symbol {
-                name: declaration.name.clone(),
-                kind: declaration.kind,
-                path: record.path.clone(),
-                line: declaration.line,
-                column: declaration.column,
-                container: declaration.container.clone(),
-                root_path: root_path.to_string(),
-                provenance: Provenance::Heuristic,
-            }));
+            if unchanged.contains(record.path.as_str()) {
+                symbols.extend(
+                    stored_symbols
+                        .get(record.path.as_str())
+                        .into_iter()
+                        .flatten()
+                        .map(|symbol| Symbol {
+                            root_path: root_path.to_string(),
+                            ..(*symbol).clone()
+                        }),
+                );
+            } else {
+                extracted += 1;
+                symbols.extend(record.declarations.iter().map(|declaration| Symbol {
+                    name: declaration.name.clone(),
+                    kind: declaration.kind,
+                    path: record.path.clone(),
+                    line: declaration.line,
+                    column: declaration.column,
+                    container: declaration.container.clone(),
+                    root_path: root_path.to_string(),
+                    provenance: Provenance::Heuristic,
+                }));
+            }
             for specifier in &record.imports {
                 let to = resolve_import(&record.path, &record.language, specifier, &paths)
                     .map_or_else(
@@ -191,6 +284,23 @@ impl SymbolIndex {
                 });
             }
         }
+        relations.extend(
+            stored
+                .iter()
+                .flat_map(|stored| &stored.relations)
+                .filter(|relation| {
+                    relation.provenance != Provenance::Heuristic
+                        && unchanged.contains(relation.from.path.as_str())
+                        && match &relation.to {
+                            RelationTarget::File { path } => unchanged.contains(path.as_str()),
+                            RelationTarget::Symbol(target) => {
+                                unchanged.contains(target.path.as_str())
+                            }
+                            RelationTarget::External { .. } => true,
+                        }
+                })
+                .cloned(),
+        );
 
         symbols.sort_by(|left, right| {
             (
@@ -213,11 +323,21 @@ impl SymbolIndex {
         });
         relations.dedup();
 
-        Self {
+        let files = records
+            .iter()
+            .map(|record| SymbolFile {
+                path: record.path.clone(),
+                content_hash: record.content_hash.clone(),
+            })
+            .collect();
+        let index = Self {
+            schema_version: SYMBOL_INDEX_SCHEMA_VERSION,
             repository_id: index.repository_id.clone(),
+            files,
             symbols,
             relations,
-        }
+        };
+        (index, extracted)
     }
 
     /// Exact matches, then prefix, then fuzzy, ordered by provenance first
@@ -257,6 +377,120 @@ impl SymbolIndex {
         matches.truncate(limit);
         matches
     }
+}
+
+/// Matches as a JSON array, for front ends that do not depend on serde.
+pub fn symbol_matches_json(matches: &[SymbolMatch]) -> String {
+    // Strings, numbers, options and unit enums, none of which can fail.
+    serde_json::to_string(matches).expect("symbol matches always serialise")
+}
+
+/// How [`SymbolIndexStore::load_or_build`] got its index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolLoad {
+    /// The stored index was still the index of these inputs.
+    Reused,
+    /// There was no stored index.
+    Built,
+    /// A stored index existed and could not be returned as stored. `Stale`
+    /// means it was readable and some files were taken from it.
+    Rebuilt { reason: RebuildReason },
+}
+
+/// The persisted symbol index, one JSON file per repository (proposal §5.10,
+/// `context.md` §5), following [`crate::RepositoryMapStore`].
+#[derive(Debug, Clone)]
+pub struct SymbolIndexStore {
+    data_dir: PathBuf,
+    audit_log: AuditLog,
+}
+
+impl SymbolIndexStore {
+    pub fn new(data_dir: impl AsRef<Path>, audit_log: AuditLog) -> Self {
+        Self {
+            data_dir: data_dir.as_ref().to_path_buf(),
+            audit_log,
+        }
+    }
+
+    pub fn path(data_dir: &Path, repository_id: &str) -> PathBuf {
+        data_dir
+            .join("symbol-index")
+            .join(format!("{repository_id}.json"))
+    }
+
+    /// The index of `index`, reusing every stored file whose content hash
+    /// still matches (see [`SymbolIndex::assemble`]). Anything that differs
+    /// from what is stored is written before it is returned, and every
+    /// rebuild is audited as `symbol_index_rebuilt` with its reason, the
+    /// number of files taken from the index pass, and the time it took.
+    pub fn load_or_build(
+        &self,
+        index: &RepositoryIndex,
+        map: &RepositoryMap,
+        policy: &PathPolicy,
+    ) -> Result<(SymbolIndex, SymbolLoad)> {
+        let started = Instant::now();
+        let path = Self::path(&self.data_dir, &index.repository_id);
+        let (stored, unusable) = match fs::read(&path) {
+            Ok(bytes) => match stored_index(&bytes, &index.repository_id) {
+                Ok(stored) => (Some(stored), None),
+                Err(reason) => (None, Some(reason)),
+            },
+            Err(error) if error.kind() == ErrorKind::NotFound => (None, None),
+            Err(error) => return Err(error.into()),
+        };
+
+        let (symbols, extracted) = SymbolIndex::assemble(index, map, policy, stored.as_ref());
+        if stored.as_ref() == Some(&symbols) {
+            return Ok((symbols, SymbolLoad::Reused));
+        }
+        let json = serde_json::to_vec_pretty(&symbols).map_err(|error| {
+            ClientError::Io(format!("Failed to serialise the symbol index: {error}"))
+        })?;
+        write_replacing(&path, &json)?;
+        let reason = match (stored, unusable) {
+            (Some(_), _) => RebuildReason::Stale,
+            (None, Some(reason)) => reason,
+            (None, None) => return Ok((symbols, SymbolLoad::Built)),
+        };
+        let mut fields = vec![
+            ("repositoryId", symbols.repository_id.clone()),
+            ("reason", reason.as_str().to_string()),
+            ("fileCount", extracted.to_string()),
+            ("totalFiles", symbols.files.len().to_string()),
+            ("durationMs", started.elapsed().as_millis().to_string()),
+        ];
+        if let RebuildReason::SchemaMismatch { found } = reason {
+            fields.push(("foundSchemaVersion", found.to_string()));
+        }
+        self.audit_log.record("symbol_index_rebuilt", &fields)?;
+        Ok((symbols, SymbolLoad::Rebuilt { reason }))
+    }
+}
+
+/// Parses a stored index, or says why it cannot be used. The version is read
+/// before the shape, so an index from another schema is reported as that
+/// rather than as corrupt.
+fn stored_index(
+    bytes: &[u8],
+    repository_id: &str,
+) -> std::result::Result<SymbolIndex, RebuildReason> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| RebuildReason::Corrupt)?;
+    let found = value
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or(RebuildReason::Corrupt)?;
+    if found != SYMBOL_INDEX_SCHEMA_VERSION {
+        return Err(RebuildReason::SchemaMismatch { found });
+    }
+    let stored: SymbolIndex = serde_json::from_value(value).map_err(|_| RebuildReason::Corrupt)?;
+    if stored.repository_id != repository_id {
+        return Err(RebuildReason::Corrupt);
+    }
+    Ok(stored)
 }
 
 fn match_quality(name: &str, query: &str, lowered_query: &str) -> Option<MatchQuality> {

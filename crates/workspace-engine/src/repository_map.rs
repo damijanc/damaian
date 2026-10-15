@@ -874,7 +874,7 @@ fn stored_map(
 /// a crash leaves the old file or the new one, never half of either. The
 /// temp name is unique, so two processes rebuilding at once do not write
 /// into each other's file.
-fn write_replacing(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> Result<()> {
     let directory = path
         .parent()
         .ok_or_else(|| ClientError::Io(format!("{} has no parent", path.display())))?;

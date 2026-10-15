@@ -24,6 +24,26 @@ pub enum SymbolKind {
     Unknown,
 }
 
+impl SymbolKind {
+    /// The serde name, for surfaces that print rather than serialise.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Function => "function",
+            Method => "method",
+            Struct => "struct",
+            Enum => "enum",
+            Class => "class",
+            Interface => "interface",
+            Trait => "trait",
+            Type => "type",
+            Constant => "constant",
+            Variable => "variable",
+            Module => "module",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// What source text alone says about one declaration. Task 2 turns it into a
 /// `Symbol` by adding the path, root and provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]

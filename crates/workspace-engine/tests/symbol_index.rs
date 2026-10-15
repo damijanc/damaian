@@ -10,6 +10,9 @@
 //! Task 2 pins `SymbolIndex::build` over real indexes of temp repositories:
 //! lookups at exact lines, lines that survive redaction, restricted files
 //! left out, roots, import resolution, `TestOf`, and determinism.
+//!
+//! Task 3 pins `SymbolIndexStore`: rebuilds and their audit, reuse, per-file
+//! reuse across both tiers, and the engine's `find_symbols`.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -20,8 +23,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::language::extract_symbols;
 use workspace_engine::{
     AuditLog, CommandPolicy, Config, Declaration, MatchQuality, PathPolicy, ProjectIndexer,
-    Provenance, RelationKind, RelationTarget, RepositoryIndex, RepositoryMap, SecretScanner,
-    SymbolIndex, SymbolKind, extract_declarations,
+    Provenance, RebuildReason, RelationKind, RelationTarget, RepositoryIndex, RepositoryMap,
+    SYMBOL_INDEX_SCHEMA_VERSION, SecretScanner, SymbolIndex, SymbolIndexStore, SymbolKind,
+    SymbolLoad, WorkspaceEngine, extract_declarations,
 };
 
 use SymbolKind::{
@@ -885,4 +889,387 @@ fn a_build_is_deterministic_whatever_the_file_order() {
     let from_reversed = serde_json::to_string(&repo.build_from(&reversed, &policy)).unwrap();
     assert_eq!(first, second);
     assert_eq!(first, from_reversed);
+}
+
+// ---- Task 3: persistence, rebuild reporting, engine API ----
+
+impl Repo {
+    fn store(&self) -> SymbolIndexStore {
+        let scanner = SecretScanner::new(self.secret_patterns.clone());
+        SymbolIndexStore::new(&self.data_dir, AuditLog::new(&self.data_dir, true, scanner))
+    }
+
+    /// Indexes the repository again and loads its symbol index through the
+    /// store, as the engine does.
+    fn load(&self) -> (SymbolIndex, SymbolLoad) {
+        let index = self.index();
+        let map = RepositoryMap::build(&index, &CommandPolicy::new(self.config()));
+        self.store()
+            .load_or_build(&index, &map, &PathPolicy::new(&self.config()))
+            .expect("the symbol index should load")
+    }
+
+    fn index_file(&self) -> PathBuf {
+        SymbolIndexStore::path(&self.data_dir, &self.index().repository_id)
+    }
+
+    fn stored(&self) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(self.index_file()).unwrap()).unwrap()
+    }
+
+    fn store_json(&self, value: &serde_json::Value) {
+        fs::write(self.index_file(), serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    }
+
+    /// The `symbol_index_rebuilt` events in the audit log, oldest first.
+    fn rebuild_events(&self) -> Vec<serde_json::Value> {
+        fs::read_to_string(self.data_dir.join("audit/events.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["eventType"] == "symbol_index_rebuilt")
+            .collect()
+    }
+}
+
+/// `(name, path, line, provenance)` of every symbol.
+fn entries(index: &SymbolIndex) -> Vec<(String, String, u32, Provenance)> {
+    index
+        .symbols
+        .iter()
+        .map(|symbol| {
+            (
+                symbol.name.clone(),
+                symbol.path.clone(),
+                symbol.line,
+                symbol.provenance,
+            )
+        })
+        .collect()
+}
+
+fn two_file_repo(name: &str) -> Repo {
+    Repo::new(
+        name,
+        &[
+            ("src/alpha.rs", "fn alpha() {}\n"),
+            ("src/beta.rs", "fn beta() {}\n"),
+        ],
+    )
+}
+
+#[test]
+fn a_missing_index_is_built_and_an_unchanged_repository_reuses_it() {
+    let repo = two_file_repo("store-reuse");
+    let (built, outcome) = repo.load();
+    assert_eq!(outcome, SymbolLoad::Built);
+    let path = repo.index_file();
+    assert!(
+        path.ends_with(format!("symbol-index/{}.json", built.repository_id)),
+        "{}",
+        path.display()
+    );
+    let bytes = fs::read(&path).expect("the index is written");
+    assert_eq!(
+        serde_json::from_slice::<SymbolIndex>(&bytes).unwrap(),
+        built
+    );
+    let stored = repo.stored();
+    assert_eq!(stored["schemaVersion"], SYMBOL_INDEX_SCHEMA_VERSION);
+    let hashes: Vec<(String, String)> = repo
+        .index()
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), file.content_hash.clone()))
+        .collect();
+    let stored_hashes: Vec<(String, String)> = stored["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            (
+                file["path"].as_str().unwrap().to_string(),
+                file["contentHash"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(stored_hashes, hashes, "one content hash per file");
+
+    let (reused, outcome) = repo.load();
+    assert_eq!(outcome, SymbolLoad::Reused);
+    assert_eq!(reused, built);
+    assert_eq!(fs::read(&path).unwrap(), bytes, "a reuse does not rewrite");
+    assert!(repo.rebuild_events().is_empty(), "neither is a rebuild");
+    let entries: Vec<_> = fs::read_dir(path.parent().unwrap()).unwrap().collect();
+    assert_eq!(entries.len(), 1, "no temp file is left beside the index");
+}
+
+#[test]
+fn a_garbage_index_file_is_rebuilt_as_corrupt_and_audited() {
+    let repo = two_file_repo("store-corrupt");
+    let path = repo.index_file();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, b"\x00\xffnot json at all").unwrap();
+
+    let (index, outcome) = repo.load();
+    assert_eq!(
+        outcome,
+        SymbolLoad::Rebuilt {
+            reason: RebuildReason::Corrupt
+        }
+    );
+    assert_eq!(
+        locations(&index, "alpha"),
+        [("src/alpha.rs".to_string(), 1)]
+    );
+    assert_eq!(
+        serde_json::from_slice::<SymbolIndex>(&fs::read(&path).unwrap()).unwrap(),
+        index
+    );
+    let events = repo.rebuild_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["reason"], "corrupt");
+    assert_eq!(events[0]["repositoryId"], index.repository_id.as_str());
+    assert_eq!(events[0]["fileCount"], "2");
+    assert_eq!(events[0]["totalFiles"], "2");
+    assert!(
+        events[0]["durationMs"]
+            .as_str()
+            .is_some_and(|ms| ms.parse::<u64>().is_ok()),
+        "{events:?}"
+    );
+    assert_eq!(repo.load().1, SymbolLoad::Reused);
+    assert_eq!(repo.rebuild_events().len(), 1);
+}
+
+#[test]
+fn an_index_from_another_schema_version_is_rebuilt_as_a_mismatch() {
+    let repo = two_file_repo("store-schema");
+    let (built, _) = repo.load();
+    let mut stored = repo.stored();
+    stored["schemaVersion"] = (SYMBOL_INDEX_SCHEMA_VERSION + 1).into();
+    // Otherwise valid and current: only the version is wrong.
+    repo.store_json(&stored);
+
+    let (rebuilt, outcome) = repo.load();
+    assert_eq!(
+        outcome,
+        SymbolLoad::Rebuilt {
+            reason: RebuildReason::SchemaMismatch {
+                found: SYMBOL_INDEX_SCHEMA_VERSION + 1
+            }
+        }
+    );
+    assert_eq!(rebuilt, built);
+    let events = repo.rebuild_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["reason"], "schemaMismatch");
+    assert_eq!(
+        events[0]["foundSchemaVersion"],
+        (SYMBOL_INDEX_SCHEMA_VERSION + 1).to_string()
+    );
+    assert_eq!(repo.stored()["schemaVersion"], SYMBOL_INDEX_SCHEMA_VERSION);
+}
+
+#[test]
+fn an_index_of_another_repository_is_rebuilt_as_corrupt() {
+    let repo = two_file_repo("store-foreign");
+    repo.load();
+    let mut stored = repo.stored();
+    stored["repositoryId"] = "someone-else".into();
+    repo.store_json(&stored);
+
+    assert_eq!(
+        repo.load().1,
+        SymbolLoad::Rebuilt {
+            reason: RebuildReason::Corrupt
+        }
+    );
+}
+
+#[test]
+fn an_edited_file_is_taken_again_and_unchanged_files_keep_either_tier() {
+    let repo = two_file_repo("store-incremental");
+    repo.load();
+
+    // Mark every stored symbol as a language server's, on a line the
+    // heuristic would not give, and add a stored reference between the files.
+    let mut stored = repo.stored();
+    for symbol in stored["symbols"].as_array_mut().unwrap() {
+        symbol["provenance"] = "language_server".into();
+        symbol["line"] = 7.into();
+    }
+    stored["relations"] = serde_json::json!([{
+        "kind": "references",
+        "from": { "path": "src/alpha.rs", "name": "alpha", "line": 7 },
+        "to": { "type": "symbol", "path": "src/beta.rs", "name": "beta", "line": 7 },
+        "provenance": "language_server"
+    }]);
+    repo.store_json(&stored);
+
+    let (kept, outcome) = repo.load();
+    assert_eq!(outcome, SymbolLoad::Reused, "nothing changed");
+    assert_eq!(
+        entries(&kept),
+        [
+            (
+                "alpha".into(),
+                "src/alpha.rs".into(),
+                7,
+                Provenance::LanguageServer
+            ),
+            (
+                "beta".into(),
+                "src/beta.rs".into(),
+                7,
+                Provenance::LanguageServer
+            ),
+        ]
+    );
+    assert_eq!(kept.relations.len(), 1, "{:?}", kept.relations);
+
+    repo.write("src/beta.rs", "fn beta() {}\nfn gamma() {}\n");
+    repo.write("src/delta.rs", "fn delta() {}\n");
+    let (updated, outcome) = repo.load();
+    assert_eq!(
+        outcome,
+        SymbolLoad::Rebuilt {
+            reason: RebuildReason::Stale
+        }
+    );
+    assert_eq!(
+        entries(&updated),
+        [
+            (
+                "alpha".into(),
+                "src/alpha.rs".into(),
+                7,
+                Provenance::LanguageServer
+            ),
+            (
+                "beta".into(),
+                "src/beta.rs".into(),
+                1,
+                Provenance::Heuristic
+            ),
+            (
+                "gamma".into(),
+                "src/beta.rs".into(),
+                2,
+                Provenance::Heuristic
+            ),
+            (
+                "delta".into(),
+                "src/delta.rs".into(),
+                1,
+                Provenance::Heuristic
+            ),
+        ],
+        "the edited file's language-server entry is dropped, the other's kept"
+    );
+    assert!(
+        updated.relations.is_empty(),
+        "a reference into the edited file is dropped: {:?}",
+        updated.relations
+    );
+    let events = repo.rebuild_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["reason"], "stale");
+    assert_eq!(events[0]["fileCount"], "2", "beta and delta, not alpha");
+    assert_eq!(events[0]["totalFiles"], "3");
+
+    fs::remove_file(repo.root.join("src/alpha.rs")).unwrap();
+    let (pruned, _) = repo.load();
+    assert!(locations(&pruned, "alpha").is_empty());
+    assert!(pruned.files.iter().all(|file| file.path != "src/alpha.rs"));
+}
+
+#[test]
+fn the_engine_finds_symbols_from_the_stored_index() {
+    let repo = two_file_repo("engine");
+    let engine = WorkspaceEngine::new(repo.config());
+
+    let (_, outcome) = engine.symbol_index(&repo.root).unwrap();
+    assert_eq!(outcome, SymbolLoad::Built);
+    let found = engine.find_symbols(&repo.root, "alpha", 10).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].quality, MatchQuality::Exact);
+    assert_eq!(
+        (
+            found[0].symbol.path.as_str(),
+            found[0].symbol.line,
+            found[0].symbol.provenance
+        ),
+        ("src/alpha.rs", 1, Provenance::Heuristic)
+    );
+    assert_eq!(
+        engine.symbol_index(&repo.root).unwrap().1,
+        SymbolLoad::Reused
+    );
+}
+
+/// Times `SymbolIndexStore::load_or_build` on this checkout, for proposal §7.
+/// Ignored because it reads the user's own checkout. Run it with a release
+/// build:
+///
+/// ```text
+/// CARGO_TARGET_DIR="$PWD/target" cargo test --release -p workspace-engine \
+///   --test symbol_index -- --ignored --nocapture measures_load_or_build_on_this_repository
+/// ```
+#[test]
+#[ignore = "reads this checkout; run by hand for proposal §7"]
+fn measures_load_or_build_on_this_repository() {
+    let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = Repo::new("measure", &[]);
+    let config = Config {
+        data_dir: repo.data_dir.clone(),
+        enable_index_watcher: false,
+        ..Config::default()
+    };
+    let scanner = SecretScanner::new(config.secret_patterns.clone());
+    let audit_log = AuditLog::new(&repo.data_dir, true, scanner.clone());
+    let index = ProjectIndexer::new(config.clone(), scanner, audit_log.clone())
+        .index_repository(&checkout)
+        .unwrap();
+    let map = RepositoryMap::build(&index, &CommandPolicy::new(config.clone()));
+    let policy = PathPolicy::new(&config);
+    let store = SymbolIndexStore::new(&repo.data_dir, audit_log);
+
+    let started = std::time::Instant::now();
+    let (built, outcome) = store.load_or_build(&index, &map, &policy).unwrap();
+    let built_time = started.elapsed();
+    assert_eq!(outcome, SymbolLoad::Built);
+    let started = std::time::Instant::now();
+    let (_, outcome) = store.load_or_build(&index, &map, &policy).unwrap();
+    let reused_time = started.elapsed();
+    assert_eq!(outcome, SymbolLoad::Reused);
+    let size = fs::metadata(SymbolIndexStore::path(&repo.data_dir, &index.repository_id))
+        .unwrap()
+        .len();
+    println!(
+        "files {} symbols {} relations {} | built {built_time:?} | reused {reused_time:?} | {size} bytes",
+        built.files.len(),
+        built.symbols.len(),
+        built.relations.len()
+    );
+}
+
+#[test]
+fn a_reused_file_takes_its_root_from_the_current_map() {
+    let repo = Repo::new(
+        "store-root",
+        &[("packages/web/index.ts", "export function web() {}\n")],
+    );
+    let (before, _) = repo.load();
+    assert_eq!(before.symbols[0].root_path, "");
+
+    // The file is unchanged; a new manifest moves it into its own root.
+    repo.write("packages/web/package.json", "{}\n");
+    let (after, _) = repo.load();
+    let web = after
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "web")
+        .expect("the symbol is kept");
+    assert_eq!(web.root_path, "packages/web");
 }
