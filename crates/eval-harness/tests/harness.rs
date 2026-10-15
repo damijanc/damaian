@@ -40,6 +40,36 @@ fn accepts_a_temporary_data_dir() {
     eval_harness::guard::assert_safe_data_dir(&dir).expect("a temp dir must be accepted");
 }
 
+/// nextest runs every test in its own process, so a per-process counter
+/// restarts at 1 in each of them, and macOS's clock has microsecond resolution:
+/// two tests starting in the same microsecond used to get the same directory and
+/// collide on `git init` (`could not lock config file`). The process id is what
+/// separates concurrent processes.
+#[test]
+fn a_data_dir_name_carries_the_process_id() {
+    let dir = eval_harness::guard::eval_data_dir().expect("temp dir");
+    let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+    let pid = std::process::id().to_string();
+
+    assert!(
+        name.split('-').any(|part| part == pid),
+        "{name} should carry this process's id {pid}"
+    );
+}
+
+#[test]
+fn successive_data_dirs_are_distinct_and_fresh() {
+    let first = eval_harness::guard::eval_data_dir().expect("temp dir");
+    std::fs::write(first.join("marker"), "first").unwrap();
+    let second = eval_harness::guard::eval_data_dir().expect("temp dir");
+
+    assert_ne!(first, second);
+    assert!(
+        std::fs::read_dir(&second).unwrap().next().is_none(),
+        "a new data dir must start empty, never reuse an existing one"
+    );
+}
+
 #[test]
 fn materializing_a_fixture_produces_a_real_git_repository() {
     let fixture = eval_harness::fixture::materialize("rust-workspace")

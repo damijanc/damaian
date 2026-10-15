@@ -33,17 +33,38 @@ pub fn assert_safe_data_dir(dir: &Path) -> Result<()> {
 }
 
 /// A fresh, checked temporary data directory for one run.
+///
+/// The name carries the process id because nextest runs each test in its own
+/// process, where `COUNTER` restarts at 1, and macOS's clock only has
+/// microsecond resolution. And it is created with `create_dir`, not
+/// `create_dir_all`, so a name that is somehow already taken is skipped rather
+/// than silently shared with another run.
 pub fn eval_data_dir() -> Result<PathBuf> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| ClientError::Io(format!("system clock is before the epoch: {error}")))?
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "damaian-eval-{now}-{}",
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    assert_safe_data_dir(&dir)?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| ClientError::Io(format!("could not create {}: {error}", dir.display())))?;
-    Ok(dir)
+    let pid = std::process::id();
+    let base = std::env::temp_dir();
+    for _ in 0..100 {
+        let dir = base.join(format!(
+            "damaian-eval-{now}-{pid}-{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        assert_safe_data_dir(&dir)?;
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(ClientError::Io(format!(
+                    "could not create {}: {error}",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    Err(ClientError::Io(format!(
+        "could not find an unused data directory name under {}",
+        base.display()
+    )))
 }
