@@ -6,10 +6,10 @@ use workspace_engine::{
     ConfigScope, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExclusionReason, MapLoad,
     MockModelAdapter, OpenAICompatibleAdapter, ProcessRegistry, ProfileId, ReadWindow,
     RebuildReason, RepositoryMap, RootEvidence, RootOverride, RootOverrideEdit, SearchResult,
-    WorkspaceEngine, command_approval_prompt, edit_root_overrides, ensure_data_dir_schema,
-    export_profile, import_profile, parse_hunk_selection, patch_diff_text, patch_hunk_summary,
-    profile_import_base, render_markdown_to_ansi, review_profile_import, review_profile_rejections,
-    select_profile,
+    SymbolLoad, SymbolMatch, WorkspaceEngine, command_approval_prompt, edit_root_overrides,
+    ensure_data_dir_schema, export_profile, import_profile, parse_hunk_selection, patch_diff_text,
+    patch_hunk_summary, profile_import_base, render_markdown_to_ansi, review_profile_import,
+    review_profile_rejections, select_profile, symbol_matches_json,
 };
 
 fn usage() -> &'static str {
@@ -23,6 +23,7 @@ fn usage() -> &'static str {
   damaian git-diff <repo>
   damaian detect-commands <repo>
   damaian repo-map <repo> [--json]
+  damaian symbols <repo> <query> [--json]
   damaian classify-command <command>
   damaian config-show [--sources] [repo]
   damaian config-review <repo>
@@ -295,6 +296,29 @@ fn run() -> workspace_engine::Result<()> {
                 );
             } else {
                 print!("{}", repository_map_summary(&map, &load));
+            }
+        }
+        "symbols" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let json = args.iter().skip(2).any(|arg| arg == "--json");
+            let query = args
+                .iter()
+                .skip(2)
+                .find(|arg| *arg != "--json")
+                .ok_or_else(|| {
+                    workspace_engine::ClientError::InvalidInput("Missing <query>".to_string())
+                })?;
+            let engine = engine_for_repo(repo)?;
+            let (index, load) = engine.symbol_index(repo)?;
+            let matches = index.find(query, SYMBOL_LIMIT);
+            if json {
+                println!(
+                    "{{\"load\":{},\"matches\":{}}}",
+                    symbol_load_json(&load),
+                    symbol_matches_json(&matches)
+                );
+            } else {
+                print!("{}", symbol_matches_text(&matches, &load));
             }
         }
         "propose-validations" => {
@@ -909,6 +933,57 @@ fn search_results_json(results: &[SearchResult]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{body}]")
+}
+
+/// How many matches `damaian symbols` prints.
+const SYMBOL_LIMIT: usize = 50;
+
+fn symbol_load_json(load: &SymbolLoad) -> String {
+    match load {
+        SymbolLoad::Reused => map_load_json(&MapLoad::Reused),
+        SymbolLoad::Built => map_load_json(&MapLoad::Built),
+        SymbolLoad::Rebuilt { reason } => map_load_json(&MapLoad::Rebuilt { reason: *reason }),
+    }
+}
+
+/// `name  kind  path:line  root  provenance`, one match per line, after a
+/// line saying how the index was loaded. Provenance is always printed: a
+/// heuristic is never shown as fact (spec 25 §5.7).
+fn symbol_matches_text(matches: &[SymbolMatch], load: &SymbolLoad) -> String {
+    let mut output = match load {
+        SymbolLoad::Reused => "symbol index reused (files unchanged)\n".to_string(),
+        SymbolLoad::Built => "symbol index built (none stored)\n".to_string(),
+        SymbolLoad::Rebuilt { reason } => match reason {
+            RebuildReason::Corrupt => {
+                "symbol index rebuilt: the stored index was unreadable\n".to_string()
+            }
+            RebuildReason::SchemaMismatch { found } => format!(
+                "symbol index rebuilt: the stored index was schema version {found}, this build reads {}\n",
+                workspace_engine::SYMBOL_INDEX_SCHEMA_VERSION
+            ),
+            RebuildReason::Stale => "symbol index updated: files changed\n".to_string(),
+        },
+    };
+    if matches.is_empty() {
+        output.push_str("no matching symbols\n");
+    }
+    for found in matches {
+        let symbol = &found.symbol;
+        let root = if symbol.root_path.is_empty() {
+            "."
+        } else {
+            &symbol.root_path
+        };
+        output.push_str(&format!(
+            "{}  {}  {}:{}  {root}  {}\n",
+            symbol.name,
+            symbol.kind.as_str(),
+            symbol.path,
+            symbol.line,
+            symbol.provenance.as_str()
+        ));
+    }
+    output
 }
 
 fn map_load_json(load: &MapLoad) -> String {

@@ -152,8 +152,9 @@ pub use session::{
 };
 pub use steering::TurnSteering;
 pub use symbol_index::{
-    MatchQuality, Provenance, Relation, RelationKind, RelationTarget, Symbol, SymbolIndex,
-    SymbolMatch, SymbolRef,
+    MatchQuality, Provenance, Relation, RelationKind, RelationTarget, SYMBOL_INDEX_SCHEMA_VERSION,
+    Symbol, SymbolFile, SymbolIndex, SymbolIndexStore, SymbolLoad, SymbolMatch, SymbolRef,
+    symbol_matches_json,
 };
 pub use tree_walk::{WalkEvent, WalkFile, WalkSkip};
 pub use validation::{

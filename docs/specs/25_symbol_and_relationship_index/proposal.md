@@ -1,6 +1,6 @@
 # Feature Spec: Symbol and Relationship Index
 
-Status: In progress. Tasks 1–2 of 11 done (started 2026-10-13); see
+Status: In progress. Tasks 1–3 of 11 done (started 2026-10-13); see
 [`tasks.md`](tasks.md). Split into a folder and planned on 2026-10-09, re-checked
 against `main` on 2026-10-12. Design unchanged from the original flat spec. Corrections where it no
 longer matches the code are in [`context.md`](context.md), not inlined here,
