@@ -1038,6 +1038,22 @@ while a turn streams is a follow-up, proposal §7. The sidebar's dots and badge
 have no timer of their own, so with the board closed they can be stale until a
 project is drawn, a session loads or the window regains focus.
 
+#### An answer has handoff prompts but no *Start worker*
+
+*Start worker* appears only on a block whose fence's info string is exactly
+`worker-prompt`, in an assistant message that has finished streaming. A block
+that opens with a bare fence and has `worker-prompt` as its first line inside
+is deliberately not matched, so that no button lands on the wrong thing
+(proposal §4). The handoff paragraph shows the model the literal opening fence
+for this reason. If a model still writes it wrongly, ask it to rewrite the
+prompts as `worker-prompt` blocks, or paste the text into **New worker**. If
+the request produced a patch preview instead of an answer, it went to the
+one-shot patch flow, whose prompt has no handoff paragraph. That happens to a
+request with an edit verb and a code word (`looksLikeEditRequest` in
+`app.js`) unless Worker sessions is on and the request also says *split*,
+*plan*, *tasks*, *hand off*, *parallel*, *worker* or *session*. Reword it with
+one of those.
+
 #### A worker shows *Interrupted*, or *Ended*
 
 The worker's process has gone and its session has not. *Interrupted* means the

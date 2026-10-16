@@ -1,6 +1,6 @@
 # Feature Spec: Worker Sessions
 
-Status: In progress (Tasks 1–11 of 12 done, 2026-10-07 to 2026-10-16; see [`tasks.md`](tasks.md)). Acceptance with DeepSeek was not met on its first clause (§6). Task 12 resolves §7 items 10 and 11 and re-runs it, and the spec is not Done until it passes
+Status: Done 2026-10-16 (Tasks 1–12; see [`tasks.md`](tasks.md)). Acceptance passed with DeepSeek (`deepseek-v4-flash`) on its re-run in Task 12, after §7 items 10 and 11 were resolved (§6)
 Order: 57 of 57
 Plan: none. An exception to the graduation rule, like #41–#44 and #47: it came
 from describing how this repository is actually built — a planner session that
@@ -149,8 +149,9 @@ worker_record(session).is_none()`
 
 > When work should continue in a separate session — because it is a
 > self-contained task, or one of several that can run in parallel — write each
-> task as a prompt in its own fenced block tagged `worker-prompt`. The user can
-> start a worker from that block. A worker starts with a fresh context in its
+> task as a prompt in its own fenced block whose opening line is exactly
+> ```` ```worker-prompt ````, with the tag on the fence line itself and not
+> inside the block. The user can start a worker from that block. A worker starts with a fresh context in its
 > own git worktree and sees only the repository and that prompt, so say what to
 > read, what to change, which checks to run, and when to stop. Do not use the
 > `worker-prompt` tag for anything else.
@@ -959,6 +960,46 @@ model's answer, so *Start worker* → confirm on a model-written block is shown
 only against a scripted answer (Task 8). Two findings follow, §7 items 10 and
 11. Each answer was also one sample, from one provider.
 
+**Acceptance, re-run 2026-10-16 with DeepSeek (`deepseek-v4-flash`) after
+Task 12: met.** Same set-up as above (port 4799, its own data directory, a
+throwaway key the user put in the Keychain, a fresh fixture with no
+`AGENTS.md`), with the two fixes: the §5.0 paragraph now shows the literal
+opening fence (item 10), and with Worker sessions on `looksLikeEditRequest`
+leaves planning requests to the chat turn (item 11).
+
+1. Request 1's exact wording ("Split this work into separate tasks that can
+   run in parallel: add a --reset flag to main.rs, and add a Usage section to
+   README.md") went to `/api/ask-stream`, not `/api/propose-edit`. The one
+   answer held two blocks rendered as `language-worker-prompt`, each with a
+   *Start worker* button.
+2. *Start worker* on the README block opened the dialog with the block's text.
+   Confirming started a worker on `damaian/add-a-usage-section-to-readme-md-in-this`
+   in `.damaian/worktrees/…`, as process 52345. It appeared on the board, in
+   the sidebar under its parent and in the parent's "Spawned worker" line.
+3. After an unapproved `ls -la`, it stopped for approval on each command it
+   proposed (`high`, "cannot run in sandbox mode"), shown as *Needs you* /
+   *Waiting for approval*. After the first approval it was still process
+   52345 (checked by pid). Three more approvals followed in the same turn,
+   with no *Interrupted* state.
+4. *Pause*, clicked as soon as a round started, took effect at its boundary
+   (*Paused*, round 4). A note sent while paused reached the model, which
+   acted on it in round 5 by rewriting `README.md` as the note asked.
+5. *Stop* during an approval ended it (`exited`, *Finished*). 52345 was gone,
+   and the worktree held the steered README. The source tree was unchanged.
+6. A second worker was started from the other block (process 55341, with a
+   model request in flight as `curl` 55435). `SIGKILL` of the shell's own pid
+   left neither the worker nor the `curl` running 0.5 s later. Its worktree
+   and branch were kept, as §5.3 says.
+7. Restarted with the setting off, `/api/workers-enabled` was false, and
+   neither the Workers entry nor a *Start worker* footer was shown. The same
+   blocks rendered as ordinary code blocks, and request 1's wording routed to
+   the patch flow again, as before Task 12.
+
+Also seen, not investigated (outside this spec): the worker's
+`cat > README.md <<'EOF'` was stored, approved and run as that first line only
+(the audit's `command` field), so the heredoc's body was lost and the file
+came out empty. This was one sample, from one provider.
+
 ## 7. Follow-up specs, not part of this one
 
 In the order agreed during design:
@@ -997,7 +1038,7 @@ Smaller open items, recorded so they are not lost (Task 11):
    two-parent commit, which merging the worker's branch carries into history.
    `commit-tree <stash>^{tree} -p HEAD` would give a single-parent base.
 
-Found by the acceptance run (§6), and blocking its first clause. These two are **not** follow-ups: they are Task 12 of this spec, which stays in progress until both are resolved and acceptance passes (decided 2026-10-16):
+Found by the acceptance run (§6), and blocking its first clause. These two were **not** follow-ups: they were Task 12 of this spec, which resolved both and re-ran acceptance (decided 2026-10-16):
 
 10. **The handoff's exact form.** DeepSeek put `worker-prompt` on the first line
     inside a bare fence, twice out of two handoffs. Either the paragraph shows
@@ -1005,9 +1046,16 @@ Found by the acceptance run (§6), and blocking its first clause. These two are 
     also accepts a bare fence whose first line is exactly `worker-prompt` and
     drops that line from the prompt. The second loosens the "no button on the
     wrong thing" rule (§4), so it is a decision, not a fix.
+    **Resolved in Task 12 (user's decision):** the paragraph shows the
+    literal fence, and matching stays exact.
 11. **Planning prompts routed to the patch flow.** `looksLikeEditRequest`
     (`app.js`) sends any prompt with an edit verb and a code word to
     `/api/propose-edit`, whose prompt has no §5.0 paragraph. "Split adding X
     to the README into tasks" is such a prompt. Either that flow gets the
     paragraph too, or the heuristic leaves planning requests to the chat
     turn. This predates spec 57 and affects every provider.
+    **Resolved in Task 12 (user's decision):** with Worker sessions on, a
+    prompt saying *split*, *plan*, *tasks*, *hand off*, *parallel*, *worker*
+    or *session* is not an edit request. With the setting off, routing is
+    unchanged. The patch flow keeps its own prompt, since it can only answer
+    with a diff.

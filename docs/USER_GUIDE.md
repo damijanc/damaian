@@ -121,7 +121,7 @@ Use the `Chat` tab to ask questions about the selected repository. Damaian retri
 
 Press `Enter` to send a chat message. Press `Shift+Enter` to insert a new line.
 
-Questions stream read-only answers. Code and file change requests, such as `create a test file` or `update the README`, generate an inline patch preview in the conversation.
+Questions stream read-only answers. Code and file change requests, such as `create a test file` or `update the README`, generate an inline patch preview in the conversation. With Worker sessions on, a request to plan, split or hand off work stays in the conversation instead (see [Worker Sessions](#worker-sessions)).
 
 Use `+ File` above the prompt to pin specific repository files into the next chat request. Pinned files appear as chips above the prompt and are included before automatic retrieval. Use the `x` on a chip to remove one file, or `Clear` to remove all pinned files.
 
@@ -582,7 +582,7 @@ If a turn was waiting for your approval when Damaian stopped, that approval come
 
 A **worker** is a session that runs on its own: it gets a prompt, works in a new Git worktree of its own, and is hosted by a separate Damaian process, so you can keep talking to the session that started it. Workers are for handing off self-contained tasks, several at once if they can run in parallel.
 
-**Turning them on.** Workers are off by default. Turn on **Worker sessions** at the top of `Settings` → General. A repository cannot turn them on for you. While they are on, every session that is not itself a worker is told how to write a handoff: a prompt in a fenced block tagged `worker-prompt`. Off, nothing of this section is visible and nothing is added to what the model is sent.
+**Turning them on.** Workers are off by default. Turn on **Worker sessions** at the top of `Settings` → General. A repository cannot turn them on for you. While they are on, every session that is not itself a worker is told how to write a handoff: a prompt in a fenced block whose opening line is ```` ```worker-prompt ````. A request that asks to plan, split or hand off work (it says *split*, *plan*, *tasks*, *hand off*, *parallel*, *worker* or *session*) then always goes to the conversation, even when it also asks for an edit, rather than to a one-shot patch preview, which could only answer with a diff. Off, nothing of this section is visible and nothing is added to what the model is sent.
 
 **Starting a worker.** A `worker-prompt` block in an assistant's answer gets a **Start worker** button once the answer has finished. No other block gets one. Clicking it opens the New worker dialog with the block's text, which you can still edit. Confirm with **Start worker**. The session holding the block becomes the worker's parent: the block then shows "Started *‹title›* →", and the conversation gets a one-line "Spawned worker" link. **New worker** on a project's ⋮ menu or on the Workers board opens the same dialog empty, for a worker with no parent. A worker cannot start workers of its own.
 

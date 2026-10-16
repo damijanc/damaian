@@ -9880,12 +9880,20 @@ for (const id of ["profile-import-text", "profile-import-name", "profile-import-
   $(id).addEventListener("input", clearProfileImportReview);
 }
 
+// A request to plan, split or hand off work. With Worker sessions on, it goes
+// to the chat turn, whose system prompt carries the handoff paragraph; the
+// one-shot patch flow can only answer with a diff (spec 57 §7 item 11). With
+// the setting off, routing is exactly what it was.
+const PLANNING_REQUEST =
+  /\b(split|plan|planning|tasks?|hand\s*off|handoffs?|parallel|workers?|sessions?)\b|\bbreak\b.*\b(down|up|into)\b/;
+
 function looksLikeEditRequest(prompt) {
   const text = prompt.trim().toLowerCase();
   if (!text) return false;
   if (/^(how\s+(do|can|would|should)\s+i|how\s+to|what\s+is|why\b|where\b)/.test(text)) {
     return false;
   }
+  if (workersEnabled && PLANNING_REQUEST.test(text)) return false;
   const editVerb =
     /\b(add|create|write|generate|implement|modify|update|change|fix|refactor|remove|delete|make)\b/;
   const codeTarget =
