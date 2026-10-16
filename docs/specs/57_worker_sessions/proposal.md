@@ -1,6 +1,6 @@
 # Feature Spec: Worker Sessions
 
-Status: Done 2026-10-16 (Tasks 1–11; see [`tasks.md`](tasks.md). Acceptance with a live model was not run; §6 says what that leaves unproven)
+Status: In progress (Tasks 1–11 of 12 done, 2026-10-07 to 2026-10-16; see [`tasks.md`](tasks.md)). Acceptance with DeepSeek was not met on its first clause (§6). Task 12 resolves §7 items 10 and 11 and re-runs it, and the spec is not Done until it passes
 Order: 57 of 57
 Plan: none. An exception to the graduation rule, like #41–#44 and #47: it came
 from describing how this repository is actually built — a planner session that
@@ -933,17 +933,31 @@ model request was prepared at **7.3–7.6 s**. Nearly all of it is the worker
 building its index of a worktree it has never seen. No index is shared with
 the source, which is the cost of a process per worker (§4).
 
-**Acceptance was not run.** It needs a live model with the user's key, and
-Task 11 is an agent session that must never hold one. Shown elsewhere:
-`worker-prompt` blocks get *Start worker*, which starts a worker without
-copying (Task 8, against a scripted answer). With the setting off nothing is
-visible (Tasks 8–10) or sent (`no_mode_changes_when_handoffs_are_not_offered`,
-the byte-identical test). The board, pause, notes, approvals without restart
-and stop work against a real worker on a scripted endpoint (Tasks 9–10), and
-the kill test. **Not shown:** that a real model, told only the §5.0 paragraph,
-writes `worker-prompt` blocks when asked to split work in a repository with no
-`AGENTS.md`. That is the remaining check, for the user to make with their
-provider.
+**Acceptance, run 2026-10-16 with DeepSeek (`deepseek-v4-flash`), not met on
+its first clause.** It was run in a scratch shell on port 4799 with its own data
+directory, a throwaway key the user put in the Keychain, Worker sessions on, and
+a fixture repository with no `AGENTS.md`. Four requests to split two tasks
+(a `--reset` flag, a README usage section):
+
+1. "Split this work into separate tasks … add a --reset flag … add a Usage
+   section to README.md": the web UI's `looksLikeEditRequest` (an edit verb
+   plus a code word) sent it to the one-shot patch flow (`/api/propose-edit`),
+   which has its own prompt without the §5.0 paragraph. It ended "Generated
+   edit did not contain any file changes".
+2. Reworded without those words: a chat turn, which carries the paragraph.
+   The model wrote the plan as a patch adding `TASKS.md`.
+3. and 4. Asked not to touch the repository and to hand each task to its own
+   session: the model wrote two handoff prompts each time, as a bare fence
+   with `worker-prompt` on the first line *inside* it, not as the fence's info
+   string. Damaian matches the info string exactly (§5.1), so neither answer
+   had a *Start worker* button.
+
+Nothing in the engine rewrites fences, so this is the model's formatting. With
+the setting turned off, the UI showed no Workers entry, board, dot or button,
+and `/api/workers-enabled` answered false. No worker was started from a real
+model's answer, so *Start worker* → confirm on a model-written block is shown
+only against a scripted answer (Task 8). Two findings follow, §7 items 10 and
+11. Each answer was also one sample, from one provider.
 
 ## 7. Follow-up specs, not part of this one
 
@@ -982,3 +996,18 @@ Smaller open items, recorded so they are not lost (Task 11):
 9. **The *Include* base commit** (Task 4 (a)). `git stash create` makes a
    two-parent commit, which merging the worker's branch carries into history.
    `commit-tree <stash>^{tree} -p HEAD` would give a single-parent base.
+
+Found by the acceptance run (§6), and blocking its first clause. These two are **not** follow-ups: they are Task 12 of this spec, which stays in progress until both are resolved and acceptance passes (decided 2026-10-16):
+
+10. **The handoff's exact form.** DeepSeek put `worker-prompt` on the first line
+    inside a bare fence, twice out of two handoffs. Either the paragraph shows
+    the literal opening fence (```` ```worker-prompt ````), or *Start worker*
+    also accepts a bare fence whose first line is exactly `worker-prompt` and
+    drops that line from the prompt. The second loosens the "no button on the
+    wrong thing" rule (§4), so it is a decision, not a fix.
+11. **Planning prompts routed to the patch flow.** `looksLikeEditRequest`
+    (`app.js`) sends any prompt with an edit verb and a code word to
+    `/api/propose-edit`, whose prompt has no §5.0 paragraph. "Split adding X
+    to the README into tasks" is such a prompt. Either that flow gets the
+    paragraph too, or the heuristic leaves planning requests to the chat
+    turn. This predates spec 57 and affects every provider.
