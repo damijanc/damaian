@@ -3701,6 +3701,91 @@ body.workers-board-open #thread-menu-btn {
   background: var(--accent);
 }
 
+/* Spec 57 §5.7 Worker session: the control strip under the header. One
+   control row, the header's gutters, and nothing while the board shows. */
+.worker-strip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 40px;
+  padding: 5px 14px 5px 22px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-soft);
+  font-size: 12px;
+}
+
+body.workers-board-open .worker-strip {
+  display: none;
+}
+
+.worker-pill {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.worker-round {
+  flex: none;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.worker-strip-note {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worker-strip-actions {
+  flex: none;
+  margin-left: auto;
+}
+
+.thread-worker-meta {
+  margin: 1px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.thread-worker-meta code {
+  font-size: 11px;
+}
+
+/* A worker's composer says what its button sends (§5.7), so the round send
+   button becomes a labelled one. Still the row's one filled control. */
+.send-button.is-worker-command {
+  width: auto;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 14px;
+  background: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.send-button.is-worker-command:hover {
+  background: var(--accent);
+  filter: brightness(0.92);
+}
+
+/* Context files and the model choice do not reach a worker: it takes the
+   configured provider and model, and its messages carry text only. */
+body.worker-view #composer-attach-menu,
+body.worker-view #chat-model-menu {
+  display: none;
+}
+
 .workers-cell-doing {
   max-width: 320px;
 }
