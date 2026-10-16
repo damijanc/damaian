@@ -806,6 +806,14 @@ impl SessionStore {
         self.append_session_event(parent_session_id, "worker_spawned", &payload.to_string())
     }
 
+    /// Whether `session_id` is a worker whose process is running now, judged
+    /// by #46's registry (spec 57 correction C12). Crash recovery leaves such a
+    /// session alone: its tasks are in flight in that process.
+    pub fn has_live_worker(&self, session_id: &str) -> Result<bool> {
+        Ok(self.worker_record(session_id)?.is_some()
+            && crate::process_registry::live_worker_registered(&self.data_dir, session_id)?)
+    }
+
     /// The session's own worker record, or `None` for an ordinary session.
     ///
     /// Reads with `parsed_events`, not `active_events`, for the reason

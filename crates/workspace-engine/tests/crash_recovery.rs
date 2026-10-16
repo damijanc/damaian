@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, SecretScanner, SessionStore, Task, TaskStatus, WorkerRecord, classify_session,
+    AuditLog, ProcessIdentity, ProcessKind, ProcessRegistry, SecretScanner, SessionStore, Task,
+    TaskStatus, WorkerRecord, classify_session,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -139,6 +140,127 @@ fn a_worker_session_is_never_auto_resumed() {
             "{status:?}: a worker's turn must not resume in the shell"
         );
     }
+}
+
+/// Spec 57 correction C12. The shell runs the sweep on the first
+/// `GET /api/recovery`, which can come after it has started a worker. A live
+/// worker's tasks are running, not left by a crash: they must not be audited as
+/// recovered, charged a lost model call, or have their approval reattached (and
+/// here, failed for want of a proposal) by the shell. Once the worker is gone
+/// the same session is classified as any other.
+#[test]
+fn a_live_worker_session_is_not_recovered() {
+    let fixture = fixture("live-worker");
+    record_worker(&fixture);
+    let running = task_left_in(&fixture, TaskStatus::PreparingContext, None);
+    let _model_call = fixture
+        .store
+        .start_action_with_estimate(&running, "model_call", "m", false, Some(1200))
+        .unwrap();
+    let waiting = task_left_in(&fixture, TaskStatus::WaitingForApproval, None);
+    // This test process stands in for the worker: a live pid the shell
+    // registered for the session.
+    let registry = ProcessRegistry::open(&fixture.data_dir).unwrap();
+    let registration = registry
+        .register(ProcessKind::Worker, &fixture.session_id, std::process::id())
+        .unwrap();
+
+    let recovered = classify_session(&fixture.store, &fixture.audit, &fixture.session_id).unwrap();
+    let reattached = reattach(&fixture);
+
+    assert!(recovered.is_empty(), "{recovered:?}");
+    assert!(reattached.is_empty(), "{reattached:?}");
+    let audit = audit_log_text(&fixture);
+    assert!(!audit.contains("task_recovered"), "{audit}");
+    assert!(
+        !audit.contains("task_usage_recorded_for_lost_call"),
+        "{audit}"
+    );
+    let statuses = fixture
+        .store
+        .read_task_statuses(&fixture.session_id)
+        .unwrap();
+    assert_eq!(
+        statuses.get(&waiting.id).map(String::as_str),
+        Some("waiting_for_approval")
+    );
+
+    // The worker exits: its entry goes with it, and #17 takes over.
+    drop(registration);
+    let recovered = classify_session(&fixture.store, &fixture.audit, &fixture.session_id).unwrap();
+    assert_eq!(recovered.len(), 1, "{recovered:?}");
+    assert_eq!(recovered[0].task_id, running.id);
+    assert!(!recovered[0].auto_resume_permitted);
+    assert!(audit_log_text(&fixture).contains("task_recovered"));
+}
+
+/// A worker session is skipped only for a live worker of its own: a worker
+/// entry for another session, another kind of entry, or a stale entry whose pid
+/// no longer names a live process does not shield it.
+#[test]
+fn only_a_live_worker_for_this_session_skips_recovery() {
+    let fixture = fixture("other-worker");
+    record_worker(&fixture);
+    task_left_in(&fixture, TaskStatus::PreparingContext, None);
+    // Live pids, but the wrong session or the wrong kind; then a worker entry
+    // for this session whose pid names no process, as a worker that died
+    // without removing its entry leaves behind.
+    let me = ProcessIdentity::of(std::process::id()).unwrap();
+    let processes = fixture.data_dir.join("processes");
+    fs::create_dir_all(&processes).unwrap();
+    for (name, pid, start, kind, session) in [
+        ("other", me.pid, me.start_time_us, "worker", "ses_other"),
+        (
+            "command",
+            me.pid,
+            me.start_time_us,
+            "command",
+            fixture.session_id.as_str(),
+        ),
+        ("stale", 9_999_999, 1, "worker", fixture.session_id.as_str()),
+    ] {
+        fs::write(
+            processes.join(format!("{name}.json")),
+            format!(
+                r#"{{"pid":{pid},"startTimeUs":{start},"pgid":{pid},"kind":"{kind}","sessionId":"{session}","registeredAtMs":1,"ownerPid":1,"ownerStartTimeUs":1}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    let recovered = classify_session(&fixture.store, &fixture.audit, &fixture.session_id).unwrap();
+
+    assert_eq!(recovered.len(), 1, "{recovered:?}");
+}
+
+fn record_worker(fixture: &Fixture) {
+    fixture
+        .store
+        .record_worker_spawned(
+            &fixture.session_id,
+            &WorkerRecord {
+                parent_session_id: None,
+                source_repository: PathBuf::from("/code/app"),
+                worktree_path: PathBuf::from("/code/app/.damaian/worktrees/w"),
+                branch: "damaian/w".to_string(),
+                base_commit: "0123456".to_string(),
+                included_uncommitted: false,
+                git_commands: Vec::new(),
+            },
+        )
+        .unwrap();
+}
+
+fn reattach(fixture: &Fixture) -> Vec<workspace_engine::ReattachedApproval> {
+    workspace_engine::reattach_pending_approvals(
+        &fixture.store,
+        &fixture.audit,
+        &workspace_engine::CommandStore::new(&fixture.data_dir),
+        &workspace_engine::PatchStore::new(&fixture.data_dir),
+        &workspace_engine::PausedTurns::new(&fixture.data_dir),
+        &fixture.session_id,
+    )
+    .unwrap()
 }
 
 /// §5.4 rule 2, first half.

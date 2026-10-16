@@ -56,6 +56,13 @@ pub fn classify_session(
     audit: &AuditLog,
     session_id: &str,
 ) -> Result<Vec<RecoveredTask>> {
+    // Spec 57 correction C12: a live worker's tasks are running in that
+    // process, not left by a crash. Checked before anything is audited or
+    // written, so the sweep records nothing about them — not even a lost model
+    // call, which is still in flight.
+    if store.has_live_worker(session_id)? {
+        return Ok(Vec::new());
+    }
     let unreadable = store.unreadable_event_count(session_id)?;
     if unreadable > 0 {
         audit.record(
@@ -309,6 +316,11 @@ pub fn reattach_pending_approvals(
     paused: &PausedTurns,
     session_id: &str,
 ) -> Result<Vec<ReattachedApproval>> {
+    // A live worker is waiting on its own approval (spec 57 correction C12).
+    // Reattaching it would let the shell answer it behind the worker's back.
+    if store.has_live_worker(session_id)? {
+        return Ok(Vec::new());
+    }
     let mut reattached = Vec::new();
     for (task_id, raw_status) in store.read_task_statuses(session_id)? {
         if TaskStatus::parse(&raw_status) != Some(TaskStatus::WaitingForApproval) {

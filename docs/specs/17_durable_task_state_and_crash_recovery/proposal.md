@@ -193,6 +193,13 @@ Classification appends a `task_recovered` event with the classification and the
 evidence — the dangling action and its `seq` — so a recovery decision is
 auditable rather than a conclusion the UI reached once and forgot.
 
+A session whose [spec 57](../57_worker_sessions/proposal.md) worker is still
+alive is skipped entirely, here and in §5.5's reattachment: its tasks are
+running in that process, not left behind by a crash. "Alive" means a
+`ProcessKind::Worker` entry in [spec 46](../46_process_registry_and_orphan_sweep/proposal.md)'s
+registry for that session whose pid still has the recorded start time (spec 57
+correction C12).
+
 Auto-resume is permitted **only** for `interrupted` tasks whose dangling action,
 if any, was `preparing_context` or a read-only model call, per requirement 6.
 

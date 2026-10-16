@@ -1136,6 +1136,59 @@ mod tests {
         assert!(engine.command_store.load_proposal(&proposal.id).is_ok());
     }
 
+    /// Spec 57 correction C12, as observed on 2026-10-16: the sweep ran while a
+    /// worker was preparing context and offered *Resume* for its live task.
+    #[test]
+    fn a_live_worker_is_not_offered_for_recovery() {
+        let (engine, dir) = engine("live-worker");
+        let session = engine
+            .session_store
+            .create_session("repo_1", "Worker")
+            .unwrap();
+        engine
+            .session_store
+            .record_worker_spawned(
+                &session.id,
+                &workspace_engine::WorkerRecord {
+                    parent_session_id: None,
+                    source_repository: PathBuf::from("/code/app"),
+                    worktree_path: PathBuf::from("/code/app/.damaian/worktrees/w"),
+                    branch: "damaian/w".to_string(),
+                    base_commit: "0123456".to_string(),
+                    included_uncommitted: false,
+                    git_commands: Vec::new(),
+                },
+            )
+            .unwrap();
+        let task = task_left_in(
+            &engine,
+            &session.id,
+            "add retries",
+            TaskStatus::PreparingContext,
+            Some(("model_call", "m", false)),
+        );
+        // This test process stands in for the worker the shell registered.
+        let _worker = workspace_engine::ProcessRegistry::open(&dir)
+            .unwrap()
+            .register(
+                workspace_engine::ProcessKind::Worker,
+                &session.id,
+                std::process::id(),
+            )
+            .unwrap();
+
+        let (_, payload) = sweep(&engine);
+
+        assert!(!payload.contains(&task.id), "got {payload}");
+        assert!(
+            !audit_text(&dir).contains("task_recovered"),
+            "a live worker's task is not crash debris"
+        );
+        let error = apply_decision(&engine, &decision(&session.id, &task.id, "mark_failed"))
+            .expect_err("a live worker's task is not a recovered task");
+        assert!(error.contains("is not a recovered task"), "got {error}");
+    }
+
     /// §5.5 of spec 17: a task awaiting an approval nothing recorded is failed
     /// with a reason rather than rebuilt from partial data.
     #[test]

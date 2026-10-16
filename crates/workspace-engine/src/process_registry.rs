@@ -230,23 +230,50 @@ impl ProcessRegistry {
     /// did not parse — a write interrupted between `create_new` and
     /// `write_all`, which the sweep audits rather than ignores.
     pub fn entries(&self) -> Result<Vec<(PathBuf, Option<RegisteredProcess>)>> {
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(&self.dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-                continue;
-            }
-            let parsed = fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| serde_json::from_str::<RegisteredProcess>(&text).ok());
-            entries.push((path, parsed));
-        }
-        Ok(entries)
+        read_entries(&self.dir)
     }
 
     pub fn owner(&self) -> ProcessIdentity {
         self.owner
     }
+}
+
+fn read_entries(dir: &Path) -> Result<Vec<(PathBuf, Option<RegisteredProcess>)>> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let parsed = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<RegisteredProcess>(&text).ok());
+        entries.push((path, parsed));
+    }
+    Ok(entries)
+}
+
+/// Whether a spec 57 worker for `session_id` is running: a
+/// [`ProcessKind::Worker`] entry for that session whose pid still has the
+/// recorded start time.
+///
+/// Crash recovery asks this so that a live worker's tasks are not taken for a
+/// crash's leftovers (spec 57 correction C12). It reads rather than opens the
+/// registry, because a reader has no business creating the directory, and a
+/// missing directory means nothing was ever registered.
+pub fn live_worker_registered(data_dir: &Path, session_id: &str) -> Result<bool> {
+    let dir = data_dir.join("processes");
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    Ok(read_entries(&dir)?
+        .into_iter()
+        .filter_map(|(_, entry)| entry)
+        .any(|entry| {
+            entry.kind == ProcessKind::Worker.as_str()
+                && entry.session_id == session_id
+                && ProcessIdentity::of(entry.pid) == Some(entry.identity())
+        }))
 }
 
 /// Which entries a sweep considers. The per-entry identity check is identical
