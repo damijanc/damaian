@@ -8889,6 +8889,57 @@ mod tests {
             assert_eq!(payloads(&lines, "note").len(), 1, "{lines:?}");
         }
 
+        /// A note accepted while the round runs, in a round that then stops
+        /// for approval, reaches the resumed turn: the approval continues the
+        /// same turn (§5.6), so the note joins it at its next boundary like
+        /// any other (§5.4). Task 10 discovery 3.
+        #[test]
+        fn a_note_queued_before_an_approval_reaches_the_resumed_turn() {
+            let script = calls_then("run_command", TOUCH, "Done.");
+            let gated = Gated::new(script.clone());
+            let (host, session) = hosted(&fixture("nappr"), gated.clone());
+            assert_eq!(send(&host, message("Mark it."))["ok"], true);
+            gated.wait_entered();
+            assert_eq!(
+                send(
+                    &host,
+                    ControlCommand::Note {
+                        text: "Mind the README.".to_string()
+                    }
+                )["ok"],
+                true,
+                "a note is accepted while the round runs"
+            );
+            gated.open();
+            let waiting = settle(&host);
+            assert_eq!(waiting["state"], "waiting_for_approval", "{waiting}");
+            let proposal_id = waiting["proposalId"].as_str().unwrap().to_string();
+            assert_eq!(
+                send(&host, ControlCommand::Approve { proposal_id })["ok"],
+                true
+            );
+            assert_eq!(settle(&host)["state"], "idle");
+
+            let messages = store().read_messages(&session).unwrap();
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.role == "user" && message.content == "Mind the README."),
+                "the note was dropped at the approval: {messages:?}"
+            );
+            let requests = &script.0.lock().unwrap().requests;
+            assert!(
+                requests
+                    .last()
+                    .unwrap()
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains("Mind the README.")),
+                "the resumed turn's next model request carries the note"
+            );
+            assert_eq!(payloads(&progress(&session), "note").len(), 1);
+        }
+
         #[test]
         fn stop_ends_the_running_turn_cancelled() {
             let gated = Gated::new(calls_then("run_command", PWD, "Done."));
@@ -9282,6 +9333,46 @@ exec /bin/cat > /dev/null
             );
 
             fixture.supervisor.shutdown_all();
+        }
+
+        /// A data directory whose worker socket path cannot fit `sun_path` is
+        /// refused before anything is created: no worktree, no branch, no
+        /// session. Before this check it was refused only when the process
+        /// started, after all three existed (Task 9 discovery 3).
+        #[test]
+        fn a_data_dir_too_long_for_the_socket_is_refused_before_the_worktree() {
+            let mut fixture = Fixture::new();
+            fixture.config.data_dir = fixture.root.join("d".repeat(120));
+            let refused = fixture.supervisor.spawn(
+                &fixture.config,
+                SpawnRequest {
+                    repo: fixture.repo.clone(),
+                    prompt: "Fix the parser".to_string(),
+                    include_uncommitted: false,
+                    parent_session_id: None,
+                },
+                KEY,
+            );
+            let error = refused.expect_err("the spawn must be refused");
+            assert!(error.contains("socket path"), "{error}");
+            assert!(
+                !fixture.repo.join(".damaian").exists(),
+                "a worktree was created before the refusal"
+            );
+            let branches = Command::new("git")
+                .args(["branch", "--list", "damaian/*"])
+                .current_dir(&fixture.repo)
+                .output()
+                .unwrap();
+            assert!(
+                branches.stdout.is_empty(),
+                "a branch was created before the refusal: {}",
+                String::from_utf8_lossy(&branches.stdout)
+            );
+            assert!(
+                !fixture.config.data_dir.join("sessions").exists(),
+                "a session was created before the refusal"
+            );
         }
 
         /// Requirement 9: the key reaches the worker on stdin only, from

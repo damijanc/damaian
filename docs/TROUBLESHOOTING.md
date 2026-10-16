@@ -35,6 +35,7 @@ most of the time:
 | Native wrapper | `damaian-desktop` | Tauri app: window, menus, folder picker, Keychain, updater, PTY terminal. Spawns the shell in a background thread. |
 | Local shell | `damaian-desktop-shell` | HTTP server on `127.0.0.1:4765` serving the web UI and the `/api/*` surface. Also runnable standalone. |
 | CLI | `damaian` | Same workspace engine, no HTTP, no UI. |
+| Worker | `damaian-desktop --worker` (or `damaian-desktop-shell --worker` in development) | One per running worker session ([spec 57](specs/57_worker_sessions/proposal.md)): the app's own binary re-launched by the shell, with no window and no HTTP server. See [Worker sessions](#worker-sessions). |
 
 The webview loads `http://127.0.0.1:4765/` — the UI is a normal web page talking
 to a local HTTP server, so browser-side debugging applies (see
@@ -80,6 +81,8 @@ isolated tree — that is the intended way to test without touching real data.
 | `commands/output/<exec-id>/` | `stdout.log`, `stderr.log`, `summary.dcmd` per execution | [validation.rs:67](../crates/workspace-engine/src/validation.rs:67) |
 | `commands/rejected/<id>.dcmd` | Rejected command proposals | [validation.rs:93](../crates/workspace-engine/src/validation.rs:93) |
 | `chat/pending/<proposal-id>.json` | Suspended chat turn awaiting a command decision | [chat.rs:859](../crates/workspace-engine/src/chat.rs:859) |
+| `sessions/<session-id>.progress.jsonl` | A worker's live progress, the board's and control strip's source. Secret-redacted, truncated when the worker starts, deleted with the session | [worker_progress.rs](../crates/workspace-engine/src/worker_progress.rs) |
+| `workers/<hash>.sock` | A running worker's control socket (`0600` in a `0700` directory), removed when it exits cleanly | [worker.rs](../crates/desktop-shell/src/worker.rs) |
 | `processes/<pid>-<start-time-us>.json` | One live child process this instance spawned, written **before** the child is returned to its caller and unlinked on clean exit | [process_registry.rs:164](../crates/workspace-engine/src/process_registry.rs:164) |
 | `web-diagnostics/<session-id>/<task-id>/run-<ms>/` | Browser diagnostic screenshots, copied out of the browser server's own output. Images are **not** secret-scanned; they show whatever the page showed | `materialize_browser_artifacts` ([desktop-shell/src/lib.rs](../crates/desktop-shell/src/lib.rs)) |
 | `repository-map/<repo-id>.json` | The repository map: roots, their evidence and commands, and excluded paths. Derived, safe to delete | `RepositoryMapStore` ([repository_map.rs](../crates/workspace-engine/src/repository_map.rs)) |
@@ -980,8 +983,126 @@ leftover this sweep exists to clean up.
 If you expected a cleanup and got nothing, check in this order: the entry's
 `ownerPid` is still alive (so the entry is deliberately skipped); the sweep runs
 at launch and on `SIGINT`/`SIGTERM`/`SIGHUP`, so a `SIGKILL`ed Damaian cleans up
-on its *next* start rather than immediately; and a process started outside
+on its *next* start rather than immediately (workers are the exception: they
+end themselves at once, see [Worker sessions](#worker-sessions)); and a process started outside
 Damaian was never registered, so it is not the sweep's to kill.
+
+### Worker sessions
+
+A worker ([spec 57](specs/57_worker_sessions/proposal.md)) is a session hosted
+by its own process, the app binary re-launched with `--worker`. Its stderr is
+the shell's, so a worker's refusals appear in the shell's own output (see
+[Capturing stdout and stderr](#capturing-stdout-and-stderr)). Nothing is written
+to a separate worker log.
+
+**Where a worker's files are:**
+
+| What | Where |
+|---|---|
+| Worktree and branch | `<source repo>/.damaian/worktrees/<slug>` on `damaian/<slug>`; `.damaian/worktrees/` is a line in the source's `.git/info/exclude` |
+| What created them | the worker's own session log, first event `worker_spawned` (`gitCommands`, `baseCommit`, `includedUncommitted`, `parentSessionId`), and the same event in the audit log |
+| Its conversation | `sessions/<session-id>.jsonl`, keyed by the **worktree's** repository id, not the source's. The parent's log has a `worker_spawned` event naming it |
+| Live progress | `sessions/<session-id>.progress.jsonl` |
+| Control socket | `workers/<first 16 hex of sha256(session id)>.sock` |
+| Its process | a `processes/*.json` entry with `kind` `worker`, owned by the shell. The worker's own commands and model calls are entries owned by the worker's pid |
+
+Every worker of a source repository, with its state, as the board reads it:
+
+```bash
+curl -s -H "x-damaian-api-token: $TOKEN" \
+  "http://127.0.0.1:4765/api/workers?repo=$(jq -rn --arg r "$REPO" '$r|@uri')" \
+  | jq -r '.workers[] | "\(.group) \(.state) \(.taskStatus // "-") \(.sessionId) \(.branch)"'
+```
+
+Worker lifecycle events in the audit log:
+
+```bash
+jq -r 'select(.eventType|startswith("worker_")) | "\(.eventType) \(.sessionId // "-") \(.error // .pid // "")"' "$DATA_DIR/audit/events.jsonl"
+```
+
+`worker_spawned`, `worker_spawn_failed`, `worker_restarted`,
+`worker_terminated` (a `SIGTERM` from the stop escalation or at quit, with the
+registry's pid and start time) and `worker_worktree_removed`.
+
+#### The board or the control strip stops updating
+
+The shell answers one request at a time, and a turn streaming in another
+session holds it for that turn's whole length. The board and the worker's
+control strip then keep their last rows. After 3 seconds the board says how old
+they are and that the shell answers once the turn ends; the strip shows nothing.
+Workers keep running meanwhile, and only the view lags. When the other turn
+ends, polling resumes within a second. Only a request that **fails** shows
+"Could not refresh". This is accepted behaviour (correction C10 in
+[`tasks.md`](specs/57_worker_sessions/tasks.md)). Answering the worker routes
+while a turn streams is a follow-up, proposal §7. The sidebar's dots and badge
+have no timer of their own, so with the board closed they can be stale until a
+project is drawn, a session loads or the window regains focus.
+
+#### A worker shows *Interrupted*, or *Ended*
+
+The worker's process has gone and its session has not. *Interrupted* means the
+process ended part way through a turn. Its task was then classified by crash
+recovery ([After a crash: what recovery decided](#after-a-crash-what-recovery-decided))
+as `interrupted` or, when a command was running, `unknown_external_outcome`.
+*Ended* means it ended between turns. Common causes: the app quit or crashed
+(workers never outlive it), the worker was stopped, or its session's parent was
+deleted.
+
+**Restart worker** starts a new, idle process for the same session and worktree
+(`worker_restarted`). It does not continue the old turn: a worker session is
+never auto-resumed or resumed in the shell (correction C5), because its
+repository is a worktree and its host is gone. An approval the old process was
+waiting for ended with it and its command did not run. Its
+`chat/pending/<proposal-id>.json` snapshot stays on disk. Restart is refused
+while a live worker holds the worktree, and once the worktree was removed.
+
+The shell's crash-recovery card is never shown for a worker session. A **live**
+worker's in-flight task is not crash debris either. `GET /api/recovery` skips a
+session that has a worker record and a live `ProcessKind::Worker` registry
+entry with a matching start time (correction C12), so a running worker gets no
+`task_recovered` event, no `lost_to_crash` usage and no recovery card. If you
+see `task_recovered` for a worker's task, its process had already ended when
+the sweep ran.
+
+#### A worker will not start
+
+- "the worker socket path is N bytes": the data directory is too long for a
+  Unix socket path (macOS allows 103 bytes, and the socket adds about 30). It
+  only happens with a long `DAMAIAN_DATA_DIR`, and it is refused before
+  anything is created.
+- A refusal naming a symlink, an existing path or a tracked path under
+  `.damaian/worktrees`: the creation checks treat `.damaian/` as untrusted
+  ([`SECURITY.md`](../SECURITY.md#worker-sessions)). Nothing was changed.
+- `worker_spawn_failed` with an error after `worktree add` (copying an
+  untracked file under *Include*): the worktree and its branch are left in
+  place, and the event does not list the commands that ran. Look for the
+  directory under `.damaian/worktrees/` and `git branch --list 'damaian/*'`.
+- 403 "Worker sessions are turned off": the setting is off. Every worker route
+  except `GET /api/workers` refuses then, `stop` and `shutdown` included, so a
+  worker left running when you turned the setting off is controlled again by
+  turning it on, or ends when the app quits.
+
+#### Leftover worktrees after a crash
+
+Workers die with the app, and the process registry backs that up at the next
+launch, but **worktrees and branches are kept on purpose**: they hold the
+worker's work. After a crash, a worker's worktree is still listed by
+`git -C "$REPO" worktree list` and its session still shows in the sidebar,
+with *Restart worker*. Remove a worktree you no longer want from the board's
+*Remove worktree*, which refuses anything that is not a worker worktree and
+confirms uncommitted changes first, or by hand with
+`git worktree remove .damaian/worktrees/<slug>`. Damaian never deletes the
+`damaian/<slug>` branch. If a directory was deleted by hand, `git worktree
+prune` clears Git's record of it.
+
+#### `DAMAIAN_MOCK_MODEL_RESPONSE` is set in the shell's environment
+
+The desktop shell builds its model adapter the same way for its own turns and
+for workers (`chat_model_adapter`), and like the CLI it answers from
+`DAMAIAN_MOCK_MODEL_RESPONSE` when that variable is set. A shell started from a
+terminal with it set therefore answers every turn, its own and its workers',
+from the variable, without calling the provider. The app started from Finder
+does not inherit a terminal's variables.
 
 ### Checkpoints and rewind
 

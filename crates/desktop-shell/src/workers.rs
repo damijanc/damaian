@@ -155,6 +155,11 @@ impl Supervisor {
                 return Err("A worker cannot start workers.".to_string());
             }
         }
+        // The socket path's length depends only on the data directory, so a
+        // directory too long for `sun_path` is refused here, before the
+        // worktree, its branch and the records exist rather than after.
+        let data_dir = std::path::absolute(&config.data_dir).map_err(|error| error.to_string())?;
+        crate::worker_socket_path(&data_dir, "socket-length-check")?;
         let audit = audit_log(config);
         let created = match create_worker_worktree(
             &request.repo,

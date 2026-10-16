@@ -1,6 +1,6 @@
 # Feature Spec: Worker Sessions
 
-Status: In progress (Tasks 1–10 of 11 done, 2026-10-07, 2026-10-09, 2026-10-09, 2026-10-12, 2026-10-12, 2026-10-15, 2026-10-15, 2026-10-16, 2026-10-16 and 2026-10-16; see [`tasks.md`](tasks.md))
+Status: Done 2026-10-16 (Tasks 1–11; see [`tasks.md`](tasks.md). Acceptance with a live model was not run; §6 says what that leaves unproven)
 Order: 57 of 57
 Plan: none. An exception to the graduation rule, like #41–#44 and #47: it came
 from describing how this repository is actually built — a planner session that
@@ -132,8 +132,11 @@ in Settings as "Worker sessions" with a one-line description. It is classified
 and so a `Capability` key in #31's partition:
 a repository must not be able to change how the user's sessions behave or add
 text to their system prompt. Turning it off while workers are running does not
-stop them; it hides the entry points for new ones, and the board stays
-reachable until no worker is left on it.
+stop them; it hides the entry points for new ones. As built (Tasks 9–10), it
+also hides the board, the sidebar entries and the worker controls, and every
+worker route except the list refuses, `stop` and `shutdown` included (decided
+in Task 11, §5.7 Setting off). A running worker then ends with its turn or when
+the application quits, or is controlled again by turning the setting back on.
 
 **Instruction.** When the setting is on, one fixed paragraph
 (`WORKER_HANDOFF_PARAGRAPH`) is appended to the system prompt of every session
@@ -245,7 +248,11 @@ exists, `-2`, `-3`, … is appended to both until neither does.
 A creation that fails is recorded as a `worker_spawn_failed` audit event with
 the error. A failure after step 5 leaves the worktree and its branch in place,
 and the commands run so far are not in that event, because
-`create_worker_worktree` does not return them on an error.
+`create_worker_worktree` does not return them on an error (a follow-up, §7).
+Before step 1 the shell checks that the worker's control socket path fits
+(§5.2). Its length depends only on the data directory, so a data directory too
+long for it is refused before anything exists (Task 11; until then it was
+refused only at step 9, after the worktree, branch and records).
 
 **Approval.** #36 requires action-specific approval for git mutations. Clicking
 *Start worker* is that approval: the user initiated the action and the dialog
@@ -311,7 +318,8 @@ bytes including its NUL, and the id-named path measured 107 bytes under the real
 `~/Library/Application Support/DamaianClient` and 132 under a `/var/folders/…`
 test directory (2026-10-12). The hashed path is 91 bytes under the real
 directory. When even that does not fit, the worker refuses to start and says
-how long the path is. A leftover socket from a crashed worker is replaced; one
+how long the path is, and the shell refuses the spawn before creating anything
+(§5.1). A leftover socket from a crashed worker is replaced; one
 that still answers is not, because a live worker holds it. Line-delimited JSON
 requests, one response each, one connection at a time; a connection idle for 5
 seconds is closed. Every request carries the token; a wrong or missing token
@@ -453,6 +461,17 @@ At the existing round-boundary check, before the next model request
    never weaker. There is no composer length limit to reuse; the worker's
    socket (Task 5) is where a note's length is bounded. Emit a `note` progress
    event.
+
+   A note reaches the turn only at a boundary. A round that ends in a command or
+   plan approval never returns to the loop's top, so the worker carries the
+   notes it has accepted but not delivered into the resumed job: `approve` and
+   `reject` continue the same turn (§5.6), and its next boundary drains them
+   (Task 11, `a_note_queued_before_an_approval_reaches_the_resumed_turn`; before
+   that they were dropped with the job's `TurnSteering`). A note accepted during
+   a turn's final round, which then completes with no further model request, is
+   not delivered: no boundary follows. Carrying it into the next `message` would
+   put it after a message the user wrote later, so that case is a follow-up
+   (§7), and the user guide says so.
 4. If the turn was paused, persist the running status again and continue.
 
 A pause requested during a model call or a tool takes effect at the following
@@ -672,9 +691,12 @@ As built (Task 10), with no new route:
   old process was waiting for approval, the toast says that approval ended
   with it and its command did not run (Task 7), and the card is gone.
 - **Setting off.** Workers show as ordinary sessions: no strip, no header
-  line, no poll, and the composer as it was. Whether `stop` and `shutdown`
-  should still be accepted by the shell while the setting is off remains
-  open (Task 7). With it off the UI offers no worker controls at all.
+  line, no poll, and the composer as it was. **Decided in Task 11:** the
+  shell keeps refusing `stop` and `shutdown` (403) while the setting is off,
+  like every worker route but the list. With it off the UI offers no worker
+  controls at all, so accepting them would serve no client, and "off" stays
+  one rule with no exceptions to explain. The worker still cannot outlive
+  the application, and turning the setting back on restores its controls.
 
 **Parent session.** Prompt blocks carry *Start worker* (§5.1). Once a block has
 been used, its footer also shows "Started *‹worker title›* →", linking to the
@@ -824,6 +846,105 @@ it is doing, pause it, steer it with a note, and stop it. It waits for approvals
 without restarting. If Damaian exits for any reason, nothing it started keeps
 running.
 
+### As verified (Task 11, 2026-10-16)
+
+Each item above, with the test or the recorded manual check that covers it.
+`ws` is `crates/workspace-engine`, `ds` is `crates/desktop-shell`, and "ignored"
+means a real-process test run by hand (`tasks.md` rows 5–7 and 11).
+
+- **`TurnSteering`.** `ws/tests/steering.rs`:
+  `pause_takes_effect_only_at_a_round_boundary`,
+  `a_paused_turn_persists_paused_then_running_again`,
+  `resume_continues_the_same_turn`,
+  `a_note_becomes_a_user_message_before_the_next_model_request`,
+  `cancel_while_paused_ends_cancelled`, `a_turn_without_steering_is_unchanged`;
+  `steering.rs::wait_while_paused_returns_on_cancel_without_wake`. Note refused
+  while waiting: `ds` `worker_turns::a_note_while_waiting_for_approval_is_refused`.
+  Added in Task 11: `a_note_queued_before_an_approval_reaches_the_resumed_turn`.
+- **Same-turn guarantee.** `worker_turns::a_turn_through_the_worker_host_matches_the_shell_host`,
+  plus `a_worker_turn_gets_the_shells_chat_integrations`, which catches what
+  that comparison cannot see (Task 6).
+- **Progress file.** `worker_progress.rs`: `seq_strictly_increases_from_one`,
+  `reading_after_n_returns_exactly_the_later_lines`,
+  `a_seeded_secret_never_reaches_the_file`.
+- **Key and token.** Ignored `ds/tests/worker_process.rs`:
+  `a_command_the_worker_runs_sees_neither_key_nor_token` (environment) and
+  `the_worker_keeps_key_and_token_out_of_argv_and_output` (argv).
+- **Stdin close.** Ignored `closing_stdin_exits_the_worker_and_kills_its_sleeping_child`.
+  It spawns a real process, so it is ignored rather than "a normal test" as
+  planned.
+- **Socket.** `worker.rs`: `the_socket_is_0600_in_a_0700_directory`,
+  `a_wrong_or_missing_token_closes_the_connection`,
+  `an_unknown_command_is_rejected`.
+- **Command approval.** `worker_turns::a_command_approval_continues_in_process`
+  (snapshot present while waiting, gone after, same pid). Killed while
+  waiting: ignored `killing_a_worker_waiting_for_approval_leaves_a_snapshot_recovery_finds`.
+- **Patch proposal.** `worker_turns::a_patch_proposal_leaves_the_worker_idle_and_alive`.
+- **Creation.** `ws/tests/worktree.rs`:
+  `a_worktree_is_created_under_damaian_worktrees_on_a_damaian_branch`,
+  `the_exclude_line_is_added_once`, `colliding_names_get_matching_suffixes`.
+- **Refusals.** `refuses_a_symlink_anywhere_in_the_path`,
+  `refuses_a_tracked_path_under_worktrees`,
+  `refuses_a_path_that_resolves_outside_the_repository`,
+  `refuses_a_non_git_source`. An existing path: naming skips it, so it is
+  never reused (`colliding_names_get_matching_suffixes`). The refusal behind
+  naming has no test of its own, because naming never hands it an existing
+  path.
+- **Include / last commit.** `include_carries_tracked_edits_and_untracked_files`,
+  `start_from_last_commit_carries_neither`.
+- **`worker_spawned` records.** `ds` `worker_supervisor::spawn_records_worker_spawned_on_worker_parent_and_audit`.
+- **Restart refusal.** `worker_supervisor::restart_is_refused_while_a_live_worker_holds_the_worktree`.
+- **Parent deleted.** `worker_supervisor::deleting_a_parent_sends_shutdown_to_its_workers_and_keeps_their_worktrees`.
+- **Dirty removal.** `worker_supervisor::remove_worktree_requires_the_second_confirmation_when_dirty`
+  and `worktree.rs::removing_a_dirty_worktree_reports_paths_and_does_not_force`.
+- **Kill test.** Ignored `ds/tests/workers.rs::sigkilling_the_shell_ends_its_worker_and_the_workers_command`,
+  added in Task 11. Run 2026-10-16: the worker and its `sleep` command were
+  gone 44 ms after the shell's `SIGKILL`. Falsified: with the lifeline's EOF
+  ignored it fails at 5 s.
+- **UI.** Each item is a recorded manual check in the running shell on port 4799
+  with its own data directory. Task 8's row: the tag rule through both
+  renderers (untagged, `text`, `prompt`, `rust`, `worker-prompt extra`,
+  `Worker-Prompt`, a user message's block, while streaming, in a worker
+  session, setting off), the exact pre-fill, the dialog clean and dirty, and
+  the "Started" link and entry. Task 9's row: board groups and ordering, *Stop*
+  in the overflow, and setting off (no board, no sidebar entries, no button).
+  Task 10's row: the strip in each state, a note while running and while
+  paused, approval with the same pid, and Stop.
+- **Setting and instruction.** `chat.rs`:
+  `code_mode_system_prompt_is_byte_identical_to_todays` (unmodified),
+  `no_mode_changes_when_handoffs_are_not_offered`,
+  `the_handoff_paragraph_is_appended_when_offered`,
+  `a_non_worker_session_gets_the_paragraph_when_enabled`,
+  `a_worker_session_never_gets_the_paragraph`;
+  `ws/tests/repository_config_trust.rs::repository_config_cannot_enable_worker_sessions`.
+- **Also.** The deterministic eval tier ran 16/16 in Task 6, when turn hosting
+  changed. Task 11 changed only worker bookkeeping, and the tier also runs
+  in the workspace test suite on CI. The full seven-check gate runs on CI
+  (`AGENTS.md`).
+- **C12** (a live worker is not crash debris): `ws/tests/crash_recovery.rs::a_live_worker_session_is_not_recovered`,
+  `ds` `recovery.rs::a_live_worker_is_not_offered_for_recovery`.
+
+**Cold start**, informational: ignored `workers.rs::worker_cold_start_on_this_repository`,
+a debug build on the development Mac, 2026-10-16. Source: a local clone of this
+repository (333 tracked files). The model was `DAMAIAN_MOCK_MODEL_RESPONSE`, so
+no provider time is counted. In three runs, `spawn` returned in 143–163 ms
+(worktree, records, process), the socket answered at 169–406 ms, and the first
+model request was prepared at **7.3–7.6 s**. Nearly all of it is the worker
+building its index of a worktree it has never seen. No index is shared with
+the source, which is the cost of a process per worker (§4).
+
+**Acceptance was not run.** It needs a live model with the user's key, and
+Task 11 is an agent session that must never hold one. Shown elsewhere:
+`worker-prompt` blocks get *Start worker*, which starts a worker without
+copying (Task 8, against a scripted answer). With the setting off nothing is
+visible (Tasks 8–10) or sent (`no_mode_changes_when_handoffs_are_not_offered`,
+the byte-identical test). The board, pause, notes, approvals without restart
+and stop work against a real worker on a scripted endpoint (Tasks 9–10), and
+the kill test. **Not shown:** that a real model, told only the §5.0 paragraph,
+writes `worker-prompt` blocks when asked to split work in a repository with no
+`AGENTS.md`. That is the remaining check, for the user to make with their
+provider.
+
 ## 7. Follow-up specs, not part of this one
 
 In the order agreed during design:
@@ -842,3 +963,22 @@ In the order agreed during design:
    held for the whole of an `/api/ask-stream` turn, so the board and the
    progress polls wait until it ends. Answering the read-only worker routes
    while a turn streams would remove the lag.
+
+Smaller open items, recorded so they are not lost (Task 11):
+
+5. **Partial git commands on a failed creation** (Tasks 4 and 7, (b)). A failure
+   after `git worktree add` leaves the worktree and branch in place, and
+   `worker_spawn_failed` records only the error. `create_worker_worktree` would
+   have to return the commands it ran with its error, or remove what it made.
+6. **A note accepted in a turn's final round** is not delivered (§5.4). The
+   worker could report it as undelivered in the job's closing `status` line,
+   or carry it into the next turn. The choice is a design decision.
+7. **The board's row facts** (Task 9 discoveries 1–2). A `phase` line's empty
+   label for the context and model phases makes *Doing* read "Working". A
+   finished row has no end time; a `lastProgressAtMs` on the row would give it
+   one.
+8. **A worker's model** (Task 6 (a)). A worker takes the configured provider and
+   model, not the one chosen in the parent's composer.
+9. **The *Include* base commit** (Task 4 (a)). `git stash create` makes a
+   two-parent commit, which merging the worker's branch carries into history.
+   `commit-tree <stash>^{tree} -p HEAD` would give a single-parent base.
