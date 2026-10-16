@@ -390,6 +390,24 @@ pending-approval snapshot. A worker whose process ended without finishing its
 turn is marked `Interrupted` through #17, and its session offers *Restart
 worker* (§5.7).
 
+**A live worker is not crash debris** (correction C12 in
+[`tasks.md`](tasks.md)). #17's sweep assumes every non-terminal task in the
+data directory was left by a process that died, and the shell runs that sweep
+lazily, on the first `GET /api/recovery`, which can come after it has started a
+worker. So `classify_session` and `reattach_pending_approvals` skip a session
+that has a worker record **and** a live `ProcessKind::Worker` registry entry
+for it (`process_registry::live_worker_registered`: kind `worker`, that
+session id, and a pid whose start time still matches). Such a session gets no
+`task_recovered` event, no `lost_to_crash` usage for its in-flight model call,
+no recovery card and no reattached approval that the shell could answer behind
+the worker's back. A worker whose process has ended is still classified as
+before: that is how its task becomes `Interrupted`, how a lost model call is
+accounted for, and why skipping every worker session outright was rejected.
+The registry decides rather than the supervisor because the guarantee belongs
+in the engine, where every caller of the classifier gets it, and the shell
+registers a worker before handing it anything to run, so there is no window in
+which a worker has a task and no entry.
+
 **Stop escalation** from the UI: `stop`; if the turn has not ended within 10
 seconds, `shutdown`; if the process has not exited 5 seconds later, `SIGTERM` to
 its registry PID. As built (`Supervisor::stop`), the shell asks `status`
