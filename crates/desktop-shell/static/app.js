@@ -303,6 +303,7 @@ function renderThreadHeader() {
   // From the last status, no request: this only keeps the folder's display
   // name (a project rename) and the bar's visibility current.
   renderRepoBar();
+  renderWorkerHeaderMeta();
 
   if (!repoPath) {
     sessionLine.textContent = "";
@@ -3867,6 +3868,7 @@ function clearSessionList() {
 }
 
 function clearChat() {
+  stopWorkerView();
   $("chat-log").innerHTML = "";
   sessionHasRecordedDiagnostics = false;
   // Every caller means "no conversation": a new, deleted or unselected
@@ -4472,8 +4474,13 @@ async function renderRecoveryPrompts(sessionId) {
   if (!sessionId) return;
   await loadRecoverySweep();
   if (sessionId !== currentSessionId) return;
+  // C5: a worker's turn is never resumed in the shell, whose sweep cannot tell
+  // a worker's live turn from a crashed one. Its strip offers *Restart worker*.
+  const resumable = !(workersEnabled && isWorkerSession(sessionId));
   const cards = [
-    ...recoveredTasks.filter((task) => task.sessionId === sessionId).map(createRecoveryCard),
+    ...recoveredTasks
+      .filter((task) => resumable && task.sessionId === sessionId)
+      .map(createRecoveryCard),
     ...reattachedApprovals
       .filter((approval) => approval.sessionId === sessionId)
       .map(createReattachedApprovalCard),
@@ -5115,6 +5122,12 @@ let workersEnabled = false;
 // any other, and a parent which workers it started.
 let workerRows = [];
 
+// The open worker's live state (§5.7 Worker session), or null when the open
+// session is not a worker, the setting is off or the board is showing. Only
+// while it is set do the control strip, the progress poll and the composer's
+// worker commands exist.
+let workerView = null;
+
 async function refreshWorkersEnabled() {
   let enabled = false;
   try {
@@ -5229,6 +5242,8 @@ async function openWorkerSessionAt(sessionId, { source = "", review = false } = 
   await loadSession(sessionId);
   renderProjectList();
   if (review) {
+    // The worker's approval card arrives with the view's first progress read.
+    await workerViewCaughtUp();
     const cards = $("chat-log").querySelectorAll(
       ".command-approval, .patch-preview, .recovery-card",
     );
@@ -6203,6 +6218,651 @@ function tickWorkersBoard() {
   renderWorkersBoardStatus();
 }
 
+// ---------------------------------------------------------------------------
+// The worker session (§5.7 Worker session): a control strip under the header,
+// a composer that talks to the worker, and its live progress. History is the
+// session log, drawn by `loadSession` as for any session. This adds only what
+// the worker is doing now, read from its progress file.
+// ---------------------------------------------------------------------------
+
+// `status` states that end a job: the turn finished, or it waits for approval.
+const WORKER_JOB_END_STATES = new Set(["idle", "waiting_for_approval"]);
+const WORKER_TURN_STATES = new Set(["running", "paused", "waiting_for_approval"]);
+
+const WORKER_VIEW_LABELS = {
+  running: ["running", "Running"],
+  paused: ["paused", "Paused"],
+  waiting_for_approval: ["needs-you", "Waiting for approval"],
+  idle: ["finished", "Idle"],
+  shutting_down: ["finished", "Stopping"],
+};
+
+// What the composer's button sends in each state (§5.7), with its label and
+// the field's placeholder.
+const WORKER_COMPOSER_MODES = {
+  running: ["note", "Send note", "Steer the worker: a note reaches it before its next round"],
+  paused: ["resume", "Resume with note", "Add a note: the worker reads it as it resumes"],
+  idle: ["message", "Send message", "Message the worker"],
+};
+
+// The composer as the page drew it, kept while a worker view borrows it.
+let composerDefaults = null;
+
+function workerViewActive(view) {
+  return Boolean(
+    view &&
+      view === workerView &&
+      workersEnabled &&
+      !workersBoardProject &&
+      view.sessionId === currentSessionId,
+  );
+}
+
+// Called last in `loadSession`: starts, keeps or ends the view for the session
+// now open. Reloading the same worker keeps its place in the progress file.
+function syncWorkerView() {
+  const sessionId = currentSessionId;
+  if (!workersEnabled || !sessionId || workersBoardProject || !isWorkerSession(sessionId)) {
+    stopWorkerView();
+    return;
+  }
+  if (workerView?.sessionId !== sessionId) {
+    stopWorkerView();
+    const row = workerRowFor(sessionId);
+    let resolveReady = () => {};
+    const ready = new Promise((resolve) => {
+      resolveReady = resolve;
+    });
+    workerView = {
+      sessionId,
+      after: 0,
+      caughtUp: false,
+      ready,
+      resolveReady,
+      alive: Boolean(row.alive),
+      state: row.alive ? row.state : "exited",
+      round: row.round ?? null,
+      maxRounds: row.maxRounds ?? null,
+      lastPhase: null,
+      plan: null,
+      approval: null,
+      liveText: "",
+      live: null,
+      pendingNotes: [],
+      turnError: "",
+      pollError: "",
+      sending: false,
+      inFlight: false,
+      timer: null,
+    };
+  } else {
+    // `renderMessages` cleared the log, and the live bubble went with it.
+    finishWorkerLive(workerView);
+  }
+  const view = workerView;
+  document.body.classList.add("worker-view");
+  if (view.caughtUp && view.alive && (view.state === "running" || view.state === "paused")) {
+    showWorkerLive(view);
+  }
+  renderWorkerView(view);
+  if (!view.inFlight && !view.timer) void pollWorkerProgress();
+}
+
+// Off, another session, a new one or the board: nothing of the view stays.
+function stopWorkerView() {
+  const view = workerView;
+  if (!view) return;
+  workerView = null;
+  clearTimeout(view.timer);
+  view.timer = null;
+  finishWorkerLive(view);
+  view.resolveReady();
+  document.body.classList.remove("worker-view");
+  document.querySelector(".worker-strip")?.remove();
+  renderWorkerHeaderMeta();
+  restoreComposerFromWorker();
+}
+
+// Resolves once the open worker's progress has been read, so *Review* finds
+// its approval card. A held shell (C10) does not hold *Review* for long.
+function workerViewCaughtUp() {
+  const view = workerView;
+  if (!view || view.caughtUp) return Promise.resolve();
+  return Promise.race([view.ready, new Promise((resolve) => setTimeout(resolve, 3000))]);
+}
+
+// C10, as the board does it: one request out at a time, the next a second
+// after the answer, no error for a slow answer, and nothing while the window
+// is hidden or once the view is left.
+async function pollWorkerProgress() {
+  const view = workerView;
+  if (!view) return;
+  clearTimeout(view.timer);
+  view.timer = null;
+  if (!workerViewActive(view)) {
+    stopWorkerView();
+    return;
+  }
+  if (view.inFlight || document.hidden) return;
+  view.inFlight = true;
+  try {
+    const answer = await api(
+      `/api/worker-progress?session=${encodeURIComponent(view.sessionId)}&after=${view.after}`,
+    );
+    view.pollError = "";
+    if (workerViewActive(view)) await applyWorkerProgress(view, answer);
+  } catch (error) {
+    view.pollError = error.message;
+  } finally {
+    view.inFlight = false;
+    if (!view.caughtUp) view.resolveReady();
+  }
+  if (!workerViewActive(view)) {
+    if (view === workerView) stopWorkerView();
+    return;
+  }
+  renderWorkerView(view);
+  // A restart starts the file again: read it at once from the start.
+  const delay = view.readNow ? 0 : 1000;
+  view.readNow = false;
+  view.timer = setTimeout(() => void pollWorkerProgress(), delay);
+}
+
+function pollWorkerProgressNow(view) {
+  if (view === workerView && !view.inFlight) void pollWorkerProgress();
+}
+
+document.addEventListener("visibilitychange", () => {
+  const view = workerView;
+  if (document.hidden || !view || view.inFlight || view.timer) return;
+  void pollWorkerProgress();
+});
+
+async function applyWorkerProgress(view, answer) {
+  // A restarted worker (§5.7) is a new process with a new progress file.
+  if (view.caughtUp && !view.alive && answer.alive) {
+    resetWorkerViewForRestart(view);
+    return;
+  }
+  // The first read catches up silently: what finished is already in the log.
+  const live = view.caughtUp;
+  let jobEnded = false;
+  for (const event of Array.isArray(answer.events) ? answer.events : []) {
+    view.after = Math.max(view.after, Number(event.seq) || 0);
+    const payload = event.payload || {};
+    if (event.kind === "status") {
+      const before = view.state;
+      view.state = payload.state || view.state;
+      if (view.state === "running" && before !== "paused" && before !== "running") {
+        // A new job: a turn, or the rest of one after an approval.
+        Object.assign(view, { liveText: "", plan: null, approval: null, lastPhase: null });
+        view.turnError = "";
+        if (live) {
+          finishWorkerLive(view);
+          showWorkerLive(view);
+        }
+      } else if (live && view.live && view.state !== before) {
+        view.live.indicator.phase({
+          phase: view.state,
+          label: WORKER_VIEW_LABELS[view.state]?.[1],
+        });
+      }
+      if (WORKER_JOB_END_STATES.has(view.state)) {
+        view.turnError = payload.error || "";
+        view.liveText = "";
+        view.plan = null;
+        if (live) {
+          finishWorkerLive(view);
+          jobEnded = true;
+        }
+      }
+    } else if (event.kind === "phase") {
+      view.lastPhase = payload;
+      if (Number.isFinite(payload.round)) view.round = payload.round;
+      if (Number.isFinite(payload.maxRounds)) view.maxRounds = payload.maxRounds;
+      if (live) showWorkerLive(view).indicator.phase(payload);
+    } else if (event.kind === "text") {
+      view.liveText += payload.text || "";
+      if (live) {
+        const { target, indicator } = showWorkerLive(view);
+        updateChatMessage(target, view.liveText);
+        indicator.streaming();
+      }
+    } else if (event.kind === "plan") {
+      view.plan = payload;
+      if (live) renderPlanPanel(showWorkerLive(view).target, payload);
+    } else if (event.kind === "approval") {
+      view.approval = payload;
+    } else if (event.kind === "note" && live) {
+      await showWorkerNote(view, payload.messageId);
+    }
+  }
+  const wasAlive = view.alive;
+  view.alive = Boolean(answer.alive);
+  if (!view.caughtUp) {
+    view.caughtUp = true;
+    if (view.alive && (view.state === "running" || view.state === "paused")) showWorkerLive(view);
+    renderWorkerView(view);
+    view.resolveReady();
+    return;
+  }
+  // Its process ended: the log and the row (C5) say how it was left.
+  if (wasAlive && !view.alive) {
+    finishWorkerLive(view);
+    jobEnded = true;
+  }
+  // The finished turn is in the session log now, so the log is drawn again,
+  // as the shell does after a turn of its own.
+  if (jobEnded) await loadSession(view.sessionId);
+}
+
+function resetWorkerViewForRestart(view) {
+  finishWorkerLive(view);
+  Object.assign(view, {
+    after: 0,
+    alive: true,
+    state: "idle",
+    round: null,
+    maxRounds: null,
+    lastPhase: null,
+    plan: null,
+    approval: null,
+    liveText: "",
+    turnError: "",
+    pendingNotes: [],
+    readNow: true,
+  });
+}
+
+// The running turn's bubble: its text so far and the phase it is in.
+function showWorkerLive(view) {
+  if (view.live) return view.live;
+  const target = appendChatMessage("assistant", "");
+  const indicator = startTurnIndicator(target);
+  view.live = { target, indicator };
+  if (view.lastPhase) indicator.phase(view.lastPhase);
+  if (view.liveText) {
+    updateChatMessage(target, view.liveText);
+    indicator.streaming();
+  }
+  if (view.state === "paused") indicator.phase({ phase: "paused", label: "Paused" });
+  if (view.plan) renderPlanPanel(target, view.plan);
+  return view.live;
+}
+
+function finishWorkerLive(view) {
+  if (!view.live) return;
+  view.live.indicator.finish("complete");
+  view.live = null;
+}
+
+// §5.4: a note joins the conversation as a user message at the round boundary.
+// The text streamed before it stays above it; the next round gets a new bubble.
+async function showWorkerNote(view, messageId) {
+  if (view.live && !view.liveText.trim()) view.live.target.message.remove();
+  finishWorkerLive(view);
+  view.liveText = "";
+  let text = view.pendingNotes.shift();
+  if (text === undefined) {
+    try {
+      const payload = await api(`/api/session?session_id=${encodeURIComponent(view.sessionId)}`);
+      text = (payload.messages || []).find((message) => message.id === messageId)?.content;
+    } catch {
+      // The log has it; the next reload draws it.
+    }
+  }
+  if (workerViewActive(view) && text) appendChatMessage("user", text);
+}
+
+function workerViewStatus(view) {
+  if (!view.alive) {
+    const unfinished =
+      workerRowFor(view.sessionId)?.taskStatus === "interrupted" ||
+      WORKER_TURN_STATES.has(view.state);
+    return unfinished
+      ? { dot: "failed", label: "Interrupted", ended: true }
+      : { dot: "finished", label: "Ended", ended: true };
+  }
+  const [dot, label] = WORKER_VIEW_LABELS[view.state] || ["finished", "Idle"];
+  return { dot, label, ended: false };
+}
+
+function workerViewRow(view) {
+  const row = workerRowFor(view.sessionId) || findProjectWorkerRow(view.sessionId) || {};
+  return {
+    ...row,
+    sessionId: view.sessionId,
+    title: row.title || "this worker",
+    state: view.state,
+  };
+}
+
+function workerViewSource(view) {
+  return workerSourceOf(workerViewRow(view).worktree || "") || repo();
+}
+
+function renderWorkerView(view) {
+  if (!workerViewActive(view)) return;
+  renderWorkerStrip(view);
+  renderWorkerComposer(view);
+  renderWorkerApproval(view);
+  renderWorkerHeaderMeta();
+}
+
+// "from ‹parent›" and the branch, under the session title (§5.7).
+function renderWorkerHeaderMeta() {
+  const identity = document.querySelector(".thread-identity");
+  if (!identity) return;
+  let meta = identity.querySelector(".thread-worker-meta");
+  const view = workerView;
+  const row =
+    view && !workersBoardProject && view.sessionId === currentSessionId
+      ? workerRowFor(view.sessionId)
+      : null;
+  if (!row) {
+    meta?.remove();
+    return;
+  }
+  if (!meta) {
+    meta = document.createElement("p");
+    meta.className = "thread-worker-meta";
+    identity.append(meta);
+  }
+  const parts = [];
+  if (row.parentTitle) {
+    const parent = document.createElement("em");
+    parent.textContent = row.parentTitle;
+    parts.push(document.createTextNode("from "), parent, document.createTextNode(" · "));
+  }
+  const branch = document.createElement("code");
+  branch.textContent = row.branch;
+  parts.push(branch);
+  meta.replaceChildren(...parts);
+  meta.title = row.parentTitle
+    ? `Worker from ${row.parentTitle}, on ${row.branch}`
+    : `Worker on ${row.branch}`;
+}
+
+function workerStripButton(label, className, run) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.textContent = label;
+  button.addEventListener("click", runSessionAction(run));
+  return button;
+}
+
+// Status pill, `Round r/max` with a bar, and the controls for the state:
+// *Pause* and *Stop* while running, *Resume* and *Stop* while paused, *Stop*
+// while waiting (§5.7). *Stop* also ends an idle worker, as on the board.
+function renderWorkerStrip(view) {
+  const top = document.querySelector(".thread-top");
+  let strip = top.querySelector(".worker-strip");
+  if (!strip) {
+    strip = document.createElement("div");
+    strip.className = "worker-strip";
+    strip.setAttribute("role", "region");
+    strip.setAttribute("aria-label", "Worker controls");
+    top.querySelector(".thread-header").after(strip);
+  }
+  const status = workerViewStatus(view);
+  const note = view.pollError
+    ? `Could not refresh: ${view.pollError}`
+    : view.turnError
+      ? `Last turn failed: ${view.turnError}`
+      : "";
+  const signature = JSON.stringify([status, view.state, view.round, view.maxRounds, note]);
+  // Redrawn only when it changed, so a focused button is not replaced each second.
+  if (strip.dataset.signature === signature) return;
+  strip.dataset.signature = signature;
+
+  const pill = document.createElement("span");
+  pill.className = "worker-pill";
+  pill.dataset.state = status.dot;
+  const dot = document.createElement("span");
+  dot.className = "worker-dot";
+  dot.dataset.state = status.dot;
+  dot.setAttribute("aria-hidden", "true");
+  pill.append(dot, document.createTextNode(status.label));
+
+  const round = document.createElement("span");
+  round.className = "worker-round";
+  const bar = document.createElement("span");
+  bar.className = "workers-rounds-bar";
+  bar.setAttribute("aria-hidden", "true");
+  const fill = document.createElement("span");
+  const known =
+    Number.isFinite(view.round) && Number.isFinite(view.maxRounds) && view.maxRounds > 0;
+  fill.style.width = known ? `${Math.min(100, (view.round / view.maxRounds) * 100)}%` : "0%";
+  bar.append(fill);
+  round.append(
+    bar,
+    document.createTextNode(known ? `Round ${view.round}/${view.maxRounds}` : "Round —"),
+  );
+
+  const parts = [pill, round];
+  if (note) {
+    const text = document.createElement("span");
+    text.className = "worker-strip-note";
+    text.textContent = note;
+    text.title = note;
+    parts.push(text);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "inline-actions worker-strip-actions";
+  const row = () => workerViewRow(view);
+  const after = () => pollWorkerProgressNow(view);
+  if (status.ended) {
+    actions.append(
+      workerStripButton("Restart worker", "btn-sm", () => restartWorkerFromView(view)),
+    );
+  } else {
+    if (view.state === "running") {
+      actions.append(
+        workerStripButton("Pause", "btn-sm", async () => {
+          await pauseWorker(row(), workerViewSource(view));
+          after();
+        }),
+      );
+    }
+    if (view.state === "paused") {
+      actions.append(
+        workerStripButton("Resume", "btn-sm btn-primary", async () => {
+          await api("/api/worker-control", form({ session_id: view.sessionId, command: "resume" }));
+          after();
+        }),
+      );
+    }
+    if (view.state !== "shutting_down") {
+      actions.append(
+        workerStripButton("Stop", "btn-sm btn-danger", async () => {
+          await stopWorker(row(), workerViewSource(view));
+          after();
+        }),
+      );
+    }
+  }
+  parts.push(actions);
+  strip.replaceChildren(...parts);
+}
+
+// *Restart worker* (§5.7): a new, idle process for the same session and
+// worktree. A pending approval belonged to the old process and is not handed
+// to the new one (Task 7), so the command it asked about did not run.
+async function restartWorkerFromView(view) {
+  const wasWaiting = view.state === "waiting_for_approval";
+  await api("/api/worker-restart", form({ session_id: view.sessionId }));
+  resetWorkerViewForRestart(view);
+  toast(
+    wasWaiting
+      ? "Worker restarted. The approval it was waiting for ended with its old process, so that command did not run. Send a message to continue."
+      : "Worker restarted. Send it a message to continue.",
+  );
+  refreshWorkersAfterAction(workerViewSource(view));
+  renderWorkerView(view);
+  pollWorkerProgressNow(view);
+}
+
+function workerComposerMode(view) {
+  if (!view.alive || view.sending) return null;
+  return WORKER_COMPOSER_MODES[view.state] || null;
+}
+
+// The composer sends a note while running, a resume with a note while paused
+// and a message when idle, and says which on its button. It is disabled while
+// the worker waits for approval (notes are refused then) and once it ended.
+function renderWorkerComposer(view) {
+  const button = $("ask-btn");
+  const field = $("chat-prompt");
+  if (!composerDefaults) {
+    composerDefaults = { placeholder: field.placeholder, content: [...button.childNodes] };
+  }
+  const mode = workerComposerMode(view);
+  let placeholder = mode?.[2];
+  if (!mode && !view.sending) {
+    if (workerViewStatus(view).ended) {
+      placeholder = "This worker's process has ended. Restart it to continue.";
+    } else if (view.state === "waiting_for_approval") {
+      placeholder = "Approve or reject the proposal above first. A waiting worker takes no notes.";
+    } else {
+      placeholder = "The worker is stopping.";
+    }
+  }
+  const label = mode?.[1] || "Send";
+  button.classList.add("is-worker-command");
+  if (button.textContent !== label) button.textContent = label;
+  button.setAttribute("aria-label", label);
+  button.disabled = !mode;
+  field.disabled = !mode && !view.sending;
+  if (placeholder) field.placeholder = placeholder;
+}
+
+function restoreComposerFromWorker() {
+  if (!composerDefaults) return;
+  const button = $("ask-btn");
+  const field = $("chat-prompt");
+  button.classList.remove("is-worker-command");
+  button.replaceChildren(...composerDefaults.content);
+  button.setAttribute("aria-label", "Send message");
+  button.disabled = false;
+  field.disabled = false;
+  field.placeholder = composerDefaults.placeholder;
+  composerDefaults = null;
+}
+
+// Requirement 4: every word to a worker goes through `/api/worker-control`.
+async function sendWorkerComposer(override = "") {
+  const view = workerView;
+  const mode = view && workerComposerMode(view);
+  if (!mode) return;
+  const field = $("chat-prompt");
+  const text = (override || field.value).trim();
+  if (!text) {
+    toast(mode[0] === "message" ? "Write a message first" : "Write a note first");
+    return;
+  }
+  const fields = { session_id: view.sessionId, command: mode[0] };
+  if (mode[0] === "resume") fields.note = text;
+  else fields.text = text;
+  view.sending = true;
+  renderWorkerComposer(view);
+  try {
+    await api("/api/worker-control", form(fields));
+    if (!override) {
+      field.value = "";
+      autoGrowPrompt();
+    }
+    if (mode[0] === "message") {
+      // The worker writes it to the log as its turn starts; drawn now so it
+      // does not wait for the next read.
+      appendChatMessage("user", text);
+      Object.assign(view, { state: "running", liveText: "", plan: null, approval: null });
+      Object.assign(view, { lastPhase: null, turnError: "" });
+      renderWorkerApproval(view);
+      showWorkerLive(view);
+    } else {
+      view.pendingNotes.push(text);
+      toast(
+        mode[0] === "note"
+          ? "Note queued. The worker reads it before its next round."
+          : "Resuming. The worker reads your note before its next round.",
+      );
+    }
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    view.sending = false;
+    if (view === workerView) {
+      renderWorkerView(view);
+      pollWorkerProgressNow(view);
+    }
+  }
+}
+
+// Which proposal the open worker shows a card for. A command or plan waits in
+// the live process, so it shows only while that process waits; a patch or a
+// provider-fallback offer ended the turn and is answered through the shell's
+// own routes with the worktree as `repo` (§5.6), until the next job starts.
+function workerApprovalToShow(view) {
+  const approval = view.approval;
+  if (!view.caughtUp || !approval?.proposal) return null;
+  if (approval.kind === "command" || approval.kind === "plan") {
+    return view.alive && view.state === "waiting_for_approval" ? approval : null;
+  }
+  if (approval.kind === "patch" || approval.kind === "fallback") {
+    return view.state === "idle" ? approval : null;
+  }
+  return null;
+}
+
+// The shell's own cards, consent content in full (style guide §5). Only where
+// the decision goes differs: a command or plan to the worker.
+function renderWorkerApproval(view) {
+  const log = $("chat-log");
+  const shown = log.querySelector("[data-worker-approval]");
+  const approval = workerApprovalToShow(view);
+  const proposal = approval?.proposal || {};
+  const key = approval
+    ? `${view.sessionId}\n${approval.kind}\n${proposal.proposalId || proposal.patchId || ""}`
+    : "";
+  if (shown && shown.dataset.workerApproval === key) return;
+  shown?.remove();
+  if (!approval) return;
+  const worktree = workerViewRow(view).worktree || "";
+  const decide = (approved) => decideWorkerApproval(view, proposal, approved);
+  const card =
+    approval.kind === "command"
+      ? createCommandApprovalPreview(proposal, worktree, { decide })
+      : approval.kind === "plan"
+        ? createPlanReview(proposal, worktree, { decide })
+        : approval.kind === "patch"
+          ? createPatchPreview(proposal, worktree)
+          : createFallbackOffer(proposal, worktree);
+  card.dataset.workerApproval = key;
+  // Beside the last answer's body, not in it: the body is re-rendered once
+  // its markdown is finalized, which would take the card with it.
+  const answers = log.querySelectorAll(".message.assistant");
+  const host = answers[answers.length - 1];
+  if (host) host.append(card);
+  else log.append(card);
+}
+
+async function decideWorkerApproval(view, proposal, approved) {
+  await api(
+    "/api/worker-control",
+    form({
+      session_id: view.sessionId,
+      command: approved ? "approve" : "reject",
+      proposal_id: proposal.proposalId,
+    }),
+  );
+  pollWorkerProgressNow(view);
+  return approved
+    ? "Approved. The worker continues its turn in its own process."
+    : "Rejected. The worker continues its turn without it.";
+}
+
 // A cost that rounds to zero is shown as a bound, never as `$0.0000`: a real
 // charge displayed as zero reads as "this turn was free", which is the one
 // thing token accounting exists to stop saying. An actual zero is still zero.
@@ -6896,7 +7556,9 @@ let findingsPanelOpen = false;
 
 async function refreshFindings() {
   const sessionId = currentSessionId;
-  const repoPath = repo();
+  // A worker opened under its source project keeps its findings in its
+  // worktree, the repository its session belongs to (spec 57 §5.7).
+  const repoPath = (workersEnabled && workerRowFor(sessionId)?.worktree) || repo();
   if (!sessionId || !repoPath) {
     sessionFindings = [];
   } else {
@@ -7910,10 +8572,17 @@ function createFallbackOffer(proposal, proposalRepo) {
 // evidence is tied to a state of the repository, and the engine refuses to
 // delete one, so offering the control would be offering something that does
 // not work.
-function createPlanReview(proposal, proposalRepo) {
+//
+// `decide` is for a worker's plan (spec 57 §5.6), as on the command card. The
+// worker's `approve` takes no revision, so its steps are shown, not edited.
+function createPlanReview(proposal, proposalRepo, { decide: decideInWorker = null } = {}) {
   const plan = proposal.plan || { steps: [] };
-  const editable = (plan.steps || []).filter((step) => step.outcome === "outstanding");
-  const settled = (plan.steps || []).filter((step) => step.outcome !== "outstanding");
+  const editable = decideInWorker
+    ? []
+    : (plan.steps || []).filter((step) => step.outcome === "outstanding");
+  const settled = decideInWorker
+    ? plan.steps || []
+    : (plan.steps || []).filter((step) => step.outcome !== "outstanding");
   let steps = editable.map((step) => ({ id: step.id, title: step.title }));
 
   const wrapper = document.createElement("div");
@@ -7931,9 +8600,11 @@ function createPlanReview(proposal, proposalRepo) {
 
   const note = document.createElement("p");
   note.className = "plan-review-note";
-  note.textContent = settled.length
-    ? `Nothing has changed yet. ${settled.length === 1 ? "One step has" : `${settled.length} steps have`} already finished and cannot be removed.`
-    : "Nothing has changed yet. Adjust the steps or approve them as they stand.";
+  note.textContent = decideInWorker
+    ? "Nothing has changed yet. Approve the steps as they stand, or decline them."
+    : settled.length
+      ? `Nothing has changed yet. ${settled.length === 1 ? "One step has" : `${settled.length} steps have`} already finished and cannot be removed.`
+      : "Nothing has changed yet. Adjust the steps or approve them as they stand.";
 
   const list = document.createElement("ol");
   list.className = "plan-review-list";
@@ -8039,6 +8710,18 @@ function createPlanReview(proposal, proposalRepo) {
     });
     output.hidden = false;
     output.textContent = approved ? "Continuing…" : "Declining…";
+
+    if (decideInWorker) {
+      try {
+        output.textContent = await decideInWorker(approved);
+      } catch (error) {
+        approveButton.disabled = false;
+        declineButton.disabled = false;
+        output.textContent = error.message;
+        throw error;
+      }
+      return;
+    }
 
     const revision = approved ? revisionOrNull() : null;
     const assistantMessage = appendChatMessage("assistant", "");
@@ -8480,10 +9163,14 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
 // `detached` is for a proposal reattached after a crash: the same card, but
 // the turn that raised it is gone, so approving runs the stored proposal on its
 // own rather than resuming a chat turn. See docs/specs/45_crash_recovery_prompt.md §5.7.
+//
+// `decide` is for a worker's proposal (spec 57 §5.6): the turn waits in the
+// worker's process, so the decision goes to it and the card only reports what
+// was sent. It resolves to the line the card shows.
 function createCommandApprovalPreview(
   proposal,
   proposalRepo,
-  { detached = false, onResolved = null } = {},
+  { detached = false, onResolved = null, decide = null } = {},
 ) {
   const isBrowserDiagnostic =
     proposal.allowBrowserDiagnosticsForSession || (proposal.risk || "").startsWith("browser");
@@ -8561,15 +9248,16 @@ function createCommandApprovalPreview(
   // (spec 12). The server decides eligibility — blocked commands, shell-control
   // syntax and `require_approval_for_all_commands` all rule out the allowlist
   // path — so an item is offered only when the proposal says it may be.
+  // A worker's `approve` carries no grant, so a worker's card offers none.
   const menuItems = [];
-  if (proposal.allowAlways) {
+  if (proposal.allowAlways && !decide) {
     menuItems.push({
       label: "Always allow in this project",
       hint: "Adds to the allowlist — persists after this turn",
       onSelect: () => runWithGrant({ always: true }, "Command allowed for this project"),
     });
   }
-  if (proposal.allowBrowserDiagnosticsForSession) {
+  if (proposal.allowBrowserDiagnosticsForSession && !decide) {
     menuItems.push({
       label: "Allow for this session",
       hint: "Browser diagnostics only, until this session ends",
@@ -8644,6 +9332,11 @@ function createCommandApprovalPreview(
       await loadSessions(currentSessionId, false);
       await refreshFindings();
       void refreshRepoBar();
+      return;
+    }
+
+    if (decide) {
+      output.textContent = await decide(approved);
       return;
     }
 
@@ -8754,7 +9447,7 @@ function createCommandApprovalPreview(
   runButton.addEventListener("click", async () => {
     try {
       await resolveCommandProposal(true);
-      toast("Command completed");
+      toast(decide ? "Command approved" : "Command completed");
     } catch (error) {
       restoreActions();
       output.textContent = error.message;
@@ -8839,6 +9532,8 @@ async function loadSession(sessionId) {
   // After the conversation, because `renderMessages` clears the log and the
   // cards sit above what it renders.
   await renderRecoveryPrompts(currentSessionId);
+  // Last: the strip and a worker's approval card follow what was just drawn.
+  syncWorkerView();
 }
 
 async function streamChatRequest(data, handlers, signal) {
@@ -9286,6 +9981,12 @@ async function sendChatPrompt(options = {}) {
   let prompt = "";
   const promptOverride = (options.prompt || "").trim();
   const restoreSubmittedPrompt = options.restorePrompt !== false && !promptOverride;
+  // A worker's turns run in its own process (requirement 4): its composer
+  // talks to the worker, never to the shell's turn routes.
+  if (workerView) {
+    await sendWorkerComposer(promptOverride);
+    return;
+  }
   if (chatSubmitting) return;
   try {
     prompt = promptOverride || $("chat-prompt").value.trim();

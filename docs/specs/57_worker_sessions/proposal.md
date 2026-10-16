@@ -1,6 +1,6 @@
 # Feature Spec: Worker Sessions
 
-Status: In progress (Tasks 1–9 of 11 done, 2026-10-07, 2026-10-09, 2026-10-09, 2026-10-12, 2026-10-12, 2026-10-15, 2026-10-15, 2026-10-16 and 2026-10-16; see [`tasks.md`](tasks.md))
+Status: In progress (Tasks 1–10 of 11 done, 2026-10-07, 2026-10-09, 2026-10-09, 2026-10-12, 2026-10-12, 2026-10-15, 2026-10-15, 2026-10-16, 2026-10-16 and 2026-10-16; see [`tasks.md`](tasks.md))
 Order: 57 of 57
 Plan: none. An exception to the graduation rule, like #41–#44 and #47: it came
 from describing how this repository is actually built — a planner session that
@@ -601,6 +601,62 @@ As built (Task 9), with no new route:
 - A worker whose process has ended unfinished shows *Restart worker*, which
   starts a new process for the same session and worktree (refused if another
   live worker holds it). Its composer is disabled until then.
+
+As built (Task 10), with no new route:
+
+- **Strip.** It sits under the header while the open session is a worker and
+  the setting is on, and is removed otherwise. Its state comes from the
+  progress file's `status` lines and the route's `alive`, its round from the
+  last `phase` line ("Round —" until one arrives). *Stop* also shows for an
+  idle worker and sends `shutdown` there, as on the board (Task 9), and
+  confirms first. A worker whose process ended shows *Interrupted* when it
+  ended mid-turn (the row's `taskStatus`, C5) and *Ended* otherwise. Both
+  offer *Restart worker*, because no other control can bring an ended
+  worker back to take a message; it is not filled, as *Resume* stays the
+  strip's one primary.
+- **Composer.** Its round send button becomes a labelled one (*Send note*,
+  *Resume with note*, *Send message*), and the attach menu and model choice
+  step aside, because a worker takes the configured provider and model and
+  its messages carry text only. While the worker waits for approval, is
+  stopping or has ended, the field and the button are disabled and the
+  placeholder says why. `sendChatPrompt` hands everything to the worker
+  while its view is open, so no path from the worker view reaches the
+  shell's turn routes.
+- **Live progress.** The poll follows the board's C10 rules: one request
+  out, the next a second after the answer, nothing while the window is
+  hidden, and it ends when another session, a new one, the board or the
+  setting going off replaces the view. A slow answer shows nothing; a
+  failed one says "Could not refresh". The first read catches up silently,
+  because what finished is already in the log. After that, a running turn
+  draws one assistant bubble with the shell's turn indicator, fed by
+  `phase`, `text` and `plan` lines. A `note` line closes that bubble and adds
+  the note as a user message, then the next round gets a new bubble. When a
+  job ends (`idle` or `waiting_for_approval`) or the process exits, the
+  conversation is drawn again from the session log, as the shell does after
+  a turn of its own.
+- **Approvals.** The worker's card is the shell's own: a command shows
+  `createCommandApprovalPreview`, a plan shows `createPlanReview`, with
+  consent content in full. A `decide` option sends the decision to
+  `/api/worker-control` (`approve`/`reject` with `proposal_id`) instead of
+  the shell's resume routes. Without it the cards are unchanged. Because the
+  worker's `approve` carries no grant or step revision, the command card
+  offers no "always allow" overflow and the plan's steps are shown, not
+  edited. A command or plan card shows only while the live process waits.
+  A patch or fallback offer shows the shell's card unchanged, with the
+  worktree as `repo`, while the worker is idle after that turn. The card
+  sits beside the last answer's body, so *Review* on the board finds it;
+  *Review* waits for the view's first read (at most 3 s).
+- **Recovery.** The shell's crash-recovery card is not shown for a worker
+  session: its *Resume* would continue the worker's turn in the shell, which
+  C5 rules out, and the strip's *Restart worker* takes its place. Findings
+  for a worker are read with its worktree as `repo`.
+- **Restart.** A restarted worker is idle, with a new progress file. When the
+  old process was waiting for approval, the toast says that approval ended
+  with it and its command did not run (Task 7), and the card is gone.
+- **Setting off.** Workers show as ordinary sessions: no strip, no header
+  line, no poll, and the composer as it was. Whether `stop` and `shutdown`
+  should still be accepted by the shell while the setting is off remains
+  open (Task 7). With it off the UI offers no worker controls at all.
 
 **Parent session.** Prompt blocks carry *Start worker* (§5.1). Once a block has
 been used, its footer also shows "Started *‹worker title›* →", linking to the
