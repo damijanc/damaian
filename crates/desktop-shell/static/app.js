@@ -241,6 +241,9 @@ function startBootstrap() {
       apiToken = token;
       setDesktopApiBanner(null);
       if (!chatSubmitting) $("ask-btn").disabled = false;
+      // Before the first session renders, so its messages are drawn once with
+      // the setting already known.
+      await refreshWorkersEnabled();
       loadProjectState();
       const lastRepo = localStorage.getItem(lastRepoStorageKey);
       if (lastRepo) {
@@ -307,7 +310,9 @@ function renderThreadHeader() {
     return;
   }
 
-  const session = currentSession();
+  // A worker opened from its parent is not in this project's session list:
+  // its sessions are keyed by its worktree (spec 57 §5.7).
+  const session = currentSession() || workerRowFor(currentSessionId);
   sessionLine.textContent = session ? session.title : "New session";
   if (session) sessionLine.title = session.title;
   else sessionLine.removeAttribute("title");
@@ -3760,6 +3765,9 @@ async function loadConfigFile() {
   syncModelKeyAccountFromConfig(payload.content);
   renderConfigPolicy(payload);
   $("config-path").textContent = payload.exists ? payload.path : `${payload.path} (new)`;
+  // The toggle writes through the editor's content, so it stays off until
+  // that content is the file's: saving an empty editor would empty the file.
+  $("worker-sessions-input").disabled = false;
   void refreshModelKeyStatus().catch((error) => setModelKeyStatus(error.message, "error"));
   return payload;
 }
@@ -3780,6 +3788,9 @@ async function saveConfigFile() {
   $("config-path").textContent = payload.path;
   syncModelKeyAccountFromConfig($("config-editor").value);
   void refreshModelKeyStatus().catch((error) => setModelKeyStatus(error.message, "error"));
+  // Any save can change it, the raw editor's included; the route reports the
+  // effective value.
+  await refreshWorkersEnabled();
   return payload;
 }
 
@@ -4202,6 +4213,9 @@ function renderChatMessageError(target, error) {
 // from history) since it replaces the bubble's entire innerHTML.
 async function finalizeChatMessage(target, content) {
   const chatRepo = repo();
+  // Read before the render request: the session may change while it is out,
+  // and a block's parent is the session that holds the message.
+  const sessionId = currentSessionId;
   try {
     const payload = await api("/api/render-markdown", form({ content, repo: chatRepo || "" }));
     target.body.innerHTML = payload.html;
@@ -4210,6 +4224,9 @@ async function finalizeChatMessage(target, content) {
   }
   appendWebDiagnosticArtifacts(target.body, content);
   wireFileReferences(target.body, chatRepo);
+  // Only here, never in `updateChatMessage`: a block still streaming can
+  // change under the button (spec 57 C8).
+  attachWorkerPromptActions(target, sessionId);
   $("chat-log").scrollTop = $("chat-log").scrollHeight;
 }
 
@@ -4298,6 +4315,8 @@ function wireFileReferences(container, chatRepo) {
 
 // `tasks` carries each task's final status so a stopped turn stays marked as
 // one on reload. Without it a truncated answer renders as a complete short one.
+// Returns each message with its bubble, in order, for entries placed between
+// them afterwards.
 function renderMessages(messages, tasks = []) {
   $("chat-log").innerHTML = "";
   const cancelledTasks = new Set(
@@ -4337,7 +4356,7 @@ function renderMessages(messages, tasks = []) {
   const usageByTask = new Map(
     tasks.filter((task) => typeof task.inputTokens === "number").map((task) => [task.id, task]),
   );
-  messages.forEach((message) => {
+  return messages.map((message) => {
     const bubble = appendChatMessage(message.role, message.content);
     if (message.seq) bubble.message.dataset.seq = message.seq;
     if (message.role === "user") {
@@ -4363,6 +4382,7 @@ function renderMessages(messages, tasks = []) {
       }
       if (message.taskId) markMessageUsage(bubble, usageByTask.get(message.taskId));
     }
+    return { message, bubble };
   });
 }
 
@@ -5055,6 +5075,374 @@ function showRewindDialog(checkpoint) {
     backdrop.querySelector(".app-dialog-cancel").addEventListener("click", () => cleanup(null));
     document.addEventListener("keydown", onKeydown, true);
     backdrop.querySelector(".app-dialog-confirm").focus();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Worker sessions (docs/specs/57_worker_sessions/proposal.md §5.1, §5.7)
+// ---------------------------------------------------------------------------
+
+// `enable_worker_sessions`, as `GET /api/workers-enabled` reports it. While
+// false nothing below draws anything (requirement 1).
+let workersEnabled = false;
+
+// `GET /api/workers` rows for the open project, and for the worktree's source
+// when the open folder is a worker's worktree. They tell a worker session from
+// any other, and a parent which workers it started.
+let workerRows = [];
+
+async function refreshWorkersEnabled() {
+  let enabled = false;
+  try {
+    enabled = Boolean((await api("/api/workers-enabled")).enabled);
+  } catch {
+    // Unknown reads as off: an entry point must not appear on a guess.
+  }
+  const changed = enabled !== workersEnabled;
+  workersEnabled = enabled;
+  $("worker-sessions-input").checked = enabled;
+  // Redraw the open conversation so its blocks gain or lose the action. Not
+  // during a turn: the next load redraws it anyway.
+  if (changed && currentSessionId && !chatSubmitting) {
+    void loadSession(currentSessionId).catch((error) => toast(error.message));
+  }
+}
+
+// C9: written the way the MCP form writes, through the editor's content.
+async function saveWorkerSessionsSetting(enabled) {
+  $("config-editor").value = upsertConfigValue(
+    $("config-editor").value,
+    "enable_worker_sessions",
+    enabled ? "true" : "false",
+  );
+  await saveConfigFile();
+  if (workersEnabled !== enabled) {
+    throw new Error("Saved, but another configuration file overrides Worker sessions.");
+  }
+}
+
+// §5.1 Naming: a worktree lives at `<source>/.damaian/worktrees/<slug>`.
+function workerSourceOf(repoPath) {
+  const match = /^(.+)\/\.damaian\/worktrees\/[^/]+$/.exec(normalizeProjectPath(repoPath));
+  return match ? match[1] : "";
+}
+
+async function refreshWorkerIndex() {
+  workerRows = [];
+  const repoPath = repo();
+  if (!workersEnabled || !repoPath) return;
+  const sources = [...new Set([repoPath, workerSourceOf(repoPath)].filter(Boolean))];
+  const answers = await Promise.all(
+    sources.map((source) =>
+      api(`/api/workers?repo=${encodeURIComponent(source)}`).catch(() => ({ workers: [] })),
+    ),
+  );
+  const seen = new Set();
+  answers.forEach((answer) => {
+    (answer.workers || []).forEach((row) => {
+      if (seen.has(row.sessionId)) return;
+      seen.add(row.sessionId);
+      workerRows.push(row);
+    });
+  });
+}
+
+function workerRowFor(sessionId) {
+  return (sessionId && workerRows.find((row) => row.sessionId === sessionId)) || null;
+}
+
+// Workers do not start workers (§5.1 Entry points).
+function isWorkerSession(sessionId) {
+  return Boolean(workerRowFor(sessionId));
+}
+
+function workerChildrenOf(parentSessionId) {
+  return workerRows
+    .filter((row) => parentSessionId && row.parentSessionId === parentSessionId)
+    .sort((a, b) => a.createdAtMs - b.createdAtMs);
+}
+
+// The shell's `worker_title`: the first non-blank line, at most 80 characters.
+// How a block is matched to the worker it started once the page reloads.
+function workerTitleOf(prompt) {
+  const line = String(prompt || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .find(Boolean);
+  return line ? Array.from(line).slice(0, 80).join("") : "Worker";
+}
+
+// The block's text as written. Both renderers keep the content's own lines;
+// the server's highlighter also keeps the newline that ended the last one.
+function workerPromptText(code) {
+  return code.textContent.replace(/\n$/, "");
+}
+
+// Opens a worker's conversation. Its sidebar place is Task 9's; until then
+// the conversation opens here, and the shell refuses a turn sent to it from
+// this folder, because the session belongs to the worktree.
+function openWorkerSession(sessionId) {
+  void loadSession(sessionId).catch((error) => toast(error.message));
+}
+
+function createWorkerLink(row, text) {
+  const link = document.createElement("button");
+  link.type = "button";
+  link.className = "worker-link";
+  const title = document.createElement("em");
+  title.textContent = row.title;
+  link.append(document.createTextNode(`${text} `), title, document.createTextNode(" →"));
+  link.addEventListener("click", () => openWorkerSession(row.sessionId));
+  return link;
+}
+
+// C8: assistant messages only, and only a block whose class is exactly
+// `language-worker-prompt`: the server writes the fence's info string into the
+// class verbatim, so `worker-prompt extra` arrives as a different class.
+function attachWorkerPromptActions(target, sessionId) {
+  if (!workersEnabled || !sessionId || isWorkerSession(sessionId)) return;
+  if (!target.message?.classList.contains("assistant")) return;
+  target.body.querySelectorAll("pre > code").forEach((code) => {
+    if (code.className !== "language-worker-prompt") return;
+    const pre = code.parentElement;
+    if (pre.nextElementSibling?.classList.contains("worker-prompt-footer")) return;
+    const prompt = workerPromptText(code);
+    const footer = document.createElement("div");
+    footer.className = "worker-prompt-footer";
+    const start = document.createElement("button");
+    start.type = "button";
+    start.className = "btn-sm";
+    start.textContent = "Start worker";
+    start.addEventListener("click", async () => {
+      const started = await showNewWorkerDialog({ prompt, parentSessionId: sessionId });
+      if (!started) return;
+      footer.append(createWorkerLink(started, "Started"));
+      appendSpawnedWorkerEntry(target.message, started);
+    });
+    footer.append(start);
+    // A used block says so, so a second click is a deliberate second worker.
+    const title = workerTitleOf(prompt);
+    (startedWorkersByMessage.get(target.message) || [])
+      .filter((row) => row.title === title)
+      .forEach((row) => {
+        footer.append(createWorkerLink(row, "Started"));
+      });
+    pre.after(footer);
+  });
+}
+
+function spawnedWorkerEntry(row) {
+  const entry = document.createElement("p");
+  entry.className = "worker-spawned-entry";
+  entry.append(createWorkerLink(row, "Spawned worker"));
+  return entry;
+}
+
+// After the message, and after any entries already following it.
+function appendSpawnedWorkerEntry(messageEl, row) {
+  let anchor = messageEl;
+  while (anchor.nextElementSibling?.classList.contains("worker-spawned-entry")) {
+    anchor = anchor.nextElementSibling;
+  }
+  anchor.after(spawnedWorkerEntry(row));
+}
+
+// Which workers each rendered message started, for its blocks' "Started"
+// links. Set on reload, before the messages' async finalize attaches them.
+let startedWorkersByMessage = new WeakMap();
+
+// The titles of a message's `worker-prompt` blocks. The client renderer keeps
+// the exact tag and the block's lines as the server's does, and answers at once.
+function workerPromptTitles(content) {
+  const scratch = document.createElement("div");
+  scratch.innerHTML = renderMarkdown(content);
+  return [...scratch.querySelectorAll("pre > code")]
+    .filter((code) => code.className === "language-worker-prompt")
+    .map((code) => workerTitleOf(workerPromptText(code)));
+}
+
+// §5.7 Parent session, on reload. No route says which block started a worker:
+// a row carries the worker's title and creation time, not the parent's event.
+// So a worker belongs to the latest assistant message written before it that
+// holds a block with its title, and failing that, to the last message written
+// before it.
+function renderSpawnedWorkerEntries(rendered, sessionId) {
+  startedWorkersByMessage = new WeakMap();
+  const children = workerChildrenOf(sessionId);
+  if (!children.length) return;
+  const titles = new Map(
+    rendered
+      .filter(({ message }) => message.role === "assistant")
+      .map(({ message }) => [message, workerPromptTitles(message.content)]),
+  );
+  children.forEach((row) => {
+    const before = rendered.filter(({ message }) => message.createdAtMs <= row.createdAtMs);
+    const holder = before.filter(({ message }) => titles.get(message)?.includes(row.title)).pop();
+    const anchor = holder || before[before.length - 1];
+    if (!anchor) {
+      $("chat-log").prepend(spawnedWorkerEntry(row));
+      return;
+    }
+    if (holder) {
+      const started = startedWorkersByMessage.get(holder.bubble.message) || [];
+      startedWorkersByMessage.set(holder.bubble.message, [...started, row]);
+    }
+    appendSpawnedWorkerEntry(anchor.bubble.message, row);
+  });
+}
+
+function describeUncommittedFiles(status) {
+  const paths = Array.isArray(status.paths) ? status.paths : [];
+  const mentioned = Array.isArray(status.mentioned) ? status.mentioned : [];
+  // Mentioned first (§5.1): those are the files the worker is likely to need.
+  const ordered = [...new Set([...mentioned, ...paths])];
+  const shown = ordered.slice(0, 3);
+  const more = ordered.length - shown.length;
+  const message = document.createDocumentFragment();
+  message.append(
+    `⚠ ${paths.length} uncommitted ${paths.length === 1 ? "file" : "files"} in your tree, including `,
+  );
+  shown.forEach((path, index) => {
+    if (index > 0) message.append(index === shown.length - 1 && !more ? " and " : ", ");
+    const code = document.createElement("code");
+    code.textContent = path;
+    message.append(code);
+  });
+  if (more) message.append(` and ${more} more`);
+  message.append(". The worker won't see them unless you include them.");
+  return message;
+}
+
+// "New worker" (§5.1 Dialog), built the way `showRewindDialog` is. Resolves
+// to the spawned worker's row, or null when cancelled.
+function showNewWorkerDialog({ prompt = "", parentSessionId = "" } = {}) {
+  const repoPath = repo();
+  return new Promise((resolve) => {
+    const backdrop = document.createElement("div");
+    backdrop.className = "app-dialog-backdrop";
+    backdrop.innerHTML = `
+      <div class="app-dialog app-dialog-wide app-dialog-worker" role="dialog" aria-modal="true">
+        <p class="app-dialog-title">New worker</p>
+        <textarea class="worker-dialog-prompt" rows="12" aria-label="Worker prompt"></textarea>
+        <div class="worker-dialog-dirty" hidden>
+          <p class="worker-dialog-dirty-message"></p>
+          <label class="field-checkbox">
+            <input type="radio" name="worker-dialog-base" value="include" checked />
+            <span>Include uncommitted changes</span>
+          </label>
+          <label class="field-checkbox">
+            <input type="radio" name="worker-dialog-base" value="head" />
+            <span>Start from last commit</span>
+          </label>
+        </div>
+        <p class="worker-dialog-status" role="status" hidden></p>
+        <div class="app-dialog-actions">
+          <button type="button" class="btn-quiet worker-dialog-cancel">Cancel</button>
+          <button type="button" class="btn-primary worker-dialog-confirm" disabled>
+            Start worker
+          </button>
+        </div>
+      </div>
+    `;
+    const field = backdrop.querySelector(".worker-dialog-prompt");
+    const dirty = backdrop.querySelector(".worker-dialog-dirty");
+    const status = backdrop.querySelector(".worker-dialog-status");
+    const cancelButton = backdrop.querySelector(".worker-dialog-cancel");
+    const confirmButton = backdrop.querySelector(".worker-dialog-confirm");
+    field.value = prompt;
+    document.body.append(backdrop);
+
+    const showStatus = (text) => {
+      status.textContent = text;
+      status.hidden = !text;
+    };
+
+    // Start waits for the first answer, so a dirty tree is never started
+    // from without the user having seen the choice.
+    let checks = 0;
+    let checkTimer = null;
+    const checkSource = async () => {
+      const check = ++checks;
+      try {
+        const answer = await api(
+          `/api/worker-source-status?repo=${encodeURIComponent(repoPath)}&prompt=${encodeURIComponent(field.value)}`,
+        );
+        if (check !== checks) return;
+        const paths = Array.isArray(answer.paths) ? answer.paths : [];
+        backdrop
+          .querySelector(".worker-dialog-dirty-message")
+          .replaceChildren(describeUncommittedFiles(answer));
+        dirty.hidden = paths.length === 0;
+        showStatus("");
+      } catch (error) {
+        if (check !== checks) return;
+        dirty.hidden = true;
+        showStatus(error.message);
+      }
+      confirmButton.disabled = false;
+    };
+    // The prompt decides which files are named first.
+    const onInput = () => {
+      clearTimeout(checkTimer);
+      checkTimer = setTimeout(() => void checkSource(), 400);
+    };
+
+    const cleanup = (result) => {
+      clearTimeout(checkTimer);
+      checks += 1;
+      document.removeEventListener("keydown", onKeydown, true);
+      backdrop.remove();
+      resolve(result);
+    };
+    const onKeydown = (event) => {
+      if (event.key === "Escape") cleanup(null);
+    };
+    const onConfirm = async () => {
+      const text = field.value;
+      if (!text.trim()) {
+        showStatus("Write the worker's prompt first.");
+        return;
+      }
+      const include =
+        !dirty.hidden &&
+        backdrop.querySelector('input[name="worker-dialog-base"]:checked')?.value === "include";
+      confirmButton.disabled = true;
+      cancelButton.disabled = true;
+      showStatus("Starting the worker…");
+      try {
+        const started = await api(
+          "/api/workers",
+          form({
+            repo: repoPath,
+            prompt: text,
+            include_uncommitted: include ? "true" : "false",
+            parent_session_id: parentSessionId,
+          }),
+        );
+        const row = {
+          sessionId: started.sessionId,
+          title: started.title,
+          parentSessionId: parentSessionId || null,
+          branch: started.branch,
+          worktree: started.worktree,
+          createdAtMs: Date.now(),
+        };
+        workerRows.push(row);
+        toast(`Started worker ${row.title} on ${row.branch}`);
+        cleanup(row);
+      } catch (error) {
+        showStatus(error.message);
+        confirmButton.disabled = false;
+        cancelButton.disabled = false;
+      }
+    };
+
+    field.addEventListener("input", onInput);
+    confirmButton.addEventListener("click", () => void onConfirm());
+    cancelButton.addEventListener("click", () => cleanup(null));
+    document.addEventListener("keydown", onKeydown, true);
+    field.focus();
+    void checkSource();
   });
 }
 
@@ -7667,7 +8055,11 @@ async function loadSession(sessionId) {
   syncSessionListActive();
   loadPinnedContextFiles(currentSessionId);
   await loadSessionCheckpoints(currentSessionId);
-  renderMessages(payload.messages, payload.tasks || []);
+  // Before rendering: the messages' *Start worker* actions depend on it.
+  await refreshWorkerIndex();
+  renderThreadHeader();
+  const rendered = renderMessages(payload.messages, payload.tasks || []);
+  renderSpawnedWorkerEntries(rendered, currentSessionId);
   await refreshFindings();
   // After the conversation, because `renderMessages` clears the log and the
   // cards sit above what it renders.
@@ -8426,6 +8818,17 @@ $("config-save-btn").addEventListener("click", async () => {
     const payload = await saveConfigFile();
     toast(payload.path);
   } catch (error) {
+    toast(error.message);
+  }
+});
+
+$("worker-sessions-input").addEventListener("change", async (event) => {
+  const enabled = event.target.checked;
+  try {
+    await saveWorkerSessionsSetting(enabled);
+    toast(enabled ? "Worker sessions on" : "Worker sessions off");
+  } catch (error) {
+    event.target.checked = workersEnabled;
     toast(error.message);
   }
 });
