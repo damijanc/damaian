@@ -1,6 +1,6 @@
 # Feature Spec: Worker Sessions
 
-Status: In progress (Tasks 1–8 of 11 done, 2026-10-07, 2026-10-09, 2026-10-09, 2026-10-12, 2026-10-12, 2026-10-15, 2026-10-15 and 2026-10-16; see [`tasks.md`](tasks.md))
+Status: In progress (Tasks 1–9 of 11 done, 2026-10-07, 2026-10-09, 2026-10-09, 2026-10-12, 2026-10-12, 2026-10-15, 2026-10-15, 2026-10-16 and 2026-10-16; see [`tasks.md`](tasks.md))
 Order: 57 of 57
 Plan: none. An exception to the graduation rule, like #41–#44 and #47: it came
 from describing how this repository is actually built — a planner session that
@@ -533,6 +533,60 @@ that project's repository as the source.
   visible. The source repository is compared by its canonical path, as the
   worker record stores it.
 
+As built (Task 9), with no new route:
+
+- **Where it shows.** The board takes the conversation's place in the main
+  pane (`#workers-board`): the log, the composer and the header's ⋮ step
+  aside, and the header reads "Workers · ‹project›". Opening any session,
+  starting a new one or switching project leaves it. Opening the board of a
+  project that is not open opens that project first.
+- **Sidebar.** Under an expanded project: the Workers entry first, then the
+  sessions in their usual order, each worker indented under its parent
+  (oldest first). A worker without a parent in that list, because it had
+  none or its parent was deleted, is placed among the sessions by its
+  `updatedAtMs`. A worker row opens the worker under its source project
+  (`openWorkerSession`), which becomes the active row; if only the worktree
+  was added as a project, the worker opens in place. Its ⋮ is the board's
+  menu without *Dismiss*. The sidebar's rows are read when a project is drawn,
+  when a session loads, on every board poll and when the window regains focus.
+  There is no timed poll behind them, so with the board hidden a badge can be
+  stale until one of those happens.
+- **Dots.** *Needs you* for waiting for approval, a hollow *paused* for
+  paused, *running*, then for finished rows *failed* when the row carries an
+  error or ended `failed`, `interrupted`, `unknown_external_outcome` or with a
+  budget used up, and *finished* otherwise (complete, cancelled). A worker
+  whose process ended while paused or waiting is reported `interrupted`
+  (C5), so it shows failed with "Interrupted: its process ended mid-turn" and
+  *Open*. *Restart worker* is the worker session's (Task 10).
+- **Stop** shows for every live worker, not only running, paused and waiting
+  ones. An idle worker refuses `stop` (it has no turn), so *Stop* on an idle
+  row sends `shutdown`. That is also how a finished but still-live worker is
+  ended. *Remove worktree* stays visible on such a row but disabled with
+  "Stop the worker first", because the shell refuses removal while a live
+  worker holds the worktree. Both confirm first; removal shows the worktree
+  path and says the branch is kept, and a `dirty` answer is confirmed a second
+  time naming the paths, then resent with `confirmed_dirty=true`.
+- **Reveal worktree in Finder** is the existing `POST /api/reveal-in-finder`
+  with the row's `worktree` as `repo`.
+- **Dismiss from board** is client-side: session ids in the webview's
+  `localStorage` (`damaian:dismissedWorkers`). It hides a finished row from
+  the board only. A dismissed worker that runs again (*Restart worker*) is
+  taken off the list and shows again.
+- **New worker** is on the board's header and in the project row's ⋮ (§5.1
+  Entry points: empty, no parent).
+- **Elapsed** runs live for unfinished rows. A row has no end time, and the
+  session's `updatedAtMs` does not move while a worker's turns run, so a
+  finished row shows "—" rather than a duration that reads as zero.
+- **A held shell (C10).** The shell serves one request at a time, so a poll
+  can wait for the whole of a turn streaming in another session. The board
+  keeps one request out at a time and schedules the next a second after the
+  last one answered, so a held shell gets one poll, not a pile. A slow
+  answer is not an error. The rows stay as they were, and after three seconds
+  a quiet line says how old they are and that the shell answers once a turn
+  running in another session ends. Only a request that fails shows "Could not
+  refresh: …". Workers keep running meanwhile; only the view lags. The board
+  does not poll while the window is hidden.
+
 **Worker session.** The ordinary session view with two additions:
 
 - A **control strip** under the header: status pill, `Round r/max` with a bar,
@@ -567,9 +621,10 @@ characters, the shell's title rule) is the worker's title. That block gets the
 edited in its first line matches no block. Its entry then follows the last
 message created before it, and no block gets a link. Two identical blocks
 give the link to the later one. Right after a spawn, the clicked block and its
-message get both, exactly. Until the sidebar lists workers (Task 9), the link
-opens the worker's conversation in place. The shell refuses a turn sent to it
-from the source folder, because the session belongs to its worktree.
+message get both, exactly. The link opens the worker where the sidebar lists
+it, under its source project (Task 9). The shell refuses an ordinary turn sent
+to it from the source folder, because the session belongs to its worktree;
+the worker's own composer is Task 10's.
 
 **Shell routes** (the table is in [`tasks.md`](tasks.md), Interfaces):
 `GET /api/workers-enabled`, `GET /api/worker-source-status`,
@@ -709,3 +764,7 @@ In the order agreed during design:
 3. **Opt-in result summary** — a parent may read a finished worker's final
    status and closing summary, never its transcript, through the same
    redaction as everything else leaving a session.
+4. **Serve worker routes during a stream** (C10) — the shell's accept loop is
+   held for the whole of an `/api/ask-stream` turn, so the board and the
+   progress polls wait until it ends. Answering the read-only worker routes
+   while a turn streams would remove the lag.
