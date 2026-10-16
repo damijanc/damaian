@@ -1,6 +1,6 @@
 # Feature Spec: Worker Sessions
 
-Status: In progress (Tasks 1–7 of 11 done, 2026-10-07, 2026-10-09, 2026-10-09, 2026-10-12, 2026-10-12, 2026-10-15 and 2026-10-15; see [`tasks.md`](tasks.md))
+Status: In progress (Tasks 1–8 of 11 done, 2026-10-07, 2026-10-09, 2026-10-09, 2026-10-12, 2026-10-12, 2026-10-15, 2026-10-15 and 2026-10-16; see [`tasks.md`](tasks.md))
 Order: 57 of 57
 Plan: none. An exception to the graduation rule, like #41–#44 and #47: it came
 from describing how this repository is actually built — a planner session that
@@ -553,6 +553,23 @@ been used, its footer also shows "Started *‹worker title›* →", linking to 
 worker, so a second click is a visible, deliberate second worker rather than an
 accident. A one-line, quiet entry is appended where the worker was spawned:
 "Spawned worker *‹title›* →". No live card.
+
+As built (Task 8), with no new route: the UI reads `GET /api/workers` for the
+open folder, and also for its source when the folder is itself a worktree
+(`<source>/.damaian/worktrees/<slug>`). A session whose id is in those rows is
+a worker and shows neither entry point. The rows with the open session as
+`parentSessionId` are its workers. No route says which block started a
+worker, and the parent's `worker_spawned` event does not reach the UI. So on
+reload each worker is placed at the latest assistant message created before
+it that holds a `worker-prompt` block whose first non-blank line (at most 80
+characters, the shell's title rule) is the worker's title. That block gets the
+"Started" link and the message gets the entry. A worker whose prompt was
+edited in its first line matches no block. Its entry then follows the last
+message created before it, and no block gets a link. Two identical blocks
+give the link to the later one. Right after a spawn, the clicked block and its
+message get both, exactly. Until the sidebar lists workers (Task 9), the link
+opens the worker's conversation in place. The shell refuses a turn sent to it
+from the source folder, because the session belongs to its worktree.
 
 **Shell routes** (the table is in [`tasks.md`](tasks.md), Interfaces):
 `GET /api/workers-enabled`, `GET /api/worker-source-status`,

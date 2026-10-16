@@ -3363,6 +3363,103 @@ code.command-approval-command {
   width: min(640px, calc(100vw - 32px));
 }
 
+/* New worker (spec 57 §5.1): the prompt is the dialog's content, so it gets
+   the width and the height. */
+.app-dialog-worker {
+  width: min(640px, calc(100vw - 32px));
+}
+
+.worker-dialog-prompt {
+  width: 100%;
+  min-height: 0;
+  max-height: 50vh;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.worker-dialog-prompt:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.worker-dialog-dirty {
+  display: grid;
+  gap: 6px;
+  border-left: 3px solid var(--warn);
+  border-radius: 4px;
+  background: var(--surface-soft);
+  padding: 8px 10px;
+}
+
+.worker-dialog-dirty[hidden] {
+  display: none;
+}
+
+.worker-dialog-dirty-message {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.worker-dialog-dirty-message code {
+  font-size: 12px;
+}
+
+.worker-dialog-dirty .field-checkbox {
+  font-size: 13px;
+}
+
+.worker-dialog-status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* The row under a `worker-prompt` block: its action, then where it led. */
+.worker-prompt-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  margin: -4px 0 10px;
+}
+
+.worker-link {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  padding: 0;
+  font-size: 12px;
+  font-weight: 400;
+  text-align: left;
+}
+
+.worker-link:hover {
+  text-decoration: underline;
+}
+
+.worker-link em {
+  font-style: italic;
+}
+
+/* Quiet, one line, where a worker was started (§5.7 Parent session). */
+.worker-spawned-entry {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.worker-spawned-entry .worker-link {
+  color: var(--muted);
+}
+
 .app-dialog-checklist {
   display: grid;
   gap: 6px;
