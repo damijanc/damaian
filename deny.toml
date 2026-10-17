@@ -20,6 +20,17 @@ ignore = [
   # (vector_index.rs) and via syntect. Revisit if the local vector-index cache
   # format is ever changed.
   { id = "RUSTSEC-2025-0141", reason = "bincode is feature-complete and unmaintained by choice; no vulnerability" },
+  # zip 8.6.0: all three are in `ZipArchive::extract` / `ZipStreamReader::extract`
+  # (fixed in 9.0.0). Reached only via candle-core 0.11.0, which pins zip 8.6
+  # and is the latest candle, so there is no upgrade path. candle never calls
+  # `extract` (it reads `.npy`/`.npz`/pickle entries by name and writes with
+  # `ZipWriter`), and embeddings.rs loads weights with
+  # `from_mmaped_safetensors`, which uses no zip at all. Check for candle-core
+  # releases: once one depends on zip >= 9, bump candle-core, candle-nn and
+  # candle-transformers together and remove these three ignores.
+  { id = "RUSTSEC-2026-0367", reason = "zip extract() not reachable: candle only reads entries by name; no candle release on zip 9" },
+  { id = "RUSTSEC-2026-0368", reason = "zip extract() not reachable: candle only reads entries by name; no candle release on zip 9" },
+  { id = "RUSTSEC-2026-0369", reason = "zip extract() not reachable: candle only reads entries by name; no candle release on zip 9" },
 ]
 
 [licenses]
