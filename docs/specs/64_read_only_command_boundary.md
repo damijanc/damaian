@@ -1,6 +1,8 @@
 # Feature Spec: The Read-Only Command Boundary
 
-Status: Not started. Specified on 2026-10-17. It began as "let read-only
+Status: In progress. Started 2026-10-17: requirements 1–4 and 8 (the
+tightening) are implemented; requirement 5 waits for #60, and requirements 6–7
+(pipelines) are not started. Specified on 2026-10-17. It began as "let read-only
 pipelines run without approval", from the session behind
 [#59](59_exploration_round_allowance/proposal.md)–[#63](63_exploratory_command_failures/proposal.md).
 Reading the policy to design that found the existing read-only list already
@@ -262,4 +264,61 @@ Throughout:
 
 ## 7. Implementation Notes
 
-None yet.
+### Requirements 1–4 and 8 (2026-10-17)
+
+All in `command_policy.rs`; no new dependency.
+
+- **Tokenizer.** `shell_words` is hand-written rather than `shell-words`,
+  because that crate reports no unquoted globs or tildes, and requirement 1
+  needs exactly that. It refuses (returns `None`, so a read-only program asks)
+  on a backslash, an unclosed quote, an operator or a control character, and
+  flags expansion on `$`, a backtick, `$`/backtick inside double quotes,
+  unquoted `* ? [ { ( )`, and `= ^ #` at the start of a word (zsh's `=cmd`,
+  `extended_glob`'s `^`, a comment).
+- **`~` is refused only where the shell expands it**: at the start of a word,
+  or after `=` or `:`. Requirement 1 says "no unquoted `~`", but `HEAD~1` is
+  common and the shell leaves a mid-word `~` alone, so it stays admitted.
+- **Verdicts.** `read_only_verdict` returns `NotReadOnly` (not `pwd`, `ls` or
+  `git status|diff|log|show`, so the later branches classify it as before —
+  `git -C /tmp commit` keeps its old answer), `Refused` (a read-only program
+  in a form outside §5.2: High risk, approval, a reason naming the argument or
+  the expansion) or `Admitted` with its path arguments.
+  `is_low_risk_read_only` is "admitted", so `is_read_only_without_approval`
+  and therefore Plan, Review and `command_access=read_only` follow it
+  (requirement 8) with no change to `mode.rs`.
+- **Options** follow §5.2's table, with these readings: short flags may be
+  combined (`ls -la`, `git status -sb`); `git log` also takes `-n5` and `-5`;
+  `git diff`/`git show` take `-U3` and `--unified=3` as spellings of `-U N`.
+  `git log -p`/`--patch` stay admitted until #60, because requirement 5 and
+  §5.4 say the content-bearing forms ask only once `read_git_log` exists,
+  although the table omits them. `git status` takes no paths, as the table
+  says. Anything else, including harmless options such as `git log --since`,
+  needs approval.
+- **Paths.** Every git positional word is path-checked, since git decides
+  between revision and path only when it runs. The path half of
+  `<rev>:<path>` resolves from the repository root unless it starts with
+  `./` or `../`, as git resolves it; other paths resolve from the working
+  directory. A path is checked lexically, then, if it exists, again after
+  resolving symlinks. A path is restricted when it, an ancestor, or *every
+  child* would match `restricted_patterns`: the default patterns restrict a
+  directory's contents (`secrets/**`), not its name, and `ls secrets` reads
+  exactly those. Git positional words containing `* ? [ (`, and pathspecs
+  after `--` starting with `:`, are refused even when quoted, because git
+  expands globs and pathspec magic itself.
+- **Requirement 4** is also checked in `classify_at` for admitted commands
+  (with the same contents rule), not only in `resolve_command_directory`, so
+  a caller that classifies directly (the CLI) gets the same answer.
+- **Reasons.** Without #62's `ApprovalCause`, the restricted-path reason is
+  the string `RESTRICTED_PATH_REASON` followed by the path; the expansion
+  reason says "shell expansion". The outside-repository reason is unchanged.
+  `references_path_outside_root` still runs for every command that is not
+  admitted read-only (allowlisted ones included, a non-goal here).
+- **Not covered.** `ls -R crates` lists a restricted directory nested below
+  `crates`, and `git diff -- crates` diffs one; the path check sees only the
+  path named. Requirement 5 closes the git half; the `ls` half is §5.2's
+  accepted behaviour for names.
+- **Tests.** `command_policy::tests::read_only_boundary` covers every
+  "Tightening" criterion against a real temporary repository, plus symlink
+  escape, `<rev>:<path>` resolution, `ls -R`, a restricted working directory
+  and git globs. `mode::tests::plan_and_review_refuse_commands_the_read_only_boundary_refuses`
+  covers requirement 8. No existing policy test needed changing.
