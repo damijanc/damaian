@@ -1,6 +1,7 @@
 use crate::audit::AuditLog;
 use crate::cancel::CancelToken;
 use crate::command_policy::{CommandPolicy, CommandRisk};
+use crate::command_purpose::CommandPurpose;
 use crate::config::Config;
 use crate::error::{ClientError, Result};
 use crate::hash::{create_id, now_millis};
@@ -30,6 +31,9 @@ pub struct CommandExecution {
     pub termination: CommandTermination,
     pub stdout: String,
     pub stderr: String,
+    /// What the command was for, as its proposal decided (spec 63). Carried,
+    /// never computed or read, by the runner.
+    pub purpose: CommandPurpose,
 }
 
 /// Why a running child stopped being waited on.
@@ -86,6 +90,8 @@ pub struct CommandRunOptions<'a> {
     pub task_id: Option<&'a str>,
     pub cancel: &'a CancelToken,
     pub on_output: &'a mut dyn FnMut(&str),
+    /// Copied onto the execution. Not a policy input (spec 63 requirement 6).
+    pub purpose: CommandPurpose,
 }
 
 /// How long the poll loop sleeps between `try_wait` calls. Short enough that a
@@ -345,6 +351,7 @@ impl CommandRunner {
             termination,
             stdout: redacted_stdout,
             stderr: redacted_stderr,
+            purpose: options.purpose,
         };
 
         self.audit_log.record(
@@ -508,6 +515,7 @@ mod tests {
     use crate::audit::AuditLog;
     use crate::cancel::CancelToken;
     use crate::command_policy::CommandPolicy;
+    use crate::command_purpose::CommandPurpose;
     use crate::config::Config;
     use crate::process_registry::ProcessRegistry;
     use crate::secret_scanner::SecretScanner;
@@ -526,6 +534,7 @@ mod tests {
             task_id: None,
             cancel,
             on_output,
+            purpose: CommandPurpose::Other,
         }
     }
 

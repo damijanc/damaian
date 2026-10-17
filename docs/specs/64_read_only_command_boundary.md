@@ -2,7 +2,7 @@
 
 Status: Not started. Specified on 2026-10-17. It began as "let read-only
 pipelines run without approval", from the session behind
-[#59](59_exploration_round_allowance/proposal.md)–[#63](63_exploratory_command_failures.md).
+[#59](59_exploration_round_allowance/proposal.md)–[#63](63_exploratory_command_failures/proposal.md).
 Reading the policy to design that found the existing read-only list already
 lets through more than it should: a command that writes a file, one that reads
 outside the repository, and one that reads a restricted file all run today

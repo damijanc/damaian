@@ -5534,6 +5534,7 @@ mod evidence_tests {
             termination: crate::command_runner::CommandTermination::TimedOut,
             stdout: String::new(),
             stderr: String::new(),
+            purpose: crate::command_purpose::CommandPurpose::Other,
         };
 
         let context = sandbox_command_context(&execution);

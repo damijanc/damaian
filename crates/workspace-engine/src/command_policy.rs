@@ -1029,7 +1029,7 @@ fn restricted_prefix(
     })
 }
 
-fn is_validation_command(command: &str) -> bool {
+pub(crate) fn is_validation_command(command: &str) -> bool {
     command == "npm test"
         || command.starts_with("npm test ")
         || command.starts_with("npm run test")
