@@ -15,8 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::plan::{Evidence, StepStatus, TaskPlan};
 use workspace_engine::{
-    CancelToken, ChatTurnResult, Config, MockModelAdapter, ModelAdapter, PlanRevisionStep,
-    ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
+    CancelToken, ChatTurnResult, CommandPurpose, Config, MockModelAdapter, ModelAdapter,
+    PlanRevisionStep, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -264,6 +264,53 @@ fn a_step_whose_command_passed_completes_and_carries_its_evidence() {
     // And the next step took over, still only one at a time.
     assert_eq!(plan.steps[1].status, StepStatus::InProgress);
     assert!(!plan.violates_single_in_progress());
+}
+
+#[test]
+fn a_search_that_matched_nothing_does_not_block_its_step() {
+    // Spec 63 §6. `grep` exits 1 when nothing matches. That is the answer to
+    // the question the step asked, not a failure of the step, so the exit is
+    // kept as evidence and the plan moves on.
+    let repo = temp_repo("search-no-match");
+    // `grep` asks for approval by default, which would raise the plan review.
+    // Allowlisting the exact command keeps the turn to one call, and what the
+    // policy decided is not under test here.
+    let engine = WorkspaceEngine::new(Config {
+        command_allowlist: vec!["grep -rn nothing-matches src".to_string()],
+        data_dir: repo.join(".damaian"),
+        enable_index_watcher: false,
+        ..Config::default()
+    });
+    let mut adapter = scripted(vec![
+        vec![call(
+            "propose_plan",
+            r#"{"steps":[{"title":"Look for callers"},{"title":"Report"}]}"#,
+        )],
+        vec![call(
+            "run_command",
+            r#"{"command":"grep -rn nothing-matches src","reason":"Search"}"#,
+        )],
+        vec![call("complete_step", "{}")],
+    ]);
+
+    let result = ask(&engine, &repo, "Look for callers", &mut adapter);
+    let plan = plan_of(&engine, &result).expect("the turn proposed a plan");
+
+    assert_eq!(plan.steps[0].status, StepStatus::Completed);
+    // The exit stays evidence, with its purpose, and no finding beside it.
+    assert!(
+        matches!(
+            plan.steps[0].evidence.as_slice(),
+            [Evidence::CommandExit {
+                exit_code: Some(1),
+                purpose: CommandPurpose::Exploration,
+                ..
+            }]
+        ),
+        "{:?}",
+        plan.steps[0].evidence
+    );
+    assert_eq!(plan.steps[1].status, StepStatus::InProgress);
 }
 
 #[test]

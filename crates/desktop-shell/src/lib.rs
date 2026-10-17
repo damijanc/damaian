@@ -4540,6 +4540,7 @@ mod tests {
             evidence: vec![Evidence::CommandExit {
                 marker_id: "action_1".to_string(),
                 exit_code: Some(0),
+                purpose: workspace_engine::CommandPurpose::Other,
             }],
         });
         plan.steps.push(PlanStep {

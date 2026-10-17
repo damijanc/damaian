@@ -1,6 +1,6 @@
 # Feature Spec: Exploratory Command Failures Are Not Findings
 
-Status: In progress (started 2026-10-17; Tasks 1–2 of 6 done — see
+Status: In progress (started 2026-10-17; Tasks 1–3 of 6 done — see
 [`tasks.md`](tasks.md)). Specified on 2026-10-17 from the session behind
 [#59](../59_exploration_round_allowance/proposal.md)–[#62](../62_approval_prompts_name_the_reason.md),
 a reporting-only request that left two open **error** findings behind: an
@@ -159,7 +159,15 @@ whatever the exit or termination. For `Check` and `Other` it is unchanged.
 
 `Evidence::CommandExit` gains `purpose`, with `#[serde(default)]` reading old
 events as `Other`, which keeps their recorded behaviour. `status_from_evidence`
-blocks on a non-zero exit only when the purpose is not `Exploration`.
+blocks on a failed exit only when the purpose is not `Exploration`. The exit
+is still recorded as the step's evidence.
+
+The evidence is minted by `evidence_for` (`chat.rs`) from
+`ActionOutcome::CommandExit`, so the outcome carries the execution's purpose
+beside its exit code. `None` (killed, timed out, cancelled) from exploration
+does not block either: it is still not a pass, but a look-around that learned
+nothing says nothing about the step's own work. For `Check` and `Other`, `None`
+blocks as before.
 
 ### 5.4 Telling the model about the shell
 
@@ -216,3 +224,9 @@ the design above have been folded into §5.1.
 - **Task 2 (2026-10-17).** `findings_from_execution` reads the purpose from the
   execution, so its signature did not change (§5.2). Tests that used a failing
   `ls` to mean "a failed command" now use a repository script, which is `Other`.
+- **Task 3 (2026-10-17).** The purpose reaches plan evidence through
+  `ActionOutcome::CommandExit`, not only `Evidence::CommandExit` (C5). An
+  exploration exit of `None` does not block (§5.3). The purpose is always
+  written, as `"purpose":"exploration"` and so on, and an event without it
+  reads as `Other`. The shell's plan panel still describes such a step's
+  evidence as "a command ran and exited 1"; it does not read the purpose.
