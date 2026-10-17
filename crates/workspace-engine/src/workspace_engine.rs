@@ -8,7 +8,9 @@ use crate::context_manager::{ContextManager, RepositoryMapSource};
 use crate::edit::{EditOrchestrator, PatchStore};
 use crate::error::Result;
 use crate::file_access::FileAccessController;
+use crate::finding::{Finding, FindingSource};
 use crate::git_service::GitService;
+use crate::hash::{file_hash, repository_id_for_root};
 use crate::index_cache::IndexCache;
 use crate::indexer::ProjectIndexer;
 use crate::lsp::{
@@ -23,7 +25,7 @@ use crate::secret_scanner::SecretScanner;
 use crate::session::SessionStore;
 use crate::symbol_index::{SymbolIndex, SymbolIndexStore, SymbolLoad, SymbolMatch};
 use crate::validation::{CommandStore, ValidationOrchestrator};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::path::Path;
 
@@ -269,6 +271,73 @@ impl WorkspaceEngine {
         .map(Some)
     }
 
+    /// Records the global hub's diagnostics for this repository as findings.
+    /// See [`Self::record_language_server_findings_with`].
+    pub fn record_language_server_findings(
+        &self,
+        session_id: &str,
+        repository_root: impl AsRef<Path>,
+    ) -> Result<usize> {
+        self.record_language_server_findings_with(
+            LanguageServerHub::global(),
+            session_id,
+            repository_root,
+        )
+    }
+
+    /// Records, in `session_id`, each diagnostic `hub` holds for this
+    /// repository that the session does not hold yet, and returns how many
+    /// it recorded (spec 25 `context.md` §10). A diagnostic is held when a
+    /// language-server finding with the same range (path included), code,
+    /// summary and file hash is in the session, whatever its status: a
+    /// dismissed one stays dismissed, and a file the server has since
+    /// cleared removes nothing, because statuses belong to the user (spec
+    /// 22). No task id: a finding recorded outside the turn loop is linked
+    /// to no plan step and cannot block one.
+    ///
+    /// It reads what the hub holds and never waits on or starts a server.
+    pub fn record_language_server_findings_with(
+        &self,
+        hub: &LanguageServerHub,
+        session_id: &str,
+        repository_root: impl AsRef<Path>,
+    ) -> Result<usize> {
+        let root = repository_root.as_ref();
+        // Canonical, as the hub keys its entries (`LanguageServerLaunch`).
+        let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let files = hub.diagnostics(&repository_id_for_root(&canonical));
+        if files.iter().all(|file| file.findings.is_empty()) {
+            return Ok(0);
+        }
+        let mut held: BTreeSet<FindingKey> = self
+            .session_store
+            .read_findings(session_id, root)?
+            .iter()
+            .filter(|finding| finding.source() == FindingSource::LanguageServer)
+            .map(finding_key)
+            .collect();
+        let mut recorded = 0;
+        for file in files {
+            // The hub dropped these already, by the policy its entry was
+            // started with; this is the policy in force now.
+            if file.findings.is_empty() || self.path_policy.is_restricted(&file.path, false) {
+                continue;
+            }
+            // A file gone since the server published has nothing to point at.
+            let Ok(hash) = file_hash(canonical.join(&file.path)) else {
+                continue;
+            };
+            for draft in file.findings {
+                let finding = Finding::new(draft, &self.scanner).with_file_hash(hash.clone());
+                if held.insert(finding_key(&finding)) {
+                    self.session_store.record_finding(session_id, &finding)?;
+                    recorded += 1;
+                }
+            }
+        }
+        Ok(recorded)
+    }
+
     /// What the hub needs to start `language`'s server for this repository,
     /// or `None` when this config names none. The config is the one loaded
     /// for the repository, so a server its own config tried to name was
@@ -286,6 +355,30 @@ impl WorkspaceEngine {
             session_id,
         )
     }
+}
+
+/// A range's path, lines and columns.
+type RangeKey = (String, u32, Option<u32>, Option<u32>, Option<u32>);
+
+/// What makes two language-server findings the same diagnostic: range, code,
+/// summary (as redacted) and file hash.
+type FindingKey = (Option<RangeKey>, Option<String>, String, Option<String>);
+
+fn finding_key(finding: &Finding) -> FindingKey {
+    (
+        finding.range().map(|range| {
+            (
+                range.path.clone(),
+                range.start_line,
+                range.start_column,
+                range.end_line,
+                range.end_column,
+            )
+        }),
+        finding.code().map(str::to_string),
+        finding.summary().to_string(),
+        finding.file_hash().map(str::to_string),
+    )
 }
 
 impl Default for WorkspaceEngine {

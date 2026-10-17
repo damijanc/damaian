@@ -11,7 +11,7 @@ pub struct ResolvedPath {
     pub relative_path: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathPolicy {
     allowed_roots: Vec<PathBuf>,
     restricted_rules: Vec<IgnoreRule>,

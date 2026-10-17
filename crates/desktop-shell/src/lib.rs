@@ -3920,6 +3920,12 @@ fn handle_findings(stream: &mut TcpStream, request: &Request) -> Result<(), Stri
     let session_id = required_param(request, "session_id")?;
     let engine = engine_for_repo(&repo)?;
     session_in_repository(&engine, &repo, &session_id)?;
+    // Language-server diagnostics become findings here, from what the hub
+    // already holds (spec 25 `context.md` §10). A failure must not cost the
+    // panel what it already has.
+    if let Err(error) = engine.record_language_server_findings(&session_id, &repo) {
+        eprintln!("Could not record language-server findings for session {session_id}: {error}");
+    }
     let body = findings_json(&engine, &repo, &session_id)?;
     write_response(stream, request, 200, "application/json", &body)
 }
@@ -4437,10 +4443,10 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use workspace_engine::CheckpointRestoreResult;
     use workspace_engine::{
-        AgentPlanProposal, CancelToken, Config, Evidence, GeneratedSecretWarning, MockModelAdapter,
-        PlanStep, SecretScanner, SessionMode, StepStatus, TaskPlan, TaskUsage, ToolCall,
-        TurnProgress, TurnSink, UsageSource, WebDiagnosticRecord, WebDiagnosticReport,
-        WorkspaceEngine,
+        AgentPlanProposal, CancelToken, Config, Evidence, GeneratedSecretWarning,
+        LanguageServerHub, LanguageServerLaunch, MockModelAdapter, PlanStep, SecretScanner,
+        SessionMode, StepStatus, TaskPlan, TaskUsage, ToolCall, TurnProgress, TurnSink,
+        UsageSource, WebDiagnosticRecord, WebDiagnosticReport, WorkspaceEngine,
         finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange},
     };
 
@@ -6382,6 +6388,169 @@ mod tests {
         let body = format!("repo={}&session_id={foreign}&finding_ids=x", repo.display());
         let repair = post_form_for_test(port, &token, "/api/findings-repair", &body);
         assert!(!repair.starts_with("HTTP/1.1 200"), "{repair}");
+    }
+
+    /// The `language_server.rust` command line for this test binary's fake
+    /// server, `fake_language_server_for_findings_helper`. libtest prints on
+    /// stdout before the helper runs, so the helper speaks LSP on fd 3.
+    fn fake_language_server_command() -> String {
+        format!(
+            "/bin/sh -c \"export DAMAIAN_SHELL_FAKE_LSP=1; exec \\\"\\$0\\\" --ignored --exact \
+             tests::fake_language_server_for_findings_helper 3>&1 1>/dev/null\" '{}'",
+            std::env::current_exe().unwrap().display()
+        )
+    }
+
+    /// Held by each test that uses the global hub, because each ends with
+    /// `shutdown_global`, which would stop the other's server under a
+    /// threaded `cargo test`.
+    static GLOBAL_HUB_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Opens `src/lib.rs` on the global hub, the one `GET /api/findings`
+    /// reads, and waits for a `documentSymbol` answer. The fake server
+    /// publishes on `didOpen`, before it reads the request, so once the
+    /// answer is in the hub holds the diagnostic.
+    fn publish_a_language_server_error(engine: &WorkspaceEngine, repo: &std::path::Path) {
+        let mut config = engine.config.clone();
+        config
+            .language_servers
+            .insert("rust".to_string(), fake_language_server_command());
+        let launch = LanguageServerLaunch::from_config(&config, repo, "rust", "ses_shell")
+            .expect("rust is configured");
+        let hub = LanguageServerHub::global();
+        hub.notify(&launch, |client, uris| {
+            client.did_open(&uris.uri_for("src/lib.rs"), "rust", 1, "fn a() {}\n")
+        })
+        .expect("didOpen");
+        hub.request(&launch, |client, uris| {
+            client.document_symbol(&uris.uri_for("src/lib.rs"))
+        })
+        .expect("documentSymbol");
+    }
+
+    /// Spec 25 Task 7: the panel's GET records what the hub holds first.
+    #[test]
+    fn get_findings_returns_a_language_server_diagnostic() {
+        let _hub = GLOBAL_HUB_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (repo, engine, session_id) = findings_fixture("language-server");
+        publish_a_language_server_error(&engine, &repo);
+        let (port, token) = serve_for_test();
+
+        let response = get_findings_for_test(port, &token, &repo, &session_id);
+        let again = get_findings_for_test(port, &token, &repo, &session_id);
+        LanguageServerHub::shutdown_global();
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let json = json_of(&response);
+        let findings = json["findings"].as_array().expect("findings");
+        assert_eq!(findings.len(), 1, "{json}");
+        let finding = &findings[0];
+        assert_eq!(finding["source"], "language_server");
+        assert_eq!(finding["severity"], "error");
+        assert_eq!(finding["summary"], "the fake server says no");
+        assert_eq!(finding["code"], "E1");
+        assert_eq!(finding["taskId"], serde_json::Value::Null);
+        assert_eq!(finding["range"]["path"], "src/lib.rs");
+        assert_eq!(finding["range"]["startLine"], 1);
+        assert_eq!(finding["range"]["startColumn"], 4);
+        assert_eq!(finding["status"], "open");
+        assert_eq!(
+            json_of(&again)["findings"].as_array().unwrap().len(),
+            1,
+            "a second GET records nothing new"
+        );
+    }
+
+    /// A recording failure is logged, and the panel still gets what the
+    /// session holds. Here the session log is read-only, so the append fails.
+    #[test]
+    fn get_findings_lists_what_it_has_when_recording_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _hub = GLOBAL_HUB_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (repo, engine, session_id) = findings_fixture("language-server-failing");
+        let kept = record_finding_for_test(&engine, &repo, &session_id, "kept", None);
+        publish_a_language_server_error(&engine, &repo);
+        let log = engine
+            .config
+            .data_dir
+            .join("sessions")
+            .join(format!("{session_id}.jsonl"));
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o444)).unwrap();
+        let (port, token) = serve_for_test();
+
+        let response = get_findings_for_test(port, &token, &repo, &session_id);
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+        LanguageServerHub::shutdown_global();
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let json = json_of(&response);
+        let ids: Vec<&str> = json["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .map(|finding| finding["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec![kept.as_str()], "{json}");
+    }
+
+    /// The fake language server for the two tests above. Never run on its
+    /// own: they re-execute this test binary into it, and run directly it
+    /// returns at once. It answers `initialize`, `documentSymbol` (`[]`) and
+    /// `shutdown`, and on each `didOpen` publishes one error on the opened
+    /// file: line 0, characters 3–4, code `E1`.
+    #[test]
+    #[ignore = "the fake language server; re-executed by the findings tests"]
+    fn fake_language_server_for_findings_helper() {
+        use std::os::fd::FromRawFd;
+        use workspace_engine::{read_message, write_message};
+
+        if std::env::var("DAMAIAN_SHELL_FAKE_LSP").is_err() {
+            return;
+        }
+        // SAFETY: fd 3 is the pipe the command line moved there, and nothing
+        // else in this process owns it.
+        let mut output = unsafe { fs::File::from_raw_fd(3) };
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        loop {
+            let Ok(Some(message)) = read_message(&mut input) else {
+                return;
+            };
+            let id = message.get("id").cloned();
+            let reply = match (message["method"].as_str().unwrap_or_default(), id) {
+                ("initialize", Some(id)) => {
+                    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "capabilities": {} } })
+                }
+                ("shutdown", Some(id)) => {
+                    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": null })
+                }
+                (_, Some(id)) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": [] }),
+                ("exit", None) => return,
+                ("textDocument/didOpen", None) => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/publishDiagnostics",
+                    "params": {
+                        "uri": message["params"]["textDocument"]["uri"],
+                        "diagnostics": [{
+                            "range": {
+                                "start": { "line": 0, "character": 3 },
+                                "end": { "line": 0, "character": 4 },
+                            },
+                            "severity": 1,
+                            "code": "E1",
+                            "message": "the fake server says no",
+                        }],
+                    },
+                }),
+                _ => continue,
+            };
+            write_message(&mut output, &reply).unwrap();
+        }
     }
 
     /// The follow-up GET proves the write persisted. An endpoint that only
