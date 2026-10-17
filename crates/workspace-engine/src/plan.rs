@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::command_purpose::CommandPurpose;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
@@ -72,10 +74,17 @@ pub enum Evidence {
     ///
     /// `exit_code` is `None` when the command was killed or signalled. That is
     /// not a zero and must never be read as one.
+    ///
+    /// `purpose` says what the command was for (spec 63 §5.3). It is recorded
+    /// so the status rule can tell a failed check from a search that found
+    /// nothing. An event written before spec 63 has no `purpose` and reads as
+    /// `Other`, which is the rule it was judged by when it was written.
     #[serde(rename_all = "camelCase")]
     CommandExit {
         marker_id: String,
         exit_code: Option<i32>,
+        #[serde(default)]
+        purpose: CommandPurpose,
     },
     /// A patch was applied, with the hash actually written per file.
     #[serde(rename_all = "camelCase")]
@@ -162,6 +171,16 @@ pub fn status_from_evidence(evidence: &[Evidence]) -> StepStatus {
         // passed". Writing this as `matches!(code, Some(c) if *c != 0)` would
         // let `None` fall through as success, which is the same defect as an
         // `unwrap_or(0)` wearing different clothes.
+        //
+        // Except for exploration (spec 63 §5.3). A `grep` that matched nothing
+        // or an `ls` of a missing path is an answer, not a failed step, so its
+        // exit is kept as evidence and decides nothing. That includes `None`:
+        // a killed or timed-out look-around says nothing about whether the
+        // step's work succeeded, and §5.3 blocks only for other purposes.
+        Evidence::CommandExit {
+            purpose: CommandPurpose::Exploration,
+            ..
+        } => false,
         Evidence::CommandExit { exit_code, .. } => *exit_code != Some(0),
         // Neither of the first two has a failure mode to encode: a patch that
         // did not apply returns an error and produces no evidence, and a file

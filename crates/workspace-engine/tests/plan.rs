@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::plan::{
     Evidence, PlanStep, StepOutcome, StepStatus, TaskPhase, TaskPlan, status_from_evidence,
 };
-use workspace_engine::{SessionStore, Task};
+use workspace_engine::{CommandPurpose, SessionStore, Task};
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -114,6 +114,7 @@ fn a_plan_round_trips_through_json_unchanged() {
             evidence: vec![Evidence::CommandExit {
                 marker_id: "action_1".to_string(),
                 exit_code: Some(0),
+                purpose: CommandPurpose::Other,
             }],
         }],
     };
@@ -140,6 +141,7 @@ fn an_absent_exit_code_survives_the_round_trip_as_absent() {
     let evidence = Evidence::CommandExit {
         marker_id: "action_1".to_string(),
         exit_code: None,
+        purpose: CommandPurpose::Other,
     };
     let text = serde_json::to_string(&evidence).expect("evidence serializes");
     assert_eq!(
@@ -191,6 +193,7 @@ fn the_newest_event_per_step_wins_on_replay() {
     first.evidence = vec![Evidence::CommandExit {
         marker_id: "action_1".to_string(),
         exit_code: Some(0),
+        purpose: CommandPurpose::Other,
     }];
     fixture.store.update_plan_step(&task, &first).unwrap();
 
@@ -205,6 +208,81 @@ fn the_newest_event_per_step_wins_on_replay() {
     // list from the updates would lose the order the plan was written in.
     assert_eq!(replayed.steps[1].status, StepStatus::Pending);
     assert_eq!(replayed.steps[1].id, "step_2");
+}
+
+#[test]
+fn a_pre_spec_63_log_replays_with_the_same_step_statuses() {
+    // Spec 63 §6: an old log, whose `commandExit` events carry no `purpose`,
+    // must read back exactly as it was judged. The events below are written
+    // raw in the pre-spec shape rather than through the store, which would
+    // add the field.
+    let fixture = Fixture::new("pre-spec-63");
+    let task = fixture.task("add retry handling");
+    let mut plan = TaskPlan::new(&task.id, 0);
+    for id in ["step_1", "step_2", "step_3"] {
+        plan.steps.push(step(id, StepStatus::Pending));
+    }
+    fixture.store.create_plan(&task, &plan).unwrap();
+
+    let old_events = [
+        ("step_1", "completed", "0"),
+        ("step_2", "blocked", "1"),
+        ("step_3", "blocked", "null"),
+    ];
+    for (index, (id, status, exit_code)) in old_events.iter().enumerate() {
+        fixture.append_raw(&format!(
+            concat!(
+                r#"{{"eventId":"evt_old_{index}","seq":{seq},"timestampMs":1,"#,
+                r#""eventType":"plan_step_updated","payload":{{"taskId":"{task}","step":{{"#,
+                r#""id":"{id}","title":"Step {id}","detail":null,"status":"{status}","#,
+                r#""dependsOn":[],"startedAtMs":1,"completedAtMs":2,"evidence":[{{"#,
+                r#""kind":"commandExit","markerId":"action_{index}","exitCode":{exit_code}}}]}}}}}}"#
+            ),
+            index = index,
+            seq = 100 + index,
+            task = task.id,
+            id = id,
+            status = status,
+            exit_code = exit_code,
+        ));
+    }
+
+    let replayed = fixture
+        .store
+        .read_task_plan(&fixture.session_id, &task.id)
+        .unwrap()
+        .expect("a plan was created");
+    let statuses: Vec<StepStatus> = replayed.steps.iter().map(|step| step.status).collect();
+    assert_eq!(
+        statuses,
+        vec![
+            StepStatus::Completed,
+            StepStatus::Blocked,
+            StepStatus::Blocked
+        ]
+    );
+    for step in &replayed.steps {
+        assert!(
+            step.evidence.iter().all(|item| matches!(
+                item,
+                Evidence::CommandExit {
+                    purpose: CommandPurpose::Other,
+                    ..
+                }
+            )),
+            "{}: {:?}",
+            step.id,
+            step.evidence
+        );
+        // A resumed step is re-judged on everything it carries, so the rule
+        // must reach the same verdict on old evidence as the log recorded.
+        assert_eq!(
+            status_from_evidence(&step.evidence),
+            step.status,
+            "{}",
+            step.id
+        );
+    }
 }
 
 #[test]
@@ -490,6 +568,7 @@ fn command_exit(exit_code: Option<i32>) -> Evidence {
     Evidence::CommandExit {
         marker_id: "action_1".to_string(),
         exit_code,
+        purpose: CommandPurpose::Other,
     }
 }
 
@@ -577,6 +656,77 @@ fn one_failure_among_successes_still_blocks() {
         status_from_evidence(&[command_exit(Some(1)), command_exit(Some(0))]),
         StepStatus::Blocked
     );
+}
+
+// ---------------------------------------------------------------------------
+// Exploration does not block. Spec 63 §5.3.
+// ---------------------------------------------------------------------------
+
+fn exit_with_purpose(exit_code: Option<i32>, purpose: CommandPurpose) -> Evidence {
+    Evidence::CommandExit {
+        marker_id: "action_1".to_string(),
+        exit_code,
+        purpose,
+    }
+}
+
+#[test]
+fn a_failed_exploration_does_not_block_the_step() {
+    // A `grep` that matched nothing exits 1, an `ls` of a missing path exits
+    // 1 or 2. Both are answers. A killed one (`None`) learned nothing, which
+    // says nothing about whether the step's own work succeeded.
+    for exit_code in [Some(1), Some(2), None] {
+        assert_eq!(
+            status_from_evidence(&[exit_with_purpose(exit_code, CommandPurpose::Exploration)]),
+            StepStatus::Completed,
+            "exploration exit {exit_code:?}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_check_or_other_command_still_blocks() {
+    // Requirement 4: only exploration changes anything.
+    for purpose in [CommandPurpose::Check, CommandPurpose::Other] {
+        for exit_code in [Some(1), None] {
+            assert_eq!(
+                status_from_evidence(&[exit_with_purpose(exit_code, purpose)]),
+                StepStatus::Blocked,
+                "{purpose:?} exit {exit_code:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_failed_check_blocks_even_beside_a_failed_exploration() {
+    let exploration = exit_with_purpose(Some(1), CommandPurpose::Exploration);
+    let check = exit_with_purpose(Some(1), CommandPurpose::Check);
+    assert_eq!(
+        status_from_evidence(&[exploration.clone(), check.clone()]),
+        StepStatus::Blocked
+    );
+    assert_eq!(
+        status_from_evidence(&[check, exploration]),
+        StepStatus::Blocked
+    );
+}
+
+#[test]
+fn a_command_exit_without_a_purpose_reads_as_other() {
+    // What every event written before spec 63 looks like.
+    let evidence: Evidence =
+        serde_json::from_str(r#"{"kind":"commandExit","markerId":"action_1","exitCode":1}"#)
+            .expect("a pre-spec event deserialises");
+    assert_eq!(evidence, exit_with_purpose(Some(1), CommandPurpose::Other));
+    assert_eq!(status_from_evidence(&[evidence]), StepStatus::Blocked);
+}
+
+#[test]
+fn the_purpose_is_written_in_snake_case() {
+    let text = serde_json::to_string(&exit_with_purpose(Some(1), CommandPurpose::Exploration))
+        .expect("evidence serializes");
+    assert!(text.contains("\"purpose\":\"exploration\""), "got: {text}");
 }
 
 #[test]

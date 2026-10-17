@@ -7,6 +7,7 @@ use crate::clarification::{
     AskUserInput, OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN, QUESTION_MAX_CHARS,
 };
 use crate::command_policy::{CommandClassification, CommandRisk, allow_always_eligible};
+use crate::command_purpose::CommandPurpose;
 use crate::command_runner::{CommandExecution, CommandTermination};
 use crate::config::{Config, CostEstimate, McpTransport};
 use crate::context_manager::ContextManager;
@@ -63,8 +64,10 @@ enum ActionOutcome {
     /// Dispatch succeeded and the tool reported nothing to the contrary.
     Ok,
     /// A command ran. The code is whatever the process reported, and `None`
-    /// means it was killed or signalled — not that it passed.
-    CommandExit(Option<i32>),
+    /// means it was killed or signalled — not that it passed. The purpose is
+    /// the execution's own (spec 63 §5.3), so the step's status can tell a
+    /// failed check from a search that found nothing.
+    CommandExit(Option<i32>, CommandPurpose),
     /// A file was read, carrying what was read and the hash of the content.
     ///
     /// Both travel out of the arm for the same reason the exit code does:
@@ -99,10 +102,13 @@ enum ActionOutcome {
 /// the *absence* of confirming evidence.
 fn evidence_for(outcome: &ActionOutcome, marker_id: &str) -> Option<crate::plan::Evidence> {
     match outcome {
-        ActionOutcome::CommandExit(exit_code) => Some(crate::plan::Evidence::CommandExit {
-            marker_id: marker_id.to_string(),
-            exit_code: *exit_code,
-        }),
+        ActionOutcome::CommandExit(exit_code, purpose) => {
+            Some(crate::plan::Evidence::CommandExit {
+                marker_id: marker_id.to_string(),
+                exit_code: *exit_code,
+                purpose: *purpose,
+            })
+        }
         // No marker id: unlike a command, the fact worth keeping is *which
         // content* was read, and the hash says that across turns while a
         // marker id only points at the call. §5.3's rule that evidence must
@@ -2757,7 +2763,7 @@ impl ChatOrchestrator {
                             (
                                 tool_call_summary(&command_request),
                                 command_context,
-                                ActionOutcome::CommandExit(exit_code),
+                                ActionOutcome::CommandExit(exit_code, record.execution.purpose),
                             )
                         }
                         ToolAction::ProposePatch(generated_edit) => {
@@ -3225,7 +3231,7 @@ impl ChatOrchestrator {
                 // the exit code rather than passed beside it — the two cannot then
                 // disagree in the log.
                 match action_outcome {
-                    ActionOutcome::CommandExit(exit_code) => self
+                    ActionOutcome::CommandExit(exit_code, _) => self
                         .session_store
                         .finish_command_action(action_marker, exit_code)?,
                     // A successful read is an `ok` dispatch like any other; the
@@ -5487,10 +5493,14 @@ mod evidence_tests {
     #[test]
     fn a_failing_command_produces_evidence_carrying_its_code() {
         assert_eq!(
-            evidence_for(&ActionOutcome::CommandExit(Some(1)), "action_1"),
+            evidence_for(
+                &ActionOutcome::CommandExit(Some(1), CommandPurpose::Check),
+                "action_1"
+            ),
             Some(Evidence::CommandExit {
                 marker_id: "action_1".to_string(),
                 exit_code: Some(1),
+                purpose: CommandPurpose::Check,
             })
         );
     }
@@ -5501,10 +5511,31 @@ mod evidence_tests {
         // "we did not run it", and the status rule needs the difference to
         // block the step rather than complete it unverified.
         assert_eq!(
-            evidence_for(&ActionOutcome::CommandExit(None), "action_1"),
+            evidence_for(
+                &ActionOutcome::CommandExit(None, CommandPurpose::Other),
+                "action_1"
+            ),
             Some(Evidence::CommandExit {
                 marker_id: "action_1".to_string(),
                 exit_code: None,
+                purpose: CommandPurpose::Other,
+            })
+        );
+    }
+
+    #[test]
+    fn a_failed_exploration_still_produces_evidence_carrying_its_purpose() {
+        // Spec 63 §5.3: the exit stays evidence. What changes is only how the
+        // status rule reads it, so the purpose has to reach the step.
+        assert_eq!(
+            evidence_for(
+                &ActionOutcome::CommandExit(Some(1), CommandPurpose::Exploration),
+                "action_1"
+            ),
+            Some(Evidence::CommandExit {
+                marker_id: "action_1".to_string(),
+                exit_code: Some(1),
+                purpose: CommandPurpose::Exploration,
             })
         );
     }
