@@ -708,6 +708,35 @@ mod tests {
         );
     }
 
+    /// Spec 64 requirement 8: Plan and Review use the tightened read-only
+    /// definition, because they read the same classification.
+    #[test]
+    fn plan_and_review_refuse_commands_the_read_only_boundary_refuses() {
+        let policy = crate::command_policy::CommandPolicy::new(crate::config::Config::default());
+        let root = std::path::Path::new("/Users/example/project");
+        let permits = |mode: SessionMode, command: &str| {
+            let action = ToolAction::Command(CommandRequest {
+                command: command.into(),
+                reason: String::new(),
+                working_directory: None,
+            });
+            let classification = policy.classify(command, root);
+            mode_permits(mode, &action, Some(&classification), None).is_allowed()
+        };
+        for mode in [SessionMode::Plan, SessionMode::Review] {
+            for command in [
+                "git diff --output=README.md",
+                "git log --output=x",
+                "ls $HOME/.ssh",
+                "git show HEAD:.env",
+                "git -C /tmp status",
+            ] {
+                assert!(!permits(mode, command), "{mode:?} ran {command}");
+            }
+            assert!(permits(mode, "git log --oneline -n 5"), "{mode:?}");
+        }
+    }
+
     #[test]
     fn plan_refuses_a_mutating_command() {
         let action = ToolAction::Command(CommandRequest {
