@@ -1,10 +1,12 @@
 # Feature Spec: Worktree-Aware Read Tools
 
-Status: Not started. Specified on 2026-10-17 from the same session as
-[#59](../59_exploration_round_allowance/proposal.md), after it was continued
-three times and still did not finish: 35 of its 40 approval prompts were
-read-only commands the agent ran in worktrees because no tool could reach them
-([`context.md`](context.md) §1). Not yet planned: there is no `tasks.md`.
+Status: In progress (started 2026-10-17). Task 1 of 6 is done: registered
+worktrees are resolved and refused (§5.1); the tools do not use it yet. Plan and
+progress in [`tasks.md`](tasks.md). Specified on 2026-10-17 from the same
+session as [#59](../59_exploration_round_allowance/proposal.md), after it was
+continued three times and still did not finish: 35 of its 40 approval prompts
+were read-only commands the agent ran in worktrees because no tool could reach
+them ([`context.md`](context.md) §1).
 Order: 60 of 60
 Plan: none. Evidence-driven like [#47](../47_agent_working_capability/proposal.md)
 and #59 — an exception to the rule in [`README.md`](../README.md).
@@ -131,13 +133,19 @@ entry. This spec applies it to the one place #47's tools stop.
 ### 5.1 Which worktrees are reachable
 
 `GitService::worktrees(repository_root)` runs
-`git -C <root> worktree list --porcelain` and parses each entry's `worktree`,
-`HEAD`, `branch`, `detached`, `locked` and `prunable` lines.
+`git -C <root> worktree list --porcelain -z` and parses each entry's `worktree`,
+`HEAD`, `branch`, `bare`, `detached`, `locked` and `prunable` lines. `-z`
+terminates fields with NUL, so a worktree path containing a newline cannot
+forge a second entry.
 
 A worktree is **reachable** when all of these hold:
 
-- it is listed, is not the main worktree (that is the session's own checkout,
-  addressed by omitting `worktree`), and is not `prunable`;
+- it is listed, is not `bare`, is not the session's own checkout (addressed by
+  omitting `worktree`), and is not `prunable`. The own checkout is the entry
+  whose canonical path is the session's canonical root. That is usually git's
+  main worktree, but not in a spec 57 worker session, whose root is a linked
+  worktree; there the main worktree is an ordinary entry, reachable only under
+  the location rule below (`tasks.md` C1);
 - its listed path canonicalizes, and the canonical path is a directory;
 - the canonical path is inside the canonical repository root, or inside a
   canonical `allowed_roots` entry (requirement 6);
@@ -147,7 +155,10 @@ A `worktree` argument is resolved by canonicalizing it — as given, absolute or
 relative to the repository root — and comparing it with the canonical paths of
 the reachable set. Only an exact match is accepted. Everything else is refused
 with the reachable worktrees listed in the error, so the model can correct
-itself in the same round rather than guess.
+itself in the same round rather than guess. When the argument is a registered
+worktree that is not reachable, the refusal also says why: the session's own
+checkout, bare, prunable, missing, or outside the repository root and
+`allowed_roots`.
 
 Comparing canonical paths with a set git produced is the whole defence against
 a planted directory. A cloned repository can ship `.claude/worktrees/x` as a
@@ -211,10 +222,15 @@ These apply to every git read, including today's `read_git_status` and
 `read_git_diff` on the main checkout, because the same function serves both and
 the gaps are the same ([`context.md`](context.md) §3).
 
-- **Restricted paths are excluded** with `:(exclude,glob)<pattern>` pathspecs
-  built from `restricted_patterns`, so a restricted file's changes never leave
-  git. Status entries for restricted paths are dropped the way
-  `list_directory` drops them, since a path can name a secret.
+- **Restricted paths are excluded** with `PathPolicy::is_restricted`, the
+  matcher `read_file` and `list_directory` use. `restricted_patterns` are
+  gitignore-style (`.env` matches at any depth, `!` negates), which a
+  `:(exclude,glob)` pathspec cannot express, so the changed paths are listed
+  first (`--name-status -z --no-renames`, so both sides of a rename are
+  checked), restricted ones are dropped, and the content diff runs over the
+  rest as `:(top,literal)` pathspecs (`tasks.md` C2). Status entries for
+  restricted paths are dropped from both the parsed files and the raw porcelain
+  the way `list_directory` drops them, since a path can name a secret.
 - **Output is bounded** by `max_read_lines` and `max_file_bytes`, whichever
   binds first, and a truncated result says so and how much it cut — the rule
   #47 §5.5 set for reads.
@@ -222,6 +238,10 @@ the gaps are the same ([`context.md`](context.md) §3).
   `-c core.fsmonitor=false`, and `diff` and `log` pass `--no-ext-diff` and
   `--no-textconv`. `.gitattributes` is repository content; it can name a diff
   driver, and a user's own git config can define one with that name.
+- **A read takes no lock.** Every invocation passes `--no-optional-locks`, as
+  `checkpoint.rs::run_user_git` does. Otherwise `git status` may take
+  `index.lock` to refresh the index, and in a worktree where another agent is
+  working, that agent's own `git add` could fail (`tasks.md` C3).
 - **Arguments cannot become options.** `base` must satisfy git's ref-name rules
   and must not start with `-`; it is passed after `--end-of-options`. `paths`
   are resolved through `PathPolicy` against the worktree first and passed after
@@ -247,8 +267,11 @@ the gaps are the same ([`context.md`](context.md) §3).
 `ToolAction::ListWorktrees` and `ToolAction::ReadGitLog` are
 `ActionEffect::ReadOnly` in `action_effect`, so they batch within a round, need
 no approval, count as exploration under #59, and the mode matrix allows them
-everywhere, as it does today's git reads. The `worktree` field on the existing
-variants changes none of that.
+everywhere, as it does today's git reads. `mode.rs` crosses tools with two
+exhaustive matches, `profile_permits` and `mode_permits`; both gain the two
+variants in their read-only arms, and `ReadGitStatus` becomes a struct variant
+there (`tasks.md` C6). The `worktree` field on the existing variants changes
+none of that.
 
 ### 5.7 Eval scenario
 
@@ -297,4 +320,7 @@ and why: not registered, outside the allowed roots, or prunable), and
 
 ## 7. Implementation Notes
 
-None yet.
+- Task 1 (2026-10-17): resolution lives in `worktree_access.rs`
+  (`parse_worktree_list`, `classify_worktrees`, `resolve_worktree`), with
+  `GitService::worktrees` and `PathPolicy::is_inside_allowed_root`. Nothing
+  dispatches through it until Task 3.

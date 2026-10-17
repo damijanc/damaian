@@ -47,6 +47,7 @@ pub mod web_diagnostics;
 pub mod worker_progress;
 pub mod workspace_engine;
 pub mod worktree;
+pub mod worktree_access;
 
 pub use audit::AuditLog;
 pub use cancel::CancelToken;
