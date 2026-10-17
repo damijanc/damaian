@@ -32,7 +32,15 @@ fn write_fixture(root: &Path, relative_path: &str, content: &str) {
     fs::write(path, content).unwrap();
 }
 
+/// `#[ignore]`d per `AGENTS.md` because the first run on a machine downloads
+/// the embedding model from huggingface.co. Run it by hand:
+///
+/// ```sh
+/// cargo test -p workspace-engine --test semantic_search -- --ignored --exact \
+///   embedding_model_scores_semantically_similar_text_higher_than_unrelated_text
+/// ```
 #[test]
+#[ignore]
 fn embedding_model_scores_semantically_similar_text_higher_than_unrelated_text() {
     let model = EmbeddingModel::load(&embedding_cache_dir())
         .expect("embedding model should load (requires network on first run)");
@@ -62,9 +70,30 @@ fn embedding_model_scores_semantically_similar_text_higher_than_unrelated_text()
     );
 }
 
+/// `#[ignore]`d per `AGENTS.md` because the first run on a machine downloads
+/// the embedding model from huggingface.co. Run it by hand:
+///
+/// ```sh
+/// cargo test -p workspace-engine --test semantic_search -- --ignored --exact \
+///   vector_index_cache_finds_semantically_related_code_that_keyword_search_misses
+/// ```
 #[test]
+#[ignore]
 fn vector_index_cache_finds_semantically_related_code_that_keyword_search_misses() {
     let repo = temp_repo_dir("vector-index");
+    let data_dir = repo.join(".damaian");
+    // The model loads from `<data_dir>/models`. This test's data dir is new
+    // on every run, so without the link it would download ~90MB each time.
+    // The vector index itself stays in the fresh data dir, where the
+    // assertions below expect it.
+    EmbeddingModel::load(&embedding_cache_dir())
+        .expect("embedding model should load (requires network on first run)");
+    fs::create_dir_all(&data_dir).expect("data dir should be created");
+    std::os::unix::fs::symlink(
+        embedding_cache_dir().join("models"),
+        data_dir.join("models"),
+    )
+    .expect("model directory should be linked to the shared cache");
     write_fixture(
         &repo,
         "src/resilience.rs",
@@ -80,7 +109,7 @@ fn vector_index_cache_finds_semantically_related_code_that_keyword_search_misses
     );
 
     let config = Config {
-        data_dir: repo.join(".damaian"),
+        data_dir,
         enable_semantic_search: true,
         ..Config::default()
     };

@@ -653,7 +653,7 @@ Tests that:
 
 must be `#[ignore]` unless there is a compelling reason otherwise.
 
-Known examples: `serves_the_ui_for_manual_inspection` (serves the real web UI on port 4899 with a known API token), `live_tier_runs_one_scenario_against_a_real_provider` (calls a real model provider over the network), and `a_real_sigkill_mid_action_leaves_a_readable_log_and_an_unknown_outcome` (spawns a child process and `SIGKILL`s it, plus the helper test it re-executes into), alongside tests that open Finder, spawn a real login shell, or read your own checkout to measure census cost.
+Known examples: `serves_the_ui_for_manual_inspection` (serves the real web UI on port 4899 with a known API token), `live_tier_runs_one_scenario_against_a_real_provider` (calls a real model provider over the network), and `a_real_sigkill_mid_action_leaves_a_readable_log_and_an_unknown_outcome` (spawns a child process and `SIGKILL`s it, plus the helper test it re-executes into), the two `semantic_search` tests (download the embedding model from huggingface.co on first run), alongside tests that open Finder, spawn a real login shell, or read your own checkout to measure census cost.
 
 Every ignored test with side effects must include a doc comment explaining the command needed to run it manually.
 
