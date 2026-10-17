@@ -1,13 +1,18 @@
 //! Spec 63 Task 1: a command's purpose is decided when it is proposed,
 //! stored with the proposal, and carried to its execution — and it never
-//! changes what the policy decided (requirement 6).
+//! changes what the policy decided (requirement 6). Task 2: a failed
+//! exploration command records no finding.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::config::CommandAccess;
-use workspace_engine::{CancelToken, CommandProposal, CommandPurpose, Config, WorkspaceEngine};
+use workspace_engine::finding::{Finding, FindingSource, Severity};
+use workspace_engine::{
+    CancelToken, CommandProposal, CommandPurpose, Config, MockModelAdapter, ModelAdapter,
+    ModelRequest, ModelRun, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
+};
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -224,6 +229,200 @@ fn the_execution_carries_the_stored_purpose() {
 
     assert_ne!(record.execution.exit_code, Some(0));
     assert_eq!(record.execution.purpose, CommandPurpose::Exploration);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Task 2: no findings for exploration, through the chat loop.
+// ---------------------------------------------------------------------------
+
+/// Delegates to a scripted mock and keeps every request, so a test can see
+/// the tool result the model was given.
+struct Recording {
+    inner: MockModelAdapter,
+    requests: Vec<ModelRequest>,
+}
+
+impl ModelAdapter for Recording {
+    fn stream_response(
+        &mut self,
+        request: &ModelRequest,
+        cancel: &CancelToken,
+        on_token: &mut dyn FnMut(&str),
+        on_wait: &mut dyn FnMut(u64),
+    ) -> workspace_engine::Result<ModelRun> {
+        self.requests.push(request.clone());
+        self.inner
+            .stream_response(request, cancel, on_token, on_wait)
+    }
+}
+
+/// One `run_command` round, then a plain answer.
+fn one_command(command: &str) -> MockModelAdapter {
+    let arguments = serde_json::json!({ "command": command, "reason": "Look around" });
+    MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Done.".to_string()],
+        vec![
+            vec![ToolCall {
+                id: "call_run_command".to_string(),
+                name: "run_command".to_string(),
+                arguments_json: arguments.to_string(),
+            }],
+            Vec::new(),
+        ],
+    )
+}
+
+/// What one agent command left behind: its session's findings, and the
+/// tool result the model received for it.
+struct AgentRun {
+    findings: Vec<Finding>,
+    tool_result: String,
+}
+
+/// Runs `command` as the agent would, approving it when the policy asks, so
+/// a test covers whichever of `record_command_findings`' two call paths the
+/// policy picks.
+fn run_as_agent(engine: &WorkspaceEngine, repo: &Path, command: &str) -> AgentRun {
+    let cancel = CancelToken::new();
+    let (mut on_token, mut on_progress) = (|_: &str| {}, |_: TurnProgress| {});
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let mut adapter = Recording {
+        inner: one_command(command),
+        requests: Vec::new(),
+    };
+    let result = engine
+        .chat_orchestrator
+        .ask_with_session(repo, "Look around", &[], None, &mut adapter, &mut sink)
+        .expect("the turn should run");
+    if let Some(proposal) = &result.command_proposal {
+        assert!(!proposal.blocked, "{command}: {proposal:?}");
+        adapter.inner = MockModelAdapter::new("Done.");
+        engine
+            .chat_orchestrator
+            .resume_after_command_decision(&proposal.id, true, "tester", &mut adapter, &mut sink)
+            .expect("the resumed turn should run");
+    }
+
+    let header = format!("Command: {command}\n");
+    let tool_result = adapter
+        .requests
+        .iter()
+        .flat_map(|request| &request.messages)
+        .map(|message| message.content.clone())
+        .find(|content| content.contains(&header))
+        .unwrap_or_else(|| panic!("{command}: the model never saw the command's result"));
+    let findings = engine
+        .session_store
+        .read_findings(&result.session.id, repo)
+        .expect("findings should read");
+    AgentRun {
+        findings,
+        tool_result,
+    }
+}
+
+fn failed_exit(tool_result: &str) -> bool {
+    tool_result.contains("Exit code: ") && !tool_result.contains("Exit code: 0\n")
+}
+
+/// Requirement 2 and the first two acceptance criteria. The commands are
+/// the two from proposal §1 and an unsuccessful search. `/bin/sh` has no
+/// `nomatch`, so the glob command fails here because `grep` found nothing,
+/// not because the shell refused it; it is the same exploration either way.
+#[test]
+fn failed_exploration_commands_record_no_finding_and_still_reach_the_model() {
+    let repo = temp_dir("exploration");
+    let worktree = repo.join(".claude/worktrees/spec25-task8/src");
+    fs::create_dir_all(&worktree).unwrap();
+    fs::write(worktree.join("a.rs"), "fn main() {}\n").unwrap();
+    // Outside the repository, or `grep -rn nothing-matches .` finds its own
+    // command in the session log.
+    let data = temp_dir("exploration-data");
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: data.clone(),
+        ..test_config(&repo)
+    });
+
+    for (command, says) in [
+        (
+            "cd .claude/worktrees/spec25-task8 && grep -rn 'ContextManager::new' --include=*.rs .",
+            "",
+        ),
+        ("ls -d target; du -sh target; ls -d ../../target", "target"),
+        ("grep -rn nothing-matches .", ""),
+    ] {
+        let proposal = engine
+            .validation_orchestrator
+            .propose_command(&repo, command, "Spec 63")
+            .unwrap();
+        assert_eq!(proposal.purpose, CommandPurpose::Exploration, "{command}");
+
+        let run = run_as_agent(&engine, &repo, command);
+        assert!(
+            failed_exit(&run.tool_result),
+            "{command}: {}",
+            run.tool_result
+        );
+        assert!(run.tool_result.contains(says), "{}", run.tool_result);
+        assert!(run.findings.is_empty(), "{command}: {:?}", run.findings);
+    }
+
+    fs::remove_dir_all(repo).unwrap();
+    fs::remove_dir_all(data).unwrap();
+}
+
+/// Requirement 4: an unrecognised command keeps today's generic finding.
+/// The script fails whether `python3` is installed or not.
+#[test]
+fn a_failed_other_command_records_a_generic_finding() {
+    let repo = temp_dir("other");
+    fs::write(repo.join("script.py"), "raise SystemExit('boom')\n").unwrap();
+    let engine = WorkspaceEngine::new(test_config(&repo));
+
+    let run = run_as_agent(&engine, &repo, "python3 script.py");
+
+    assert!(failed_exit(&run.tool_result), "{}", run.tool_result);
+    assert_eq!(run.findings.len(), 1, "{:?}", run.findings);
+    assert_eq!(run.findings[0].source(), FindingSource::Command);
+    assert!(
+        run.findings[0].summary().starts_with("python3 script.py"),
+        "{}",
+        run.findings[0].summary()
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+/// Requirement 3: checks record findings as before. Neither project exists
+/// in the fixture, so both fail before running anything: the Rust test
+/// parser reads cargo's `error:` line, and `npm` gets the generic fallback.
+#[test]
+fn failed_checks_record_findings_as_before() {
+    let repo = temp_dir("checks");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+
+    for command in ["cargo test", "npm run lint"] {
+        let run = run_as_agent(&engine, &repo, command);
+        assert!(
+            failed_exit(&run.tool_result),
+            "{command}: {}",
+            run.tool_result
+        );
+        assert!(
+            run.findings
+                .iter()
+                .any(|finding| finding.severity() == Severity::Error),
+            "{command}: {:?}",
+            run.findings
+        );
+    }
 
     fs::remove_dir_all(repo).unwrap();
 }

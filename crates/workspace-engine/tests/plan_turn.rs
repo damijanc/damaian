@@ -8,6 +8,7 @@
 //! from what the engine observed and not from what the model said about it.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -192,7 +193,16 @@ fn a_step_whose_command_failed_is_blocked_however_the_model_describes_it() {
     // The requirement this spec exists for. The model completes the step and
     // says so in prose; the command it ran exited non-zero. Evidence wins.
     let repo = temp_repo("blocked");
-    let engine = engine_for(&repo);
+    // A failed `ls` is exploration, which records no finding (spec 63), so
+    // the failing check here is a repository script, run without approval.
+    fs::write(repo.join("check"), "#!/bin/sh\nexec ls no-such-directory\n").unwrap();
+    fs::set_permissions(repo.join("check"), fs::Permissions::from_mode(0o755)).unwrap();
+    let engine = WorkspaceEngine::new(Config {
+        command_allowlist: vec!["./check".to_string()],
+        data_dir: repo.join(".damaian"),
+        enable_index_watcher: false,
+        ..Config::default()
+    });
     let mut adapter = scripted(vec![
         vec![call(
             "propose_plan",
@@ -200,7 +210,7 @@ fn a_step_whose_command_failed_is_blocked_however_the_model_describes_it() {
         )],
         vec![call(
             "run_command",
-            r#"{"command":"ls no-such-directory","reason":"List it"}"#,
+            r#"{"command":"./check","reason":"Check it"}"#,
         )],
         vec![call("complete_step", "{}")],
     ]);

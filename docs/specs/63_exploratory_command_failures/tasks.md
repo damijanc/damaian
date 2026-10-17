@@ -10,7 +10,7 @@
 | Task | State | Notes |
 |---|---|---|
 | 1 · `CommandPurpose`, proposal to execution | Done 2026-10-17 | New module `command_purpose.rs`: `CommandPurpose { Check, Exploration, Other }` (serde `snake_case`, `Default` = `Other`, `as_str`/`from_stored`, where an unknown value reads as `Other`) and `command_purpose(command, detected)`. Check means `detected`, `is_validation_command`, or any `default_parsers()` match. Exploration means every simple command is on the list, ignoring `cd <dir>`; a lone `cd` is `Other`. The split respects quotes and treats `2>&1` as a redirection. `git -C <dir> <read>` counts (C7). `CommandProposal.purpose` is computed in `proposal_from_classification` from `classification.command`, after the policy decided. It is stored as a trailing optional `PURPOSE` field (C2), and `store_proposal(…, detected)` is the private path that `propose_command_at` (`false`) and `propose_detected_validations` (`true`) share. `CommandExecution.purpose` comes from the new `CommandRunOptions::purpose`, which `run_proposal` fills (C3). `command_policy.rs`: one change, `is_validation_command` is now `pub(crate)`. Re-exported as `workspace_engine::{CommandPurpose, command_purpose}`. Test literals of `CommandExecution` and `CommandRunOptions` gained `purpose: Other` (finding.rs, its three parsers, one chat.rs test, command_runner.rs, tests/command_lifecycle.rs). **Tests:** 7 unit tests in `command_purpose::tests` and 5 in the new `tests/command_purpose.rs`. Among them, `purpose_never_changes_what_the_policy_decided` checks requirement 6: for 16 commands under 4 configs (default, approve-all, `command_access` ReadOnly and None), the stored proposal's command, risk, blocked, approval, reasons, effects and network flag equal `classify_command`, and `command_needs_approval` agrees. **Falsified:** dropping `detected` from `command_purpose` fails `a_detected_validation_is_a_check_whatever_its_text`. Clearing `requires_approval` for exploration in `proposal_from_classification` fails `purpose_never_changes_what_the_policy_decided`. Both were reverted. **Discovery (C4):** every command `detect_in` produces today is already on the validation list, so `detected` changes no current outcome and is tested at the function level only. **Checks (local, 2026-10-17):** fmt, node, lint and typos passed. `cargo deny` passed outside the sandbox; inside it, it cannot take its advisory lock. Scoped clippy for `workspace-engine` passed. `cargo check` of `desktop-shell`, `damaian-cli` and `eval-harness` is clean. `cargo nextest run -p workspace-engine`: 1210 of 1210 passed outside the sandbox; inside it, only the FSEvents watcher test failed. Workspace clippy and tests are left to CI. |
-| 2 · No findings for exploration | Not started | |
+| 2 · No findings for exploration | Done 2026-10-17 | `findings_from_execution` (`finding.rs`) returns empty for `execution.purpose == Exploration` before any parser runs. The signature is unchanged, because Task 1 already put the purpose on `CommandExecution`, so `record_command_findings` (`chat.rs`) and both of its call paths are untouched. Proposal §5.2 is corrected to say so. **Tests:** in `finding::dispatch_tests`, `an_exploration_command_yields_no_findings` covers seven runs: a plain failure, one a parser explains, one with only warnings, a pass with warnings, a timeout, a signal and a cancellation. `a_check_and_an_other_command_keep_todays_findings` checks that the same runs give `Check` and `Other` exactly what they get today. In `tests/command_purpose.rs`, three chat-loop tests drive `MockModelAdapter` through a recording wrapper and approve when the policy asks. `failed_exploration_commands_record_no_finding_and_still_reach_the_model` runs the two §1 commands and `grep -rn nothing-matches .`, each with a non-zero exit in the tool result and no finding. `a_failed_other_command_records_a_generic_finding` runs `python3 script.py`. `failed_checks_record_findings_as_before` runs `cargo test` and `npm run lint`. **Deviations:** (a) The tests run under `/bin/sh`, which has no `nomatch`, so the §1 glob command fails because `grep` found nothing rather than because zsh refused it. It is the same exploration either way. (b) The search test keeps the data directory outside the fixture, because otherwise `grep -rn … .` matches its own session log. (c) With no `Cargo.toml`, `cargo test`'s finding comes from the Rust test parser reading cargo's `error:` line, not from the generic fallback, so the test asserts an error finding rather than its summary. **Discovery:** five existing tests used a failing `ls no-such-directory` to stand for "a failed command": four in `tests/finding_recording.rs` and `a_step_whose_command_failed_is_blocked_however_the_model_describes_it` in `tests/plan_turn.rs`. `ls` is exploration, so they now run an allowlisted repository script (`./list`, `./check`), which is `Other`, keeps the generic finding and still runs without approval. What they check is unchanged. Task 3 should know that the plan-blocking test no longer uses an exploration command. The eval scenario `failed_validation_retry` still runs `ls no-such-directory`. It checks the tool outcome, not findings, so it is unaffected here, but Task 5's per-purpose report will count it as exploration. **Falsified:** with the early return removed, `an_exploration_command_yields_no_findings` and the chat-level exploration test fail, and nothing else does. The early return was restored. Step 2's "confirm they fail" was shown this way, because the implementation was written before the first run. **Checks (local, 2026-10-17):** fmt, node, lint and typos passed. `cargo deny` passed outside the sandbox; inside it, it cannot take its advisory lock. Scoped clippy for `workspace-engine` passed. The verification-loop tests and `finding_recording` passed (8 of 8). `cargo nextest run -p workspace-engine`: 1247 of 1248 passed inside the sandbox; the one failure is the FSEvents watcher test, which needs a real FSEvents. Workspace clippy and tests are left to CI. |
 | 3 · Plan evidence that does not block on exploration | Not started | |
 | 4 · The shell named in model-facing text | Not started | |
 | 5 · Recording and the eval report | Not started | |
@@ -176,7 +176,7 @@ Task 6 closes the spec.
 `chat.rs` (`record_command_findings` only), `tests/command_purpose.rs`, and
 the existing finding tests.
 
-- [ ] **Step 1: Write the failing tests.** In `finding.rs`: a failed
+- [x] **Step 1: Write the failing tests.** In `finding.rs`: a failed
   `Exploration` execution yields no findings, whatever its exit code or
   termination. `Check` and `Other` are unchanged: the existing parser and
   generic-fallback tests pass with the purpose set to each. Through the chat
@@ -185,18 +185,18 @@ the existing finding tests.
   reaches the model as the tool result. `python3 script.py` failing records
   one generic finding. `cargo test` and `npm run lint` failing record
   findings as before.
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Implement.** `findings_from_execution` reads
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: Implement.** `findings_from_execution` reads
   `execution.purpose` (it is already on the execution, so the signature need
   not change; if a parameter reads better, pass it from
   `record_command_findings` on both call paths). For `Exploration` it returns
   empty before any parser runs.
-- [ ] **Step 4: Falsify** by returning the generic draft for exploration
+- [x] **Step 4: Falsify** by returning the generic draft for exploration
   again, and confirm the chat-level test fails.
-- [ ] **Step 5: Confirm #23 is untouched.** Run the verification-loop tests
+- [x] **Step 5: Confirm #23 is untouched.** Run the verification-loop tests
   (`cargo nextest run -p workspace-engine -E 'test(verification)'`) and
   `tests/finding_recording.rs`.
-- [ ] **Step 6: Scoped checks**, then update this row and the proposal.
+- [x] **Step 6: Scoped checks**, then update this row and the proposal.
 
 ## Task 3: Plan evidence that does not block on exploration
 

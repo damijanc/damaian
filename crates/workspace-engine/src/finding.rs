@@ -4,6 +4,7 @@
 //! and therefore the only place redaction and bounding happen
 //! (`docs/specs/22_findings_model_and_panel/context.md` §2).
 
+use crate::command_purpose::CommandPurpose;
 use crate::command_runner::{CommandExecution, CommandTermination};
 use crate::hash::{create_id, now_millis};
 use crate::secret_scanner::SecretScanner;
@@ -344,11 +345,19 @@ fn verdict(execution: &CommandExecution) -> Verdict {
 /// error falls through to one generic finding, so a regex that stops
 /// matching after a tool upgrade cannot swallow a failure (§5.3). Warnings
 /// alone do not explain a failure (`context.md` §10).
+///
+/// An exploration command yields nothing, whatever its result: a `grep`
+/// that matched nothing or an `ls` of a missing directory says nothing about
+/// the user's code (spec 63 §5.2). Its output still reaches the model as the
+/// tool result.
 pub fn findings_from_execution(
     execution: &CommandExecution,
     parsers: &[Box<dyn FindingParser>],
     scanner: &SecretScanner,
 ) -> Vec<Finding> {
+    if execution.purpose == CommandPurpose::Exploration {
+        return Vec::new();
+    }
     let mut drafts = parsers
         .iter()
         .find(|parser| parser.matches(&execution.command))
@@ -986,5 +995,92 @@ mod dispatch_tests {
             findings[0].summary()
         );
         assert!(!findings[0].details().unwrap().contains(key));
+    }
+
+    fn with_purpose(mut execution: CommandExecution, purpose: CommandPurpose) -> CommandExecution {
+        execution.purpose = purpose;
+        execution
+    }
+
+    /// One execution of each kind the tests above cover: a plain failure,
+    /// one a parser explains, one with only warnings, a pass with warnings,
+    /// a timeout, a signal and a cancellation.
+    fn every_kind_of_run() -> Vec<(CommandExecution, Vec<Box<dyn FindingParser>>)> {
+        let error = || vec![draft(FindingSource::Test, Severity::Error, "a failed")];
+        let warning = || vec![draft(FindingSource::Compiler, Severity::Warning, "unused")];
+        vec![
+            (failed("grep -rn x .", "", "nothing\n"), vec![]),
+            (
+                failed("grep -rn x .", "", "boom\n"),
+                vec![stub("grep", error())],
+            ),
+            (
+                failed("grep -rn x .", "", "SIGABRT\n"),
+                vec![stub("grep", warning())],
+            ),
+            (passed("grep -rn x ."), vec![stub("grep", warning())]),
+            (
+                execution("ls", CommandTermination::TimedOut, None, "a\n", ""),
+                vec![],
+            ),
+            (
+                execution("ls", CommandTermination::Exited, None, "", ""),
+                vec![],
+            ),
+            (
+                execution("ls", CommandTermination::Cancelled, None, "", ""),
+                vec![stub("ls", error())],
+            ),
+        ]
+    }
+
+    /// Spec 63 requirement 2: whatever its exit or termination, and even
+    /// when a parser would have explained it.
+    #[test]
+    fn an_exploration_command_yields_no_findings() {
+        for (run_of, parsers) in every_kind_of_run() {
+            let exploration = with_purpose(run_of, CommandPurpose::Exploration);
+            assert!(
+                run(&exploration, &parsers).is_empty(),
+                "{} ({:?}, {:?})",
+                exploration.command,
+                exploration.termination,
+                exploration.exit_code
+            );
+        }
+    }
+
+    /// Spec 63 requirements 3 and 4: a check and an unrecognised command get
+    /// exactly what the tests above expect of a run with no purpose.
+    #[test]
+    fn a_check_and_an_other_command_keep_todays_findings() {
+        let shape = |findings: Vec<Finding>| -> Vec<_> {
+            findings
+                .iter()
+                .map(|f| {
+                    (
+                        f.source(),
+                        f.severity(),
+                        f.summary().to_string(),
+                        f.details().map(str::to_string),
+                    )
+                })
+                .collect()
+        };
+        let mut produced = 0;
+        for (run_of, parsers) in every_kind_of_run() {
+            let today = shape(run(&run_of, &parsers));
+            produced += today.len();
+            for purpose in [CommandPurpose::Check, CommandPurpose::Other] {
+                let execution = with_purpose(run_of.clone(), purpose);
+                assert_eq!(
+                    shape(run(&execution, &parsers)),
+                    today,
+                    "{purpose:?}: {}",
+                    execution.command
+                );
+            }
+        }
+        assert!(produced > 0, "the runs must produce findings to compare");
     }
 }
