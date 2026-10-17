@@ -44,7 +44,7 @@ test. Each was reverted. No `chat.rs` or `mode.rs` change in this task.
 (outside the agent sandbox, which cannot take its advisory-db lock); scoped
 clippy for `workspace-engine` is clean; nextest over `worktree_reads`,
 `worktree`, `agent_tools` and the `worktree_access`/`path_policy`/`git_service`
-unit tests: 80 passed. Workspace clippy and tests are left to CI.
+unit tests: 80 passed. The full seven-check gate passed in CI on 2026-10-17.
 
 **Task 2 (Done 2026-10-17).** `git_service.rs`: every git process starts from
 one runner, `read_git`: `--no-optional-locks`, `-c core.fsmonitor=false`, `-c
