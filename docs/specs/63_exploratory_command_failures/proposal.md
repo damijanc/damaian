@@ -1,23 +1,24 @@
 # Feature Spec: Exploratory Command Failures Are Not Findings
 
-Status: Not started. Specified on 2026-10-17 from the session behind
-[#59](59_exploration_round_allowance/proposal.md)–[#62](62_approval_prompts_name_the_reason.md),
+Status: In progress (started 2026-10-17; Task 1 of 6 done — see
+[`tasks.md`](tasks.md)). Specified on 2026-10-17 from the session behind
+[#59](../59_exploration_round_allowance/proposal.md)–[#62](../62_approval_prompts_name_the_reason.md),
 a reporting-only request that left two open **error** findings behind: an
 unquoted glob that zsh refused, and an `ls -d` of a directory that did not
 exist.
 Order: 63 of 63
 Plan: none. Evidence-driven, like #47 — an exception to the rule in
-[`README.md`](README.md).
-Depends on: [#22](22_findings_model_and_panel/proposal.md) (the finding model and
-its generic fallback) — built; [#21](21_task_plan_progress_and_budget/proposal.md)
+[`README.md`](../README.md).
+Depends on: [#22](../22_findings_model_and_panel/proposal.md) (the finding model and
+its generic fallback) — built; [#21](../21_task_plan_progress_and_budget/proposal.md)
 (plan evidence and step status) — built. Everything else named below is a
 cross-reference, not a prerequisite.
 Related implementation specs:
-[`23_verification_loop`](23_verification_loop/proposal.md) (whose checks are
+[`23_verification_loop`](../23_verification_loop/proposal.md) (whose checks are
 detected validations, and which this spec must not weaken),
-[`58_header_repo_bar_and_menus`](58_header_repo_bar_and_menus/proposal.md) (the
+[`58_header_repo_bar_and_menus`](../58_header_repo_bar_and_menus/proposal.md) (the
 *Fix N errors* action that offered these two for repair),
-[`62_approval_prompts_name_the_reason.md`](62_approval_prompts_name_the_reason.md)
+[`62_approval_prompts_name_the_reason.md`](../62_approval_prompts_name_the_reason.md)
 (also corrects what the model is told about the shell).
 
 ## 1. Motivation
@@ -100,15 +101,25 @@ was looking.
 - Changing the user's shell or its options. Setting `NO_NOMATCH` for agent
   commands would change what a command means relative to the same command typed
   by the user, and `shell` is the user's setting.
-- Deciding approval from purpose. That is [#64](64_read_only_command_boundary.md)'s
+- Deciding approval from purpose. That is [#64](../64_read_only_command_boundary.md)'s
   subject, and it uses its own, stricter rules.
 
 ## 5. Design
 
 ### 5.1 Deciding the purpose
 
-`CommandPurpose { Check, Exploration, Other }`, computed in `validation.rs` when a
-proposal is built and stored on `CommandProposal` and then `CommandExecution`.
+`CommandPurpose { Check, Exploration, Other }`, defined with its rules in
+`command_purpose.rs` and computed by `proposal_from_classification`
+(`validation.rs`) from the classification's command, after the policy has
+decided. It is stored on `CommandProposal` — as an optional trailing `PURPOSE`
+field of the stored proposal, so a proposal written before this spec reads as
+`Other` — and copied onto `CommandExecution` through
+`CommandRunOptions::purpose`, which `run_proposal` fills from the proposal. The
+runner carries it and never computes or reads it. Every agent command goes
+through `propose_command_at` and `run_proposal` (the auto-run path and the
+resume after approval), so the proposal is the one place it is decided.
+`command_policy.rs` is touched only to make `is_validation_command` visible to
+the crate.
 
 - **Check** when any of: the proposal came from `propose_detected_validations`
   (marked by a field, not by its reason string); `is_validation_command` matches;
@@ -120,7 +131,10 @@ proposal is built and stored on `CommandProposal` and then `CommandExecution`.
   program from a closed list: `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `grep`,
   `rg`, `find`, `sed -n`, `awk`, `sort`, `uniq`, `cut`, `du`, `stat`, `file`,
   `echo`, `true`, and `git` with `status`, `diff`, `log`, `show`, `rev-list`,
-  `rev-parse`, `branch --list`, `worktree list`, `ls-files`, `grep`.
+  `rev-parse`, `branch --list`, `worktree list`, `ls-files`, `grep`, optionally
+  after `-C <dir>`. Programs are matched by their exact first word, so
+  `./grep` and `FOO=1 grep` are `Other`. The split respects single and double
+  quotes and backslashes, and does not treat the `&` of `2>&1` as a separator.
 - **Other** otherwise.
 
 The list is generous on purpose, because requirement 6 makes it harmless: it
@@ -130,7 +144,7 @@ through the policy's approval first, and a missed finding for it is a lost hint,
 not a lost guard.
 
 The split is a lexical split for description only. It is not the parser
-[#64](64_read_only_command_boundary.md) needs for a security decision, and must
+[#64](../64_read_only_command_boundary.md) needs for a security decision, and must
 not be reused as one.
 
 ### 5.2 Findings
@@ -187,4 +201,13 @@ On Done: `docs/USER_GUIDE.md` (findings: which commands produce them), and
 
 ## 7. Implementation Notes
 
-None yet.
+The execution order and per-task record are in [`tasks.md`](tasks.md), which
+also lists the corrections found while planning (C1–C8). The ones that change
+the design above have been folded into §5.1.
+
+- **Task 1 (2026-10-17).** `CommandPurpose` and `command_purpose` are in
+  `command_purpose.rs`, not `validation.rs`: #64 rewrites `command_policy.rs` at
+  the same time, and a separate module keeps the description away from the
+  policy code. Every command `detect_in` produces today is on the validation
+  list, so the `detected` flag changes no current outcome; it is kept so a
+  future detector cannot fall through to `Other`.

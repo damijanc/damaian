@@ -4,6 +4,7 @@ pub mod chat;
 pub mod checkpoint;
 pub mod clarification;
 pub mod command_policy;
+pub mod command_purpose;
 pub mod command_runner;
 pub mod config;
 pub mod context_manager;
@@ -68,6 +69,7 @@ pub use clarification::{
 pub use command_policy::{
     CommandClassification, CommandPolicy, CommandRisk, PROJECT_MANIFESTS, allow_always_eligible,
 };
+pub use command_purpose::{CommandPurpose, command_purpose};
 pub use command_runner::{CommandExecution, CommandRunOptions, CommandRunner, CommandTermination};
 pub use config::{
     AppliedKey, CommandAccess, Config, ConfigKeyKind, ConfigOverlay, ConfigScope, CostEstimate,

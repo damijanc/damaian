@@ -123,4 +123,4 @@ of the read surface already holds.
   `--include=*.rs` that zsh's `nomatch` rejected, and an `ls -d` of a directory
   that did not exist. Neither was a defect in the user's code, and both were
   offered for repair. Specified as
-  [#63](../63_exploratory_command_failures.md).
+  [#63](../63_exploratory_command_failures/proposal.md).

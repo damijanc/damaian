@@ -210,6 +210,7 @@ mod tests {
             termination: CommandTermination::Exited,
             stdout: String::new(),
             stderr: stderr.to_string(),
+            purpose: crate::command_purpose::CommandPurpose::Other,
         }
     }
 

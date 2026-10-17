@@ -4,6 +4,7 @@ use crate::command_policy::{
     CommandClassification, CommandPolicy, CommandRisk, allow_always_eligible, relative_location,
     root_qualified_allowlist_entry,
 };
+use crate::command_purpose::{CommandPurpose, command_purpose};
 use crate::command_runner::{CommandExecution, CommandRunOptions, CommandRunner};
 use crate::config::ConfigOverlay;
 use crate::error::{ClientError, Result};
@@ -30,6 +31,10 @@ pub struct CommandProposal {
     pub reasons: Vec<String>,
     pub created_at_ms: u128,
     pub status: String,
+    /// What the command is for (spec 63 §5.1), decided from the
+    /// classification after the policy has judged it. It describes the run's
+    /// findings and evidence and never feeds back into approval.
+    pub purpose: CommandPurpose,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +246,19 @@ impl ValidationOrchestrator {
         command: &str,
         reason: &str,
     ) -> Result<CommandProposal> {
+        self.store_proposal(repository_root, working_directory, command, reason, false)
+    }
+
+    /// `detected` marks a proposal from [`Self::propose_detected_validations`],
+    /// whose purpose is `Check` whatever its text.
+    fn store_proposal(
+        &self,
+        repository_root: impl AsRef<Path>,
+        working_directory: impl AsRef<Path>,
+        command: &str,
+        reason: &str,
+        detected: bool,
+    ) -> Result<CommandProposal> {
         let classification =
             self.classify_command_at(&repository_root, &working_directory, command);
         let proposal = proposal_from_classification(
@@ -248,6 +266,7 @@ impl ValidationOrchestrator {
             working_directory.as_ref(),
             reason,
             classification,
+            detected,
         );
         self.command_store.save_proposal(&proposal)?;
         self.audit_log.record(
@@ -287,11 +306,12 @@ impl ValidationOrchestrator {
                 } else {
                     repository_root.join(&command.working_directory)
                 };
-                proposals.push(self.propose_command_at(
+                proposals.push(self.store_proposal(
                     repository_root,
                     &working_directory,
                     &command.command,
                     &format!("Detected project validation command from {}", command.name),
+                    true,
                 )?);
             }
         }
@@ -329,6 +349,7 @@ impl ValidationOrchestrator {
                 task_id,
                 cancel,
                 on_output,
+                purpose: proposal.purpose,
             },
         )?;
         let record = self.command_store.save_execution(&proposal, &execution)?;
@@ -457,7 +478,11 @@ fn proposal_from_classification(
     working_directory: &Path,
     reason: &str,
     classification: CommandClassification,
+    detected: bool,
 ) -> CommandProposal {
+    // From the classification's own command, after every policy decision
+    // above is final: the purpose is a description, not an input.
+    let purpose = command_purpose(&classification.command, detected);
     CommandProposal {
         id: create_id("cmdprop"),
         command: classification.command,
@@ -472,6 +497,7 @@ fn proposal_from_classification(
         reasons: classification.reasons,
         created_at_ms: now_millis(),
         status: "pending".to_string(),
+        purpose,
     }
 }
 
@@ -523,6 +549,9 @@ fn serialize_proposal(proposal: &CommandProposal) -> String {
     // Last, so a reader can treat it as optional: proposals stored before
     // spec 24 end at `STATUS`.
     write_field(&mut output, "REPOSITORY_ROOT", &proposal.repository_root);
+    // After it, optional the same way: proposals stored before spec 63 have
+    // no purpose and read as `Other`, which keeps their old treatment.
+    write_field(&mut output, "PURPOSE", proposal.purpose.as_str());
     output.push_str("END_COMMAND_PROPOSAL\n");
     output
 }
@@ -555,6 +584,11 @@ fn deserialize_proposal(raw: &str) -> Result<CommandProposal> {
     } else {
         working_directory.clone()
     };
+    let purpose = if cursor.next_field_is("PURPOSE") {
+        CommandPurpose::from_stored(&cursor.read_field("PURPOSE")?)
+    } else {
+        CommandPurpose::Other
+    };
     Ok(CommandProposal {
         id,
         command,
@@ -569,6 +603,7 @@ fn deserialize_proposal(raw: &str) -> Result<CommandProposal> {
         reasons,
         created_at_ms,
         status,
+        purpose,
     })
 }
 

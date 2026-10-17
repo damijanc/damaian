@@ -13,8 +13,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, CancelToken, CommandPolicy, CommandRunOptions, CommandRunner, CommandTermination,
-    Config, SecretScanner,
+    AuditLog, CancelToken, CommandPolicy, CommandPurpose, CommandRunOptions, CommandRunner,
+    CommandTermination, Config, SecretScanner,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -57,6 +57,7 @@ fn options<'a>(
         task_id: None,
         cancel,
         on_output,
+        purpose: CommandPurpose::Other,
     }
 }
 

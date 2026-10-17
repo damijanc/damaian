@@ -176,6 +176,7 @@ mod tests {
             termination: CommandTermination::Exited,
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
+            purpose: crate::command_purpose::CommandPurpose::Other,
         }
     }
 
