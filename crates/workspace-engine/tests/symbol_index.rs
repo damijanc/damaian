@@ -23,6 +23,11 @@
 //! Task 6 pins the eager definition pass against the same fake server, in
 //! modes that answer some files only, never answer, or exit halfway, and the
 //! merge of the two tiers on its own.
+//!
+//! Task 7 pins diagnostics as findings, published by the same fake server on
+//! `didOpen`: recorded once, 1-based, hashed, with no task; never for a
+//! restricted file or outside the root; a clearing set removes nothing; and a
+//! plan step is left alone.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -31,6 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use workspace_engine::finding::{FindingSource, FindingStatus, Severity, SourceRange};
 use workspace_engine::language::extract_symbols;
 use workspace_engine::{
     AuditLog, CommandPolicy, Config, ConfigOverlay, Declaration, LANGUAGE_SERVER_LANGUAGES,
@@ -42,6 +48,7 @@ use workspace_engine::{
     Symbol, SymbolIndex, SymbolIndexStore, SymbolKind, SymbolLoad, WorkspaceEngine,
     extract_declarations, merge, read_message, run_definition_pass, write_message,
 };
+use workspace_engine::{Evidence, FileDiagnostics, PlanStep, StepStatus, TaskPhase, TaskPlan};
 
 use SymbolKind::{
     Class, Constant, Enum, Function, Interface, Method, Module, Struct, Trait, Type, Variable,
@@ -1302,6 +1309,7 @@ const FAKE_MODE: &str = "DAMAIAN_FAKE_LSP_MODE";
 const FAKE_LOG: &str = "DAMAIAN_FAKE_LSP_LOG";
 const FAKE_REGISTRY: &str = "DAMAIAN_FAKE_LSP_REGISTRY";
 const FAKE_SYMBOLS: &str = "DAMAIAN_FAKE_LSP_SYMBOLS";
+const FAKE_DIAGNOSTICS: &str = "DAMAIAN_FAKE_LSP_DIAGNOSTICS";
 
 /// A temp repository with a data directory, a fake server log, and the
 /// config that names the fake server for Rust.
@@ -1326,11 +1334,12 @@ impl ServerFixture {
         let binary = std::env::current_exe().expect("test binary path");
         format!(
             "/bin/sh -c \"export {FAKE_MODE}={mode} {FAKE_LOG}='{}' {FAKE_REGISTRY}='{}' \
-             {FAKE_SYMBOLS}='{}'; \
+             {FAKE_SYMBOLS}='{}' {FAKE_DIAGNOSTICS}='{}'; \
              exec \\\"\\$0\\\" --ignored --exact fake_language_server_helper 3>&1 1>/dev/null\" '{}'",
             self.log.display(),
             self.repo.data_dir.join("processes").display(),
             self.symbols_file().display(),
+            self.diagnostics_file().display(),
             binary.display(),
         )
     }
@@ -1343,6 +1352,19 @@ impl ServerFixture {
     /// The fake server answers `documentSymbol` for these files only.
     fn answer_symbols(&self, answers: serde_json::Value) {
         fs::write(self.symbols_file(), answers.to_string()).unwrap();
+    }
+
+    /// Where the fake server reads what to publish on `didOpen` from.
+    fn diagnostics_file(&self) -> PathBuf {
+        self.repo.data_dir.join("fake-diagnostics.json")
+    }
+
+    /// On each `didOpen` of a listed path, the fake server publishes that
+    /// path's notifications, in order: `{ path: [{ "uri", "diagnostics" }] }`,
+    /// where a `uri` that is not a `file://` URI is relative to the root.
+    /// Read on every `didOpen`, so a test can change it between opens.
+    fn publish_on_open(&self, notifications: serde_json::Value) {
+        fs::write(self.diagnostics_file(), notifications.to_string()).unwrap();
     }
 
     /// An engine whose config names the fake server in `mode` for Rust.
@@ -2322,6 +2344,337 @@ fn a_server_that_never_answers_costs_one_timeout_per_file_and_never_delays_a_rea
     hub.shutdown_all();
 }
 
+// ---- Task 7: diagnostics as findings ----
+
+/// An error and a warning on `src/x.rs`, as the fake server publishes them:
+/// 0-based LSP positions, a string code and a number code, and a two-line
+/// message.
+fn x_rs_diagnostics() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "range": { "start": { "line": 1, "character": 4 }, "end": { "line": 1, "character": 9 } },
+            "severity": 1,
+            "code": "E0308",
+            "message": "mismatched types",
+        },
+        {
+            "range": { "start": { "line": 2, "character": 0 }, "end": { "line": 2, "character": 3 } },
+            "severity": 2,
+            "code": 6,
+            "message": "unused variable: `y`\nhelp: prefix it with an underscore",
+        },
+    ])
+}
+
+const X_RS: &str = "fn x() {\n    let y = 1;\n    y;\n}\n";
+
+/// Opens `path` and waits for a `documentSymbol` answer. The fake server
+/// publishes on `didOpen` before it reads the request, and one stream carries
+/// both, so once the answer is in, the hub has routed the diagnostics: no
+/// sleep, and nothing checked from inside the server.
+fn open_and_settle(hub: &LanguageServerHub, launch: &LanguageServerLaunch, path: &str) {
+    let text = fs::read_to_string(launch.root.join(path)).unwrap();
+    hub.notify(launch, |client, uris| {
+        client.did_open(&uris.uri_for(path), "rust", 1, &text)
+    })
+    .expect("didOpen");
+    hub.request(launch, |client, uris| {
+        client.document_symbol(&uris.uri_for(path))
+    })
+    .expect("documentSymbol");
+    hub.notify(launch, |client, uris| client.did_close(&uris.uri_for(path)))
+        .expect("didClose");
+}
+
+fn new_session(engine: &WorkspaceEngine, root: &PathBuf) -> String {
+    let repository_id = engine.indexer.repository_id_for_path(root).unwrap();
+    engine
+        .session_store
+        .create_session(&repository_id, "Diagnostics")
+        .unwrap()
+        .id
+}
+
+fn canonical_repository_id(root: &PathBuf) -> String {
+    workspace_engine::repository_id_for_root(fs::canonicalize(root).unwrap())
+}
+
+#[test]
+fn diagnostics_are_recorded_once_with_one_based_ranges_and_a_clearing_set_removes_nothing() {
+    let fixture = ServerFixture::with_files("lsp-diagnostics", &[("src/x.rs", X_RS)]);
+    fixture.publish_on_open(serde_json::json!({
+        "src/x.rs": [{ "uri": "src/x.rs", "diagnostics": x_rs_diagnostics() }],
+    }));
+    let engine = fixture.engine("normal");
+    let session_id = new_session(&engine, &fixture.repo.root);
+    let hub = LanguageServerHub::with_limits(limits(START_TIMEOUT, Duration::from_secs(600)));
+    let launch = fixture.launch("normal");
+
+    open_and_settle(&hub, &launch, "src/x.rs");
+    let recorded = engine
+        .record_language_server_findings_with(&hub, &session_id, &fixture.repo.root)
+        .unwrap();
+
+    assert_eq!(recorded, 2);
+    let findings = engine
+        .session_store
+        .read_findings(&session_id, &fixture.repo.root)
+        .unwrap();
+    assert_eq!(findings.len(), 2, "{findings:?}");
+    let hash = workspace_engine::hash::file_hash(fixture.repo.root.join("src/x.rs")).unwrap();
+    for finding in &findings {
+        assert_eq!(finding.source(), FindingSource::LanguageServer);
+        assert_eq!(finding.task_id(), None, "no task: context.md §10");
+        assert_eq!(finding.file_hash(), Some(hash.as_str()));
+        assert_eq!(finding.status(), FindingStatus::Open);
+    }
+    let error = &findings[0];
+    assert_eq!(error.severity(), Severity::Error);
+    assert_eq!(error.summary(), "mismatched types");
+    assert_eq!(error.code(), Some("E0308"));
+    assert_eq!(
+        error.range(),
+        Some(&SourceRange {
+            path: "src/x.rs".to_string(),
+            start_line: 2,
+            start_column: Some(5),
+            end_line: Some(2),
+            end_column: Some(10),
+        })
+    );
+    let warning = &findings[1];
+    assert_eq!(warning.severity(), Severity::Warning);
+    assert_eq!(warning.summary(), "unused variable: `y`");
+    assert_eq!(warning.code(), Some("6"));
+    assert_eq!(
+        warning
+            .range()
+            .map(|range| (range.start_line, range.start_column)),
+        Some((3, Some(1)))
+    );
+
+    // The hub still holds both; the session already does.
+    assert_eq!(
+        engine
+            .record_language_server_findings_with(&hub, &session_id, &fixture.repo.root)
+            .unwrap(),
+        0
+    );
+    // Published again unchanged (a reopen): still nothing new.
+    open_and_settle(&hub, &launch, "src/x.rs");
+    assert_eq!(
+        engine
+            .record_language_server_findings_with(&hub, &session_id, &fixture.repo.root)
+            .unwrap(),
+        0
+    );
+
+    // The user dismisses the warning; then the server clears the file.
+    engine
+        .session_store
+        .set_finding_status(&session_id, warning.id(), FindingStatus::Dismissed)
+        .unwrap();
+    fixture.publish_on_open(serde_json::json!({
+        "src/x.rs": [{ "uri": "src/x.rs", "diagnostics": [] }],
+    }));
+    open_and_settle(&hub, &launch, "src/x.rs");
+    assert_eq!(
+        hub.diagnostics(&canonical_repository_id(&fixture.repo.root)),
+        vec![FileDiagnostics {
+            path: "src/x.rs".to_string(),
+            findings: Vec::new(),
+        }],
+        "a clearing notification replaces the file's set"
+    );
+    assert_eq!(
+        engine
+            .record_language_server_findings_with(&hub, &session_id, &fixture.repo.root)
+            .unwrap(),
+        0
+    );
+    let after: Vec<(String, FindingStatus)> = engine
+        .session_store
+        .read_findings(&session_id, &fixture.repo.root)
+        .unwrap()
+        .iter()
+        .map(|finding| (finding.id().to_string(), finding.status()))
+        .collect();
+    assert_eq!(
+        after,
+        vec![
+            (error.id().to_string(), FindingStatus::Open),
+            (warning.id().to_string(), FindingStatus::Dismissed),
+        ],
+        "statuses belong to the user (spec 22)"
+    );
+    hub.shutdown_all();
+}
+
+#[test]
+fn a_diagnostic_on_a_restricted_file_or_outside_the_repository_is_never_recorded() {
+    let fixture = ServerFixture::with_files(
+        "lsp-diagnostics-restricted",
+        &[("src/x.rs", X_RS), (".env", "TOKEN=1\n")],
+    );
+    let root = fs::canonicalize(&fixture.repo.root).unwrap();
+    let error = |message: &str| {
+        serde_json::json!([{
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+            "severity": 1,
+            "message": message,
+        }])
+    };
+    fixture.publish_on_open(serde_json::json!({
+        "src/x.rs": [
+            { "uri": ".env", "diagnostics": error("restricted-file diagnostic") },
+            { "uri": "file:///elsewhere/y.rs", "diagnostics": error("outside diagnostic") },
+            {
+                "uri": format!("file://{}-two/src/x.rs", root.display()),
+                "diagnostics": error("sibling diagnostic"),
+            },
+            { "uri": "src/x.rs", "diagnostics": error("inside diagnostic") },
+        ],
+    }));
+    let engine = fixture.engine("normal");
+    let session_id = new_session(&engine, &fixture.repo.root);
+    let hub = LanguageServerHub::with_limits(limits(START_TIMEOUT, Duration::from_secs(600)));
+    let launch = fixture.launch("normal");
+
+    open_and_settle(&hub, &launch, "src/x.rs");
+    let published = fixture
+        .log_lines()
+        .iter()
+        .filter(|line| line.starts_with("publish "))
+        .count();
+    assert_eq!(published, 4, "the server published all four");
+
+    let held: Vec<String> = hub
+        .diagnostics(&canonical_repository_id(&fixture.repo.root))
+        .into_iter()
+        .map(|file| file.path)
+        .collect();
+    assert_eq!(held, vec!["src/x.rs".to_string()], "dropped as they arrive");
+    let recorded = engine
+        .record_language_server_findings_with(&hub, &session_id, &fixture.repo.root)
+        .unwrap();
+    assert_eq!(recorded, 1);
+    let summaries: Vec<String> = engine
+        .session_store
+        .read_findings(&session_id, &fixture.repo.root)
+        .unwrap()
+        .iter()
+        .map(|finding| finding.summary().to_string())
+        .collect();
+    assert_eq!(summaries, vec!["inside diagnostic".to_string()]);
+    hub.shutdown_all();
+}
+
+/// The hub filters by the policy its entry was started with. A pattern added
+/// since (a new config, the same running server) is applied when recording.
+#[test]
+fn a_file_restricted_since_the_server_published_is_not_recorded() {
+    let fixture = ServerFixture::with_files("lsp-diagnostics-policy", &[("src/x.rs", X_RS)]);
+    fixture.publish_on_open(serde_json::json!({
+        "src/x.rs": [{ "uri": "src/x.rs", "diagnostics": x_rs_diagnostics() }],
+    }));
+    let mut config = fixture.engine("normal").config;
+    config.restricted_patterns.push("src/x.rs".to_string());
+    let engine = WorkspaceEngine::new(config);
+    let session_id = new_session(&engine, &fixture.repo.root);
+    let hub = LanguageServerHub::with_limits(limits(START_TIMEOUT, Duration::from_secs(600)));
+    let launch = fixture.launch("normal");
+
+    open_and_settle(&hub, &launch, "src/x.rs");
+    assert_eq!(
+        hub.diagnostics(&canonical_repository_id(&fixture.repo.root))
+            .len(),
+        1,
+        "the entry's own policy does not restrict it"
+    );
+
+    let recorded = engine
+        .record_language_server_findings_with(&hub, &session_id, &fixture.repo.root)
+        .unwrap();
+    assert_eq!(recorded, 0);
+    assert!(
+        engine
+            .session_store
+            .read_findings(&session_id, &fixture.repo.root)
+            .unwrap()
+            .is_empty()
+    );
+    hub.shutdown_all();
+}
+
+#[test]
+fn a_language_server_error_leaves_the_active_plan_step_unchanged() {
+    let fixture = ServerFixture::with_files("lsp-diagnostics-plan", &[("src/x.rs", X_RS)]);
+    fixture.publish_on_open(serde_json::json!({
+        "src/x.rs": [{ "uri": "src/x.rs", "diagnostics": x_rs_diagnostics() }],
+    }));
+    let engine = fixture.engine("normal");
+    let session_id = new_session(&engine, &fixture.repo.root);
+    let task = engine
+        .session_store
+        .create_task(&session_id, "Fix x", "mock", "mock")
+        .unwrap();
+    let mut plan = TaskPlan::new(task.id.clone(), 1);
+    plan.steps.push(PlanStep {
+        id: "step_1".to_string(),
+        title: "Edit x".to_string(),
+        detail: None,
+        status: StepStatus::InProgress,
+        depends_on: Vec::new(),
+        started_at_ms: Some(1),
+        completed_at_ms: None,
+        evidence: vec![Evidence::FileRead {
+            path: "src/x.rs".to_string(),
+            hash: workspace_engine::hash::file_hash(fixture.repo.root.join("src/x.rs")).unwrap(),
+        }],
+    });
+    engine.session_store.create_plan(&task, &plan).unwrap();
+    let before = engine
+        .session_store
+        .read_task_plan(&session_id, &task.id)
+        .unwrap()
+        .expect("a plan");
+    let hub = LanguageServerHub::with_limits(limits(START_TIMEOUT, Duration::from_secs(600)));
+    let launch = fixture.launch("normal");
+
+    open_and_settle(&hub, &launch, "src/x.rs");
+    let recorded = engine
+        .record_language_server_findings_with(&hub, &session_id, &fixture.repo.root)
+        .unwrap();
+
+    assert_eq!(recorded, 2);
+    let findings = engine
+        .session_store
+        .read_findings(&session_id, &fixture.repo.root)
+        .unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.severity() == Severity::Error)
+    );
+    assert!(
+        findings.iter().all(|finding| finding.task_id().is_none()),
+        "not attributed to the active task: {findings:?}"
+    );
+    let after = engine
+        .session_store
+        .read_task_plan(&session_id, &task.id)
+        .unwrap()
+        .expect("a plan");
+    assert_eq!(
+        after, before,
+        "the step's evidence and status are unchanged"
+    );
+    assert_eq!(after.steps[0].status, StepStatus::InProgress);
+    assert_eq!(after.phase(false), TaskPhase::Understanding);
+    assert_eq!(after.phase(false), before.phase(false));
+    hub.shutdown_all();
+}
+
 /// The fake language server. Never run on its own: a test re-executes the
 /// test binary into it through `ServerFixture::command`, and run directly it
 /// returns at once. Its behaviour is `DAMAIAN_FAKE_LSP_MODE`, a
@@ -2338,6 +2691,10 @@ fn a_server_that_never_answers_costs_one_timeout_per_file_and_never_delays_a_rea
 /// - `delay_<ms>`: waits that long before answering `documentSymbol`
 ///   (Task 6).
 ///
+/// On `didOpen` it publishes what `DAMAIAN_FAKE_LSP_DIAGNOSTICS` lists for
+/// the opened file, before reading anything else, so a request answered after
+/// the `didOpen` was answered after the diagnostics too (Task 7).
+///
 /// When the file `DAMAIAN_FAKE_LSP_SYMBOLS` exists, it is a JSON object from
 /// repository-relative path to `documentSymbol` result: a listed file gets
 /// its result, and every other file `null`, as from a server that indexes
@@ -2346,7 +2703,7 @@ fn a_server_that_never_answers_costs_one_timeout_per_file_and_never_delays_a_rea
 /// It appends what happened to `DAMAIAN_FAKE_LSP_LOG`, and on `initialize`
 /// records whether its own registry entry already existed.
 #[test]
-#[ignore = "the fake language server; re-executed by the Task 5 and 6 tests"]
+#[ignore = "the fake language server; re-executed by the Task 5, 6 and 7 tests"]
 fn fake_language_server_helper() {
     use std::io::Write;
     use std::os::fd::FromRawFd;
@@ -2391,10 +2748,9 @@ fn fake_language_server_helper() {
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut answered = 0;
-    let mut reply = |id: &serde_json::Value, result: serde_json::Value| {
-        let message = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
-        write_message(&mut output, &message).unwrap();
-    };
+    let mut root_uri = String::new();
+    let mut send = |message: serde_json::Value| write_message(&mut output, &message).unwrap();
+    let reply = |id: &serde_json::Value, result: serde_json::Value| serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
     loop {
         let Ok(Some(message)) = read_message(&mut input) else {
             std::process::exit(0);
@@ -2410,13 +2766,17 @@ fn fake_language_server_helper() {
                         .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
                 });
                 log(&format!("initialize registered={registered}"));
+                root_uri = message["params"]["rootUri"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
                 if !flags.contains(&"silent") {
-                    reply(&id, serde_json::json!({ "capabilities": {} }));
+                    send(reply(&id, serde_json::json!({ "capabilities": {} })));
                 }
             }
             ("shutdown", Some(id)) => {
                 log("shutdown");
-                reply(&id, serde_json::Value::Null);
+                send(reply(&id, serde_json::Value::Null));
             }
             ("exit", None) => {
                 log("exit");
@@ -2446,7 +2806,7 @@ fn fake_language_server_helper() {
                         .map_or(serde_json::Value::Null, |(_, result)| result.clone()),
                     None => serde_json::json!([]),
                 };
-                reply(&id, result);
+                send(reply(&id, result));
                 answered += 1;
                 if exit_after.is_some_and(|limit| answered >= limit) {
                     std::process::exit(0);
@@ -2454,7 +2814,7 @@ fn fake_language_server_helper() {
             }
             (method, Some(id)) => {
                 log(&format!("request {method}"));
-                reply(&id, serde_json::json!([]));
+                send(reply(&id, serde_json::json!([])));
                 answered += 1;
                 if exit_after.is_some_and(|limit| answered >= limit) {
                     std::process::exit(0);
@@ -2465,6 +2825,38 @@ fn fake_language_server_helper() {
                     .as_str()
                     .unwrap_or_default();
                 log(&format!("notify {method} {uri}"));
+                if method != "textDocument/didOpen" {
+                    continue;
+                }
+                let Some(published) = std::env::var(FAKE_DIAGNOSTICS)
+                    .ok()
+                    .and_then(|path| fs::read(path).ok())
+                    .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap())
+                else {
+                    continue;
+                };
+                let listed = published
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .find_map(|(path, sets)| {
+                        uri.ends_with(&format!("/{path}"))
+                            .then(|| sets.as_array().unwrap().clone())
+                    });
+                for set in listed.unwrap_or_default() {
+                    let target = set["uri"].as_str().unwrap();
+                    let target = if target.starts_with("file://") {
+                        target.to_string()
+                    } else {
+                        format!("{root_uri}/{target}")
+                    };
+                    log(&format!("publish {target}"));
+                    send(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "textDocument/publishDiagnostics",
+                        "params": { "uri": target, "diagnostics": set["diagnostics"] },
+                    }));
+                }
             }
         }
     }

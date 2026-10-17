@@ -23,6 +23,9 @@
 //! Task 6 adds [`run_definition_pass`], the eager `documentSymbol` pass that
 //! merges each file's result into the stored symbol index, on a thread of its
 //! own ([`DefinitionPass`]).
+//!
+//! Task 7 keeps each entry's latest `publishDiagnostics` per file
+//! ([`LanguageServerHub::diagnostics`]), which the engine records as findings.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -1001,6 +1004,9 @@ pub struct LanguageServerLaunch {
     /// The session whose request caused the spawn, for the audit trail only
     /// (`context.md` §3).
     pub session_id: String,
+    /// The config's path policy. A diagnostic for a file it restricts is
+    /// dropped as it arrives, so the hub never holds one (`context.md` §7).
+    pub policy: PathPolicy,
 }
 
 impl LanguageServerLaunch {
@@ -1021,6 +1027,7 @@ impl LanguageServerLaunch {
             command: command.clone(),
             data_dir: config.data_dir.clone(),
             session_id: session_id.to_string(),
+            policy: PathPolicy::new(config),
         })
     }
 
@@ -1046,6 +1053,10 @@ struct ServerProcess {
     client: LspClient<ChildStdin>,
     messages: Receiver<Value>,
     uris: RepositoryUris,
+    policy: PathPolicy,
+    /// The entry's diagnostics, shared with its [`Slot`], so they outlive a
+    /// restart.
+    diagnostics: Arc<DiagnosticsByFile>,
     /// Removes the registry entry when dropped. Declared last, and the child
     /// is always reaped before it drops, so a live server is never
     /// unrecorded.
@@ -1058,6 +1069,7 @@ impl ServerProcess {
     fn start(
         launch: &LanguageServerLaunch,
         timeout: Duration,
+        diagnostics: Arc<DiagnosticsByFile>,
     ) -> std::result::Result<Self, String> {
         let (mut child, registration) = spawn_registered(launch)?;
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
@@ -1083,6 +1095,8 @@ impl ServerProcess {
             client: LspClient::new(stdin),
             messages,
             uris: RepositoryUris::new(&launch.root),
+            policy: launch.policy.clone(),
+            diagnostics,
             _registration: registration,
         };
         if let Err(error) = reader {
@@ -1122,7 +1136,9 @@ impl ServerProcess {
 
     /// Task 4's `await_response`, with `next` a `recv_timeout` on the reader
     /// thread's channel. A timed-out request is forgotten, so its late answer
-    /// is `Unmatched`.
+    /// is `Unmatched`. Diagnostics that arrive while it waits, including
+    /// those queued since the last request, are kept per file; every other
+    /// event is dropped.
     fn await_response(
         &mut self,
         id: u64,
@@ -1132,7 +1148,12 @@ impl ServerProcess {
         let mut timed_out = false;
         let mut disconnected = false;
         let Self {
-            client, messages, ..
+            client,
+            messages,
+            uris,
+            policy,
+            diagnostics,
+            ..
         } = self;
         let result = client.await_response(
             id,
@@ -1150,9 +1171,11 @@ impl ServerProcess {
                     }
                 }
             },
-            // Diagnostics and the rest are routed by Task 7; until then a
-            // notification that arrives during a wait is dropped.
-            |_event| {},
+            |event| {
+                if let LspEvent::Diagnostics(params) = event {
+                    diagnostics.publish(&params, uris, policy);
+                }
+            },
         );
         match result {
             Ok(value) => Ok(value),
@@ -1230,6 +1253,32 @@ fn spawn_registered(
     }
 }
 
+/// One entry's latest `publishDiagnostics` per repository-relative path
+/// (`context.md` §10). Its lock is held only to replace or copy a map entry,
+/// never across a request, so a reader never waits on a server.
+#[derive(Default)]
+struct DiagnosticsByFile(Mutex<BTreeMap<String, Vec<FindingDraft>>>);
+
+impl DiagnosticsByFile {
+    fn files(&self) -> MutexGuard<'_, BTreeMap<String, Vec<FindingDraft>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Replaces the notification's file's set, an empty one included. A URI
+    /// outside the repository and a restricted file are dropped.
+    fn publish(&self, params: &Value, uris: &RepositoryUris, policy: &PathPolicy) {
+        let Some(file) = findings_from_diagnostics(params, uris) else {
+            return;
+        };
+        if policy.is_restricted(&file.path, false) {
+            return;
+        }
+        self.files().insert(file.path, file.findings);
+    }
+}
+
 struct SlotMeta {
     state: LanguageServerState,
     /// Whether a request has claimed the first start.
@@ -1247,6 +1296,9 @@ struct Slot {
     launch: LanguageServerLaunch,
     meta: Mutex<SlotMeta>,
     process: Mutex<Option<ServerProcess>>,
+    /// Kept for the entry's life, across restarts: a restarted server
+    /// republishes a file only when it is opened again.
+    diagnostics: Arc<DiagnosticsByFile>,
 }
 
 impl Slot {
@@ -1423,6 +1475,37 @@ impl LanguageServerHub {
             .collect()
     }
 
+    /// The latest diagnostics every entry of `repository_id` holds, by path
+    /// and then language; a clearing notification is a file with no
+    /// findings. A copy of what the servers last published: it never waits
+    /// on a server or starts one. An entry dropped by idle expiry takes its
+    /// diagnostics with it.
+    pub fn diagnostics(&self, repository_id: &str) -> Vec<FileDiagnostics> {
+        let slots: Vec<Arc<Slot>> = self
+            .inner
+            .slots()
+            .iter()
+            .filter(|((repository, _), _)| repository == repository_id)
+            .map(|(_, slot)| Arc::clone(slot))
+            .collect();
+        let mut files: Vec<FileDiagnostics> = slots
+            .iter()
+            .flat_map(|slot| {
+                slot.diagnostics
+                    .files()
+                    .iter()
+                    .map(|(path, findings)| FileDiagnostics {
+                        path: path.clone(),
+                        findings: findings.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        // Stable, so one path's sets stay in language order.
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        files
+    }
+
     /// Stops every server: `shutdown`, `exit`, a grace period, then a kill.
     pub fn shutdown_all(&self) {
         let slots: Vec<Arc<Slot>> = std::mem::take(&mut *self.inner.slots())
@@ -1469,7 +1552,11 @@ impl LanguageServerHub {
             };
             let mut process = slot.process();
             if claim {
-                let started = ServerProcess::start(&slot.launch, self.inner.limits.request_timeout);
+                let started = ServerProcess::start(
+                    &slot.launch,
+                    self.inner.limits.request_timeout,
+                    Arc::clone(&slot.diagnostics),
+                );
                 let mut meta = slot.meta();
                 match started {
                     Ok(started) => {
@@ -1523,6 +1610,7 @@ impl LanguageServerHub {
                         pid: None,
                     }),
                     process: Mutex::new(None),
+                    diagnostics: Arc::default(),
                 })
             })
             .clone();
@@ -2522,6 +2610,7 @@ mod tests {
             ),
             data_dir: data_dir.clone(),
             session_id: "ses_unit".to_string(),
+            policy: PathPolicy::unrestricted(),
         };
 
         let (mut child, registration) = spawn_registered(&launch).unwrap();
