@@ -9,7 +9,7 @@ use crate::edit::{EditOrchestrator, PatchStore};
 use crate::error::Result;
 use crate::file_access::FileAccessController;
 use crate::finding::{Finding, FindingSource};
-use crate::git_service::GitService;
+use crate::git_service::{GitReadCaps, GitService};
 use crate::hash::{file_hash, repository_id_for_root};
 use crate::index_cache::IndexCache;
 use crate::indexer::ProjectIndexer;
@@ -93,7 +93,12 @@ impl WorkspaceEngine {
             audit_log.clone(),
             scanner.clone(),
         );
-        let git = GitService::new(audit_log.clone(), scanner.clone());
+        let git = GitService::new(
+            audit_log.clone(),
+            scanner.clone(),
+            path_policy.clone(),
+            GitReadCaps::from_config(&config),
+        );
         let patch_engine = PatchEngine::new(
             config.clone(),
             audit_log.clone(),

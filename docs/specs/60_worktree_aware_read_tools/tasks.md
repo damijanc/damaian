@@ -10,7 +10,7 @@
 | Task | State | Notes |
 |---|---|---|
 | 1 · Registered-worktree resolution and refusal | Done 2026-10-17 | Details in the note below the table. |
-| 2 · Git read hardening on the main checkout | Not started | |
+| 2 · Git read hardening on the main checkout | Done 2026-10-17 | Details in the note below the table. |
 | 3 · `worktree` on the five read tools | Not started | |
 | 4 · `list_worktrees` and `read_git_log` | Not started | |
 | 5 · `worktree_survey` eval scenario | Not started | |
@@ -45,6 +45,82 @@ test. Each was reverted. No `chat.rs` or `mode.rs` change in this task.
 clippy for `workspace-engine` is clean; nextest over `worktree_reads`,
 `worktree`, `agent_tools` and the `worktree_access`/`path_policy`/`git_service`
 unit tests: 80 passed. Workspace clippy and tests are left to CI.
+
+**Task 2 (Done 2026-10-17).** `git_service.rs`: every git process starts from
+one runner, `read_git`: `--no-optional-locks`, `-c core.fsmonitor=false`, `-c
+diff.autoRefreshIndex=false`, stdin null (`status`, `diff`, `summary`,
+`worktrees`); `diff` adds `--no-ext-diff --no-textconv`. `diff` lists the
+changed paths with `--name-status -z --no-renames` and drops restricted ones.
+When nothing was dropped, the content diff runs without pathspecs; when
+something was, over `:(top,literal)` pathspecs; when everything was, not at
+all. `status` drops porcelain entries naming a restricted path on either side
+of a rename, after undoing git's C-style path quoting. A path is restricted
+when it or any parent directory is (`PathPolicy::is_restricted`), so a file
+below `config/private` is dropped, as `list_directory` would never reach it.
+Diff output is redacted, then cut to `max_read_lines`/`max_file_bytes` with a
+last line `[Diff truncated by lines|bytes: N of M lines shown; F of T files not
+shown.]`. `GitService::new` takes the `PathPolicy` and a new `GitReadCaps`
+(`from_config`); `workspace_engine.rs` and the module's test helper follow. The
+CLI and `tests/foundation.rs` needed no edit: `diff`'s signature is unchanged
+until Task 3.
+
+**Deviations.** (1) C3 was incomplete. `git diff` rewrites the index under
+`index.lock` whenever it finds stat-only changes (`refresh_index_quietly`),
+whatever `--no-optional-locks` says; only `diff.autoRefreshIndex=false` stops
+it. The patch output is unchanged by it. The `--name-status` listing can then
+name a stat-only file, which only widens the pathspec. Proposal §5.4 updated.
+(2) `status` is capped too, by the same two caps, since requirement 8 covers
+every git read: `GitStatus` gained `omitted`, and `format_git_status` (the only
+`chat.rs` edit) ends a cut listing with `[Status truncated: N of M entries
+shown.]`. (3) A status whose only changes are restricted is `clean`, so the
+model reads "Working tree clean." and "No differences." Nothing hints at the
+restricted change, as `list_directory` does not hint at a dropped path.
+
+**Main-checkout output changes**, all intended: restricted entries are gone
+from `read_git_status`, `read_git_diff`, `damaian git-status`'s `fileCount`,
+`damaian git-diff`, and the desktop shell's `/api/git-status` file list (the
+post-patch "changed" message). Diffs over 400 lines or 1 MiB, and statuses over
+400 entries, are cut with the footers above. A diff under a user-configured
+external or textconv driver shows git's own diff instead. Reads no longer
+refresh `.git/index`'s stat cache. The repo bar's line counts (`summary`) still
+include restricted files: they are numbers, not paths. Audit records are
+unchanged.
+
+**Discovery, not fixed.** `.gitattributes` can also select a `filter=<name>`
+whose `clean` command the user's config defines, and `status`/`diff` run it on
+stat-dirty files. No git flag disables filters wholesale, and disabling them
+would make git-lfs or git-crypt files read as modified. Left for a later
+decision; recorded in proposal §7.
+
+**Tests.** `tests/worktree_reads.rs` grows by 11 (25 in all), plus
+`porcelain_paths_are_unquoted_before_they_are_judged` in the module. Step 2:
+the tests first failed to compile (no `GitReadCaps`, no `GitStatus::omitted`).
+The first implementation then failed `status_does_not_take_the_index_lock`,
+which is how deviation (1) was found.
+
+**Falsified**, each reverted. No status filter failed
+`a_restricted_tracked_file_is_absent_from_status_and_diff`. No diff filter
+failed 4 tests, the rename test among them. No parent-directory check failed
+`a_file_inside_a_restricted_directory_is_absent_from_status_and_diff`; it first
+survived with a `private/` pattern, which matches descendants on its own, so
+the test uses `config/private`. No unquoting failed the restricted test.
+Judging only a rename's new name failed the rename test; it first survived
+because the test only renamed onto a restricted path, and now renames off one
+too. No diff cap and no status cap failed their truncation tests. No
+`--no-ext-diff`, no `--no-textconv` and no `core.fsmonitor=false` each failed
+its driver test, and each driver test also proves its driver runs under plain
+git. No `--no-optional-locks` and no `diff.autoRefreshIndex=false` each failed
+`status_does_not_take_the_index_lock`. A `--no-renames` content diff failed
+`a_diff_with_no_changes_is_unchanged`.
+
+**Checks (local):** fmt, node, lint and typos pass; `cargo deny check` passes
+(outside the agent sandbox, which cannot take its advisory-db lock); scoped
+clippy for `workspace-engine`, `damaian-cli` and `desktop-shell` is clean;
+nextest over `worktree_reads`, `foundation`, `agent_tools` and the
+`git_service`/`worktree_access` unit tests: 233 run, 232 passed inside the
+sandbox, and the one failure,
+`index_cache_picks_up_file_changes_via_watcher_without_full_rescan`, needs
+FSEvents and passes outside it. Workspace clippy and tests are left to CI.
 
 ## Global Constraints
 
@@ -102,7 +178,7 @@ Each one names the task that owns it.
 |---|---|---|---|
 | C1 | A reachable worktree "is not the main worktree (that is the session's own checkout)" (§5.1) | A spec 57 worker session's repository root **is** a linked worktree (`.damaian/worktrees/<slug>`). From there git still lists the main worktree first, and the session's own checkout is a later entry | Exclude the entry whose canonical path is the session's canonical root, whichever it is. The main worktree is then an ordinary entry, reachable only by the location rule (for a worker, outside its root, so it needs `allowed_roots`). A `bare` entry has no working tree and is excluded. Proposal §5.1 updated. **Task 1** |
 | C2 | Restricted paths are excluded with `:(exclude,glob)<pattern>` pathspecs (§5.4) | `restricted_patterns` are gitignore-style and matched by `PathPolicy::is_restricted` (`ignore.rs`): `.env` matches at any depth, a trailing `/` means a directory, and `!` negates. A glob pathspec has none of those semantics, so the translation would drift from what `read_file` refuses | Filter with `PathPolicy::is_restricted` itself, the same matcher `list_directory` uses: list the changed paths first (`diff --name-status -z --no-renames`, so both sides of a rename are checked), drop restricted ones, and run the content diff over the remaining paths as `:(top,literal)` pathspecs after `--`. Proposal §5.4 updated. **Task 2** |
-| C3 | Every invocation passes `-c core.fsmonitor=false` (§5.4) | `git status` refreshes the index and takes `index.lock` opportunistically. In a worktree where another agent is running git, a Damaian read could make that agent's `git add` fail. `checkpoint.rs::run_user_git` already passes `--no-optional-locks` for this reason | Every read also passes `--no-optional-locks`. Proposal §5.4 updated. **Tasks 1, 2** |
+| C3 | Every invocation passes `-c core.fsmonitor=false` (§5.4) | `git status` refreshes the index and takes `index.lock` opportunistically. In a worktree where another agent is running git, a Damaian read could make that agent's `git add` fail. `checkpoint.rs::run_user_git` already passes `--no-optional-locks` for this reason. Task 2 found `git diff` does the same whatever `--no-optional-locks` says | Every read also passes `--no-optional-locks` and `-c diff.autoRefreshIndex=false`. Proposal §5.4 updated. **Tasks 1, 2** |
 | C4 | `GitService::status`/`diff` take a root and apply restricted patterns and caps (§5.3, §5.4) | `GitService::new(audit_log, scanner)` (`git_service.rs:174`) has no `Config` or `PathPolicy`. It is built once in `workspace_engine.rs:96`, and `damaian-cli/src/main.rs:173,184` and `tests/foundation.rs:1381` call `status`/`diff` | `GitService::new` gains the `PathPolicy` and the caps (`max_read_lines`, `max_file_bytes`). The CLI's `damaian git status`/`diff` get the same hardening, which is intended: they are the same read. **Task 2** |
 | C5 | `GitStatus` entries for restricted paths are dropped (§5.4) | `GitStatus.raw` carries git's raw porcelain beside `files`, and `format_git_status` (`chat.rs`) is what the model sees | Filter `raw` with the same rule, so no restricted path survives in either field. **Task 2** |
 | C6 | "The mode matrix allows them everywhere" (§5.6) | `mode.rs` has two exhaustive matches over `ToolAction`: `profile_permits` (line 168) and `mode_permits` (line 244), plus the test list at line 472. `ToolAction::ReadGitStatus` is a unit variant, so adding `worktree` changes its pattern in all three places and in `chat.rs` | Add `ListWorktrees` and `ReadGitLog` to both matches' read-only arms; widen `ReadGitStatus` to `ReadGitStatus { .. }`. Nothing else in `mode.rs` changes (Global Constraints). Proposal §5.6 updated. **Tasks 3, 4** |
@@ -230,7 +306,7 @@ and 4 must not run beside #59, #61, #62 or another spec's `chat.rs` task
 call changes), `tests/worktree_reads.rs`, `chat.rs` only if
 `format_git_status` must change.
 
-- [ ] **Step 1: Write the failing tests** (all on the main checkout):
+- [x] **Step 1: Write the failing tests** (all on the main checkout):
   - `a_restricted_tracked_file_is_absent_from_status_and_diff` (both
     `files` and `raw`; both unstaged and `staged`);
   - `a_rename_onto_a_restricted_path_is_excluded`;
@@ -244,20 +320,24 @@ call changes), `tests/worktree_reads.rs`, `chat.rs` only if
     make `status` fail);
   - `a_diff_with_no_changes_is_unchanged` (byte-identical to today's output
     for an ordinary diff with nothing restricted).
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: One hardened git runner** in `git_service.rs`: `--no-optional-locks`,
-      `-c core.fsmonitor=false`, stdin null; `diff` and `log` add
+  Added while implementing:
+  `a_file_inside_a_restricted_directory_is_absent_from_status_and_diff`,
+  `a_status_with_only_restricted_changes_is_clean` and
+  `a_large_status_is_truncated_and_says_what_it_cut`.
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: One hardened git runner** in `git_service.rs`: `--no-optional-locks`,
+      `-c core.fsmonitor=false`, `-c diff.autoRefreshIndex=false`, stdin null; `diff` and `log` add
       `--no-ext-diff --no-textconv`. `summary` uses it too.
-- [ ] **Step 4: Restricted exclusion (C2, C5)** with `PathPolicy::is_restricted`.
-- [ ] **Step 5: Caps.** `max_read_lines` and `max_file_bytes`, whichever binds
+- [x] **Step 4: Restricted exclusion (C2, C5)** with `PathPolicy::is_restricted`.
+- [x] **Step 5: Caps.** `max_read_lines` and `max_file_bytes`, whichever binds
       first, with a trailing line naming what was cut (lines and files
       omitted), the shape #47 §5.5 uses.
-- [ ] **Step 6: Constructor (C4).** `GitService::new` takes the `PathPolicy`
+- [x] **Step 6: Constructor (C4).** `GitService::new` takes the `PathPolicy`
       and caps; update `workspace_engine.rs`, the module's test helper and the
       CLI.
-- [ ] **Step 7: Falsify** each test (drop the exclusion, the cap, each flag)
+- [x] **Step 7: Falsify** each test (drop the exclusion, the cap, each flag)
       and revert.
-- [ ] **Step 8: Scoped checks**, including `--test foundation` and
+- [x] **Step 8: Scoped checks**, including `--test foundation` and
       `--test agent_tools`, and clippy for `workspace-engine` and `damaian-cli`.
       Record in the Progress row every way main-checkout output changed.
 

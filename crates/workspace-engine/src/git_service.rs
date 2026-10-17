@@ -1,8 +1,12 @@
 use crate::audit::AuditLog;
+use crate::config::Config;
 use crate::error::{ClientError, Result};
+use crate::path_policy::PathPolicy;
 use crate::secret_scanner::SecretScanner;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitFileStatus {
@@ -14,6 +18,9 @@ pub struct GitFileStatus {
     pub conflicted: bool,
 }
 
+/// `git status` as a read sees it (spec 60 §5.4): entries naming a restricted
+/// path are dropped from `files` and `raw` alike, and `clean` is judged after
+/// that, so no field says a restricted file changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitStatus {
     pub clean: bool,
@@ -21,6 +28,25 @@ pub struct GitStatus {
     pub raw: String,
     pub stderr: String,
     pub files: Vec<GitFileStatus>,
+    /// Entries past the read caps, left out of `files` and `raw`.
+    pub omitted: usize,
+}
+
+/// The read caps a git read honours, spec 47 §5.5's `max_read_lines` and
+/// `max_file_bytes`; whichever binds first cuts the output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GitReadCaps {
+    pub max_lines: usize,
+    pub max_bytes: u64,
+}
+
+impl GitReadCaps {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            max_lines: config.max_read_lines,
+            max_bytes: config.max_file_bytes,
+        }
+    }
 }
 
 /// A GitHub repository parsed from the `origin` remote.
@@ -102,12 +128,30 @@ const UNTRACKED_COUNT_MAX_BYTES: u64 = 1024 * 1024;
 /// Git's own binary heuristic: a NUL byte in the first 8 KiB.
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
-fn git_output(root: &Path, args: &[&str]) -> Result<std::process::Output> {
-    Ok(Command::new("git")
-        .arg("-C")
+/// `git -C <root>` for a read (spec 60 §5.4). A read never takes `index.lock`
+/// from an agent working in the same checkout: `--no-optional-locks` stops
+/// `status` refreshing the index, and `diff.autoRefreshIndex=false` stops
+/// `diff` doing the same, which it does whatever `--no-optional-locks` says.
+/// No fsmonitor hook runs either; config could point it anywhere. Every git
+/// process this module starts begins here.
+fn read_git(root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args([
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "diff.autoRefreshIndex=false",
+            "-C",
+        ])
         .arg(root)
-        .args(args)
-        .output()?)
+        .stdin(Stdio::null());
+    command
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Ok(read_git(root).args(args).output()?)
 }
 
 /// Trimmed stdout of a successful command, or `None` when it failed or was empty.
@@ -168,25 +212,48 @@ fn count_listed_files(root: &Path, raw: &[u8]) -> u64 {
 pub struct GitService {
     audit_log: AuditLog,
     scanner: SecretScanner,
+    path_policy: PathPolicy,
+    caps: GitReadCaps,
 }
 
 impl GitService {
-    pub fn new(audit_log: AuditLog, scanner: SecretScanner) -> Self {
-        Self { audit_log, scanner }
+    pub fn new(
+        audit_log: AuditLog,
+        scanner: SecretScanner,
+        path_policy: PathPolicy,
+        caps: GitReadCaps,
+    ) -> Self {
+        Self {
+            audit_log,
+            scanner,
+            path_policy,
+            caps,
+        }
     }
 
     pub fn status(&self, root_path: impl AsRef<Path>) -> Result<GitStatus> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(root_path.as_ref())
-            .arg("status")
-            .arg("--porcelain=v1")
-            .output()?;
+        let output = git_output(root_path.as_ref(), &["status", "--porcelain=v1"])?;
         let exit_code = output.status.code().unwrap_or(-1);
-        let raw = String::from_utf8_lossy(&output.stdout).to_string();
+        let full = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let entries: Vec<&str> = full
+            .lines()
+            .filter(|line| !line.is_empty() && !self.porcelain_entry_is_restricted(line))
+            .collect();
+        let shown = self.lines_within_caps(&entries);
+        let omitted = entries.len() - shown;
+        // Rebuilt only when something was dropped, so an ordinary status
+        // stays byte-identical to git's.
+        let raw = if shown == full.lines().filter(|line| !line.is_empty()).count() {
+            full.clone()
+        } else {
+            entries[..shown]
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect()
+        };
         let status = GitStatus {
-            clean: exit_code == 0 && raw.trim().is_empty(),
+            clean: exit_code == 0 && entries.is_empty(),
             exit_code,
             files: if exit_code == 0 {
                 parse_porcelain(&raw)
@@ -195,6 +262,7 @@ impl GitService {
             },
             raw,
             stderr,
+            omitted,
         };
         self.audit_log.record(
             "git_status_read",
@@ -294,13 +362,58 @@ impl GitService {
         })
     }
 
+    /// The working tree's (or with `staged`, the index's) diff, with
+    /// restricted paths left out and the output capped (spec 60 §5.4).
+    ///
+    /// Restricted paths are judged by [`PathPolicy::is_restricted`], the rule
+    /// `read_file` refuses by, which a git pathspec cannot express. So the
+    /// changed paths are listed first, without rename pairing so both sides of
+    /// a rename are judged, and when any is restricted the content diff runs
+    /// over the others as literal pathspecs. When none is, it runs without
+    /// pathspecs and is byte-identical to `git diff`; a restricted file that
+    /// starts changing between the two git calls is the accepted gap.
+    /// Without the index refresh (`read_git`) the listing can also name a file
+    /// whose stat changed but whose content did not; it only widens the
+    /// pathspec, and the content diff prints nothing for it.
     pub fn diff(&self, root_path: impl AsRef<Path>, staged: bool) -> Result<String> {
-        let mut command = Command::new("git");
-        command.arg("-C").arg(root_path.as_ref()).arg("diff");
+        let root = root_path.as_ref();
+        let mut args = vec!["diff"];
         if staged {
-            command.arg("--staged");
+            args.push("--staged");
         }
-        let output = command.output()?;
+        args.extend(["--no-ext-diff", "--no-textconv"]);
+        let mut listing_args = args.clone();
+        listing_args.extend(["--name-status", "-z", "--no-renames"]);
+        let listing = git_output(root, &listing_args)?;
+        let output = if !listing.status.success() {
+            listing
+        } else {
+            let changed = parse_name_status_z(&listing.stdout);
+            let kept: Vec<&[u8]> = changed
+                .iter()
+                .copied()
+                .filter(|path| !self.path_is_restricted(&String::from_utf8_lossy(path)))
+                .collect();
+            if kept.len() == changed.len() {
+                git_output(root, &args)?
+            } else if kept.is_empty() {
+                // Everything changed is restricted: an empty diff, as if
+                // nothing had changed, without a second git call.
+                std::process::Output {
+                    stdout: Vec::new(),
+                    ..listing
+                }
+            } else {
+                let mut command = read_git(root);
+                command.args(&args).arg("--");
+                for path in kept {
+                    let mut pathspec = b":(top,literal)".to_vec();
+                    pathspec.extend_from_slice(path);
+                    command.arg(OsStr::from_bytes(&pathspec));
+                }
+                command.output()?
+            }
+        };
         let exit_code = output.status.code().unwrap_or(-1);
         self.audit_log.record(
             "git_diff_read",
@@ -324,7 +437,83 @@ impl GitService {
             ));
         }
         let raw_diff = String::from_utf8_lossy(&output.stdout);
-        Ok(self.scanner.redact(raw_diff.as_ref()).text)
+        // Redact before cutting: a cut through a secret could leave a prefix
+        // the scanner no longer recognises.
+        let redacted = self.scanner.redact(raw_diff.as_ref()).text;
+        Ok(self.cap_diff(redacted))
+    }
+
+    /// How many of `lines` fit under both caps, counting each with its newline.
+    fn lines_within_caps(&self, lines: &[&str]) -> usize {
+        let max_bytes = usize::try_from(self.caps.max_bytes).unwrap_or(usize::MAX);
+        let mut bytes = 0usize;
+        lines
+            .iter()
+            .take(self.caps.max_lines)
+            .take_while(|line| {
+                bytes = bytes.saturating_add(line.len() + 1);
+                bytes <= max_bytes
+            })
+            .count()
+    }
+
+    /// `diff` cut to the caps, ending in a line that says what was cut: the
+    /// lines shown of the total, and the files whose header was not reached
+    /// (spec 47 §5.5's shape).
+    fn cap_diff(&self, diff: String) -> String {
+        let lines: Vec<&str> = diff.lines().collect();
+        let shown = self.lines_within_caps(&lines);
+        if shown == lines.len() {
+            return diff;
+        }
+        let cut_by = if shown == self.caps.max_lines {
+            "lines"
+        } else {
+            "bytes"
+        };
+        let files = |lines: &[&str]| {
+            lines
+                .iter()
+                .filter(|line| line.starts_with("diff --git ") || line.starts_with("diff --cc "))
+                .count()
+        };
+        let total_files = files(&lines);
+        let shown_files = files(&lines[..shown]);
+        let mut capped: String = lines[..shown]
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect();
+        capped.push_str(&format!(
+            "[Diff truncated by {cut_by}: {shown} of {} lines shown; {} of {total_files} files not shown.]\n",
+            lines.len(),
+            total_files - shown_files,
+        ));
+        capped
+    }
+
+    /// Whether `relative_path`, or any directory above it, is restricted. A
+    /// path inside a restricted directory is one `list_directory` never
+    /// reaches, so a git read does not show it either. A trailing `/` is how
+    /// porcelain names an untracked directory.
+    fn path_is_restricted(&self, relative_path: &str) -> bool {
+        let (path, is_directory) = match relative_path.strip_suffix('/') {
+            Some(directory) => (directory, true),
+            None => (relative_path, false),
+        };
+        self.path_policy.is_restricted(path, is_directory)
+            || path
+                .match_indices('/')
+                .any(|(at, _)| self.path_policy.is_restricted(&path[..at], true))
+    }
+
+    /// Whether a `--porcelain=v1` line names a restricted path on either side
+    /// of a rename. A path containing ` -> ` is ambiguous in this format, so
+    /// the whole field is judged as well as each side.
+    fn porcelain_entry_is_restricted(&self, line: &str) -> bool {
+        let field = line.get(3..).unwrap_or_default();
+        std::iter::once(field)
+            .chain(field.split(" -> "))
+            .any(|path| self.path_is_restricted(&unquote_porcelain_path(path)))
     }
 
     /// Every worktree git has registered for the repository at `root_path`,
@@ -338,15 +527,10 @@ impl GitService {
         &self,
         root_path: impl AsRef<Path>,
     ) -> Result<Vec<crate::worktree_access::WorktreeEntry>> {
-        let output = Command::new("git")
-            .arg("--no-optional-locks")
-            .arg("-c")
-            .arg("core.fsmonitor=false")
-            .arg("-C")
-            .arg(root_path.as_ref())
-            .args(["worktree", "list", "--porcelain", "-z"])
-            .stdin(std::process::Stdio::null())
-            .output()?;
+        let output = git_output(
+            root_path.as_ref(),
+            &["worktree", "list", "--porcelain", "-z"],
+        )?;
         if !output.status.success() {
             return Err(ClientError::Git(
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
@@ -365,6 +549,61 @@ impl GitService {
             format!("chore: {normalized}")
         }
     }
+}
+
+/// The paths `diff --name-status -z --no-renames` printed: a status field and
+/// one path per entry, each NUL-terminated.
+fn parse_name_status_z(raw: &[u8]) -> Vec<&[u8]> {
+    raw.split(|&byte| byte == 0)
+        .skip(1)
+        .step_by(2)
+        .filter(|path| !path.is_empty())
+        .collect()
+}
+
+/// A porcelain path as git wrote it, with C-style quoting undone. Git quotes
+/// a path holding a control character, `"`, `\\` or (by default) any non-ASCII
+/// byte, so `".env\303\251"` must be judged as the name it stands for.
+fn unquote_porcelain_path(path: &str) -> String {
+    let Some(inner) = path
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return path.to_string();
+    };
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' || index + 1 == bytes.len() {
+            out.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let escaped = bytes[index + 1];
+        let octal = bytes
+            .get(index + 1..index + 4)
+            .filter(|digits| digits.iter().all(|digit| (b'0'..=b'7').contains(digit)));
+        if let Some(digits) = octal {
+            out.push(digits.iter().fold(0u8, |value, digit| {
+                value.wrapping_mul(8).wrapping_add(digit - b'0')
+            }));
+            index += 4;
+            continue;
+        }
+        out.push(match escaped {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'v' => 0x0b,
+            other => other,
+        });
+        index += 2;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn parse_porcelain(raw: &str) -> Vec<GitFileStatus> {
@@ -402,6 +641,15 @@ mod tests {
             owner: owner.to_string(),
             name: name.to_string(),
         })
+    }
+
+    #[test]
+    fn porcelain_paths_are_unquoted_before_they_are_judged() {
+        assert_eq!(unquote_porcelain_path("plain.txt"), "plain.txt");
+        assert_eq!(unquote_porcelain_path("\".env.\\303\\251\""), ".env.é");
+        assert_eq!(unquote_porcelain_path("\"a\\tb\\\"c\\\\d\""), "a\tb\"c\\d");
+        // Out-of-range octal wraps rather than panicking.
+        assert_eq!(unquote_porcelain_path("\"\\777\""), "\u{FFFD}");
     }
 
     #[test]
@@ -549,7 +797,12 @@ mod tests {
             let data_dir = base.join("data");
             fs::create_dir_all(&repository).unwrap();
             let scanner = SecretScanner::new(Vec::new());
-            let service = GitService::new(AuditLog::new(&data_dir, true, scanner.clone()), scanner);
+            let service = GitService::new(
+                AuditLog::new(&data_dir, true, scanner.clone()),
+                scanner,
+                PathPolicy::unrestricted(),
+                GitReadCaps::from_config(&Config::default()),
+            );
             Self {
                 repository,
                 data_dir,

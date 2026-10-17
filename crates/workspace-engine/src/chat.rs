@@ -5342,12 +5342,21 @@ fn format_git_status(status: &GitStatus) -> String {
     if status.clean {
         "Working tree clean.".to_string()
     } else {
-        status
+        let mut listed = status
             .files
             .iter()
             .map(|file| file.raw.clone())
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        if status.omitted > 0 {
+            // Spec 47 §5.5: a cut listing says so, or it reads as complete.
+            listed.push_str(&format!(
+                "\n[Status truncated: {} of {} entries shown.]",
+                status.files.len(),
+                status.files.len() + status.omitted
+            ));
+        }
+        listed
     }
 }
 

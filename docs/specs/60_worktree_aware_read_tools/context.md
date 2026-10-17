@@ -69,7 +69,9 @@ functions, and a worktree argument would otherwise multiply them.
   external diffs, textconv and fsmonitor for reads costs nothing a read needs.
 
 None of these was observed being exploited. They are gaps in a boundary the rest
-of the read surface already holds.
+of the read surface already holds. Task 2 closed all four on 2026-10-17, and
+found a fifth it did not close: `.gitattributes` can also select a clean
+filter by name (`proposal.md` §7).
 
 ## 4. Alternatives rejected
 
