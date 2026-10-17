@@ -33,6 +33,7 @@ fn temp_repo(name: &str) -> PathBuf {
     ));
     fs::create_dir_all(repo.join("src")).expect("repository should be created");
     fs::write(repo.join("src/a.rs"), "fn main() {}\n").expect("a source file");
+    with_list_script(&repo);
     repo
 }
 
@@ -41,8 +42,21 @@ fn engine_for(repo: &Path) -> WorkspaceEngine {
         data_dir: repo.join(".damaian"),
         // Throwaway repository: a watcher would only cost FSEvents registration.
         enable_index_watcher: false,
+        // So the failing commands below run without approval, like the
+        // read-only `ls` they stand in for.
+        command_allowlist: vec![FAILING.to_string(), format!("./list {SECRET}")],
         ..Config::default()
     })
+}
+
+/// A failing command that is not exploration. A failed `ls` records no
+/// finding since spec 63 Task 2, so these tests list through a repository
+/// script, which is `Other` and keeps the generic finding.
+const FAILING: &str = "./list no-such-directory";
+
+fn with_list_script(repo: &Path) {
+    fs::write(repo.join("list"), "#!/bin/sh\nexec ls \"$@\"\n").unwrap();
+    fs::set_permissions(repo.join("list"), fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 fn sink_parts() -> (CancelToken, impl FnMut(&str), impl FnMut(TurnProgress)) {
@@ -135,7 +149,7 @@ fn findings(engine: &WorkspaceEngine, repo: &Path, session_id: &str) -> Vec<Find
         .expect("findings should read")
 }
 
-/// A failed sandbox command becomes one generic finding (`ls` has no
+/// A failed sandbox command becomes one generic finding (the script has no
 /// parser). It carries its task and an `origin_ref` under which the full
 /// stored output lives (`context.md` §13.4).
 #[test]
@@ -144,7 +158,7 @@ fn a_failed_sandbox_command_is_recorded_with_its_task_and_reachable_output() {
     let engine = engine_for(&repo);
     let mut adapter = scripted(vec![vec![call(
         "run_command",
-        r#"{"command":"ls no-such-directory","reason":"List it"}"#,
+        r#"{"command":"./list no-such-directory","reason":"List it"}"#,
     )]]);
 
     let result = ask(&engine, &repo, "List the folder", &mut adapter);
@@ -154,7 +168,7 @@ fn a_failed_sandbox_command_is_recorded_with_its_task_and_reachable_output() {
     let finding = &recorded[0];
     assert_eq!(finding.source(), FindingSource::Command);
     assert!(
-        finding.summary().starts_with("ls no-such-directory: "),
+        finding.summary().starts_with("./list no-such-directory: "),
         "{}",
         finding.summary()
     );
@@ -194,7 +208,7 @@ fn the_failed_step_carries_findings_evidence_after_its_exit() {
         )],
         vec![call(
             "run_command",
-            r#"{"command":"ls no-such-directory","reason":"List it"}"#,
+            r#"{"command":"./list no-such-directory","reason":"List it"}"#,
         )],
         vec![call("complete_step", "{}")],
     ]);
@@ -232,7 +246,7 @@ fn a_secret_in_a_failed_command_is_not_in_the_recorded_finding() {
     let engine = engine_for(&repo);
     let mut adapter = scripted(vec![vec![call(
         "run_command",
-        &format!(r#"{{"command":"ls {SECRET}","reason":"List it"}}"#),
+        &format!(r#"{{"command":"./list {SECRET}","reason":"List it"}}"#),
     )]]);
 
     let result = ask(&engine, &repo, "List it", &mut adapter);
@@ -396,7 +410,7 @@ fn dismissing_a_finding_does_not_suppress_the_same_problem_from_a_later_check() 
     let failing = || {
         scripted(vec![vec![call(
             "run_command",
-            r#"{"command":"ls no-such-directory","reason":"List it"}"#,
+            r#"{"command":"./list no-such-directory","reason":"List it"}"#,
         )]])
     };
 

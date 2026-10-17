@@ -1,6 +1,6 @@
 # Feature Spec: Exploratory Command Failures Are Not Findings
 
-Status: In progress (started 2026-10-17; Task 1 of 6 done — see
+Status: In progress (started 2026-10-17; Tasks 1–2 of 6 done — see
 [`tasks.md`](tasks.md)). Specified on 2026-10-17 from the session behind
 [#59](../59_exploration_round_allowance/proposal.md)–[#62](../62_approval_prompts_name_the_reason.md),
 a reporting-only request that left two open **error** findings behind: an
@@ -149,9 +149,11 @@ not be reused as one.
 
 ### 5.2 Findings
 
-`findings_from_execution` takes the purpose. For `Exploration` it returns no
-findings. For `Check` and `Other` it is unchanged. `record_command_findings`
-passes the purpose from the execution, on both of its call paths.
+`findings_from_execution` reads the purpose from `CommandExecution::purpose`,
+which Task 1 already put there, so its signature and `record_command_findings`
+are unchanged and both call paths (the auto-run and the resume after approval)
+get the rule. For `Exploration` it returns no findings, before any parser runs,
+whatever the exit or termination. For `Check` and `Other` it is unchanged.
 
 ### 5.3 Plan evidence
 
@@ -211,3 +213,6 @@ the design above have been folded into §5.1.
   policy code. Every command `detect_in` produces today is on the validation
   list, so the `detected` flag changes no current outcome; it is kept so a
   future detector cannot fall through to `Other`.
+- **Task 2 (2026-10-17).** `findings_from_execution` reads the purpose from the
+  execution, so its signature did not change (§5.2). Tests that used a failing
+  `ls` to mean "a failed command" now use a repository script, which is `Other`.
