@@ -97,7 +97,7 @@ pub use effective_policy::{
 pub use error::{ClientError, ProviderRefusal, Result};
 pub use file_access::{FileAccessController, FileRead, LineRange, ReadWindow};
 pub use git_service::{
-    GitFileStatus, GitHubRepo, GitService, GitStatus, GitSummary, parse_github_remote,
+    GitFileStatus, GitHubRepo, GitReadCaps, GitService, GitStatus, GitSummary, parse_github_remote,
 };
 pub use hash::repository_id_for_root;
 pub use hooks::{HookEnvelope, HookFailureKind, HookFinding, HookResponse};

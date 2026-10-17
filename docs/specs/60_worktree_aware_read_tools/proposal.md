@@ -1,8 +1,9 @@
 # Feature Spec: Worktree-Aware Read Tools
 
-Status: In progress (started 2026-10-17). Task 1 of 6 is done: registered
-worktrees are resolved and refused (§5.1); the tools do not use it yet. Plan and
-progress in [`tasks.md`](tasks.md). Specified on 2026-10-17 from the same
+Status: In progress (started 2026-10-17). Tasks 1–2 of 6 are done: registered
+worktrees are resolved and refused (§5.1), though no tool uses it yet, and the
+git reads on the main checkout are hardened (§5.4). Plan and progress in
+[`tasks.md`](tasks.md). Specified on 2026-10-17 from the same
 session as [#59](../59_exploration_round_allowance/proposal.md), after it was
 continued three times and still did not finish: 35 of its 40 approval prompts
 were read-only commands the agent ran in worktrees because no tool could reach
@@ -230,18 +231,26 @@ the gaps are the same ([`context.md`](context.md) §3).
   checked), restricted ones are dropped, and the content diff runs over the
   rest as `:(top,literal)` pathspecs (`tasks.md` C2). Status entries for
   restricted paths are dropped from both the parsed files and the raw porcelain
-  the way `list_directory` drops them, since a path can name a secret.
+  the way `list_directory` drops them, since a path can name a secret; a
+  rename is dropped when either name is restricted. A path below a restricted
+  directory counts as restricted, since `list_directory` never descends into
+  one. A status whose only changes are restricted reads as clean.
 - **Output is bounded** by `max_read_lines` and `max_file_bytes`, whichever
   binds first, and a truncated result says so and how much it cut — the rule
-  #47 §5.5 set for reads.
+  #47 §5.5 set for reads. A diff ends `[Diff truncated by lines: 400 of 5120
+  lines shown; 7 of 12 files not shown.]`; a status, `[Status truncated: 400 of
+  1830 entries shown.]`. The diff is redacted before it is cut, so a cut cannot
+  leave a secret's prefix the scanner no longer recognises.
 - **No repository-supplied code runs.** Every invocation passes
   `-c core.fsmonitor=false`, and `diff` and `log` pass `--no-ext-diff` and
   `--no-textconv`. `.gitattributes` is repository content; it can name a diff
   driver, and a user's own git config can define one with that name.
 - **A read takes no lock.** Every invocation passes `--no-optional-locks`, as
-  `checkpoint.rs::run_user_git` does. Otherwise `git status` may take
-  `index.lock` to refresh the index, and in a worktree where another agent is
-  working, that agent's own `git add` could fail (`tasks.md` C3).
+  `checkpoint.rs::run_user_git` does, and `-c diff.autoRefreshIndex=false`.
+  Otherwise `git status` may take `index.lock` to refresh the index, and `git
+  diff` does the same whenever it finds stat-only changes, whatever
+  `--no-optional-locks` says. In a worktree where another agent is working,
+  that agent's own `git add` could fail (`tasks.md` C3).
 - **Arguments cannot become options.** `base` must satisfy git's ref-name rules
   and must not start with `-`; it is passed after `--end-of-options`. `paths`
   are resolved through `PathPolicy` against the worktree first and passed after
@@ -324,3 +333,15 @@ and why: not registered, outside the allowed roots, or prunable), and
   (`parse_worktree_list`, `classify_worktrees`, `resolve_worktree`), with
   `GitService::worktrees` and `PathPolicy::is_inside_allowed_root`. Nothing
   dispatches through it until Task 3.
+- Task 2 (2026-10-17): every git process `git_service.rs` starts goes through
+  one runner, `read_git`, and `GitService::new` takes the `PathPolicy` and
+  `GitReadCaps`. The hardening applies to the CLI's `git-status`/`git-diff`
+  and the desktop shell's `/api/git-status` too, since they call the same
+  functions. `tasks.md` lists every way main-checkout output changed.
+- Found in Task 2, not addressed: `.gitattributes` can select a
+  `filter=<name>` whose `clean` command the user's own git config defines,
+  and `status` and `diff` run it on stat-dirty files. Git has no flag that
+  disables filters, and turning them off by name would make git-lfs or
+  git-crypt files read as modified, so §5.4's "no repository-supplied code
+  runs" holds for diff drivers, textconv and fsmonitor, not for filters. It
+  needs its own decision.
