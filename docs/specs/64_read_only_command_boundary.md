@@ -268,6 +268,9 @@ Throughout:
 
 All in `command_policy.rs`; no new dependency.
 
+The full seven-check gate passed in CI on 2026-10-17; scoped checks passed
+locally: fmt, node, lint, typos, deny, and `cargo clippy -p workspace-engine`.
+
 - **Tokenizer.** `shell_words` is hand-written rather than `shell-words`,
   because that crate reports no unquoted globs or tildes, and requirement 1
   needs exactly that. It refuses (returns `None`, so a read-only program asks)
