@@ -1,6 +1,6 @@
 # Feature Spec: Worker Sessions
 
-Status: In progress (Tasks 1–7 of 11 done, 2026-10-07, 2026-10-09, 2026-10-09, 2026-10-12, 2026-10-12, 2026-10-15 and 2026-10-15; see [`tasks.md`](tasks.md))
+Status: Done 2026-10-16 (Tasks 1–12; see [`tasks.md`](tasks.md)). Acceptance passed with DeepSeek (`deepseek-v4-flash`) on its re-run in Task 12, after §7 items 10 and 11 were resolved (§6)
 Order: 57 of 57
 Plan: none. An exception to the graduation rule, like #41–#44 and #47: it came
 from describing how this repository is actually built — a planner session that
@@ -132,8 +132,11 @@ in Settings as "Worker sessions" with a one-line description. It is classified
 and so a `Capability` key in #31's partition:
 a repository must not be able to change how the user's sessions behave or add
 text to their system prompt. Turning it off while workers are running does not
-stop them; it hides the entry points for new ones, and the board stays
-reachable until no worker is left on it.
+stop them; it hides the entry points for new ones. As built (Tasks 9–10), it
+also hides the board, the sidebar entries and the worker controls, and every
+worker route except the list refuses, `stop` and `shutdown` included (decided
+in Task 11, §5.7 Setting off). A running worker then ends with its turn or when
+the application quits, or is controlled again by turning the setting back on.
 
 **Instruction.** When the setting is on, one fixed paragraph
 (`WORKER_HANDOFF_PARAGRAPH`) is appended to the system prompt of every session
@@ -146,8 +149,9 @@ worker_record(session).is_none()`
 
 > When work should continue in a separate session — because it is a
 > self-contained task, or one of several that can run in parallel — write each
-> task as a prompt in its own fenced block tagged `worker-prompt`. The user can
-> start a worker from that block. A worker starts with a fresh context in its
+> task as a prompt in its own fenced block whose opening line is exactly
+> ```` ```worker-prompt ````, with the tag on the fence line itself and not
+> inside the block. The user can start a worker from that block. A worker starts with a fresh context in its
 > own git worktree and sees only the repository and that prompt, so say what to
 > read, what to change, which checks to run, and when to stop. Do not use the
 > `worker-prompt` tag for anything else.
@@ -245,7 +249,11 @@ exists, `-2`, `-3`, … is appended to both until neither does.
 A creation that fails is recorded as a `worker_spawn_failed` audit event with
 the error. A failure after step 5 leaves the worktree and its branch in place,
 and the commands run so far are not in that event, because
-`create_worker_worktree` does not return them on an error.
+`create_worker_worktree` does not return them on an error (a follow-up, §7).
+Before step 1 the shell checks that the worker's control socket path fits
+(§5.2). Its length depends only on the data directory, so a data directory too
+long for it is refused before anything exists (Task 11; until then it was
+refused only at step 9, after the worktree, branch and records).
 
 **Approval.** #36 requires action-specific approval for git mutations. Clicking
 *Start worker* is that approval: the user initiated the action and the dialog
@@ -311,7 +319,8 @@ bytes including its NUL, and the id-named path measured 107 bytes under the real
 `~/Library/Application Support/DamaianClient` and 132 under a `/var/folders/…`
 test directory (2026-10-12). The hashed path is 91 bytes under the real
 directory. When even that does not fit, the worker refuses to start and says
-how long the path is. A leftover socket from a crashed worker is replaced; one
+how long the path is, and the shell refuses the spawn before creating anything
+(§5.1). A leftover socket from a crashed worker is replaced; one
 that still answers is not, because a live worker holds it. Line-delimited JSON
 requests, one response each, one connection at a time; a connection idle for 5
 seconds is closed. Every request carries the token; a wrong or missing token
@@ -390,6 +399,24 @@ pending-approval snapshot. A worker whose process ended without finishing its
 turn is marked `Interrupted` through #17, and its session offers *Restart
 worker* (§5.7).
 
+**A live worker is not crash debris** (correction C12 in
+[`tasks.md`](tasks.md)). #17's sweep assumes every non-terminal task in the
+data directory was left by a process that died, and the shell runs that sweep
+lazily, on the first `GET /api/recovery`, which can come after it has started a
+worker. So `classify_session` and `reattach_pending_approvals` skip a session
+that has a worker record **and** a live `ProcessKind::Worker` registry entry
+for it (`process_registry::live_worker_registered`: kind `worker`, that
+session id, and a pid whose start time still matches). Such a session gets no
+`task_recovered` event, no `lost_to_crash` usage for its in-flight model call,
+no recovery card and no reattached approval that the shell could answer behind
+the worker's back. A worker whose process has ended is still classified as
+before: that is how its task becomes `Interrupted`, how a lost model call is
+accounted for, and why skipping every worker session outright was rejected.
+The registry decides rather than the supervisor because the guarantee belongs
+in the engine, where every caller of the classifier gets it, and the shell
+registers a worker before handing it anything to run, so there is no window in
+which a worker has a task and no entry.
+
 **Stop escalation** from the UI: `stop`; if the turn has not ended within 10
 seconds, `shutdown`; if the process has not exited 5 seconds later, `SIGTERM` to
 its registry PID. As built (`Supervisor::stop`), the shell asks `status`
@@ -435,6 +462,17 @@ At the existing round-boundary check, before the next model request
    never weaker. There is no composer length limit to reuse; the worker's
    socket (Task 5) is where a note's length is bounded. Emit a `note` progress
    event.
+
+   A note reaches the turn only at a boundary. A round that ends in a command or
+   plan approval never returns to the loop's top, so the worker carries the
+   notes it has accepted but not delivered into the resumed job: `approve` and
+   `reject` continue the same turn (§5.6), and its next boundary drains them
+   (Task 11, `a_note_queued_before_an_approval_reaches_the_resumed_turn`; before
+   that they were dropped with the job's `TurnSteering`). A note accepted during
+   a turn's final round, which then completes with no further model request, is
+   not delivered: no boundary follows. Carrying it into the next `message` would
+   put it after a message the user wrote later, so that case is a follow-up
+   (§7), and the user guide says so.
 4. If the turn was paused, persist the running status again and continue.
 
 A pause requested during a model call or a tool takes effect at the following
@@ -533,6 +571,60 @@ that project's repository as the source.
   visible. The source repository is compared by its canonical path, as the
   worker record stores it.
 
+As built (Task 9), with no new route:
+
+- **Where it shows.** The board takes the conversation's place in the main
+  pane (`#workers-board`): the log, the composer and the header's ⋮ step
+  aside, and the header reads "Workers · ‹project›". Opening any session,
+  starting a new one or switching project leaves it. Opening the board of a
+  project that is not open opens that project first.
+- **Sidebar.** Under an expanded project: the Workers entry first, then the
+  sessions in their usual order, each worker indented under its parent
+  (oldest first). A worker without a parent in that list, because it had
+  none or its parent was deleted, is placed among the sessions by its
+  `updatedAtMs`. A worker row opens the worker under its source project
+  (`openWorkerSession`), which becomes the active row; if only the worktree
+  was added as a project, the worker opens in place. Its ⋮ is the board's
+  menu without *Dismiss*. The sidebar's rows are read when a project is drawn,
+  when a session loads, on every board poll and when the window regains focus.
+  There is no timed poll behind them, so with the board hidden a badge can be
+  stale until one of those happens.
+- **Dots.** *Needs you* for waiting for approval, a hollow *paused* for
+  paused, *running*, then for finished rows *failed* when the row carries an
+  error or ended `failed`, `interrupted`, `unknown_external_outcome` or with a
+  budget used up, and *finished* otherwise (complete, cancelled). A worker
+  whose process ended while paused or waiting is reported `interrupted`
+  (C5), so it shows failed with "Interrupted: its process ended mid-turn" and
+  *Open*. *Restart worker* is the worker session's (Task 10).
+- **Stop** shows for every live worker, not only running, paused and waiting
+  ones. An idle worker refuses `stop` (it has no turn), so *Stop* on an idle
+  row sends `shutdown`. That is also how a finished but still-live worker is
+  ended. *Remove worktree* stays visible on such a row but disabled with
+  "Stop the worker first", because the shell refuses removal while a live
+  worker holds the worktree. Both confirm first; removal shows the worktree
+  path and says the branch is kept, and a `dirty` answer is confirmed a second
+  time naming the paths, then resent with `confirmed_dirty=true`.
+- **Reveal worktree in Finder** is the existing `POST /api/reveal-in-finder`
+  with the row's `worktree` as `repo`.
+- **Dismiss from board** is client-side: session ids in the webview's
+  `localStorage` (`damaian:dismissedWorkers`). It hides a finished row from
+  the board only. A dismissed worker that runs again (*Restart worker*) is
+  taken off the list and shows again.
+- **New worker** is on the board's header and in the project row's ⋮ (§5.1
+  Entry points: empty, no parent).
+- **Elapsed** runs live for unfinished rows. A row has no end time, and the
+  session's `updatedAtMs` does not move while a worker's turns run, so a
+  finished row shows "—" rather than a duration that reads as zero.
+- **A held shell (C10).** The shell serves one request at a time, so a poll
+  can wait for the whole of a turn streaming in another session. The board
+  keeps one request out at a time and schedules the next a second after the
+  last one answered, so a held shell gets one poll, not a pile. A slow
+  answer is not an error. The rows stay as they were, and after three seconds
+  a quiet line says how old they are and that the shell answers once a turn
+  running in another session ends. Only a request that fails shows "Could not
+  refresh: …". Workers keep running meanwhile; only the view lags. The board
+  does not poll while the window is hidden.
+
 **Worker session.** The ordinary session view with two additions:
 
 - A **control strip** under the header: status pill, `Round r/max` with a bar,
@@ -548,11 +640,88 @@ that project's repository as the source.
   starts a new process for the same session and worktree (refused if another
   live worker holds it). Its composer is disabled until then.
 
+As built (Task 10), with no new route:
+
+- **Strip.** It sits under the header while the open session is a worker and
+  the setting is on, and is removed otherwise. Its state comes from the
+  progress file's `status` lines and the route's `alive`, its round from the
+  last `phase` line ("Round —" until one arrives). *Stop* also shows for an
+  idle worker and sends `shutdown` there, as on the board (Task 9), and
+  confirms first. A worker whose process ended shows *Interrupted* when it
+  ended mid-turn (the row's `taskStatus`, C5) and *Ended* otherwise. Both
+  offer *Restart worker*, because no other control can bring an ended
+  worker back to take a message; it is not filled, as *Resume* stays the
+  strip's one primary.
+- **Composer.** Its round send button becomes a labelled one (*Send note*,
+  *Resume with note*, *Send message*), and the attach menu and model choice
+  step aside, because a worker takes the configured provider and model and
+  its messages carry text only. While the worker waits for approval, is
+  stopping or has ended, the field and the button are disabled and the
+  placeholder says why. `sendChatPrompt` hands everything to the worker
+  while its view is open, so no path from the worker view reaches the
+  shell's turn routes.
+- **Live progress.** The poll follows the board's C10 rules: one request
+  out, the next a second after the answer, nothing while the window is
+  hidden, and it ends when another session, a new one, the board or the
+  setting going off replaces the view. A slow answer shows nothing; a
+  failed one says "Could not refresh". The first read catches up silently,
+  because what finished is already in the log. After that, a running turn
+  draws one assistant bubble with the shell's turn indicator, fed by
+  `phase`, `text` and `plan` lines. A `note` line closes that bubble and adds
+  the note as a user message, then the next round gets a new bubble. When a
+  job ends (`idle` or `waiting_for_approval`) or the process exits, the
+  conversation is drawn again from the session log, as the shell does after
+  a turn of its own.
+- **Approvals.** The worker's card is the shell's own: a command shows
+  `createCommandApprovalPreview`, a plan shows `createPlanReview`, with
+  consent content in full. A `decide` option sends the decision to
+  `/api/worker-control` (`approve`/`reject` with `proposal_id`) instead of
+  the shell's resume routes. Without it the cards are unchanged. Because the
+  worker's `approve` carries no grant or step revision, the command card
+  offers no "always allow" overflow and the plan's steps are shown, not
+  edited. A command or plan card shows only while the live process waits.
+  A patch or fallback offer shows the shell's card unchanged, with the
+  worktree as `repo`, while the worker is idle after that turn. The card
+  sits beside the last answer's body, so *Review* on the board finds it;
+  *Review* waits for the view's first read (at most 3 s).
+- **Recovery.** The shell's crash-recovery card is not shown for a worker
+  session: its *Resume* would continue the worker's turn in the shell, which
+  C5 rules out, and the strip's *Restart worker* takes its place. Findings
+  for a worker are read with its worktree as `repo`.
+- **Restart.** A restarted worker is idle, with a new progress file. When the
+  old process was waiting for approval, the toast says that approval ended
+  with it and its command did not run (Task 7), and the card is gone.
+- **Setting off.** Workers show as ordinary sessions: no strip, no header
+  line, no poll, and the composer as it was. **Decided in Task 11:** the
+  shell keeps refusing `stop` and `shutdown` (403) while the setting is off,
+  like every worker route but the list. With it off the UI offers no worker
+  controls at all, so accepting them would serve no client, and "off" stays
+  one rule with no exceptions to explain. The worker still cannot outlive
+  the application, and turning the setting back on restores its controls.
+
 **Parent session.** Prompt blocks carry *Start worker* (§5.1). Once a block has
 been used, its footer also shows "Started *‹worker title›* →", linking to the
 worker, so a second click is a visible, deliberate second worker rather than an
 accident. A one-line, quiet entry is appended where the worker was spawned:
 "Spawned worker *‹title›* →". No live card.
+
+As built (Task 8), with no new route: the UI reads `GET /api/workers` for the
+open folder, and also for its source when the folder is itself a worktree
+(`<source>/.damaian/worktrees/<slug>`). A session whose id is in those rows is
+a worker and shows neither entry point. The rows with the open session as
+`parentSessionId` are its workers. No route says which block started a
+worker, and the parent's `worker_spawned` event does not reach the UI. So on
+reload each worker is placed at the latest assistant message created before
+it that holds a `worker-prompt` block whose first non-blank line (at most 80
+characters, the shell's title rule) is the worker's title. That block gets the
+"Started" link and the message gets the entry. A worker whose prompt was
+edited in its first line matches no block. Its entry then follows the last
+message created before it, and no block gets a link. Two identical blocks
+give the link to the later one. Right after a spawn, the clicked block and its
+message get both, exactly. The link opens the worker where the sidebar lists
+it, under its source project (Task 9). The shell refuses an ordinary turn sent
+to it from the source folder, because the session belongs to its worktree;
+the worker's own composer is Task 10's.
 
 **Shell routes** (the table is in [`tasks.md`](tasks.md), Interfaces):
 `GET /api/workers-enabled`, `GET /api/worker-source-status`,
@@ -678,6 +847,159 @@ it is doing, pause it, steer it with a note, and stop it. It waits for approvals
 without restarting. If Damaian exits for any reason, nothing it started keeps
 running.
 
+### As verified (Task 11, 2026-10-16)
+
+Each item above, with the test or the recorded manual check that covers it.
+`ws` is `crates/workspace-engine`, `ds` is `crates/desktop-shell`, and "ignored"
+means a real-process test run by hand (`tasks.md` rows 5–7 and 11).
+
+- **`TurnSteering`.** `ws/tests/steering.rs`:
+  `pause_takes_effect_only_at_a_round_boundary`,
+  `a_paused_turn_persists_paused_then_running_again`,
+  `resume_continues_the_same_turn`,
+  `a_note_becomes_a_user_message_before_the_next_model_request`,
+  `cancel_while_paused_ends_cancelled`, `a_turn_without_steering_is_unchanged`;
+  `steering.rs::wait_while_paused_returns_on_cancel_without_wake`. Note refused
+  while waiting: `ds` `worker_turns::a_note_while_waiting_for_approval_is_refused`.
+  Added in Task 11: `a_note_queued_before_an_approval_reaches_the_resumed_turn`.
+- **Same-turn guarantee.** `worker_turns::a_turn_through_the_worker_host_matches_the_shell_host`,
+  plus `a_worker_turn_gets_the_shells_chat_integrations`, which catches what
+  that comparison cannot see (Task 6).
+- **Progress file.** `worker_progress.rs`: `seq_strictly_increases_from_one`,
+  `reading_after_n_returns_exactly_the_later_lines`,
+  `a_seeded_secret_never_reaches_the_file`.
+- **Key and token.** Ignored `ds/tests/worker_process.rs`:
+  `a_command_the_worker_runs_sees_neither_key_nor_token` (environment) and
+  `the_worker_keeps_key_and_token_out_of_argv_and_output` (argv).
+- **Stdin close.** Ignored `closing_stdin_exits_the_worker_and_kills_its_sleeping_child`.
+  It spawns a real process, so it is ignored rather than "a normal test" as
+  planned.
+- **Socket.** `worker.rs`: `the_socket_is_0600_in_a_0700_directory`,
+  `a_wrong_or_missing_token_closes_the_connection`,
+  `an_unknown_command_is_rejected`.
+- **Command approval.** `worker_turns::a_command_approval_continues_in_process`
+  (snapshot present while waiting, gone after, same pid). Killed while
+  waiting: ignored `killing_a_worker_waiting_for_approval_leaves_a_snapshot_recovery_finds`.
+- **Patch proposal.** `worker_turns::a_patch_proposal_leaves_the_worker_idle_and_alive`.
+- **Creation.** `ws/tests/worktree.rs`:
+  `a_worktree_is_created_under_damaian_worktrees_on_a_damaian_branch`,
+  `the_exclude_line_is_added_once`, `colliding_names_get_matching_suffixes`.
+- **Refusals.** `refuses_a_symlink_anywhere_in_the_path`,
+  `refuses_a_tracked_path_under_worktrees`,
+  `refuses_a_path_that_resolves_outside_the_repository`,
+  `refuses_a_non_git_source`. An existing path: naming skips it, so it is
+  never reused (`colliding_names_get_matching_suffixes`). The refusal behind
+  naming has no test of its own, because naming never hands it an existing
+  path.
+- **Include / last commit.** `include_carries_tracked_edits_and_untracked_files`,
+  `start_from_last_commit_carries_neither`.
+- **`worker_spawned` records.** `ds` `worker_supervisor::spawn_records_worker_spawned_on_worker_parent_and_audit`.
+- **Restart refusal.** `worker_supervisor::restart_is_refused_while_a_live_worker_holds_the_worktree`.
+- **Parent deleted.** `worker_supervisor::deleting_a_parent_sends_shutdown_to_its_workers_and_keeps_their_worktrees`.
+- **Dirty removal.** `worker_supervisor::remove_worktree_requires_the_second_confirmation_when_dirty`
+  and `worktree.rs::removing_a_dirty_worktree_reports_paths_and_does_not_force`.
+- **Kill test.** Ignored `ds/tests/workers.rs::sigkilling_the_shell_ends_its_worker_and_the_workers_command`,
+  added in Task 11. Run 2026-10-16: the worker and its `sleep` command were
+  gone 44 ms after the shell's `SIGKILL`. Falsified: with the lifeline's EOF
+  ignored it fails at 5 s.
+- **UI.** Each item is a recorded manual check in the running shell on port 4799
+  with its own data directory. Task 8's row: the tag rule through both
+  renderers (untagged, `text`, `prompt`, `rust`, `worker-prompt extra`,
+  `Worker-Prompt`, a user message's block, while streaming, in a worker
+  session, setting off), the exact pre-fill, the dialog clean and dirty, and
+  the "Started" link and entry. Task 9's row: board groups and ordering, *Stop*
+  in the overflow, and setting off (no board, no sidebar entries, no button).
+  Task 10's row: the strip in each state, a note while running and while
+  paused, approval with the same pid, and Stop.
+- **Setting and instruction.** `chat.rs`:
+  `code_mode_system_prompt_is_byte_identical_to_todays` (unmodified),
+  `no_mode_changes_when_handoffs_are_not_offered`,
+  `the_handoff_paragraph_is_appended_when_offered`,
+  `a_non_worker_session_gets_the_paragraph_when_enabled`,
+  `a_worker_session_never_gets_the_paragraph`;
+  `ws/tests/repository_config_trust.rs::repository_config_cannot_enable_worker_sessions`.
+- **Also.** The deterministic eval tier ran 16/16 in Task 6, when turn hosting
+  changed. Task 11 changed only worker bookkeeping, and the tier also runs
+  in the workspace test suite on CI. The full seven-check gate runs on CI
+  (`AGENTS.md`).
+- **C12** (a live worker is not crash debris): `ws/tests/crash_recovery.rs::a_live_worker_session_is_not_recovered`,
+  `ds` `recovery.rs::a_live_worker_is_not_offered_for_recovery`.
+
+**Cold start**, informational: ignored `workers.rs::worker_cold_start_on_this_repository`,
+a debug build on the development Mac, 2026-10-16. Source: a local clone of this
+repository (333 tracked files). The model was `DAMAIAN_MOCK_MODEL_RESPONSE`, so
+no provider time is counted. In three runs, `spawn` returned in 143–163 ms
+(worktree, records, process), the socket answered at 169–406 ms, and the first
+model request was prepared at **7.3–7.6 s**. Nearly all of it is the worker
+building its index of a worktree it has never seen. No index is shared with
+the source, which is the cost of a process per worker (§4).
+
+**Acceptance, run 2026-10-16 with DeepSeek (`deepseek-v4-flash`), not met on
+its first clause.** It was run in a scratch shell on port 4799 with its own data
+directory, a throwaway key the user put in the Keychain, Worker sessions on, and
+a fixture repository with no `AGENTS.md`. Four requests to split two tasks
+(a `--reset` flag, a README usage section):
+
+1. "Split this work into separate tasks … add a --reset flag … add a Usage
+   section to README.md": the web UI's `looksLikeEditRequest` (an edit verb
+   plus a code word) sent it to the one-shot patch flow (`/api/propose-edit`),
+   which has its own prompt without the §5.0 paragraph. It ended "Generated
+   edit did not contain any file changes".
+2. Reworded without those words: a chat turn, which carries the paragraph.
+   The model wrote the plan as a patch adding `TASKS.md`.
+3. and 4. Asked not to touch the repository and to hand each task to its own
+   session: the model wrote two handoff prompts each time, as a bare fence
+   with `worker-prompt` on the first line *inside* it, not as the fence's info
+   string. Damaian matches the info string exactly (§5.1), so neither answer
+   had a *Start worker* button.
+
+Nothing in the engine rewrites fences, so this is the model's formatting. With
+the setting turned off, the UI showed no Workers entry, board, dot or button,
+and `/api/workers-enabled` answered false. No worker was started from a real
+model's answer, so *Start worker* → confirm on a model-written block is shown
+only against a scripted answer (Task 8). Two findings follow, §7 items 10 and
+11. Each answer was also one sample, from one provider.
+
+**Acceptance, re-run 2026-10-16 with DeepSeek (`deepseek-v4-flash`) after
+Task 12: met.** Same set-up as above (port 4799, its own data directory, a
+throwaway key the user put in the Keychain, a fresh fixture with no
+`AGENTS.md`), with the two fixes: the §5.0 paragraph now shows the literal
+opening fence (item 10), and with Worker sessions on `looksLikeEditRequest`
+leaves planning requests to the chat turn (item 11).
+
+1. Request 1's exact wording ("Split this work into separate tasks that can
+   run in parallel: add a --reset flag to main.rs, and add a Usage section to
+   README.md") went to `/api/ask-stream`, not `/api/propose-edit`. The one
+   answer held two blocks rendered as `language-worker-prompt`, each with a
+   *Start worker* button.
+2. *Start worker* on the README block opened the dialog with the block's text.
+   Confirming started a worker on `damaian/add-a-usage-section-to-readme-md-in-this`
+   in `.damaian/worktrees/…`, as process 52345. It appeared on the board, in
+   the sidebar under its parent and in the parent's "Spawned worker" line.
+3. After an unapproved `ls -la`, it stopped for approval on each command it
+   proposed (`high`, "cannot run in sandbox mode"), shown as *Needs you* /
+   *Waiting for approval*. After the first approval it was still process
+   52345 (checked by pid). Three more approvals followed in the same turn,
+   with no *Interrupted* state.
+4. *Pause*, clicked as soon as a round started, took effect at its boundary
+   (*Paused*, round 4). A note sent while paused reached the model, which
+   acted on it in round 5 by rewriting `README.md` as the note asked.
+5. *Stop* during an approval ended it (`exited`, *Finished*). 52345 was gone,
+   and the worktree held the steered README. The source tree was unchanged.
+6. A second worker was started from the other block (process 55341, with a
+   model request in flight as `curl` 55435). `SIGKILL` of the shell's own pid
+   left neither the worker nor the `curl` running 0.5 s later. Its worktree
+   and branch were kept, as §5.3 says.
+7. Restarted with the setting off, `/api/workers-enabled` was false, and
+   neither the Workers entry nor a *Start worker* footer was shown. The same
+   blocks rendered as ordinary code blocks, and request 1's wording routed to
+   the patch flow again, as before Task 12.
+
+Also seen, not investigated (outside this spec): the worker's
+`cat > README.md <<'EOF'` was stored, approved and run as that first line only
+(the audit's `command` field), so the heredoc's body was lost and the file
+came out empty. This was one sample, from one provider.
+
 ## 7. Follow-up specs, not part of this one
 
 In the order agreed during design:
@@ -692,3 +1014,48 @@ In the order agreed during design:
 3. **Opt-in result summary** — a parent may read a finished worker's final
    status and closing summary, never its transcript, through the same
    redaction as everything else leaving a session.
+4. **Serve worker routes during a stream** (C10) — the shell's accept loop is
+   held for the whole of an `/api/ask-stream` turn, so the board and the
+   progress polls wait until it ends. Answering the read-only worker routes
+   while a turn streams would remove the lag.
+
+Smaller open items, recorded so they are not lost (Task 11):
+
+5. **Partial git commands on a failed creation** (Tasks 4 and 7, (b)). A failure
+   after `git worktree add` leaves the worktree and branch in place, and
+   `worker_spawn_failed` records only the error. `create_worker_worktree` would
+   have to return the commands it ran with its error, or remove what it made.
+6. **A note accepted in a turn's final round** is not delivered (§5.4). The
+   worker could report it as undelivered in the job's closing `status` line,
+   or carry it into the next turn. The choice is a design decision.
+7. **The board's row facts** (Task 9 discoveries 1–2). A `phase` line's empty
+   label for the context and model phases makes *Doing* read "Working". A
+   finished row has no end time; a `lastProgressAtMs` on the row would give it
+   one.
+8. **A worker's model** (Task 6 (a)). A worker takes the configured provider and
+   model, not the one chosen in the parent's composer.
+9. **The *Include* base commit** (Task 4 (a)). `git stash create` makes a
+   two-parent commit, which merging the worker's branch carries into history.
+   `commit-tree <stash>^{tree} -p HEAD` would give a single-parent base.
+
+Found by the acceptance run (§6), and blocking its first clause. These two were **not** follow-ups: they were Task 12 of this spec, which resolved both and re-ran acceptance (decided 2026-10-16):
+
+10. **The handoff's exact form.** DeepSeek put `worker-prompt` on the first line
+    inside a bare fence, twice out of two handoffs. Either the paragraph shows
+    the literal opening fence (```` ```worker-prompt ````), or *Start worker*
+    also accepts a bare fence whose first line is exactly `worker-prompt` and
+    drops that line from the prompt. The second loosens the "no button on the
+    wrong thing" rule (§4), so it is a decision, not a fix.
+    **Resolved in Task 12 (user's decision):** the paragraph shows the
+    literal fence, and matching stays exact.
+11. **Planning prompts routed to the patch flow.** `looksLikeEditRequest`
+    (`app.js`) sends any prompt with an edit verb and a code word to
+    `/api/propose-edit`, whose prompt has no §5.0 paragraph. "Split adding X
+    to the README into tasks" is such a prompt. Either that flow gets the
+    paragraph too, or the heuristic leaves planning requests to the chat
+    turn. This predates spec 57 and affects every provider.
+    **Resolved in Task 12 (user's decision):** with Worker sessions on, a
+    prompt saying *split*, *plan*, *tasks*, *hand off*, *parallel*, *worker*
+    or *session* is not an edit request. With the setting off, routing is
+    unchanged. The patch flow keeps its own prompt, since it can only answer
+    with a diff.

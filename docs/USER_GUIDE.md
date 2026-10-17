@@ -121,7 +121,7 @@ Use the `Chat` tab to ask questions about the selected repository. Damaian retri
 
 Press `Enter` to send a chat message. Press `Shift+Enter` to insert a new line.
 
-Questions stream read-only answers. Code and file change requests, such as `create a test file` or `update the README`, generate an inline patch preview in the conversation.
+Questions stream read-only answers. Code and file change requests, such as `create a test file` or `update the README`, generate an inline patch preview in the conversation. With Worker sessions on, a request to plan, split or hand off work stays in the conversation instead (see [Worker Sessions](#worker-sessions)).
 
 Use `+ File` above the prompt to pin specific repository files into the next chat request. Pinned files appear as chips above the prompt and are included before automatic retrieval. Use the `x` on a chip to remove one file, or `Clear` to remove all pinned files.
 
@@ -578,6 +578,34 @@ Where something was running that could have changed the world — a command, a p
 
 If a turn was waiting for your approval when Damaian stopped, that approval comes back: the command, the patch, or the plan is re-presented exactly as it was, and nothing runs until you approve it. A command approved this way runs on its own — the conversation that proposed it ended with the crash, so its output is not fed back to the model. A plan is the exception: the turn that asked you to review it was saved, so approving the plan continues that turn from where it stopped. Occasionally an approval cannot be restored, because an older version of Damaian recorded that a turn was waiting without recording what it was waiting for. That turn is closed with the reason stated rather than shown as a rebuilt approval card: approving a command Damaian is guessing at would be worse than losing the turn. Your stored patches and commands are untouched either way.
 
+## Worker Sessions
+
+A **worker** is a session that runs on its own: it gets a prompt, works in a new Git worktree of its own, and is hosted by a separate Damaian process, so you can keep talking to the session that started it. Workers are for handing off self-contained tasks, several at once if they can run in parallel.
+
+**Turning them on.** Workers are off by default. Turn on **Worker sessions** at the top of `Settings` → General. A repository cannot turn them on for you. While they are on, every session that is not itself a worker is told how to write a handoff: a prompt in a fenced block whose opening line is ```` ```worker-prompt ````. A request that asks to plan, split or hand off work (it says *split*, *plan*, *tasks*, *hand off*, *parallel*, *worker* or *session*) then always goes to the conversation, even when it also asks for an edit, rather than to a one-shot patch preview, which could only answer with a diff. Off, nothing of this section is visible and nothing is added to what the model is sent.
+
+**Starting a worker.** A `worker-prompt` block in an assistant's answer gets a **Start worker** button once the answer has finished. No other block gets one. Clicking it opens the New worker dialog with the block's text, which you can still edit. Confirm with **Start worker**. The session holding the block becomes the worker's parent: the block then shows "Started *‹title›* →", and the conversation gets a one-line "Spawned worker" link. **New worker** on a project's ⋮ menu or on the Workers board opens the same dialog empty, for a worker with no parent. A worker cannot start workers of its own.
+
+**Uncommitted changes.** A worker starts from your last commit, so it cannot see work you have not committed — often the very task file you planned it from. If your tree has uncommitted changes, the dialog says how many and names the files the prompt mentions first. Choose **Include uncommitted changes** (selected by default), which copies your tracked edits and untracked files into the worker's tree, or **Start from last commit**. Your own tree is not changed either way.
+
+**What a worker creates.** A branch `damaian/<name>` and a worktree at `<repository>/.damaian/worktrees/<name>`, the name taken from the prompt's first line. Damaian adds `.damaian/worktrees/` to `.git/info/exclude` once, so worktrees never show as untracked files. `.gitignore` is never edited. Clicking *Start worker* is your approval of those Git commands. They are recorded in the audit log and in the worker's session.
+
+**The Workers board.** **Workers** at the top of each project in the sidebar opens the board, and its badge counts the workers that need you. Workers are also listed in the sidebar under their parent, with a status dot. The board groups workers under *Needs you* (waiting for approval, or paused), *Running* and *Finished*, newest first. Each row shows the planner it came from, its rounds, what it is doing and how long it has run. Finished rows show files changed and commits ahead of where the worker started. Each row has one action — **Review** for an approval, **Pause** while running, **Open** otherwise — and a ⋯ menu with **Stop**, **Reveal worktree in Finder**, **Remove worktree** and **Dismiss from board**. Dismissing only hides the row. The session stays in the sidebar.
+
+**In a worker's session** a control strip under the header shows its state and round, with **Pause** and **Stop** while it runs, **Resume** and **Stop** while it is paused, and **Stop** while it waits or sits idle. The header says which session it came from and which branch it is on.
+
+- **Notes.** While a worker runs, the composer's button reads **Send note**. A note joins the conversation as your message at the worker's next round, before its next model request. While paused it reads **Resume with note**, and when the worker is idle, **Send message** starts a new turn. A note sent during the turn's final round, after which the turn finishes without another model request, does not reach that turn.
+- **Pause** takes effect at the next round boundary. A running command or model call is never cut short.
+- **Stop** ends the turn at its next safe point. If it has not ended within 10 seconds Damaian asks the worker to shut down, and 5 seconds after that it terminates the process. Stopping a worker that waits for approval or sits idle shuts it down.
+- **Approvals** look exactly as they do in your own sessions and continue in the same worker process without restarting it. A worker's command card has no *Allow Always*, and its plan steps cannot be edited before approval. Patch proposals and provider-switch offers end the turn as usual and are answered from the worker's session.
+- **Restart worker.** A worker whose process ended shows *Interrupted* if it ended mid-turn, or *Ended*, and offers **Restart worker**. That starts a new, idle process for the same session and worktree, and the composer comes back. An approval the old process was waiting for ended with it, and its command did not run.
+
+**Nothing outlives Damaian.** When Damaian quits, crashes or is force-quit, every worker exits within seconds and takes every command it started with it. Deleting a session stops its workers, and a worker's own session too. Their worktrees, branches and session logs are kept.
+
+**Removing a worktree.** *Remove worktree* on a finished worker's ⋯ menu removes `.damaian/worktrees/<name>`, after a confirmation. If the worktree has uncommitted changes, a second confirmation names them. **The branch is never deleted**: merging or deleting it is yours, through ordinary Git or by asking a session to.
+
+**Turning workers off** hides every entry point, the board and the controls. Workers that are already running keep running until they finish their turn or Damaian quits. To pause, steer or stop one, turn the setting on again.
+
 ## Settings
 
 Use the `Settings` tab to inspect and edit user configuration values, then select `Load`.
@@ -609,7 +637,7 @@ Repository-scoped settings are not edited from Settings. Put repository defaults
 
 Because that file arrives with a clone, a repository can only make Damaian *more* careful, never less:
 
-- `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
+- `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
 - `restricted_patterns`, `ignore_patterns`, and `command_blocklist` are added to yours rather than replacing them.
 - The `require_approval_for_*` flags can be turned on by a repository, not off. MCP and individual MCP servers can be turned off, not on.
 - `command_allowlist` is never taken from repository config; `Allow Always` writes to your own config instead. See [Chat](#chat).

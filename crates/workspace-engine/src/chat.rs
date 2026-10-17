@@ -4113,7 +4113,7 @@ const ABSOLUTE_TOOL_ROUND_CAP: u32 = 16;
 /// Damaian's own handoff instruction, verbatim from spec 57 §5.0. It is what
 /// makes *Start worker* appear without any repository's `AGENTS.md` teaching
 /// the `worker-prompt` tag.
-pub const WORKER_HANDOFF_PARAGRAPH: &str = "When work should continue in a separate session — because it is a self-contained task, or one of several that can run in parallel — write each task as a prompt in its own fenced block tagged `worker-prompt`. The user can start a worker from that block. A worker starts with a fresh context in its own git worktree and sees only the repository and that prompt, so say what to read, what to change, which checks to run, and when to stop. Do not use the `worker-prompt` tag for anything else.";
+pub const WORKER_HANDOFF_PARAGRAPH: &str = "When work should continue in a separate session — because it is a self-contained task, or one of several that can run in parallel — write each task as a prompt in its own fenced block whose opening line is exactly ```worker-prompt, with the tag on the fence line itself and not inside the block. The user can start a worker from that block. A worker starts with a fresh context in its own git worktree and sees only the repository and that prompt, so say what to read, what to change, which checks to run, and when to stop. Do not use the `worker-prompt` tag for anything else.";
 
 /// [`system_prompt`] plus the handoff paragraph when the session is offered
 /// handoffs. `system_prompt` itself never changes, which is how the setting
@@ -6264,7 +6264,7 @@ mod worker_handoff_tests {
     fn the_handoff_paragraph_is_appended_when_offered() {
         // Verbatim from proposal §5.0, re-typed here so an edit to the
         // constant has to be an edit to the spec too.
-        let from_the_spec = "When work should continue in a separate session — because it is a self-contained task, or one of several that can run in parallel — write each task as a prompt in its own fenced block tagged `worker-prompt`. The user can start a worker from that block. A worker starts with a fresh context in its own git worktree and sees only the repository and that prompt, so say what to read, what to change, which checks to run, and when to stop. Do not use the `worker-prompt` tag for anything else.";
+        let from_the_spec = "When work should continue in a separate session — because it is a self-contained task, or one of several that can run in parallel — write each task as a prompt in its own fenced block whose opening line is exactly ```worker-prompt, with the tag on the fence line itself and not inside the block. The user can start a worker from that block. A worker starts with a fresh context in its own git worktree and sees only the repository and that prompt, so say what to read, what to change, which checks to run, and when to stop. Do not use the `worker-prompt` tag for anything else.";
         assert_eq!(WORKER_HANDOFF_PARAGRAPH, from_the_spec);
 
         for mode in ALL_MODES {

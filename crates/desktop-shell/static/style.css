@@ -3363,6 +3363,458 @@ code.command-approval-command {
   width: min(640px, calc(100vw - 32px));
 }
 
+/* New worker (spec 57 §5.1): the prompt is the dialog's content, so it gets
+   the width and the height. */
+.app-dialog-worker {
+  width: min(640px, calc(100vw - 32px));
+}
+
+.worker-dialog-prompt {
+  width: 100%;
+  min-height: 0;
+  max-height: 50vh;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.worker-dialog-prompt:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.worker-dialog-dirty {
+  display: grid;
+  gap: 6px;
+  border-left: 3px solid var(--warn);
+  border-radius: 4px;
+  background: var(--surface-soft);
+  padding: 8px 10px;
+}
+
+.worker-dialog-dirty[hidden] {
+  display: none;
+}
+
+.worker-dialog-dirty-message {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.worker-dialog-dirty-message code {
+  font-size: 12px;
+}
+
+.worker-dialog-dirty .field-checkbox {
+  font-size: 13px;
+}
+
+.worker-dialog-status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* The row under a `worker-prompt` block: its action, then where it led. */
+.worker-prompt-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  margin: -4px 0 10px;
+}
+
+.worker-link {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  padding: 0;
+  font-size: 12px;
+  font-weight: 400;
+  text-align: left;
+}
+
+.worker-link:hover {
+  text-decoration: underline;
+}
+
+.worker-link em {
+  font-style: italic;
+}
+
+/* Quiet, one line, where a worker was started (§5.7 Parent session). */
+.worker-spawned-entry {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.worker-spawned-entry .worker-link {
+  color: var(--muted);
+}
+
+/* Spec 57 §5.7: a worker's status, in the sidebar and on the board. State
+   colours only. Finished is neutral, because `--ok` beside `--accent` reads
+   as a second "running"; paused is hollow, a needs-you that is not asking. */
+.worker-dot {
+  flex: none;
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.worker-dot[data-state="running"] {
+  background: var(--accent);
+}
+
+.worker-dot[data-state="needs-you"] {
+  background: var(--warn);
+}
+
+.worker-dot[data-state="paused"] {
+  border: 1.5px solid var(--warn);
+  background: transparent;
+}
+
+.worker-dot[data-state="finished"] {
+  background: var(--line-strong);
+}
+
+.worker-dot[data-state="failed"] {
+  background: var(--danger);
+}
+
+/* The Workers entry at the top of a project's sessions. */
+.project-workers-entry {
+  width: 100%;
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: #3b3f44;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 6px 9px;
+  text-align: left;
+}
+
+.project-workers-entry:hover {
+  background: rgba(255, 255, 255, 0.7);
+  color: inherit;
+}
+
+.project-workers-entry.active {
+  background: #e6e6e3;
+  color: var(--ink);
+}
+
+.workers-badge {
+  min-width: 18px;
+  border-radius: 9px;
+  background: var(--warn);
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 18px;
+  padding: 0 5px;
+  text-align: center;
+}
+
+.project-worker-open {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.project-worker-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Under its parent: indented by one step, with the dot where a child's
+   bullet would be. */
+.project-worker-item.nested {
+  margin-left: 14px;
+  width: calc(100% - 14px);
+}
+
+.project-worker-item.nested .project-worker-open {
+  font-size: 13px;
+}
+
+/* The board takes the conversation's place: the log and the composer step
+   aside, and it fills the row that grows. */
+body.workers-board-open #chat-log,
+body.workers-board-open .composer,
+body.workers-board-open #thread-menu-btn {
+  display: none;
+}
+
+.workers-board {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  padding: 22px clamp(18px, 5vw, 72px);
+}
+
+.workers-board[hidden] {
+  display: none;
+}
+
+.workers-board-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+}
+
+.workers-board-summary {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.workers-board-status {
+  flex: 1 1 240px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.workers-board-head > .btn-sm {
+  margin-left: auto;
+}
+
+.workers-board-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.workers-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.workers-table thead th {
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 8px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.workers-group th[scope="rowgroup"] {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  padding: 14px 8px 4px;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.workers-row td {
+  border-bottom: 1px solid var(--line);
+  padding: 6px 8px;
+  vertical-align: middle;
+}
+
+.workers-cell-dot {
+  width: 8px;
+}
+
+.workers-cell-worker {
+  max-width: 280px;
+}
+
+.workers-title,
+.workers-branch,
+.workers-doing,
+.workers-meta {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workers-title {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.workers-branch {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+.workers-cell-planner {
+  max-width: 180px;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workers-cell-rounds {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.workers-rounds-bar {
+  display: inline-block;
+  width: 48px;
+  height: 4px;
+  margin-right: 6px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--line);
+  vertical-align: middle;
+}
+
+.workers-rounds-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+/* Spec 57 §5.7 Worker session: the control strip under the header. One
+   control row, the header's gutters, and nothing while the board shows. */
+.worker-strip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 40px;
+  padding: 5px 14px 5px 22px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-soft);
+  font-size: 12px;
+}
+
+body.workers-board-open .worker-strip {
+  display: none;
+}
+
+.worker-pill {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.worker-round {
+  flex: none;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.worker-strip-note {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worker-strip-actions {
+  flex: none;
+  margin-left: auto;
+}
+
+.thread-worker-meta {
+  margin: 1px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.thread-worker-meta code {
+  font-size: 11px;
+}
+
+/* A worker's composer says what its button sends (§5.7), so the round send
+   button becomes a labelled one. Still the row's one filled control. */
+.send-button.is-worker-command {
+  width: auto;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 14px;
+  background: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.send-button.is-worker-command:hover {
+  background: var(--accent);
+  filter: brightness(0.92);
+}
+
+/* Context files and the model choice do not reach a worker: it takes the
+   configured provider and model, and its messages carry text only. */
+body.worker-view #composer-attach-menu,
+body.worker-view #chat-model-menu {
+  display: none;
+}
+
+.workers-cell-doing {
+  max-width: 320px;
+}
+
+.workers-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.workers-cell-elapsed {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.workers-cell-actions {
+  width: 1%;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.workers-cell-actions > * + * {
+  margin-left: 4px;
+}
+
+.workers-row[data-state="failed"] .workers-doing {
+  color: var(--danger);
+}
+
 .app-dialog-checklist {
   display: grid;
   gap: 6px;

@@ -694,6 +694,9 @@ impl WorkerHost {
     }
 
     /// Gives the turn thread a job with a fresh cancel token and steering.
+    /// A decision resumes the same turn (§5.6), so the notes it had accepted
+    /// but not yet reached a boundary with go with it: a round that ends in
+    /// an approval never returns to the loop's top, where notes are drained.
     fn hand_over(&self, slot: &mut TurnSlot, job: TurnJob) -> Value {
         let jobs = self
             .jobs
@@ -702,8 +705,15 @@ impl WorkerHost {
         let Some(jobs) = jobs.as_ref() else {
             return refusal("this worker hosts no turns");
         };
+        let carried = match job {
+            TurnJob::Decide { .. } => slot.steering.drain_notes(),
+            TurnJob::Message(_) => Vec::new(),
+        };
         slot.cancel = CancelToken::new();
         slot.steering = Arc::new(TurnSteering::new());
+        for note in carried {
+            slot.steering.queue_note(note);
+        }
         let previous = slot.state;
         slot.state = WorkerState::Running;
         if jobs.send(job).is_err() {

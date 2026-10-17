@@ -121,6 +121,8 @@
 
         <section id="chat-log" class="chat-log" aria-live="polite"></section>
 
+        <section id="workers-board" class="workers-board" aria-label="Workers" hidden></section>
+
         <footer class="composer">
           <div id="repo-bar" class="repo-bar" hidden>
             <div class="repo-bar-start">
@@ -394,6 +396,16 @@
 
         <section id="settings-page-general" class="settings-page" data-page="general">
           <h2 class="settings-page-title">General</h2>
+          <section class="settings-section">
+            <label class="field-checkbox">
+              <input id="worker-sessions-input" type="checkbox" disabled />
+              <span>Worker sessions</span>
+            </label>
+            <p class="settings-page-hint worker-sessions-hint">
+              Offer <em>Start worker</em> on task prompts the assistant writes, to run each in its
+              own session and git worktree.
+            </p>
+          </section>
           <section class="settings-section">
             <div class="section-heading">
               <h3>User configuration</h3>

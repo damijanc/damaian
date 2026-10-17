@@ -301,6 +301,259 @@ fn the_shells_signal_handler_reaches_workers_through_sweep_own() {
     );
 }
 
+/// Requirement 8, proposal §6's end-to-end kill test: a shell process with a
+/// real worker running a long command is `SIGKILL`ed, so no cleanup code of
+/// the shell's runs, and the worker and its command are gone within 5
+/// seconds. Only the worker's lifeline (§5.3 step 1) can end them: the kernel
+/// closes the dead shell's end of the pipe, the worker reads EOF, and its own
+/// `sweep_own` ends the command it registered.
+///
+/// The "shell" is a helper process that does what the standalone shell's
+/// `main` does with a worker (the handler over its registry, a `Supervisor`
+/// over the real binary) and approves the command when asked. The real
+/// shell's API token arrives only over Tauri IPC, so a test cannot drive it.
+/// The helper is this test's own unreaped child, so its pid cannot have been
+/// reused when it is killed. If the worker or its command outlives the
+/// assertion, a guard `SIGTERM`s them by their registered identity; nothing
+/// is killed by name.
+///
+/// `#[ignore]`d per `AGENTS.md` because it spawns and `SIGKILL`s real
+/// processes. Run it by hand:
+///
+/// ```sh
+/// CARGO_TARGET_DIR="$PWD/target" cargo test -p desktop-shell --test workers -- \
+///   --ignored --exact sigkilling_the_shell_ends_its_worker_and_the_workers_command
+/// ```
+#[test]
+#[ignore]
+fn sigkilling_the_shell_ends_its_worker_and_the_workers_command() {
+    /// `SIGTERM`s whatever still has its registered identity when dropped, so
+    /// a failing run leaves nothing behind.
+    struct Leftovers(Vec<ProcessIdentity>);
+    impl Drop for Leftovers {
+        fn drop(&mut self) {
+            for identity in &self.0 {
+                identity.send_sigterm();
+            }
+        }
+    }
+
+    let root = scratch("kill");
+    let mut shell = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "kill_helper_runs_a_worker_command_and_waits",
+        ])
+        .env("DAMAIAN_WORKERS_KILL_DIR", &root)
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("the shell helper should start");
+    let shell_identity = ProcessIdentity::of(shell.id()).unwrap();
+
+    let pids_file = root.join("pids");
+    wait_until(
+        "the worker's command to start",
+        Duration::from_secs(120),
+        || std::fs::read_to_string(&pids_file).is_ok_and(|text| text.ends_with('\n')),
+    );
+    let pids: Vec<u32> = std::fs::read_to_string(&pids_file)
+        .unwrap()
+        .split_whitespace()
+        .map(|pid| pid.parse().unwrap())
+        .collect();
+    let [worker_pid, command_pid] = pids[..] else {
+        panic!("expected two pids: {pids:?}");
+    };
+    let registered = |pid: u32| {
+        ProcessRegistry::open(root.join("d"))
+            .unwrap()
+            .entries()
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, entry)| entry)
+            .find(|entry| entry.pid == pid)
+            .unwrap_or_else(|| panic!("pid {pid} is not registered"))
+    };
+    let worker = registered(worker_pid);
+    let command = registered(command_pid);
+    assert_eq!(worker.kind, "worker");
+    assert_eq!(
+        worker.owner_pid,
+        shell.id(),
+        "the shell registered the worker"
+    );
+    assert_eq!(command.kind, "command");
+    assert_eq!(
+        command.owner_pid, worker_pid,
+        "the worker registered its command"
+    );
+    assert_eq!(ProcessIdentity::of(worker_pid), Some(worker.identity()));
+    assert_eq!(ProcessIdentity::of(command_pid), Some(command.identity()));
+    let _leftovers = Leftovers(vec![worker.identity(), command.identity()]);
+
+    assert_eq!(
+        ProcessIdentity::of(shell.id()),
+        Some(shell_identity),
+        "the pid must still name the helper this test started"
+    );
+    shell.kill().expect("SIGKILL should be delivered");
+    let killed_at = Instant::now();
+    let exit = shell.wait().unwrap();
+    assert!(!exit.success(), "{exit}");
+
+    wait_until(
+        "the worker and its command to be gone",
+        Duration::from_secs(5),
+        || ProcessIdentity::of(worker_pid).is_none() && ProcessIdentity::of(command_pid).is_none(),
+    );
+    // The command ran in its own group; nothing of that group may remain.
+    let group = Command::new("/usr/bin/pgrep")
+        .args(["-g", &command.pgid.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        group.stdout.is_empty(),
+        "the command's process group outlived the worker: {}",
+        String::from_utf8_lossy(&group.stdout)
+    );
+    println!(
+        "worker {worker_pid} and command {command_pid} (group {}) gone {:?} after SIGKILL of shell {}",
+        command.pgid,
+        killed_at.elapsed(),
+        shell_identity.pid
+    );
+}
+
+/// Proposal §6's informational measurement, not a gate: a worker's cold start
+/// on this repository, from the shell's `spawn` call to the worker's first
+/// model request (`model_request_prepared` in the audit log). The source is a
+/// local clone of this checkout's `HEAD`, so the worker indexes and assembles
+/// context over the real tree; the model is `DAMAIAN_MOCK_MODEL_RESPONSE`, so
+/// no provider latency is counted. Three workers in a row, printed per phase.
+///
+/// `#[ignore]`d per `AGENTS.md` because it spawns real processes. Run it by
+/// hand:
+///
+/// ```sh
+/// CARGO_TARGET_DIR="$PWD/target" cargo test -p desktop-shell --test workers -- \
+///   --ignored --exact worker_cold_start_on_this_repository --nocapture
+/// ```
+#[test]
+#[ignore]
+fn worker_cold_start_on_this_repository() {
+    // SAFETY: set before any thread of this test reads the environment.
+    unsafe { std::env::set_var("DAMAIAN_MOCK_MODEL_RESPONSE", "Measured.") };
+    let root = scratch("cold");
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = root.join("r");
+    let cloned = Command::new("git")
+        .args(["clone", "-q", "--local"])
+        .arg(&checkout)
+        .arg(&repo)
+        .status()
+        .unwrap();
+    assert!(cloned.success());
+    let repo = std::fs::canonicalize(&repo).unwrap();
+    let files = Command::new("git")
+        .args(["ls-files"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    println!(
+        "source: a clone of this checkout, {} tracked files",
+        String::from_utf8_lossy(&files.stdout).lines().count()
+    );
+    let config = config(&root);
+    let supervisor = Supervisor::new(
+        PathBuf::from(env!("CARGO_BIN_EXE_damaian-desktop-shell")),
+        WorkerTimeouts::default(),
+    );
+    for run in 1..=3 {
+        let prepared_before = audit_events(&config.data_dir, "model_request_prepared").len();
+        let started = Instant::now();
+        let session = spawn(&supervisor, &config, &repo, &format!("Cold start {run}"));
+        let spawned = started.elapsed();
+        wait_until("the worker's socket", Duration::from_secs(60), || {
+            supervisor
+                .control(&session, "status", serde_json::Map::new())
+                .is_ok()
+        });
+        let answering = started.elapsed();
+        wait_until("the first model request", Duration::from_secs(300), || {
+            audit_events(&config.data_dir, "model_request_prepared").len() > prepared_before
+        });
+        let first_request = started.elapsed();
+        println!(
+            "run {run}: spawn returned {spawned:?} (worktree, records, process), \
+             socket answered {answering:?}, first model request {first_request:?}"
+        );
+        supervisor.shutdown_all();
+    }
+}
+
+/// Re-executed by the kill test, never run on its own: the shell's part. It
+/// installs the handler as `main` does, spawns a real worker whose scripted
+/// model asks for `sleep 300` on every call, approves it if asked, and writes
+/// the worker's pid and the command's once the worker has registered the
+/// command. Then it waits to be killed.
+#[test]
+#[ignore]
+fn kill_helper_runs_a_worker_command_and_waits() {
+    let Ok(root) = std::env::var("DAMAIAN_WORKERS_KILL_DIR") else {
+        return;
+    };
+    // SAFETY: set before this process starts any other thread; the worker
+    // inherits it, as it inherits every variable of the shell's.
+    unsafe {
+        std::env::set_var(
+            "DAMAIAN_MOCK_MODEL_RESPONSE",
+            "DAMAIAN_COMMAND_V1\nCOMMAND: sleep 300\nREASON: Fixture.\nEND_COMMAND",
+        )
+    };
+    let root = PathBuf::from(root);
+    let config = config(&root);
+    let (registry, audit) = ProcessRegistry::open_with_audit(&config).unwrap();
+    registry.install_shutdown_handler(audit).unwrap();
+    let registry = ProcessRegistry::open(&config.data_dir).unwrap();
+
+    let repo = repository(&root);
+    let supervisor = Supervisor::new(
+        PathBuf::from(env!("CARGO_BIN_EXE_damaian-desktop-shell")),
+        WorkerTimeouts::default(),
+    );
+    let session = spawn(&supervisor, &config, &repo, "Run the long command");
+    let worker_pid = supervisor.pid(&session).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(100);
+    let command_pid = loop {
+        assert!(Instant::now() < deadline, "the command never started");
+        if let Ok(status) = supervisor.control(&session, "status", serde_json::Map::new())
+            && status["state"] == "waiting_for_approval"
+        {
+            let mut arguments = serde_json::Map::new();
+            arguments.insert("proposalId".to_string(), status["proposalId"].clone());
+            supervisor.control(&session, "approve", arguments).unwrap();
+        }
+        let command = registry
+            .entries()
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, entry)| entry)
+            .find(|entry| entry.kind == "command" && entry.owner_pid == worker_pid);
+        if let Some(command) = command {
+            break command.pid;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut file = std::fs::File::create(root.join("pids.tmp")).unwrap();
+    writeln!(file, "{worker_pid} {command_pid}").unwrap();
+    drop(file);
+    std::fs::rename(root.join("pids.tmp"), root.join("pids")).unwrap();
+
+    std::thread::sleep(Duration::from_secs(120));
+}
+
 /// Re-executed by the signal test, never run on its own: installs the handler
 /// as the standalone shell's `main` does, spawns one worker, and waits.
 #[test]
