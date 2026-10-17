@@ -1,0 +1,300 @@
+# Feature Spec: Worktree-Aware Read Tools
+
+Status: Not started. Specified on 2026-10-17 from the same session as
+[#59](../59_exploration_round_allowance/proposal.md), after it was continued
+three times and still did not finish: 35 of its 40 approval prompts were
+read-only commands the agent ran in worktrees because no tool could reach them
+([`context.md`](context.md) §1). Not yet planned: there is no `tasks.md`.
+Order: 60 of 60
+Plan: none. Evidence-driven like [#47](../47_agent_working_capability/proposal.md)
+and #59 — an exception to the rule in [`README.md`](../README.md).
+Also in this spec: [`context.md`](context.md) (the session, why the tools stop at
+the worktree boundary today, the git hazards, and the alternatives rejected).
+Depends on: [#47](../47_agent_working_capability/proposal.md) (the read tools
+and their trust boundary) — built;
+[#34](../34_repository_config_trust_boundary.md) (repository content is
+untrusted) — built; [#20](../20_working_modes/proposal.md) (read-only tools are
+allowed in every mode) — built. Everything else named below is a
+cross-reference, not a prerequisite.
+Related implementation specs:
+[`03_structured_tool_calling.md`](../03_structured_tool_calling.md) (owns the
+tool surface this extends),
+[`57_worker_sessions`](../57_worker_sessions/proposal.md) (creates the
+`.damaian/worktrees/` this reaches),
+[`59_exploration_round_allowance`](../59_exploration_round_allowance/proposal.md)
+(reads made through these tools count as exploration rounds; not a
+prerequisite — this spec is useful without it, and #59 is more useful with this),
+[`52_mcp_server_mode.md`](../52_mcp_server_mode.md) (exposes `list_directory`,
+`read_git_status` and `read_git_diff` and must decide whether it exposes the
+new argument).
+
+## 1. Motivation
+
+Damaian's own workflow puts work in progress in git worktrees: spec 57's
+workers under `.damaian/worktrees/`, and coding agents such as Claude Code under
+`.claude/worktrees/`. "What is in progress?" is therefore a question about
+worktrees, and the agent cannot answer it with its tools.
+
+`list_directory` and `search_content` honour `.gitignore`, and both directories
+are ignored, so the worktrees are invisible to them. `read_git_status` and
+`read_git_diff` take no argument naming a worktree, so they only ever describe
+the session's own checkout. `read_file` can technically read a worktree file by
+path, but nothing tells the model that the worktrees exist or where they are.
+
+So the model falls back to the shell. In the motivating session it asked for 40
+commands, and 35 of them only read: `cd .claude/worktrees/spec25-task8 && git
+--no-pager diff -- … | head`, `git worktree list --porcelain`, `grep -n … | sed
+-n …`. Every one needed approval, because a compound command never qualifies
+as low-risk read-only. The user approved 40 prompts in about fifteen minutes and
+the turn still ran out of rounds.
+
+#47 already established the principle: navigation the agent needs often should
+be a tool, which needs no approval, not a shell command with an allow-list
+entry. This spec applies it to the one place #47's tools stop.
+
+## 2. Current State
+
+- `list_directory` and `search_content` (`navigation.rs:85`, `navigation.rs:172`)
+  resolve the requested directory through `PathPolicy::resolve_existing` against
+  the repository root and walk it with `tree_walk::walk`, which accumulates each
+  directory's `.gitignore` plus the configured `ignore_patterns`. This
+  repository's `.gitignore` lists `.claude/` and `.damaian/`, and
+  `DEFAULT_IGNORE_PATTERNS` lists `.damaian/` as well.
+- `read_file` (`file_access.rs:88`) resolves through the same `PathPolicy` and
+  checks restricted patterns, but does not consult ignore rules. A worktree file
+  is readable if the model already knows its path.
+- `GitService::status` and `GitService::diff` (`git_service.rs:178`,
+  `git_service.rs:297`) run `git -C <repository root>` with fixed arguments.
+  `diff` returns the whole diff, **unbounded**, and does not exclude restricted
+  paths: a tracked file matching `restricted_patterns` shows its changed lines,
+  protected only by secret redaction ([`context.md`](context.md) §3).
+- The tool definitions (`chat.rs`, `read_git_status_tool_definition` and
+  siblings) describe "the repository" with no worktree argument.
+- `action_effect` marks all six read tools `ActionEffect::ReadOnly`, so they
+  batch within a round, need no approval, and are allowed in every mode
+  (`mode.rs:244`).
+- `PathPolicy::canonical_root` refuses a root outside `allowed_roots` when that
+  list is non-empty, and allows any root when it is empty.
+
+## 3. Requirements
+
+1. The agent can list the repository's git worktrees with a tool, and learn each
+   one's path, branch, `HEAD`, whether it is dirty, and how far it is ahead of and
+   behind a base branch — in one call and with no approval.
+2. `read_file`, `list_directory`, `search_content`, `read_git_status` and
+   `read_git_diff` accept an optional `worktree` argument. With it, paths
+   resolve against that worktree's root and git runs in that worktree. Without
+   it, every tool behaves exactly as today.
+3. The agent can read the commits a worktree's branch has that a base branch
+   does not, as one-line summaries, with a tool.
+4. `read_git_diff` can limit itself to given paths, return a `--stat` summary
+   instead of hunks, and compare against a base branch's merge base instead of
+   the index.
+5. A `worktree` argument is honoured only when it names a worktree **registered
+   with this repository's git**, determined by git itself and compared by
+   canonical path. A directory that merely looks like a worktree — including a
+   symlink a cloned repository ships under `.claude/worktrees/` — is refused.
+6. Worktrees inside the repository root are reachable by default. A registered
+   worktree outside it is reachable only when a configured `allowed_roots` entry
+   contains it.
+7. Inside a worktree the session's effective policy applies unchanged:
+   restricted patterns, ignore patterns, read and search caps, and secret
+   redaction. The worktree's own repository configuration is never loaded.
+8. Every git read — in a worktree or the main checkout — excludes restricted
+   paths, is bounded by a cap that says what it cut, and runs git with external
+   diff drivers, text conversion and filesystem-monitor hooks disabled.
+9. No new command enters `command_allowlist`, `is_low_risk_read_only` keeps its
+   commands, and the shell-control gate is untouched. This is #47 requirement 3,
+   restated because this spec is the first to widen what the tools reach.
+10. Every new tool and argument records through `AuditLog::record`, naming the
+    worktree it acted in.
+
+## 4. Non-goals
+
+- Making read-only shell commands auto-approvable, including compound ones such
+  as `cd x && git diff | head`. That would widen the command trust boundary,
+  which #47 requirement 3 and AGENTS.md forbid without a spec of its own. It
+  stays a separate question ([`context.md`](context.md) §5).
+- Writing to a worktree: edits, patches, commands or checkpoints. A patch
+  proposed against a worktree path is out of scope and is refused as today.
+- Indexing worktrees for `search_codebase`, the symbol index or context
+  assembly. Those are per-repository and building them per worktree is a cost
+  this spec does not take on.
+- Reading another repository's worktrees, or any worktree not registered with
+  this repository.
+- Reading a committed version of a file (`git show <ref>:<path>`). The session
+  used it once; `read_git_diff` with a base answers the same question.
+- Creating, removing or pruning worktrees. Spec 57 owns its own.
+
+## 5. Design
+
+### 5.1 Which worktrees are reachable
+
+`GitService::worktrees(repository_root)` runs
+`git -C <root> worktree list --porcelain` and parses each entry's `worktree`,
+`HEAD`, `branch`, `detached`, `locked` and `prunable` lines.
+
+A worktree is **reachable** when all of these hold:
+
+- it is listed, is not the main worktree (that is the session's own checkout,
+  addressed by omitting `worktree`), and is not `prunable`;
+- its listed path canonicalizes, and the canonical path is a directory;
+- the canonical path is inside the canonical repository root, or inside a
+  canonical `allowed_roots` entry (requirement 6);
+- `PathPolicy::canonical_root` accepts it.
+
+A `worktree` argument is resolved by canonicalizing it — as given, absolute or
+relative to the repository root — and comparing it with the canonical paths of
+the reachable set. Only an exact match is accepted. Everything else is refused
+with the reachable worktrees listed in the error, so the model can correct
+itself in the same round rather than guess.
+
+Comparing canonical paths with a set git produced is the whole defence against
+a planted directory. A cloned repository can ship `.claude/worktrees/x` as a
+symlink to anywhere, but it cannot register a worktree: registration lives in
+`.git/worktrees/`, which is local and never cloned. The symlink canonicalizes to
+its target, the target is not in git's list, and the argument is refused.
+
+The reachable set is computed once per tool call. It is not cached across calls,
+so a worktree created or removed mid-turn is seen correctly; the cost is one
+extra git spawn per call that names a worktree.
+
+### 5.2 The tool surface
+
+| Tool | New or changed arguments | Returns |
+|---|---|---|
+| `list_worktrees` (new) | `base?` | One entry per reachable worktree: repository-relative path (absolute when outside the root), branch or `detached`, short `HEAD`, changed-file count, and commits ahead and behind `base` |
+| `read_file` | `worktree?` | Unchanged, with paths relative to the worktree |
+| `list_directory` | `worktree?` | Unchanged, walking the worktree under its own `.gitignore` |
+| `search_content` | `worktree?` | Unchanged, searching the worktree |
+| `read_git_status` | `worktree?` | Unchanged, for that worktree |
+| `read_git_diff` | `worktree?`, `paths?`, `stat?`, `base?` | As today, or `--stat`, or against `merge-base(base, HEAD)`, limited to `paths`, bounded (§5.4) |
+| `read_git_log` (new) | `worktree?`, `base?`, `max_count?` | `base..HEAD` as `short-sha subject` lines, newest first, capped |
+
+`base` defaults to the branch checked out in the main worktree, which is what
+"how far ahead of main" means in practice; when the main worktree is detached
+the default is absent and `ahead`/`behind` are omitted rather than guessed.
+
+`list_worktrees` puts ahead and behind counts in one result because the session
+spent a round, and an approval, per worktree to get them. With `n` worktrees it
+spawns `1 + 2n` git processes (the list, then `status` and `rev-list
+--left-right --count` per worktree), capped at 20 worktrees with the rest
+counted. On this machine a spawn is usually milliseconds and occasionally
+~280 ms (`docs/TROUBLESHOOTING.md`, "The quality gate is slow locally"), so the
+cap also bounds the worst case.
+
+Tool descriptions say plainly what the session lacked: worktrees exist,
+`list_worktrees` finds them, and the read tools take `worktree` — so the model
+does not need to discover them with a shell command.
+
+### 5.3 One resolution path
+
+The worktree argument is resolved in one place, before dispatch, into the root
+the existing code already takes. `FileAccess::read_file`,
+`Navigation::list_directory` and `search_content`, and `GitService` already
+accept a root path; they receive the worktree's canonical root instead of the
+repository's. `PathPolicy`, the walker, the ignore and restricted rules, the
+caps and the `SecretScanner` are therefore the same code on the same path, which
+is how requirement 7 holds structurally rather than by a parallel
+implementation.
+
+The policy applied is the session's: the `Config` the engine was built with,
+meaning the user's configuration and **this** repository's overlay. A worktree
+is the same repository on another branch, and its `.damaian/config.toml` may
+differ, but reading files needs no repository configuration, and loading one
+from a branch the user did not open would be repository content choosing its own
+policy (#34).
+
+### 5.4 Git reads are bounded and policed
+
+These apply to every git read, including today's `read_git_status` and
+`read_git_diff` on the main checkout, because the same function serves both and
+the gaps are the same ([`context.md`](context.md) §3).
+
+- **Restricted paths are excluded** with `:(exclude,glob)<pattern>` pathspecs
+  built from `restricted_patterns`, so a restricted file's changes never leave
+  git. Status entries for restricted paths are dropped the way
+  `list_directory` drops them, since a path can name a secret.
+- **Output is bounded** by `max_read_lines` and `max_file_bytes`, whichever
+  binds first, and a truncated result says so and how much it cut — the rule
+  #47 §5.5 set for reads.
+- **No repository-supplied code runs.** Every invocation passes
+  `-c core.fsmonitor=false`, and `diff` and `log` pass `--no-ext-diff` and
+  `--no-textconv`. `.gitattributes` is repository content; it can name a diff
+  driver, and a user's own git config can define one with that name.
+- **Arguments cannot become options.** `base` must satisfy git's ref-name rules
+  and must not start with `-`; it is passed after `--end-of-options`. `paths`
+  are resolved through `PathPolicy` against the worktree first and passed after
+  `--`. Arguments go to `Command` as argv; no shell is involved.
+- **Output is redacted** by `SecretScanner`, as `diff` is today.
+
+### 5.5 Recording
+
+- The audit records `git_status_read` and `git_diff_read` gain a `worktree`
+  field (empty for the main checkout). `list_worktrees` records
+  `git_worktrees_listed` with the count, and `read_git_log` records
+  `git_log_read`.
+- The action marker's `ref` carries the worktree prefix
+  (`.claude/worktrees/spec25-task8:crates/…/symbol_index.rs`), so the session log
+  says where a read happened and #59's repeat detection distinguishes the same
+  path in two worktrees.
+- A refused `worktree` argument is an ordinary failed tool call with
+  `ActionOutcome::Failed`. It is not a finding: a refusal of a read is not a
+  defect in the user's code.
+
+### 5.6 Modes and batching
+
+`ToolAction::ListWorktrees` and `ToolAction::ReadGitLog` are
+`ActionEffect::ReadOnly` in `action_effect`, so they batch within a round, need
+no approval, count as exploration under #59, and the mode matrix allows them
+everywhere, as it does today's git reads. The `worktree` field on the existing
+variants changes none of that.
+
+### 5.7 Eval scenario
+
+A deterministic scenario, `worktree_survey`: a fixture repository with two
+registered worktrees — one with uncommitted changes, one with commits ahead of
+`main` — and a planted symlink under `.claude/worktrees/` pointing outside the
+repository. The scripted turn calls `list_worktrees`, then `read_git_diff` with
+`stat` and `read_git_log` on each, then tries the symlink. Assertions: zero
+approval stops, the symlink is refused, the restricted file changed in one
+worktree does not appear in its diff, and the answer names both worktrees.
+
+### 5.8 Documentation
+
+On Done: `docs/USER_GUIDE.md` (what the agent can see without asking, now
+including worktrees), `docs/TROUBLESHOOTING.md` (a refused `worktree` argument
+and why: not registered, outside the allowed roots, or prunable), and
+`SECURITY.md` (the git read hardening in §5.4).
+
+## 6. Acceptance Criteria
+
+- `list_worktrees` on this repository lists every worktree `git worktree list`
+  shows inside the repository root, except the main one, with branch, `HEAD`,
+  dirty count and ahead/behind against the main worktree's branch.
+- Each of the five existing read tools, given `worktree`, reads that worktree;
+  without it, its output is byte-identical to before on the existing
+  deterministic scenarios.
+- A symlink under `.claude/worktrees/` that points outside the repository is
+  refused, and so is a plain directory that is not a registered worktree; the
+  refusal lists the reachable worktrees.
+- A registered worktree outside the repository root is refused with
+  `allowed_roots` empty, and reachable when an `allowed_roots` entry contains it.
+- A `prunable` worktree is refused.
+- A tracked file matching `restricted_patterns` and changed in a worktree
+  appears in neither `read_git_status` nor `read_git_diff`, in that worktree or
+  the main checkout.
+- A diff larger than the caps is truncated and says what it cut.
+- A `base` of `--output=/tmp/x` or `main..; rm` is refused before git runs.
+- A `.gitattributes` diff driver in a worktree, with a matching driver in the
+  test's git config, is not invoked by `read_git_diff`.
+- No change to `command_allowlist`, `is_low_risk_read_only` or the shell-control
+  gate, asserted by the existing policy tests passing unchanged.
+- `worktree_survey` passes with zero approval stops.
+- The motivating prompt, re-run live against `deepseek-v4-flash` on this
+  repository, makes no approval stop for reading worktrees. Record how many
+  approvals it did make and for what.
+
+## 7. Implementation Notes
+
+None yet.
