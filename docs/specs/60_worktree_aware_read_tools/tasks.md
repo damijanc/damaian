@@ -1,0 +1,347 @@
+# Worktree-Aware Read Tools Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Implements:** [`proposal.md`](proposal.md) · background in [`context.md`](context.md)
+**Started:** 2026-10-17 (planned the same day; references checked against the tree on 2026-10-17)
+
+## Progress
+
+| Task | State | Notes |
+|---|---|---|
+| 1 · Registered-worktree resolution and refusal | Done 2026-10-17 | Details in the note below the table. |
+| 2 · Git read hardening on the main checkout | Not started | |
+| 3 · `worktree` on the five read tools | Not started | |
+| 4 · `list_worktrees` and `read_git_log` | Not started | |
+| 5 · `worktree_survey` eval scenario | Not started | |
+| 6 · Docs, live re-run and close-out | Not started | |
+
+**Task 1 (Done 2026-10-17).** New module `worktree_access.rs`:
+`parse_worktree_list` reads `git worktree list --porcelain -z` (NUL-terminated
+fields, so a path with a newline cannot forge an entry), `GitService::worktrees`
+runs it with `--no-optional-locks` and `-c core.fsmonitor=false`,
+`classify_worktrees` gives each listed entry a `WorktreeRefusal` or none, and
+`resolve_worktree` matches a `worktree` argument by canonical path against the
+reachable set. A refusal names the reason when the argument is a registered
+worktree that is not reachable (own checkout, bare, prunable, missing, outside
+the repository root and `allowed_roots`), and always lists the reachable
+worktrees. `PathPolicy::is_inside_allowed_root` added (false with an empty
+list). **Deviation:** C1 — the excluded entry is the session's own checkout,
+not git's main worktree; proposal §5.1 updated. A non-repository folder makes
+`GitService::worktrees` return `ClientError::Git` rather than an empty list;
+Task 4 decides what `list_worktrees` shows for it. **Discovery for Task 5:**
+git marks a worktree prunable as soon as its `.git` file is gone, with the
+directory still present, which is how the prunable test builds one. Tests:
+`tests/worktree_reads.rs`, 14 tests, plus 5 parser unit tests in the module
+(`test(worktree_access)`); all pass. **Falsified:** not excluding the own
+checkout failed 6 tests; skipping the prunable check failed
+`a_prunable_worktree_is_refused_with_the_reason`; comparing the argument
+without canonicalizing failed 8, including the symlink alias and trailing-slash
+tests; letting an empty `allowed_roots` allow everything failed
+`an_outside_worktree_is_refused_with_empty_allowed_roots` and the linked-worktree
+test. Each was reverted. No `chat.rs` or `mode.rs` change in this task.
+**Checks (local):** fmt, node, lint and typos pass; `cargo deny check` passes
+(outside the agent sandbox, which cannot take its advisory-db lock); scoped
+clippy for `workspace-engine` is clean; nextest over `worktree_reads`,
+`worktree`, `agent_tools` and the `worktree_access`/`path_policy`/`git_service`
+unit tests: 80 passed. Workspace clippy and tests are left to CI.
+
+## Global Constraints
+
+Every task's requirements implicitly include this section.
+
+- **Read [`proposal.md`](proposal.md) §2, §3 and §5 and the corrections below
+  before starting.** Where a correction contradicts the proposal's prose, the
+  correction wins, and the task that acts on it updates the proposal in the
+  same change (most were already folded in while planning).
+- **No command-policy change** (requirement 9). Nothing in this spec edits
+  `command_policy.rs`, `command_allowlist`, `is_low_risk_read_only` or the
+  shell-control gate. Spec 64 is changing `command_policy.rs` on another
+  branch; if a task finds itself wanting to touch it, stop and say so.
+- **One resolution path** (§5.3). A worktree argument becomes a root once,
+  through `worktree_access::resolve_worktree`, and the existing
+  `FileAccessController`, `NavigationController` and `GitService` functions
+  receive that root. No parallel read, walk, restricted or redaction code.
+- **The session's policy, never the worktree's** (requirement 7, #34). No code
+  path loads `.damaian/config.toml` from a worktree.
+- **No worktree is trusted by location.** Only an entry git lists, compared by
+  canonical path. Never accept a directory because it is under
+  `.claude/worktrees/` or `.damaian/worktrees/`.
+- **Without `worktree`, output is byte-identical** (requirement 2), except
+  where Task 2's hardening changes the main checkout's git reads on purpose.
+  Each such change is listed in that task's Progress row.
+- **`mode.rs` stays a minimal addition.** Spec 64's uncommitted branch
+  (`claude/modest-swanson-faf4df`) edits `mode.rs` too. Add match arms and
+  widen patterns (`ReadGitStatus` → `ReadGitStatus { .. }`); do not reflow,
+  reorder or rename anything there.
+- **`chat.rs` is shared.** Spec 63 edits it around `record_command_findings`
+  and the `run_command` description. Keep this spec's edits to the tool
+  definitions, `parse_tool_call`, the read-only dispatch arms,
+  `action_effect`, `tool_action_marker` and the progress labels.
+- **Tests:** fixture repositories are fresh `git init` directories under the
+  temp dir with `user.name`, `user.email` and `commit.gpgsign=false` set
+  locally, as `tests/worktree.rs` does. Engines built in tests set
+  `enable_index_watcher: false` and their own data directory. Model-dependent
+  paths use `MockModelAdapter` or `DAMAIAN_MOCK_MODEL_RESPONSE`.
+- **Falsify every load-bearing test.** Break what it guards, confirm it fails,
+  revert, and record that in the Progress row.
+- **A private Cargo target directory per worktree.** Prefix every `cargo`
+  command with `CARGO_TARGET_DIR="$PWD/target"` from the worktree root.
+- **Scoped checks per task; the full gate runs on CI only** (AGENTS.md, since
+  2026-10-15). Each task runs `scripts/quality-gate.sh fmt node lint typos deny`,
+  `cargo clippy -p <crate> --all-targets --locked -- -D warnings` for every
+  crate it touches, and the test files it names.
+- **Never `git commit` or `git push` unasked.** Each task ends by showing the
+  change and the check results. One-line commit subject, no body.
+
+## Corrections to the proposal found while planning
+
+Each one names the task that owns it.
+
+| # | Proposal said | Code says | Resolution |
+|---|---|---|---|
+| C1 | A reachable worktree "is not the main worktree (that is the session's own checkout)" (§5.1) | A spec 57 worker session's repository root **is** a linked worktree (`.damaian/worktrees/<slug>`). From there git still lists the main worktree first, and the session's own checkout is a later entry | Exclude the entry whose canonical path is the session's canonical root, whichever it is. The main worktree is then an ordinary entry, reachable only by the location rule (for a worker, outside its root, so it needs `allowed_roots`). A `bare` entry has no working tree and is excluded. Proposal §5.1 updated. **Task 1** |
+| C2 | Restricted paths are excluded with `:(exclude,glob)<pattern>` pathspecs (§5.4) | `restricted_patterns` are gitignore-style and matched by `PathPolicy::is_restricted` (`ignore.rs`): `.env` matches at any depth, a trailing `/` means a directory, and `!` negates. A glob pathspec has none of those semantics, so the translation would drift from what `read_file` refuses | Filter with `PathPolicy::is_restricted` itself, the same matcher `list_directory` uses: list the changed paths first (`diff --name-status -z --no-renames`, so both sides of a rename are checked), drop restricted ones, and run the content diff over the remaining paths as `:(top,literal)` pathspecs after `--`. Proposal §5.4 updated. **Task 2** |
+| C3 | Every invocation passes `-c core.fsmonitor=false` (§5.4) | `git status` refreshes the index and takes `index.lock` opportunistically. In a worktree where another agent is running git, a Damaian read could make that agent's `git add` fail. `checkpoint.rs::run_user_git` already passes `--no-optional-locks` for this reason | Every read also passes `--no-optional-locks`. Proposal §5.4 updated. **Tasks 1, 2** |
+| C4 | `GitService::status`/`diff` take a root and apply restricted patterns and caps (§5.3, §5.4) | `GitService::new(audit_log, scanner)` (`git_service.rs:174`) has no `Config` or `PathPolicy`. It is built once in `workspace_engine.rs:96`, and `damaian-cli/src/main.rs:173,184` and `tests/foundation.rs:1381` call `status`/`diff` | `GitService::new` gains the `PathPolicy` and the caps (`max_read_lines`, `max_file_bytes`). The CLI's `damaian git status`/`diff` get the same hardening, which is intended: they are the same read. **Task 2** |
+| C5 | `GitStatus` entries for restricted paths are dropped (§5.4) | `GitStatus.raw` carries git's raw porcelain beside `files`, and `format_git_status` (`chat.rs`) is what the model sees | Filter `raw` with the same rule, so no restricted path survives in either field. **Task 2** |
+| C6 | "The mode matrix allows them everywhere" (§5.6) | `mode.rs` has two exhaustive matches over `ToolAction`: `profile_permits` (line 168) and `mode_permits` (line 244), plus the test list at line 472. `ToolAction::ReadGitStatus` is a unit variant, so adding `worktree` changes its pattern in all three places and in `chat.rs` | Add `ListWorktrees` and `ReadGitLog` to both matches' read-only arms; widen `ReadGitStatus` to `ReadGitStatus { .. }`. Nothing else in `mode.rs` changes (Global Constraints). Proposal §5.6 updated. **Tasks 3, 4** |
+
+## File Structure
+
+| File | Change |
+|---|---|
+| `crates/workspace-engine/src/worktree_access.rs` | **New (Task 1).** Porcelain parser, reachability classification, argument resolution |
+| `crates/workspace-engine/src/git_service.rs` | `worktrees` (Task 1); hardened `status`/`diff`, new constructor (Task 2); `diff` options, `log`, `ahead_behind` (Tasks 3, 4) |
+| `crates/workspace-engine/src/path_policy.rs` | `is_inside_allowed_root` (Task 1) |
+| `crates/workspace-engine/src/workspace_engine.rs` | `GitService::new` call (Task 2) |
+| `crates/damaian-cli/src/main.rs` | Follows the new `diff` signature (Task 2) |
+| `crates/workspace-engine/src/chat.rs` | Tool definitions, `parse_tool_call`, `ToolAction` fields and variants, read-only dispatch, `action_effect`, `tool_action_marker`, progress labels (Tasks 3, 4) |
+| `crates/workspace-engine/src/mode.rs` | Two arms and one widened pattern (Tasks 3, 4) |
+| `crates/workspace-engine/tests/worktree_reads.rs` | **New (Task 1).** Grows with every task |
+| `crates/eval-harness/scenarios/worktree_survey.toml`, fixture | **New (Task 5)** |
+| `docs/USER_GUIDE.md`, `docs/TROUBLESHOOTING.md`, `SECURITY.md`, `docs/specs/52_mcp_server_mode.md`, `docs/specs/64_read_only_command_boundary.md` | Task 6 |
+
+## Interfaces
+
+Task 1 lands these; later tasks consume them.
+
+```rust
+// worktree_access.rs
+pub struct WorktreeEntry {          // one `git worktree list --porcelain -z` record
+    pub path: PathBuf,              // as git listed it
+    pub head: Option<String>,
+    pub branch: Option<String>,     // `refs/heads/` stripped
+    pub bare: bool,
+    pub detached: bool,
+    pub locked: bool,
+    pub prunable: bool,
+}
+pub enum WorktreeRefusal { OwnCheckout, Bare, Prunable, Missing, OutsideAllowedRoots }
+pub struct ClassifiedWorktree {
+    pub entry: WorktreeEntry,
+    pub canonical: Option<PathBuf>,
+    pub display: String,            // repository-relative inside the root, else absolute
+    pub refusal: Option<WorktreeRefusal>,
+}
+pub fn parse_worktree_list(raw: &[u8]) -> Vec<WorktreeEntry>;
+pub fn classify_worktrees(policy: &PathPolicy, repository_root: &Path,
+                          entries: Vec<WorktreeEntry>) -> Result<Vec<ClassifiedWorktree>>;
+pub fn resolve_worktree(git: &GitService, policy: &PathPolicy, repository_root: &Path,
+                        requested: &str) -> Result<ClassifiedWorktree>;
+
+// git_service.rs
+impl GitService { pub fn worktrees(&self, root: &Path) -> Result<Vec<WorktreeEntry>>; }
+// path_policy.rs
+impl PathPolicy { pub fn is_inside_allowed_root(&self, canonical: &Path) -> bool; }
+```
+
+`resolve_worktree` refuses with `ClientError::AccessDenied`. It does not audit:
+the tool that called it records the read (§5.5), and Task 4's `list_worktrees`
+records `git_worktrees_listed`.
+
+## Order and parallelism
+
+```
+1 ──> 2 ──> 3 ──> 4 ──> 5 ──> 6
+```
+
+Sequential. Tasks 2–4 all edit `git_service.rs`, and 3–4 both edit `chat.rs`
+and `mode.rs`. Task 1 touches no shared file except `git_service.rs`,
+`path_policy.rs` and `lib.rs`, so it could run beside spec 63 or 64. Tasks 3
+and 4 must not run beside #59, #61, #62 or another spec's `chat.rs` task
+(`docs/specs/README.md`, "Parallel work").
+
+---
+
+## Task 1: Registered-worktree resolution and refusal
+
+**Requirements:** 5, 6. **Proposal:** §5.1. **Corrections:** C1, C3.
+**Files:** `worktree_access.rs` (new), `git_service.rs`, `path_policy.rs`,
+`lib.rs`, `tests/worktree_reads.rs` (new).
+
+- [x] **Step 1: Write the failing tests** in `tests/worktree_reads.rs`, each on
+      a fresh fixture with two linked worktrees under `.claude/worktrees/`:
+  - `registered_worktrees_inside_the_root_are_reachable` (both, by display
+    path, and the main checkout is not in the reachable set);
+  - `a_worktree_argument_resolves_relative_or_absolute_to_the_same_root`;
+  - `a_symlink_under_claude_worktrees_pointing_outside_is_refused`;
+  - `a_symlink_to_a_registered_worktree_resolves_to_that_worktree` (canonical
+    comparison is the rule, not "no symlinks");
+  - `a_plain_directory_that_is_not_registered_is_refused`;
+  - `a_refusal_lists_the_reachable_worktrees`;
+  - `a_prunable_worktree_is_refused_with_the_reason`;
+  - `the_sessions_own_checkout_is_not_a_worktree_argument`;
+  - `an_outside_worktree_is_refused_with_empty_allowed_roots`;
+  - `an_outside_worktree_is_reachable_inside_an_allowed_root`;
+  - `from_a_linked_worktree_the_main_checkout_is_listed_but_outside` (C1);
+  - `a_nonexistent_argument_is_refused_with_the_list`;
+  - `an_allowed_roots_entry_that_holds_only_the_repository_keeps_outside_worktrees_out`;
+  - `a_folder_that_is_not_a_repository_resolves_no_worktree`.
+  And parser unit tests in the module: main plus linked entries, `detached`,
+  `locked <reason>`, `prunable <reason>`, `bare`, and a path containing a
+  newline.
+- [x] **Step 2: Run them and confirm they fail** (the module does not exist,
+      so they fail to compile).
+- [x] **Step 3: `parse_worktree_list` and `GitService::worktrees`.** `-z`
+      output; git run with `--no-optional-locks -c core.fsmonitor=false`.
+- [x] **Step 4: `PathPolicy::is_inside_allowed_root`, `classify_worktrees`,
+      `resolve_worktree`.** Reasons checked in this order: bare, prunable,
+      missing (does not canonicalize, or not a directory), own checkout,
+      outside (neither inside the canonical repository root nor inside a
+      canonical `allowed_roots` entry, or `PathPolicy::canonical_root` refuses
+      it). Prunable before missing, so a deleted worktree reports the reason git
+      gives.
+- [x] **Step 5: Falsify.** Accept the first entry instead of excluding the own
+      checkout; skip the prunable check; compare the requested path without
+      canonicalizing; treat an empty `allowed_roots` as allowing everything.
+      Confirm a named test fails for each, and revert.
+- [x] **Step 6: Update the proposal** for C1 and C3.
+- [x] **Step 7: Scoped checks.** `cargo nextest run -p workspace-engine --test
+      worktree_reads`, `cargo nextest run -p workspace-engine -E
+      'test(worktree_access) + test(path_policy)'`, scoped clippy for
+      `workspace-engine`, and the fast checks.
+
+## Task 2: Git read hardening on the main checkout
+
+**Requirements:** 8 (and its acceptance rows). **Proposal:** §5.4.
+**Corrections:** C2, C3, C4, C5. **Files:** `git_service.rs`,
+`workspace_engine.rs`, `damaian-cli/src/main.rs`, `tests/foundation.rs` (if its
+call changes), `tests/worktree_reads.rs`, `chat.rs` only if
+`format_git_status` must change.
+
+- [ ] **Step 1: Write the failing tests** (all on the main checkout):
+  - `a_restricted_tracked_file_is_absent_from_status_and_diff` (both
+    `files` and `raw`; both unstaged and `staged`);
+  - `a_rename_onto_a_restricted_path_is_excluded`;
+  - `a_large_diff_is_truncated_and_says_what_it_cut`;
+  - `a_gitattributes_diff_driver_is_not_invoked` (local `.git/config` defines
+    `diff.evil.command` writing a marker file; `.gitattributes` selects it;
+    the marker must not appear) and the same for `textconv`;
+  - `fsmonitor_is_not_run` (local `core.fsmonitor` pointing at a script that
+    writes a marker);
+  - `status_does_not_take_the_index_lock` (an existing `index.lock` does not
+    make `status` fail);
+  - `a_diff_with_no_changes_is_unchanged` (byte-identical to today's output
+    for an ordinary diff with nothing restricted).
+- [ ] **Step 2: Run them and confirm they fail.**
+- [ ] **Step 3: One hardened git runner** in `git_service.rs`: `--no-optional-locks`,
+      `-c core.fsmonitor=false`, stdin null; `diff` and `log` add
+      `--no-ext-diff --no-textconv`. `summary` uses it too.
+- [ ] **Step 4: Restricted exclusion (C2, C5)** with `PathPolicy::is_restricted`.
+- [ ] **Step 5: Caps.** `max_read_lines` and `max_file_bytes`, whichever binds
+      first, with a trailing line naming what was cut (lines and files
+      omitted), the shape #47 §5.5 uses.
+- [ ] **Step 6: Constructor (C4).** `GitService::new` takes the `PathPolicy`
+      and caps; update `workspace_engine.rs`, the module's test helper and the
+      CLI.
+- [ ] **Step 7: Falsify** each test (drop the exclusion, the cap, each flag)
+      and revert.
+- [ ] **Step 8: Scoped checks**, including `--test foundation` and
+      `--test agent_tools`, and clippy for `workspace-engine` and `damaian-cli`.
+      Record in the Progress row every way main-checkout output changed.
+
+## Task 3: The `worktree` argument on the five read tools
+
+**Requirements:** 2, 7, 10. **Proposal:** §5.2, §5.3, §5.5.
+**Corrections:** C6. **Files:** `chat.rs`, `mode.rs`, `git_service.rs`,
+`tests/worktree_reads.rs`, `tests/agent_tools.rs`.
+
+- [ ] **Step 1: Write the failing tests:** for each of `read_file`,
+      `list_directory`, `search_content`, `read_git_status` and `read_git_diff`,
+      a dispatch through `MockModelAdapter` with `worktree` reads that
+      worktree, and a refused `worktree` is `ActionOutcome::Failed` naming the
+      reachable worktrees with no approval stop; a restricted file inside a
+      worktree is refused by `read_file` and absent from the others; the audit
+      records carry `worktree`; the action marker's `ref` is
+      `<worktree>:<path>`; `read_git_diff` with `paths`, `stat` and `base`
+      (merge base) on a worktree; `base` of `--output=/tmp/x` and `main..; rm`
+      refused before git runs; a `paths` entry escaping the worktree refused.
+- [ ] **Step 2: Run them and confirm they fail.**
+- [ ] **Step 3: `ToolAction` fields.** `worktree: Option<String>` on
+      `ReadFile`, `ListDirectory`, `SearchContent`; `ReadGitStatus` becomes
+      `ReadGitStatus { worktree }`; `ReadGitDiff` gains `worktree`, `paths`,
+      `stat`, `base`. Widen the `mode.rs` patterns (C6) and nothing else there.
+- [ ] **Step 4: `parse_tool_call` and tool definitions.** Descriptions say
+      that worktrees exist, that `list_worktrees` finds them, and that
+      `worktree` takes the path it returns (§5.2, last paragraph).
+- [ ] **Step 5: Dispatch.** Resolve once with `resolve_worktree`, then call the
+      existing function with the worktree's canonical root. `base` validation:
+      `git check-ref-format --allow-onelevel`-equivalent rules in Rust, no
+      leading `-`, passed after `--end-of-options`.
+- [ ] **Step 6: Byte-identical check.** The deterministic eval tier
+      (`cargo run -p eval-harness -- run --tier deterministic`) passes
+      unchanged.
+- [ ] **Step 7: Falsify** and revert.
+- [ ] **Step 8: Scoped checks.**
+
+## Task 4: `list_worktrees` and `read_git_log`
+
+**Requirements:** 1, 3, 10. **Proposal:** §5.2, §5.5, §5.6.
+**Corrections:** C6. **Files:** `chat.rs`, `mode.rs`, `git_service.rs`,
+`tests/worktree_reads.rs`.
+
+- [ ] **Step 1: Write the failing tests:** `list_worktrees` returns path,
+      branch or `detached`, short `HEAD`, changed-file count (restricted paths
+      not counted) and ahead/behind against the main worktree's branch;
+      omitted ahead/behind when the main worktree is detached; capped at 20
+      with the rest counted; `read_git_log` returns `short-sha subject` lines,
+      newest first, capped by `max_count` and the configured cap; both are
+      `ActionEffect::ReadOnly`, batch in one round, and are allowed in every
+      `SessionMode` and every profile; audit `git_worktrees_listed` and
+      `git_log_read`.
+- [ ] **Step 2: Run them and confirm they fail.**
+- [ ] **Step 3: Variants, `action_effect`, `tool_action_marker`, both `mode.rs`
+      arms (C6), progress labels, definitions, parsing, dispatch.**
+- [ ] **Step 4: Falsify** and revert.
+- [ ] **Step 5: Scoped checks**, including `--test permission_profiles`.
+
+## Task 5: The `worktree_survey` eval scenario
+
+**Requirements:** acceptance §6. **Proposal:** §5.7. **Files:**
+`crates/eval-harness/scenarios/worktree_survey.toml`, its fixture, and the
+runner only if it cannot yet create linked worktrees or a symlink in a fixture.
+
+- [ ] **Step 1: Scenario and fixture** per §5.7: two registered worktrees (one
+      dirty with a restricted file changed, one with commits ahead of `main`)
+      and a symlink under `.claude/worktrees/` pointing outside.
+- [ ] **Step 2: Run it and confirm it fails** before any fixture or runner
+      support it needs exists, then make it pass.
+- [ ] **Step 3: Assertions:** zero approval stops; the symlink refused; the
+      restricted file absent from the diff; the answer names both worktrees.
+- [ ] **Step 4: Scoped checks** (`cargo nextest run -p eval-harness`).
+
+## Task 6: Docs, live re-run and close-out
+
+- [ ] **Step 1: Live re-run** of the motivating prompt against
+      `deepseek-v4-flash` on this repository. Record approvals made and why in
+      proposal §6/§7.
+- [ ] **Step 2: Docs** (§5.8): `USER_GUIDE.md`, `TROUBLESHOOTING.md` (the
+      refusal reasons from Task 1), `SECURITY.md` (§5.4).
+- [ ] **Step 3: Cross-references.** #52 records whether its server exposes
+      `worktree`; #64's requirement 5 dependency on #60 is updated.
+- [ ] **Step 4: Close the spec** per AGENTS.md "When a spec becomes Done":
+      status in the proposal, README row and this file; `Depends on:` search;
+      What to build next; remove the item from `CHANGELOG.md` Unreleased.
+- [ ] **Step 5: Checks.** Fast checks and scoped clippy/tests locally; the full
+      gate on CI. Record the CI result here when it is green.

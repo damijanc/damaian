@@ -327,6 +327,34 @@ impl GitService {
         Ok(self.scanner.redact(raw_diff.as_ref()).text)
     }
 
+    /// Every worktree git has registered for the repository at `root_path`,
+    /// main worktree first, as `git worktree list --porcelain -z` lists them.
+    ///
+    /// Not audited: this answers which roots a read may reach, and the read
+    /// that follows records itself (spec 60 §5.5). No optional lock is taken
+    /// and no fsmonitor hook runs, because the worktrees listed may be in use
+    /// by another agent.
+    pub fn worktrees(
+        &self,
+        root_path: impl AsRef<Path>,
+    ) -> Result<Vec<crate::worktree_access::WorktreeEntry>> {
+        let output = Command::new("git")
+            .arg("--no-optional-locks")
+            .arg("-c")
+            .arg("core.fsmonitor=false")
+            .arg("-C")
+            .arg(root_path.as_ref())
+            .args(["worktree", "list", "--porcelain", "-z"])
+            .stdin(std::process::Stdio::null())
+            .output()?;
+        if !output.status.success() {
+            return Err(ClientError::Git(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+        Ok(crate::worktree_access::parse_worktree_list(&output.stdout))
+    }
+
     pub fn suggest_commit_message(&self, summary: &str, changed_files: &[String]) -> String {
         let normalized = summary.trim().trim_end_matches(['.', '!', '?']);
         if normalized.is_empty() {

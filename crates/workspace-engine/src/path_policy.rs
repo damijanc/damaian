@@ -55,6 +55,17 @@ impl PathPolicy {
         ))
     }
 
+    /// Whether an already-canonical path lies inside a configured
+    /// `allowed_roots` entry. Unlike [`Self::canonical_root`], an empty list
+    /// allows nothing: spec 60 reaches a worktree outside the repository only
+    /// when the user named a root that contains it. An entry that does not
+    /// canonicalize contains nothing.
+    pub fn is_inside_allowed_root(&self, canonical: &Path) -> bool {
+        self.allowed_roots.iter().any(|allowed| {
+            fs::canonicalize(allowed).is_ok_and(|allowed| is_inside(&allowed, canonical))
+        })
+    }
+
     pub fn resolve_existing(
         &self,
         root_path: impl AsRef<Path>,
