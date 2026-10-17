@@ -1,5 +1,6 @@
 use crate::config::{CommandAccess, Config};
 use crate::error::Result;
+use crate::path_policy::PathPolicy;
 use crate::repository_map::RootCommand;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -70,6 +71,13 @@ pub const PROJECT_MANIFESTS: [&str; 7] = [
     "Cargo.toml",
 ];
 
+const READ_ONLY_REASON: &str = "Read-only command";
+
+/// The prefix of the reason an admitted read-only command needs approval
+/// because it names a restricted path. Spec 62's `ApprovalCause` will carry
+/// this as `RestrictedPath`; until it exists, the reason string does.
+pub const RESTRICTED_PATH_REASON: &str = "Command reads a restricted path";
+
 #[derive(Debug, Clone)]
 pub struct CommandPolicy {
     config: Config,
@@ -108,14 +116,51 @@ impl CommandPolicy {
         working_directory: &Path,
     ) -> CommandClassification {
         let location = relative_location(repository_root, working_directory);
-        let mut classification = self.classify_pattern(command, location.as_deref());
+        let (mut classification, admitted_paths) =
+            self.classify_pattern(command, location.as_deref());
         if !classification.blocked && location.is_none() {
             escalate(
                 &mut classification,
                 "Working directory is outside the selected repository",
             );
         }
-        if !classification.blocked
+        if let Some(paths) = &admitted_paths {
+            // Spec 64 requirements 3–4: an admitted read-only command's
+            // paths, and the directory it runs in, go through the same
+            // restricted patterns `read_file` honours. This replaces the
+            // outside-root heuristic below for these commands.
+            let path_policy = PathPolicy::new(&self.config);
+            if let Some(relative) = location.as_deref()
+                && let Some(restricted) = restricted_reach(&path_policy, relative, true)
+            {
+                escalate(
+                    &mut classification,
+                    &format!("{RESTRICTED_PATH_REASON}: {restricted}"),
+                );
+            }
+            let mut outside_reported = false;
+            for path in paths {
+                match check_path_argument(&path_policy, repository_root, working_directory, path) {
+                    None => {}
+                    Some(PathFinding::OutsideRepository) if !outside_reported => {
+                        outside_reported = true;
+                        escalate(
+                            &mut classification,
+                            "Command references a path outside the selected repository",
+                        );
+                    }
+                    Some(PathFinding::OutsideRepository) => {}
+                    Some(PathFinding::Restricted(restricted)) => escalate(
+                        &mut classification,
+                        &format!("{RESTRICTED_PATH_REASON}: {restricted}"),
+                    ),
+                    Some(PathFinding::RecursiveRoot) => escalate(
+                        &mut classification,
+                        "`ls -R` of the repository root would list restricted directories too",
+                    ),
+                }
+            }
+        } else if !classification.blocked
             && references_path_outside_root(
                 &classification.command,
                 repository_root,
@@ -144,10 +189,36 @@ impl CommandPolicy {
     }
 
     /// `location` is the working directory relative to the repository root:
-    /// `Some("")` at the root, `None` outside the repository.
-    fn classify_pattern(&self, command: &str, location: Option<&str>) -> CommandClassification {
+    /// `Some("")` at the root, `None` outside the repository. The second
+    /// half is the path arguments of a command admitted as read-only, which
+    /// `classify_at` still has to check (spec 64 requirement 3); `None` for
+    /// every other command.
+    fn classify_pattern(
+        &self,
+        command: &str,
+        location: Option<&str>,
+    ) -> (CommandClassification, Option<Vec<PathArgument>>) {
         let normalized = command.trim().to_string();
+        let verdict = read_only_verdict(&normalized);
+        let classification = self.classify_text(normalized, command, location, &verdict);
+        let admitted = match verdict {
+            ReadOnlyVerdict::Admitted(paths)
+                if classification.reasons.first().map(String::as_str) == Some(READ_ONLY_REASON) =>
+            {
+                Some(paths)
+            }
+            _ => None,
+        };
+        (classification, admitted)
+    }
 
+    fn classify_text(
+        &self,
+        normalized: String,
+        command: &str,
+        location: Option<&str>,
+        verdict: &ReadOnlyVerdict,
+    ) -> CommandClassification {
         if configured_prefix_matches(&self.config.command_blocklist, &normalized)
             || is_blocked_command(&normalized)
         {
@@ -196,16 +267,33 @@ impl CommandPolicy {
             };
         }
 
-        if is_low_risk_read_only(&normalized) {
-            return CommandClassification {
-                command: normalized,
-                risk: CommandRisk::Low,
-                blocked: false,
-                requires_approval: self.config.require_approval_for_all_commands,
-                reasons: vec!["Read-only command".to_string()],
-                expected_effects: "Reads workspace or Git metadata".to_string(),
-                may_use_network: false,
-            };
+        match verdict {
+            ReadOnlyVerdict::Admitted(_) => {
+                return CommandClassification {
+                    command: normalized,
+                    risk: CommandRisk::Low,
+                    blocked: false,
+                    requires_approval: self.config.require_approval_for_all_commands,
+                    reasons: vec![READ_ONLY_REASON.to_string()],
+                    expected_effects: "Reads workspace or Git metadata".to_string(),
+                    may_use_network: false,
+                };
+            }
+            // A read-only program outside its admitted form: an option that
+            // writes or redirects (`--output`, `-C`), or text the shell
+            // would rewrite. Its effects are unknown until reviewed.
+            ReadOnlyVerdict::Refused(reason) => {
+                return CommandClassification {
+                    command: normalized,
+                    risk: CommandRisk::High,
+                    blocked: false,
+                    requires_approval: true,
+                    reasons: vec![reason.clone()],
+                    expected_effects: "Unknown effects until reviewed".to_string(),
+                    may_use_network: may_use_network(command),
+                };
+            }
+            ReadOnlyVerdict::NotReadOnly => {}
         }
 
         if is_validation_command(&normalized) {
@@ -458,18 +546,487 @@ fn is_blocked_command(command: &str) -> bool {
         || trimmed == "reboot"
 }
 
+/// Whether `command` is in the admitted read-only form (spec 64 §5.1–§5.2):
+/// split into words with no shell expansion, an admitted program, and only
+/// that program's admitted options. Says nothing about where its paths
+/// lead; `classify_at` checks those against the repository.
 pub(crate) fn is_low_risk_read_only(command: &str) -> bool {
-    command == "pwd"
-        || command == "ls"
-        || command.starts_with("ls ")
-        || command == "git status"
-        || command.starts_with("git status ")
-        || command == "git diff"
-        || command.starts_with("git diff ")
-        || command == "git log"
-        || command.starts_with("git log ")
-        || command == "git show"
-        || command.starts_with("git show ")
+    matches!(read_only_verdict(command), ReadOnlyVerdict::Admitted(_))
+}
+
+/// What the read-only boundary decides about a command's text (spec 64).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadOnlyVerdict {
+    /// Not one of the read-only programs; the later branches classify it.
+    NotReadOnly,
+    /// A read-only program in a form the boundary does not admit, so it
+    /// needs approval. The reason is what the user is shown.
+    Refused(String),
+    /// Admitted; each path argument still has to pass requirement 3.
+    Admitted(Vec<PathArgument>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PathArgument {
+    text: String,
+    /// The path half of `<rev>:<path>` is relative to the repository's top
+    /// level unless it starts with `./` or `../`; everything else is
+    /// relative to the working directory, as git and `ls` resolve them.
+    from_repository_root: bool,
+    /// `ls -R`: the path must not be the repository root (§5.2).
+    recursive: bool,
+}
+
+impl PathArgument {
+    fn relative_to_working_directory(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            from_repository_root: false,
+            recursive: false,
+        }
+    }
+}
+
+/// The command's words as the shell will see them, or the reason they
+/// cannot be known before the shell runs (spec 64 requirement 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellWords {
+    words: Vec<String>,
+    /// The first expansion found. The words are still returned, with the
+    /// expanding characters left in, so the caller can tell which program
+    /// was meant.
+    expansion: Option<&'static str>,
+}
+
+/// Splits `command` into words the way a POSIX shell or zsh would, without
+/// performing any expansion. `None` means the text uses syntax this
+/// tokenizer does not model (a backslash, an unclosed quote, an operator),
+/// which is a parsing gap and so must ask rather than run (§5.1).
+fn shell_words(command: &str) -> Option<ShellWords> {
+    let mut words = Vec::new();
+    let mut expansion = None;
+    let mut current = String::new();
+    let mut in_word = false;
+    // The previous unquoted character, for the positions where `~` expands.
+    let mut previous: Option<char> = None;
+    let mut characters = command.chars();
+    let note = |found: &'static str, expansion: &mut Option<&'static str>| {
+        expansion.get_or_insert(found);
+    };
+    while let Some(character) = characters.next() {
+        match character {
+            ' ' | '\t' => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+                previous = None;
+                continue;
+            }
+            '\'' => {
+                loop {
+                    match characters.next()? {
+                        '\'' => break,
+                        quoted => current.push(quoted),
+                    }
+                }
+                in_word = true;
+                previous = Some('\'');
+                continue;
+            }
+            '"' => {
+                loop {
+                    match characters.next()? {
+                        '"' => break,
+                        '$' | '`' => {
+                            note("`$` or a backtick inside double quotes", &mut expansion);
+                            current.push('$');
+                        }
+                        '\\' => return None,
+                        quoted => current.push(quoted),
+                    }
+                }
+                in_word = true;
+                previous = Some('"');
+                continue;
+            }
+            '\\' | ';' | '&' | '|' | '<' | '>' | '\n' | '\r' => return None,
+            control if control.is_control() => return None,
+            '$' => note("`$`", &mut expansion),
+            '`' => note("a backtick", &mut expansion),
+            '*' | '?' | '[' | '{' | '(' | ')' => {
+                note("a glob, brace or parenthesis", &mut expansion);
+            }
+            // Tilde expansion happens at the start of a word and, in
+            // assignments and zsh's `magic_equal_subst`, after `=` or `:`.
+            // Elsewhere (`HEAD~1`) the shell leaves it alone.
+            '~' if !in_word || matches!(previous, Some('=' | ':')) => {
+                note("`~`", &mut expansion);
+            }
+            // zsh expands a word starting with `=` to a program's path
+            // (`=ls` is `/bin/ls`), `^` starts a negated glob under
+            // `extended_glob`, and `#` starts a comment.
+            '=' | '^' | '#' if !in_word => {
+                note("`=`, `^` or `#` at the start of a word", &mut expansion);
+            }
+            _ => {}
+        }
+        current.push(character);
+        in_word = true;
+        previous = Some(character);
+    }
+    if in_word {
+        words.push(current);
+    }
+    Some(ShellWords { words, expansion })
+}
+
+const READ_ONLY_GIT_SUBCOMMANDS: [&str; 4] = ["status", "diff", "log", "show"];
+
+/// git's global options that take the next word as their value, so the
+/// subcommand can be found after them.
+const GIT_GLOBAL_OPTIONS_WITH_VALUE: [&str; 6] = [
+    "-c",
+    "-C",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--config-env",
+];
+
+/// Whether `words` names one of the read-only programs, whatever its
+/// options. Decides between `Refused` (ask) and `NotReadOnly` (let the
+/// later branches decide), so `git -C /tmp commit` keeps its old answer.
+fn names_read_only_program(words: &[&str]) -> bool {
+    match words.first() {
+        Some(&"pwd") | Some(&"ls") => true,
+        Some(&"git") => git_subcommand(&words[1..])
+            .is_some_and(|(_, subcommand, _)| READ_ONLY_GIT_SUBCOMMANDS.contains(&subcommand)),
+        _ => false,
+    }
+}
+
+/// Splits git's arguments into its global options, the subcommand and the
+/// subcommand's arguments.
+fn git_subcommand<'a>(arguments: &[&'a str]) -> Option<(Vec<&'a str>, &'a str, Vec<&'a str>)> {
+    let mut global = Vec::new();
+    let mut index = 0;
+    while let Some(word) = arguments.get(index) {
+        if !word.starts_with('-') {
+            return Some((global, word, arguments[index + 1..].to_vec()));
+        }
+        global.push(*word);
+        index += if GIT_GLOBAL_OPTIONS_WITH_VALUE.contains(word) {
+            2
+        } else {
+            1
+        };
+    }
+    None
+}
+
+fn read_only_verdict(command: &str) -> ReadOnlyVerdict {
+    let Some(parsed) = shell_words(command.trim()) else {
+        let raw: Vec<&str> = command.split_whitespace().collect();
+        return if names_read_only_program(&raw) {
+            ReadOnlyVerdict::Refused(
+                "Command uses shell syntax the read-only check does not model (a backslash, an \
+                 unclosed quote or an operator), so it needs review"
+                    .to_string(),
+            )
+        } else {
+            ReadOnlyVerdict::NotReadOnly
+        };
+    };
+    let words: Vec<&str> = parsed.words.iter().map(String::as_str).collect();
+    if !names_read_only_program(&words) {
+        return ReadOnlyVerdict::NotReadOnly;
+    }
+    if let Some(expansion) = parsed.expansion {
+        return ReadOnlyVerdict::Refused(format!(
+            "Command uses shell expansion ({expansion}), so the shell would run something other \
+             than what was checked"
+        ));
+    }
+    match words[0] {
+        "pwd" if words.len() == 1 => ReadOnlyVerdict::Admitted(Vec::new()),
+        "pwd" => refuse_argument("pwd", words[1]),
+        "ls" => ls_verdict(&words[1..]),
+        _ => {
+            let (global, subcommand, arguments) =
+                git_subcommand(&words[1..]).expect("names_read_only_program found a subcommand");
+            if let Some(option) = global.iter().find(|option| **option != "--no-pager") {
+                return refuse_argument("git", option);
+            }
+            git_verdict(subcommand, &arguments)
+        }
+    }
+}
+
+fn refuse_argument(program: &str, argument: &str) -> ReadOnlyVerdict {
+    ReadOnlyVerdict::Refused(format!(
+        "`{argument}` is not an admitted argument for a read-only `{program}`, so the command \
+         needs review"
+    ))
+}
+
+/// `ls` with `-a`, `-l`, `-1`, `-d`, `-h` or `-R`, alone or combined, and
+/// paths (spec 64 §5.2).
+fn ls_verdict(arguments: &[&str]) -> ReadOnlyVerdict {
+    let mut recursive = false;
+    let mut paths = Vec::new();
+    for argument in arguments {
+        if let Some(flags) = argument.strip_prefix('-') {
+            if flags.is_empty() || !flags.chars().all(|flag| "al1dhR".contains(flag)) {
+                return refuse_argument("ls", argument);
+            }
+            recursive |= flags.contains('R');
+        } else {
+            paths.push(PathArgument::relative_to_working_directory(argument));
+        }
+    }
+    if recursive {
+        if paths.is_empty() {
+            return ReadOnlyVerdict::Refused(
+                "`ls -R` without a directory would list the whole repository, restricted \
+                 directories included, so it needs review"
+                    .to_string(),
+            );
+        }
+        for path in &mut paths {
+            path.recursive = true;
+        }
+    }
+    ReadOnlyVerdict::Admitted(paths)
+}
+
+fn is_count(word: &str) -> bool {
+    !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The subcommand's options per §5.2, then revisions, `<rev>:<path>`, `--`
+/// and paths where the subcommand takes them.
+fn git_verdict(subcommand: &str, arguments: &[&str]) -> ReadOnlyVerdict {
+    let program = format!("git {subcommand}");
+    let mut paths = Vec::new();
+    let mut index = 0;
+    let mut after_separator = false;
+    while let Some(argument) = arguments.get(index).copied() {
+        index += 1;
+        if after_separator || !argument.starts_with('-') {
+            if subcommand == "status" {
+                return refuse_argument(&program, argument);
+            }
+            match git_path_argument(argument, after_separator) {
+                Some(path) => paths.extend(path),
+                None => return refuse_argument(&program, argument),
+            }
+            continue;
+        }
+        if argument == "--" && subcommand != "status" {
+            after_separator = true;
+            continue;
+        }
+        let admitted = match subcommand {
+            "status" => {
+                matches!(
+                    argument,
+                    "--short"
+                        | "--porcelain"
+                        | "--porcelain=v1"
+                        | "--branch"
+                        | "--untracked-files=no"
+                ) || argument.strip_prefix('-').is_some_and(|flags| {
+                    !flags.is_empty() && flags.chars().all(|flag| matches!(flag, 's' | 'b'))
+                })
+            }
+            "log" => {
+                // `-p`/`--patch` stay until #60 gives the model a bounded
+                // alternative (requirement 5, §5.4).
+                if argument == "-n" {
+                    let value = arguments.get(index).copied().unwrap_or_default();
+                    index += 1;
+                    is_count(value)
+                } else {
+                    matches!(
+                        argument,
+                        "--oneline"
+                            | "--stat"
+                            | "--name-only"
+                            | "--name-status"
+                            | "--decorate"
+                            | "--graph"
+                            | "--pretty"
+                            | "-p"
+                            | "--patch"
+                    ) || argument.starts_with("--format=")
+                        || argument.starts_with("--pretty=")
+                        || argument.strip_prefix("--max-count=").is_some_and(is_count)
+                        || argument.strip_prefix("-n").is_some_and(is_count)
+                        || argument.strip_prefix('-').is_some_and(is_count)
+                }
+            }
+            _ => {
+                if argument == "-U" {
+                    let value = arguments.get(index).copied().unwrap_or_default();
+                    index += 1;
+                    is_count(value)
+                } else {
+                    matches!(
+                        argument,
+                        "--stat" | "--name-only" | "--name-status" | "--staged" | "--cached"
+                    ) || argument.strip_prefix("-U").is_some_and(is_count)
+                        || argument.strip_prefix("--unified=").is_some_and(is_count)
+                }
+            }
+        };
+        if !admitted {
+            return refuse_argument(&program, argument);
+        }
+    }
+    ReadOnlyVerdict::Admitted(paths)
+}
+
+/// A git positional argument: a revision, a range, `<rev>:<path>` or a
+/// path. Every one is path-checked, since git decides between revision and
+/// path only when it runs. `None` refuses it: git treats `*`, `?` and `[`
+/// in a path as a glob of its own, and a pathspec starting with `:` or
+/// containing `(` is magic, so neither is what the text says.
+fn git_path_argument(argument: &str, after_separator: bool) -> Option<Option<PathArgument>> {
+    if argument.contains(['*', '?', '[', '(']) {
+        return None;
+    }
+    if after_separator {
+        if argument.starts_with(':') {
+            return None;
+        }
+        return Some(Some(PathArgument::relative_to_working_directory(argument)));
+    }
+    let Some((revision, path)) = argument.split_once(':') else {
+        return Some(Some(PathArgument::relative_to_working_directory(argument)));
+    };
+    // `:<path>` and `:<stage>:<path>` name the index.
+    let path = match path.split_once(':') {
+        Some((stage, staged)) if revision.is_empty() && is_count(stage) => staged,
+        _ => path,
+    };
+    if !revision.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(character, '.' | '/' | '_' | '-' | '~' | '^' | '@')
+    }) || revision.starts_with('-')
+    {
+        return None;
+    }
+    if path.is_empty() {
+        return Some(None);
+    }
+    Some(Some(PathArgument {
+        text: path.to_string(),
+        from_repository_root: !(path.starts_with("./") || path.starts_with("../")),
+        recursive: false,
+    }))
+}
+
+/// Why an admitted command's path argument needs approval (spec 64 §5.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathFinding {
+    OutsideRepository,
+    Restricted(String),
+    RecursiveRoot,
+}
+
+/// Resolves `argument` the way the program will and checks it against the
+/// repository and `restricted_patterns`. Requirement 1 has already refused
+/// expansion, so the text is what the program receives. A path that exists
+/// is also checked after resolving symlinks, so a link cannot lead out of
+/// the repository or into a restricted directory.
+fn check_path_argument(
+    path_policy: &PathPolicy,
+    repository_root: &Path,
+    working_directory: &Path,
+    argument: &PathArgument,
+) -> Option<PathFinding> {
+    let base = if argument.from_repository_root {
+        repository_root
+    } else {
+        working_directory
+    };
+    let candidate = base.join(&argument.text);
+    let root = normalize_lexically(repository_root);
+    let lexical = normalize_lexically(&candidate);
+    let Ok(relative) = lexical.strip_prefix(&root) else {
+        return Some(PathFinding::OutsideRepository);
+    };
+    let mut relatives = vec![slash_separated(relative)];
+    if let (Ok(canonical_root), Ok(canonical)) = (
+        fs::canonicalize(repository_root),
+        fs::canonicalize(&candidate),
+    ) {
+        match canonical.strip_prefix(&canonical_root) {
+            Ok(relative) => relatives.push(slash_separated(relative)),
+            Err(_) => return Some(PathFinding::OutsideRepository),
+        }
+    }
+    let is_directory = argument.text.ends_with('/') || candidate.is_dir();
+    for relative in &relatives {
+        if argument.recursive && relative.is_empty() {
+            return Some(PathFinding::RecursiveRoot);
+        }
+        if let Some(restricted) = restricted_reach(path_policy, relative, is_directory) {
+            return Some(PathFinding::Restricted(restricted));
+        }
+    }
+    None
+}
+
+/// The restricted path `relative` reaches, if any: the path itself, one of
+/// its ancestors, or its contents.
+///
+/// The default patterns restrict a directory's contents (`secrets/**`), not
+/// its name, and `ls secrets` or `git diff -- secrets` reads exactly those
+/// contents. So a path whose every child would be restricted counts as
+/// restricted. The synthetic child's name cannot occur in a real path, so
+/// only patterns that match any name below the path fire.
+fn restricted_reach(
+    path_policy: &PathPolicy,
+    relative: &str,
+    is_directory: bool,
+) -> Option<String> {
+    if relative.is_empty() {
+        return None;
+    }
+    restricted_prefix(path_policy, relative, is_directory).or_else(|| {
+        path_policy
+            .is_restricted(&format!("{relative}/{SYNTHETIC_CHILD}"), false)
+            .then(|| relative.to_string())
+    })
+}
+
+const SYNTHETIC_CHILD: &str = "\u{0}";
+
+fn slash_separated(relative: &Path) -> String {
+    relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The path itself or the first of its ancestors that `restricted_patterns`
+/// matches: a file inside a restricted directory is restricted too.
+fn restricted_prefix(
+    path_policy: &PathPolicy,
+    relative: &str,
+    is_directory: bool,
+) -> Option<String> {
+    let segments: Vec<&str> = relative.split('/').collect();
+    (1..=segments.len()).find_map(|length| {
+        let prefix = segments[..length].join("/");
+        let prefix_is_directory = length < segments.len() || is_directory;
+        path_policy
+            .is_restricted(&prefix, prefix_is_directory)
+            .then_some(prefix)
+    })
 }
 
 fn is_validation_command(command: &str) -> bool {
@@ -675,6 +1232,295 @@ mod tests {
             root,
             root
         ));
+    }
+
+    /// Spec 64 §6, "Tightening". Each command is classified at a repository
+    /// that exists, so symlink resolution and restricted directories are
+    /// exercised for real.
+    mod read_only_boundary {
+        use super::super::{
+            CommandClassification, CommandPolicy, CommandRisk, RESTRICTED_PATH_REASON, ShellWords,
+            is_low_risk_read_only, shell_words,
+        };
+        use crate::config::Config;
+        use std::fs;
+        use std::path::PathBuf;
+
+        struct Repository {
+            root: PathBuf,
+        }
+
+        impl Repository {
+            fn new(name: &str) -> Self {
+                let root = std::env::temp_dir().join(format!(
+                    "damaian-read-only-boundary-{name}-{}",
+                    std::process::id()
+                ));
+                let _ = fs::remove_dir_all(&root);
+                fs::create_dir_all(root.join("crates/engine")).unwrap();
+                fs::create_dir_all(root.join("secrets")).unwrap();
+                fs::write(root.join("secrets/token"), "x").unwrap();
+                fs::write(root.join("README.md"), "readme").unwrap();
+                Self { root }
+            }
+
+            fn classify(&self, command: &str) -> CommandClassification {
+                CommandPolicy::new(Config::default()).classify(command, &self.root)
+            }
+
+            fn classify_in(&self, command: &str, directory: &str) -> CommandClassification {
+                CommandPolicy::new(Config::default()).classify_at(
+                    command,
+                    &self.root,
+                    &self.root.join(directory),
+                )
+            }
+        }
+
+        impl Drop for Repository {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+
+        fn runs_unasked(classification: &CommandClassification) -> bool {
+            classification.risk == CommandRisk::Low && !classification.requires_approval
+        }
+
+        /// Needs approval, and is refused in Plan and Review, which admit
+        /// exactly what `is_read_only_without_approval` does (requirement 8).
+        fn assert_needs_approval(classification: &CommandClassification) {
+            assert!(
+                classification.requires_approval,
+                "{}: {:?}",
+                classification.command, classification.reasons
+            );
+            assert!(
+                !classification.is_read_only_without_approval(),
+                "{} would run in Plan or Review",
+                classification.command
+            );
+        }
+
+        #[test]
+        fn options_that_write_a_file_need_approval() {
+            let repo = Repository::new("output");
+            for command in ["git diff --output=README.md", "git log --output=x"] {
+                assert_needs_approval(&repo.classify(command));
+            }
+        }
+
+        #[test]
+        fn shell_expansion_needs_approval() {
+            let repo = Repository::new("expansion");
+            for command in [
+                "ls $HOME/.ssh",
+                "git diff --no-index $HOME/x README.md",
+                "ls ~",
+                "ls *",
+                "ls \"$HOME\"",
+                "ls =ls",
+                "git log --pretty=~/x",
+            ] {
+                let classification = repo.classify(command);
+                assert_needs_approval(&classification);
+                assert!(
+                    classification
+                        .reasons
+                        .iter()
+                        .any(|reason| reason.contains("shell expansion")),
+                    "{command}: {:?}",
+                    classification.reasons
+                );
+            }
+            // A backtick is caught earlier, by the shell-control gate.
+            assert_needs_approval(&repo.classify("git log --format=`id`"));
+        }
+
+        #[test]
+        fn restricted_paths_need_approval_with_the_restricted_path_reason() {
+            let repo = Repository::new("restricted");
+            for (command, restricted) in [
+                ("git show HEAD:.env", ".env"),
+                ("git diff -- .env", ".env"),
+                ("ls secrets/", "secrets"),
+                ("ls secrets", "secrets"),
+                ("git log -- secrets/token", "secrets/token"),
+                ("git show HEAD:crates/.env", "crates/.env"),
+            ] {
+                let classification = repo.classify(command);
+                assert_needs_approval(&classification);
+                assert!(
+                    classification
+                        .reasons
+                        .contains(&format!("{RESTRICTED_PATH_REASON}: {restricted}")),
+                    "{command}: {:?}",
+                    classification.reasons
+                );
+            }
+        }
+
+        #[test]
+        fn git_options_that_change_what_git_reads_or_runs_need_approval() {
+            let repo = Repository::new("git-options");
+            for command in [
+                "git -c core.pager=x log",
+                "git -C /tmp status",
+                "git --git-dir=x log",
+                "git --work-tree=/tmp status",
+                "git --exec-path=/tmp log",
+                "git diff --no-index a b",
+                "git diff --ext-diff",
+                "git show --textconv HEAD",
+                "git log --since=yesterday",
+                "git status --ignored",
+            ] {
+                let classification = repo.classify(command);
+                assert_needs_approval(&classification);
+                assert_eq!(classification.risk, CommandRisk::High, "{command}");
+            }
+        }
+
+        #[test]
+        fn the_everyday_read_only_commands_still_run_unasked() {
+            let repo = Repository::new("everyday");
+            for command in [
+                "git status --short",
+                "git status -sb",
+                "git log --oneline -n 5",
+                "git log --oneline -5",
+                "git --no-pager log --stat main..HEAD",
+                "git log --format='%h %s' -- crates",
+                "git diff",
+                "git diff --stat HEAD~1",
+                "git diff --cached -U 3 -- README.md",
+                "git show --stat",
+                "git show HEAD:README.md",
+                "git show HEAD^:crates/engine",
+                "ls crates",
+                "ls -la crates/engine",
+                "ls -R crates",
+                "ls",
+                "pwd",
+            ] {
+                let classification = repo.classify(command);
+                assert!(
+                    runs_unasked(&classification),
+                    "{command}: {:?}",
+                    classification.reasons
+                );
+                assert!(classification.is_read_only_without_approval(), "{command}");
+            }
+        }
+
+        #[test]
+        fn paths_outside_the_repository_need_approval() {
+            let repo = Repository::new("outside");
+            for command in [
+                "ls /etc",
+                "ls ../",
+                "git diff -- ../other",
+                "git show HEAD:../x",
+                "git log /etc/passwd",
+            ] {
+                let classification = repo.classify(command);
+                assert_needs_approval(&classification);
+                assert!(
+                    classification
+                        .reasons
+                        .iter()
+                        .any(|reason| reason.contains("outside the selected repository")),
+                    "{command}: {:?}",
+                    classification.reasons
+                );
+            }
+        }
+
+        /// `<rev>:<path>` is relative to the top level; `./` makes it
+        /// relative to the working directory, as git resolves it.
+        #[test]
+        fn a_revision_path_resolves_where_git_resolves_it() {
+            let repo = Repository::new("rev-path");
+            assert!(runs_unasked(
+                &repo.classify_in("git show HEAD:README.md", "crates")
+            ));
+            assert_needs_approval(&repo.classify_in("git show HEAD:../../.env", "crates"));
+            assert_needs_approval(&repo.classify_in("ls ../secrets", "crates"));
+        }
+
+        #[test]
+        fn a_symlink_out_of_the_repository_needs_approval() {
+            let repo = Repository::new("symlink");
+            let outside = std::env::temp_dir();
+            std::os::unix::fs::symlink(&outside, repo.root.join("escape")).unwrap();
+            assert_needs_approval(&repo.classify("ls escape"));
+        }
+
+        #[test]
+        fn ls_recursive_needs_a_directory_other_than_the_root() {
+            let repo = Repository::new("recursive");
+            assert_needs_approval(&repo.classify("ls -R"));
+            assert_needs_approval(&repo.classify("ls -R ."));
+            assert!(runs_unasked(&repo.classify("ls -R crates")));
+        }
+
+        /// Requirement 4: the directory a read-only command runs in is held
+        /// to the restricted patterns, as `resolve_command_directory` does.
+        #[test]
+        fn a_restricted_working_directory_needs_approval() {
+            let repo = Repository::new("restricted-wd");
+            assert_needs_approval(&repo.classify_in("ls", "secrets"));
+        }
+
+        #[test]
+        fn git_globs_and_pathspec_magic_need_approval() {
+            let repo = Repository::new("pathspec");
+            for command in [
+                "git diff -- '*.env'",
+                "git log -- ':(glob)**'",
+                "git diff -- :!README.md",
+            ] {
+                assert_needs_approval(&repo.classify(command));
+            }
+        }
+
+        #[test]
+        fn the_tokenizer_splits_quotes_without_expanding() {
+            assert_eq!(
+                shell_words("git log --format='%h $x' \"a b\" ''"),
+                Some(ShellWords {
+                    words: vec![
+                        "git".to_string(),
+                        "log".to_string(),
+                        "--format=%h $x".to_string(),
+                        "a b".to_string(),
+                        String::new(),
+                    ],
+                    expansion: None,
+                })
+            );
+            assert_eq!(
+                shell_words("git diff HEAD~1").unwrap().expansion,
+                None,
+                "`~` inside a word is not tilde expansion"
+            );
+            assert!(shell_words("ls 'unclosed").is_none());
+            assert!(shell_words("ls a\\ b").is_none());
+            assert!(shell_words("ls a{b,c}").unwrap().expansion.is_some());
+            assert!(shell_words("ls #x").unwrap().expansion.is_some());
+        }
+
+        /// The prefix match admitted anything that started with an admitted
+        /// program; the boundary does not.
+        #[test]
+        fn is_low_risk_read_only_judges_the_whole_command() {
+            assert!(is_low_risk_read_only("git status"));
+            assert!(!is_low_risk_read_only("git status --ignored"));
+            assert!(!is_low_risk_read_only("git statusx"));
+            assert!(!is_low_risk_read_only("pwd -P"));
+            assert!(!is_low_risk_read_only("ls --color=always"));
+            assert!(!is_low_risk_read_only("git status | head"));
+        }
     }
 
     #[test]
