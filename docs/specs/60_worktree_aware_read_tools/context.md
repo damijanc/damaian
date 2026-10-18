@@ -119,7 +119,7 @@ filter by name (`proposal.md` §7).
   (`command_proposal_response`, `chat.rs`), whatever actually triggered
   approval. Naming the real reason — shell control, unknown command, network —
   would let a user approve or reject faster. Specified as
-  [#62](../62_approval_prompts_name_the_reason.md).
+  [#62](../62_approval_prompts_name_the_reason/proposal.md).
 - **Benign exits become error findings.** Two `finding_recorded` events in the
   session, severity `error`, came from exploratory commands: an unquoted
   `--include=*.rs` that zsh's `nomatch` rejected, and an `ls -d` of a directory

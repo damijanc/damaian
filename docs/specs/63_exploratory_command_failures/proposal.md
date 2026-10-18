@@ -2,7 +2,7 @@
 
 Status: In progress (started 2026-10-17; Tasks 1–3 of 6 done — see
 [`tasks.md`](tasks.md)). Specified on 2026-10-17 from the session behind
-[#59](../59_exploration_round_allowance/proposal.md)–[#62](../62_approval_prompts_name_the_reason.md),
+[#59](../59_exploration_round_allowance/proposal.md)–[#62](../62_approval_prompts_name_the_reason/proposal.md),
 a reporting-only request that left two open **error** findings behind: an
 unquoted glob that zsh refused, and an `ls -d` of a directory that did not
 exist.
@@ -18,7 +18,7 @@ Related implementation specs:
 detected validations, and which this spec must not weaken),
 [`58_header_repo_bar_and_menus`](../58_header_repo_bar_and_menus/proposal.md) (the
 *Fix N errors* action that offered these two for repair),
-[`62_approval_prompts_name_the_reason.md`](../62_approval_prompts_name_the_reason.md)
+[`62_approval_prompts_name_the_reason`](../62_approval_prompts_name_the_reason/proposal.md)
 (also corrects what the model is told about the shell).
 
 ## 1. Motivation
