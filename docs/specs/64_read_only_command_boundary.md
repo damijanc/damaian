@@ -1,8 +1,10 @@
 # Feature Spec: The Read-Only Command Boundary
 
 Status: In progress. Started 2026-10-17: requirements 1–4 and 8 (the
-tightening) are implemented, and requirements 6–7 (pipelines) were implemented
-on 2026-10-18; requirement 5 waits for #60. Specified on 2026-10-17. It began as "let read-only
+tightening) and requirements 6–7 (pipelines) were implemented on 2026-10-17/18,
+and requirement 5 shipped on 2026-10-18 once #60's `read_git_diff` and
+`read_git_log` landed, so every requirement is now implemented; the §5.7
+documentation remains before the spec is Done. Specified on 2026-10-17. It began as "let read-only
 pipelines run without approval", from the session behind
 [#59](59_exploration_round_allowance/proposal.md)–[#63](63_exploratory_command_failures/proposal.md).
 Reading the policy to design that found the existing read-only list already
@@ -17,8 +19,10 @@ Depends on: [#20](20_working_modes/proposal.md) (Plan and Review allow only
 commands that need no approval) — built;
 [#34](34_repository_config_trust_boundary.md) — built;
 [#60](60_worktree_aware_read_tools/proposal.md) (tools for git content and
-worktrees) — **not built**. Requirements 1–4 and 6–8 do not need #60 and have
-shipped first. Requirement 5 waits for it, for the reason in §5.4. Everything else
+worktrees) — **not built**, but its `read_git_diff` and `read_git_log` tools
+are merged, which is all requirement 5 needs. Requirements 1–4 and 6–8 do not
+need #60 and shipped first. Requirement 5 waited for it, for the reason in
+§5.4, and shipped once those tools landed. Everything else
 named below is a cross-reference, not a prerequisite.
 Related implementation specs:
 [`10_persistent_command_approval.md`](10_persistent_command_approval.md)
@@ -155,8 +159,8 @@ asks for approval rather than running.
 | `pwd` | none |
 | `ls` | `-a`, `-l`, `-1`, `-d`, `-h`, `-R` (restricted, see below), paths |
 | `git status` | `--short`, `-s`, `--porcelain`, `--porcelain=v1`, `--branch`, `-b`, `--untracked-files=no` |
-| `git log` | `--oneline`, `-n N`, `--max-count=N`, `--stat`, `--name-only`, `--name-status`, `--format=…`, `--pretty=…`, `--decorate`, `--graph`, revision ranges, `--` and paths |
-| `git diff`, `git show` | until #60: `--stat`, `--name-only`, `--name-status`, `--staged`, `--cached`, `-U N`, revisions, `<rev>:<path>`, `--` and paths |
+| `git log` | `--oneline`, `-n N`, `--max-count=N`, `--stat`, `--name-only`, `--name-status`, `--format=…`, `--pretty=…`, `--decorate`, `--graph`, revision ranges, `--` and paths; not `-p`, `--patch` or `-u` (requirement 5) |
+| `git diff`, `git show` | none — not admitted (requirement 5, after #60): `read_git_diff` replaces them |
 | `git` (global) | `--no-pager` only |
 
 `ls -R` is admitted only with a path argument that is not the repository root,
@@ -239,7 +243,10 @@ Tightening (requirements 1–4, 8):
 - `ls $HOME/.ssh`, `git diff --no-index $HOME/x README.md`, `ls ~`, `ls *`
   need approval.
 - `git show HEAD:.env`, `git diff -- .env` and `ls secrets/` (with `secrets/`
-  restricted) need approval, with the `RestrictedPath` cause.
+  restricted) need approval, with the `RestrictedPath` cause. Requirement 5
+  later removed `git diff`/`git show` from the read-only list, so the first
+  two now ask for the `read_git_diff` reason instead; `ls secrets/` and
+  `git log -- secrets/token` still carry the `RestrictedPath` cause.
 - `git -c core.pager=x log`, `git -C /tmp status` and `git --git-dir=x log` need
   approval.
 - `git status --short`, `git log --oneline -n 5`, `ls crates` and `pwd` still
@@ -293,13 +300,11 @@ locally: fmt, node, lint, typos, deny, and `cargo clippy -p workspace-engine`.
   and therefore Plan, Review and `command_access=read_only` follow it
   (requirement 8) with no change to `mode.rs`.
 - **Options** follow §5.2's table, with these readings: short flags may be
-  combined (`ls -la`, `git status -sb`); `git log` also takes `-n5` and `-5`;
-  `git diff`/`git show` take `-U3` and `--unified=3` as spellings of `-U N`.
-  `git log -p`/`--patch` stay admitted until #60, because requirement 5 and
-  §5.4 say the content-bearing forms ask only once `read_git_log` exists,
-  although the table omits them. `git status` takes no paths, as the table
-  says. Anything else, including harmless options such as `git log --since`,
-  needs approval.
+  combined (`ls -la`, `git status -sb`); `git log` also takes `-n5` and `-5`.
+  `git status` takes no paths, as the table says. Anything else, including
+  harmless options such as `git log --since`, needs approval. Before #60,
+  `git diff`/`git show` took `-U3`/`--unified=3` and `git log` took
+  `-p`/`--patch`; requirement 5 removed all of those (see below).
 - **Paths.** Every git positional word is path-checked, since git decides
   between revision and path only when it runs. The path half of
   `<rev>:<path>` resolves from the repository root unless it starts with
@@ -320,9 +325,9 @@ locally: fmt, node, lint, typos, deny, and `cargo clippy -p workspace-engine`.
   `references_path_outside_root` still runs for every command that is not
   admitted read-only (allowlisted ones included, a non-goal here).
 - **Not covered.** `ls -R crates` lists a restricted directory nested below
-  `crates`, and `git diff -- crates` diffs one; the path check sees only the
-  path named. Requirement 5 closes the git half; the `ls` half is §5.2's
-  accepted behaviour for names.
+  `crates`, and `git diff -- crates` used to diff one; the path check sees
+  only the path named. Requirement 5 closed the git half (it now asks); the
+  `ls` half is §5.2's accepted behaviour for names.
 - **Tests.** `command_policy::tests::read_only_boundary` covers every
   "Tightening" criterion against a real temporary repository, plus symlink
   escape, `<rev>:<path>` resolution, `ls -R`, a restricted working directory
@@ -397,3 +402,49 @@ its advisory lock in the sandbox. The workspace gate is left to CI.
   `require_approval_for_all_commands`, and the tokenizer's operator split.
   The tokenizer test was updated for the rename (comment names requirement
   6); no other existing test changed.
+
+### Requirement 5 (2026-10-18)
+
+All in `command_policy.rs` and `chat.rs`; no new dependency.
+
+Now that #60's `read_git_diff` and `read_git_log` are merged, `git diff` and
+`git show` no longer run without approval in the shell: `git_verdict` refuses
+them before parsing their options, with a reason naming `read_git_diff` (the
+tool that bounds the output and excludes restricted paths), and `git log
+-p`/`--patch`/`-u` is refused the same way, naming `read_git_log`. `git
+status`, `git log` without patch output, `ls` and `pwd` stay admitted. The
+`-U`/`--unified`/`--staged`/`--cached` handling that only served
+`diff`/`show` is gone with them, so `git_verdict`'s option match now reaches
+only `status` and `log` and marks the diff/show arm unreachable. `git diff`,
+`git show` and `git log -p` still name a read-only program
+(`READ_ONLY_GIT_SUBCOMMANDS` is unchanged), so they refuse with the tool
+reason rather than falling through to `NotReadOnly`.
+
+`chat.rs` changes only the `run_command` tool description and the two
+command-envelope paragraphs: they now prefer `read_git_diff` and
+`read_git_log` for git diffs and commit content and state that `git diff`,
+`git show` and `git log -p` need approval in the shell. The spec 63 shell
+naming and zsh glob-quoting text is unchanged.
+
+- **Reasons.** Like the earlier requirements, without #62's structured causes
+  the reason is a string: `` `git diff` prints file contents, so it needs
+  approval; use the `read_git_diff` tool, which bounds its output and excludes
+  restricted paths `` (and the analogous `read_git_log` form for `git log
+  -p`/`--patch`/`-u`).
+- **Tests.** `command_policy::tests::read_only_boundary` gained
+  `git_diff_show_and_log_patch_ask_and_name_the_replacement_tool`, covering
+  every "After #60" criterion (`git diff`, `git show HEAD`, `git log -p`,
+  plus `--patch` and `-u`, each High with the tool named). The
+  `-U`/`--unified` handling and the `git diff`/`git show` entries left the
+  "everyday", "restricted paths", "outside repository" and `<rev>:<path>`
+  tests, which now use `git log` for the path checks that remain;
+  `git status -sb && git diff --stat | tail -n 1` became `git log --stat`.
+  `mode::tests::plan_and_review_refuse_commands_the_read_only_boundary_refuses`
+  adds `git diff`, `git show HEAD` and `git log -p` (requirement 8 follows
+  requirement 5 automatically). `tests/permission_profiles.rs`'s
+  `ACCESS_TABLE` row for `git diff` changes to blocked-under-read_only,
+  `tests/agent_tools.rs`'s boundary test drops `git diff`/`git show` from the
+  approval-free list, and `tests/foundation.rs` pins `git log --stat` (not
+  `git show --stat`) as Low. `chat.rs`'s byte-identical prompt constants were
+  re-pinned to the new paragraph, and a new test asserts the description and
+  paragraphs name both tools. Each changed test names requirement 5.

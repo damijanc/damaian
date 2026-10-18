@@ -1045,6 +1045,16 @@ fn is_count(word: &str) -> bool {
 /// The subcommand's options per §5.2, then revisions, `<rev>:<path>`, `--`
 /// and paths where the subcommand takes them.
 fn git_verdict(subcommand: &str, arguments: &[&str]) -> ReadOnlyVerdict {
+    // Spec 64 requirement 5: now that #60's `read_git_diff` exists, `git diff`
+    // and `git show` no longer run without approval in the shell. They print
+    // file contents, which a command line cannot bound or exclude restricted
+    // paths from; the tool does both.
+    if matches!(subcommand, "diff" | "show") {
+        return ReadOnlyVerdict::Refused(format!(
+            "`git {subcommand}` prints file contents, so it needs approval; use the \
+             `read_git_diff` tool, which bounds its output and excludes restricted paths"
+        ));
+    }
     let program = format!("git {subcommand}");
     let mut paths = Vec::new();
     let mut index = 0;
@@ -1079,8 +1089,16 @@ fn git_verdict(subcommand: &str, arguments: &[&str]) -> ReadOnlyVerdict {
                 })
             }
             "log" => {
-                // `-p`/`--patch` stay until #60 gives the model a bounded
-                // alternative (requirement 5, §5.4).
+                // Spec 64 requirement 5: `-p`/`--patch`/`-u` print file
+                // contents; the `read_git_log` tool is the bounded, restricted
+                // alternative, so these ask.
+                if matches!(argument, "-p" | "--patch" | "-u") {
+                    return ReadOnlyVerdict::Refused(format!(
+                        "`git log {argument}` prints file contents, so it needs approval; use \
+                         the `read_git_log` tool, which bounds its output and excludes restricted \
+                         paths"
+                    ));
+                }
                 if argument == "-n" {
                     let value = arguments.get(index).copied().unwrap_or_default();
                     index += 1;
@@ -1095,8 +1113,6 @@ fn git_verdict(subcommand: &str, arguments: &[&str]) -> ReadOnlyVerdict {
                             | "--decorate"
                             | "--graph"
                             | "--pretty"
-                            | "-p"
-                            | "--patch"
                     ) || argument.starts_with("--format=")
                         || argument.starts_with("--pretty=")
                         || argument.strip_prefix("--max-count=").is_some_and(is_count)
@@ -1104,19 +1120,11 @@ fn git_verdict(subcommand: &str, arguments: &[&str]) -> ReadOnlyVerdict {
                         || argument.strip_prefix('-').is_some_and(is_count)
                 }
             }
-            _ => {
-                if argument == "-U" {
-                    let value = arguments.get(index).copied().unwrap_or_default();
-                    index += 1;
-                    is_count(value)
-                } else {
-                    matches!(
-                        argument,
-                        "--stat" | "--name-only" | "--name-status" | "--staged" | "--cached"
-                    ) || argument.strip_prefix("-U").is_some_and(is_count)
-                        || argument.strip_prefix("--unified=").is_some_and(is_count)
-                }
-            }
+            // `git diff` and `git show` were refused above (requirement 5),
+            // before their options were ever parsed. Anything else that
+            // reaches here is refused rather than panicking: a classifier
+            // that crashes on an unexpected command must fail closed.
+            _ => false,
         };
         if !admitted {
             return refuse_argument(&program, argument);
@@ -1581,13 +1589,13 @@ mod tests {
         #[test]
         fn restricted_paths_need_approval_with_the_restricted_path_reason() {
             let repo = Repository::new("restricted");
+            // Requirement 5 removed `git diff`/`git show` from the read-only
+            // list, so their restricted-path checks moved to the tools; `git
+            // log -- <path>` still exercises the path half here.
             for (command, restricted) in [
-                ("git show HEAD:.env", ".env"),
-                ("git diff -- .env", ".env"),
                 ("ls secrets/", "secrets"),
                 ("ls secrets", "secrets"),
                 ("git log -- secrets/token", "secrets/token"),
-                ("git show HEAD:crates/.env", "crates/.env"),
             ] {
                 let classification = repo.classify(command);
                 assert_needs_approval(&classification);
@@ -1622,9 +1630,41 @@ mod tests {
             }
         }
 
+        /// Spec 64 §6, "After #60" (requirement 5): `git diff`, `git show`
+        /// and `git log -p`/`--patch`/`-u` ask, and the reason names the
+        /// replacement tool.
+        #[test]
+        fn git_diff_show_and_log_patch_ask_and_name_the_replacement_tool() {
+            let repo = Repository::new("after-60");
+            for (command, tool) in [
+                ("git diff", "read_git_diff"),
+                ("git show HEAD", "read_git_diff"),
+                ("git show --stat", "read_git_diff"),
+                ("git diff --cached -- README.md", "read_git_diff"),
+                ("git log -p", "read_git_log"),
+                ("git log --patch -n 3", "read_git_log"),
+                ("git log -u", "read_git_log"),
+            ] {
+                let classification = repo.classify(command);
+                assert_needs_approval(&classification);
+                assert_eq!(classification.risk, CommandRisk::High, "{command}");
+                assert!(
+                    classification
+                        .reasons
+                        .iter()
+                        .any(|reason| reason.contains(tool)),
+                    "{command} must name {tool}: {:?}",
+                    classification.reasons
+                );
+            }
+        }
+
         #[test]
         fn the_everyday_read_only_commands_still_run_unasked() {
             let repo = Repository::new("everyday");
+            // Requirement 5: `git diff` and `git show` ask now and moved to
+            // the tools (see `git_diff_show_and_log_patch_ask`), so they no
+            // longer belong in the still-unasked list.
             for command in [
                 "git status --short",
                 "git status -sb",
@@ -1632,12 +1672,6 @@ mod tests {
                 "git log --oneline -5",
                 "git --no-pager log --stat main..HEAD",
                 "git log --format='%h %s' -- crates",
-                "git diff",
-                "git diff --stat HEAD~1",
-                "git diff --cached -U 3 -- README.md",
-                "git show --stat",
-                "git show HEAD:README.md",
-                "git show HEAD^:crates/engine",
                 "ls crates",
                 "ls -la crates/engine",
                 "ls -R crates",
@@ -1657,13 +1691,11 @@ mod tests {
         #[test]
         fn paths_outside_the_repository_need_approval() {
             let repo = Repository::new("outside");
-            for command in [
-                "ls /etc",
-                "ls ../",
-                "git diff -- ../other",
-                "git show HEAD:../x",
-                "git log /etc/passwd",
-            ] {
+            // Requirement 5: `git diff`/`git show` now refuse for the reason
+            // that names `read_git_diff`, before their paths are inspected, so
+            // their outside-path checks moved to the tools; `git log` still
+            // exercises the path half here.
+            for command in ["ls /etc", "ls ../", "git log /etc/passwd"] {
                 let classification = repo.classify(command);
                 assert_needs_approval(&classification);
                 assert!(
@@ -1678,14 +1710,16 @@ mod tests {
         }
 
         /// `<rev>:<path>` is relative to the top level; `./` makes it
-        /// relative to the working directory, as git resolves it.
+        /// relative to the working directory, as git resolves it. `git log`
+        /// carries the `<rev>:<path>` half now that requirement 5 removed
+        /// `git show` from the read-only list.
         #[test]
         fn a_revision_path_resolves_where_git_resolves_it() {
             let repo = Repository::new("rev-path");
             assert!(runs_unasked(
-                &repo.classify_in("git show HEAD:README.md", "crates")
+                &repo.classify_in("git log HEAD:README.md", "crates")
             ));
-            assert_needs_approval(&repo.classify_in("git show HEAD:../../.env", "crates"));
+            assert_needs_approval(&repo.classify_in("git log HEAD:../../.env", "crates"));
             assert_needs_approval(&repo.classify_in("ls ../secrets", "crates"));
         }
 
@@ -1798,7 +1832,9 @@ mod tests {
                 "git log --oneline | grep -F -c '[x]'",
                 "ls crates | wc -lw",
                 "ls&&pwd|wc -c",
-                "git status -sb && git diff --stat | tail -n 1",
+                // Requirement 5 removed `git diff` from the read-only list;
+                // `git log --stat` carries this pipeline segment now.
+                "git status -sb && git log --stat | tail -n 1",
                 // Quoted `|` is a word, not an operator.
                 "git log --format='%h|%s' -n 3",
             ] {
@@ -1899,9 +1935,10 @@ mod tests {
         fn paths_after_a_cd_resolve_in_the_cd_directory() {
             let repo = Repository::new("pipeline-cd-paths");
             assert!(runs_unasked(&repo.classify("cd crates && ls engine")));
-            // The path half of `<rev>:<path>` is still from the top level.
+            // The path half of `<rev>:<path>` is still from the top level;
+            // requirement 5 moved the example from `git show` to `git log`.
             assert!(runs_unasked(
-                &repo.classify("cd crates && git show HEAD:README.md | head -n 5")
+                &repo.classify("cd crates && git log HEAD:README.md | head -n 5")
             ));
             let restricted = repo.classify("cd crates && ls ../secrets");
             assert_needs_approval(&restricted);

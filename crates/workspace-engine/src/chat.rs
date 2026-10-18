@@ -4317,7 +4317,7 @@ fn shell_guidance(shell: &str) -> String {
 /// only mode that should teach it.
 fn command_envelope_paragraph_unrestricted(shell: &str) -> String {
     format!(
-        "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. {} When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.",
+        "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. The app will run sandbox-safe commands automatically. {} When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.",
         shell_guidance(shell),
     )
 }
@@ -4328,7 +4328,7 @@ fn command_envelope_paragraph_unrestricted(shell: &str) -> String {
 /// actually happen: it is refused, not queued for approval.
 fn command_envelope_paragraph_read_only(shell: &str) -> String {
     format!(
-        "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. {} In this mode only read-only commands that need no approval are available; a command with side effects, network access, Docker access, shell control, or unknown risk is refused outright, not queued for approval. Do not request one.",
+        "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. The app will run sandbox-safe commands automatically. {} In this mode only read-only commands that need no approval are available; a command with side effects, network access, Docker access, shell control, or unknown risk is refused outright, not queued for approval. Do not request one.",
         shell_guidance(shell),
     )
 }
@@ -4858,7 +4858,7 @@ fn run_command_tool_definition(shell: &str) -> ToolDefinition {
     ToolDefinition {
         name: "run_command".to_string(),
         description: format!(
-            "Request a local shell command in the selected repository. {} Damaian runs sandbox-safe read-only commands automatically and pauses for user approval before running commands with side effects, network access, Docker access, shell control, or unknown risk.",
+            "Request a local shell command in the selected repository. {} Damaian runs sandbox-safe read-only commands automatically and pauses for user approval before running commands with side effects, network access, Docker access, shell control, or unknown risk. For git diffs and commit content, use the read_git_diff and read_git_log tools instead; git diff, git show and git log -p need approval in the shell.",
             shell_guidance(shell),
         ),
         parameters_json: "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The shell command to run\"},\"reason\":{\"type\":\"string\",\"description\":\"Why this command is needed\"},\"working_directory\":{\"type\":\"string\",\"description\":\"Repository-relative directory to run in; defaults to the repository root\"}},\"required\":[\"command\"]}".to_string(),
@@ -6588,7 +6588,7 @@ mod system_prompt_tests {
     /// `code_mode_system_prompt_is_byte_identical_to_todays` pins the Code
     /// output against it; spec 49 Task 8's prefix-stability guards depend on
     /// this staying true.
-    const TODAYS_CODE_SYSTEM_PROMPT: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.\n\nIf the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.";
+    const TODAYS_CODE_SYSTEM_PROMPT: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.\n\nIf the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. The app will run sandbox-safe commands automatically. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.";
 
     #[test]
     fn code_mode_system_prompt_is_byte_identical_to_todays() {
@@ -6747,6 +6747,26 @@ mod shell_naming_tests {
             !description.contains("/opt/homebrew/bin/bash"),
             "full path leaked: {description}"
         );
+    }
+
+    /// Spec 64 requirement 5: the model is pointed at `read_git_diff` and
+    /// `read_git_log` for diff and commit content, and the shell forms that
+    /// now ask (`git diff`, `git show`, `git log -p`) leave the "prefer
+    /// read-only commands" list.
+    #[test]
+    fn the_command_description_and_envelope_paragraphs_point_to_the_git_read_tools() {
+        for text in [
+            run_command_tool_definition("/bin/zsh").description,
+            command_envelope_paragraph_unrestricted("/bin/zsh"),
+            command_envelope_paragraph_read_only("/bin/zsh"),
+        ] {
+            assert!(text.contains("read_git_diff"), "{text}");
+            assert!(text.contains("read_git_log"), "{text}");
+            assert!(
+                !text.contains("git show, git diff"),
+                "the read-only list must not still advertise git show/diff: {text}"
+            );
+        }
     }
 }
 
@@ -6933,8 +6953,8 @@ mod clarification_tests {
     // guidance, and spec 49's cache prefix depends on `messages[0]` staying
     // put.
     const PREFIX_BEFORE_SPEC_50: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.";
-    const CODE_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.";
-    const READ_ONLY_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. In this mode only read-only commands that need no approval are available; a command with side effects, network access, Docker access, shell control, or unknown risk is refused outright, not queued for approval. Do not request one.";
+    const CODE_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. The app will run sandbox-safe commands automatically. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.";
+    const READ_ONLY_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, ls, and pwd when they are sufficient, and the read_git_diff and read_git_log tools for git diffs and commit content; git diff, git show and git log -p need approval in the shell. The app will run sandbox-safe commands automatically. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. In this mode only read-only commands that need no approval are available; a command with side effects, network access, Docker access, shell control, or unknown risk is refused outright, not queued for approval. Do not request one.";
 
     fn prompt_before_spec_50(mode: SessionMode) -> String {
         match mode {

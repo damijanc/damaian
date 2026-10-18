@@ -736,13 +736,18 @@ fn navigation_needs_no_command_allowlist_entry() {
 fn the_low_risk_read_only_set_is_unchanged_by_this_spec() {
     let repo = temp_dir("tools-boundary");
     let policy = CommandPolicy::new(test_config(&repo));
-    for command in ["pwd", "ls", "git status", "git diff", "git log", "git show"] {
+    // Requirement 5 of spec 64 removed `git diff` and `git show` from the
+    // read-only set; `git log` without patch output stays.
+    for command in ["pwd", "ls", "git status", "git log"] {
         assert!(
             !policy.classify(command, &repo).requires_approval,
             "{command} must stay approval-free"
         );
     }
     for command in [
+        "git diff",
+        "git show",
+        "git log -p",
         "grep -r foo .",
         "find . -name x",
         "cat src/lib.rs",
@@ -750,8 +755,7 @@ fn the_low_risk_read_only_set_is_unchanged_by_this_spec() {
     ] {
         assert!(
             policy.classify(command, &repo).requires_approval,
-            "{command} must still need approval: this spec gives navigation as a \
-             tool, not at the shell"
+            "{command} must still need approval"
         );
     }
 }
