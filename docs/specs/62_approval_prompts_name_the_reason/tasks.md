@@ -3,13 +3,13 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md)
-**Status:** Not started; planned 2026-10-18.
+**Status:** In progress. Task 1 done 2026-10-18; tasks 2–7 remain.
 
 ## Progress
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · `ApprovalCause` and structured causes | Not started | |
+| 1 · `ApprovalCause` and structured causes | Done 2026-10-18 | **Landed:** `ApprovalCause` (all 11 §5.1 variants), `CommandClassification.causes`, `reasons` rendered from `causes` via `plain_words()` (one source, no drift), the `Network`/`HighRisk`/`Unknown` split (C2), the `Blocklisted`/`Destructive` split, and `ShellControl`/`Docker`/`RestrictedPath`/`OutsideRepository` causes for each escalation. Helpers: `network_keyword`, `high_risk_keyword`, `destructive_pattern`, `configured_prefix_match` (returns the matched rule), `shell_control_constructs`, `first_word`, and `escaping_path_outside_root` (returns the escaping token so the cause can name it). `read_only_classification` no longer sets a `READ_ONLY_REASON` marker; `classify_text` returns an `admitted_read_only` bool instead, so `classify_pattern` no longer sniffs a reason string. **Tests:** 12 new in `tests/permission_profiles.rs` (one per cause + `reasons_are_derived_from_causes` + the regression guard over a 18-command table). `cargo nextest run -p workspace-engine --locked`: 1314 passed, 24 skipped. Scoped `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `scripts/quality-gate.sh fmt node lint typos deny` clean. **Falsified:** `reasons` written directly (empty) → `reasons_are_derived_from_causes` fails; `network_keyword` returning `None` → `a_curl_command_names_the_network_keyword` fails (curl falls to `Unknown`); shell-control branch pushing no cause → `a_shell_control_command_names_its_constructs` fails. All reverted. **Deviations:** (1) The shell-control branch's secondary read-only refusal is dropped — `ShellControl` is the deciding cause — so spec 64's two-reason shell-control output collapses to one cause. (2) `cd <dir>`-not-a-directory maps to `Unknown { program: "cd" }` and `ls -R` of the root maps to `RestrictedPath { path }`, because the closed enum has no dedicated variant for either; neither is in Task 1's test list. (3) The spec-64 refusal that named `read_git_diff`/`read_git_log` now maps to `Unknown { program: "git" }` per C1, so that tool pointer survives only in the model-facing description (Task 3); `git_diff_show_and_log_patch_ask_and_name_the_replacement_tool` was repurposed to assert the `Unknown` mapping. (4) Necessary ripple beyond the two named files: `causes: Vec::new()` added to `CommandClassification` literals in `mode.rs` (3) and `chat.rs` (1); `ApprovalCause` re-exported in `lib.rs`; classifier reason-string assertions in `foundation.rs` and `repository_map.rs` moved from `reasons` to `causes`. **Discoveries for later tasks:** Task 2 wires `Setting`/`ProfileBlocked` (declared, unconstructed) and must convert the `command_access` block, which still pushes its literal `Blocked by permission profile: command_access=…` string, and the `require_approval_for_*` settings, which currently leave allowlisted/admitted/validation commands with empty `causes`; `reasons_are_derived_from_causes` is scoped to the default `command_access=all` config so it does not trip on that block today. |
 | 2 · Setting and profile-block causes | Not started | |
 | 3 · Prompt and model-facing wording | Not started | |
 | 4 · The card names the cause and the model's reason | Not started | |
@@ -144,8 +144,9 @@ Tasks 3 and 4 both edit `chat.rs`. No task may run beside #59, #60 or #63
 **Requirements:** 1, 2 (the value, not the sentence). **Proposal:** §5.1.
 **Corrections:** C1, C2. **Files:** `command_policy.rs`,
 `tests/permission_profiles.rs`.
+**Started:** 2026-10-18 — **Done:** 2026-10-18.
 
-- [ ] **Step 1: Write the failing tests.** For each branch of `classify_text` and
+- [x] **Step 1: Write the failing tests.** For each branch of `classify_text` and
       each escalation in `classify_at`, assert `causes` carries the right variant
       in the right order, and that `reasons` equals the rendered plain words:
   - `a_shell_control_command_names_its_constructs` (`cd x && git diff | head` →
@@ -167,20 +168,20 @@ Tasks 3 and 4 both edit `chat.rs`. No task may run beside #59, #60 or #63
   And the regression guard: for every command in the existing policy tests,
   `risk`, `requires_approval` and `blocked` are unchanged (assert this over the
   same command table, not by editing the existing assertions).
-- [ ] **Step 2: Run them and confirm they fail** (no `causes` field exists yet).
-- [ ] **Step 3: The enum, the field, and the renderer.** Add `ApprovalCause` and
+- [x] **Step 2: Run them and confirm they fail** (no `causes` field exists yet).
+- [x] **Step 3: The enum, the field, and the renderer.** Add `ApprovalCause` and
       `CommandClassification.causes`; move each branch's reason into a cause and
       render `reasons` from `causes`. Keep `is_low_risk_read_only`'s verdicts
       intact.
-- [ ] **Step 4: The `Network`/`HighRisk` split (C2).** A `Network` branch before
+- [x] **Step 4: The `Network`/`HighRisk` split (C2).** A `Network` branch before
       the high-risk branch, naming the keyword; `HighRisk` names the keyword that
       fired; `Unknown` names the program (first word).
-- [ ] **Step 5: Falsify.** Revert each mapping in turn (a branch that pushes no
+- [x] **Step 5: Falsify.** Revert each mapping in turn (a branch that pushes no
       cause, a keyword left unnamed, `reasons` written directly) and confirm a
       named test fails for each, then revert.
-- [ ] **Step 6: Update the proposal** for C1 and C2 (already folded in; check
+- [x] **Step 6: Update the proposal** for C1 and C2 (already folded in; check
       §2 and §5.1 agree).
-- [ ] **Step 7: Scoped checks.** `cargo nextest run -p workspace-engine --test
+- [x] **Step 7: Scoped checks.** `cargo nextest run -p workspace-engine --test
       permission_profiles`, the `command_policy` unit tests, scoped clippy for
       `workspace-engine`, and the fast checks.
 

@@ -1,7 +1,7 @@
 # Feature Spec: Approval Prompts Name the Reason
 
-Status: Not started. Split into a folder and planned 2026-10-18. Specified on
-2026-10-17 from the session behind
+Status: In progress. Task 1 (`ApprovalCause` and structured causes) landed
+2026-10-18. Specified on 2026-10-17 from the session behind
 [#59](../59_exploration_round_allowance/proposal.md)–[#61](../61_continue_the_stopped_turn.md),
 in which the user answered 40 approval prompts that all gave the same reason,
 "because it cannot run in sandbox mode", and none gave the real one.

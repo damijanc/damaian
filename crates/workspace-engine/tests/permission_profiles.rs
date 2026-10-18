@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AppliedKey, AuditLog, CancelToken, ChatTurnResult, ClientError, CommandAccess,
+    AppliedKey, ApprovalCause, AuditLog, CancelToken, ChatTurnResult, ClientError, CommandAccess,
     CommandClassification, CommandPolicy, CommandRisk, Config, ConfigKeyKind, ConfigOverlay,
     ConfigScope, EffectivePolicy, MockModelAdapter, ModelProviderConfig, ProfileCapabilities,
     ProfileId, RefusedBy, RefusedRequest, RepositoryConfigReport, RepositoryKeyClass,
@@ -2969,4 +2969,226 @@ fn the_custom_profile_listing_names_only_valid_custom_files() {
     );
 
     fixture.cleanup();
+}
+
+// Spec 62 Task 1: `ApprovalCause` and structured causes. Each classifier branch
+// and escalation names its cause, and `reasons` is rendered from `causes`
+// (one source, so the string and the value cannot drift).
+
+fn classify(command: &str) -> CommandClassification {
+    CommandPolicy::new(Config::default()).classify(command, Path::new("/Users/example/project"))
+}
+
+fn plain_words_of(causes: &[ApprovalCause]) -> Vec<String> {
+    causes.iter().map(ApprovalCause::plain_words).collect()
+}
+
+#[test]
+fn a_shell_control_command_names_its_constructs() {
+    let classification = classify("cd x && git diff | head");
+    assert_eq!(classification.risk, CommandRisk::High);
+    match classification.causes.first() {
+        Some(ApprovalCause::ShellControl { constructs }) => {
+            assert!(constructs.contains("&&"), "{constructs}");
+            assert!(constructs.contains('|'), "{constructs}");
+        }
+        other => panic!("first cause should be shell control, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_curl_command_names_the_network_keyword() {
+    let classification = classify("curl https://example.com");
+    assert_eq!(
+        classification.causes,
+        vec![ApprovalCause::Network {
+            keyword: "curl".to_string()
+        }]
+    );
+}
+
+#[test]
+fn a_high_risk_command_names_its_keyword() {
+    for (command, keyword) in [("chmod +x f", "chmod"), ("git commit -m x", "git commit")] {
+        let classification = classify(command);
+        assert_eq!(
+            classification.causes,
+            vec![ApprovalCause::HighRisk {
+                keyword: keyword.to_string()
+            }],
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_command_names_its_program() {
+    let classification = classify("python3 script.py");
+    assert_eq!(
+        classification.causes,
+        vec![ApprovalCause::Unknown {
+            program: "python3".to_string()
+        }]
+    );
+}
+
+#[test]
+fn a_docker_command_is_a_docker_cause() {
+    let classification = classify("docker ps");
+    assert_eq!(classification.causes, vec![ApprovalCause::Docker]);
+}
+
+#[test]
+fn a_blocklisted_command_is_blocked_with_its_rule() {
+    let config = Config {
+        command_blocklist: vec!["git push".to_string()],
+        ..Config::default()
+    };
+    let classification = CommandPolicy::new(config)
+        .classify("git push origin main", Path::new("/Users/example/project"));
+    assert!(classification.blocked);
+    assert_eq!(
+        classification.causes,
+        vec![ApprovalCause::Blocklisted {
+            rule: "git push".to_string()
+        }]
+    );
+}
+
+#[test]
+fn a_destructive_command_is_blocked_with_its_pattern() {
+    for (command, pattern) in [
+        ("rm -rf /", "rm -rf"),
+        ("git reset --hard", "git reset --hard"),
+    ] {
+        let classification = classify(command);
+        assert!(classification.blocked);
+        assert_eq!(
+            classification.causes,
+            vec![ApprovalCause::Destructive {
+                pattern: pattern.to_string()
+            }],
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn a_restricted_path_escalation_is_a_restricted_path_cause() {
+    let root = temp_dir("restricted-cause");
+    fs::create_dir_all(root.join("secrets")).unwrap();
+    fs::write(root.join("secrets/token"), "x").unwrap();
+    let classification = CommandPolicy::new(Config::default()).classify("ls secrets", &root);
+    assert!(classification.requires_approval);
+    assert!(
+        classification
+            .causes
+            .contains(&ApprovalCause::RestrictedPath {
+                path: "secrets".to_string()
+            }),
+        "{:?}",
+        classification.causes
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_path_outside_the_repository_is_an_outside_repository_cause() {
+    let classification = classify("ls /etc");
+    assert!(classification.requires_approval);
+    assert!(
+        classification
+            .causes
+            .contains(&ApprovalCause::OutsideRepository {
+                path: "/etc".to_string()
+            }),
+        "{:?}",
+        classification.causes
+    );
+}
+
+#[test]
+fn the_read_only_refusal_reasons_are_rendered_from_causes() {
+    for command in ["git diff", "ls $HOME/.ssh", "git log -p"] {
+        let classification = classify(command);
+        assert_eq!(classification.risk, CommandRisk::High, "{command}");
+        assert!(classification.requires_approval, "{command}");
+        // Spec 64's `Refused` forms map to `Unknown`, naming the program.
+        let program = command.split_whitespace().next().unwrap();
+        assert!(
+            classification.causes.iter().any(
+                |cause| matches!(cause, ApprovalCause::Unknown { program: p } if p == program)
+            ),
+            "{command}: {:?}",
+            classification.causes
+        );
+        // And `reasons` is rendered from `causes`, never a raw refusal string.
+        assert_eq!(
+            classification.reasons,
+            plain_words_of(&classification.causes),
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn reasons_are_derived_from_causes() {
+    for command in [
+        "git status",
+        "ls",
+        "git diff",
+        "npm test",
+        "docker ps",
+        "curl example.com",
+        "chmod +x f",
+        "python3 script.py",
+        "rm -rf /",
+        "ls /etc",
+        "cd x && git diff | head",
+        "ls $HOME",
+        "git log -p",
+        "sh -c whoami",
+        "git fetch",
+        "git clone x",
+    ] {
+        let classification = classify(command);
+        assert_eq!(
+            classification.reasons,
+            plain_words_of(&classification.causes),
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn classification_results_are_unchanged_for_existing_policy_tests() {
+    let cases: &[(&str, CommandRisk, bool, bool)] = &[
+        ("git status", CommandRisk::Low, false, false),
+        ("ls", CommandRisk::Low, false, false),
+        ("git log --stat", CommandRisk::Low, false, false),
+        ("git diff", CommandRisk::High, true, false),
+        ("ls | head", CommandRisk::High, true, false),
+        ("npm test", CommandRisk::Medium, true, false),
+        ("cargo test", CommandRisk::Medium, true, false),
+        ("docker ps", CommandRisk::High, true, false),
+        ("curl example.com", CommandRisk::High, true, false),
+        ("chmod +x f", CommandRisk::High, true, false),
+        ("python3 script.py", CommandRisk::High, true, false),
+        ("npm ci", CommandRisk::High, true, false),
+        ("rm -rf /", CommandRisk::Blocked, true, true),
+        ("git reset --hard", CommandRisk::Blocked, true, true),
+        ("ls ../outside", CommandRisk::Medium, true, false),
+        ("ls /etc", CommandRisk::Medium, true, false),
+        ("ls -R", CommandRisk::High, true, false),
+        ("cd x && git diff | head", CommandRisk::High, true, false),
+    ];
+    for (command, risk, requires_approval, blocked) in cases {
+        let classification = classify(command);
+        assert_eq!(&classification.risk, risk, "{command}");
+        assert_eq!(
+            classification.requires_approval, *requires_approval,
+            "{command}"
+        );
+        assert_eq!(classification.blocked, *blocked, "{command}");
+    }
 }

@@ -26,18 +26,102 @@ impl CommandRisk {
     }
 }
 
+/// Why a command needs approval or is blocked, as a value rather than only a
+/// display string (spec 62 §5.1). The set is closed: a new variant is a design
+/// decision. `Setting` and `ProfileBlocked` are wired by Task 2; Task 1 lands
+/// the classifier-branch and path-escalation causes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalCause {
+    Blocklisted { rule: String },
+    Destructive { pattern: String },
+    ShellControl { constructs: String },
+    Docker,
+    HighRisk { keyword: String },
+    Network { keyword: String },
+    Unknown { program: String },
+    RestrictedPath { path: String },
+    OutsideRepository { path: String },
+    Setting { key: String, source: String },
+    ProfileBlocked { access: CommandAccess },
+}
+
+impl ApprovalCause {
+    /// The first line of an approval prompt, in plain words (spec 62 §5.1).
+    pub fn plain_words(&self) -> String {
+        match self {
+            Self::Blocklisted { rule } => {
+                format!("Blocked: matches *Commands that are always blocked* (`{rule}`)")
+            }
+            Self::Destructive { pattern } => format!("Blocked: `{pattern}` can destroy work"),
+            Self::ShellControl { constructs } => format!(
+                "Asks first: uses {constructs} — Damaian never runs shell control without asking"
+            ),
+            Self::Docker => "Asks first: Docker commands always ask".to_string(),
+            Self::HighRisk { keyword } => {
+                format!("Asks first: `{keyword}` changes your system or repository")
+            }
+            Self::Network { keyword } => format!("Asks first: may use the network (`{keyword}`)"),
+            Self::Unknown { program } => {
+                format!("Asks first: Damaian does not know what `{program}` does")
+            }
+            Self::RestrictedPath { path } => {
+                format!("Asks first: reads `{path}`, which the policy restricts")
+            }
+            Self::OutsideRepository { path } => {
+                format!("Asks first: refers to `{path}`, outside the repository")
+            }
+            Self::Setting { key, source } => {
+                let label = crate::effective_policy::rule_label(key).unwrap_or_else(|| key.clone());
+                format!("Asks first: *{label}* is on (set by {source})")
+            }
+            Self::ProfileBlocked { access } => format!(
+                "Blocked: the permission profile allows {} commands only",
+                access.as_str()
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandClassification {
     pub command: String,
     pub risk: CommandRisk,
     pub blocked: bool,
     pub requires_approval: bool,
+    /// The rendered plain words of [`Self::causes`]; derived, never set
+    /// directly, so the string and the value cannot drift (spec 62 §5.1).
     pub reasons: Vec<String>,
+    /// Why the command needs approval or is blocked, most decisive first
+    /// (blocking before approval). Empty for a command that runs without a
+    /// reason, such as an allowlisted or admitted read-only command.
+    pub causes: Vec<ApprovalCause>,
     pub expected_effects: String,
     pub may_use_network: bool,
 }
 
 impl CommandClassification {
+    fn new(
+        command: String,
+        risk: CommandRisk,
+        blocked: bool,
+        requires_approval: bool,
+        causes: Vec<ApprovalCause>,
+        expected_effects: String,
+        may_use_network: bool,
+    ) -> Self {
+        let reasons = causes.iter().map(ApprovalCause::plain_words).collect();
+        Self {
+            command,
+            risk,
+            blocked,
+            requires_approval,
+            reasons,
+            causes,
+            expected_effects,
+            may_use_network,
+        }
+    }
+
     /// What Plan and Review mode allow, and what `command_access=read_only`
     /// allows: low risk, no approval, *and* read-only by its text. The third
     /// check stops the allowlist, which also yields low risk with no approval,
@@ -70,13 +154,6 @@ pub const PROJECT_MANIFESTS: [&str; 7] = [
     "go.mod",
     "Cargo.toml",
 ];
-
-const READ_ONLY_REASON: &str = "Read-only command";
-
-/// The prefix of the reason an admitted read-only command needs approval
-/// because it names a restricted path. Spec 62's `ApprovalCause` will carry
-/// this as `RestrictedPath`; until it exists, the reason string does.
-pub const RESTRICTED_PATH_REASON: &str = "Command reads a restricted path";
 
 #[derive(Debug, Clone)]
 pub struct CommandPolicy {
@@ -120,7 +197,9 @@ impl CommandPolicy {
         if !classification.blocked && location.is_none() {
             escalate(
                 &mut classification,
-                "Working directory is outside the selected repository",
+                ApprovalCause::OutsideRepository {
+                    path: working_directory.to_string_lossy().into_owned(),
+                },
             );
         }
         if let Some(admission) = &admission {
@@ -134,7 +213,7 @@ impl CommandPolicy {
             {
                 escalate(
                     &mut classification,
-                    &format!("{RESTRICTED_PATH_REASON}: {restricted}"),
+                    ApprovalCause::RestrictedPath { path: restricted },
                 );
             }
             // Requirement 6: a leading `cd <dir>` is held to the same rules
@@ -149,15 +228,12 @@ impl CommandPolicy {
                 Some(target) => normalize_lexically(&working_directory.join(&target.text)),
                 None => working_directory.to_path_buf(),
             };
-            if let Some(target) = &cd_target
-                && !directory.is_dir()
-            {
+            if cd_target.is_some() && !directory.is_dir() {
                 escalate(
                     &mut classification,
-                    &format!(
-                        "`cd {}` does not name a directory in the repository",
-                        target.text
-                    ),
+                    ApprovalCause::Unknown {
+                        program: "cd".to_string(),
+                    },
                 );
             }
             let checks = cd_target
@@ -177,22 +253,26 @@ impl CommandPolicy {
                         outside_reported = true;
                         escalate(
                             &mut classification,
-                            "Command references a path outside the selected repository",
+                            ApprovalCause::OutsideRepository {
+                                path: path.text.clone(),
+                            },
                         );
                     }
                     Some(PathFinding::OutsideRepository) => {}
                     Some(PathFinding::Restricted(restricted)) => escalate(
                         &mut classification,
-                        &format!("{RESTRICTED_PATH_REASON}: {restricted}"),
+                        ApprovalCause::RestrictedPath { path: restricted },
                     ),
                     Some(PathFinding::RecursiveRoot) => escalate(
                         &mut classification,
-                        "`ls -R` of the repository root would list restricted directories too",
+                        ApprovalCause::RestrictedPath {
+                            path: path.text.clone(),
+                        },
                     ),
                 }
             }
         } else if !classification.blocked
-            && references_path_outside_root(
+            && let Some(path) = escaping_path_outside_root(
                 &classification.command,
                 repository_root,
                 working_directory,
@@ -200,13 +280,14 @@ impl CommandPolicy {
         {
             escalate(
                 &mut classification,
-                "Command references a path outside the selected repository",
+                ApprovalCause::OutsideRepository { path },
             );
         }
         // After the whole classification, so the block never has to invent a
         // risk (spec 31 proposal §4) and sees the outside-root approval, the way
         // Plan mode does. After the allowlist too: Allow Always cannot outrank
-        // a profile.
+        // a profile. Task 2 turns this into a `ProfileBlocked` cause; until
+        // then it keeps its literal reason string.
         if !classification.blocked
             && !command_access_permits(self.config.command_access, &classification)
         {
@@ -231,13 +312,10 @@ impl CommandPolicy {
     ) -> (CommandClassification, Option<Admission>) {
         let normalized = command.trim().to_string();
         let verdict = read_only_verdict(&normalized);
-        let classification = self.classify_text(normalized, command, location, &verdict);
+        let (classification, admitted_read_only) =
+            self.classify_text(normalized, command, location, &verdict);
         let admitted = match verdict {
-            ReadOnlyVerdict::Admitted(admission)
-                if classification.reasons.first().map(String::as_str) == Some(READ_ONLY_REASON) =>
-            {
-                Some(admission)
-            }
+            ReadOnlyVerdict::Admitted(admission) if admitted_read_only => Some(admission),
             _ => None,
         };
         (classification, admitted)
@@ -249,19 +327,38 @@ impl CommandPolicy {
         command: &str,
         location: Option<&str>,
         verdict: &ReadOnlyVerdict,
-    ) -> CommandClassification {
-        if configured_prefix_matches(&self.config.command_blocklist, &normalized)
-            || is_blocked_command(&normalized)
-        {
-            return CommandClassification {
-                command: normalized,
-                risk: CommandRisk::Blocked,
-                blocked: true,
-                requires_approval: true,
-                reasons: vec!["Command matches a blocked destructive pattern".to_string()],
-                expected_effects: "Blocked by local policy".to_string(),
-                may_use_network: may_use_network(command),
-            };
+    ) -> (CommandClassification, bool) {
+        if let Some(rule) = configured_prefix_match(&self.config.command_blocklist, &normalized) {
+            return (
+                CommandClassification::new(
+                    normalized,
+                    CommandRisk::Blocked,
+                    true,
+                    true,
+                    vec![ApprovalCause::Blocklisted {
+                        rule: rule.to_string(),
+                    }],
+                    "Blocked by local policy".to_string(),
+                    may_use_network(command),
+                ),
+                false,
+            );
+        }
+        if let Some(pattern) = destructive_pattern(&normalized) {
+            return (
+                CommandClassification::new(
+                    normalized,
+                    CommandRisk::Blocked,
+                    true,
+                    true,
+                    vec![ApprovalCause::Destructive {
+                        pattern: pattern.to_string(),
+                    }],
+                    "Blocked by local policy".to_string(),
+                    may_use_network(command),
+                ),
+                false,
+            );
         }
 
         if contains_shell_control(&normalized) {
@@ -270,22 +367,21 @@ impl CommandPolicy {
             // inside quotes, passes; every other operator, redirect and
             // substitution is still caught here.
             if matches!(verdict, ReadOnlyVerdict::Admitted(_)) {
-                return self.read_only_classification(normalized);
+                return (self.read_only_classification(normalized), true);
             }
-            let mut reasons =
-                vec!["Command contains shell control syntax and needs explicit review".to_string()];
-            if let ReadOnlyVerdict::Refused(reason) = verdict {
-                reasons.push(reason.clone());
-            }
-            return CommandClassification {
-                command: normalized,
-                risk: CommandRisk::High,
-                blocked: false,
-                requires_approval: true,
-                reasons,
-                expected_effects: "Potential chained or redirected command effects".to_string(),
-                may_use_network: may_use_network(command),
-            };
+            let constructs = shell_control_constructs(&normalized);
+            return (
+                CommandClassification::new(
+                    normalized,
+                    CommandRisk::High,
+                    false,
+                    true,
+                    vec![ApprovalCause::ShellControl { constructs }],
+                    "Potential chained or redirected command effects".to_string(),
+                    may_use_network(command),
+                ),
+                false,
+            );
         }
 
         let allowlisted = match location {
@@ -297,106 +393,142 @@ impl CommandPolicy {
             None => false,
         };
         if allowlisted {
-            return CommandClassification {
-                command: normalized,
-                risk: CommandRisk::Low,
-                blocked: false,
-                requires_approval: self.config.require_approval_for_all_commands,
-                reasons: vec!["Command matches configured allowlist".to_string()],
-                expected_effects: "Configured safe command".to_string(),
-                may_use_network: false,
-            };
+            return (
+                CommandClassification::new(
+                    normalized,
+                    CommandRisk::Low,
+                    false,
+                    self.config.require_approval_for_all_commands,
+                    Vec::new(),
+                    "Configured safe command".to_string(),
+                    false,
+                ),
+                false,
+            );
         }
 
         match verdict {
-            ReadOnlyVerdict::Admitted(_) => return self.read_only_classification(normalized),
+            ReadOnlyVerdict::Admitted(_) => {
+                return (self.read_only_classification(normalized), true);
+            }
             // A read-only program outside its admitted form: an option that
             // writes or redirects (`--output`, `-C`), or text the shell
-            // would rewrite. Its effects are unknown until reviewed.
-            ReadOnlyVerdict::Refused(reason) => {
-                return CommandClassification {
-                    command: normalized,
-                    risk: CommandRisk::High,
-                    blocked: false,
-                    requires_approval: true,
-                    reasons: vec![reason.clone()],
-                    expected_effects: "Unknown effects until reviewed".to_string(),
-                    may_use_network: may_use_network(command),
-                };
+            // would rewrite. Its effects are unknown until reviewed, so it
+            // names the program as unknown (spec 62 Correction C1).
+            ReadOnlyVerdict::Refused(_) => {
+                let program = first_word(&normalized);
+                return (
+                    CommandClassification::new(
+                        normalized,
+                        CommandRisk::High,
+                        false,
+                        true,
+                        vec![ApprovalCause::Unknown { program }],
+                        "Unknown effects until reviewed".to_string(),
+                        may_use_network(command),
+                    ),
+                    false,
+                );
             }
             ReadOnlyVerdict::NotReadOnly => {}
         }
 
         if is_validation_command(&normalized) {
-            return CommandClassification {
-                command: normalized,
-                risk: CommandRisk::Medium,
-                blocked: false,
-                requires_approval: self.config.require_approval_for_all_commands
-                    || self.config.require_approval_for_risky_commands,
-                reasons: vec![
-                    "Validation command may write build, cache, or coverage artifacts".to_string(),
-                ],
-                expected_effects: "Runs project validation and may create local artifacts"
-                    .to_string(),
-                may_use_network: false,
-            };
+            // A validation command asks only when a setting raises it; Task 2
+            // adds the `Setting` cause, so this branch carries no cause yet.
+            return (
+                CommandClassification::new(
+                    normalized,
+                    CommandRisk::Medium,
+                    false,
+                    self.config.require_approval_for_all_commands
+                        || self.config.require_approval_for_risky_commands,
+                    Vec::new(),
+                    "Runs project validation and may create local artifacts".to_string(),
+                    false,
+                ),
+                false,
+            );
         }
 
         if is_docker_command(&normalized) {
-            return CommandClassification {
-                command: normalized,
-                risk: CommandRisk::High,
-                blocked: false,
-                requires_approval: true,
-                reasons: vec![
-                    "Docker command may start containers, mount host paths, mutate images or volumes, expose ports, or use the network".to_string(),
-                ],
-                expected_effects:
+            return (
+                CommandClassification::new(
+                    normalized,
+                    CommandRisk::High,
+                    false,
+                    true,
+                    vec![ApprovalCause::Docker],
                     "Potential Docker daemon, workspace, network, or background-service effects"
                         .to_string(),
-                may_use_network: true,
-            };
+                    true,
+                ),
+                false,
+            );
         }
 
-        if is_high_risk_command(&normalized) {
-            return CommandClassification {
-                command: normalized,
-                risk: CommandRisk::High,
-                blocked: false,
-                requires_approval: true,
-                reasons: vec![
-                    "Command may modify dependencies, Git state, permissions, network, or shell state"
-                        .to_string(),
-                ],
-                expected_effects: "Potential workspace or external side effects".to_string(),
-                may_use_network: may_use_network(command),
-            };
+        if let Some(keyword) = network_keyword(&normalized) {
+            return (
+                CommandClassification::new(
+                    normalized,
+                    CommandRisk::High,
+                    false,
+                    true,
+                    vec![ApprovalCause::Network {
+                        keyword: keyword.to_string(),
+                    }],
+                    "Potential workspace or external side effects".to_string(),
+                    true,
+                ),
+                false,
+            );
         }
 
-        CommandClassification {
-            command: normalized,
-            risk: CommandRisk::High,
-            blocked: false,
-            requires_approval: true,
-            reasons: vec!["Unknown command effects".to_string()],
-            expected_effects: "Unknown effects until reviewed".to_string(),
-            may_use_network: may_use_network(command),
+        if let Some(keyword) = high_risk_keyword(&normalized) {
+            return (
+                CommandClassification::new(
+                    normalized,
+                    CommandRisk::High,
+                    false,
+                    true,
+                    vec![ApprovalCause::HighRisk {
+                        keyword: keyword.to_string(),
+                    }],
+                    "Potential workspace or external side effects".to_string(),
+                    may_use_network(command),
+                ),
+                false,
+            );
         }
+
+        let program = first_word(&normalized);
+        (
+            CommandClassification::new(
+                normalized,
+                CommandRisk::High,
+                false,
+                true,
+                vec![ApprovalCause::Unknown { program }],
+                "Unknown effects until reviewed".to_string(),
+                may_use_network(command),
+            ),
+            false,
+        )
     }
 
     /// An admitted read-only command or pipeline (spec 64 §5.5): Low, and
-    /// needing approval only when every command does.
+    /// needing approval only when every command does. No cause: a command that
+    /// runs without asking has no "why approval" to name.
     fn read_only_classification(&self, normalized: String) -> CommandClassification {
-        CommandClassification {
-            command: normalized,
-            risk: CommandRisk::Low,
-            blocked: false,
-            requires_approval: self.config.require_approval_for_all_commands,
-            reasons: vec![READ_ONLY_REASON.to_string()],
-            expected_effects: "Reads workspace or Git metadata".to_string(),
-            may_use_network: false,
-        }
+        CommandClassification::new(
+            normalized,
+            CommandRisk::Low,
+            false,
+            self.config.require_approval_for_all_commands,
+            Vec::new(),
+            "Reads workspace or Git metadata".to_string(),
+            false,
+        )
     }
 
     pub fn detect_project_commands(
@@ -517,12 +649,13 @@ pub(crate) fn command_access_permits(
     }
 }
 
-fn escalate(classification: &mut CommandClassification, reason: &str) {
+fn escalate(classification: &mut CommandClassification, cause: ApprovalCause) {
     classification.requires_approval = true;
     if classification.risk == CommandRisk::Low {
         classification.risk = CommandRisk::Medium;
     }
-    classification.reasons.push(reason.to_string());
+    classification.reasons.push(cause.plain_words());
+    classification.causes.push(cause);
 }
 
 /// The allowlist entry that authorises `command` in the directory `relative`
@@ -553,8 +686,11 @@ pub(crate) fn relative_location(
     Some(parts.join("/"))
 }
 
-fn configured_prefix_matches(patterns: &[String], command: &str) -> bool {
-    patterns.iter().any(|pattern| command.starts_with(pattern))
+fn configured_prefix_match<'a>(patterns: &'a [String], command: &str) -> Option<&'a str> {
+    patterns
+        .iter()
+        .find(|pattern| command.starts_with(pattern.as_str()))
+        .map(String::as_str)
 }
 
 fn configured_exact_matches(patterns: &[String], command: &str) -> bool {
@@ -573,22 +709,94 @@ fn contains_shell_control(command: &str) -> bool {
         || command.contains("$(")
 }
 
-fn is_blocked_command(command: &str) -> bool {
+/// The shell-control constructs in `command`, each wrapped in backticks and
+/// joined with ", ", in the order they first appear. Called only when
+/// [`contains_shell_control`] already matched, so it names at least one.
+fn shell_control_constructs(command: &str) -> String {
+    let characters: Vec<char> = command.chars().collect();
+    let mut constructs: Vec<&'static str> = Vec::new();
+    let mut index = 0;
+    while index < characters.len() {
+        let construct = match characters[index] {
+            '&' if characters.get(index + 1) == Some(&'&') => {
+                index += 1;
+                Some("&&")
+            }
+            '&' => Some("&"),
+            '|' if characters.get(index + 1) == Some(&'|') => {
+                index += 1;
+                Some("||")
+            }
+            '|' if characters.get(index + 1) == Some(&'&') => {
+                index += 1;
+                Some("|&")
+            }
+            '|' => Some("|"),
+            ';' => Some(";"),
+            '`' => Some("`"),
+            '<' => Some("<"),
+            '>' => Some(">"),
+            '$' if characters.get(index + 1) == Some(&'(') => Some("$("),
+            '\n' | '\r' => Some("newline"),
+            _ => None,
+        };
+        if let Some(construct) = construct
+            && !constructs.contains(&construct)
+        {
+            constructs.push(construct);
+        }
+        index += 1;
+    }
+    constructs
+        .iter()
+        .map(|construct| format!("`{construct}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The first word of a command: the program the classifier could not place.
+fn first_word(command: &str) -> String {
+    command
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The built-in destructive pattern `command` matches, if any (spec 10). The
+/// name is the canonical pattern, not the exact text, so a family of
+/// spellings shares one cause.
+fn destructive_pattern(command: &str) -> Option<&'static str> {
     let trimmed = command.trim();
-    let delete_root = trimmed.starts_with("rm -rf /")
+    if trimmed.starts_with("rm -rf /")
         || trimmed == "rm -rf ."
         || trimmed == "rm -rf ./"
         || trimmed == "rm -rf *"
         || trimmed == "rm -rf ~"
         || trimmed == "rm -rf \".\""
-        || trimmed == "rm -rf '.'";
-    delete_root
-        || trimmed.contains("git reset --hard")
-        || trimmed.contains("git clean -fd")
-        || trimmed.starts_with("dd if=")
-        || trimmed.contains(" mkfs")
-        || trimmed == "shutdown"
-        || trimmed == "reboot"
+        || trimmed == "rm -rf '.'"
+    {
+        return Some("rm -rf");
+    }
+    if trimmed.contains("git reset --hard") {
+        return Some("git reset --hard");
+    }
+    if trimmed.contains("git clean -fd") {
+        return Some("git clean -fd");
+    }
+    if trimmed.starts_with("dd if=") {
+        return Some("dd");
+    }
+    if trimmed.contains(" mkfs") {
+        return Some("mkfs");
+    }
+    if trimmed == "shutdown" {
+        return Some("shutdown");
+    }
+    if trimmed == "reboot" {
+        return Some("reboot");
+    }
+    None
 }
 
 /// Whether `command` is in the admitted read-only form (spec 64 §5.1–§5.2):
@@ -1303,31 +1511,49 @@ fn is_docker_command(command: &str) -> bool {
         || command.starts_with("docker-compose ")
 }
 
-fn is_high_risk_command(command: &str) -> bool {
-    command.contains("npm install")
-        || command.contains("npm i ")
-        || command.contains("npm add")
-        || command.contains("yarn add")
-        || command.contains("yarn install")
-        || command.contains("pnpm add")
-        || command.contains("pnpm install")
-        || command.contains("pip install")
-        || command.contains("curl")
-        || command.contains("wget")
-        || command.contains("chmod")
-        || command.contains("chown")
-        || command.contains("git commit")
-        || command.contains("git push")
-        || command.contains("git pull")
-        || command.contains("git reset")
-        || command.contains("git checkout")
-        || command.contains("git switch")
-        || command.contains("git merge")
-        || command.contains("git rebase")
-        || command.contains("git branch")
-        || command.starts_with("sh ")
-        || command.starts_with("bash ")
-        || command.starts_with("zsh ")
+fn network_keyword(command: &str) -> Option<&'static str> {
+    [
+        "curl",
+        "wget",
+        "git pull",
+        "git push",
+        "git fetch",
+        "git clone",
+        "npm install",
+        "npm i ",
+        "npm add",
+        "yarn add",
+        "yarn install",
+        "pnpm add",
+        "pnpm install",
+        "pip install",
+    ]
+    .into_iter()
+    .find(|keyword| command.contains(keyword))
+}
+
+fn high_risk_keyword(command: &str) -> Option<&'static str> {
+    for keyword in [
+        "chmod",
+        "chown",
+        "git commit",
+        "git reset",
+        "git checkout",
+        "git switch",
+        "git merge",
+        "git rebase",
+        "git branch",
+    ] {
+        if command.contains(keyword) {
+            return Some(keyword);
+        }
+    }
+    for shell in ["sh ", "bash ", "zsh "] {
+        if command.starts_with(shell) {
+            return Some(shell.trim());
+        }
+    }
+    None
 }
 
 fn may_use_network(command: &str) -> bool {
@@ -1352,12 +1578,13 @@ fn may_use_network(command: &str) -> bool {
 // Heuristic, not a security boundary: shell commands aren't sandboxed by path, so this only
 // flags likely out-of-repo path arguments for the approval prompt shown to the user.
 // Relative tokens resolve against the working directory, but the boundary is
-// always the repository root: a sub-root never narrows or widens it.
-fn references_path_outside_root(
+// always the repository root: a sub-root never narrows or widens it. Returns
+// the first token that escapes, so the caller can name it.
+fn escaping_path_outside_root(
     command: &str,
     repository_root: &Path,
     working_directory: &Path,
-) -> bool {
+) -> Option<String> {
     command
         .split_whitespace()
         .flat_map(|token| {
@@ -1367,7 +1594,8 @@ fn references_path_outside_root(
                 _ => vec![token],
             }
         })
-        .any(|token| token_escapes_root(token, repository_root, working_directory))
+        .find(|token| token_escapes_root(token, repository_root, working_directory))
+        .map(str::to_string)
 }
 
 fn token_escapes_root(token: &str, repository_root: &Path, working_directory: &Path) -> bool {
@@ -1406,7 +1634,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, allow_always_eligible, contains_shell_control, references_path_outside_root,
+        Config, allow_always_eligible, contains_shell_control, escaping_path_outside_root,
     };
     use std::path::Path;
 
@@ -1460,27 +1688,15 @@ mod tests {
     #[test]
     fn detects_relative_traversal_outside_root() {
         let root = Path::new("/Users/example/project");
-        assert!(references_path_outside_root(
-            "cat ../secrets/id_rsa",
-            root,
-            root
-        ));
-        assert!(references_path_outside_root(
-            "ls ../../other-project",
-            root,
-            root
-        ));
+        assert!(escaping_path_outside_root("cat ../secrets/id_rsa", root, root).is_some());
+        assert!(escaping_path_outside_root("ls ../../other-project", root, root).is_some());
     }
 
     #[test]
     fn detects_absolute_path_outside_root() {
         let root = Path::new("/Users/example/project");
-        assert!(references_path_outside_root("cat /etc/passwd", root, root));
-        assert!(references_path_outside_root(
-            "cat ~/secrets.txt",
-            root,
-            root
-        ));
+        assert!(escaping_path_outside_root("cat /etc/passwd", root, root).is_some());
+        assert!(escaping_path_outside_root("cat ~/secrets.txt", root, root).is_some());
     }
 
     /// Spec 64 §6, "Tightening". Each command is classified at a repository
@@ -1488,8 +1704,8 @@ mod tests {
     /// exercised for real.
     mod read_only_boundary {
         use super::super::{
-            CommandClassification, CommandPolicy, CommandRisk, Operator, RESTRICTED_PATH_REASON,
-            ShellLine, is_low_risk_read_only, shell_line,
+            ApprovalCause, CommandClassification, CommandPolicy, CommandRisk, Operator, ShellLine,
+            is_low_risk_read_only, shell_line,
         };
         use crate::config::Config;
         use std::fs;
@@ -1573,13 +1789,15 @@ mod tests {
             ] {
                 let classification = repo.classify(command);
                 assert_needs_approval(&classification);
+                // Spec 62 Correction C1: a spec-64 read-only refusal maps to
+                // `Unknown`, naming the program rather than the expansion.
                 assert!(
                     classification
-                        .reasons
+                        .causes
                         .iter()
-                        .any(|reason| reason.contains("shell expansion")),
+                        .any(|cause| matches!(cause, ApprovalCause::Unknown { .. })),
                     "{command}: {:?}",
-                    classification.reasons
+                    classification.causes
                 );
             }
             // A backtick is caught earlier, by the shell-control gate.
@@ -1601,10 +1819,12 @@ mod tests {
                 assert_needs_approval(&classification);
                 assert!(
                     classification
-                        .reasons
-                        .contains(&format!("{RESTRICTED_PATH_REASON}: {restricted}")),
+                        .causes
+                        .contains(&ApprovalCause::RestrictedPath {
+                            path: restricted.to_string()
+                        }),
                     "{command}: {:?}",
-                    classification.reasons
+                    classification.causes
                 );
             }
         }
@@ -1631,30 +1851,32 @@ mod tests {
         }
 
         /// Spec 64 §6, "After #60" (requirement 5): `git diff`, `git show`
-        /// and `git log -p`/`--patch`/`-u` ask, and the reason names the
-        /// replacement tool.
+        /// and `git log -p`/`--patch`/`-u` ask. Spec 62 maps the refusal to
+        /// `Unknown` (Correction C1); the pointer to `read_git_diff`/
+        /// `read_git_log` now lives in the model-facing `run_command`
+        /// description, not the classifier's reason string (Task 3).
         #[test]
         fn git_diff_show_and_log_patch_ask_and_name_the_replacement_tool() {
             let repo = Repository::new("after-60");
-            for (command, tool) in [
-                ("git diff", "read_git_diff"),
-                ("git show HEAD", "read_git_diff"),
-                ("git show --stat", "read_git_diff"),
-                ("git diff --cached -- README.md", "read_git_diff"),
-                ("git log -p", "read_git_log"),
-                ("git log --patch -n 3", "read_git_log"),
-                ("git log -u", "read_git_log"),
+            for command in [
+                "git diff",
+                "git show HEAD",
+                "git show --stat",
+                "git diff --cached -- README.md",
+                "git log -p",
+                "git log --patch -n 3",
+                "git log -u",
             ] {
                 let classification = repo.classify(command);
                 assert_needs_approval(&classification);
                 assert_eq!(classification.risk, CommandRisk::High, "{command}");
-                assert!(
-                    classification
-                        .reasons
-                        .iter()
-                        .any(|reason| reason.contains(tool)),
-                    "{command} must name {tool}: {:?}",
-                    classification.reasons
+                assert_eq!(
+                    classification.causes,
+                    vec![ApprovalCause::Unknown {
+                        program: "git".to_string()
+                    }],
+                    "{command}: {:?}",
+                    classification.causes
                 );
             }
         }
@@ -1700,11 +1922,11 @@ mod tests {
                 assert_needs_approval(&classification);
                 assert!(
                     classification
-                        .reasons
+                        .causes
                         .iter()
-                        .any(|reason| reason.contains("outside the selected repository")),
+                        .any(|cause| matches!(cause, ApprovalCause::OutsideRepository { .. })),
                     "{command}: {:?}",
-                    classification.reasons
+                    classification.causes
                 );
             }
         }
@@ -1905,21 +2127,21 @@ mod tests {
             let restricted = repo.classify("cd secrets && ls");
             assert_needs_approval(&restricted);
             assert!(
-                restricted
-                    .reasons
-                    .contains(&format!("{RESTRICTED_PATH_REASON}: secrets")),
+                restricted.causes.contains(&ApprovalCause::RestrictedPath {
+                    path: "secrets".to_string()
+                }),
                 "{:?}",
-                restricted.reasons
+                restricted.causes
             );
             let outside = repo.classify("cd .. && ls");
             assert_needs_approval(&outside);
             assert!(
                 outside
-                    .reasons
+                    .causes
                     .iter()
-                    .any(|reason| reason.contains("outside the selected repository")),
+                    .any(|cause| matches!(cause, ApprovalCause::OutsideRepository { .. })),
                 "{:?}",
-                outside.reasons
+                outside.causes
             );
             // A directory that does not exist could be found through `CDPATH`.
             assert_needs_approval(&repo.classify("cd missing && ls"));
@@ -1943,11 +2165,11 @@ mod tests {
             let restricted = repo.classify("cd crates && ls ../secrets");
             assert_needs_approval(&restricted);
             assert!(
-                restricted
-                    .reasons
-                    .contains(&format!("{RESTRICTED_PATH_REASON}: secrets")),
+                restricted.causes.contains(&ApprovalCause::RestrictedPath {
+                    path: "secrets".to_string()
+                }),
                 "{:?}",
-                restricted.reasons
+                restricted.causes
             );
             assert_needs_approval(&repo.classify("cd crates && ls ../.."));
             assert_needs_approval(&repo.classify("cd crates && ls -R .."));
@@ -1997,16 +2219,11 @@ mod tests {
     #[test]
     fn does_not_flag_paths_inside_root() {
         let root = Path::new("/Users/example/project");
-        assert!(!references_path_outside_root("cat src/main.rs", root, root));
-        assert!(!references_path_outside_root(
-            "cat /Users/example/project/src/main.rs",
-            root,
-            root
-        ));
-        assert!(!references_path_outside_root(
-            "git status --short",
-            root,
-            root
-        ));
+        assert!(escaping_path_outside_root("cat src/main.rs", root, root).is_none());
+        assert!(
+            escaping_path_outside_root("cat /Users/example/project/src/main.rs", root, root)
+                .is_none()
+        );
+        assert!(escaping_path_outside_root("git status --short", root, root).is_none());
     }
 }

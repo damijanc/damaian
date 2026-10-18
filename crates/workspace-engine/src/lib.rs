@@ -68,7 +68,8 @@ pub use clarification::{
     validate_answer,
 };
 pub use command_policy::{
-    CommandClassification, CommandPolicy, CommandRisk, PROJECT_MANIFESTS, allow_always_eligible,
+    ApprovalCause, CommandClassification, CommandPolicy, CommandRisk, PROJECT_MANIFESTS,
+    allow_always_eligible,
 };
 pub use command_purpose::{CommandPurpose, command_purpose};
 pub use command_runner::{CommandExecution, CommandRunOptions, CommandRunner, CommandTermination};
