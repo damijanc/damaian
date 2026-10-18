@@ -51,11 +51,12 @@ impl MetricSet {
     /// spec's named measures absent from the output, which is the exact failure
     /// requirement 5 guards against.
     ///
-    /// The next four are spec 21's plan rows, and the last is spec 49's
-    /// `cache_hit_rate`. They live here rather than in a metric set of their
+    /// The next four are spec 21's plan rows, then spec 49's
+    /// `cache_hit_rate`, and the last is spec 63's `exploration_findings`.
+    /// They live here rather than in a metric set of their
     /// own because requirement 5 is about *the* report — a measure kept
     /// somewhere else is a measure a baseline diff does not cover.
-    pub const KEYS: [&'static str; 21] = [
+    pub const KEYS: [&'static str; 22] = [
         "task_completion_rate",
         "check_pass_rate",
         "approval_policy_violations",
@@ -77,6 +78,7 @@ impl MetricSet {
         "plan_steps_completed_unverified",
         "plan_steps_blocked",
         "cache_hit_rate",
+        "exploration_findings",
     ];
 
     pub fn get(&self, key: &str) -> Option<&Metric> {
@@ -423,6 +425,27 @@ impl MetricSet {
                     value: cached_numerator as f64 / cached_denominator as f64,
                 }
             },
+        );
+
+        // Spec 63 §5.5, asserted zero: a failed look-around is not a problem
+        // to file. No data when no run explored, because zero findings over
+        // zero exploration commands is the fabricated zero `count_or_no_data`
+        // exists to refuse.
+        let explored: u64 = runnable
+            .iter()
+            .map(|record| record.findings_by_purpose.exploration.commands)
+            .sum();
+        push(
+            "exploration_findings",
+            "Findings from exploration commands",
+            count_or_no_data(
+                runnable
+                    .iter()
+                    .map(|record| record.findings_by_purpose.exploration.findings)
+                    .sum(),
+                explored as usize,
+                "no-exploration-commands",
+            ),
         );
 
         MetricSet { metrics }

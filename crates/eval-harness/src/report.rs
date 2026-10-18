@@ -73,6 +73,33 @@ pub fn to_text(report: &Report) -> String {
         ));
     }
 
+    // Spec 63 §5.5. Only runs that executed a command: the rest have nothing
+    // to group.
+    let commanded: Vec<&RunRecord> = report
+        .records
+        .iter()
+        .filter(|record| {
+            let grouped = &record.findings_by_purpose;
+            grouped.check.commands + grouped.exploration.commands + grouped.other.commands > 0
+        })
+        .collect();
+    if !commanded.is_empty() {
+        out.push_str("\nFindings by command purpose (findings/commands)\n");
+        for record in commanded {
+            let grouped = &record.findings_by_purpose;
+            out.push_str(&format!(
+                "  {:<32} check {}/{}  exploration {}/{}  other {}/{}\n",
+                record.scenario,
+                grouped.check.findings,
+                grouped.check.commands,
+                grouped.exploration.findings,
+                grouped.exploration.commands,
+                grouped.other.findings,
+                grouped.other.commands,
+            ));
+        }
+    }
+
     out.push_str("\nMetrics\n");
     for metric in &report.metrics.metrics {
         let rendered = match &metric.value {
