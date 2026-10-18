@@ -50,6 +50,11 @@ pub struct Asserts {
     pub file_references_resolve: Option<bool>,
     pub context_contains: Option<Vec<String>>,
     pub context_excludes: Option<Vec<String>>,
+    /// That the final answer names each of these strings. Unlike
+    /// `context_contains`, this reads the response rather than the retrieved
+    /// context, so a live-tier run checks the model's own wording. Each entry
+    /// is matched as a substring.
+    pub response_contains: Option<Vec<String>>,
     pub context_ranks_within: Option<(String, u64)>,
     pub refused: Option<bool>,
     pub absent_everywhere: Option<String>,

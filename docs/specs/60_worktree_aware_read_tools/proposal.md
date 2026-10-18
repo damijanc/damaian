@@ -1,9 +1,10 @@
 # Feature Spec: Worktree-Aware Read Tools
 
-Status: In progress (started 2026-10-17). Tasks 1–4 of 6 are done: registered
+Status: In progress (started 2026-10-17). Tasks 1–5 of 6 are done: registered
 worktrees are resolved and refused (§5.1), the git reads are hardened (§5.4),
-the five read tools take `worktree` (§5.3), and `list_worktrees` and
-`read_git_log` are live (§5.2). Plan and progress in
+the five read tools take `worktree` (§5.3), `list_worktrees` and
+`read_git_log` are live (§5.2), and the `worktree_survey` eval scenario passes
+(§5.7). Plan and progress in
 [`tasks.md`](tasks.md). Specified on 2026-10-17 from the same
 session as [#59](../59_exploration_round_allowance/proposal.md), after it was
 continued three times and still did not finish: 35 of its 40 approval prompts

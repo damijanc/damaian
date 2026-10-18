@@ -1,0 +1,32 @@
+version = "1"
+description = """
+A repository with two linked worktrees under `.claude/worktrees/` and a planted
+symlink, built for spec 60's `worktree_survey` scenario.
+
+`wt-a` is dirty: `secrets/token.txt` (tracked, and covered by
+DEFAULT_RESTRICTED_PATTERNS' `secrets/**`) and `README.md` are modified but not
+committed, so its diff must show the latter and never the former. `wt-b` is two
+commits ahead of `main`, both touching `src/lib.rs`. `.claude/worktrees/planted`
+is a symlink to the run's data directory — outside the repository — and must be
+refused as "not a registered worktree" by a `worktree` argument.
+"""
+
+[[worktrees]]
+path = ".claude/worktrees/wt-a"
+branch = "wt-a"
+dirty = [
+  { path = "secrets/token.txt", content = "rotated-fixture-token\n" },
+  { path = "README.md", content = "# Worktree survey fixture (edited in wt-a)\n" },
+]
+
+[[worktrees]]
+path = ".claude/worktrees/wt-b"
+branch = "wt-b"
+commits = [
+  { file = "src/lib.rs", content = "// worktree survey lib\n\npub fn base() -> &'static str {\n    \"fixture\"\n}\n\npub fn upload(payload: &str) {\n    let _ = payload;\n}\n", message = "Add the upload helper" },
+  { file = "src/lib.rs", content = "// worktree survey lib\n\npub fn base() -> &'static str {\n    \"fixture\"\n}\n\npub fn upload(payload: &str) {\n    let _ = payload;\n}\n\npub fn upload_with_retry(payload: &str) {\n    upload(payload);\n}\n", message = "Retry uploads" },
+]
+
+[[symlinks]]
+path = ".claude/worktrees/planted"
+target = "@data"

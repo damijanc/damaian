@@ -1,0 +1,62 @@
+name = "worktree_survey"
+fixture = "worktree-survey"
+tier = "deterministic"
+prompt = "What work is in progress in this repository's worktrees, and what is each worktree ahead of main by?"
+
+# Spec 60 §5.7: a fixture repository with two registered worktrees — one dirty
+# (with a restricted file changed), one two commits ahead of `main` — and a
+# planted symlink under `.claude/worktrees/` pointing outside the repository.
+# The scripted turn surveys them the way the motivating session wanted to: with
+# tools, not shell commands, so no approval stops.
+#
+# **What this scenario cannot measure.** The restricted file's absence from the
+# diff is a tool *result*, and tool results reach none of the artifacts the
+# `[assert]` block reads (response, context, record, audit trace) — the same
+# limit `navigated_edit.toml` documents. That half is asserted by
+# `the_worktree_survey_diff_hides_the_restricted_file` in `tests/harness.rs`,
+# which reads the tool result back from the session log. The symlink refusal is
+# likewise asserted there, from the recorded call outcome. What the `[assert]`
+# block can claim — and what a live-tier run must still satisfy — is zero
+# approval stops, that all six calls dispatched, and that the answer names both
+# worktrees.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "list_worktrees", arguments = {} },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_git_diff", arguments = { worktree = ".claude/worktrees/wt-a", stat = true } },
+  { name = "read_git_log", arguments = { worktree = ".claude/worktrees/wt-a" } },
+  { name = "read_git_diff", arguments = { worktree = ".claude/worktrees/wt-b", stat = true } },
+  { name = "read_git_log", arguments = { worktree = ".claude/worktrees/wt-b" } },
+]
+
+# The planted symlink is refused as "not a registered worktree": it resolves to
+# the data directory, which git has never registered. A refusal is a failed
+# call, not a turn-level error, so the survey continues.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_git_diff", arguments = { worktree = ".claude/worktrees/planted", stat = true } },
+]
+
+[[turn]]
+content = """
+Two worktrees are in progress. `.claude/worktrees/wt-a` is on branch `wt-a` and
+has an uncommitted change to `README.md`; its change to `secrets/token.txt` is
+restricted and does not appear in the diff. `.claude/worktrees/wt-b` is on
+branch `wt-b`, two commits ahead of `main` (`Retry uploads` and `Add the upload
+helper`). The `.claude/worktrees/planted` entry is a symlink pointing outside
+the repository, not a registered worktree, and was refused.
+"""
+
+[assert]
+approval_required = false
+response_contains = [".claude/worktrees/wt-a", ".claude/worktrees/wt-b"]
+# All six scripted calls must have dispatched — proving the tool surface reached
+# the worktrees without the shell. Script-derived, so the live tier skips it.
+tool_calls_at_least = 6
+deterministic_only = ["tool_calls_at_least"]
