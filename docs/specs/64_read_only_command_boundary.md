@@ -24,7 +24,7 @@ Related implementation specs:
 [`10_persistent_command_approval.md`](10_persistent_command_approval.md)
 (*Allow Always*, unchanged), [`31_permission_profiles`](31_permission_profiles/proposal.md)
 (`command_access`, unchanged),
-[`62_approval_prompts_name_the_reason.md`](62_approval_prompts_name_the_reason.md)
+[`62_approval_prompts_name_the_reason`](62_approval_prompts_name_the_reason/proposal.md)
 (the causes this spec adds), [`47_agent_working_capability`](47_agent_working_capability/proposal.md)
 (requirement 3: tools gain capabilities, the shell does not).
 

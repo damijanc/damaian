@@ -1,19 +1,20 @@
 # Feature Spec: Approval Prompts Name the Reason
 
-Status: Not started. Specified on 2026-10-17 from the session behind
-[#59](59_exploration_round_allowance/proposal.md)–[#61](61_continue_the_stopped_turn.md),
+Status: Not started. Split into a folder and planned 2026-10-18. Specified on
+2026-10-17 from the session behind
+[#59](../59_exploration_round_allowance/proposal.md)–[#61](../61_continue_the_stopped_turn.md),
 in which the user answered 40 approval prompts that all gave the same reason,
 "because it cannot run in sandbox mode", and none gave the real one.
 Order: 62 of 62
 Plan: none. Evidence-driven, like #47 — an exception to the rule in
-[`README.md`](README.md).
-Depends on: [#10](10_persistent_command_approval.md) (the approval card and
-*Allow Always*) — built; [#31](31_permission_profiles/proposal.md) (the
+[`README.md`](../README.md).
+Depends on: [#10](../10_persistent_command_approval.md) (the approval card and
+*Allow Always*) — built; [#31](../31_permission_profiles/proposal.md) (the
 plain-word rule names in `effective_policy.rs`) — built. Everything else named
 below is a cross-reference, not a prerequisite.
 Related implementation specs:
-[`20_working_modes`](20_working_modes/proposal.md) (mode refusals, which already
-name their reason), [`64_read_only_command_boundary.md`](64_read_only_command_boundary.md)
+[`20_working_modes`](../20_working_modes/proposal.md) (mode refusals, which already
+name their reason), [`64_read_only_command_boundary.md`](../64_read_only_command_boundary.md)
 (adds reasons of its own to the classifier this spec makes structured).
 
 ## 1. Motivation
@@ -42,32 +43,58 @@ believes auto-run commands are sandboxed will trust them more than they should.
 
 ## 2. Current State
 
-- `command_proposal_response` (`chat.rs:5105`) returns one of two fixed
+> Written before spec 64 merged on 2026-10-17/18. Spec 64 rewrote the read-only
+> boundary and its classifier, and its reason strings are what §5.1's
+> `ApprovalCause` replaces. The `tasks.md` Corrections table records where the
+> code now differs from this section; the bullets below are the corrected view.
+
+- `command_proposal_response` (`chat.rs:5310`) returns one of two fixed
   sentences, both claiming "sandbox mode", whatever the proposal says.
-- `CommandProposal` (`validation.rs:17`) carries `risk`, `requires_approval`,
-  `blocked`, `expected_effects`, `may_use_network` and `reasons: Vec<String>` —
-  one fixed English string per classifier rule that fired. It records neither the
-  rule as a value nor which setting turned a low-risk command into one that needs
-  approval.
-- The classifier (`command_policy.rs`, `classify_pattern`) checks, in order: the
-  blocklist and destructive patterns; shell control (`;`, `&`, `|`, a backtick,
-  `<`, `>`, a newline, `$(`); the allowlist; `is_low_risk_read_only`; validation
-  commands; Docker; high-risk keywords; and anything else as unknown.
-  `classify_at` then raises the risk for a working directory or path argument
-  outside the repository, and applies the permission profile's `command_access`.
+- `CommandProposal` (`validation.rs:18`) carries the model's stated `reason`
+  (set from the tool call in `propose_command_at`), plus `risk`,
+  `requires_approval`, `blocked`, `expected_effects`, `may_use_network` and
+  `reasons: Vec<String>` — one fixed English string per classifier branch or
+  read-only refusal that fired. It records neither the rule as a value nor which
+  setting turned a low-risk command into one that needs approval. The model's
+  `reason` is stored but never reaches the card.
+- The classifier (`command_policy.rs`): `classify_pattern` first runs
+  `read_only_verdict` (spec 64's tokenizer — `shell_line`, `command_verdict`,
+  `pipeline_verdict`), then `classify_text` checks, in order: the blocklist and
+  destructive patterns; shell control (an admitted read-only pipeline passes
+  through); the allowlist; the read-only verdict (`Admitted` / `Refused` /
+  `NotReadOnly`); validation commands; Docker; high-risk keywords; and anything
+  else as unknown. `classify_at` then escalates for a working directory or path
+  argument outside the repository, a restricted path (`RESTRICTED_PATH_REASON`,
+  whose doc comment names this spec), a `cd` target that is not a directory,
+  `ls -R` of the root, and applies the permission profile's `command_access`
+  (which blocks with "Blocked by permission profile: command_access=…").
+- There is no separate network branch: `curl`/`wget` fall into the high-risk
+  bucket with the generic "may modify dependencies, Git state, permissions,
+  network, or shell state" reason, and `may_use_network` is a boolean kept
+  beside the reasons rather than a cause. §5.1's `Network { keyword }` must be
+  split out and the keyword named.
 - `require_approval_for_all_commands` and `require_approval_for_risky_commands`
   set `requires_approval` without adding a reason. A low-risk command that needs
   approval only because of them still reads "Read-only command".
 - The approval card (`createCommandApprovalPreview`, `app.js:9170`) shows the
   command and a risk badge, and puts the plain-text `command_approval_prompt`,
   which includes the reasons, behind a **Why this command** disclosure. The
-  model's own stated reason is not shown.
+  model's own stated reason is not shown; `AgentCommandProposal` (`chat.rs:287`)
+  carries no `reason` field to show.
 - `effective_policy.rs`'s `rule_label` names configuration keys in plain words
   ("Ask before every command", "Commands that are always blocked"). It does not
-  name classifier branches.
-- The tool description for `run_command` and the system prompt tell the model
-  that Damaian "runs sandbox-safe read-only commands automatically"
-  (`chat.rs:4589`, and the command envelope paragraphs).
+  name classifier branches. The source attribution it computes (`Config::load_scoped`'s
+  `RepositoryConfigReport` → `EffectivePolicy`) is **not** available where
+  `classify_at` runs: `CommandPolicy` is built from `Config` alone
+  (`workspace_engine.rs:78`), so §5.1's `Setting.source` needs that attribution
+  threaded in.
+- The tool description for `run_command` (`chat.rs:4747`) and the system prompt
+  and command envelope paragraphs (`chat.rs:4247`, `4255`) tell the model that
+  Damaian "runs sandbox-safe read-only commands automatically". Three more
+  "sandbox" strings are not in those paragraphs: the auto-run path passes the
+  literal `"sandbox"` as `approved_by` (`chat.rs:2756`), the model-facing
+  context separator is `--- sandbox_command_result ---` (`chat.rs:4300`), and
+  the audit turn status includes `complete_with_sandbox_command` (`chat.rs:3411`).
 
 ## 3. Requirements
 
@@ -92,7 +119,7 @@ believes auto-run commands are sandboxed will trust them more than they should.
 ## 4. Non-goals
 
 - Changing which commands need approval. This spec explains the decision; it
-  does not move it. [#64](64_read_only_command_boundary.md) changes the
+  does not move it. [#64](../64_read_only_command_boundary.md) changes the
   boundary.
 - Adding a real sandbox.
 - Approving several prompts at once, or session-scoped grants. Both are worth
@@ -115,18 +142,32 @@ A new enum in `command_policy.rs`:
 | `HighRisk { keyword }` | "Asks first: `<keyword>` changes your system or repository" |
 | `Network { keyword }` | "Asks first: may use the network (`<keyword>`)" |
 | `Unknown { program }` | "Asks first: Damaian does not know what `<program>` does" |
+| `RestrictedPath { path }` | "Asks first: reads `<path>`, which the policy restricts" |
 | `OutsideRepository { path }` | "Asks first: refers to `<path>`, outside the repository" |
 | `Setting { key, source }` | "Asks first: *<rule_label(key)>* is on (set by <source>)" |
 | `ProfileBlocked { access }` | "Blocked: the permission profile allows <access> commands only" |
+
+`RestrictedPath` is added for the reason spec 64 already emits
+(`RESTRICTED_PATH_REASON`, whose doc comment names this spec); the spec-64
+read-only form refusals ("not an admitted read-only command", "uses shell
+expansion", "not an admitted filter") map to `Unknown` (or a dedicated variant
+if the task finds the distinction worth naming), and the `Network`/`HighRisk`
+split requires pulling the network keywords out of `is_high_risk_command`.
+Blocking causes sort before approval causes; among approval causes, the
+classifier's own order applies.
 
 `CommandClassification` gains `causes: Vec<ApprovalCause>`, ordered most
 decisive first. The existing `reasons` strings are rendered from the causes, so
 there is one source and the strings cannot drift. Blocking causes sort before
 approval causes; among approval causes, the classifier's own order applies.
 
-`Setting` is the new information: `classify_at` adds it wherever a setting, not
-the command, raised `requires_approval`. Its `source` comes from the same
-attribution `effective_policy.rs` already computes for the policy view (#31).
+`Setting` is the new information: the classifier adds it wherever a setting, not
+the command, raised `requires_approval` (`require_approval_for_all_commands`,
+`require_approval_for_risky_commands`). Its `source` reuses the attribution
+`effective_policy.rs` computes for the policy view (#31), but that attribution
+is not available where `classify_at` runs today (`CommandPolicy` holds `Config`
+only) — the task threads the `RepositoryConfigReport` (or a derived source map)
+into the classifier or the proposal path rather than resolving it a second time.
 
 ### 5.2 The message and the card
 
@@ -152,14 +193,25 @@ uses shell control. Naming shell control there is deliberate: a model that knows
 `a && b | c` always asks may prefer two tool calls, or #60's tools, over one
 compound command.
 
-The test that asserts the read-only prompt omits the auto-run sentence
-(`chat.rs`, around line 6178) is updated with the new wording, not removed.
+The test that asserts the read-only prompt omits the auto-run sentence is
+`ask_mode_system_prompt_has_no_command_envelope` (`chat.rs:6414`), not "around
+line 6178". It is updated with the new wording, not removed, and
+`code_mode_system_prompt_is_byte_identical_to_todays` (`chat.rs:6406`) pins the
+Code system prompt against a `TODAYS_CODE_SYSTEM_PROMPT` constant — that constant
+and the `CODE_PARAGRAPH_BEFORE_SPEC_50` / `READ_ONLY_PARAGRAPH_BEFORE_SPEC_50`
+fixtures (`chat.rs:6665`) change in the same commit or the byte-identical test
+breaks.
 
 ### 5.4 Recording
 
-The audit record for a command proposal gains `causes`, the enum variant names
-in order (`shell_control,unknown`). The session log's assistant message carries
-the plain words already, so no new event is needed.
+The audit record for a command proposal — the `command_proposal_stored` event
+written in `validation.rs`'s `store_proposal`, which today carries
+`risk`/`requiresApproval`/`blocked` only — gains `causes`, the enum variant
+names in order (`shell_control,unknown`). Because the stored proposal
+(`serialize_proposal`) round-trips to disk and is reloaded for reattach and
+*Allow Always*, `CommandProposal` gains a `causes` field written and read with
+it, so the audit value and the reloaded proposal cannot drift. The session log's
+assistant message carries the plain words already, so no new event is needed.
 
 ### 5.5 Measuring
 
