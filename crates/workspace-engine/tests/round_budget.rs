@@ -77,6 +77,18 @@ fn audit_events(repo: &Path) -> String {
     fs::read_to_string(repo.join(".damaian/audit/events.jsonl")).unwrap_or_default()
 }
 
+/// The `turn_budget_extended` audit records, parsed in order, so a test can
+/// assert each continuation's round, delta and running total.
+fn turn_budget_extended_events(repo: &Path) -> Vec<serde_json::Value> {
+    audit_events(repo)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            event.get("eventType").and_then(|value| value.as_str()) == Some("turn_budget_extended")
+        })
+        .collect()
+}
+
 fn pending_file(repo: &Path, proposal_id: &str) -> String {
     fs::read_to_string(
         repo.join(".damaian/chat/pending")
@@ -111,6 +123,32 @@ fn resume_round_budget(
         .chat_orchestrator
         .resume_round_budget(proposal_id, decision, "tester", adapter, &mut sink)
         .expect("the round-budget resume should run")
+}
+
+/// Like `resume_round_budget`, but returns the result so a test can assert a
+/// refusal (e.g. *Continue* at the hard cap).
+fn resume_round_budget_attempt(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    decision: RoundBudgetDecision,
+    adapter: &mut MockModelAdapter,
+) -> workspace_engine::Result<ChatTurnResult> {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine.chat_orchestrator.resume_round_budget(
+        proposal_id,
+        decision,
+        "tester",
+        adapter,
+        &mut sink,
+    )
 }
 
 fn resume_command_decision(
@@ -482,5 +520,122 @@ fn command_and_fallback_resume_refuse_a_round_budget_pause() {
     assert!(
         !pending_file(&repo, &proposal.id).is_empty(),
         "the round-budget pause must remain on disk for its own entry point"
+    );
+}
+
+#[test]
+fn each_continuation_is_recorded() {
+    // Two consecutive *Continue*s must each actually gain a segment of rounds
+    // (the running total grows 0 -> 8 -> 16), and each is recorded with the
+    // round it was granted at, the delta, and the running total. This pins the
+    // gap that `ABSOLUTE_TURN_ROUND_CAP` closes: with the per-segment cap the
+    // second Continue would grant nothing and the turn would re-pause at once.
+    let repo = temp_repo("recorded");
+    let engine = engine(&repo, 8, None);
+    let mut adapter = MockModelAdapter::new(read_only_round());
+
+    let (result, _) = ask(&engine, &repo, "Look at the source", &mut adapter);
+    let first = result
+        .round_budget_proposal
+        .clone()
+        .expect("the turn pauses at its first segment");
+    assert_eq!(first.rounds_granted, 0);
+
+    let second = resume_round_budget(
+        &engine,
+        &first.id,
+        RoundBudgetDecision::Continue,
+        &mut adapter,
+    )
+    .round_budget_proposal
+    .expect("the first Continue pauses again");
+    assert_eq!(
+        second.rounds_granted, 8,
+        "the first Continue grants one segment"
+    );
+
+    let third = resume_round_budget(
+        &engine,
+        &second.id,
+        RoundBudgetDecision::Continue,
+        &mut adapter,
+    )
+    .round_budget_proposal
+    .expect("the second Continue pauses again");
+    assert_eq!(
+        third.rounds_granted, 16,
+        "the second Continue grants another segment"
+    );
+    assert_eq!(
+        third.rounds_used, 24,
+        "the second Continue actually gains eight more rounds"
+    );
+
+    let extended = turn_budget_extended_events(&repo);
+    assert_eq!(extended.len(), 2, "one record per continuation");
+    assert_eq!(extended[0]["actor"], "tester");
+    assert_eq!(extended[0]["round"], "8");
+    assert_eq!(extended[0]["roundsGranted"], "8");
+    assert_eq!(extended[0]["roundsTotal"], "8");
+    assert_eq!(extended[1]["actor"], "tester");
+    assert_eq!(extended[1]["round"], "16");
+    assert_eq!(extended[1]["roundsGranted"], "8");
+    assert_eq!(extended[1]["roundsTotal"], "16");
+}
+
+#[test]
+fn a_repeatedly_continued_turn_still_ends() {
+    // Requirement 4 / §5.3: `ABSOLUTE_TURN_ROUND_CAP` bounds the rounds of one
+    // turn across all continuations. With the default eight-round segment the
+    // turn takes seven continuations to reach the cap (64 = 8 + 7×8), and the
+    // eighth pause reports `at_hard_cap` and refuses *Continue* — only *Answer
+    // now* remains.
+    let repo = temp_repo("hardcap");
+    let engine = engine(&repo, 8, None);
+    let mut adapter = MockModelAdapter::new(read_only_round());
+
+    let (mut result, _) = ask(&engine, &repo, "Look at the source", &mut adapter);
+    let mut proposal = result
+        .round_budget_proposal
+        .clone()
+        .expect("the turn pauses at its first segment");
+
+    let mut continuations = 0;
+    while !proposal.at_hard_cap {
+        assert!(
+            continuations < 16,
+            "the turn must reach the hard cap in bounded steps"
+        );
+        result = resume_round_budget(
+            &engine,
+            &proposal.id,
+            RoundBudgetDecision::Continue,
+            &mut adapter,
+        );
+        proposal = result
+            .round_budget_proposal
+            .clone()
+            .expect("each continuation pauses again");
+        continuations += 1;
+    }
+
+    assert_eq!(continuations, 7, "64 = 8 + 7 continuations of 8");
+    assert_eq!(proposal.rounds_used, 64);
+    assert_eq!(proposal.rounds_granted, 56);
+    assert!(proposal.at_hard_cap);
+
+    // At the bound only *Answer now* is offered: Continue is refused, and the
+    // pending turn stays on disk so the answer-now entry point can still find it.
+    let error = resume_round_budget_attempt(
+        &engine,
+        &proposal.id,
+        RoundBudgetDecision::Continue,
+        &mut adapter,
+    )
+    .expect_err("Continue must be refused at the hard cap");
+    assert!(matches!(error, ClientError::InvalidInput(_)), "{error}");
+    assert!(
+        !pending_file(&repo, &proposal.id).is_empty(),
+        "the pending turn must remain for Answer now"
     );
 }

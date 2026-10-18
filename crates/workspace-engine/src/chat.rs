@@ -357,9 +357,7 @@ pub struct AgentFallbackProposal {
 }
 
 /// The pause a turn takes when it reaches its round budget with the model
-/// still wanting a tool (spec 61). Resumed through `resume_round_budget` once
-/// that exists (Task 2); for now the proposal is carried so the shell can
-/// render the pause and the id hand back to the resume entry point.
+/// still wanting a tool (spec 61). Resumed through `resume_round_budget`.
 ///
 /// Names the rounds the turn has used and been granted so the row can say
 /// "Used 8 of 8" without the model guessing a number.
@@ -373,8 +371,7 @@ pub struct AgentRoundBudgetProposal {
     pub rounds_total: u32,
     /// The running total of extra rounds granted across continuations.
     pub rounds_granted: u32,
-    /// `ABSOLUTE_TURN_ROUND_CAP` reached, so only *Answer now* is offered
-    /// (Task 3 computes this; Task 1 always reports `false`).
+    /// `ABSOLUTE_TURN_ROUND_CAP` reached, so only *Answer now* is offered.
     pub at_hard_cap: bool,
 }
 
@@ -1539,6 +1536,15 @@ impl ChatOrchestrator {
 
         match decision {
             RoundBudgetDecision::Continue => {
+                // The turn has spent every segment the cap allows; only *Answer
+                // now* remains (spec 61 §5.3). The pause stays on disk for it.
+                if pause.rounds_used >= ABSOLUTE_TURN_ROUND_CAP {
+                    self.pending_commands.save(&pending)?;
+                    return Err(ClientError::InvalidInput(format!(
+                        "Proposal {proposal_id} has reached the turn round cap \
+                         ({ABSOLUTE_TURN_ROUND_CAP}); only Answer now is available"
+                    )));
+                }
                 // The segment granted is the same one a token-ceiling
                 // continuation adds (`default_tool_round_limit`), and the
                 // running total is what the resumed turn seeds its extension
@@ -2252,7 +2258,7 @@ impl ChatOrchestrator {
 
             let max_rounds = (self.tool_round_limit(web_debug_mode, turn_options)
                 + round_budget_extension)
-                .min(ABSOLUTE_TOOL_ROUND_CAP);
+                .min(ABSOLUTE_TURN_ROUND_CAP);
             let force_final = round >= max_rounds;
             // Spec 61 §5.1: at the round budget, with no token ceiling to
             // continue under, pause before the forced final call instead of
@@ -2786,7 +2792,7 @@ impl ChatOrchestrator {
                 }
                 let max_rounds = (self.tool_round_limit(web_debug_mode, turn_options)
                     + round_budget_extension)
-                    .min(ABSOLUTE_TOOL_ROUND_CAP);
+                    .min(ABSOLUTE_TURN_ROUND_CAP);
                 sink.phase(
                     PhaseKind::Tool,
                     tool_action_label(&tool_action),
@@ -3796,6 +3802,8 @@ impl ChatOrchestrator {
     ) -> Result<ChatTurnResult> {
         let proposal_id = create_id("roundbudget");
         let response = round_budget_pause_response(round, max_rounds);
+        // The turn has spent its last segment: only *Answer now* is left.
+        let at_hard_cap = round >= ABSOLUTE_TURN_ROUND_CAP;
         let pause = RoundBudgetPause {
             rounds_used: round,
             rounds_granted,
@@ -3879,7 +3887,7 @@ impl ChatOrchestrator {
                 rounds_used: round,
                 rounds_total: max_rounds,
                 rounds_granted,
-                at_hard_cap: false,
+                at_hard_cap,
             }),
             cancelled: false,
             usage,
@@ -4529,6 +4537,13 @@ impl PendingCommandStore {
 /// requires explicit UI work so an agent cannot silently spend a whole session
 /// on repeated tool calls.
 const ABSOLUTE_TOOL_ROUND_CAP: u32 = 16;
+
+/// Absolute bound on the rounds of one turn across all round-budget
+/// continuations (spec 61 §5.3): the initial eight-round segment plus seven
+/// continuations of eight. Distinct from [`ABSOLUTE_TOOL_ROUND_CAP`], which
+/// bounds a single configured segment — and #47's token-ceiling continuation,
+/// which the manual *Continue* is not tied to.
+const ABSOLUTE_TURN_ROUND_CAP: u32 = 64;
 
 /// Damaian's own handoff instruction, verbatim from spec 57 §5.0. It is what
 /// makes *Start worker* appear without any repository's `AGENTS.md` teaching

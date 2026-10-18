@@ -170,11 +170,11 @@ Nothing about it depends on the eight-message window, because the in-turn
 
 ### 5.3 The hard bound
 
-`ABSOLUTE_TURN_ROUND_CAP`, a constant, bounds the rounds of one turn across all
-continuations. Proposed value: 64 action rounds — the initial eight-round segment
-plus seven continuations of eight. At the bound, the pause offers only *Answer
-now*. This constant is distinct from the existing `ABSOLUTE_TOOL_ROUND_CAP`
-(`chat.rs:4117`, value 16), which bounds a single configured segment.
+`ABSOLUTE_TURN_ROUND_CAP` (`chat.rs:4546`), value 64, bounds the rounds of one
+turn across all continuations — the initial eight-round segment plus seven
+continuations of eight. At the bound, the pause offers only *Answer now*. It is
+distinct from the existing `ABSOLUTE_TOOL_ROUND_CAP` (`chat.rs:4539`, value 16),
+which bounds a single configured segment and #47's token-ceiling continuation.
 
 Each request inside the turn stays bounded by `agent_max_turn_messages` through
 `bounded_messages`, so continuing grows the number of calls, not their size.
