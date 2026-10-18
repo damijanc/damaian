@@ -111,5 +111,5 @@ specs, not here:
 - The forced final call (tools dropped) still produced a tool request that
   `model_output_requests_tool` caught. Whether the model was told clearly
   enough that tools were gone is unexamined.
-  [#61](../61_continue_the_stopped_turn.md) moves the pause before that call,
+  [#61](../61_continue_the_stopped_turn/proposal.md) moves the pause before that call,
   so it is made only when the user asks for an answer.

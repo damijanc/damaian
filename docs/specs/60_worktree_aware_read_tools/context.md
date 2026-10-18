@@ -108,7 +108,7 @@ filter by name (`proposal.md` §7).
   `cargo nextest`. Spec 47 requirement 6 already names the round cap as "a
   cliff whose only continuation is a manual re-ask that starts a new task and
   loses in-turn state". Specified as
-  [#61](../61_continue_the_stopped_turn.md).
+  [#61](../61_continue_the_stopped_turn/proposal.md).
 - **Compound read-only commands always need approval.** Even with this spec, a
   model that reaches for `grep … | head` in the main checkout is interrupted.
   Whether a pipeline of individually read-only commands should be eligible for
