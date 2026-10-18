@@ -3389,8 +3389,11 @@ fn repeated_failed_browser_diagnostics_are_stopped() {
 }
 
 #[test]
-fn tool_round_exhaustion_is_terminal_when_model_still_requests_tools() {
-    let repo = temp_dir("chat-tool-budget-exhausted");
+fn tool_round_exhaustion_pauses_when_model_still_requests_tools() {
+    // Spec 61: at the round cap with no token ceiling, the turn pauses as a
+    // `round_budget` approval before the forced final call, instead of ending
+    // `ToolBudgetExhausted`. The forced call is made only on *Answer now*.
+    let repo = temp_dir("chat-tool-budget-paused");
     write_fixture(&repo, "README.md", "# Tool budget\n");
     let mut config = test_config(&repo);
     config.agent_max_tool_rounds = 1;
@@ -3418,9 +3421,13 @@ fn tool_round_exhaustion_is_terminal_when_model_still_requests_tools() {
         .ask(&repo, "Check status.", &[], &mut adapter, &mut on_token)
         .unwrap();
 
-    assert_eq!(result.task.status, TaskStatus::ToolBudgetExhausted);
-    assert!(result.response.contains("tool round limit"));
-    assert!(adapter.requests[1].tools.is_none());
+    assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+    assert!(result.round_budget_proposal.is_some());
+    assert_eq!(
+        adapter.requests.len(),
+        1,
+        "no forced final call before the choice"
+    );
 
     fs::remove_dir_all(repo).unwrap();
 }

@@ -1,6 +1,6 @@
 # Feature Spec: Continue the Stopped Turn
 
-Status: Not started. Specified on 2026-10-17 from the session behind
+Status: In progress. Specified on 2026-10-17 from the session behind
 [#59](../59_exploration_round_allowance/proposal.md) and
 [#60](../60_worktree_aware_read_tools/proposal.md): three presses of *Continue
 debugging* produced three new turns that had lost the user's request, drifted
@@ -51,28 +51,28 @@ which sets none, the cliff is still there.
   model still asks for a tool, the turn stops with `StopReason::ToolBudget` and
   `TaskStatus::ToolBudgetExhausted`, which is terminal (`session.rs`,
   `is_terminal`). The forced call's output is replaced by
-  `tool_budget_exhausted_response` (called at `chat.rs:2364`, defined at
-  `chat.rs:5244`).
+  `tool_budget_exhausted_response` (called at `chat.rs:2421`, defined at
+  `chat.rs:5630`).
 - With `agent_max_task_tokens` set, #47's continuation adds a segment of
   `agent_max_tool_rounds` inside the same turn instead, up to
-  `ABSOLUTE_TOOL_ROUND_CAP`, and records `turn_continued` (`chat.rs:2342`).
+  `ABSOLUTE_TOOL_ROUND_CAP`, and records `turn_continued` (`chat.rs:2400`).
 - *Continue debugging* (`continueDebuggingFromExhausted`, `app.js:10119`) posts
   the fixed prompt with `continue_debugging: true`. The engine creates a new task
-  (`chat.rs:780`), raises its round limit to `ABSOLUTE_TOOL_ROUND_CAP`
-  (`tool_round_limit`, `chat.rs:541`), and forces `web_debug_mode` on
-  (`chat.rs:1906`), whatever the original request was.
-- `build_model_prompt` (`chat.rs:4190`) gives a new turn the last eight messages,
+  (`chat.rs:807`), raises its round limit to `ABSOLUTE_TOOL_ROUND_CAP`
+  (`tool_round_limit`, `chat.rs:568`), and forces `web_debug_mode` on
+  (`chat.rs:1942`), whatever the original request was.
+- `build_model_prompt` (`chat.rs:4445`) gives a new turn the last eight messages,
   each truncated to 2,000 characters.
-- `carry_plan_from_the_previous_turn` (`chat.rs:1686`) carries the plan only from
+- `carry_plan_from_the_previous_turn` (`chat.rs:1713`) carries the plan only from
   a `TokenBudgetExhausted` or superseded task. A tool-round stop drops it.
 - A turn paused for approval is persisted as a `PendingChatTurn`
-  (`chat.rs:3927`) at `<data_dir>/chat/pending/<proposal_id>.json`, with its
+  (`chat.rs:4163`) at `<data_dir>/chat/pending/<proposal_id>.json`, with its
   `messages`, `round`, `turn_options` and plan review, and resumes into
   `run_agentic_turn` with the same task. `PendingApprovalRef.kind` is
   `command`, `patch`, `plan` or `provider_fallback` (`session.rs:244`), and
   crash recovery reattaches each kind (`reattach_pending_approvals`,
   `recovery.rs:311`).
-- The existing absolute cap is `ABSOLUTE_TOOL_ROUND_CAP` (`chat.rs:4117`), value
+- The existing absolute cap is `ABSOLUTE_TOOL_ROUND_CAP` (`chat.rs:4372`), value
   **16**, and the default segment is `agent_max_tool_rounds` (`config.rs:2570`),
   value **8**. §5.3's `ABSOLUTE_TURN_ROUND_CAP` is a new, distinct constant.
 
@@ -151,7 +151,7 @@ pending turn and:
   forced final call with tools dropped, and the turn ends as today: answered, or
   `ToolBudgetExhausted` if the model still asks for a tool.
 
-`round_budget_extension` is a *local* of `run_agentic_turn` (`chat.rs:1945`), not
+`round_budget_extension` is a *local* of `run_agentic_turn` (`chat.rs:1981`), not
 part of the persisted turn. The `round_budget` field's `rounds_granted` is the
 running total, and the resumed turn seeds `round_budget_extension` from it so its
 `max_rounds` continues where it stopped rather than resetting to the base limit.

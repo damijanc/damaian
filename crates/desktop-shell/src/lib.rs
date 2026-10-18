@@ -9,19 +9,19 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use workspace_engine::finding::{FindingStatus, RepairRequest};
 use workspace_engine::{
-    AgentFallbackProposal, AgentPlanProposal, CURRENT_DATA_SCHEMA_VERSION, CancelToken,
-    ChatMessage, ChatTurnOptions, ChatTurnResult, Config, CostEstimate, CurlModelTransport,
-    DataSchemaOutcome, EffectivePolicy, ExportFormat, GeneratedSecretWarning, McpClient,
-    McpServerConfig, McpTokenResolver, McpTransport, ModelAdapter, ModelRequest, ModelRun,
-    OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId,
-    ProposedFilePatch, ResumeDecisionOptions, SearchOptions, Session, SessionMode, StepStatus,
-    TaskPlan, TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall,
-    WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
-    WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible, command_approval_prompt,
-    custom_profile_ids, ensure_data_dir_schema, export_profile, import_profile,
-    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
-    parse_hunk_selection, parse_mcp_transport, patch_diff_text, profile_import_base,
-    review_profile_import, review_profile_rejections, select_profile,
+    AgentFallbackProposal, AgentPlanProposal, AgentRoundBudgetProposal,
+    CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult, Config,
+    CostEstimate, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExportFormat,
+    GeneratedSecretWarning, McpClient, McpServerConfig, McpTokenResolver, McpTransport,
+    ModelAdapter, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep,
+    ProcessRegistry, ProfileId, ProposedFilePatch, ResumeDecisionOptions, SearchOptions, Session,
+    SessionMode, StepStatus, TaskPlan, TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink,
+    WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport,
+    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible,
+    command_approval_prompt, custom_profile_ids, ensure_data_dir_schema, export_profile,
+    import_profile, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    profile_import_base, review_profile_import, review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -3628,6 +3628,22 @@ fn fallback_proposal_json(proposal: Option<&AgentFallbackProposal>) -> String {
     )
 }
 
+/// Spec 61's round-budget pause: the rounds used and granted, and whether the
+/// turn is at the hard cap (so the shell can offer only *Answer now*).
+fn round_budget_proposal_json(proposal: Option<&AgentRoundBudgetProposal>) -> String {
+    let Some(proposal) = proposal else {
+        return "null".to_string();
+    };
+    format!(
+        "{{\"proposalId\":\"{}\",\"roundsUsed\":{},\"roundsTotal\":{},\"roundsGranted\":{},\"atHardCap\":{}}}",
+        escape_json(&proposal.id),
+        proposal.rounds_used,
+        proposal.rounds_total,
+        proposal.rounds_granted,
+        proposal.at_hard_cap,
+    )
+}
+
 /// Forwards a turn's events to the client as SSE, and stops the turn if the
 /// client goes away.
 ///
@@ -3731,7 +3747,7 @@ where
 
 fn chat_result_json(result: &ChatTurnResult) -> String {
     format!(
-        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"usage\":{}}}",
+        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"usage\":{}}}",
         escape_json(&result.response),
         json_string_array(&result.context_files),
         escape_json(&result.session.id),
@@ -3744,6 +3760,7 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         patch_proposal_json(result),
         plan_proposal_json(result.plan_proposal.as_ref()),
         fallback_proposal_json(result.fallback_proposal.as_ref()),
+        round_budget_proposal_json(result.round_budget_proposal.as_ref()),
         task_usage_json(result.usage.as_ref(), result.estimated_cost)
     )
 }

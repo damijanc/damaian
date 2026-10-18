@@ -356,6 +356,28 @@ pub struct AgentFallbackProposal {
     pub message: String,
 }
 
+/// The pause a turn takes when it reaches its round budget with the model
+/// still wanting a tool (spec 61). Resumed through `resume_round_budget` once
+/// that exists (Task 2); for now the proposal is carried so the shell can
+/// render the pause and the id hand back to the resume entry point.
+///
+/// Names the rounds the turn has used and been granted so the row can say
+/// "Used 8 of 8" without the model guessing a number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRoundBudgetProposal {
+    /// The id to hand back to `resume_round_budget`.
+    pub id: String,
+    /// The round that hit the limit.
+    pub rounds_used: u32,
+    /// The round limit the turn had this segment (`max_rounds`).
+    pub rounds_total: u32,
+    /// The running total of extra rounds granted across continuations.
+    pub rounds_granted: u32,
+    /// `ABSOLUTE_TURN_ROUND_CAP` reached, so only *Answer now* is offered
+    /// (Task 3 computes this; Task 1 always reports `false`).
+    pub at_hard_cap: bool,
+}
+
 /// One step of a user's revision to a proposed plan.
 ///
 /// Identifies the step by id rather than position so a reorder and a deletion
@@ -386,6 +408,9 @@ pub struct ChatTurnResult {
     /// The turn is paused, not failed, until
     /// [`ChatOrchestrator::resume_after_fallback_decision`] decides.
     pub fallback_proposal: Option<AgentFallbackProposal>,
+    /// The turn reached its round budget and paused before the forced final
+    /// call. Resumed through `resume_round_budget` (spec 61).
+    pub round_budget_proposal: Option<AgentRoundBudgetProposal>,
     /// The user stopped this turn. Distinct from a failure: `response` holds
     /// whatever had been generated, and it is persisted.
     pub cancelled: bool,
@@ -2070,6 +2095,27 @@ impl ChatOrchestrator {
                 + round_budget_extension)
                 .min(ABSOLUTE_TOOL_ROUND_CAP);
             let force_final = round >= max_rounds;
+            // Spec 61 §5.1: at the round budget, with no token ceiling to
+            // continue under, pause before the forced final call instead of
+            // spending it on text nobody sees. The forced call is made only
+            // when the user answers *Answer now*. #47's continuation still
+            // applies when a ceiling is set and the absolute cap is not yet
+            // reached, so the forced call proceeds on that path.
+            if force_final
+                && (self.config.agent_max_task_tokens.is_none() || round >= ABSOLUTE_TOOL_ROUND_CAP)
+            {
+                return self.pause_for_round_budget(
+                    repository_root,
+                    session,
+                    task,
+                    context_files,
+                    messages,
+                    round,
+                    max_rounds,
+                    round_budget_extension,
+                    turn_options,
+                );
+            }
             let tools = if force_final {
                 None
             } else {
@@ -2547,6 +2593,7 @@ impl ChatOrchestrator {
                             deferred_action: deferred_action.clone(),
                         }),
                         provider_fallback: None,
+                        round_budget: None,
                     })?;
                     self.note_pending_approvals(
                         &session,
@@ -2706,6 +2753,7 @@ impl ChatOrchestrator {
                                     web_diagnostic_call: None,
                                     plan_review: None,
                                     provider_fallback: None,
+                                    round_budget: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -3037,6 +3085,7 @@ impl ChatOrchestrator {
                                     web_diagnostic_call: Some(PendingWebDiagnosticCall { call }),
                                     plan_review: None,
                                     provider_fallback: None,
+                                    round_budget: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -3149,6 +3198,7 @@ impl ChatOrchestrator {
                                     web_diagnostic_call: None,
                                     plan_review: None,
                                     provider_fallback: None,
+                                    round_budget: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -3448,6 +3498,7 @@ impl ChatOrchestrator {
             patch_proposal: proposals.patch,
             plan_proposal: proposals.plan,
             fallback_proposal: None,
+            round_budget_proposal: None,
             cancelled: false,
             usage,
             estimated_cost,
@@ -3493,6 +3544,7 @@ impl ChatOrchestrator {
             web_diagnostic_call: None,
             plan_review: None,
             provider_fallback: Some(offer.clone()),
+            round_budget: None,
         })?;
         self.note_pending_approvals(
             &session,
@@ -3554,6 +3606,120 @@ impl ChatOrchestrator {
                 fallback_model: offer.fallback_model,
                 refusal_code: offer.refusal_code,
                 message: offer.message,
+            }),
+            round_budget_proposal: None,
+            cancelled: false,
+            usage,
+            estimated_cost,
+        })
+    }
+
+    /// Parks a turn that hit its round budget (spec 61 §5.1).
+    ///
+    /// Returned from the loop directly, before the forced final call is made:
+    /// nothing is in flight, so there is no model run to finish and no response
+    /// to persist, and skipping the seal is right — like a plan review, nothing
+    /// has happened yet and the turn may still continue. The forced call is made
+    /// only when the user answers *Answer now* (Task 2).
+    #[allow(clippy::too_many_arguments)]
+    fn pause_for_round_budget(
+        &self,
+        repository_root: &Path,
+        session: Session,
+        task: Task,
+        context_files: Vec<String>,
+        messages: Vec<ModelMessage>,
+        round: u32,
+        max_rounds: u32,
+        rounds_granted: u32,
+        turn_options: ChatTurnOptions,
+    ) -> Result<ChatTurnResult> {
+        let proposal_id = create_id("roundbudget");
+        let response = round_budget_pause_response(round, max_rounds);
+        let pause = RoundBudgetPause {
+            rounds_used: round,
+            rounds_granted,
+        };
+        self.pending_commands.save(&PendingChatTurn {
+            proposal_id: proposal_id.clone(),
+            session: session.clone(),
+            task: task.clone(),
+            repository_root: repository_root.to_string_lossy().to_string(),
+            context_files: context_files.clone(),
+            round,
+            // The conversation so far, unchanged: nothing was dispatched, so
+            // resuming replays it and the model simply asks for its tool again.
+            messages,
+            matched_tool_call: None,
+            last_content: String::new(),
+            turn_options,
+            reasoning_content: None,
+            round_calls_fed_back: false,
+            mcp_call: None,
+            web_diagnostic_call: None,
+            plan_review: None,
+            provider_fallback: None,
+            round_budget: Some(pause),
+        })?;
+        self.note_pending_approvals(
+            &session,
+            &task,
+            vec![PendingApproval {
+                kind: "round_budget".to_string(),
+                proposal_id: proposal_id.clone(),
+            }],
+        );
+        let task = self.session_store.await_approval(
+            &task,
+            &crate::session::PendingApprovalRef {
+                kind: "round_budget".to_string(),
+                proposal_id: proposal_id.clone(),
+            },
+        )?;
+        self.audit_log.record(
+            "round_budget_paused",
+            &[
+                ("actor", "system".to_string()),
+                ("sessionId", session.id.clone()),
+                ("taskId", task.id.clone()),
+                ("proposalId", proposal_id.clone()),
+                ("roundsUsed", round.to_string()),
+                ("roundsTotal", max_rounds.to_string()),
+                ("roundsGranted", rounds_granted.to_string()),
+            ],
+        )?;
+        let usage = self
+            .session_store
+            .read_task_usage(&session.id)
+            .ok()
+            .and_then(|usage| usage.get(&task.id).copied());
+        let estimated_cost = usage.as_ref().and_then(|usage| {
+            self.config.estimated_cost(&TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                source: usage.source,
+            })
+        });
+        let mut model_run =
+            ModelRun::cancelled_before_start(&self.config.model_provider, &self.config.model_name);
+        model_run.content = response.clone();
+        Ok(ChatTurnResult {
+            session,
+            task,
+            model_run,
+            context_files,
+            response,
+            command_proposal: None,
+            patch_proposal: None,
+            plan_proposal: None,
+            fallback_proposal: None,
+            round_budget_proposal: Some(AgentRoundBudgetProposal {
+                id: proposal_id,
+                rounds_used: round,
+                rounds_total: max_rounds,
+                rounds_granted,
+                at_hard_cap: false,
             }),
             cancelled: false,
             usage,
@@ -3628,6 +3794,7 @@ impl ChatOrchestrator {
             patch_proposal: None,
             plan_proposal: None,
             fallback_proposal: None,
+            round_budget_proposal: None,
             cancelled: true,
             usage,
             estimated_cost,
@@ -4040,11 +4207,30 @@ struct PendingChatTurn {
     /// before the offer existed loadable.
     #[serde(default)]
     provider_fallback: Option<PendingProviderFallback>,
+    /// Present when the pause is a round-budget stop (spec 61). As with a plan
+    /// review nothing was dispatched: the turn hit its round limit and paused
+    /// before the forced final call, so `messages` is the conversation so far
+    /// and `round` the round that hit the limit. `#[serde(default)]` keeps
+    /// pending turns written before the pause existed loadable.
+    #[serde(default)]
+    round_budget: Option<RoundBudgetPause>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PendingPlanReview {
     deferred_action: String,
+}
+
+/// The persisted half of a round-budget pause (spec 61). `rounds_granted` is
+/// the running total of extra rounds granted across continuations, so the
+/// resumed turn can seed its `round_budget_extension` from it and keep its
+/// limit where it stopped instead of resetting to the base segment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RoundBudgetPause {
+    /// The round that hit the limit.
+    rounds_used: u32,
+    /// The running total of granted rounds across continuations.
+    rounds_granted: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -5444,6 +5630,13 @@ fn tool_budget_exhausted_response(max_rounds: u32) -> String {
     format!(
         "This turn reached the configured tool round limit ({max_rounds}) while the model was still trying to call another tool. I stopped instead of treating the raw tool request as a completed answer. Continue debugging with a narrower next request or approve a larger diagnostic budget if available."
     )
+}
+
+/// The pause message a round-budget stop leaves in the transcript (spec 61
+/// §5.6). Names the rounds so the user knows where the turn is; the buttons the
+/// shell renders beside it are what carry the decision.
+fn round_budget_pause_response(rounds_used: u32, rounds_total: u32) -> String {
+    format!("Used {rounds_used} of {rounds_total} tool rounds.")
 }
 
 /// Builds the approval proposal surfaced to the user for a pending MCP tool
