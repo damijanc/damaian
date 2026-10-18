@@ -18,7 +18,7 @@ use crate::finding::{
     Finding, Severity, default_parsers, findings_from_execution, findings_from_web_record,
     resolve_finding_path,
 };
-use crate::git_service::{DiffOptions, GitService, GitStatus};
+use crate::git_service::{DiffOptions, GitService, GitStatus, WorktreeListing};
 use crate::hash::{create_id, now_millis};
 use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
@@ -1865,6 +1865,16 @@ impl ChatOrchestrator {
                 base: None,
             }) {
                 tools.push(read_git_diff_tool_definition());
+            }
+            if offered(&ToolAction::ListWorktrees { base: None }) {
+                tools.push(list_worktrees_tool_definition());
+            }
+            if offered(&ToolAction::ReadGitLog {
+                worktree: None,
+                base: None,
+                max_count: None,
+            }) {
+                tools.push(read_git_log_tool_definition());
             }
             if self.web_diagnostics_runner.is_some()
                 && offered(&ToolAction::WebDiagnostic(WebDiagnosticCall {
@@ -3948,6 +3958,36 @@ impl ChatOrchestrator {
                     outcome,
                 )
             }
+            ToolAction::ListWorktrees { base } => {
+                let (content, outcome) =
+                    match self.git.list_worktrees(repository_root, base.as_deref()) {
+                        Ok(listing) => (format_worktree_listing(&listing), ActionOutcome::Ok),
+                        Err(error) => (
+                            format!("Cannot list worktrees: {error}"),
+                            ActionOutcome::Failed,
+                        ),
+                    };
+                ("Listed worktrees".to_string(), content, outcome)
+            }
+            ToolAction::ReadGitLog {
+                base, max_count, ..
+            } => {
+                let (content, outcome) =
+                    match self
+                        .git
+                        .log_in(repository_root, worktree, base.as_deref(), *max_count)
+                    {
+                        Ok(log) if log.trim().is_empty() => {
+                            (format!("No commits{scope}."), ActionOutcome::Ok)
+                        }
+                        Ok(log) => (log, ActionOutcome::Ok),
+                        Err(error) => (
+                            format!("Cannot read git log: {error}"),
+                            ActionOutcome::Failed,
+                        ),
+                    };
+                (format!("Read git log{scope}"), content, outcome)
+            }
             other => unreachable!("not a read-only action: {other:?}"),
         }
     }
@@ -4467,6 +4507,17 @@ pub(crate) enum ToolAction {
         stat: bool,
         base: Option<String>,
     },
+    /// Lists the repository's reachable worktrees (spec 60 §5.2). No
+    /// `worktree`: it is the tool that discovers them.
+    ListWorktrees {
+        base: Option<String>,
+    },
+    /// `base..HEAD` as one-line summaries (spec 60 §5.2).
+    ReadGitLog {
+        worktree: Option<String>,
+        base: Option<String>,
+        max_count: Option<usize>,
+    },
     WebDiagnostic(WebDiagnosticCall),
     McpCall {
         server_id: String,
@@ -4517,7 +4568,9 @@ fn action_effect(action: &ToolAction) -> ActionEffect {
         | ToolAction::SearchContent { .. }
         | ToolAction::SearchCodebase { .. }
         | ToolAction::ReadGitStatus { .. }
-        | ToolAction::ReadGitDiff { .. } => ActionEffect::ReadOnly,
+        | ToolAction::ReadGitDiff { .. }
+        | ToolAction::ListWorktrees { .. }
+        | ToolAction::ReadGitLog { .. } => ActionEffect::ReadOnly,
     }
 }
 
@@ -4558,7 +4611,8 @@ fn read_tool_worktree(action: &ToolAction) -> Option<&str> {
         | ToolAction::ListDirectory { worktree, .. }
         | ToolAction::SearchContent { worktree, .. }
         | ToolAction::ReadGitStatus { worktree }
-        | ToolAction::ReadGitDiff { worktree, .. } => worktree.as_deref(),
+        | ToolAction::ReadGitDiff { worktree, .. }
+        | ToolAction::ReadGitLog { worktree, .. } => worktree.as_deref(),
         _ => None,
     }
 }
@@ -4618,6 +4672,23 @@ fn tool_action_marker_unscoped(
                 reference.push_str(&format!(" paths={}", paths.join(",")));
             }
             ("read_git_diff", reference, side_effecting)
+        }
+        ToolAction::ListWorktrees { base } => (
+            "list_worktrees",
+            base.clone().unwrap_or_default(),
+            side_effecting,
+        ),
+        ToolAction::ReadGitLog {
+            base, max_count, ..
+        } => {
+            let mut reference = String::new();
+            if let Some(base) = base {
+                reference.push_str(&format!(" base={base}"));
+            }
+            if let Some(max_count) = max_count {
+                reference.push_str(&format!(" n={max_count}"));
+            }
+            ("read_git_log", reference, side_effecting)
         }
         ToolAction::WebDiagnostic(call) => ("web_diagnostic", call.url.clone(), side_effecting),
         ToolAction::McpCall {
@@ -4762,6 +4833,10 @@ fn tool_action_label(action: &ToolAction) -> String {
                 )
             }
         }
+        ToolAction::ListWorktrees { .. } => "Listing worktrees".to_string(),
+        ToolAction::ReadGitLog { worktree, .. } => {
+            format!("Reading git log{}", in_worktree(worktree.as_deref()))
+        }
         ToolAction::WebDiagnostic(call) => match call.kind {
             WebDiagnosticKind::Inspect => format!("Inspecting {}", call.url),
             WebDiagnosticKind::Scenario => format!("Running web scenario on {}", call.url),
@@ -4887,6 +4962,22 @@ fn read_git_diff_tool_definition() -> ToolDefinition {
         name: "read_git_diff".to_string(),
         description: "Read the repository's current git diff, or a git worktree's with `worktree`. Restricted files are left out and a long diff is cut with a note saying what was cut. Prefer this over running git in a shell: it needs no approval.".to_string(),
         parameters_json: "{\"type\":\"object\",\"properties\":{\"staged\":{\"type\":\"boolean\",\"description\":\"Read the staged diff instead of the working tree diff; defaults to false\"},\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"},\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Limit the diff to these files or directories, relative to the repository or worktree\"},\"stat\":{\"type\":\"boolean\",\"description\":\"Return a --stat summary of changed files instead of hunks; defaults to false\"},\"base\":{\"type\":\"string\",\"description\":\"A branch name; compare against its merge base with HEAD, so the diff includes the branch's commits as well as uncommitted changes\"}},\"required\":[]}".to_string(),
+    }
+}
+
+fn list_worktrees_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "list_worktrees".to_string(),
+        description: "List this repository's git worktrees: each one's path, branch (or `detached`), short HEAD, count of changed files, and how far it is ahead of and behind a base branch. Use this to discover the worktrees, then pass one's path as `worktree` to the read tools. Restricted files are not counted. Prefer this over running git in a shell: it needs no approval.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"base\":{\"type\":\"string\",\"description\":\"A branch name to measure ahead/behind against; defaults to the main worktree's branch, and is omitted when it is detached\"}},\"required\":[]}".to_string(),
+    }
+}
+
+fn read_git_log_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "read_git_log".to_string(),
+        description: "Read the commits a branch (or a git worktree with `worktree`) has that a base branch does not, as `short-sha subject` lines, newest first. Prefer this over running git in a shell: it needs no approval.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"},\"base\":{\"type\":\"string\",\"description\":\"A branch name; list only the commits `base..HEAD`, i.e. what this branch has that `base` does not. Defaults to the main worktree's branch\"},\"max_count\":{\"type\":\"integer\",\"description\":\"Maximum number of commits to return; cannot exceed the configured read cap\"}},\"required\":[]}".to_string(),
     }
 }
 
@@ -5159,6 +5250,26 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
                 paths,
                 stat: flag("stat"),
                 base: string_argument(&arguments, "base"),
+            }))
+        }
+        "list_worktrees" => {
+            let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+                .unwrap_or(serde_json::Value::Null);
+            Ok(Some(ToolAction::ListWorktrees {
+                base: string_argument(&arguments, "base"),
+            }))
+        }
+        "read_git_log" => {
+            let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+                .unwrap_or(serde_json::Value::Null);
+            let max_count = arguments
+                .get("max_count")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as usize);
+            Ok(Some(ToolAction::ReadGitLog {
+                worktree: string_argument(&arguments, "worktree"),
+                base: string_argument(&arguments, "base"),
+                max_count,
             }))
         }
         "inspect_web_page" | "run_web_scenario" => {
@@ -5604,6 +5715,42 @@ fn format_git_status(status: &GitStatus) -> String {
         }
         listed
     }
+}
+
+/// `list_worktrees`' result text: one line per listed worktree with path,
+/// branch (or `detached`), short `HEAD`, changed-file count and, when a base
+/// exists, ahead/behind (spec 60 §5.2). The rest are counted, not listed.
+fn format_worktree_listing(listing: &WorktreeListing) -> String {
+    let mut text = match &listing.base {
+        Some(base) => format!(
+            "Worktrees ({} listed, ahead/behind vs `{base}`):\n",
+            listing.entries.len()
+        ),
+        None => format!("Worktrees ({} listed):\n", listing.entries.len()),
+    };
+    for entry in &listing.entries {
+        let branch = entry.branch.as_deref().unwrap_or("detached");
+        let mut line = format!(
+            "{}: {} @ {}, {} changed files",
+            entry.path,
+            branch,
+            entry.head.as_deref().unwrap_or("unknown"),
+            entry.changed_files,
+        );
+        if let (Some(ahead), Some(behind)) = (entry.ahead, entry.behind) {
+            line.push_str(&format!(", {ahead} ahead, {behind} behind"));
+        }
+        text.push_str(&line);
+        text.push('\n');
+    }
+    if listing.omitted > 0 {
+        text.push_str(&format!(
+            "[Worktrees truncated: {} of {} listed.]\n",
+            listing.entries.len(),
+            listing.entries.len() + listing.omitted
+        ));
+    }
+    text
 }
 
 fn tool_call_summary(command_request: &CommandRequest) -> String {

@@ -1,8 +1,9 @@
 # Feature Spec: Worktree-Aware Read Tools
 
-Status: In progress (started 2026-10-17). Tasks 1–2 of 6 are done: registered
-worktrees are resolved and refused (§5.1), though no tool uses it yet, and the
-git reads on the main checkout are hardened (§5.4). Plan and progress in
+Status: In progress (started 2026-10-17). Tasks 1–4 of 6 are done: registered
+worktrees are resolved and refused (§5.1), the git reads are hardened (§5.4),
+the five read tools take `worktree` (§5.3), and `list_worktrees` and
+`read_git_log` are live (§5.2). Plan and progress in
 [`tasks.md`](tasks.md). Specified on 2026-10-17 from the same
 session as [#59](../59_exploration_round_allowance/proposal.md), after it was
 continued three times and still did not finish: 35 of its 40 approval prompts
@@ -189,11 +190,11 @@ the default is absent and `ahead`/`behind` are omitted rather than guessed.
 
 `list_worktrees` puts ahead and behind counts in one result because the session
 spent a round, and an approval, per worktree to get them. With `n` worktrees it
-spawns `1 + 2n` git processes (the list, then `status` and `rev-list
---left-right --count` per worktree), capped at 20 worktrees with the rest
-counted. On this machine a spawn is usually milliseconds and occasionally
-~280 ms (`docs/TROUBLESHOOTING.md`, "The quality gate is slow locally"), so the
-cap also bounds the worst case.
+spawns `1 + 3n` git processes (the list, then `status`, `rev-parse --short HEAD`
+and `rev-list --left-right --count` per worktree), capped at 20 worktrees with
+the rest counted. On this machine a spawn is usually milliseconds and
+occasionally ~280 ms (`docs/TROUBLESHOOTING.md`, "The quality gate is slow
+locally"), so the cap also bounds the worst case.
 
 Tool descriptions say plainly what the session lacked: worktrees exist,
 `list_worktrees` finds them, and the read tools take `worktree` — so the model
