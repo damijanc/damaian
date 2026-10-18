@@ -259,14 +259,16 @@ the gaps are the same ([`context.md`](context.md) §3).
 
 ### 5.5 Recording
 
-- The audit records `git_status_read` and `git_diff_read` gain a `worktree`
-  field (empty for the main checkout). `list_worktrees` records
+- The audit records of the five read tools (`file_read`, `directory_listed`,
+  `content_searched`, `git_status_read` and `git_diff_read`) gain a `worktree`
+  field, the worktree's display path, empty for the session's own checkout. `list_worktrees` records
   `git_worktrees_listed` with the count, and `read_git_log` records
   `git_log_read`.
 - The action marker's `ref` carries the worktree prefix
   (`.claude/worktrees/spec25-task8:crates/…/symbol_index.rs`), so the session log
   says where a read happened and #59's repeat detection distinguishes the same
-  path in two worktrees.
+  path in two worktrees. A worktree read's `FileRead` evidence carries the same
+  prefixed path.
 - A refused `worktree` argument is an ordinary failed tool call with
   `ActionOutcome::Failed`. It is not a finding: a refusal of a read is not a
   defect in the user's code.
@@ -338,6 +340,12 @@ and why: not registered, outside the allowed roots, or prunable), and
   `GitReadCaps`. The hardening applies to the CLI's `git-status`/`git-diff`
   and the desktop shell's `/api/git-status` too, since they call the same
   functions. `tasks.md` lists every way main-checkout output changed.
+- Task 3 (2026-10-18): dispatch resolves `worktree` once and calls `_in`
+  siblings of the existing read functions (`read_file_in`,
+  `list_directory_in`, `search_content_in`, `status_in`, `diff_in`) with the
+  worktree's root and display path; the old functions pass `None`. `base` is
+  validated in Rust and the merge base resolved by its own git call; `paths`
+  go through `PathPolicy::resolve_for_write` so a deleted file can be named.
 - Found in Task 2, not addressed: `.gitattributes` can select a
   `filter=<name>` whose `clean` command the user's own git config defines,
   and `status` and `diff` run it on stat-dirty files. Git has no flag that

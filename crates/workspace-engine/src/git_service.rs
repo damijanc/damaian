@@ -49,6 +49,57 @@ impl GitReadCaps {
     }
 }
 
+/// What `read_git_diff` asks of [`GitService::diff_in`] beyond the root
+/// (spec 60 §5.2). The default is the diff `read_git_diff` always returned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffOptions {
+    /// The index against `HEAD` (or the merge base) instead of the working tree.
+    pub staged: bool,
+    /// Limit the diff to these root-relative paths or directories.
+    pub paths: Vec<String>,
+    /// `--stat` instead of hunks.
+    pub stat: bool,
+    /// Compare against `merge-base(base, HEAD)` instead of the index.
+    pub base: Option<String>,
+}
+
+/// Refuses a `base` that is not a branch name under `git check-ref-format
+/// --allow-onelevel`'s rules, or that starts with `-`. Checked in Rust before
+/// any git process starts, so a refused `base` never reaches git, which is
+/// what keeps `--output=<file>` from being an option and `main..; rm` from
+/// being anything at all. Stricter than git where it is cheap to be: no
+/// leading `/` and no `@`.
+fn validate_base(base: &str) -> Result<()> {
+    let invalid = base.is_empty()
+        || base.starts_with('-')
+        || base.starts_with('/')
+        || base.ends_with('/')
+        || base.ends_with('.')
+        || base.contains("..")
+        || base.contains("@{")
+        || base == "@"
+        || base
+            .chars()
+            .any(|c| c.is_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+        || base
+            .split('/')
+            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"));
+    if invalid {
+        return Err(ClientError::InvalidInput(format!(
+            "`{base}` is not a branch name git would accept as `base`"
+        )));
+    }
+    Ok(())
+}
+
+/// A root-relative path as a pathspec that matches it and nothing else: no
+/// glob, no magic, whatever bytes it holds.
+fn literal_pathspec(path: &[u8]) -> Vec<u8> {
+    let mut pathspec = b":(top,literal)".to_vec();
+    pathspec.extend_from_slice(path);
+    pathspec
+}
+
 /// A GitHub repository parsed from the `origin` remote.
 ///
 /// The fields are private so the only way to obtain one is
@@ -232,6 +283,16 @@ impl GitService {
     }
 
     pub fn status(&self, root_path: impl AsRef<Path>) -> Result<GitStatus> {
+        self.status_in(root_path, None)
+    }
+
+    /// [`Self::status`] of a worktree's root, recording `worktree` (its
+    /// display path) in the audit record; `None` is the session's own checkout.
+    pub fn status_in(
+        &self,
+        root_path: impl AsRef<Path>,
+        worktree: Option<&str>,
+    ) -> Result<GitStatus> {
         let output = git_output(root_path.as_ref(), &["status", "--porcelain=v1"])?;
         let exit_code = output.status.code().unwrap_or(-1);
         let full = String::from_utf8_lossy(&output.stdout).to_string();
@@ -278,6 +339,7 @@ impl GitService {
                 ),
                 ("exitCode", exit_code.to_string()),
                 ("fileCount", status.files.len().to_string()),
+                ("worktree", worktree.unwrap_or_default().to_string()),
             ],
         )?;
         Ok(status)
@@ -364,27 +426,79 @@ impl GitService {
 
     /// The working tree's (or with `staged`, the index's) diff, with
     /// restricted paths left out and the output capped (spec 60 §5.4).
+    pub fn diff(&self, root_path: impl AsRef<Path>, staged: bool) -> Result<String> {
+        self.diff_in(
+            root_path,
+            None,
+            &DiffOptions {
+                staged,
+                ..DiffOptions::default()
+            },
+        )
+    }
+
+    /// [`Self::diff`] with `read_git_diff`'s options, recording `worktree`
+    /// (its display path) in the audit record; `None` is the session's own
+    /// checkout. Default options run exactly the git commands `diff` always
+    /// ran, so its output is unchanged.
     ///
     /// Restricted paths are judged by [`PathPolicy::is_restricted`], the rule
     /// `read_file` refuses by, which a git pathspec cannot express. So the
     /// changed paths are listed first, without rename pairing so both sides of
     /// a rename are judged, and when any is restricted the content diff runs
-    /// over the others as literal pathspecs. When none is, it runs without
-    /// pathspecs and is byte-identical to `git diff`; a restricted file that
-    /// starts changing between the two git calls is the accepted gap.
-    /// Without the index refresh (`read_git`) the listing can also name a file
-    /// whose stat changed but whose content did not; it only widens the
-    /// pathspec, and the content diff prints nothing for it.
-    pub fn diff(&self, root_path: impl AsRef<Path>, staged: bool) -> Result<String> {
+    /// over the others as literal pathspecs. When none is, it runs over
+    /// `options.paths` alone and, without `paths`, is byte-identical to `git
+    /// diff`; a restricted file that starts changing between the two git calls
+    /// is the accepted gap. Without the index refresh (`read_git`) the listing
+    /// can also name a file whose stat changed but whose content did not; it
+    /// only widens the pathspec, and the content diff prints nothing for it.
+    ///
+    /// `base` and `paths` are model input. Both are checked before git runs:
+    /// `base` against git's ref-name rules, so it cannot become an option, and
+    /// each path through [`PathPolicy`], so it cannot leave `root_path`.
+    pub fn diff_in(
+        &self,
+        root_path: impl AsRef<Path>,
+        worktree: Option<&str>,
+        options: &DiffOptions,
+    ) -> Result<String> {
         let root = root_path.as_ref();
+        if let Some(base) = &options.base {
+            validate_base(base)?;
+        }
+        let scope = self.diff_scope(root, &options.paths)?;
+        let merge_base = match &options.base {
+            Some(base) => Some(self.merge_base(root, base)?),
+            None => None,
+        };
         let mut args = vec!["diff"];
-        if staged {
+        if options.staged {
             args.push("--staged");
         }
         args.extend(["--no-ext-diff", "--no-textconv"]);
         let mut listing_args = args.clone();
         listing_args.extend(["--name-status", "-z", "--no-renames"]);
-        let listing = git_output(root, &listing_args)?;
+        if options.stat {
+            args.push("--stat");
+        }
+        // Options end here: the merge base and pathspecs after it are never
+        // read as options, whatever they contain.
+        let revision: Vec<&str> = match &merge_base {
+            Some(sha) => vec!["--end-of-options", sha.as_str()],
+            None => Vec::new(),
+        };
+        let with_paths = |command: &mut Command, paths: &[Vec<u8>]| {
+            if !paths.is_empty() {
+                command.arg("--");
+                for path in paths {
+                    command.arg(OsStr::from_bytes(path));
+                }
+            }
+        };
+        let mut listing = read_git(root);
+        listing.args(&listing_args).args(&revision);
+        with_paths(&mut listing, &scope);
+        let listing = listing.output()?;
         let output = if !listing.status.success() {
             listing
         } else {
@@ -394,9 +508,7 @@ impl GitService {
                 .copied()
                 .filter(|path| !self.path_is_restricted(&String::from_utf8_lossy(path)))
                 .collect();
-            if kept.len() == changed.len() {
-                git_output(root, &args)?
-            } else if kept.is_empty() {
+            if kept.is_empty() && !changed.is_empty() {
                 // Everything changed is restricted: an empty diff, as if
                 // nothing had changed, without a second git call.
                 std::process::Output {
@@ -404,13 +516,14 @@ impl GitService {
                     ..listing
                 }
             } else {
+                let pathspecs = if kept.len() == changed.len() {
+                    scope
+                } else {
+                    kept.into_iter().map(literal_pathspec).collect()
+                };
                 let mut command = read_git(root);
-                command.args(&args).arg("--");
-                for path in kept {
-                    let mut pathspec = b":(top,literal)".to_vec();
-                    pathspec.extend_from_slice(path);
-                    command.arg(OsStr::from_bytes(&pathspec));
-                }
+                command.args(&args).args(&revision);
+                with_paths(&mut command, &pathspecs);
                 command.output()?
             }
         };
@@ -419,16 +532,14 @@ impl GitService {
             "git_diff_read",
             &[
                 ("actor", "system".to_string()),
-                (
-                    "resourcePath",
-                    root_path.as_ref().to_string_lossy().to_string(),
-                ),
+                ("resourcePath", root.to_string_lossy().to_string()),
                 (
                     "status",
                     if exit_code == 0 { "complete" } else { "failed" }.to_string(),
                 ),
                 ("exitCode", exit_code.to_string()),
-                ("staged", staged.to_string()),
+                ("staged", options.staged.to_string()),
+                ("worktree", worktree.unwrap_or_default().to_string()),
             ],
         )?;
         if exit_code != 0 {
@@ -441,6 +552,44 @@ impl GitService {
         // the scanner no longer recognises.
         let redacted = self.scanner.redact(raw_diff.as_ref()).text;
         Ok(self.cap_diff(redacted))
+    }
+
+    /// `paths` as root-relative literal pathspecs, each resolved through
+    /// [`PathPolicy`] so `..`, an absolute path or a symlink cannot reach
+    /// outside `root`. A path need not exist: a deleted file is still in the
+    /// diff.
+    fn diff_scope(&self, root: &Path, paths: &[String]) -> Result<Vec<Vec<u8>>> {
+        paths
+            .iter()
+            .map(|path| {
+                let resolved = self
+                    .path_policy
+                    .resolve_for_write(root, path)
+                    .map_err(|_| {
+                        ClientError::AccessDenied(format!(
+                            "Diff path `{path}` resolves outside the checkout being read"
+                        ))
+                    })?;
+                Ok(match resolved.relative_path.as_str() {
+                    "" | "." => b":(top)".to_vec(),
+                    relative => literal_pathspec(relative.as_bytes()),
+                })
+            })
+            .collect()
+    }
+
+    /// `merge-base(base, HEAD)` as a full SHA, so the diff compares against
+    /// the point the branch left `base` rather than `base`'s current tip.
+    fn merge_base(&self, root: &Path, base: &str) -> Result<String> {
+        let output = git_output(root, &["merge-base", "--end-of-options", base, "HEAD"])?;
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success() || sha.is_empty() {
+            return Err(ClientError::Git(format!(
+                "No merge base between `{base}` and HEAD: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(sha)
     }
 
     /// How many of `lines` fit under both caps, counting each with its newline.

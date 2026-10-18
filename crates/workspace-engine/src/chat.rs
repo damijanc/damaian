@@ -17,7 +17,7 @@ use crate::finding::{
     Finding, Severity, default_parsers, findings_from_execution, findings_from_web_record,
     resolve_finding_path,
 };
-use crate::git_service::{GitService, GitStatus};
+use crate::git_service::{DiffOptions, GitService, GitStatus};
 use crate::hash::{create_id, now_millis};
 use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
@@ -42,6 +42,7 @@ use crate::web_diagnostics::{
     WEB_SCENARIO_ACTIONS, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
     WebDiagnosticReport, WebDiagnosticsRunnerHandle,
 };
+use crate::worktree_access::resolve_worktree;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -1814,12 +1815,14 @@ impl ChatOrchestrator {
             if offered(&ToolAction::ReadFile {
                 path: String::new(),
                 range: None,
+                worktree: None,
             }) {
                 tools.push(read_file_tool_definition());
             }
             if offered(&ToolAction::ListDirectory {
                 dir: None,
                 depth: None,
+                worktree: None,
             }) {
                 tools.push(list_directory_tool_definition());
             }
@@ -1827,6 +1830,7 @@ impl ChatOrchestrator {
                 pattern: String::new(),
                 path_glob: None,
                 max_matches: None,
+                worktree: None,
             }) {
                 tools.push(search_content_tool_definition());
             }
@@ -1843,10 +1847,16 @@ impl ChatOrchestrator {
             }) {
                 tools.push(search_codebase_tool_definition());
             }
-            if offered(&ToolAction::ReadGitStatus) {
+            if offered(&ToolAction::ReadGitStatus { worktree: None }) {
                 tools.push(read_git_status_tool_definition());
             }
-            if offered(&ToolAction::ReadGitDiff { staged: false }) {
+            if offered(&ToolAction::ReadGitDiff {
+                staged: false,
+                worktree: None,
+                paths: Vec::new(),
+                stat: false,
+                base: None,
+            }) {
                 tools.push(read_git_diff_tool_definition());
             }
             if self.web_diagnostics_runner.is_some()
@@ -3685,14 +3695,39 @@ impl ChatOrchestrator {
         task: &Task,
         action: &ToolAction,
     ) -> (String, String, ActionOutcome) {
+        // Spec 60 §5.3: a `worktree` argument becomes a root here, once, and
+        // the same read functions then run on it under the session's policy.
+        // A refusal is an ordinary failed call naming the reachable worktrees.
+        let resolved = match read_tool_worktree(action) {
+            None => None,
+            Some(requested) => {
+                match resolve_worktree(&self.git, &self.path_policy, repository_root, requested) {
+                    Ok(worktree) => Some(worktree),
+                    Err(error) => {
+                        return (
+                            format!("Attempted to read worktree `{requested}`"),
+                            format!("Cannot use worktree `{requested}`: {error}"),
+                            ActionOutcome::Failed,
+                        );
+                    }
+                }
+            }
+        };
+        let worktree = resolved.as_ref().map(|worktree| worktree.display.as_str());
+        let repository_root = resolved
+            .as_ref()
+            .and_then(|worktree| worktree.canonical.as_deref())
+            .unwrap_or(repository_root);
+        let scope = in_worktree(worktree);
         match action {
-            ToolAction::ReadFile { path, range } => {
+            ToolAction::ReadFile { path, range, .. } => {
                 let window = match range {
                     Some(range) => ReadWindow::Range(*range),
                     None => ReadWindow::Default,
                 };
-                let (content, outcome) = match self.file_access.read_file(
+                let (content, outcome) = match self.file_access.read_file_in(
                     repository_root,
+                    worktree,
                     path,
                     Some(&task.id),
                     Some(&session.repository_id),
@@ -3702,7 +3737,7 @@ impl ChatOrchestrator {
                 ) {
                     Ok(file_read) => {
                         let mut content = format!(
-                            "Content of {}, lines {}–{} of {}:",
+                            "Content of {}{scope}, lines {}–{} of {}:",
                             file_read.path,
                             file_read.line_range.start,
                             file_read.line_range.end,
@@ -3714,24 +3749,31 @@ impl ChatOrchestrator {
                             ));
                         }
                         content.push_str(&format!("\n{}", file_read.content));
+                        // Evidence names the worktree too, so a read there is
+                        // never taken for a read of the same path here.
+                        let evidence_path = match worktree {
+                            Some(worktree) => format!("{worktree}:{}", file_read.path),
+                            None => file_read.path.clone(),
+                        };
                         (
                             content,
                             ActionOutcome::FileRead {
-                                path: file_read.path.clone(),
+                                path: evidence_path,
                                 hash: file_read.hash.clone(),
                             },
                         )
                     }
                     Err(error) => (
-                        format!("Cannot read {path}: {error}"),
+                        format!("Cannot read {path}{scope}: {error}"),
                         ActionOutcome::Failed,
                     ),
                 };
-                (format!("Read `{path}`"), content, outcome)
+                (format!("Read `{path}`{scope}"), content, outcome)
             }
-            ToolAction::ListDirectory { dir, depth } => {
-                match self.navigation.list_directory(
+            ToolAction::ListDirectory { dir, depth, .. } => {
+                match self.navigation.list_directory_in(
                     repository_root,
+                    worktree,
                     dir.as_deref(),
                     *depth,
                     Some(&task.id),
@@ -3741,19 +3783,23 @@ impl ChatOrchestrator {
                         let dir_name = dir.as_deref().unwrap_or(".");
                         let content = if listing.truncated {
                             format!(
-                                "Listing of {dir_name} ({} of {} paths):\n{}",
+                                "Listing of {dir_name}{scope} ({} of {} paths):\n{}",
                                 listing.paths.len(),
                                 listing.total_found,
                                 listing.paths.join("\n")
                             )
                         } else {
                             format!(
-                                "Listing of {dir_name} ({} paths):\n{}",
+                                "Listing of {dir_name}{scope} ({} paths):\n{}",
                                 listing.total_found,
                                 listing.paths.join("\n")
                             )
                         };
-                        (format!("Listed {dir_name}"), content, ActionOutcome::Ok)
+                        (
+                            format!("Listed {dir_name}{scope}"),
+                            content,
+                            ActionOutcome::Ok,
+                        )
                     }
                     Err(error) => (
                         "Attempted to list the directory.".to_string(),
@@ -3766,9 +3812,11 @@ impl ChatOrchestrator {
                 pattern,
                 path_glob,
                 max_matches,
+                ..
             } => {
-                match self.navigation.search_content(
+                match self.navigation.search_content_in(
                     repository_root,
+                    worktree,
                     pattern,
                     path_glob.as_deref(),
                     *max_matches,
@@ -3786,7 +3834,7 @@ impl ChatOrchestrator {
                             lines.push('\n');
                         }
                         let content = format!(
-                            "{} matches for \"{}\" across {} files (showing {}):\n{}",
+                            "{} matches for \"{}\" across {} files{scope} (showing {}):\n{}",
                             found.total_found,
                             pattern,
                             found.files_searched,
@@ -3794,7 +3842,7 @@ impl ChatOrchestrator {
                             lines,
                         );
                         (
-                            format!("Searched for \"{pattern}\""),
+                            format!("Searched for \"{pattern}\"{scope}"),
                             content,
                             ActionOutcome::Ok,
                         )
@@ -3846,20 +3894,37 @@ impl ChatOrchestrator {
                     ActionOutcome::Ok,
                 )
             }
-            ToolAction::ReadGitStatus => {
-                let (content, outcome) = match self.git.status(repository_root) {
+            ToolAction::ReadGitStatus { .. } => {
+                let (content, outcome) = match self.git.status_in(repository_root, worktree) {
+                    Ok(status) if worktree.is_some() => (
+                        format!("Git status{scope}:\n{}", format_git_status(&status)),
+                        ActionOutcome::Ok,
+                    ),
                     Ok(status) => (format_git_status(&status), ActionOutcome::Ok),
                     Err(error) => (
                         format!("Cannot read git status: {error}"),
                         ActionOutcome::Failed,
                     ),
                 };
-                ("Checked git status".to_string(), content, outcome)
+                (format!("Checked git status{scope}"), content, outcome)
             }
-            ToolAction::ReadGitDiff { staged } => {
-                let (content, outcome) = match self.git.diff(repository_root, *staged) {
+            ToolAction::ReadGitDiff {
+                staged,
+                paths,
+                stat,
+                base,
+                ..
+            } => {
+                let options = DiffOptions {
+                    staged: *staged,
+                    paths: paths.clone(),
+                    stat: *stat,
+                    base: base.clone(),
+                };
+                let (content, outcome) = match self.git.diff_in(repository_root, worktree, &options)
+                {
                     Ok(diff) if diff.trim().is_empty() => {
-                        ("No differences.".to_string(), ActionOutcome::Ok)
+                        (format!("No differences{scope}."), ActionOutcome::Ok)
                     }
                     Ok(diff) => (diff, ActionOutcome::Ok),
                     Err(error) => (
@@ -3868,7 +3933,10 @@ impl ChatOrchestrator {
                     ),
                 };
                 (
-                    format!("Read git diff{}", if *staged { " (staged)" } else { "" }),
+                    format!(
+                        "Read git diff{}{scope}",
+                        if *staged { " (staged)" } else { "" }
+                    ),
                     content,
                     outcome,
                 )
@@ -4318,18 +4386,23 @@ pub(crate) enum ToolAction {
     /// the step ended — the engine derives that from the evidence accrued
     /// while the step was in progress (§5.3).
     CompleteStep,
+    // `worktree` on the five read tools is the argument as the model gave it,
+    // resolved at dispatch (spec 60 §5.3); `None` reads the session's checkout.
     ReadFile {
         path: String,
         range: Option<LineRange>,
+        worktree: Option<String>,
     },
     ListDirectory {
         dir: Option<String>,
         depth: Option<usize>,
+        worktree: Option<String>,
     },
     SearchContent {
         pattern: String,
         path_glob: Option<String>,
         max_matches: Option<usize>,
+        worktree: Option<String>,
     },
     EditFile {
         summary: String,
@@ -4340,9 +4413,15 @@ pub(crate) enum ToolAction {
         semantic: bool,
         limit: usize,
     },
-    ReadGitStatus,
+    ReadGitStatus {
+        worktree: Option<String>,
+    },
     ReadGitDiff {
         staged: bool,
+        worktree: Option<String>,
+        paths: Vec<String>,
+        stat: bool,
+        base: Option<String>,
     },
     WebDiagnostic(WebDiagnosticCall),
     McpCall {
@@ -4393,7 +4472,7 @@ fn action_effect(action: &ToolAction) -> ActionEffect {
         | ToolAction::ListDirectory { .. }
         | ToolAction::SearchContent { .. }
         | ToolAction::SearchCodebase { .. }
-        | ToolAction::ReadGitStatus
+        | ToolAction::ReadGitStatus { .. }
         | ToolAction::ReadGitDiff { .. } => ActionEffect::ReadOnly,
     }
 }
@@ -4418,6 +4497,41 @@ fn tool_action_marker(action: &ToolAction) -> (&'static str, String, bool) {
     // the append-only session log, so a crash leaves `interrupted`, not
     // `unknown_external_outcome`.
     let side_effecting = matches!(action_effect(action), ActionEffect::WritesRepository);
+    // Spec 60 §5.5: a worktree read's reference is `<worktree>:<reference>`,
+    // so the log says where it happened and the same path in two worktrees is
+    // two references. Without `worktree` the reference is unchanged.
+    let (name, reference, side_effecting) = tool_action_marker_unscoped(action, side_effecting);
+    match read_tool_worktree(action) {
+        Some(worktree) => (name, format!("{worktree}:{reference}"), side_effecting),
+        None => (name, reference, side_effecting),
+    }
+}
+
+/// The `worktree` argument of a read tool, if it was given one.
+fn read_tool_worktree(action: &ToolAction) -> Option<&str> {
+    match action {
+        ToolAction::ReadFile { worktree, .. }
+        | ToolAction::ListDirectory { worktree, .. }
+        | ToolAction::SearchContent { worktree, .. }
+        | ToolAction::ReadGitStatus { worktree }
+        | ToolAction::ReadGitDiff { worktree, .. } => worktree.as_deref(),
+        _ => None,
+    }
+}
+
+/// " in worktree `x`" for a worktree read, nothing otherwise, so a read
+/// without `worktree` says exactly what it always said.
+fn in_worktree(worktree: Option<&str>) -> String {
+    worktree
+        .map(|worktree| format!(" in worktree `{worktree}`"))
+        .unwrap_or_default()
+}
+
+/// [`tool_action_marker`] before the worktree prefix.
+fn tool_action_marker_unscoped(
+    action: &ToolAction,
+    side_effecting: bool,
+) -> (&'static str, String, bool) {
     match action {
         ToolAction::Command(request) => ("run_command", request.command.clone(), side_effecting),
         ToolAction::ProposePatch(edit) => ("propose_patch", edit.summary.clone(), side_effecting),
@@ -4439,8 +4553,28 @@ fn tool_action_marker(action: &ToolAction) -> (&'static str, String, bool) {
         ToolAction::SearchCodebase { query, .. } => {
             ("search_codebase", query.clone(), side_effecting)
         }
-        ToolAction::ReadGitStatus => ("read_git_status", String::new(), side_effecting),
-        ToolAction::ReadGitDiff { staged } => ("read_git_diff", staged.to_string(), side_effecting),
+        ToolAction::ReadGitStatus { .. } => ("read_git_status", String::new(), side_effecting),
+        ToolAction::ReadGitDiff {
+            staged,
+            paths,
+            stat,
+            base,
+            ..
+        } => {
+            // The options join the reference only when given, so a plain diff's
+            // reference is unchanged and two differently scoped diffs differ.
+            let mut reference = staged.to_string();
+            if let Some(base) = base {
+                reference.push_str(&format!(" base={base}"));
+            }
+            if *stat {
+                reference.push_str(" stat");
+            }
+            if !paths.is_empty() {
+                reference.push_str(&format!(" paths={}", paths.join(",")));
+            }
+            ("read_git_diff", reference, side_effecting)
+        }
         ToolAction::WebDiagnostic(call) => ("web_diagnostic", call.url.clone(), side_effecting),
         ToolAction::McpCall {
             server_id,
@@ -4548,22 +4682,40 @@ fn tool_action_label(action: &ToolAction) -> String {
         ToolAction::ProposePlan(steps) => format!("Planning {} steps", steps.len()),
         ToolAction::CompleteStep => "Finishing a step".to_string(),
         ToolAction::AskUser(_) => "Asking you a question".to_string(),
-        ToolAction::ReadFile { path, .. } => format!("Reading {path}"),
-        ToolAction::ListDirectory { dir, .. } => match dir {
-            Some(dir) => format!("Listing {dir}"),
-            None => "Listing the repository".to_string(),
+        ToolAction::ReadFile { path, worktree, .. } => {
+            format!("Reading {path}{}", in_worktree(worktree.as_deref()))
+        }
+        ToolAction::ListDirectory { dir, worktree, .. } => match (dir, worktree) {
+            (Some(dir), _) => format!("Listing {dir}{}", in_worktree(worktree.as_deref())),
+            (None, Some(worktree)) => format!("Listing worktree `{worktree}`"),
+            (None, None) => "Listing the repository".to_string(),
         },
-        ToolAction::SearchContent { pattern, .. } => {
-            format!("Searching for \"{pattern}\"")
+        ToolAction::SearchContent {
+            pattern, worktree, ..
+        } => {
+            format!(
+                "Searching for \"{pattern}\"{}",
+                in_worktree(worktree.as_deref())
+            )
         }
         ToolAction::EditFile { summary, .. } => format!("Preparing an edit: {summary}"),
         ToolAction::SearchCodebase { query, .. } => format!("Searching for \"{query}\""),
-        ToolAction::ReadGitStatus => "Reading git status".to_string(),
-        ToolAction::ReadGitDiff { staged } => {
+        ToolAction::ReadGitStatus { worktree } => {
+            format!("Reading git status{}", in_worktree(worktree.as_deref()))
+        }
+        ToolAction::ReadGitDiff {
+            staged, worktree, ..
+        } => {
             if *staged {
-                "Reading the staged diff".to_string()
+                format!(
+                    "Reading the staged diff{}",
+                    in_worktree(worktree.as_deref())
+                )
             } else {
-                "Reading the working diff".to_string()
+                format!(
+                    "Reading the working diff{}",
+                    in_worktree(worktree.as_deref())
+                )
             }
         }
         ToolAction::WebDiagnostic(call) => match call.kind {
@@ -4638,24 +4790,24 @@ fn ask_user_tool_definition() -> ToolDefinition {
 fn read_file_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "read_file".to_string(),
-        description: "Read a file from the repository to help answer the user's question. The result states the lines returned and the file's total line count, so a truncated read says so rather than reading as the whole file.".to_string(),
-        parameters_json: "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Repository-relative file path\"},\"start_line\":{\"type\":\"integer\",\"description\":\"First line to return, 1-based; default 1\"},\"end_line\":{\"type\":\"integer\",\"description\":\"Last line to return, inclusive; default is the last line or the read cap\"}},\"required\":[\"path\"]}".to_string(),
+        description: "Read a file from the repository, or from one of its git worktrees with `worktree`, to help answer the user's question. The result states the lines returned and the file's total line count, so a truncated read says so rather than reading as the whole file.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Repository-relative file path\"},\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"},\"start_line\":{\"type\":\"integer\",\"description\":\"First line to return, 1-based; default 1\"},\"end_line\":{\"type\":\"integer\",\"description\":\"Last line to return, inclusive; default is the last line or the read cap\"}},\"required\":[\"path\"]}".to_string(),
     }
 }
 
 fn list_directory_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "list_directory".to_string(),
-        description: "List repository-relative file paths, honouring .gitignore. Prefer this over a shell command: it needs no approval.".to_string(),
-        parameters_json: "{\"type\":\"object\",\"properties\":{\"dir\":{\"type\":\"string\",\"description\":\"Repository-relative directory; defaults to the repository root\"},\"depth\":{\"type\":\"integer\",\"description\":\"Maximum directory depth to descend\"}},\"required\":[]}".to_string(),
+        description: "List repository-relative file paths, honouring .gitignore. With `worktree`, list a git worktree of this repository instead, even one .gitignore hides. Prefer this over a shell command: it needs no approval.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"},\"dir\":{\"type\":\"string\",\"description\":\"Repository-relative directory; defaults to the repository root\"},\"depth\":{\"type\":\"integer\",\"description\":\"Maximum directory depth to descend\"}},\"required\":[]}".to_string(),
     }
 }
 
 fn search_content_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "search_content".to_string(),
-        description: "Search file contents by regular expression and return path, line number and the matching line. Use this to find call sites; use search_codebase to find which files are about a topic.".to_string(),
-        parameters_json: "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":\"Regular expression\"},\"path_glob\":{\"type\":\"string\",\"description\":\"Optional glob limiting which files are searched\"},\"max_matches\":{\"type\":\"integer\",\"description\":\"Fewer matches than the configured cap; it cannot raise it\"}},\"required\":[\"pattern\"]}".to_string(),
+        description: "Search file contents by regular expression and return path, line number and the matching line. Use this to find call sites; use search_codebase to find which files are about a topic. With `worktree`, search a git worktree of this repository instead.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"},\"pattern\":{\"type\":\"string\",\"description\":\"Regular expression\"},\"path_glob\":{\"type\":\"string\",\"description\":\"Optional glob limiting which files are searched\"},\"max_matches\":{\"type\":\"integer\",\"description\":\"Fewer matches than the configured cap; it cannot raise it\"}},\"required\":[\"pattern\"]}".to_string(),
     }
 }
 
@@ -4678,16 +4830,16 @@ fn search_codebase_tool_definition() -> ToolDefinition {
 fn read_git_status_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "read_git_status".to_string(),
-        description: "Read the repository's current git status (modified, staged, untracked, and conflicted files).".to_string(),
-        parameters_json: "{\"type\":\"object\",\"properties\":{}}".to_string(),
+        description: "Read the repository's current git status (modified, staged, untracked, and conflicted files), or a git worktree's with `worktree`. Prefer this over running git in a shell: it needs no approval.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"}}}".to_string(),
     }
 }
 
 fn read_git_diff_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "read_git_diff".to_string(),
-        description: "Read the repository's current git diff.".to_string(),
-        parameters_json: "{\"type\":\"object\",\"properties\":{\"staged\":{\"type\":\"boolean\",\"description\":\"Read the staged diff instead of the working tree diff; defaults to false\"}},\"required\":[]}".to_string(),
+        description: "Read the repository's current git diff, or a git worktree's with `worktree`. Restricted files are left out and a long diff is cut with a note saying what was cut. Prefer this over running git in a shell: it needs no approval.".to_string(),
+        parameters_json: "{\"type\":\"object\",\"properties\":{\"staged\":{\"type\":\"boolean\",\"description\":\"Read the staged diff instead of the working tree diff; defaults to false\"},\"worktree\":{\"type\":\"string\",\"description\":\"A git worktree of this repository to read instead of the repository itself, as its path relative to the repository root (for example .claude/worktrees/x) or absolute; paths are then relative to the worktree. Only worktrees git has registered for this repository are accepted; any other path is refused with the list of reachable worktrees\"},\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Limit the diff to these files or directories, relative to the repository or worktree\"},\"stat\":{\"type\":\"boolean\",\"description\":\"Return a --stat summary of changed files instead of hunks; defaults to false\"},\"base\":{\"type\":\"string\",\"description\":\"A branch name; compare against its merge base with HEAD, so the diff includes the branch's commits as well as uncommitted changes\"}},\"required\":[]}".to_string(),
     }
 }
 
@@ -4796,6 +4948,7 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
             Ok(Some(ToolAction::ReadFile {
                 path: path.to_string(),
                 range,
+                worktree: string_argument(&arguments, "worktree"),
             }))
         }
         "list_directory" => {
@@ -4813,7 +4966,11 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
                 .get("depth")
                 .and_then(|value| value.as_u64())
                 .map(|value| value as usize);
-            Ok(Some(ToolAction::ListDirectory { dir, depth }))
+            Ok(Some(ToolAction::ListDirectory {
+                dir,
+                depth,
+                worktree: string_argument(&arguments, "worktree"),
+            }))
         }
         "search_content" => {
             let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
@@ -4842,6 +4999,7 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
                 pattern: pattern.to_string(),
                 path_glob,
                 max_matches,
+                worktree: string_argument(&arguments, "worktree"),
             }))
         }
         "edit_file" => {
@@ -4917,13 +5075,44 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
                 limit,
             }))
         }
-        "read_git_status" => Ok(Some(ToolAction::ReadGitStatus)),
+        // Both stay as lenient as they always were: malformed arguments read
+        // the session's checkout rather than refusing the call.
+        "read_git_status" => {
+            let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+                .unwrap_or(serde_json::Value::Null);
+            Ok(Some(ToolAction::ReadGitStatus {
+                worktree: string_argument(&arguments, "worktree"),
+            }))
+        }
         "read_git_diff" => {
-            let staged = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
-                .ok()
-                .and_then(|value| value.get("staged").and_then(|value| value.as_bool()))
-                .unwrap_or(false);
-            Ok(Some(ToolAction::ReadGitDiff { staged }))
+            let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+                .unwrap_or(serde_json::Value::Null);
+            let flag = |key: &str| {
+                arguments
+                    .get(key)
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+            };
+            let paths = arguments
+                .get("paths")
+                .and_then(|value| value.as_array())
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry.as_str())
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(Some(ToolAction::ReadGitDiff {
+                staged: flag("staged"),
+                worktree: string_argument(&arguments, "worktree"),
+                paths,
+                stat: flag("stat"),
+                base: string_argument(&arguments, "base"),
+            }))
         }
         "inspect_web_page" | "run_web_scenario" => {
             WebDiagnosticCall::from_tool_call(&call.name, &call.arguments_json)
@@ -4937,6 +5126,16 @@ fn tool_action_from_call(call: &ToolCall) -> Result<Option<ToolAction>> {
             }),
         ),
     }
+}
+
+/// A trimmed, non-empty string argument, or `None`.
+fn string_argument(arguments: &serde_json::Value, key: &str) -> Option<String> {
+    arguments
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// A decoded call and what it asks for; `None` is the text-envelope fallback.
@@ -5703,6 +5902,7 @@ mod evidence_tests {
                 ToolAction::ReadFile {
                     path: "src/a.rs".to_string(),
                     range: None,
+                    worktree: None,
                 },
             ),
             (
@@ -5710,6 +5910,7 @@ mod evidence_tests {
                 ToolAction::ReadFile {
                     path: "src/b.rs".to_string(),
                     range: None,
+                    worktree: None,
                 },
             ),
         ]
@@ -5812,6 +6013,7 @@ mod evidence_tests {
                         pattern: "needle".to_string(),
                         path_glob: None,
                         max_matches: None,
+                        worktree: None,
                     },
                 )
             })

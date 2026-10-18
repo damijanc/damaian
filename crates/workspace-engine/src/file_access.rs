@@ -95,6 +95,33 @@ impl FileAccessController {
         allow_outside_root: bool,
         window: ReadWindow,
     ) -> Result<FileRead> {
+        self.read_file_in(
+            root_path,
+            None,
+            requested_path,
+            task_id,
+            repository_id,
+            allow_restricted,
+            allow_outside_root,
+            window,
+        )
+    }
+
+    /// [`Self::read_file`] under a worktree's root, recording `worktree` (its
+    /// display path) in the audit record; `None` is the session's own checkout.
+    /// The same policy, caps and redaction apply either way (spec 60 §5.3).
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_file_in(
+        &self,
+        root_path: impl AsRef<Path>,
+        worktree: Option<&str>,
+        requested_path: impl AsRef<Path>,
+        task_id: Option<&str>,
+        repository_id: Option<&str>,
+        allow_restricted: bool,
+        allow_outside_root: bool,
+        window: ReadWindow,
+    ) -> Result<FileRead> {
         let target =
             self.path_policy
                 .resolve_existing(root_path, requested_path, allow_outside_root)?;
@@ -219,6 +246,7 @@ impl FileAccessController {
                 ("status", "allowed".to_string()),
                 ("redactionStatus", result.redaction_status.clone()),
                 ("findingCount", result.finding_count.to_string()),
+                ("worktree", worktree.unwrap_or_default().to_string()),
             ],
         )?;
 
