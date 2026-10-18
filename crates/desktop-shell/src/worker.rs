@@ -26,7 +26,7 @@ use serde_json::{Map, Value, json};
 use workspace_engine::worker_progress::{ProgressKind, ProgressWriter};
 use workspace_engine::{
     CancelToken, ChatTurnOptions, ChatTurnResult, Config, ModelAdapter, PhaseKind, ProcessRegistry,
-    SecretScanner, TaskStatus, TurnProgress, TurnSink, TurnSteering,
+    RoundBudgetDecision, SecretScanner, TaskStatus, TurnProgress, TurnSink, TurnSteering,
 };
 
 /// The first argument that selects worker mode, in both `main`s.
@@ -502,6 +502,10 @@ impl ShutdownSignal {
 enum DecisionKind {
     Command,
     Plan,
+    /// A round-budget pause (spec 61). There is no reject: `approve` means
+    /// *Continue* and `reject` means *Answer now*, both of which resume the
+    /// same turn through `resume_round_budget`.
+    RoundBudget,
 }
 
 /// The turn the host holds. The cancel token and the steering belong to the
@@ -884,6 +888,21 @@ impl TurnDriver {
                 adapter.as_mut(),
                 &mut sink,
             ),
+            TurnJob::Decide {
+                proposal_id,
+                kind: DecisionKind::RoundBudget,
+                approved,
+            } => chat.resume_round_budget(
+                &proposal_id,
+                if approved {
+                    RoundBudgetDecision::Continue
+                } else {
+                    RoundBudgetDecision::AnswerNow
+                },
+                "desktop_user",
+                adapter.as_mut(),
+                &mut sink,
+            ),
         };
         progress.borrow_mut().flush();
         result.map_err(|error| error.to_string())
@@ -1032,15 +1051,18 @@ fn parsed(json_text: &str) -> Value {
     serde_json::from_str(json_text).unwrap_or(Value::Null)
 }
 
-/// A command or plan approval keeps the worker waiting on the socket (§5.6).
-/// A patch or a provider fallback offer ends the turn, and is answered through
-/// the shell's own routes with the worktree as `repo`.
+/// A command, plan or round-budget approval keeps the worker waiting on the
+/// socket (§5.6). A patch or a provider fallback offer ends the turn, and is
+/// answered through the shell's own routes with the worktree as `repo`.
 fn pending_decision(result: &ChatTurnResult) -> Option<(String, DecisionKind)> {
     if result.task.status != TaskStatus::WaitingForApproval {
         return None;
     }
     if let Some(plan) = &result.plan_proposal {
         return Some((plan.id.clone(), DecisionKind::Plan));
+    }
+    if let Some(round_budget) = &result.round_budget_proposal {
+        return Some((round_budget.id.clone(), DecisionKind::RoundBudget));
     }
     result
         .command_proposal
@@ -1064,6 +1086,11 @@ fn approval_payload(result: &ChatTurnResult) -> Option<Value> {
         (
             "fallback",
             crate::fallback_proposal_json(result.fallback_proposal.as_ref()),
+        )
+    } else if result.round_budget_proposal.is_some() {
+        (
+            "round_budget",
+            crate::round_budget_proposal_json(result.round_budget_proposal.as_ref()),
         )
     } else {
         return None;

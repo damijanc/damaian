@@ -56,7 +56,7 @@ pub use chat::{
     AgentCommandProposal, AgentFallbackProposal, AgentPatchProposal, AgentPlanProposal,
     AgentRoundBudgetProposal, ChatOrchestrator, ChatTurnOptions, ChatTurnResult, McpTokenResolver,
     PausedTurns, PhaseKind, PlanRevisionStep, ResumeDecisionOptions, RoundBudgetDecision,
-    TurnPhase, TurnProgress, TurnSink,
+    RoundBudgetPause, TurnPhase, TurnProgress, TurnSink,
 };
 pub use checkpoint::{
     CheckpointConversation, CheckpointExclusion, CheckpointFile, CheckpointManifest,

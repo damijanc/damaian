@@ -8494,6 +8494,14 @@ mod tests {
         const PWD: &str = r#"{"command":"pwd","reason":"See where the turn runs"}"#;
         const TOUCH: &str = r#"{"command":"touch approved.txt","reason":"Mark the tree"}"#;
 
+        /// A read-only command envelope the policy runs automatically, so a
+        /// turn of it walks the round budget without pausing for a command
+        /// approval (spec 61).
+        fn read_only_round() -> String {
+            "DAMAIAN_COMMAND_V1\nCOMMAND: pwd\nREASON: Confirm the working directory.\nEND_COMMAND\n"
+                .to_string()
+        }
+
         /// The worker builds an adapter per job; sharing one script across
         /// them lets a turn and its resume read one sequence, as one turn.
         #[derive(Clone)]
@@ -8976,6 +8984,49 @@ mod tests {
                 false,
                 "a decision resumes once"
             );
+        }
+
+        /// Spec 61 §5.5: a turn paused at its round budget is answered in the
+        /// worker's own process through `resume_round_budget`, never by the
+        /// shell reading the pending file. `approve` means *Continue*, so the
+        /// turn re-enters with more rounds and completes as the same task.
+        #[test]
+        fn a_worker_answers_a_round_budget_pause_in_process() {
+            let repo = fixture("rb");
+            // Eight read-only rounds hit the default eight-round budget; the
+            // ninth response answers after *Continue* re-enters the turn.
+            let responses: Vec<String> = (0..8)
+                .map(|_| read_only_round())
+                .chain(std::iter::once("Done looking.".to_string()))
+                .collect();
+            let script = Scripted::new(MockModelAdapter::new_sequence(responses));
+            let (host, session) = hosted(&repo, script);
+
+            assert_eq!(send(&host, message("Look at the files."))["ok"], true);
+            let waiting = settle(&host);
+            assert_eq!(waiting["state"], "waiting_for_approval", "{waiting}");
+            let proposal_id = waiting["proposalId"].as_str().unwrap().to_string();
+
+            let approvals = payloads(&progress(&session), "approval");
+            assert_eq!(approvals.len(), 1, "{approvals:?}");
+            assert_eq!(approvals[0]["kind"], "round_budget");
+            assert_eq!(approvals[0]["proposal"]["proposalId"], proposal_id.as_str());
+
+            assert_eq!(
+                send(&host, ControlCommand::Approve { proposal_id })["ok"],
+                true
+            );
+            let done = settle(&host);
+            assert_eq!(done["state"], "idle", "{done}");
+            assert_eq!(
+                done["pid"],
+                std::process::id(),
+                "the same process resumed it"
+            );
+
+            let tasks = store().read_tasks(&session).unwrap();
+            assert_eq!(tasks.len(), 1, "one turn, resumed, not a second one");
+            assert_eq!(tasks[0].status, TaskStatus::Complete);
         }
 
         /// §5.6: a patch ends the turn; the worker stays alive and idle, and

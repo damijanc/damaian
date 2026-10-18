@@ -569,6 +569,27 @@ fn describe_approval(
             ),
             unavailable_reason: None,
         },
+        // Spec 61. Like a plan review, the paused turn is on disk, so the card
+        // answers through the same resume the live pause uses and continuing
+        // resumes the turn. Only the rounds are named: that is all
+        // `PausedTurns` exposes for a round-budget pause.
+        ReattachedApproval::RoundBudget {
+            task_id,
+            proposal_id,
+            rounds_used,
+            rounds_granted,
+        } => Approval {
+            session_id: session_id.to_string(),
+            task_id,
+            kind: "round_budget",
+            payload: format!(
+                "{{\"proposalId\":\"{}\",\"roundsUsed\":{},\"roundsGranted\":{}}}",
+                escape_json(&proposal_id),
+                rounds_used,
+                rounds_granted,
+            ),
+            unavailable_reason: None,
+        },
         ReattachedApproval::Unavailable { task_id, reason } => Approval {
             session_id: session_id.to_string(),
             task_id,

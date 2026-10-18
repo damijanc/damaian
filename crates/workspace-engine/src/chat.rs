@@ -4393,12 +4393,16 @@ struct PendingPlanReview {
 /// the running total of extra rounds granted across continuations, so the
 /// resumed turn can seed its `round_budget_extension` from it and keep its
 /// limit where it stopped instead of resetting to the base segment.
+///
+/// Public because [`PausedTurns::round_budget_pause`] returns it, and crash
+/// recovery reads its two fields to decide whether the pause can be
+/// re-presented.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct RoundBudgetPause {
+pub struct RoundBudgetPause {
     /// The round that hit the limit.
-    rounds_used: u32,
+    pub rounds_used: u32,
     /// The running total of granted rounds across continuations.
-    rounds_granted: u32,
+    pub rounds_granted: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4480,6 +4484,22 @@ impl PausedTurns {
             .get("fallback_provider")?
             .as_str()
             .map(str::to_string)
+    }
+
+    /// The rounds a paused round-budget turn had used and been granted, or
+    /// `None` when the id names no paused turn, or one that is not a
+    /// round-budget pause (spec 61). Recovery reads it to know whether the
+    /// pause can still be re-presented; a missing or unreadable file means
+    /// resuming would have nothing to continue, which fails the task instead.
+    pub fn round_budget_pause(&self, proposal_id: &str) -> Option<RoundBudgetPause> {
+        let path = PendingCommandStore::new(&self.data_dir).path_for(proposal_id);
+        let content = fs::read_to_string(path).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let round_budget = value.get("round_budget")?;
+        Some(RoundBudgetPause {
+            rounds_used: round_budget.get("rounds_used")?.as_u64()? as u32,
+            rounds_granted: round_budget.get("rounds_granted")?.as_u64()? as u32,
+        })
     }
 }
 

@@ -197,7 +197,9 @@ cross it.
   missing or unreadable file fails the task with a stated reason and audits
   `pending_approval_unavailable`, as for the other kinds.
 - A worker session (#57) answers the pause in its own process, through the same
-  in-process approval path its command approvals use.
+  in-process approval path its command approvals use. The worker's socket
+  `approve` command means *Continue* and `reject` means *Answer now*; both
+  resume the turn through `resume_round_budget`.
 
 ### 5.6 What the user sees
 
