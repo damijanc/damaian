@@ -45,6 +45,11 @@ fn engine_with_ceiling(repo: &Path, ceiling: Option<u64>) -> WorkspaceEngine {
         // The repository map (spec 24) adds tokens to every request, so it
         // would move them for reasons that have nothing to do with the ceiling.
         repository_map_max_tokens: 0,
+        // The system prompt names the configured shell (spec 63 requirement
+        // 7), so the request size — and thus the measured call count — now
+        // depends on it. Pin zsh so the count below is not at the mercy of
+        // the machine's `$SHELL`.
+        shell: "/bin/zsh".to_string(),
         // Throwaway repository: a watcher would only cost FSEvents registration.
         enable_index_watcher: false,
         ..Config::default()
@@ -121,18 +126,21 @@ fn a_turn_stops_before_the_call_that_would_cross_the_ceiling() {
     // point of this ceiling is that it does *not* spend a call to discover it
     // has run out, and only the exact number can say so.
     //
-    // 3, measured rather than assumed: two calls record enough estimated usage
-    // to reach 1000 tokens, and the third iteration stops before its request is
-    // built. The `force_final` shape would make it 4. If this number moves,
-    // check *why* before updating it — a change here is a change in what the
-    // ceiling costs.
+    // 2, measured rather than assumed: the check runs before each request is
+    // built, and two calls now accumulate enough estimated usage to cross the
+    // 1000-token ceiling, so the third iteration stops before its request is
+    // built. This was 3 before spec 63 requirement 7 named the shell in the
+    // system prompt — a slightly longer prompt crosses sooner. The
+    // `force_final` shape would make it 3. If this number moves, check *why*
+    // before updating it — a change here is a change in what the ceiling
+    // costs.
     let repo = temp_repo("stops");
     let engine = engine_with_ceiling(&repo, Some(1_000));
     let (result, calls) = ask(&engine, &repo, "Look at the source", &mut keeps_working());
 
     assert_eq!(result.task.status, TaskStatus::TokenBudgetExhausted);
     assert_eq!(
-        calls, 3,
+        calls, 2,
         "the ceiling must not spend a model call discovering it was reached"
     );
 }
