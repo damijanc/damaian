@@ -326,6 +326,14 @@ logic in `command_purpose.rs` and `validation.rs` and touches
 `command_policy.rs` only to make `is_validation_command` visible, so it may run
 beside #64; either may pair with #61. #63's Task 4 rewrites the same
 model-facing command text as #62 and must not run beside it.
+[#65](65_exploration_memory_within_a_turn.md), added on 2026-10-18 from a
+review of #59–#64, is ready: #20, #34 and #47 are built. Only its requirement 7
+(how notes count against the round budget) waits for #59. Nothing depends on
+it. It edits `bounded_messages` and the turn loop in `chat.rs`, so it does not
+pair with #59, #60, #61 or #62. Build it after #59 and #61 if exploration is
+the priority. #59 gives a turn the rounds and #61 keeps a stopped turn alive;
+this spec makes those rounds still count once the request window has dropped
+them.
 
 ### Parallel work
 
@@ -433,6 +441,7 @@ is ready.
 | 62 | [62_approval_prompts_name_the_reason/](62_approval_prompts_name_the_reason/proposal.md) | **Not started; split into a folder and planned 2026-10-18.** See `tasks.md` for the task breakdown. Specified 2026-10-17: every approval said "because it cannot run in sandbox mode", and there is no sandbox. The classifier returns structured `ApprovalCause`s, the prompt's first line names the deciding one (which shell control, which keyword, which setting and who set it), the model's own reason is shown beside it, and "sandbox" leaves every user- and model-facing string. Changes no approval decision. |
 | 63 | [63_exploratory_command_failures/](63_exploratory_command_failures/proposal.md) | **In progress** (started 2026-10-17). Tasks 1–3 of 6 done: `CommandPurpose` is decided when a command is proposed, stored with the proposal and carried to its execution, and a test pins that it changes no policy decision. A failed exploration command now records no finding and no longer blocks its plan step; its exit is still kept as the step's evidence. Specified 2026-10-17: a zsh glob error and an `ls` of a missing directory became open **error** findings offered for repair, and a `grep` with no match blocks its plan step. Commands get a purpose (check, exploration, other) that never influences approval; exploration failures produce no finding and block no step, checks and unknown commands behave as today, and the model is told its shell and zsh's glob rule. |
 | 64 | [64_read_only_command_boundary.md](64_read_only_command_boundary.md) | **In progress** (started 2026-10-17): requirements 1–4 and 8, the tightening, are done, and requirements 6–7 (read-only pipelines: a leading `cd <dir> &&`, `&&` chains of admitted commands, `|` into stdin-only filters) were done 2026-10-18; requirement 5 waits for #60. Specified 2026-10-17. Began as "let read-only pipelines run unasked" and found the read-only list is not read-only: `git diff --output=<file>` writes, `$HOME/…` passes the outside-repository check, and `git show HEAD:.env` reads a restricted file, all without approval and in Plan and Review too. Replaces the prefix match with a tokenizer that refuses expansion, per-program option lists, and `PathPolicy` checks on every path argument; after #60, content-bearing `git diff/show/log -p` ask and the tools take over. Then admits `cd <dir> &&` and `&&`/`|` pipelines of admitted commands into stdin-only filters. |
+| 65 | [65_exploration_memory_within_a_turn.md](65_exploration_memory_within_a_turn.md) | **Not started.** Specified 2026-10-18 from a review of #59–#64: they give a turn the rounds to explore, but `bounded_messages` sends only the last ~7 rounds (`agent_max_turn_messages` 24), so in a #59-length turn most of what the agent read is gone before it answers, and re-reading it is charged as a repeat. Adds a `turn_notes` tool. Its bounded text (`agent_max_turn_notes_chars`, default 8,000, ceiling 32,000, restrict-only) is pinned after the seed and never elided. The elision notice now lists which calls were cut, and the cut moves in steps so the request prefix holds between cuts. Notes are redacted, persisted in the session log and `PendingChatTurn`, and shown under the turn. Rejected: a model-call summary of elided rounds, and a bigger window. Requirement 7, the budget interaction, waits for #59. |
 
 **Ordering exception.** Numbers are assigned in creation order, so #34 is last in
 the table but is the next thing to implement. It is a bug-driven spec covering a
