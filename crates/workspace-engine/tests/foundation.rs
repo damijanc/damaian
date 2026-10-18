@@ -5,15 +5,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, CancelToken, ChatTurnOptions, ChatTurnResult, ClientError, CommandPolicy,
-    CommandRisk, Config, ConfigOverlay, ConfigScope, DEFAULT_CONTEXT_TOKEN_BUDGET, IndexCache,
-    McpClient, McpServerConfig, McpTransport, MockModelAdapter, MockModelTransport, ModelAdapter,
-    ModelMessage, ModelProviderConfig, ModelRequest, ModelTransport, OpenAICompatibleAdapter,
-    PatchEngine, PatchStore, PathPolicy, PhaseKind, ProjectIndexer, ProposedChange, Result,
-    ResumeDecisionOptions, SecretScanner, SessionStore, TaskStatus, TokenUsage, ToolCall,
-    TurnProgress, TurnSink, UsageSource, WebDiagnosticCall, WebDiagnosticReport,
-    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, extract_model_tokens,
-    model_request_json, parse_generated_edit,
+    ApprovalCause, AuditLog, CancelToken, ChatTurnOptions, ChatTurnResult, ClientError,
+    CommandPolicy, CommandRisk, Config, ConfigOverlay, ConfigScope, DEFAULT_CONTEXT_TOKEN_BUDGET,
+    IndexCache, McpClient, McpServerConfig, McpTransport, MockModelAdapter, MockModelTransport,
+    ModelAdapter, ModelMessage, ModelProviderConfig, ModelRequest, ModelTransport,
+    OpenAICompatibleAdapter, PatchEngine, PatchStore, PathPolicy, PhaseKind, ProjectIndexer,
+    ProposedChange, Result, ResumeDecisionOptions, SecretScanner, SessionStore, TaskStatus,
+    TokenUsage, ToolCall, TurnProgress, TurnSink, UsageSource, WebDiagnosticCall,
+    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
+    extract_model_tokens, model_request_json, parse_generated_edit,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -539,12 +539,7 @@ fn classifies_docker_commands_as_approval_gated_high_risk() {
         assert_eq!(classification.risk, CommandRisk::High);
         assert!(classification.requires_approval);
         assert!(classification.may_use_network);
-        assert!(
-            classification
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("Docker command may start containers"))
-        );
+        assert!(classification.causes.contains(&ApprovalCause::Docker));
         assert!(classification.expected_effects.contains("Docker daemon"));
     }
 }
@@ -615,9 +610,9 @@ fn escalates_approval_for_commands_referencing_paths_outside_repo() {
     assert!(classification.requires_approval);
     assert!(
         classification
-            .reasons
+            .causes
             .iter()
-            .any(|reason| reason.contains("outside the selected repository"))
+            .any(|cause| matches!(cause, ApprovalCause::OutsideRepository { .. }))
     );
 
     let inside = policy.classify("ls src", root);
@@ -625,9 +620,9 @@ fn escalates_approval_for_commands_referencing_paths_outside_repo() {
     assert!(!inside.requires_approval);
     assert!(
         !inside
-            .reasons
+            .causes
             .iter()
-            .any(|reason| reason.contains("outside the selected repository"))
+            .any(|cause| matches!(cause, ApprovalCause::OutsideRepository { .. }))
     );
 }
 

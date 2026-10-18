@@ -333,6 +333,7 @@ mod tests {
             blocked: false,
             requires_approval: false,
             reasons: vec![],
+            causes: vec![],
             expected_effects: String::new(),
             may_use_network: false,
         }
@@ -345,6 +346,7 @@ mod tests {
             blocked: false,
             requires_approval: true,
             reasons: vec![],
+            causes: vec![],
             expected_effects: String::new(),
             may_use_network: true,
         }
@@ -846,6 +848,7 @@ mod tests {
             blocked: false,
             requires_approval: false,
             reasons: vec!["Command matches configured allowlist".to_string()],
+            causes: vec![],
             expected_effects: "Configured safe command".to_string(),
             may_use_network: false,
         }

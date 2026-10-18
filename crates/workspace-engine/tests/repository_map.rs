@@ -39,10 +39,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use workspace_engine::finding::resolve_finding_path;
 use workspace_engine::indexer::SkippedFile;
 use workspace_engine::{
-    AuditLog, CancelToken, ChatTurnResult, CommandPolicy, CommandRisk, CommandStore, Config,
-    ConfigOverlay, Degradation, DetectedRoot, ExcludedPath, ExclusionReason, MAX_ROOT_DEPTH,
-    MapLoad, MockModelAdapter, ModelAdapter, PROJECT_MANIFESTS, ProjectIndexer, ProjectRoot,
-    REPOSITORY_MAP_SCHEMA_VERSION, RebuildReason, RepositoryIndex, RepositoryKeyClass,
+    ApprovalCause, AuditLog, CancelToken, ChatTurnResult, CommandPolicy, CommandRisk, CommandStore,
+    Config, ConfigOverlay, Degradation, DetectedRoot, ExcludedPath, ExclusionReason,
+    MAX_ROOT_DEPTH, MapLoad, MockModelAdapter, ModelAdapter, PROJECT_MANIFESTS, ProjectIndexer,
+    ProjectRoot, REPOSITORY_MAP_SCHEMA_VERSION, RebuildReason, RepositoryIndex, RepositoryKeyClass,
     RepositoryMap, RepositoryMapStore, RootCommand, RootDetection, RootEvidence, RootOverride,
     SecretScanner, SessionMode, ToolCall, TurnProgress, TurnSink, WorkspaceEngine, detect_roots,
     repository_id_for_root, split_profile_keys,
@@ -287,8 +287,6 @@ fn every_root_manifest_gives_its_directory_a_command() {
     }
 }
 
-const OUTSIDE_ROOT_REASON: &str = "Command references a path outside the selected repository";
-
 /// A repository with two npm packages, its data directory and user config
 /// inside the temp dir so nothing touches the real application state.
 struct Monorepo {
@@ -466,22 +464,22 @@ fn paths_resolve_from_the_working_directory_and_are_bounded_by_the_repository() 
     let sibling = policy.classify_at("cat ../web/src/index.ts", &repo.root, &repo.api);
     assert!(
         !sibling
-            .reasons
+            .causes
             .iter()
-            .any(|reason| reason == OUTSIDE_ROOT_REASON),
+            .any(|cause| matches!(cause, ApprovalCause::OutsideRepository { .. })),
         "a sibling root is inside the repository: {:?}",
-        sibling.reasons
+        sibling.causes
     );
 
     let escape = policy.classify_at("cat ../../../../etc/passwd", &repo.root, &repo.api);
     assert!(escape.requires_approval);
     assert!(
         escape
-            .reasons
+            .causes
             .iter()
-            .any(|reason| reason == OUTSIDE_ROOT_REASON),
+            .any(|cause| matches!(cause, ApprovalCause::OutsideRepository { .. })),
         "{:?}",
-        escape.reasons
+        escape.causes
     );
 
     // A root never widens anything: what escapes the repository from the
@@ -615,9 +613,9 @@ fn at_the_repository_root_nothing_changes() {
     assert!(
         policy
             .classify("cat ../secrets", &repo.root)
-            .reasons
+            .causes
             .iter()
-            .any(|r| r == OUTSIDE_ROOT_REASON)
+            .any(|cause| matches!(cause, ApprovalCause::OutsideRepository { .. }))
     );
 
     // The existing entry points store the root as both halves of the pair,

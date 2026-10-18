@@ -1786,6 +1786,7 @@ impl ChatOrchestrator {
                 blocked: false,
                 requires_approval: false,
                 reasons: Vec::new(),
+                causes: Vec::new(),
                 expected_effects: String::new(),
                 may_use_network: false,
             };
