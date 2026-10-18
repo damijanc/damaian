@@ -845,6 +845,7 @@ impl ChatOrchestrator {
                 mode,
                 options.user_present,
                 offer_handoffs,
+                &self.config.shell,
             )),
             ModelMessage::user(model_prompt),
         ];
@@ -1803,7 +1804,7 @@ impl ChatOrchestrator {
 
             let mut tools = Vec::new();
             if run_command_permitted {
-                tools.push(run_command_tool_definition());
+                tools.push(run_command_tool_definition(&self.config.shell));
             }
             if offered(&ToolAction::ProposePatch(GeneratedEdit {
                 summary: String::new(),
@@ -4196,8 +4197,9 @@ fn system_prompt_for_session(
     mode: SessionMode,
     user_present: bool,
     offer_handoffs: bool,
+    shell: &str,
 ) -> String {
-    let prompt = system_prompt(mode, user_present);
+    let prompt = system_prompt(mode, user_present, shell);
     if offer_handoffs {
         format!("{prompt}\n\n{WORKER_HANDOFF_PARAGRAPH}")
     } else {
@@ -4214,8 +4216,8 @@ const NO_USER_CAN_ANSWER: &str = "No user can answer a question in this context,
 /// stays byte-identical to what it was before spec 50.
 const HEADLESS_PARAGRAPH: &str = "No user is available to answer questions during this task. Where the request is ambiguous, do not stop to ask: proceed under an explicitly stated assumption, and say in your answer what you assumed and why.";
 
-fn system_prompt(mode: SessionMode, user_present: bool) -> String {
-    let prompt = mode_system_prompt(mode);
+fn system_prompt(mode: SessionMode, user_present: bool, shell: &str) -> String {
+    let prompt = mode_system_prompt(mode, shell);
     if user_present {
         prompt
     } else {
@@ -4223,19 +4225,49 @@ fn system_prompt(mode: SessionMode, user_present: bool) -> String {
     }
 }
 
-fn mode_system_prompt(mode: SessionMode) -> String {
+fn mode_system_prompt(mode: SessionMode, shell: &str) -> String {
     const PREFIX: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.";
     match mode {
         // Ask is reads-and-explanations only: no command envelope at all, so
         // there is nothing to invite a command the mode would refuse.
         SessionMode::Ask => PREFIX.to_string(),
-        SessionMode::Code => format!("{PREFIX}\n\n{}", command_envelope_paragraph_unrestricted()),
+        SessionMode::Code => {
+            format!(
+                "{PREFIX}\n\n{}",
+                command_envelope_paragraph_unrestricted(shell)
+            )
+        }
         // Plan and Review permit read-only commands but refuse anything that
         // would need approval outright rather than raising an approval card
         // (`proposal.md` §5.3), so the third paragraph matches that behavior.
         SessionMode::Plan | SessionMode::Review => {
-            format!("{PREFIX}\n\n{}", command_envelope_paragraph_read_only())
+            format!(
+                "{PREFIX}\n\n{}",
+                command_envelope_paragraph_read_only(shell)
+            )
         }
+    }
+}
+
+/// The basename of the configured shell — `zsh`, `bash`, … — the only part of
+/// `config.shell` the model needs to be told (spec 63 requirement 7). The full
+/// path is the user's own setting and adds nothing.
+fn shell_basename(shell: &str) -> &str {
+    shell.rsplit('/').next().unwrap_or(shell)
+}
+
+/// The sentence that tells the model which shell runs its commands, plus the
+/// zsh-only glob-quoting warning: zsh's `nomatch` option fails a command whose
+/// unquoted glob matches nothing, which is a look-around failure, not a code
+/// problem (spec 63 proposal §5.4).
+fn shell_guidance(shell: &str) -> String {
+    let name = shell_basename(shell);
+    if name == "zsh" {
+        format!(
+            "Commands run in {name} -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing."
+        )
+    } else {
+        format!("Commands run in {name} -lc.")
     }
 }
 
@@ -4243,16 +4275,22 @@ fn mode_system_prompt(mode: SessionMode) -> String {
 /// including the invitation to request a side-effecting command. Code is the
 /// only mode where such a request can become an approval card, so it is the
 /// only mode that should teach it.
-fn command_envelope_paragraph_unrestricted() -> &'static str {
-    "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it."
+fn command_envelope_paragraph_unrestricted(shell: &str) -> String {
+    format!(
+        "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. {} When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.",
+        shell_guidance(shell),
+    )
 }
 
 /// The command-envelope paragraph for Plan and Review. The envelope stays
 /// (read-only commands are permitted in both modes) but the Code-only
 /// invitation to request a side-effecting command is replaced with what will
 /// actually happen: it is refused, not queued for approval.
-fn command_envelope_paragraph_read_only() -> &'static str {
-    "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. In this mode only read-only commands that need no approval are available; a command with side effects, network access, Docker access, shell control, or unknown risk is refused outright, not queued for approval. Do not request one."
+fn command_envelope_paragraph_read_only(shell: &str) -> String {
+    format!(
+        "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. {} In this mode only read-only commands that need no approval are available; a command with side effects, network access, Docker access, shell control, or unknown risk is refused outright, not queued for approval. Do not request one.",
+        shell_guidance(shell),
+    )
 }
 
 fn build_model_prompt(
@@ -4741,10 +4779,13 @@ fn tool_action_label(action: &ToolAction) -> String {
 /// through a real `tools`/`tool_calls` contract instead of a text
 /// convention; the rest have no text-envelope equivalent — they only exist
 /// as native tool calls.
-fn run_command_tool_definition() -> ToolDefinition {
+fn run_command_tool_definition(shell: &str) -> ToolDefinition {
     ToolDefinition {
         name: "run_command".to_string(),
-        description: "Request a local shell command in the selected repository. Damaian runs sandbox-safe read-only commands automatically and pauses for user approval before running commands with side effects, network access, Docker access, shell control, or unknown risk.".to_string(),
+        description: format!(
+            "Request a local shell command in the selected repository. {} Damaian runs sandbox-safe read-only commands automatically and pauses for user approval before running commands with side effects, network access, Docker access, shell control, or unknown risk.",
+            shell_guidance(shell),
+        ),
         parameters_json: "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"The shell command to run\"},\"reason\":{\"type\":\"string\",\"description\":\"Why this command is needed\"},\"working_directory\":{\"type\":\"string\",\"description\":\"Repository-relative directory to run in; defaults to the repository root\"}},\"required\":[\"command\"]}".to_string(),
     }
 }
@@ -6395,24 +6436,24 @@ mod system_prompt_tests {
     use super::*;
     use crate::mode::SessionMode;
 
-    /// The exact string `system_prompt()` produced before this task, copied
-    /// from the live source rather than re-typed from the plan's quotation.
+    /// The exact string `system_prompt()` produces with the default shell
+    /// (`/bin/zsh`) after this task named the shell in the envelope paragraph.
     /// `code_mode_system_prompt_is_byte_identical_to_todays` pins the Code
     /// output against it; spec 49 Task 8's prefix-stability guards depend on
     /// this staying true.
-    const TODAYS_CODE_SYSTEM_PROMPT: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.\n\nIf the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.";
+    const TODAYS_CODE_SYSTEM_PROMPT: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.\n\nIf the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.";
 
     #[test]
     fn code_mode_system_prompt_is_byte_identical_to_todays() {
         assert_eq!(
-            system_prompt(SessionMode::Code, true),
+            system_prompt(SessionMode::Code, true, "/bin/zsh"),
             TODAYS_CODE_SYSTEM_PROMPT
         );
     }
 
     #[test]
     fn ask_mode_system_prompt_has_no_command_envelope() {
-        let prompt = system_prompt(SessionMode::Ask, true);
+        let prompt = system_prompt(SessionMode::Ask, true, "/bin/zsh");
         assert!(
             !prompt.contains("DAMAIAN_COMMAND_V1"),
             "Ask must teach no command envelope at all: {prompt}"
@@ -6425,7 +6466,7 @@ mod system_prompt_tests {
 
     #[test]
     fn plan_mode_system_prompt_keeps_the_envelope_with_restricted_wording() {
-        let prompt = system_prompt(SessionMode::Plan, true);
+        let prompt = system_prompt(SessionMode::Plan, true, "/bin/zsh");
         assert!(
             prompt.contains("DAMAIAN_COMMAND_V1"),
             "Plan still offers read-only commands, so the envelope stays: {prompt}"
@@ -6440,8 +6481,8 @@ mod system_prompt_tests {
     #[test]
     fn review_mode_system_prompt_matches_plan_modes_restricted_wording() {
         assert_eq!(
-            system_prompt(SessionMode::Review, true),
-            system_prompt(SessionMode::Plan, true),
+            system_prompt(SessionMode::Review, true, "/bin/zsh"),
+            system_prompt(SessionMode::Plan, true, "/bin/zsh"),
             "Review's command capability is identical to Plan's"
         );
     }
@@ -6456,7 +6497,7 @@ mod system_prompt_tests {
                 .join("\n\n")
         }
 
-        let ask = system_prompt(SessionMode::Ask, true);
+        let ask = system_prompt(SessionMode::Ask, true, "/bin/zsh");
         assert_eq!(
             first_two_paragraphs(&ask),
             ask,
@@ -6470,7 +6511,7 @@ mod system_prompt_tests {
             SessionMode::Review,
         ] {
             assert_eq!(
-                first_two_paragraphs(&system_prompt(mode, true)),
+                first_two_paragraphs(&system_prompt(mode, true, "/bin/zsh")),
                 ask,
                 "only the third paragraph may vary with mode; {mode:?} changed the prefix"
             );
@@ -6478,10 +6519,87 @@ mod system_prompt_tests {
 
         for mode in [SessionMode::Plan, SessionMode::Code, SessionMode::Review] {
             assert!(
-                system_prompt(mode, true).len() > ask.len(),
+                system_prompt(mode, true, "/bin/zsh").len() > ask.len(),
                 "{mode:?} keeps a mode-dependent third paragraph"
             );
         }
+    }
+}
+
+/// Spec 63 requirement 7: the model is told which shell runs its commands, and
+/// that zsh fails an unquoted glob that matches nothing. Only the shell's
+/// basename belongs in the text, never its full path (proposal §5.4).
+#[cfg(test)]
+mod shell_naming_tests {
+    use super::*;
+
+    #[test]
+    fn the_run_command_description_names_the_shell_and_warns_about_zsh_globs() {
+        let zsh = run_command_tool_definition("/bin/zsh").description;
+        assert!(zsh.contains("zsh -lc"), "zsh run_command: {zsh}");
+        assert!(
+            zsh.contains("Quote glob patterns"),
+            "zsh must teach the glob-quoting rule: {zsh}"
+        );
+        assert!(!zsh.contains("/bin/zsh"), "full path leaked: {zsh}");
+
+        let bash = run_command_tool_definition("/bin/bash").description;
+        assert!(bash.contains("bash -lc"), "bash run_command: {bash}");
+        assert!(
+            !bash.contains("Quote glob patterns"),
+            "bash must not teach the zsh-only rule: {bash}"
+        );
+        assert!(!bash.contains("/bin/bash"), "full path leaked: {bash}");
+    }
+
+    #[test]
+    fn the_envelope_paragraphs_name_the_shell_and_warn_about_zsh_globs() {
+        for zsh_paragraph in [
+            command_envelope_paragraph_unrestricted("/bin/zsh"),
+            command_envelope_paragraph_read_only("/bin/zsh"),
+        ] {
+            assert!(zsh_paragraph.contains("zsh -lc"), "{zsh_paragraph}");
+            assert!(
+                zsh_paragraph.contains("Quote glob patterns"),
+                "zsh must teach the glob-quoting rule: {zsh_paragraph}"
+            );
+            assert!(
+                !zsh_paragraph.contains("/bin/zsh"),
+                "full path leaked: {zsh_paragraph}"
+            );
+        }
+
+        for bash_paragraph in [
+            command_envelope_paragraph_unrestricted("/bin/bash"),
+            command_envelope_paragraph_read_only("/bin/bash"),
+        ] {
+            assert!(bash_paragraph.contains("bash -lc"), "{bash_paragraph}");
+            assert!(
+                !bash_paragraph.contains("Quote glob patterns"),
+                "bash must not teach the zsh-only rule: {bash_paragraph}"
+            );
+            assert!(
+                !bash_paragraph.contains("/bin/bash"),
+                "full path leaked: {bash_paragraph}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_basename_of_a_non_default_shell_path_is_named() {
+        let paragraph = command_envelope_paragraph_unrestricted("/opt/homebrew/bin/zsh");
+        assert!(paragraph.contains("zsh -lc"), "{paragraph}");
+        assert!(
+            !paragraph.contains("/opt/homebrew/bin/zsh"),
+            "full path leaked: {paragraph}"
+        );
+
+        let description = run_command_tool_definition("/opt/homebrew/bin/bash").description;
+        assert!(description.contains("bash -lc"), "{description}");
+        assert!(
+            !description.contains("/opt/homebrew/bin/bash"),
+            "full path leaked: {description}"
+        );
     }
 }
 
@@ -6513,8 +6631,11 @@ mod worker_handoff_tests {
         for mode in ALL_MODES {
             for user_present in [true, false] {
                 assert_eq!(
-                    system_prompt_for_session(mode, user_present, true),
-                    format!("{}\n\n{from_the_spec}", system_prompt(mode, user_present)),
+                    system_prompt_for_session(mode, user_present, true, "/bin/zsh"),
+                    format!(
+                        "{}\n\n{from_the_spec}",
+                        system_prompt(mode, user_present, "/bin/zsh")
+                    ),
                     "{mode:?}"
                 );
             }
@@ -6526,8 +6647,8 @@ mod worker_handoff_tests {
         for mode in ALL_MODES {
             for user_present in [true, false] {
                 assert_eq!(
-                    system_prompt_for_session(mode, user_present, false),
-                    system_prompt(mode, user_present),
+                    system_prompt_for_session(mode, user_present, false, "/bin/zsh"),
+                    system_prompt(mode, user_present, "/bin/zsh"),
                     "{mode:?}"
                 );
             }
@@ -6555,6 +6676,7 @@ mod worker_handoff_tests {
             data_dir: repo.join(".damaian"),
             enable_index_watcher: false,
             enable_worker_sessions: true,
+            shell: "/bin/zsh".to_string(),
             ..Config::default()
         })
     }
@@ -6642,7 +6764,7 @@ mod worker_handoff_tests {
         );
         assert_eq!(
             system_message(&adapter),
-            system_prompt(SessionMode::Code, false)
+            system_prompt(SessionMode::Code, false, "/bin/zsh")
         );
 
         fs::remove_dir_all(repo).unwrap();
@@ -6658,12 +6780,14 @@ mod clarification_tests {
     use crate::mode::SessionMode;
 
     // The four prompts exactly as `system_prompt` produced them before spec
-    // 50, copied from the live source. Where a user is present the prompt must
-    // not move by a byte: the tool's own description carries its guidance,
-    // and spec 49's cache prefix depends on `messages[0]` staying put.
+    // 50, copied from the live source and then re-copied when spec 63 named
+    // the shell in the envelope paragraphs. Where a user is present the prompt
+    // must not move by a byte: the tool's own description carries its
+    // guidance, and spec 49's cache prefix depends on `messages[0]` staying
+    // put.
     const PREFIX_BEFORE_SPEC_50: &str = "You are a local-first coding assistant. Answer using only the provided repository context when possible. Cite relevant file paths. Do not request or expose secrets.\n\nRepository context sections named `agent_instruction` contain AGENTS.md instructions for this repository. Follow them when they apply to the files you discuss or edit. More specific nested AGENTS.md instructions override broader ones. The user's request and Damaian's safety policy take precedence over repository instructions.";
-    const CODE_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.";
-    const READ_ONLY_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. In this mode only read-only commands that need no approval are available; a command with side effects, network access, Docker access, shell control, or unknown risk is refused outright, not queued for approval. Do not request one.";
+    const CODE_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. When the user's task requires a command with side effects, network access, Docker access, shell control, or unknown risk, request the command and Damaian will pause for user approval before running it.";
+    const READ_ONLY_PARAGRAPH_BEFORE_SPEC_50: &str = "If the user asks about current Git state, recent commits, latest changes, uncommitted changes, repository history, or another fact that requires a local command, your entire response must be exactly one command request envelope. Do not add prose before or after the envelope:\nDAMAIAN_COMMAND_V1\nCOMMAND: git log -1 --stat --oneline\nREASON: Inspect the latest commit for the user's question.\nEND_COMMAND\n\nPrefer read-only commands such as git status, git log, git show, git diff, ls, and pwd when they are sufficient. The app will run sandbox-safe commands automatically. Commands run in zsh -lc. Quote glob patterns such as '*.rs'; zsh fails a command whose unquoted glob matches nothing. In this mode only read-only commands that need no approval are available; a command with side effects, network access, Docker access, shell control, or unknown risk is refused outright, not queued for approval. Do not request one.";
 
     fn prompt_before_spec_50(mode: SessionMode) -> String {
         match mode {
@@ -6688,7 +6812,7 @@ mod clarification_tests {
     fn with_a_user_present_every_modes_prompt_is_byte_identical_to_before() {
         for mode in ALL_MODES {
             assert_eq!(
-                system_prompt(mode, true),
+                system_prompt(mode, true, "/bin/zsh"),
                 prompt_before_spec_50(mode),
                 "{mode:?}"
             );
@@ -6700,7 +6824,7 @@ mod clarification_tests {
         assert!(HEADLESS_PARAGRAPH.contains("assumption"));
         for mode in ALL_MODES {
             assert_eq!(
-                system_prompt(mode, false),
+                system_prompt(mode, false, "/bin/zsh"),
                 format!("{}\n\n{HEADLESS_PARAGRAPH}", prompt_before_spec_50(mode)),
                 "{mode:?}"
             );

@@ -1,6 +1,6 @@
 # Feature Spec: Exploratory Command Failures Are Not Findings
 
-Status: In progress (started 2026-10-17; Tasks 1–3 of 6 done — see
+Status: In progress (started 2026-10-17; Tasks 1–5 of 6 done — see
 [`tasks.md`](tasks.md)). Specified on 2026-10-17 from the session behind
 [#59](../59_exploration_round_allowance/proposal.md)–[#62](../62_approval_prompts_name_the_reason.md),
 a reporting-only request that left two open **error** findings behind: an
@@ -258,3 +258,16 @@ the design above have been folded into §5.1.
   written, as `"purpose":"exploration"` and so on, and an event without it
   reads as `Other`. The shell's plan panel still describes such a step's
   evidence as "a command ran and exited 1"; it does not read the purpose.
+- **Task 4 (2026-10-18).** The shell name is threaded into
+  `run_command_tool_definition`, both `command_envelope_paragraph_*`
+  functions, `mode_system_prompt`, `system_prompt` and
+  `system_prompt_for_session` as `&self.config.shell`, and `shell_basename`
+  reduces it to its basename before it reaches any model-facing text. The
+  exact wording is "Commands run in {name} -lc." plus, for zsh, " Quote glob
+  patterns such as '*.rs'; zsh fails a command whose unquoted glob matches
+  nothing." The three byte-identical pins in `chat.rs` moved to the zsh
+  wording. Because the prompt is now longer, the token-ceiling test
+  `a_turn_stops_before_the_call_that_would_cross_the_ceiling` crosses 1000
+  estimated tokens one call earlier (3 → 2), and `tests/token_ceiling.rs`
+  pins `shell: "/bin/zsh"` so the count no longer depends on `$SHELL`. #62
+  was still "Not started", so its wording was not a base.
