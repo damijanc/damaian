@@ -1442,7 +1442,9 @@ fn classify_under(
 const ACCESS_TABLE: &[(&str, bool, [bool; 4])] = &[
     ("cargo test", false, [true, true, false, false]),
     ("ls", false, [true, false, false, false]),
-    ("git diff", false, [true, false, false, false]),
+    // Requirement 5 of spec 64: `git diff` now needs approval, so
+    // `command_access=read_only` blocks it just as it blocks `cargo test`.
+    ("git diff", false, [true, true, false, false]),
     // Plan mode refuses this because the path escape needs approval.
     ("ls ../elsewhere", false, [true, true, false, false]),
     ("curl example.com", false, [true, true, true, false]),

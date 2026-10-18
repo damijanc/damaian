@@ -514,8 +514,10 @@ fn classifies_command_risk() {
         policy.classify("git status --short", root).risk,
         CommandRisk::Low
     );
+    // Requirement 5 of spec 64: `git show` asks now; `git log --stat`
+    // stays read-only.
     assert_eq!(
-        policy.classify("git show --stat", root).risk,
+        policy.classify("git log --stat", root).risk,
         CommandRisk::Low
     );
     assert_eq!(policy.classify("npm test", root).risk, CommandRisk::Medium);

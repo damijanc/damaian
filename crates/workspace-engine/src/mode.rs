@@ -761,6 +761,11 @@ mod tests {
                 "ls $HOME/.ssh",
                 "git show HEAD:.env",
                 "git -C /tmp status",
+                // Requirement 5: the content-bearing git commands ask, so Plan
+                // and Review refuse them too.
+                "git diff",
+                "git show HEAD",
+                "git log -p",
             ] {
                 assert!(!permits(mode, command), "{mode:?} ran {command}");
             }
