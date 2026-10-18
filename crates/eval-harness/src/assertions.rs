@@ -125,6 +125,19 @@ pub fn evaluate(
             );
         }
 
+        if let Some(wanted) = &asserts.response_contains {
+            let missing: Vec<&String> = wanted
+                .iter()
+                .filter(|needle| !run.response.contains(needle.as_str()))
+                .collect();
+            push(
+                "response_contains",
+                missing.is_empty(),
+                format!("{wanted:?}"),
+                format!("response: {:?}, missing: {missing:?}", run.response),
+            );
+        }
+
         if let Some((wanted, limit)) = &asserts.context_ranks_within {
             let rank = run
                 .context_files

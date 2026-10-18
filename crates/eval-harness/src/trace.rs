@@ -294,6 +294,39 @@ fn tally(grouped: &mut FindingsByPurpose, purpose: CommandPurpose) -> &mut Purpo
     }
 }
 
+/// The content of every tool result a run fed back to the model, in order,
+/// read from the session log's `message_appended` events with role `tool`.
+///
+/// The scenario script and the run record both omit these: the record keeps a
+/// call's marker reference and outcome, never the result text, and a scenario
+/// assertion that must see what a tool *returned* (a diff's contents, a refused
+/// worktree's message) has to read the tool result back from the session log.
+pub fn tool_results(data_dir: &Path) -> Result<Vec<String>> {
+    let mut results = Vec::new();
+    for path in session_log_paths(data_dir)? {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
+        for line in text.lines() {
+            let Ok(serde_json::Value::Object(event)) = serde_json::from_str(line.trim()) else {
+                continue;
+            };
+            if event.get("eventType").and_then(|value| value.as_str()) != Some("message_appended") {
+                continue;
+            }
+            let Some(payload) = event.get("payload").and_then(|value| value.as_object()) else {
+                continue;
+            };
+            if payload.get("role").and_then(|value| value.as_str()) != Some("tool") {
+                continue;
+            }
+            if let Some(content) = payload.get("content").and_then(|value| value.as_str()) {
+                results.push(content.to_string());
+            }
+        }
+    }
+    Ok(results)
+}
+
 /// Every session log a run wrote, in a stable order.
 ///
 /// Sorted so a run with more than one session log produces a stable record
