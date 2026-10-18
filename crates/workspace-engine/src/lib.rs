@@ -98,7 +98,7 @@ pub use error::{ClientError, ProviderRefusal, Result};
 pub use file_access::{FileAccessController, FileRead, LineRange, ReadWindow};
 pub use git_service::{
     DiffOptions, GitFileStatus, GitHubRepo, GitReadCaps, GitService, GitStatus, GitSummary,
-    parse_github_remote,
+    WorktreeListing, WorktreeListingEntry, parse_github_remote,
 };
 pub use hash::repository_id_for_root;
 pub use hooks::{HookEnvelope, HookFailureKind, HookFinding, HookResponse};

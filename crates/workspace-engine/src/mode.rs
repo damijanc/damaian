@@ -167,6 +167,8 @@ pub(crate) fn profile_permits(
         | ToolAction::SearchCodebase { .. }
         | ToolAction::ReadGitStatus { .. }
         | ToolAction::ReadGitDiff { .. }
+        | ToolAction::ListWorktrees { .. }
+        | ToolAction::ReadGitLog { .. }
         | ToolAction::ProposePlan(_)
         | ToolAction::CompleteStep
         // No capability key covers asking: it reads nothing, writes nothing
@@ -242,7 +244,9 @@ pub(crate) fn mode_permits(
         | ToolAction::SearchContent { .. }
         | ToolAction::SearchCodebase { .. }
         | ToolAction::ReadGitStatus { .. }
-        | ToolAction::ReadGitDiff { .. } => Permission::Allowed,
+        | ToolAction::ReadGitDiff { .. }
+        | ToolAction::ListWorktrees { .. }
+        | ToolAction::ReadGitLog { .. } => Permission::Allowed,
 
         // Spec 50: asking is allowed in every mode. Whether anyone can answer
         // narrows the offer in `chat.rs`; it never widens a mode.
@@ -485,6 +489,24 @@ mod tests {
                     paths: Vec::new(),
                     stat: false,
                     base: None,
+                },
+                None,
+                None,
+                [T, T, T, T],
+                [T, T, T, T],
+            ),
+            (
+                ToolAction::ListWorktrees { base: None },
+                None,
+                None,
+                [T, T, T, T],
+                [T, T, T, T],
+            ),
+            (
+                ToolAction::ReadGitLog {
+                    worktree: None,
+                    base: None,
+                    max_count: None,
                 },
                 None,
                 None,

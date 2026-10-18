@@ -12,7 +12,7 @@
 | 1 · Registered-worktree resolution and refusal | Done 2026-10-17 | Details in the note below the table. |
 | 2 · Git read hardening on the main checkout | Done 2026-10-17 | Details in the note below the table. |
 | 3 · `worktree` on the five read tools | Done 2026-10-18 | Details in the note below the table. |
-| 4 · `list_worktrees` and `read_git_log` | Not started | |
+| 4 · `list_worktrees` and `read_git_log` | Done 2026-10-18 | Details in the note below the table. |
 | 5 · `worktree_survey` eval scenario | Not started | |
 | 6 · Docs, live re-run and close-out | Not started | |
 
@@ -185,6 +185,54 @@ FSEvents and the sandbox has none. Step 6: the deterministic eval tier passes
 every scenario. The CLI, the desktop shell and context assembly call the
 unchanged functions, so this task changes no other crate. Workspace clippy
 and tests are left to CI.
+
+**Task 4 (Done 2026-10-18).** `git_service.rs`: `WorktreeListing` /
+`WorktreeListingEntry` and `GitService::list_worktrees` / `log_in`, with
+helpers `main_worktree_branch`, `ahead_behind`, `changed_file_count` and
+`cap_log`. `list_worktrees` classifies the reachable set once, then reports
+each entry's display path, branch (or none, shown as `detached`), short `HEAD`,
+changed-file count (restricted paths not counted) and ahead/behind against
+`base` (the model's override, validated, else the main worktree's branch);
+capped at 20 with the rest counted, and audited `git_worktrees_listed`.
+`log_in` runs `git log --oneline --no-ext-diff --no-textconv` over `base..HEAD`
+(`HEAD`'s history when there is no base), `base` validated and passed after
+`--end-of-options`, capped by `max_count` and the configured line/byte caps,
+redacted, audited `git_log_read` with `worktree`. `chat.rs`: the two variants,
+`ActionEffect::ReadOnly`, `read_tool_worktree` (log only — `list_worktrees` has
+no `worktree`), `tool_action_marker_unscoped`, `tool_action_label`, the two
+definitions, `tool_action_from_call` arms, the offering list, the dispatch arms
+and `format_worktree_listing`. `mode.rs`: both variants in the two read-only
+arms plus the matrix test list (allowed in every mode and every profile).
+
+**Deviations.** (1) `list_worktrees` spawns `1 + 3n` git processes, not the
+proposal's `1 + 2n`: `rev-parse --short HEAD` is added per worktree because
+`entry.head` is the full SHA and the tool reports the short one. Proposal §5.2
+updated. (2) `read_git_log` without `base` reads `main..HEAD` (the main
+worktree's branch) and, when the main worktree is detached, the whole `HEAD`
+history — the "default absent" case from §5.2, left under-specified there and
+chosen here. (3) `read_git_log`'s audit carries `worktree`, empty for the
+session's checkout, matching Task 3 deviation (1), though §5.5 names only
+`git_status_read` and `git_diff_read`. (4) The line cap is applied at `-n` in
+git (a silent bound, like `max_matches`); the byte cap is what `cap_log` cuts
+and reports.
+
+**Discovery, not fixed.** `git rev-list --left-right --count base...HEAD`
+prints the left count (behind) then the right count (ahead), and the two are
+tab-separated — easy to swap when naming the return `(ahead, behind)`; the
+first implementation did, and the ahead/behind test caught it.
+
+**Tests.** `tests/worktree_reads.rs` grows by 8 (47 in all): the listing
+fields, detached omission, restricted count, the 20 cap, log newest-first /
+`max_count` / configured cap, and a dispatch test proving both batch in one
+round, need no approval, and audit. Step 2: the tests first failed to compile
+(no `WorktreeListing`, no `log_in`). Falsified, each reverted: dropping the
+restricted filter from `changed_file_count` counted the `.env` (2 instead of 1);
+ignoring `max_count` returned 4 lines instead of 2; swapping ahead/behind made
+the listing report `0 ahead, 1 behind` for a worktree one commit ahead.
+
+**Checks (local):** fmt, node, lint, typos and deny pass; scoped clippy for
+`workspace-engine` is clean; `cargo nextest run -p workspace-engine --locked`:
+1297 run, 1297 passed (24 skipped). Workspace clippy and tests are left to CI.
 
 ## Global Constraints
 
@@ -445,7 +493,7 @@ call changes), `tests/worktree_reads.rs`, `chat.rs` only if
 **Corrections:** C6. **Files:** `chat.rs`, `mode.rs`, `git_service.rs`,
 `tests/worktree_reads.rs`.
 
-- [ ] **Step 1: Write the failing tests:** `list_worktrees` returns path,
+- [x] **Step 1: Write the failing tests:** `list_worktrees` returns path,
       branch or `detached`, short `HEAD`, changed-file count (restricted paths
       not counted) and ahead/behind against the main worktree's branch;
       omitted ahead/behind when the main worktree is detached; capped at 20
@@ -454,11 +502,11 @@ call changes), `tests/worktree_reads.rs`, `chat.rs` only if
       `ActionEffect::ReadOnly`, batch in one round, and are allowed in every
       `SessionMode` and every profile; audit `git_worktrees_listed` and
       `git_log_read`.
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Variants, `action_effect`, `tool_action_marker`, both `mode.rs`
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: Variants, `action_effect`, `tool_action_marker`, both `mode.rs`
       arms (C6), progress labels, definitions, parsing, dispatch.**
-- [ ] **Step 4: Falsify** and revert.
-- [ ] **Step 5: Scoped checks**, including `--test permission_profiles`.
+- [x] **Step 4: Falsify** and revert.
+- [x] **Step 5: Scoped checks**, including `--test permission_profiles`.
 
 ## Task 5: The `worktree_survey` eval scenario
 

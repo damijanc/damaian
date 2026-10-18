@@ -18,7 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::worktree_access::{WorktreeRefusal, classify_worktrees, resolve_worktree};
 use workspace_engine::{
     AuditLog, ClientError, Config, DiffOptions, GitReadCaps, GitService, MockModelAdapter,
-    ModelProviderConfig, PathPolicy, SecretScanner, ToolCall, WorkspaceEngine,
+    ModelProviderConfig, PathPolicy, SecretScanner, ToolCall, WorkspaceEngine, WorktreeListing,
+    WorktreeListingEntry,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1152,5 +1153,205 @@ fn read_git_diff_passes_paths_stat_and_base_from_the_tool_call() {
         turn.results[2].starts_with("Cannot read git diff"),
         "{:?}",
         turn.results
+    );
+}
+
+// ---- Task 4: `list_worktrees` and `read_git_log` (§5.2, §5.5, §5.6) ----
+
+impl Fixture {
+    /// `git -C <dir>`'s stdout, for asserting a tool output matches git's.
+    fn git_out(&self, dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    fn short_head(&self, dir: &Path) -> String {
+        self.git_out(dir, &["rev-parse", "--short", "--verify", "-q", "HEAD"])
+            .trim()
+            .to_string()
+    }
+}
+
+fn entry<'a>(listing: &'a WorktreeListing, path: &str) -> &'a WorktreeListingEntry {
+    listing
+        .entries
+        .iter()
+        .find(|entry| entry.path == path)
+        .unwrap_or_else(|| panic!("no entry for {path} in {listing:?}"))
+}
+
+#[test]
+fn list_worktrees_reports_path_branch_head_changed_count_and_ahead_behind() {
+    let (fixture, _) = ahead_fixture("list-fields");
+    let listing = fixture.git.list_worktrees(&fixture.repo, None).unwrap();
+    assert_eq!(listing.base.as_deref(), Some("main"));
+    assert_eq!(listing.entries.len(), 2);
+    assert_eq!(listing.omitted, 0);
+
+    let a = entry(&listing, ".claude/worktrees/a");
+    assert_eq!(a.branch.as_deref(), Some("wt-a"));
+    assert_eq!(
+        a.head.as_deref(),
+        Some(fixture.short_head(&fixture.worktree("a")).as_str())
+    );
+    assert_eq!(a.changed_files, 0);
+    assert_eq!((a.ahead, a.behind), (Some(0), Some(0)));
+
+    // Worktree b is one commit ahead of `main` and has an uncommitted change.
+    let b = entry(&listing, ".claude/worktrees/b");
+    assert_eq!(b.branch.as_deref(), Some("wt-b"));
+    assert_eq!(
+        b.head.as_deref(),
+        Some(fixture.short_head(&fixture.worktree("b")).as_str())
+    );
+    assert_eq!(b.changed_files, 1);
+    assert_eq!((b.ahead, b.behind), (Some(1), Some(0)));
+}
+
+#[test]
+fn list_worktrees_omits_ahead_behind_when_the_main_worktree_is_detached() {
+    let fixture = fixture("list-detached");
+    fixture.run(&["checkout", "--quiet", "--detach"]);
+    let listing = fixture.git.list_worktrees(&fixture.repo, None).unwrap();
+    assert_eq!(listing.base, None);
+    for entry in &listing.entries {
+        assert_eq!(entry.ahead, None, "{entry:?}");
+        assert_eq!(entry.behind, None, "{entry:?}");
+    }
+}
+
+#[test]
+fn list_worktrees_does_not_count_restricted_changes() {
+    let fixture = fixture("list-restricted");
+    let b = fixture.worktree("b");
+    fixture.write_in("b", ".env", "TOKEN=one\n");
+    fixture.run_in(&b, &["add", "-f", ".env"]);
+    fixture.run_in(&b, &["commit", "-q", "-m", "secret"]);
+    fixture.write_in("b", ".env", "TOKEN=two\n");
+    fixture.write_in("b", "app.txt", "free\n");
+
+    let listing = fixture.git.list_worktrees(&fixture.repo, None).unwrap();
+    assert_eq!(entry(&listing, ".claude/worktrees/b").changed_files, 1);
+}
+
+#[test]
+fn list_worktrees_is_capped_at_twenty_with_the_rest_counted() {
+    let fixture = fixture("list-capped");
+    for index in 0..20 {
+        let name = format!("extra-{index}");
+        fixture.run(&[
+            "worktree",
+            "add",
+            "-q",
+            &format!(".claude/worktrees/{name}"),
+            "-b",
+            &format!("wt-{name}"),
+        ]);
+    }
+    // 22 reachable worktrees (a, b, plus 20 extras): 20 listed, 2 counted.
+    let listing = fixture.git.list_worktrees(&fixture.repo, None).unwrap();
+    assert_eq!(listing.entries.len(), 20, "{listing:?}");
+    assert_eq!(listing.omitted, 2, "{listing:?}");
+}
+
+#[test]
+fn read_git_log_returns_short_sha_subject_lines_newest_first() {
+    let fixture = fixture("log-newest");
+    let b = fixture.worktree("b");
+    for (index, subject) in ["first", "second", "third"].iter().enumerate() {
+        fixture.write_in("b", &format!("f{index}.txt"), "x\n");
+        fixture.run_in(&b, &["add", "-A"]);
+        fixture.run_in(&b, &["commit", "-q", "-m", subject]);
+    }
+    let log = fixture
+        .git
+        .log_in(&b, Some(".claude/worktrees/b"), Some("main"), None)
+        .unwrap();
+    let expected = fixture.git_out(&b, &["log", "--oneline", "main..HEAD"]);
+    assert_eq!(log, expected);
+    let subjects: Vec<&str> = log
+        .lines()
+        .map(|line| line.split(' ').nth(1).unwrap())
+        .collect();
+    assert_eq!(subjects, vec!["third", "second", "first"]);
+}
+
+#[test]
+fn read_git_log_is_capped_by_max_count() {
+    let fixture = fixture("log-max-count");
+    let b = fixture.worktree("b");
+    for index in 0..4 {
+        fixture.write_in("b", &format!("f{index}.txt"), "x\n");
+        fixture.run_in(&b, &["add", "-A"]);
+        fixture.run_in(&b, &["commit", "-q", "-m", &format!("commit-{index}")]);
+    }
+    let log = fixture.git.log_in(&b, None, Some("main"), Some(2)).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 2, "{log}");
+    assert_eq!(lines[0].split(' ').nth(1).unwrap(), "commit-3");
+    assert_eq!(lines[1].split(' ').nth(1).unwrap(), "commit-2");
+}
+
+#[test]
+fn read_git_log_is_capped_by_the_configured_cap() {
+    let fixture = fixture("log-configured-cap");
+    let b = fixture.worktree("b");
+    for index in 0..5 {
+        fixture.write_in("b", &format!("f{index}.txt"), "x\n");
+        fixture.run_in(&b, &["add", "-A"]);
+        fixture.run_in(&b, &["commit", "-q", "-m", &format!("commit {index}")]);
+    }
+    let git = git_service(
+        &fixture.root,
+        GitReadCaps {
+            max_lines: 3,
+            max_bytes: 1024 * 1024,
+        },
+    );
+    let log = git.log_in(&b, None, Some("main"), None).unwrap();
+    assert_eq!(log.lines().count(), 3, "{log}");
+}
+
+#[test]
+fn list_worktrees_and_read_git_log_batch_read_only_and_audit() {
+    let (fixture, _) = ahead_fixture("tools-listing-log");
+    let turn = fixture.tools(&[
+        ("list_worktrees", "{}"),
+        (
+            "read_git_log",
+            "{\"worktree\":\".claude/worktrees/b\",\"base\":\"main\"}",
+        ),
+    ]);
+    assert!(!turn.approval_requested);
+    assert_eq!(turn.results.len(), 2);
+    assert!(
+        turn.results[0].contains(".claude/worktrees/a")
+            && turn.results[0].contains(".claude/worktrees/b")
+            && turn.results[0].contains("ahead/behind vs `main`"),
+        "{:?}",
+        turn.results
+    );
+    assert!(turn.results[1].contains(" ahead"), "{:?}", turn.results);
+    assert!(
+        turn.records
+            .lines()
+            .any(|line| line.contains("git_worktrees_listed")),
+        "list_worktrees must audit"
+    );
+    assert!(
+        turn.records
+            .lines()
+            .any(|line| line.contains("git_log_read")),
+        "read_git_log must audit"
     );
 }

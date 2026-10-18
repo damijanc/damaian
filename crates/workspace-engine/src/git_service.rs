@@ -63,6 +63,40 @@ pub struct DiffOptions {
     pub base: Option<String>,
 }
 
+/// One reachable worktree as `list_worktrees` reports it (spec 60 §5.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeListingEntry {
+    /// Repository-relative path, absolute when outside the repository root.
+    pub path: String,
+    /// The branch checked out; `None` when detached.
+    pub branch: Option<String>,
+    /// Short `HEAD`.
+    pub head: Option<String>,
+    /// Changed files, restricted paths not counted.
+    pub changed_files: usize,
+    /// Commits this worktree is ahead of `base`; `None` when there is no base.
+    pub ahead: Option<usize>,
+    /// Commits this worktree is behind `base`.
+    pub behind: Option<usize>,
+}
+
+/// `list_worktrees`: every reachable worktree, capped at 20 with the rest
+/// counted but not listed (spec 60 §5.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeListing {
+    /// The effective `base` the ahead/behind counts are against, or `None`
+    /// when the main worktree is detached and no `base` was given.
+    pub base: Option<String>,
+    pub entries: Vec<WorktreeListingEntry>,
+    /// Reachable worktrees past the cap, counted but not listed.
+    pub omitted: usize,
+}
+
+/// The most `list_worktrees` lists; the rest are counted, not enumerated, so a
+/// repository with many worktrees cannot turn one read into dozens of git
+/// processes (spec 60 §5.2).
+const WORKTREES_LISTED_CAP: usize = 20;
+
 /// Refuses a `base` that is not a branch name under `git check-ref-format
 /// --allow-onelevel`'s rules, or that starts with `-`. Checked in Rust before
 /// any git process starts, so a refused `base` never reaches git, which is
@@ -686,6 +720,229 @@ impl GitService {
             ));
         }
         Ok(crate::worktree_access::parse_worktree_list(&output.stdout))
+    }
+
+    /// The branch checked out in the main worktree, which `base` defaults to
+    /// (spec 60 §5.2). Git lists the main worktree first, and `git worktree
+    /// list` resolves it from any worktree of the repository. `None` when it
+    /// is detached or bare, so callers omit `ahead`/`behind` rather than guess.
+    fn main_worktree_branch(&self, repository_root: &Path) -> Result<Option<String>> {
+        Ok(self
+            .worktrees(repository_root)?
+            .into_iter()
+            .next()
+            .and_then(|entry| entry.branch))
+    }
+
+    /// `(ahead, behind)` of `root`'s HEAD against `base`, the two counts of
+    /// `rev-list --left-right --count base...HEAD`: the left count is the
+    /// commits `base` has that HEAD does not (behind), the right the reverse
+    /// (ahead).
+    fn ahead_behind(&self, root: &Path, base: &str) -> Result<(usize, usize)> {
+        let output = git_output(
+            root,
+            &[
+                "rev-list",
+                "--left-right",
+                "--count",
+                "--end-of-options",
+                &format!("{base}...HEAD"),
+            ],
+        )?;
+        if !output.status.success() {
+            return Err(ClientError::Git(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut counts = text
+            .split_whitespace()
+            .map(|n| n.parse::<usize>().unwrap_or(0));
+        // `--left-right --count` prints the left count (behind) then the right
+        // count (ahead); the return is `(ahead, behind)`.
+        let behind = counts.next().unwrap_or(0);
+        let ahead = counts.next().unwrap_or(0);
+        Ok((ahead, behind))
+    }
+
+    /// The number of changed files `status --porcelain=v1` lists, restricted
+    /// paths not counted (spec 60 §5.2). A count, not paths, so the read caps
+    /// do not apply and nothing of a restricted file's name leaves here.
+    fn changed_file_count(&self, root: &Path) -> Result<usize> {
+        let output = git_output(root, &["status", "--porcelain=v1"])?;
+        if !output.status.success() {
+            return Err(ClientError::Git(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+        let full = String::from_utf8_lossy(&output.stdout);
+        Ok(full
+            .lines()
+            .filter(|line| !line.is_empty() && !self.porcelain_entry_is_restricted(line))
+            .count())
+    }
+
+    /// Every reachable worktree, as `list_worktrees` reports them (spec 60
+    /// §5.2). `base` is the model's override, validated before any git process
+    /// runs; the default is the main worktree's branch, and when there is no
+    /// base the ahead/behind fields are `None`. One git process for the list,
+    /// then `status`, `rev-parse` and `rev-list` per listed worktree, capped at
+    /// 20 with the rest counted. Not audited per worktree: the tool records one
+    /// `git_worktrees_listed`.
+    pub fn list_worktrees(
+        &self,
+        repository_root: &Path,
+        base: Option<&str>,
+    ) -> Result<WorktreeListing> {
+        if let Some(base) = base {
+            validate_base(base)?;
+        }
+        let entries = self.worktrees(repository_root)?;
+        let default_base = entries.first().and_then(|entry| entry.branch.clone());
+        let base = base.map(str::to_string).or(default_base);
+        let classified = crate::worktree_access::classify_worktrees(
+            &self.path_policy,
+            repository_root,
+            entries,
+        )?;
+        let reachable: Vec<_> = classified
+            .iter()
+            .filter(|worktree| worktree.refusal.is_none())
+            .collect();
+        let omitted = reachable.len().saturating_sub(WORKTREES_LISTED_CAP);
+        let mut listed = Vec::new();
+        for worktree in reachable.into_iter().take(WORKTREES_LISTED_CAP) {
+            let root = worktree
+                .canonical
+                .as_deref()
+                .expect("a reachable worktree has a canonical path");
+            let head = git_line(root, &["rev-parse", "--short", "--verify", "-q", "HEAD"])?;
+            let changed_files = self.changed_file_count(root)?;
+            let (ahead, behind) = match &base {
+                Some(base) => {
+                    let (ahead, behind) = self.ahead_behind(root, base)?;
+                    (Some(ahead), Some(behind))
+                }
+                None => (None, None),
+            };
+            listed.push(WorktreeListingEntry {
+                path: worktree.display.clone(),
+                branch: worktree.entry.branch.clone(),
+                head,
+                changed_files,
+                ahead,
+                behind,
+            });
+        }
+        self.audit_log.record(
+            "git_worktrees_listed",
+            &[
+                ("actor", "system".to_string()),
+                (
+                    "resourcePath",
+                    repository_root.to_string_lossy().to_string(),
+                ),
+                ("count", listed.len().to_string()),
+                ("omitted", omitted.to_string()),
+            ],
+        )?;
+        Ok(WorktreeListing {
+            base,
+            entries: listed,
+            omitted,
+        })
+    }
+
+    /// The commits `base..HEAD` (or `HEAD`'s history without a base) as
+    /// `short-sha subject` lines, newest first, capped (spec 60 §5.2). `base`
+    /// defaults to the main worktree's branch; when there is none, the whole
+    /// history is read. `max_count` narrows the configured line cap, never
+    /// raises it. A `--oneline` log names no paths, so nothing restricted can
+    /// leak; drivers and fsmonitor stay off (spec 60 §5.4).
+    pub fn log_in(
+        &self,
+        root_path: impl AsRef<Path>,
+        worktree: Option<&str>,
+        base: Option<&str>,
+        max_count: Option<usize>,
+    ) -> Result<String> {
+        let root = root_path.as_ref();
+        if let Some(base) = base {
+            validate_base(base)?;
+        }
+        let base = match base {
+            Some(base) => Some(base.to_string()),
+            None => self.main_worktree_branch(root)?,
+        };
+        let revision = match &base {
+            Some(base) => format!("{base}..HEAD"),
+            None => "HEAD".to_string(),
+        };
+        let max_commits = max_count
+            .unwrap_or(self.caps.max_lines)
+            .min(self.caps.max_lines);
+        let max_commits = max_commits.to_string();
+        let output = git_output(
+            root,
+            &[
+                "log",
+                "--oneline",
+                "--no-ext-diff",
+                "--no-textconv",
+                "-n",
+                &max_commits,
+                "--end-of-options",
+                &revision,
+            ],
+        )?;
+        let exit_code = output.status.code().unwrap_or(-1);
+        self.audit_log.record(
+            "git_log_read",
+            &[
+                ("actor", "system".to_string()),
+                ("resourcePath", root.to_string_lossy().to_string()),
+                (
+                    "status",
+                    if exit_code == 0 { "complete" } else { "failed" }.to_string(),
+                ),
+                ("exitCode", exit_code.to_string()),
+                ("worktree", worktree.unwrap_or_default().to_string()),
+            ],
+        )?;
+        if exit_code != 0 {
+            return Err(ClientError::Git(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        // Redact before cutting, so a cut cannot leave a secret's prefix.
+        let redacted = self.scanner.redact(raw.as_ref()).text;
+        Ok(self.cap_log(redacted))
+    }
+
+    /// `log` cut to the read caps when they bind, ending in a line that says
+    /// what was cut. The commit count is already bound by `-n`, so in practice
+    /// only the byte cap cuts here (spec 60 §5.4).
+    fn cap_log(&self, log: String) -> String {
+        let lines: Vec<&str> = log.lines().collect();
+        let shown = self.lines_within_caps(&lines);
+        if shown == lines.len() {
+            return log;
+        }
+        let cut_by = if shown == self.caps.max_lines {
+            "lines"
+        } else {
+            "bytes"
+        };
+        let mut capped: String = lines[..shown]
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect();
+        capped.push_str(&format!(
+            "[Log truncated by {cut_by}: {shown} of {} commits shown.]\n",
+            lines.len()
+        ));
+        capped
     }
 
     pub fn suggest_commit_message(&self, summary: &str, changed_files: &[String]) -> String {
