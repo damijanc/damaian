@@ -453,6 +453,7 @@ fn drive(
     // whole survived. Spec 17's markers carry the engine's own per-call
     // outcome, which did not exist when this was first written.
     run_record.tool_calls = trace::tool_actions(&materialized.data_dir)?;
+    run_record.findings_by_purpose = trace::findings_by_purpose(&trace, &materialized.data_dir)?;
 
     // Read before the match below consumes `outcome`. The plan comes from the
     // session log rather than being accumulated here — the same reason tokens

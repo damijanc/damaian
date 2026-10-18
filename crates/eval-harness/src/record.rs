@@ -104,6 +104,36 @@ pub struct CacheUsage {
     pub cache_reported_input_tokens: u64,
 }
 
+/// The commands a run executed with one purpose, and the findings they
+/// recorded.
+///
+/// `commands` is kept beside `findings` so a zero means something: an
+/// exploration count of zero over no exploration commands measured nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurposeTally {
+    pub commands: u64,
+    pub findings: u64,
+}
+
+/// Spec 63 §5.5: a run's command findings grouped by the purpose of the
+/// command that produced them. Exploration findings should always be zero; a
+/// regression that files exploration failures again shows up here as a
+/// non-zero count.
+///
+/// Read from the run's own logs (`trace::findings_by_purpose`), not from the
+/// scenario: each `finding_recorded` names its origin, and the
+/// `stored_command_executed` that ran that command names its purpose.
+/// Findings with any other origin, such as a browser diagnostic, have no
+/// command purpose and are not counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindingsByPurpose {
+    pub check: PurposeTally,
+    pub exploration: PurposeTally,
+    pub other: PurposeTally,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssertionOutcome {
@@ -174,6 +204,7 @@ pub struct RunRecord {
     /// `TaskUsage`. `None` when no run in the task reported a split.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheUsage>,
+    pub findings_by_purpose: FindingsByPurpose,
 }
 
 impl RunRecord {
@@ -212,6 +243,7 @@ impl RunRecord {
             plan: None,
             native_tools: false,
             cache: None,
+            findings_by_purpose: FindingsByPurpose::default(),
         }
     }
 
