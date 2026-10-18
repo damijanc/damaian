@@ -1,8 +1,8 @@
 # Feature Spec: Exploration Round Allowance
 
-Status: Not started. Specified on 2026-10-17 from a session that ran out of tool
+Status: Planned, not started. Specified on 2026-10-17 from a session that ran out of tool
 rounds on a reporting-only request; the evidence is in
-[`context.md`](context.md) §1. Not yet planned: there is no `tasks.md`.
+[`context.md`](context.md) §1. Planned on 2026-10-18; see [`tasks.md`](tasks.md).
 Order: 59 of 59
 Plan: none. Like [#47](../47_agent_working_capability/proposal.md), this spec is
 evidence-driven rather than a roadmap graduation — an exception to the rule in
@@ -50,23 +50,26 @@ and bound what it *reads* separately and more generously.
 
 - `agent_max_tool_rounds` (default 8) is clamped to
   `ABSOLUTE_TOOL_ROUND_CAP` (16) by `default_tool_round_limit`
-  ([chat.rs:523](../../../crates/workspace-engine/src/chat.rs:523)). Web debug
+  ([chat.rs:530](../../../crates/workspace-engine/src/chat.rs:530)). Web debug
   mode uses `agent_web_debug_max_tool_rounds` (12), and *Continue debugging*
-  uses the cap itself (`tool_round_limit`, `chat.rs:535`).
+  uses the cap itself (`tool_round_limit`, `chat.rs:542`).
 - The turn loop counts every model call that returns tool calls as one round.
   At `round >= max_rounds` it sets `force_final`, makes one more call with
   tools dropped, and stops with `StopReason::ToolBudget` if the model still asks
-  for a tool (`chat.rs:2053`, `chat.rs:2324`).
+  for a tool (`chat.rs:2072`, `chat.rs:2340`).
 - With `agent_max_task_tokens` set, spec 47 requirement 6 continues past the
   cap in further segments, bounded by the token ceiling and by
-  `round < ABSOLUTE_TOOL_ROUND_CAP` (`chat.rs:2334`).
-- `action_effect` ([chat.rs:4380](../../../crates/workspace-engine/src/chat.rs:4380))
+  `round < ABSOLUTE_TOOL_ROUND_CAP` (`chat.rs:2350`).
+- `action_effect` ([chat.rs:4465](../../../crates/workspace-engine/src/chat.rs:4465))
   already classifies every tool. `ReadFile`, `ListDirectory`, `SearchContent`,
-  `SearchCodebase`, `ReadGitStatus` and `ReadGitDiff` are
+  `SearchCodebase`, `ReadGitStatus` and `ReadGitDiff` — all now carrying spec
+  60's `worktree` argument, and to be joined by that spec's `list_worktrees`
+  and `read_git_log` when its Task 4 lands — are
   `ActionEffect::ReadOnly`; commands, browser diagnostics and MCP calls are
   `WritesRepository`; patches, edits, plans, step completion and `ask_user`
   are `ShapesTurn`. Requirement 8's within-round batching is derived from the
-  same function.
+  same function, and so is this spec's classification (§5.1), which is why the
+  allowance counts spec 60's read tools automatically.
 - `agent_max_tool_rounds` is a **Preference** and Free at repository scope
   (`config.rs`, the key partition; spec 34 §5.1). Spec 21
   [`context.md`](../21_task_plan_progress_and_budget/context.md) §3.8 calls
@@ -74,12 +77,12 @@ and bound what it *reads* separately and more generously.
 - The stop reads "This turn reached the configured tool round limit (8) …
   Continue debugging with a narrower next request or approve a larger
   diagnostic budget if available" (`tool_budget_exhausted_response`,
-  `chat.rs:5238`), and the button under it says *Continue debugging*
+  `chat.rs:5443`), and the button under it says *Continue debugging*
   (`markMessageToolBudgetExhausted`, `app.js:6967`), whatever the turn was
   doing.
 - Progress shows `round N/M` (`app.js:4172`) and the Workers board draws a bar
   from `round` and `maxRounds` (`app.js:6047`), both from `TurnPhase`
-  (`chat.rs:162`).
+  (`chat.rs:168`).
 
 ## 3. Requirements
 
@@ -161,8 +164,9 @@ model that keeps asking.
 
 The loop's single `round` counter becomes two: `action_rounds` and
 `exploration_rounds`. A third, `model_calls`, keeps the role `round` has for
-anything that is genuinely per call — the progress phase's position in the
-turn, spec 57's pause-and-steer boundary, and log markers.
+anything that is genuinely per call — spec 57's pause-and-steer boundary and
+the round markers in the audit log. (`TurnPhase`'s `round` becomes the action
+count; see §5.5.)
 
 - `force_final` becomes `action_rounds >= max_action_rounds`, where
   `max_action_rounds` is today's `max_rounds` (including spec 47's
@@ -208,10 +212,18 @@ one uncaught repeat after a resume.
   `ABSOLUTE_TOOL_ROUND_CAP`, with the same doc comment: raising it past the
   constant requires explicit work, not configuration.
 - **0 is accepted** and means "no exploration allowance" (requirement 6).
-- **Scope: restrict-only, lower wins**, in the same loop as
-  `agent_max_turn_messages` and `max_read_lines` (`config.rs:1570`), and
-  `=> Capability` in the key partition. Raising it spends the user's money,
-  which is exactly what spec 21 §3.8 made the token ceiling restrict-only for.
+- **Parsing differs from `agent_max_tool_rounds`.** `parse_round_count`
+  (`config.rs`) refuses 0 and anything over 16, but this key must accept 0
+  (requirement 6) and clamp a value above 32 to the ceiling (requirement 5).
+  It gets its own parser: accept `0..=32`, clamping anything larger to
+  `ABSOLUTE_EXPLORATION_ROUND_CAP`, and let the round loop's
+  `default_exploration_round_limit` clamp again at runtime.
+- **Scope: restrict-only, lower wins**, in a `u32` variant of the
+  `restrict_only_limit` helper used for `agent_max_turn_messages` and
+  `max_read_lines` (`config.rs:1576` — that loop is `usize`-typed, so the
+  `u32` key needs its own apply block), and `=> Capability` in the key
+  partition. Raising it spends the user's money, which is exactly what spec 21
+  §3.8 made the token ceiling restrict-only for.
 - The eight places a key touches (spec 21 `context.md` §3.8) all get it:
   the field, the overlay field, the destructuring, the apply block, the key
   parser, `config_show`, the overlay serializer and `Default`. Permission
@@ -240,8 +252,12 @@ one uncaught repeat after a resume.
 ### 5.6 Recording
 
 - The round loop's existing audit records gain `explorationRounds` and
-  `explorationLimit` beside `roundLimit`, on the forced-final, continued and
-  exhausted paths.
+  `explorationLimit`: `model_request_prepared` (whose round fields are
+  `toolRound`/`toolRoundLimit`, `chat.rs:2108`) and `turn_continued` (whose are
+  `round`/`roundLimit`, `chat.rs:2358`). There is no separate forced-final or
+  exhausted audit event — exhaustion is visible through
+  `model_request_prepared` at `toolRound == toolRoundLimit` plus the stop
+  reason.
 - No new session-log event. Which rounds were exploration is derivable from the
   log already: each round opens with a `model_call` marker and its tool calls
   are recorded as action markers by name. `trace::tool_rounds` in the eval
