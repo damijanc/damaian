@@ -241,6 +241,19 @@ pub fn evaluate(
             );
         }
 
+        if let Some(expected) = asserts.exploration_findings {
+            let exploration = run.record.findings_by_purpose.exploration;
+            push(
+                "exploration_findings",
+                exploration.commands > 0 && exploration.findings == expected,
+                format!("{expected} findings from at least one exploration command"),
+                format!(
+                    "{} findings from {} exploration commands",
+                    exploration.findings, exploration.commands
+                ),
+            );
+        }
+
         if let Some(limit) = asserts.tool_rounds_at_most {
             let rounds = run.record.tool_rounds;
             push(

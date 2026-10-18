@@ -165,7 +165,7 @@ pub(crate) fn profile_permits(
         | ToolAction::ListDirectory { .. }
         | ToolAction::SearchContent { .. }
         | ToolAction::SearchCodebase { .. }
-        | ToolAction::ReadGitStatus
+        | ToolAction::ReadGitStatus { .. }
         | ToolAction::ReadGitDiff { .. }
         | ToolAction::ProposePlan(_)
         | ToolAction::CompleteStep
@@ -241,7 +241,7 @@ pub(crate) fn mode_permits(
         | ToolAction::ListDirectory { .. }
         | ToolAction::SearchContent { .. }
         | ToolAction::SearchCodebase { .. }
-        | ToolAction::ReadGitStatus
+        | ToolAction::ReadGitStatus { .. }
         | ToolAction::ReadGitDiff { .. } => Permission::Allowed,
 
         // Spec 50: asking is allowed in every mode. Whether anyone can answer
@@ -430,6 +430,7 @@ mod tests {
                 ToolAction::ReadFile {
                     path: "x".into(),
                     range: None,
+                    worktree: None,
                 },
                 None,
                 None,
@@ -440,6 +441,7 @@ mod tests {
                 ToolAction::ListDirectory {
                     dir: None,
                     depth: None,
+                    worktree: None,
                 },
                 None,
                 None,
@@ -451,6 +453,7 @@ mod tests {
                     pattern: "x".into(),
                     path_glob: None,
                     max_matches: None,
+                    worktree: None,
                 },
                 None,
                 None,
@@ -469,14 +472,20 @@ mod tests {
                 [T, T, T, T],
             ),
             (
-                ToolAction::ReadGitStatus,
+                ToolAction::ReadGitStatus { worktree: None },
                 None,
                 None,
                 [T, T, T, T],
                 [T, T, T, T],
             ),
             (
-                ToolAction::ReadGitDiff { staged: false },
+                ToolAction::ReadGitDiff {
+                    staged: false,
+                    worktree: None,
+                    paths: Vec::new(),
+                    stat: false,
+                    base: None,
+                },
                 None,
                 None,
                 [T, T, T, T],

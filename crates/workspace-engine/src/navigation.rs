@@ -90,6 +90,22 @@ impl NavigationController {
         task_id: Option<&str>,
         repository_id: Option<&str>,
     ) -> Result<DirectoryListing> {
+        self.list_directory_in(root_path, None, dir, depth, task_id, repository_id)
+    }
+
+    /// [`Self::list_directory`] under a worktree's root, recording `worktree`
+    /// (its display path) in the audit record; `None` is the session's own
+    /// checkout. The walk reads the worktree's own `.gitignore` files, under
+    /// the session's ignore and restricted patterns (spec 60 §5.3).
+    pub fn list_directory_in(
+        &self,
+        root_path: impl AsRef<Path>,
+        worktree: Option<&str>,
+        dir: Option<&str>,
+        depth: Option<usize>,
+        task_id: Option<&str>,
+        repository_id: Option<&str>,
+    ) -> Result<DirectoryListing> {
         let requested = dir.unwrap_or(".");
         // `resolve_existing` with `allow_outside_root: false` is what refuses
         // `../..`, on the same path a read would take.
@@ -156,6 +172,7 @@ impl NavigationController {
                 ("status", "allowed".to_string()),
                 ("entryCount", listing.paths.len().to_string()),
                 ("totalFound", listing.total_found.to_string()),
+                ("worktree", worktree.unwrap_or_default().to_string()),
             ],
         )?;
 
@@ -172,6 +189,31 @@ impl NavigationController {
     pub fn search_content(
         &self,
         root_path: impl AsRef<Path>,
+        pattern: &str,
+        path_glob: Option<&str>,
+        max_matches: Option<usize>,
+        task_id: Option<&str>,
+        repository_id: Option<&str>,
+    ) -> Result<ContentSearch> {
+        self.search_content_in(
+            root_path,
+            None,
+            pattern,
+            path_glob,
+            max_matches,
+            task_id,
+            repository_id,
+        )
+    }
+
+    /// [`Self::search_content`] under a worktree's root, recording `worktree`
+    /// (its display path) in the audit record; `None` is the session's own
+    /// checkout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_content_in(
+        &self,
+        root_path: impl AsRef<Path>,
+        worktree: Option<&str>,
         pattern: &str,
         path_glob: Option<&str>,
         max_matches: Option<usize>,
@@ -271,6 +313,7 @@ impl NavigationController {
                 ("matchCount", found.matches.len().to_string()),
                 ("totalFound", found.total_found.to_string()),
                 ("filesSearched", found.files_searched.to_string()),
+                ("worktree", worktree.unwrap_or_default().to_string()),
             ],
         )?;
 

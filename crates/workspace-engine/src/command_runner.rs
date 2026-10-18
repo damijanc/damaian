@@ -368,6 +368,7 @@ impl CommandRunner {
                 ),
                 ("exitCode", execution.exit_code.unwrap_or(-1).to_string()),
                 ("termination", execution.termination.as_str().to_string()),
+                ("purpose", execution.purpose.as_str().to_string()),
                 (
                     "stdoutSummary",
                     execution.stdout.chars().take(2000).collect(),

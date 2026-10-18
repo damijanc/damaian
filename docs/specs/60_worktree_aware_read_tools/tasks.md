@@ -11,7 +11,7 @@
 |---|---|---|
 | 1 · Registered-worktree resolution and refusal | Done 2026-10-17 | Details in the note below the table. |
 | 2 · Git read hardening on the main checkout | Done 2026-10-17 | Details in the note below the table. |
-| 3 · `worktree` on the five read tools | Not started | |
+| 3 · `worktree` on the five read tools | Done 2026-10-18 | Details in the note below the table. |
 | 4 · `list_worktrees` and `read_git_log` | Not started | |
 | 5 · `worktree_survey` eval scenario | Not started | |
 | 6 · Docs, live re-run and close-out | Not started | |
@@ -121,6 +121,70 @@ nextest over `worktree_reads`, `foundation`, `agent_tools` and the
 sandbox, and the one failure,
 `index_cache_picks_up_file_changes_via_watcher_without_full_rescan`, needs
 FSEvents and passes outside it. Workspace clippy and tests are left to CI.
+
+**Task 3 (Done 2026-10-18).** `chat.rs`: `ReadFile`, `ListDirectory` and
+`SearchContent` gained `worktree`; `ReadGitStatus { worktree }`; `ReadGitDiff`
+gained `worktree`, `paths`, `stat` and `base`. `dispatch_read_only_action`
+resolves `worktree` once with `resolve_worktree` and hands the worktree's
+canonical root to the existing functions. A refusal is `ActionOutcome::Failed`
+with the resolver's message, which lists the reachable worktrees. To record the
+worktree, each function gained an `_in` sibling taking `worktree: Option<&str>`,
+the display path: `FileAccessController::read_file_in`,
+`NavigationController::list_directory_in` / `search_content_in`, and
+`GitService::status_in` / `diff_in(root, worktree, &DiffOptions)`. The old
+functions pass `None`, so the CLI, the desktop shell, context assembly and every
+existing test call them unchanged. Every result, summary, label and audit value
+that names the worktree is added only when `worktree` was given. `mode.rs`:
+`ReadGitStatus` became `ReadGitStatus { .. }` in both matches, and the test
+list's constructors gained the new fields. Nothing else there changed.
+
+**Deviations.** (1) All five audit records carry `worktree`, empty for the
+session's checkout, not only `git_status_read` and `git_diff_read`
+(requirement 10). Proposal §5.5 updated. (2) A worktree read's `FileRead`
+evidence path is `<worktree>:<path>`, the same form as the marker's `ref`, so a
+step's evidence cannot take a worktree read for a read of the same path in the
+session's checkout. (3) `read_git_diff`'s marker `ref` adds ` base=…`, ` stat`
+and ` paths=…` when they are given, so two differently scoped diffs are two
+references; a plain diff's `ref` is unchanged. (4) The descriptions say that
+`worktree` takes a registered worktree's path and that a refusal lists the
+reachable ones. They do not name `list_worktrees` yet, since offering a tool
+that does not exist would mislead the model. Task 4 adds it to the
+descriptions. (5) Base validation is stricter than `check-ref-format` in two
+cheap ways: no leading `/` and no `@`. (6) The merge base is resolved with its
+own `git merge-base --end-of-options <base> HEAD`, and the diff runs against the
+SHA, so the listing and the content diff compare against the same commit.
+
+**Discovery.** `PathPolicy::resolve_for_write` is the resolver for `paths`,
+because a deleted file must still be nameable. Its refusal says "Write target",
+so `diff_scope` replaces the message with one about the checkout being read.
+`--stat` output has no `diff --git` lines, so a cut stat footer reports `0 of 0
+files not shown`; a stat over 400 lines is rare enough to leave.
+
+**Tests.** `tests/worktree_reads.rs` grows by 14 (39 in all): each of the five
+tools through `MockModelAdapter` with and without `worktree`; a refused
+worktree failing all five with no approval stop; a tracked restricted `.env`
+changed in a worktree; the audit `worktree` field on all five records; and
+`diff_in` with `base`, `paths` and `stat`, bad bases, escaping paths, and the
+three options through a tool call. Step 2: the tests first failed to compile
+(no `DiffOptions`, no `diff_in`).
+
+**Falsified**, each reverted. Dispatching on the session's root instead of the
+worktree's failed 7 tests. Falling back to the session's root on a refusal
+failed the refusal test. Dropping the marker prefix failed the `read_file` and
+`list_directory` tests. Skipping `validate_base` failed the bad-base test.
+Resolving `paths` without `PathPolicy` against the worktree failed 3 tests,
+the escape test among them. Recording an empty `worktree` in `git_diff_read`
+failed the audit test.
+
+**Checks (local):** fmt, node, lint and typos pass. `cargo deny check` fails
+only on the agent sandbox's read-only advisory-db lock. Scoped clippy for
+`workspace-engine` is clean. `cargo nextest run -p workspace-engine`: 1272
+run, 1271 passed; the one failure,
+`index_cache_picks_up_file_changes_via_watcher_without_full_rescan`, needs
+FSEvents and the sandbox has none. Step 6: the deterministic eval tier passes
+every scenario. The CLI, the desktop shell and context assembly call the
+unchanged functions, so this task changes no other crate. Workspace clippy
+and tests are left to CI.
 
 ## Global Constraints
 
@@ -347,7 +411,7 @@ call changes), `tests/worktree_reads.rs`, `chat.rs` only if
 **Corrections:** C6. **Files:** `chat.rs`, `mode.rs`, `git_service.rs`,
 `tests/worktree_reads.rs`, `tests/agent_tools.rs`.
 
-- [ ] **Step 1: Write the failing tests:** for each of `read_file`,
+- [x] **Step 1: Write the failing tests:** for each of `read_file`,
       `list_directory`, `search_content`, `read_git_status` and `read_git_diff`,
       a dispatch through `MockModelAdapter` with `worktree` reads that
       worktree, and a refused `worktree` is `ActionOutcome::Failed` naming the
@@ -357,23 +421,23 @@ call changes), `tests/worktree_reads.rs`, `chat.rs` only if
       `<worktree>:<path>`; `read_git_diff` with `paths`, `stat` and `base`
       (merge base) on a worktree; `base` of `--output=/tmp/x` and `main..; rm`
       refused before git runs; a `paths` entry escaping the worktree refused.
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: `ToolAction` fields.** `worktree: Option<String>` on
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: `ToolAction` fields.** `worktree: Option<String>` on
       `ReadFile`, `ListDirectory`, `SearchContent`; `ReadGitStatus` becomes
       `ReadGitStatus { worktree }`; `ReadGitDiff` gains `worktree`, `paths`,
       `stat`, `base`. Widen the `mode.rs` patterns (C6) and nothing else there.
-- [ ] **Step 4: `parse_tool_call` and tool definitions.** Descriptions say
+- [x] **Step 4: `parse_tool_call` and tool definitions.** Descriptions say
       that worktrees exist, that `list_worktrees` finds them, and that
       `worktree` takes the path it returns (§5.2, last paragraph).
-- [ ] **Step 5: Dispatch.** Resolve once with `resolve_worktree`, then call the
+- [x] **Step 5: Dispatch.** Resolve once with `resolve_worktree`, then call the
       existing function with the worktree's canonical root. `base` validation:
       `git check-ref-format --allow-onelevel`-equivalent rules in Rust, no
       leading `-`, passed after `--end-of-options`.
-- [ ] **Step 6: Byte-identical check.** The deterministic eval tier
+- [x] **Step 6: Byte-identical check.** The deterministic eval tier
       (`cargo run -p eval-harness -- run --tier deterministic`) passes
       unchanged.
-- [ ] **Step 7: Falsify** and revert.
-- [ ] **Step 8: Scoped checks.**
+- [x] **Step 7: Falsify** and revert.
+- [x] **Step 8: Scoped checks.**
 
 ## Task 4: `list_worktrees` and `read_git_log`
 

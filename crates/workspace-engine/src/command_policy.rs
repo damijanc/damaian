@@ -116,15 +116,14 @@ impl CommandPolicy {
         working_directory: &Path,
     ) -> CommandClassification {
         let location = relative_location(repository_root, working_directory);
-        let (mut classification, admitted_paths) =
-            self.classify_pattern(command, location.as_deref());
+        let (mut classification, admission) = self.classify_pattern(command, location.as_deref());
         if !classification.blocked && location.is_none() {
             escalate(
                 &mut classification,
                 "Working directory is outside the selected repository",
             );
         }
-        if let Some(paths) = &admitted_paths {
+        if let Some(admission) = &admission {
             // Spec 64 requirements 3–4: an admitted read-only command's
             // paths, and the directory it runs in, go through the same
             // restricted patterns `read_file` honours. This replaces the
@@ -138,9 +137,41 @@ impl CommandPolicy {
                     &format!("{RESTRICTED_PATH_REASON}: {restricted}"),
                 );
             }
+            // Requirement 6: a leading `cd <dir>` is held to the same rules
+            // as the working directory, and everything after it runs, and
+            // so resolves, there. It must name a directory that exists:
+            // otherwise `cdable_vars` or `CDPATH` may find one elsewhere.
+            let cd_target = admission
+                .directory
+                .as_deref()
+                .map(PathArgument::relative_to_working_directory);
+            let directory = match &cd_target {
+                Some(target) => normalize_lexically(&working_directory.join(&target.text)),
+                None => working_directory.to_path_buf(),
+            };
+            if let Some(target) = &cd_target
+                && !directory.is_dir()
+            {
+                escalate(
+                    &mut classification,
+                    &format!(
+                        "`cd {}` does not name a directory in the repository",
+                        target.text
+                    ),
+                );
+            }
+            let checks = cd_target
+                .iter()
+                .map(|target| (working_directory, target))
+                .chain(
+                    admission
+                        .paths
+                        .iter()
+                        .map(|path| (directory.as_path(), path)),
+                );
             let mut outside_reported = false;
-            for path in paths {
-                match check_path_argument(&path_policy, repository_root, working_directory, path) {
+            for (base, path) in checks {
+                match check_path_argument(&path_policy, repository_root, base, path) {
                     None => {}
                     Some(PathFinding::OutsideRepository) if !outside_reported => {
                         outside_reported = true;
@@ -190,22 +221,22 @@ impl CommandPolicy {
 
     /// `location` is the working directory relative to the repository root:
     /// `Some("")` at the root, `None` outside the repository. The second
-    /// half is the path arguments of a command admitted as read-only, which
-    /// `classify_at` still has to check (spec 64 requirement 3); `None` for
-    /// every other command.
+    /// half is the `cd` directory and path arguments of a command admitted
+    /// as read-only, which `classify_at` still has to check (spec 64
+    /// requirements 3, 4 and 6); `None` for every other command.
     fn classify_pattern(
         &self,
         command: &str,
         location: Option<&str>,
-    ) -> (CommandClassification, Option<Vec<PathArgument>>) {
+    ) -> (CommandClassification, Option<Admission>) {
         let normalized = command.trim().to_string();
         let verdict = read_only_verdict(&normalized);
         let classification = self.classify_text(normalized, command, location, &verdict);
         let admitted = match verdict {
-            ReadOnlyVerdict::Admitted(paths)
+            ReadOnlyVerdict::Admitted(admission)
                 if classification.reasons.first().map(String::as_str) == Some(READ_ONLY_REASON) =>
             {
-                Some(paths)
+                Some(admission)
             }
             _ => None,
         };
@@ -234,14 +265,24 @@ impl CommandPolicy {
         }
 
         if contains_shell_control(&normalized) {
+            // Spec 64 requirement 6: the tokenizer, not this character scan,
+            // decides. A read-only pipeline, or an admitted command with `|`
+            // inside quotes, passes; every other operator, redirect and
+            // substitution is still caught here.
+            if matches!(verdict, ReadOnlyVerdict::Admitted(_)) {
+                return self.read_only_classification(normalized);
+            }
+            let mut reasons =
+                vec!["Command contains shell control syntax and needs explicit review".to_string()];
+            if let ReadOnlyVerdict::Refused(reason) = verdict {
+                reasons.push(reason.clone());
+            }
             return CommandClassification {
                 command: normalized,
                 risk: CommandRisk::High,
                 blocked: false,
                 requires_approval: true,
-                reasons: vec![
-                    "Command contains shell control syntax and needs explicit review".to_string(),
-                ],
+                reasons,
                 expected_effects: "Potential chained or redirected command effects".to_string(),
                 may_use_network: may_use_network(command),
             };
@@ -268,17 +309,7 @@ impl CommandPolicy {
         }
 
         match verdict {
-            ReadOnlyVerdict::Admitted(_) => {
-                return CommandClassification {
-                    command: normalized,
-                    risk: CommandRisk::Low,
-                    blocked: false,
-                    requires_approval: self.config.require_approval_for_all_commands,
-                    reasons: vec![READ_ONLY_REASON.to_string()],
-                    expected_effects: "Reads workspace or Git metadata".to_string(),
-                    may_use_network: false,
-                };
-            }
+            ReadOnlyVerdict::Admitted(_) => return self.read_only_classification(normalized),
             // A read-only program outside its admitted form: an option that
             // writes or redirects (`--output`, `-C`), or text the shell
             // would rewrite. Its effects are unknown until reviewed.
@@ -351,6 +382,20 @@ impl CommandPolicy {
             reasons: vec!["Unknown command effects".to_string()],
             expected_effects: "Unknown effects until reviewed".to_string(),
             may_use_network: may_use_network(command),
+        }
+    }
+
+    /// An admitted read-only command or pipeline (spec 64 §5.5): Low, and
+    /// needing approval only when every command does.
+    fn read_only_classification(&self, normalized: String) -> CommandClassification {
+        CommandClassification {
+            command: normalized,
+            risk: CommandRisk::Low,
+            blocked: false,
+            requires_approval: self.config.require_approval_for_all_commands,
+            reasons: vec![READ_ONLY_REASON.to_string()],
+            expected_effects: "Reads workspace or Git metadata".to_string(),
+            may_use_network: false,
         }
     }
 
@@ -562,8 +607,19 @@ enum ReadOnlyVerdict {
     /// A read-only program in a form the boundary does not admit, so it
     /// needs approval. The reason is what the user is shown.
     Refused(String),
-    /// Admitted; each path argument still has to pass requirement 3.
-    Admitted(Vec<PathArgument>),
+    /// Admitted; the `cd` directory and each path argument still have to
+    /// pass requirements 3 and 4.
+    Admitted(Admission),
+}
+
+/// What `classify_at` still has to check about an admitted command or
+/// pipeline: where it runs and which paths it names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Admission {
+    /// The `<dir>` of a leading `cd <dir> &&`, relative to the working
+    /// directory. Every path argument resolves against it.
+    directory: Option<String>,
+    paths: Vec<PathArgument>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -587,29 +643,44 @@ impl PathArgument {
     }
 }
 
-/// The command's words as the shell will see them, or the reason they
-/// cannot be known before the shell runs (spec 64 requirement 1).
+/// The two operators a read-only pipeline may use (spec 64 requirement 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Operator {
+    And,
+    Pipe,
+}
+
+/// The command line as the shell will see it, or the reason it cannot be
+/// known before the shell runs (spec 64 requirement 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ShellWords {
-    words: Vec<String>,
-    /// The first expansion found. The words are still returned, with the
-    /// expanding characters left in, so the caller can tell which program
-    /// was meant.
+struct ShellLine {
+    /// Each simple command's words; `operators[i]` joins `commands[i]` and
+    /// `commands[i + 1]`. A command may be empty (`&& ls`), which the
+    /// caller refuses.
+    commands: Vec<Vec<String>>,
+    operators: Vec<Operator>,
+    /// The first expansion found anywhere in the line. The words are still
+    /// returned, with the expanding characters left in, so the caller can
+    /// tell which program was meant.
     expansion: Option<&'static str>,
 }
 
-/// Splits `command` into words the way a POSIX shell or zsh would, without
-/// performing any expansion. `None` means the text uses syntax this
-/// tokenizer does not model (a backslash, an unclosed quote, an operator),
-/// which is a parsing gap and so must ask rather than run (§5.1).
-fn shell_words(command: &str) -> Option<ShellWords> {
+/// Splits `command` into simple commands and words the way a POSIX shell or
+/// zsh would, without performing any expansion. `&&` and `|` separate
+/// commands. `None` means the text uses syntax this tokenizer does not model
+/// (a backslash, an unclosed quote, any other operator: `;`, `||`, `&`,
+/// `|&`, a redirect), which is a parsing gap and so must ask rather than run
+/// (§5.1).
+fn shell_line(command: &str) -> Option<ShellLine> {
+    let mut commands = Vec::new();
+    let mut operators = Vec::new();
     let mut words = Vec::new();
     let mut expansion = None;
     let mut current = String::new();
     let mut in_word = false;
     // The previous unquoted character, for the positions where `~` expands.
     let mut previous: Option<char> = None;
-    let mut characters = command.chars();
+    let mut characters = command.chars().peekable();
     let note = |found: &'static str, expansion: &mut Option<&'static str>| {
         expansion.get_or_insert(found);
     };
@@ -620,6 +691,25 @@ fn shell_words(command: &str) -> Option<ShellWords> {
                     words.push(std::mem::take(&mut current));
                     in_word = false;
                 }
+                previous = None;
+                continue;
+            }
+            '&' | '|' => {
+                let operator = match (character, characters.peek()) {
+                    ('&', Some('&')) => {
+                        characters.next();
+                        Operator::And
+                    }
+                    ('|', Some('|' | '&')) => return None,
+                    ('|', _) => Operator::Pipe,
+                    _ => return None,
+                };
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+                commands.push(std::mem::take(&mut words));
+                operators.push(operator);
                 previous = None;
                 continue;
             }
@@ -650,7 +740,7 @@ fn shell_words(command: &str) -> Option<ShellWords> {
                 previous = Some('"');
                 continue;
             }
-            '\\' | ';' | '&' | '|' | '<' | '>' | '\n' | '\r' => return None,
+            '\\' | ';' | '<' | '>' | '\n' | '\r' => return None,
             control if control.is_control() => return None,
             '$' => note("`$`", &mut expansion),
             '`' => note("a backtick", &mut expansion),
@@ -678,7 +768,12 @@ fn shell_words(command: &str) -> Option<ShellWords> {
     if in_word {
         words.push(current);
     }
-    Some(ShellWords { words, expansion })
+    commands.push(words);
+    Some(ShellLine {
+        commands,
+        operators,
+        expansion,
+    })
 }
 
 const READ_ONLY_GIT_SUBCOMMANDS: [&str; 4] = ["status", "diff", "log", "show"];
@@ -726,30 +821,170 @@ fn git_subcommand<'a>(arguments: &[&'a str]) -> Option<(Vec<&'a str>, &'a str, V
 }
 
 fn read_only_verdict(command: &str) -> ReadOnlyVerdict {
-    let Some(parsed) = shell_words(command.trim()) else {
+    let Some(line) = shell_line(command.trim()) else {
         let raw: Vec<&str> = command.split_whitespace().collect();
-        return if names_read_only_program(&raw) {
+        return if names_read_only_program(&raw) || raw.first() == Some(&"cd") {
             ReadOnlyVerdict::Refused(
                 "Command uses shell syntax the read-only check does not model (a backslash, an \
-                 unclosed quote or an operator), so it needs review"
+                 unclosed quote, or an operator other than `&&` and `|`), so it needs review"
                     .to_string(),
             )
         } else {
             ReadOnlyVerdict::NotReadOnly
         };
     };
-    let words: Vec<&str> = parsed.words.iter().map(String::as_str).collect();
-    if !names_read_only_program(&words) {
+    let commands: Vec<Vec<&str>> = line
+        .commands
+        .iter()
+        .map(|words| words.iter().map(String::as_str).collect())
+        .collect();
+    let first = commands[0].as_slice();
+    let leading_cd = first.first() == Some(&"cd") && !line.operators.is_empty();
+    if !leading_cd && !names_read_only_program(first) {
         return ReadOnlyVerdict::NotReadOnly;
     }
-    if let Some(expansion) = parsed.expansion {
+    if let Some(expansion) = line.expansion {
         return ReadOnlyVerdict::Refused(format!(
             "Command uses shell expansion ({expansion}), so the shell would run something other \
              than what was checked"
         ));
     }
+    if line.operators.is_empty() {
+        return command_verdict(first);
+    }
+    pipeline_verdict(&commands, &line.operators, leading_cd)
+}
+
+/// A read-only pipeline (spec 64 requirement 6, §5.5): an optional leading
+/// `cd <dir> &&`, then `&&` segments that are each an admitted command
+/// followed by any number of `| <filter>`. The shell gives `|` precedence
+/// over `&&`, so `a | b && c` is `(a | b) && c`, which is what this reads.
+fn pipeline_verdict(
+    commands: &[Vec<&str>],
+    operators: &[Operator],
+    leading_cd: bool,
+) -> ReadOnlyVerdict {
+    let mut admission = Admission::default();
+    let mut start = 0;
+    if leading_cd {
+        // `cd -`, `cd` alone, zsh's two-argument `cd old new` and options
+        // all go somewhere other than the word they name.
+        match commands[0].as_slice() {
+            ["cd", directory] if !directory.is_empty() && !directory.starts_with('-') => {
+                admission.directory = Some((*directory).to_string());
+            }
+            _ => {
+                return ReadOnlyVerdict::Refused(
+                    "Only `cd <dir> &&` with a single directory is admitted before a read-only \
+                     command, so the command needs review"
+                        .to_string(),
+                );
+            }
+        }
+        if operators[0] != Operator::And {
+            return ReadOnlyVerdict::Refused(
+                "`cd` is admitted only when followed by `&&`, so the command needs review"
+                    .to_string(),
+            );
+        }
+        start = 1;
+    }
+    for (index, words) in commands.iter().enumerate().skip(start) {
+        if words.is_empty() {
+            return ReadOnlyVerdict::Refused(
+                "Command has an operator with nothing on one side, so it needs review".to_string(),
+            );
+        }
+        let after_pipe = index > 0 && operators[index - 1] == Operator::Pipe;
+        if after_pipe {
+            if !is_stdin_filter(words) {
+                return ReadOnlyVerdict::Refused(format!(
+                    "`{}` after `|` is not an admitted filter (stdin only, no file arguments), so \
+                     the command needs review",
+                    words.join(" ")
+                ));
+            }
+            continue;
+        }
+        if !names_read_only_program(words) {
+            return ReadOnlyVerdict::Refused(format!(
+                "`{}` is not an admitted read-only command, so the command needs review",
+                words.join(" ")
+            ));
+        }
+        match command_verdict(words) {
+            ReadOnlyVerdict::Admitted(segment) => admission.paths.extend(segment.paths),
+            refused => return refused,
+        }
+    }
+    ReadOnlyVerdict::Admitted(admission)
+}
+
+/// The stdin-only filters of spec 64 requirement 7, with their listed
+/// options and no file argument, so a filter reads nothing but the output
+/// of the admitted command before it.
+fn is_stdin_filter(words: &[&str]) -> bool {
+    let flags_from = |argument: &str, allowed: &str| {
+        argument.strip_prefix('-').is_some_and(|flags| {
+            !flags.is_empty() && flags.chars().all(|flag| allowed.contains(flag))
+        })
+    };
+    let (program, arguments) = words
+        .split_first()
+        .expect("the caller refuses empty commands");
+    match *program {
+        "head" | "tail" => match arguments {
+            ["-n", count] => is_count(count),
+            [option] => option.strip_prefix("-n").is_some_and(is_count),
+            _ => false,
+        },
+        "wc" => arguments.iter().all(|argument| flags_from(argument, "lwc")),
+        "sort" => arguments.iter().all(|argument| flags_from(argument, "rnu")),
+        "uniq" => arguments.iter().all(|argument| *argument == "-c"),
+        "cut" => {
+            let mut remaining = arguments.iter();
+            while let Some(argument) = remaining.next() {
+                let (option, attached) = match argument.get(..2) {
+                    Some(option @ ("-d" | "-f")) => (option, &argument[2..]),
+                    _ => return false,
+                };
+                let value = if attached.is_empty() {
+                    match remaining.next() {
+                        Some(value) => *value,
+                        None => return false,
+                    }
+                } else {
+                    attached
+                };
+                let admitted = if option == "-d" {
+                    value.chars().count() == 1
+                } else {
+                    !value.is_empty()
+                        && value.chars().all(|character| {
+                            character.is_ascii_digit() || matches!(character, ',' | '-')
+                        })
+                };
+                if !admitted {
+                    return false;
+                }
+            }
+            true
+        }
+        "grep" => {
+            let (options, patterns): (Vec<&str>, Vec<&str>) = arguments
+                .iter()
+                .partition(|argument| argument.starts_with('-'));
+            options.iter().all(|option| flags_from(option, "ivncEF")) && patterns.len() == 1
+        }
+        _ => false,
+    }
+}
+
+/// One admitted program's form (spec 64 §5.2). The caller has checked that
+/// `words` names a read-only program and the line has no expansion.
+fn command_verdict(words: &[&str]) -> ReadOnlyVerdict {
     match words[0] {
-        "pwd" if words.len() == 1 => ReadOnlyVerdict::Admitted(Vec::new()),
+        "pwd" if words.len() == 1 => ReadOnlyVerdict::Admitted(Admission::default()),
         "pwd" => refuse_argument("pwd", words[1]),
         "ls" => ls_verdict(&words[1..]),
         _ => {
@@ -797,7 +1032,10 @@ fn ls_verdict(arguments: &[&str]) -> ReadOnlyVerdict {
             path.recursive = true;
         }
     }
-    ReadOnlyVerdict::Admitted(paths)
+    ReadOnlyVerdict::Admitted(Admission {
+        directory: None,
+        paths,
+    })
 }
 
 fn is_count(word: &str) -> bool {
@@ -884,7 +1122,10 @@ fn git_verdict(subcommand: &str, arguments: &[&str]) -> ReadOnlyVerdict {
             return refuse_argument(&program, argument);
         }
     }
-    ReadOnlyVerdict::Admitted(paths)
+    ReadOnlyVerdict::Admitted(Admission {
+        directory: None,
+        paths,
+    })
 }
 
 /// A git positional argument: a revision, a range, `<rev>:<path>` or a
@@ -1239,8 +1480,8 @@ mod tests {
     /// exercised for real.
     mod read_only_boundary {
         use super::super::{
-            CommandClassification, CommandPolicy, CommandRisk, RESTRICTED_PATH_REASON, ShellWords,
-            is_low_risk_read_only, shell_words,
+            CommandClassification, CommandPolicy, CommandRisk, Operator, RESTRICTED_PATH_REASON,
+            ShellLine, is_low_risk_read_only, shell_line,
         };
         use crate::config::Config;
         use std::fs;
@@ -1484,30 +1725,33 @@ mod tests {
             }
         }
 
+        /// Requirement 6 renamed `shell_words` to `shell_line`, which also
+        /// splits on `&&` and `|`; a line without them is one command.
         #[test]
         fn the_tokenizer_splits_quotes_without_expanding() {
             assert_eq!(
-                shell_words("git log --format='%h $x' \"a b\" ''"),
-                Some(ShellWords {
-                    words: vec![
+                shell_line("git log --format='%h $x' \"a b\" ''"),
+                Some(ShellLine {
+                    commands: vec![vec![
                         "git".to_string(),
                         "log".to_string(),
                         "--format=%h $x".to_string(),
                         "a b".to_string(),
                         String::new(),
-                    ],
+                    ]],
+                    operators: Vec::new(),
                     expansion: None,
                 })
             );
             assert_eq!(
-                shell_words("git diff HEAD~1").unwrap().expansion,
+                shell_line("git diff HEAD~1").unwrap().expansion,
                 None,
                 "`~` inside a word is not tilde expansion"
             );
-            assert!(shell_words("ls 'unclosed").is_none());
-            assert!(shell_words("ls a\\ b").is_none());
-            assert!(shell_words("ls a{b,c}").unwrap().expansion.is_some());
-            assert!(shell_words("ls #x").unwrap().expansion.is_some());
+            assert!(shell_line("ls 'unclosed").is_none());
+            assert!(shell_line("ls a\\ b").is_none());
+            assert!(shell_line("ls a{b,c}").unwrap().expansion.is_some());
+            assert!(shell_line("ls #x").unwrap().expansion.is_some());
         }
 
         /// The prefix match admitted anything that started with an admitted
@@ -1520,6 +1764,196 @@ mod tests {
             assert!(!is_low_risk_read_only("pwd -P"));
             assert!(!is_low_risk_read_only("ls --color=always"));
             assert!(!is_low_risk_read_only("git status | head"));
+        }
+
+        // Spec 64 §6, "Pipelines" (requirements 6–7).
+
+        #[test]
+        fn a_cd_into_the_repository_and_a_chain_of_admitted_commands_run_unasked() {
+            let repo = Repository::new("pipeline-cd");
+            fs::create_dir_all(repo.root.join(".claude/worktrees/x")).unwrap();
+            let classification = repo.classify(
+                "cd .claude/worktrees/x && git status --short && git log --oneline -n 5 | head -n 3",
+            );
+            assert!(
+                runs_unasked(&classification),
+                "{:?}",
+                classification.reasons
+            );
+            assert!(classification.is_read_only_without_approval());
+            assert!(!classification.may_use_network);
+        }
+
+        #[test]
+        fn an_admitted_command_piped_through_filters_runs_unasked() {
+            let repo = Repository::new("pipeline-filters");
+            for command in [
+                "git log --oneline | grep -i fix | wc -l",
+                "git log --oneline | head -n 3",
+                "git log --oneline | tail -n3",
+                "git log --name-only --format= | sort | uniq -c | sort -rn | head -n 10",
+                "git status --porcelain | cut -d ' ' -f 2",
+                "git log --format='%h,%s' | cut -d, -f1-2",
+                "git log --oneline | grep -vE 'wip|fixup'",
+                "git log --oneline | grep -F -c '[x]'",
+                "ls crates | wc -lw",
+                "ls&&pwd|wc -c",
+                "git status -sb && git diff --stat | tail -n 1",
+                // Quoted `|` is a word, not an operator.
+                "git log --format='%h|%s' -n 3",
+            ] {
+                let classification = repo.classify(command);
+                assert!(
+                    runs_unasked(&classification),
+                    "{command}: {:?}",
+                    classification.reasons
+                );
+                assert!(classification.is_read_only_without_approval(), "{command}");
+            }
+        }
+
+        #[test]
+        fn pipelines_outside_the_admitted_shape_need_approval() {
+            let repo = Repository::new("pipeline-refused");
+            for command in [
+                "git log --oneline | grep fix secrets.txt",
+                "ls | xargs cat",
+                "git status; rm x",
+                "git status || true",
+                "git log > out.txt",
+                "cd /tmp && ls",
+                // Every other operator and form.
+                "git status & rm x",
+                "git status |& head -n 1",
+                "git status && rm x",
+                "git status && npm test",
+                "git status | sh",
+                "git status && cd crates && ls",
+                "cd crates | ls",
+                "cd crates",
+                "cd crates engine && ls",
+                "cd - && ls",
+                "cd && ls",
+                "&& ls",
+                "ls &&",
+                "ls | | head -n 1",
+                "git log < x",
+                "git log $(id) | head -n 1",
+                "git log | grep x *",
+                "cd ~ && ls",
+                // Filters with options or arguments outside requirement 7.
+                "git log | head",
+                "git log | head -c 10",
+                "git log | tail -f",
+                "git log | head -n 3 x",
+                "git log | wc -m",
+                "git log | sort -o out.txt",
+                "git log | uniq -c out.txt",
+                "git log | cut -c 1-3",
+                "git log | cut -d ab -f 1",
+                "git log | grep -r x",
+                "git log | grep -e x",
+                "git log | grep",
+                "git log | grep --count x",
+                // The command before `|` is still held to requirements 1–3.
+                "git log --output=x | head -n 1",
+                "git show HEAD:.env | head -n 1",
+            ] {
+                assert_needs_approval(&repo.classify(command));
+            }
+        }
+
+        #[test]
+        fn a_cd_is_held_to_the_working_directory_rules() {
+            let repo = Repository::new("pipeline-cd-rules");
+            let restricted = repo.classify("cd secrets && ls");
+            assert_needs_approval(&restricted);
+            assert!(
+                restricted
+                    .reasons
+                    .contains(&format!("{RESTRICTED_PATH_REASON}: secrets")),
+                "{:?}",
+                restricted.reasons
+            );
+            let outside = repo.classify("cd .. && ls");
+            assert_needs_approval(&outside);
+            assert!(
+                outside
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.contains("outside the selected repository")),
+                "{:?}",
+                outside.reasons
+            );
+            // A directory that does not exist could be found through `CDPATH`.
+            assert_needs_approval(&repo.classify("cd missing && ls"));
+            let outside_directory = std::env::temp_dir();
+            std::os::unix::fs::symlink(&outside_directory, repo.root.join("escape")).unwrap();
+            assert_needs_approval(&repo.classify("cd escape && ls"));
+            // From a sub-root, `cd` resolves against the working directory.
+            assert!(runs_unasked(&repo.classify_in("cd engine && ls", "crates")));
+            assert_needs_approval(&repo.classify_in("cd ../secrets && ls", "crates"));
+        }
+
+        #[test]
+        fn paths_after_a_cd_resolve_in_the_cd_directory() {
+            let repo = Repository::new("pipeline-cd-paths");
+            assert!(runs_unasked(&repo.classify("cd crates && ls engine")));
+            // The path half of `<rev>:<path>` is still from the top level.
+            assert!(runs_unasked(
+                &repo.classify("cd crates && git show HEAD:README.md | head -n 5")
+            ));
+            let restricted = repo.classify("cd crates && ls ../secrets");
+            assert_needs_approval(&restricted);
+            assert!(
+                restricted
+                    .reasons
+                    .contains(&format!("{RESTRICTED_PATH_REASON}: secrets")),
+                "{:?}",
+                restricted.reasons
+            );
+            assert_needs_approval(&repo.classify("cd crates && ls ../.."));
+            assert_needs_approval(&repo.classify("cd crates && ls -R .."));
+        }
+
+        /// §5.5: a pipeline is Low like a single admitted command, so it
+        /// asks exactly when every command does.
+        #[test]
+        fn a_pipeline_asks_when_every_command_must() {
+            let repo = Repository::new("pipeline-all");
+            let classification = CommandPolicy::new(Config {
+                require_approval_for_all_commands: true,
+                ..Config::default()
+            })
+            .classify("git log --oneline | head -n 3", &repo.root);
+            assert_eq!(classification.risk, CommandRisk::Low);
+            assert!(classification.requires_approval);
+        }
+
+        #[test]
+        fn the_tokenizer_splits_on_and_and_pipe_only() {
+            let line = shell_line("cd x&&git log 'a|b' | head -n 1").unwrap();
+            assert_eq!(
+                line.commands,
+                vec![
+                    vec!["cd".to_string(), "x".to_string()],
+                    vec!["git".to_string(), "log".to_string(), "a|b".to_string()],
+                    vec!["head".to_string(), "-n".to_string(), "1".to_string()],
+                ]
+            );
+            assert_eq!(line.operators, vec![Operator::And, Operator::Pipe]);
+            for refused in [
+                "a || b", "a |& b", "a & b", "a &| b", "a; b", "a > b", "a\nb",
+            ] {
+                assert!(shell_line(refused).is_none(), "{refused}");
+            }
+        }
+
+        #[test]
+        fn is_low_risk_read_only_judges_the_whole_pipeline() {
+            assert!(is_low_risk_read_only("git status | head -n 1"));
+            assert!(is_low_risk_read_only("cd crates && ls"));
+            assert!(!is_low_risk_read_only("git status | head -n 1 && rm x"));
         }
     }
 

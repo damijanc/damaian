@@ -360,6 +360,7 @@ impl ValidationOrchestrator {
                 ("proposalId", proposal.id.clone()),
                 ("commandId", execution.id.clone()),
                 ("exitCode", execution.exit_code.unwrap_or(-1).to_string()),
+                ("purpose", execution.purpose.as_str().to_string()),
                 ("stdoutRef", record.stdout_ref.to_string_lossy().to_string()),
                 ("stderrRef", record.stderr_ref.to_string_lossy().to_string()),
             ],
@@ -647,6 +648,9 @@ fn serialize_execution_summary(
     write_field(&mut output, "TERMINATION", execution.termination.as_str());
     write_field(&mut output, "STDOUT_REF", &stdout_ref.to_string_lossy());
     write_field(&mut output, "STDERR_REF", &stderr_ref.to_string_lossy());
+    // Last, as on the proposal, so a summary written before spec 63 differs
+    // only by lacking it, and its absence means `Other`.
+    write_field(&mut output, "PURPOSE", execution.purpose.as_str());
     output.push_str("END_COMMAND_EXECUTION\n");
     output
 }

@@ -184,6 +184,34 @@ The audit record for a command execution gains `purpose`. The eval harness
 reports findings per run grouped by purpose, so a regression that starts filing
 exploration failures again shows as a non-zero count where there should be none.
 
+As built (Task 5):
+
+- Both execution audit events carry `purpose` (`check`, `exploration`,
+  `other`): `command_executed` (`command_runner.rs`) and
+  `stored_command_executed` (`validation.rs`). The stored execution summary
+  (`summary.dcmd`) ends with a `PURPOSE` field after `STDERR_REF`, the way the
+  proposal's does. Nothing in the tree reads summaries back, so a summary
+  written before this spec differs only by lacking it.
+- The eval harness had no findings at all (correction C8). Each run record
+  now carries `findingsByPurpose`, a `{commands, findings}` count for each
+  purpose. It is built by `trace::findings_by_purpose`, which joins the
+  audit trace's `stored_command_executed` (`commandId`, `purpose`) with the
+  session log's `finding_recorded` (`originRef`). Every agent command runs
+  through a stored proposal, so the join covers them all. A finding whose
+  origin is not a command, such as a browser diagnostic, has no purpose and
+  is not counted.
+- The command count sits beside the finding count, so a zero is evidence
+  only when something explored. The new metric `exploration_findings`
+  ("Findings from exploration commands") sums the exploration findings. It
+  reports no data when no run executed an exploration command, as the other
+  asserted-zero counts do. The text report gains a "Findings by command
+  purpose" section that lists `findings/commands` per purpose for each run
+  that executed a command.
+- No new scenario was needed. `failed_validation_retry` already fails `ls
+  no-such-directory` eight times. It now asserts `exploration_findings = 0`.
+  That assertion fails when the run executed no exploration command, and it
+  is `deterministic_only`, because a live model may never run one.
+
 ### 5.6 Documentation
 
 On Done: `docs/USER_GUIDE.md` (findings: which commands produce them), and

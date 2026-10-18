@@ -38,3 +38,7 @@ tool_calls = [
 # above 1, so a loop that never engaged cannot pass either.
 model_calls_at_most = 9
 files_changed_outside_patch = 0
+# Spec 63: `ls` is an exploration command, so its eight failures record no
+# finding. Deterministic only, because a live model may never run one.
+exploration_findings = 0
+deterministic_only = ["exploration_findings"]

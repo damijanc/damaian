@@ -1,8 +1,8 @@
 # Feature Spec: The Read-Only Command Boundary
 
 Status: In progress. Started 2026-10-17: requirements 1–4 and 8 (the
-tightening) are implemented; requirement 5 waits for #60, and requirements 6–7
-(pipelines) are not started. Specified on 2026-10-17. It began as "let read-only
+tightening) are implemented, and requirements 6–7 (pipelines) were implemented
+on 2026-10-18; requirement 5 waits for #60. Specified on 2026-10-17. It began as "let read-only
 pipelines run without approval", from the session behind
 [#59](59_exploration_round_allowance/proposal.md)–[#63](63_exploratory_command_failures/proposal.md).
 Reading the policy to design that found the existing read-only list already
@@ -17,8 +17,8 @@ Depends on: [#20](20_working_modes/proposal.md) (Plan and Review allow only
 commands that need no approval) — built;
 [#34](34_repository_config_trust_boundary.md) — built;
 [#60](60_worktree_aware_read_tools/proposal.md) (tools for git content and
-worktrees) — **not built**. Requirements 1–4 and 6–8 do not need #60 and may
-ship first. Requirement 5 waits for it, for the reason in §5.4. Everything else
+worktrees) — **not built**. Requirements 1–4 and 6–8 do not need #60 and have
+shipped first. Requirement 5 waits for it, for the reason in §5.4. Everything else
 named below is a cross-reference, not a prerequisite.
 Related implementation specs:
 [`10_persistent_command_approval.md`](10_persistent_command_approval.md)
@@ -198,8 +198,11 @@ needed — so requirements 1–3 narrow them now and requirement 5 finishes the 
 A pipeline is admitted segment by segment:
 
 1. An optional leading `cd <dir>` sets the directory for what follows. `<dir>`
-   must resolve inside the repository (with #60, also a registered worktree) and
-   pass requirement 4. `cd` anywhere else in the line is not admitted.
+   must resolve inside the repository (with #60, also a registered worktree),
+   pass requirement 4, and name a directory that exists: a missing one is where
+   zsh's `cdable_vars` and `CDPATH` would look elsewhere. `<dir>` is a single
+   word not starting with `-`, so `cd -` and zsh's `cd old new` ask. `cd`
+   anywhere else in the line is not admitted.
 2. Each `&&` segment is `<admitted command> [| <filter>]*`.
 3. Each filter is from requirement 7's list, with its listed options only and no
    file argument.
@@ -325,3 +328,72 @@ locally: fmt, node, lint, typos, deny, and `cargo clippy -p workspace-engine`.
   escape, `<rev>:<path>` resolution, `ls -R`, a restricted working directory
   and git globs. `mode::tests::plan_and_review_refuse_commands_the_read_only_boundary_refuses`
   covers requirement 8. No existing policy test needed changing.
+
+### Requirements 6–7 (2026-10-18)
+
+All in `command_policy.rs`; no new dependency, no change to `mode.rs`.
+
+Scoped checks passed locally: fmt, node, lint, typos and `cargo clippy -p
+workspace-engine`. `cargo nextest run -p workspace-engine`: 1272 of 1274
+passed, inside the agent sandbox. The FSEvents watcher test fails only in the
+sandbox, and
+`a_mode_refused_proposal_that_is_later_run_by_id_counts_as_an_approval_policy_violation`
+(a `touch` command, not a read-only one) failed once with "no readable
+identity to record" and passed when rerun alone. `cargo deny` could not take
+its advisory lock in the sandbox. The workspace gate is left to CI.
+
+- **Tokenizer.** `shell_words` became `shell_line`, which splits on `&&` and
+  `|` into simple commands and still returns `None` for every other operator:
+  `;`, `||`, a lone `&`, `|&`, `&|`, redirects and newlines. So those, and
+  subshells and substitutions (already expansion), reach the shell-control
+  branch as before (§4).
+- **Where the decision is made.** In `classify_text`, the shell-control
+  character scan now defers to the tokenizer: an admitted line returns Low
+  before it. Two consequences. A pipeline that is not admitted keeps the
+  shell-control reason and gains the boundary's reason (which segment or
+  filter was refused) as a second one. And a single admitted command with `|`
+  or `&` inside quotes (`git log --format='%h|%s'`), which the scan used to
+  send to approval, now runs unasked, since its words are what was checked.
+  The allowlist is still consulted only after the scan, so *Allow Always*
+  entries and root-qualified `cd <root> && <cmd>` entries keep their meaning.
+- **Pipelines.** `pipeline_verdict` reads `a | b && c` as `(a | b) && c`, as
+  the shell does. Each `&&` segment's first command goes through the same
+  per-program check as a single command (`command_verdict`), and its path
+  arguments are collected; every command after `|` must be a filter.
+  `is_low_risk_read_only` judges the whole line, so Plan, Review and
+  `command_access=read_only` admit exactly these pipelines (requirement 8).
+- **`cd`.** The leading `cd <dir>` is carried in `Admission::directory`.
+  `classify_at` checks `<dir>` like a path argument against the working
+  directory (outside the repository → the outside reason; restricted, by the
+  same contents rule as requirement 4 → `RESTRICTED_PATH_REASON`), requires it
+  to exist as a directory (§5.5, added while implementing), and resolves every
+  later path argument from it. The path half of `<rev>:<path>` still resolves
+  from the top level.
+- **Worktrees.** No dependency on #60. A worktree under the repository root
+  (`.claude/worktrees/x`) is an ordinary in-repository directory and is
+  admitted. One outside the root asks, as any outside path does, until #60's
+  registry exists.
+- **Filters,** read from requirement 7: `head`/`tail` need `-n N` (or `-nN`),
+  so bare `head` still asks, as `tests/foundation.rs` expects; `wc`, `sort`
+  and `uniq` take zero or more of their listed flags, combined or not; `cut`
+  takes `-d` with a one-character delimiter and `-f` with a list of digits,
+  `,` and `-`, attached or separate; `grep` takes combined `-ivncEF` flags and
+  exactly one pattern, which may not start with `-`. Anything else, including
+  `sort -o`, `uniq`'s output-file argument, `tail -f` and `grep -e`, asks.
+- **Not covered.** bash consults `CDPATH` *before* the current directory for a
+  relative `cd` target that does not start with `./` or `../`, so a login
+  shell that sets `CDPATH` could run `cd crates && ls` somewhere else. zsh,
+  the macOS default, checks the current directory first, and requiring the
+  directory to exist covers `cdable_vars`. `CDPATH` is the user's own
+  configuration, not the repository's. §5.6's audit record of the parsed shape
+  is not written yet: it needs `command_runner.rs` and the audit log, which
+  this change did not touch; the command text in the record still reproduces
+  the parse.
+- **Tests.** `command_policy::tests::read_only_boundary` covers every
+  "Pipelines" criterion (`a_cd_into_the_repository_and_a_chain_of_admitted_commands_run_unasked`,
+  `an_admitted_command_piped_through_filters_runs_unasked`,
+  `pipelines_outside_the_admitted_shape_need_approval`), plus `cd` into a
+  restricted, missing or symlinked-out directory, paths resolving after `cd`,
+  `require_approval_for_all_commands`, and the tokenizer's operator split.
+  The tokenizer test was updated for the rename (comment names requirement
+  6); no other existing test changed.

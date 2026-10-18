@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use workspace_engine::{ClientError, Result};
+use workspace_engine::{ClientError, CommandPurpose, Result};
 
-use crate::record::RecordedToolCall;
+use crate::record::{FindingsByPurpose, PurposeTally, RecordedToolCall};
 
 /// One audit event. `AuditLog::record` writes a flat JSON object per line with
 /// `eventId`, `timestampMs`, `userId`, `eventType` plus caller fields, every
@@ -242,6 +242,56 @@ pub fn tool_rounds(data_dir: &Path) -> Result<u64> {
     }
 
     Ok(rounds)
+}
+
+/// A run's command findings grouped by purpose (spec 63 §5.5).
+///
+/// Two logs are joined. The audit trace's `stored_command_executed` gives each
+/// executed command's `commandId` and `purpose`; every agent command runs
+/// through a stored proposal, so this covers them all. The session log's
+/// `finding_recorded` gives each finding's `originRef`, which for a command is
+/// that same id. An event written before spec 63 has no `purpose` and reads as
+/// `Other`, as everywhere else.
+pub fn findings_by_purpose(trace: &Trace, data_dir: &Path) -> Result<FindingsByPurpose> {
+    let mut grouped = FindingsByPurpose::default();
+    let mut purposes: Vec<(String, CommandPurpose)> = Vec::new();
+    for event in trace.of_type("stored_command_executed") {
+        let purpose = CommandPurpose::from_stored(event.field("purpose").unwrap_or_default());
+        tally(&mut grouped, purpose).commands += 1;
+        if let Some(id) = event.field("commandId") {
+            purposes.push((id.to_string(), purpose));
+        }
+    }
+
+    for path in session_log_paths(data_dir)? {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
+        for line in text.lines() {
+            let Ok(serde_json::Value::Object(event)) = serde_json::from_str(line.trim()) else {
+                continue;
+            };
+            if event.get("eventType").and_then(|value| value.as_str()) != Some("finding_recorded") {
+                continue;
+            }
+            let origin = event
+                .get("payload")
+                .and_then(|payload| payload.get("originRef"))
+                .and_then(|value| value.as_str());
+            if let Some((_, purpose)) = purposes.iter().find(|(id, _)| Some(id.as_str()) == origin)
+            {
+                tally(&mut grouped, *purpose).findings += 1;
+            }
+        }
+    }
+    Ok(grouped)
+}
+
+fn tally(grouped: &mut FindingsByPurpose, purpose: CommandPurpose) -> &mut PurposeTally {
+    match purpose {
+        CommandPurpose::Check => &mut grouped.check,
+        CommandPurpose::Exploration => &mut grouped.exploration,
+        CommandPurpose::Other => &mut grouped.other,
+    }
 }
 
 /// Every session log a run wrote, in a stable order.

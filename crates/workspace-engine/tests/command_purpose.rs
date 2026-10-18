@@ -1,7 +1,8 @@
 //! Spec 63 Task 1: a command's purpose is decided when it is proposed,
 //! stored with the proposal, and carried to its execution — and it never
 //! changes what the policy decided (requirement 6). Task 2: a failed
-//! exploration command records no finding.
+//! exploration command records no finding. Task 5: the purpose is recorded
+//! with the execution.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -422,6 +423,73 @@ fn failed_checks_record_findings_as_before() {
             "{command}: {:?}",
             run.findings
         );
+    }
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: the purpose is recorded with the execution.
+// ---------------------------------------------------------------------------
+
+/// The audit events of one type, parsed.
+fn audited(repo: &Path, event_type: &str) -> Vec<serde_json::Value> {
+    fs::read_to_string(repo.join(".damaian").join("audit").join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["eventType"] == event_type)
+        .collect()
+}
+
+#[test]
+fn both_execution_audit_events_and_the_stored_summary_carry_the_purpose() {
+    let repo = temp_dir("recorded");
+    let engine = WorkspaceEngine::new(test_config(&repo));
+    let mut expected = Vec::new();
+    for (command, purpose) in [
+        ("ls -d missing-directory", "exploration"),
+        ("python3 -c 'pass'", "other"),
+    ] {
+        let proposal = engine
+            .validation_orchestrator
+            .propose_command(&repo, command, "Spec 63")
+            .unwrap();
+        let record = engine
+            .validation_orchestrator
+            .run_proposal(
+                &proposal.id,
+                true,
+                "tester",
+                None,
+                &CancelToken::new(),
+                &mut |_line: &str| {},
+            )
+            .unwrap();
+        let summary = fs::read_to_string(&record.summary_ref).unwrap();
+        assert!(
+            summary.ends_with(&format!(
+                "PURPOSE {}\n{purpose}\nEND_COMMAND_EXECUTION\n",
+                purpose.len()
+            )),
+            "the summary's last field is the purpose, got:\n{summary}"
+        );
+        expected.push((command, record.execution.id.clone(), purpose));
+    }
+
+    let executed = audited(&repo, "command_executed");
+    let stored = audited(&repo, "stored_command_executed");
+    for (command, command_id, purpose) in expected {
+        let event = executed
+            .iter()
+            .find(|event| event["command"] == command)
+            .unwrap_or_else(|| panic!("no command_executed for {command}"));
+        assert_eq!(event["purpose"], purpose, "{command}");
+        let event = stored
+            .iter()
+            .find(|event| event["commandId"] == command_id.as_str())
+            .unwrap_or_else(|| panic!("no stored_command_executed for {command}"));
+        assert_eq!(event["purpose"], purpose, "{command}");
     }
 
     fs::remove_dir_all(repo).unwrap();

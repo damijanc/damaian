@@ -5,8 +5,10 @@
 //! entry git itself lists for this repository is reachable, compared by
 //! canonical path, so nothing a clone ships under `.claude/worktrees/` can
 //! stand in for one. Task 2 covers §5.4 on the main checkout: git reads drop
-//! restricted paths, are capped, and run no repository-selected code. Each
-//! test runs against its own fresh `git init` fixture.
+//! restricted paths, are capped, and run no repository-selected code. Task 3
+//! covers §5.2–§5.5: the five read tools take `worktree` and read there under
+//! the session's policy. Each test runs against its own fresh `git init`
+//! fixture.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,7 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::worktree_access::{WorktreeRefusal, classify_worktrees, resolve_worktree};
 use workspace_engine::{
-    AuditLog, ClientError, Config, GitReadCaps, GitService, PathPolicy, SecretScanner,
+    AuditLog, ClientError, Config, DiffOptions, GitReadCaps, GitService, MockModelAdapter,
+    ModelProviderConfig, PathPolicy, SecretScanner, ToolCall, WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -708,4 +711,446 @@ fn a_diff_with_no_changes_is_unchanged() {
     let status = fixture.git.status(&fixture.repo).unwrap();
     assert_eq!(status.raw, fixture.run(&["status", "--porcelain=v1"]));
     assert_eq!(status.omitted, 0);
+}
+
+// ---- Task 3: the `worktree` argument on the five read tools (§5.2, §5.3, §5.5) ----
+
+/// The provider block that turns native tools on; without it the engine falls
+/// back to the text envelope and no tool call is dispatched.
+fn native_tool_provider() -> ModelProviderConfig {
+    ModelProviderConfig {
+        id: "openai".to_string(),
+        label: "OpenAI".to_string(),
+        base_url: String::new(),
+        api_key_env: String::new(),
+        models: Vec::new(),
+        supports_native_tools: true,
+        max_output_tokens: None,
+        context_token_budget: None,
+        provider_reports_usage: true,
+        price_per_million_input_tokens: None,
+        price_per_million_output_tokens: None,
+        price_per_million_cached_input_tokens: None,
+        supports_explicit_cache_breakpoints: false,
+    }
+}
+
+/// What one turn of tool calls left behind.
+struct Turn {
+    /// The tool results, in call order.
+    results: Vec<String>,
+    /// Session events and audit records, everything the engine wrote.
+    records: String,
+    approval_requested: bool,
+}
+
+impl Fixture {
+    fn run_in(&self, dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn write_in(&self, worktree: &str, path: &str, contents: &str) {
+        let path = self
+            .repo
+            .join(".claude/worktrees")
+            .join(worktree)
+            .join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    /// One turn whose first model message makes `calls` (name, arguments),
+    /// answered by the engine with the session's own policy.
+    fn tools(&self, calls: &[(&str, &str)]) -> Turn {
+        let data = self.root.join("engine-data");
+        let mut config = Config {
+            data_dir: data.clone(),
+            enable_index_watcher: false,
+            ..Config::default()
+        };
+        config.model_providers.push(native_tool_provider());
+        let engine = WorkspaceEngine::new(config);
+        let calls = calls
+            .iter()
+            .enumerate()
+            .map(|(index, (name, arguments))| ToolCall {
+                id: format!("call_{index}"),
+                name: name.to_string(),
+                arguments_json: arguments.to_string(),
+            })
+            .collect();
+        let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+            vec![String::new(), "Done.".to_string()],
+            vec![calls, Vec::new()],
+        );
+        let mut on_token = |_token: &str| {};
+        let result = engine
+            .chat_orchestrator
+            .ask(
+                &self.repo,
+                "Look at the worktrees.",
+                &[],
+                &mut adapter,
+                &mut on_token,
+            )
+            .unwrap();
+        let results = engine
+            .session_store
+            .read_messages(&result.session.id)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.role == "tool")
+            .map(|message| message.content)
+            .collect();
+        Turn {
+            results,
+            records: text_under(&data),
+            approval_requested: result.command_proposal.is_some(),
+        }
+    }
+}
+
+/// Every file's text under `dir`, concatenated: the session event logs and
+/// the audit log among them.
+fn text_under(dir: &Path) -> String {
+    let mut text = String::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return text;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            text.push_str(&text_under(&path));
+        } else if let Ok(contents) = fs::read_to_string(&path) {
+            text.push_str(&contents);
+        }
+    }
+    text
+}
+
+const WT_A: &str = "{\"worktree\":\".claude/worktrees/a\"";
+
+fn args(rest: &str) -> String {
+    if rest.is_empty() {
+        format!("{WT_A}}}")
+    } else {
+        format!("{WT_A},{rest}}}")
+    }
+}
+
+#[test]
+fn read_file_with_worktree_reads_that_worktree() {
+    let fixture = fixture("tool-read-file");
+    fixture.write_in("a", "only-in-a.txt", "alpha marker\n");
+    let turn = fixture.tools(&[
+        ("read_file", &args("\"path\":\"only-in-a.txt\"")),
+        ("read_file", "{\"path\":\"only-in-a.txt\"}"),
+    ]);
+    assert!(
+        turn.results[0].contains("alpha marker"),
+        "{:?}",
+        turn.results
+    );
+    assert!(
+        turn.results[0].contains("in worktree `.claude/worktrees/a`"),
+        "{:?}",
+        turn.results
+    );
+    // Without the argument the path resolves against the session's checkout.
+    assert!(
+        turn.results[1].starts_with("Cannot read"),
+        "{:?}",
+        turn.results
+    );
+    assert!(!turn.approval_requested);
+    assert!(
+        turn.records
+            .contains("\"ref\":\".claude/worktrees/a:only-in-a.txt\""),
+        "the action marker names the worktree"
+    );
+}
+
+#[test]
+fn list_directory_with_worktree_walks_that_worktree() {
+    let fixture = fixture("tool-list");
+    fixture.write_in("a", "src/only-in-a.rs", "fn a() {}\n");
+    let turn = fixture.tools(&[("list_directory", &args("")), ("list_directory", "{}")]);
+    assert!(
+        turn.results[0].contains("src/only-in-a.rs"),
+        "{:?}",
+        turn.results
+    );
+    assert!(!turn.results[1].contains("only-in-a"), "{:?}", turn.results);
+    assert!(turn.records.contains("\"ref\":\".claude/worktrees/a:\""));
+}
+
+#[test]
+fn search_content_with_worktree_searches_that_worktree() {
+    let fixture = fixture("tool-search");
+    fixture.write_in("a", "src/lib.rs", "let needle_in_a = 1;\n");
+    let turn = fixture.tools(&[
+        ("search_content", &args("\"pattern\":\"needle_in_a\"")),
+        ("search_content", "{\"pattern\":\"needle_in_a\"}"),
+    ]);
+    assert!(
+        turn.results[0].contains("src/lib.rs:1: let needle_in_a = 1;"),
+        "{:?}",
+        turn.results
+    );
+    assert!(
+        turn.results[1].starts_with("0 matches"),
+        "{:?}",
+        turn.results
+    );
+}
+
+#[test]
+fn read_git_status_with_worktree_reads_that_worktree() {
+    let fixture = fixture("tool-status");
+    fixture.write_in("a", "README.md", "changed in a\n");
+    let turn = fixture.tools(&[("read_git_status", &args("")), ("read_git_status", "{}")]);
+    assert!(
+        turn.results[0].contains(" M README.md"),
+        "{:?}",
+        turn.results
+    );
+    assert_eq!(turn.results[1], "Working tree clean.");
+}
+
+#[test]
+fn read_git_diff_with_worktree_reads_that_worktree() {
+    let fixture = fixture("tool-diff");
+    fixture.write_in("a", "README.md", "changed in a\n");
+    let turn = fixture.tools(&[("read_git_diff", &args("")), ("read_git_diff", "{}")]);
+    assert!(
+        turn.results[0].contains("+changed in a"),
+        "{:?}",
+        turn.results
+    );
+    assert_eq!(turn.results[1], "No differences.");
+}
+
+#[test]
+fn a_refused_worktree_fails_every_read_tool_and_lists_the_reachable_ones() {
+    let fixture = fixture("tool-refused");
+    fs::create_dir_all(fixture.repo.join(".claude/worktrees/planted")).unwrap();
+    let planted = "{\"worktree\":\".claude/worktrees/planted\"";
+    let calls = [
+        ("read_file", format!("{planted},\"path\":\"README.md\"}}")),
+        ("list_directory", format!("{planted}}}")),
+        ("search_content", format!("{planted},\"pattern\":\"x\"}}")),
+        ("read_git_status", format!("{planted}}}")),
+        ("read_git_diff", format!("{planted}}}")),
+    ];
+    let calls: Vec<(&str, &str)> = calls.iter().map(|(n, a)| (*n, a.as_str())).collect();
+    let turn = fixture.tools(&calls);
+    assert_eq!(turn.results.len(), 5);
+    for result in &turn.results {
+        assert!(
+            result.contains("not a registered worktree")
+                && result.contains("reachable worktrees: .claude/worktrees/a, .claude/worktrees/b"),
+            "{result}"
+        );
+    }
+    assert!(
+        !turn.approval_requested,
+        "a refusal is not an approval stop"
+    );
+    assert_eq!(
+        turn.records.matches("\"outcome\":\"failed\"").count(),
+        5,
+        "each refusal is an ordinary failed call"
+    );
+}
+
+#[test]
+fn a_restricted_file_in_a_worktree_is_refused_or_absent() {
+    let fixture = fixture("tool-restricted");
+    let a = fixture.worktree("a");
+    fixture.write_in("a", ".env", "TOKEN=one\n");
+    fixture.run_in(&a, &["add", "-f", ".env"]);
+    fixture.run_in(&a, &["commit", "-q", "-m", "secret"]);
+    fixture.write_in("a", ".env", "TOKEN=two\n");
+    fixture.write_in("a", "app.txt", "TOKEN_FREE\n");
+    let turn = fixture.tools(&[
+        ("read_file", &args("\"path\":\".env\"")),
+        ("list_directory", &args("")),
+        ("search_content", &args("\"pattern\":\"TOKEN\"")),
+        ("read_git_status", &args("")),
+        ("read_git_diff", &args("")),
+    ]);
+    assert!(
+        turn.results[0].contains("restricted by policy"),
+        "{:?}",
+        turn.results
+    );
+    for result in &turn.results[1..] {
+        assert!(!result.contains(".env"), "{result}");
+        assert!(!result.contains("TOKEN="), "{result}");
+    }
+    assert!(turn.results[1].contains("app.txt"), "{:?}", turn.results);
+}
+
+#[test]
+fn the_audit_records_name_the_worktree() {
+    let fixture = fixture("tool-audit");
+    fixture.write_in("a", "README.md", "changed in a\n");
+    let turn = fixture.tools(&[
+        ("read_file", &args("\"path\":\"README.md\"")),
+        ("list_directory", &args("")),
+        ("search_content", &args("\"pattern\":\"changed\"")),
+        ("read_git_status", &args("")),
+        ("read_git_diff", &args("")),
+    ]);
+    for event in [
+        "file_read",
+        "directory_listed",
+        "content_searched",
+        "git_status_read",
+        "git_diff_read",
+    ] {
+        assert!(
+            turn.records.lines().any(|line| line.contains(event)
+                && line.contains("\"worktree\":\".claude/worktrees/a\"")),
+            "{event} must name the worktree"
+        );
+    }
+}
+
+/// Worktree `b` with one commit ahead of `main` and an uncommitted change.
+fn ahead_fixture(name: &str) -> (Fixture, PathBuf) {
+    let fixture = fixture(name);
+    let b = fixture.worktree("b");
+    fixture.write_in("b", "committed.txt", "on wt-b\n");
+    fixture.write_in("b", "other.txt", "other\n");
+    fixture.run_in(&b, &["add", "-A"]);
+    fixture.run_in(&b, &["commit", "-q", "-m", "ahead"]);
+    fixture.write_in("b", "README.md", "uncommitted in b\n");
+    (fixture, b)
+}
+
+#[test]
+fn a_diff_against_a_base_includes_the_commits_on_the_branch() {
+    let (fixture, b) = ahead_fixture("diff-base");
+    let options = DiffOptions {
+        base: Some("main".to_string()),
+        ..DiffOptions::default()
+    };
+    let diff = fixture
+        .git
+        .diff_in(&b, Some(".claude/worktrees/b"), &options)
+        .unwrap();
+    assert!(diff.contains("+on wt-b"), "{diff}");
+    assert!(diff.contains("+uncommitted in b"), "{diff}");
+    let plain = fixture.git.diff(&b, false).unwrap();
+    assert!(!plain.contains("on wt-b"), "{plain}");
+}
+
+#[test]
+fn a_diff_limited_to_paths_shows_only_those() {
+    let (fixture, b) = ahead_fixture("diff-paths");
+    let options = DiffOptions {
+        base: Some("main".to_string()),
+        paths: vec!["committed.txt".to_string()],
+        ..DiffOptions::default()
+    };
+    let diff = fixture.git.diff_in(&b, None, &options).unwrap();
+    assert!(diff.contains("committed.txt"), "{diff}");
+    assert!(
+        !diff.contains("README.md") && !diff.contains("other.txt"),
+        "{diff}"
+    );
+}
+
+#[test]
+fn a_stat_diff_summarises_instead_of_showing_hunks() {
+    let (fixture, b) = ahead_fixture("diff-stat");
+    let options = DiffOptions {
+        base: Some("main".to_string()),
+        stat: true,
+        ..DiffOptions::default()
+    };
+    let diff = fixture.git.diff_in(&b, None, &options).unwrap();
+    assert!(diff.contains("3 files changed"), "{diff}");
+    assert!(!diff.contains("@@"), "{diff}");
+}
+
+#[test]
+fn a_base_that_is_an_option_or_a_shell_fragment_is_refused_before_git_runs() {
+    let (fixture, b) = ahead_fixture("diff-bad-base");
+    let output = fixture.outside().join("x");
+    for base in [
+        format!("--output={}", output.display()),
+        "main..; rm".to_string(),
+        "-p".to_string(),
+        "main:README.md".to_string(),
+    ] {
+        let options = DiffOptions {
+            base: Some(base.clone()),
+            ..DiffOptions::default()
+        };
+        let result = fixture.git.diff_in(&b, None, &options);
+        assert!(
+            matches!(result, Err(ClientError::InvalidInput(_))),
+            "{base}: {result:?}"
+        );
+    }
+    assert!(!output.exists(), "git ran with the option");
+    let audit = text_under(&fixture.root.join("data"));
+    assert!(!audit.contains("git_diff_read"), "git ran: {audit}");
+}
+
+#[test]
+fn a_diff_path_escaping_the_worktree_is_refused() {
+    let (fixture, b) = ahead_fixture("diff-escape");
+    for path in ["../a/README.md", "../../../README.md", "/etc/hosts"] {
+        let options = DiffOptions {
+            paths: vec![path.to_string()],
+            ..DiffOptions::default()
+        };
+        let result = fixture.git.diff_in(&b, None, &options);
+        assert!(
+            matches!(result, Err(ClientError::AccessDenied(_))),
+            "{path}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn read_git_diff_passes_paths_stat_and_base_from_the_tool_call() {
+    let (fixture, _) = ahead_fixture("tool-diff-options");
+    let wt = "{\"worktree\":\".claude/worktrees/b\"";
+    let stat = format!("{wt},\"base\":\"main\",\"stat\":true}}");
+    let paths = format!("{wt},\"base\":\"main\",\"paths\":[\"committed.txt\"]}}");
+    let bad = format!("{wt},\"base\":\"--output=x\"}}");
+    let turn = fixture.tools(&[
+        ("read_git_diff", &stat),
+        ("read_git_diff", &paths),
+        ("read_git_diff", &bad),
+    ]);
+    assert!(
+        turn.results[0].contains("3 files changed"),
+        "{:?}",
+        turn.results
+    );
+    assert!(
+        turn.results[1].contains("+on wt-b") && !turn.results[1].contains("README.md"),
+        "{:?}",
+        turn.results
+    );
+    assert!(
+        turn.results[2].starts_with("Cannot read git diff"),
+        "{:?}",
+        turn.results
+    );
 }

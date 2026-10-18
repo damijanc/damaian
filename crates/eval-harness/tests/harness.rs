@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use eval_harness::assertions;
 use eval_harness::metrics::{MetricSet, MetricValue};
 use eval_harness::record::{
-    AssertionOutcome, CacheUsage, RecordedPlan, RecordedRecovery, RecordedToolCall, RunRecord,
-    Tokens,
+    AssertionOutcome, CacheUsage, FindingsByPurpose, PurposeTally, RecordedPlan, RecordedRecovery,
+    RecordedToolCall, RunRecord, Tokens,
 };
 use eval_harness::report;
 use eval_harness::scenario::{self, Tier};
-use eval_harness::trace::Trace;
+use eval_harness::trace::{self, Trace};
 use workspace_engine::SecretScanner;
 
 const FAKE_AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
@@ -1885,4 +1885,184 @@ fn the_cache_hit_rate_metric_reports_not_applicable_when_nothing_reported_a_spli
              split, got {other:?}"
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Findings by command purpose. Spec 63 §5.5.
+// ---------------------------------------------------------------------------
+
+/// The join behind the per-purpose report, on logs written by hand in the
+/// engine's own shapes: `stored_command_executed` carries `commandId` and
+/// `purpose` (`validation.rs`, `run_proposal`), and a session log's
+/// `finding_recorded` payload carries `originRef` (`SessionStore::record_finding`).
+#[test]
+fn findings_are_grouped_by_the_purpose_of_the_command_that_recorded_them() {
+    let data_dir = eval_harness::guard::eval_data_dir().expect("temp dir");
+    let audit = data_dir.join("audit");
+    std::fs::create_dir_all(&audit).expect("audit dir");
+    std::fs::write(
+        audit.join("events.jsonl"),
+        concat!(
+            r#"{"eventType":"stored_command_executed","commandId":"cmd_check","purpose":"check"}"#,
+            "\n",
+            r#"{"eventType":"stored_command_executed","commandId":"cmd_look","purpose":"exploration"}"#,
+            "\n",
+            r#"{"eventType":"stored_command_executed","commandId":"cmd_look_again","purpose":"exploration"}"#,
+            "\n",
+            // Written before spec 63: no purpose, so it reads as `Other`.
+            r#"{"eventType":"stored_command_executed","commandId":"cmd_old"}"#,
+            "\n",
+        ),
+    )
+    .expect("write audit log");
+    let sessions = data_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions dir");
+    std::fs::write(
+        sessions.join("session_1.jsonl"),
+        concat!(
+            r#"{"eventType":"finding_recorded","payload":{"originRef":"cmd_check"}}"#,
+            "\n",
+            r#"{"eventType":"finding_recorded","payload":{"originRef":"cmd_check"}}"#,
+            "\n",
+            r#"{"eventType":"finding_recorded","payload":{"originRef":"cmd_look"}}"#,
+            "\n",
+            r#"{"eventType":"finding_recorded","payload":{"originRef":"cmd_old"}}"#,
+            "\n",
+            // A browser diagnostic's finding has no command, so no purpose.
+            r#"{"eventType":"finding_recorded","payload":{"originRef":"web_1"}}"#,
+            "\n",
+            r#"{"eventType":"finding_status_changed","payload":{"findingId":"finding_1"}}"#,
+            "\n",
+        ),
+    )
+    .expect("write session log");
+
+    let trace = Trace::read(&data_dir).expect("trace");
+    let grouped = trace::findings_by_purpose(&trace, &data_dir).expect("grouped");
+
+    assert_eq!(
+        grouped,
+        FindingsByPurpose {
+            check: PurposeTally {
+                commands: 1,
+                findings: 2
+            },
+            exploration: PurposeTally {
+                commands: 2,
+                findings: 1
+            },
+            other: PurposeTally {
+                commands: 1,
+                findings: 1
+            },
+        }
+    );
+}
+
+/// The regression this report exists to catch, on a real run:
+/// `failed_validation_retry`'s `ls no-such-directory` is exploration and fails
+/// every round, and records no finding. Falsified by letting
+/// `findings_from_execution` file exploration failures again: this test, the
+/// scenario's `exploration_findings` assertion, and the metric all go
+/// non-zero.
+#[test]
+fn a_failing_exploration_command_reports_zero_exploration_findings() {
+    let (run, results) = run_and_evaluate("failed_validation_retry");
+    let grouped = run.record.findings_by_purpose;
+
+    assert!(
+        grouped.exploration.commands > 1,
+        "the scenario exists to run a failing exploration command repeatedly, got {grouped:?}"
+    );
+    assert_eq!(grouped.exploration.findings, 0, "{grouped:?}");
+    assert_eq!(grouped.check, PurposeTally::default());
+    assert_eq!(grouped.other, PurposeTally::default());
+    assert!(outcome(&results, "exploration_findings").passed);
+
+    let built = report::build(vec![run.record]);
+    let text = report::to_text(&built);
+    assert!(
+        text.contains("Findings by command purpose"),
+        "the text report groups findings by purpose:\n{text}"
+    );
+    let line = text
+        .lines()
+        .find(|line| {
+            line.trim_start().starts_with("failed_validation_retry") && line.contains("exploration")
+        })
+        .unwrap_or_else(|| panic!("no per-purpose line for the scenario:\n{text}"));
+    assert!(
+        line.contains(&format!("exploration 0/{}", grouped.exploration.commands)),
+        "{line}"
+    );
+    assert!(
+        matches!(
+            built
+                .metrics
+                .get("exploration_findings")
+                .expect("metric")
+                .value,
+            MetricValue::Count { value: 0 }
+        ),
+        "the metric reads zero over a run that explored"
+    );
+}
+
+fn record_with_findings(scenario: &str, grouped: FindingsByPurpose) -> RunRecord {
+    let mut record = RunRecord::new(scenario, "4", "deterministic", "mock", "mock");
+    record.final_status = "completed".to_string();
+    record.findings_by_purpose = grouped;
+    record
+}
+
+#[test]
+fn the_exploration_findings_metric_counts_a_regression() {
+    let explored = |findings| FindingsByPurpose {
+        exploration: PurposeTally {
+            commands: 3,
+            findings,
+        },
+        ..FindingsByPurpose::default()
+    };
+    let set = MetricSet::compute(&[
+        record_with_findings("a", explored(0)),
+        record_with_findings("b", explored(2)),
+    ]);
+    assert!(matches!(
+        set.get("exploration_findings").expect("metric").value,
+        MetricValue::Count { value: 2 }
+    ));
+}
+
+/// Zero findings over zero exploration commands measured nothing, and a zero
+/// here would read as the expected result.
+#[test]
+fn the_exploration_findings_metric_reports_no_data_when_nothing_explored() {
+    let checked = FindingsByPurpose {
+        check: PurposeTally {
+            commands: 2,
+            findings: 1,
+        },
+        ..FindingsByPurpose::default()
+    };
+    let set = MetricSet::compute(&[record_with_findings("a", checked)]);
+    match &set.get("exploration_findings").expect("metric").value {
+        MetricValue::NotApplicable { phase } => assert_eq!(phase, "no-exploration-commands"),
+        other => panic!("expected no data, got {other:?}"),
+    }
+}
+
+/// The assertion cannot pass on a run that explored nothing, or a scenario
+/// whose command stopped being exploration would keep passing silently.
+#[test]
+fn the_exploration_findings_assertion_fails_when_nothing_explored() {
+    let (mut run, _) = run_and_evaluate("failed_validation_retry");
+    run.record.findings_by_purpose = FindingsByPurpose::default();
+    let asserts = scenario::Asserts {
+        exploration_findings: Some(0),
+        ..scenario::Asserts::default()
+    };
+    let results = assertions::evaluate(&run, &asserts, Tier::Deterministic, &[]);
+    let result = outcome(&results, "exploration_findings");
+    assert!(!result.passed, "{} / {}", result.expected, result.actual);
 }

@@ -70,6 +70,10 @@ pub struct Asserts {
     /// That the interrupted action is not repeated: neither automatically, nor
     /// when a resume is asked for outright.
     pub auto_retry_refused: Option<bool>,
+    /// How many findings the run's exploration commands recorded (spec 63
+    /// §5.5), which should be zero. Fails as well when the run executed no
+    /// exploration command, since a zero over nothing measured nothing.
+    pub exploration_findings: Option<u64>,
     /// Assertion names that depend on a scripted tool call and are therefore
     /// skipped in the live tier (proposal §5.3), so a scenario stays one
     /// definition rather than two that drift.
