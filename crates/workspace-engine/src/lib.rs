@@ -55,8 +55,8 @@ pub use cancel::CancelToken;
 pub use chat::{
     AgentCommandProposal, AgentFallbackProposal, AgentPatchProposal, AgentPlanProposal,
     AgentRoundBudgetProposal, ChatOrchestrator, ChatTurnOptions, ChatTurnResult, McpTokenResolver,
-    PausedTurns, PhaseKind, PlanRevisionStep, ResumeDecisionOptions, TurnPhase, TurnProgress,
-    TurnSink,
+    PausedTurns, PhaseKind, PlanRevisionStep, ResumeDecisionOptions, RoundBudgetDecision,
+    TurnPhase, TurnProgress, TurnSink,
 };
 pub use checkpoint::{
     CheckpointConversation, CheckpointExclusion, CheckpointFile, CheckpointManifest,

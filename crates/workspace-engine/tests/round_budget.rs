@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::{
-    CancelToken, ChatTurnResult, Config, MockModelAdapter, TaskStatus, TurnProgress, TurnSink,
-    WorkspaceEngine,
+    CancelToken, ChatTurnResult, ClientError, Config, MockModelAdapter, RoundBudgetDecision,
+    TaskStatus, TurnProgress, TurnSink, WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -83,6 +83,80 @@ fn pending_file(repo: &Path, proposal_id: &str) -> String {
             .join(format!("{proposal_id}.json")),
     )
     .expect("the pending turn should be on disk")
+}
+
+/// A mutating command the policy pauses for approval, so a test can park a
+/// `command` pending turn and try the wrong resume entry point against it.
+fn command_round() -> String {
+    "DAMAIAN_COMMAND_V1\nCOMMAND: sed -i '' 's/1/2/' src/a.rs\nREASON: Bump the constant.\nEND_COMMAND\n"
+        .to_string()
+}
+
+fn resume_round_budget(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    decision: RoundBudgetDecision,
+    adapter: &mut MockModelAdapter,
+) -> ChatTurnResult {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .resume_round_budget(proposal_id, decision, "tester", adapter, &mut sink)
+        .expect("the round-budget resume should run")
+}
+
+fn resume_command_decision(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+) -> workspace_engine::Result<ChatTurnResult> {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let mut adapter = MockModelAdapter::new("Done.");
+    engine.chat_orchestrator.resume_after_command_decision(
+        proposal_id,
+        true,
+        "tester",
+        &mut adapter,
+        &mut sink,
+    )
+}
+
+fn resume_fallback_decision(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+) -> workspace_engine::Result<ChatTurnResult> {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let mut adapter = MockModelAdapter::new("Done.");
+    engine.chat_orchestrator.resume_after_fallback_decision(
+        proposal_id,
+        true,
+        "tester",
+        &mut adapter,
+        &mut sink,
+    )
 }
 
 #[test]
@@ -232,5 +306,181 @@ fn a_paused_round_budget_persists_messages_round_and_turn_options() {
     assert_eq!(
         round_budget.get("rounds_granted").and_then(|r| r.as_u64()),
         Some(0)
+    );
+}
+
+#[test]
+fn continue_resumes_the_same_task_with_more_rounds() {
+    let repo = temp_repo("continue");
+    let engine = engine(&repo, 8, None);
+    // Eight read-only rounds, then the answer the resumed turn produces. The
+    // ninth response is never consumed until *Continue* re-enters the turn.
+    let responses: Vec<String> = (0..8)
+        .map(|_| read_only_round())
+        .chain(std::iter::once("Done looking.".to_string()))
+        .collect();
+    let mut adapter = MockModelAdapter::new_sequence(responses);
+    let (paused, calls) = ask(&engine, &repo, "Look at the source", &mut adapter);
+    assert_eq!(calls, 8, "the turn pauses before its ninth call");
+    let proposal = paused
+        .round_budget_proposal
+        .as_ref()
+        .expect("the pause surfaces a proposal");
+
+    let resumed = resume_round_budget(
+        &engine,
+        &proposal.id,
+        RoundBudgetDecision::Continue,
+        &mut adapter,
+    );
+
+    assert_eq!(
+        resumed.task.id, paused.task.id,
+        "a continued turn is the same task, never a new one"
+    );
+    assert_eq!(
+        adapter.requests.len(),
+        9,
+        "the next model request is the ninth — the seeded budget must not re-pause"
+    );
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+
+    // The ninth request replays the saved messages, so it still carries the
+    // user's original request and the earlier tool results (C6).
+    let ninth = &adapter.requests[8];
+    let replayed = ninth
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        replayed.contains("Look at the source"),
+        "the user's original request must be replayed: {replayed}"
+    );
+    assert!(
+        replayed.contains("a.rs"),
+        "the earlier tool results must be replayed: {replayed}"
+    );
+
+    // The continuation is recorded, with the segment granted and the running
+    // total (`rounds_granted` grew by `agent_max_tool_rounds`).
+    let events = audit_events(&repo);
+    assert!(events.contains("turn_budget_extended"), "{events}");
+    assert!(events.contains("\"roundsGranted\":\"8\""), "{events}");
+    assert!(events.contains("\"roundsTotal\":\"8\""), "{events}");
+}
+
+#[test]
+fn answer_now_makes_exactly_one_forced_final_call() {
+    let repo = temp_repo("answernow");
+    let engine = engine(&repo, 8, None);
+    // Eight read-only rounds, then a ninth that still asks for a tool: on
+    // *Answer now* the forced call has no tools, so the turn ends exhausted
+    // after exactly one more call.
+    let responses: Vec<String> = (0..8)
+        .map(|_| read_only_round())
+        .chain(std::iter::once(read_only_round()))
+        .collect();
+    let mut adapter = MockModelAdapter::new_sequence(responses);
+    let (paused, calls) = ask(&engine, &repo, "Look at the source", &mut adapter);
+    assert_eq!(calls, 8, "the pause precedes the forced call");
+    let proposal = paused
+        .round_budget_proposal
+        .as_ref()
+        .expect("the pause surfaces a proposal");
+
+    let resumed = resume_round_budget(
+        &engine,
+        &proposal.id,
+        RoundBudgetDecision::AnswerNow,
+        &mut adapter,
+    );
+
+    assert_eq!(
+        adapter.requests.len(),
+        9,
+        "Answer now makes exactly one forced final call on resume"
+    );
+    assert_eq!(
+        resumed.task.id, paused.task.id,
+        "the answered turn is the same task"
+    );
+    assert_eq!(
+        resumed.task.status,
+        TaskStatus::ToolBudgetExhausted,
+        "the model still asks for a tool, so the turn ends exhausted"
+    );
+}
+
+#[test]
+fn resume_round_budget_refuses_a_foreign_pause() {
+    let repo = temp_repo("foreign");
+    let engine = engine(&repo, 8, None);
+    let mut adapter = MockModelAdapter::new(command_round());
+    let (paused, _) = ask(&engine, &repo, "Bump the constant with sed", &mut adapter);
+    let proposal = paused
+        .command_proposal
+        .as_ref()
+        .expect("the command should need approval");
+
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let mut resume_adapter = MockModelAdapter::new("Done.");
+    let error = engine
+        .chat_orchestrator
+        .resume_round_budget(
+            &proposal.id,
+            RoundBudgetDecision::Continue,
+            "tester",
+            &mut resume_adapter,
+            &mut sink,
+        )
+        .expect_err("a command pause must not resume through the round-budget entry point");
+    assert!(matches!(error, ClientError::InvalidInput(_)), "{error}");
+    // The pending turn is put back, so the right resume can still find it.
+    assert!(
+        !pending_file(&repo, &proposal.id).is_empty(),
+        "the command pause must remain on disk for its own entry point"
+    );
+}
+
+#[test]
+fn command_and_fallback_resume_refuse_a_round_budget_pause() {
+    let repo = temp_repo("refused");
+    let engine = engine(&repo, 8, None);
+    let mut adapter =
+        MockModelAdapter::new_sequence((0..8).map(|_| read_only_round()).collect::<Vec<_>>());
+    let (paused, _) = ask(&engine, &repo, "Look at the source", &mut adapter);
+    let proposal = paused
+        .round_budget_proposal
+        .as_ref()
+        .expect("the turn pauses at the budget");
+
+    let command_error = resume_command_decision(&engine, &proposal.id)
+        .expect_err("a round-budget pause must not resume as a command");
+    assert!(
+        matches!(command_error, ClientError::InvalidInput(_)),
+        "{command_error}"
+    );
+
+    let fallback_error = resume_fallback_decision(&engine, &proposal.id)
+        .expect_err("a round-budget pause must not resume as a fallback offer");
+    assert!(
+        matches!(fallback_error, ClientError::InvalidInput(_)),
+        "{fallback_error}"
+    );
+
+    // Still on disk after both refusals, so `resume_round_budget` can find it.
+    assert!(
+        !pending_file(&repo, &proposal.id).is_empty(),
+        "the round-budget pause must remain on disk for its own entry point"
     );
 }

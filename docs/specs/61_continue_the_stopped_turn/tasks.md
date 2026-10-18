@@ -3,14 +3,14 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md) · background in §2 of the proposal
-**Status:** In progress. Planned 2026-10-18; Task 1 started 2026-10-18.
+**Status:** In progress. Planned 2026-10-18; Task 1 done 2026-10-18, Task 2 done 2026-10-18.
 
 ## Progress
 
 | Task | State | Notes |
 |---|---|---|
 | 1 · `round_budget` pause and the `PendingChatTurn` field | Done 2026-10-18 | Landed: `RoundBudgetPause` (private) and the `round_budget: Option<RoundBudgetPause>` field on `PendingChatTurn` (`#[serde(default)]`), `AgentRoundBudgetProposal` (public) and `round_budget_proposal` on `ChatTurnResult`, `pause_for_round_budget` (mirrors `pause_for_provider_fallback`: saves the turn, `note_pending_approvals`, `await_approval` with `kind: "round_budget"`, returns the proposal; no model call and no `model_call` marker), the `round_budget_pause_response` helper ("Used N of M tool rounds."), and the loop hook before the forced call at `force_final && (no token ceiling || round >= ABSOLUTE_TOOL_ROUND_CAP)`. Serialization: `round_budget_proposal_json` and `roundBudgetProposal` in `chat_result_json`. `PendingApprovalRef`'s doc comment now names `"round_budget"`. An audit record `round_budget_paused` (not in the plan) accompanies the pause like the other kinds. **Tests:** 4 new in `tests/round_budget.rs`, written first and confirmed failing to compile on the missing field, now passing: `a_turn_that_hits_the_limit_wants_a_tool_and_pauses` (8 read-only rounds, `WaitingForApproval`, kind `round_budget`, file on disk, proposal `rounds_used==8/total==8/granted==0`, exactly 8 model calls), `no_round_budget_pause_when_the_model_answers_at_the_forced_call`, `no_round_budget_pause_with_a_token_ceiling_set` (requirement 8, `turn_continued` still fires), `a_paused_round_budget_persists_messages_round_and_turn_options`. **Deviations:** §5.1 and the acceptance criterion "no model call between limit and choice" (plus Step 5 and Step 8) are unambiguous that the pause precedes the forced call, so the forced call is *never* made on the no-ceiling path; Step 1's "ninth scripted response" wording is therefore imprecise — Test 1 scripts 8 read-only rounds and the ninth response is never consumed, and Test 2 drives a model that answers within its rounds (the forced call is deferred to *Answer now* in Task 2). Two existing tests asserted the old "stop dead" behaviour and had to change: `foundation.rs::tool_round_exhaustion_is_terminal_when_model_still_requests_tools` → `tool_round_exhaustion_pauses_when_model_still_requests_tools`, and `token_ceiling.rs::without_a_ceiling_the_round_cap_still_stops_the_turn` → `without_a_ceiling_the_round_cap_pauses_the_turn` — both outside the named files but forced by the loop change. **Falsified:** dropping the token-ceiling guard fails `no_round_budget_pause_with_a_token_ceiling_set`; moving the pause after the forced call fails `a_turn_that_hits_the_limit_wants_a_tool_and_pauses` (turn ends `ToolBudgetExhausted`, a `model_request_prepared` is emitted for the forced call). Both reverted. **Checks:** `fmt --check`, `node`, `lint`, `typos`, `deny` clean; `clippy -D warnings` clean on `workspace-engine` and `desktop-shell`; `nextest` 1293 passed / 24 skipped (`workspace-engine`) and 158 passed / 17 skipped (`desktop-shell`). **For Task 2:** `resume_round_budget` must seed `round_budget_extension` from `rounds_granted` (C3) and refuse the other kinds; `at_hard_cap` is hardcoded `false` here — Task 3 computes it from `ABSOLUTE_TURN_ROUND_CAP`. §2 and §5.2 line numbers in `proposal.md` were re-checked against the post-merge tree and updated. |
-| 2 · `resume_round_budget` with Continue and Answer now | Not started | |
+| 2 · `resume_round_budget` with Continue and Answer now | Done 2026-10-18 | Landed: `RoundBudgetDecision` (public, module scope) and `resume_round_budget`, which `take`s the pending turn, refuses a non-`round_budget` kind (`InvalidInput`, put back), and dispatches: *Continue* appends "You have N more tool rounds. Continue the task.", records `round_budget_decision` and `turn_budget_extended` (actor=user, round, `roundsGranted` delta, `roundsTotal` running total), seeds `round_budget_extension` from `rounds_granted`, and re-enters `run_agentic_turn` at `pending.round`; *Answer now* records the decision and re-enters with the forced final call. Two new `ChatTurnOptions` fields carry the seed and the answer-now bypass — `round_budget_extension: u32` (seeds the local) and `round_budget_answer_now: bool` (skips the §5.1 pause so the forced call runs); both `#[serde(default)]`. `resume_after_command_decision_with_options` gains an explicit `round_budget` guard mirroring the plan/fallback ones; `resume_after_fallback_decision` and `resume_after_plan_decision` already refuse via their generic `else`. `RoundBudgetDecision` re-exported from `lib.rs`. **Tests:** 4 new in `tests/round_budget.rs`, written first and confirmed failing to compile on the missing entry point, now passing: `continue_resumes_the_same_task_with_more_rounds` (same task id; 9th request replays the prompt and the `a.rs` tool results; `turn_budget_extended` with `roundsGranted:8`/`roundsTotal:8`), `answer_now_makes_exactly_one_forced_final_call` (exactly 9 calls, `ToolBudgetExhausted`), `resume_round_budget_refuses_a_foreign_pause`, `command_and_fallback_resume_refuse_a_round_budget_pause`. **Deviations:** the seed and the answer-now bypass travel through `ChatTurnOptions` (two new fields) rather than a new `run_agentic_turn` parameter, because the turn options already survive a pause and a restart and the method already takes them; the Interfaces section records the fields. The *Continue* delta is `default_tool_round_limit()` (matching the token-ceiling continuation at the `turn_continued` site) rather than special-casing web debug, since the base limit is recomputed from `web_debug_mode` inside the loop and the seed carries only the running total. `turn_budget_extended` is written here (Task 2 Step 3) even though the Interfaces section tags the record as Task 3's; Task 3 asserts it. **Falsified:** zeroing the seed fails `continue_resumes_...` (turn re-pauses, 8 requests not 9); dropping the answer-now bypass fails `answer_now_makes_...` (8 requests, re-pauses). Both reverted. **Checks:** fmt/typos/deny/node/lint clean; clippy `-D warnings` clean on `workspace-engine`; nextest 1297 passed / 24 skipped (`workspace-engine`). **For Task 3:** `at_hard_cap` is still hardcoded `false`; `turn_budget_extended` is already recorded by `resume_round_budget`'s *Continue* branch (round, `roundsGranted`, `roundsTotal`) — Task 3 adds `ABSOLUTE_TURN_ROUND_CAP`, computes `at_hard_cap`, and asserts the audit. |
 | 3 · `ABSOLUTE_TURN_ROUND_CAP` and `turn_budget_extended` | Not started | |
 | 4 · Crash recovery and worker sessions | Not started | |
 | 5 · UI row and the *Ask again* path | Not started | |
@@ -164,6 +164,11 @@ pub fn resume_round_budget(
     sink: &mut TurnSink<'_>,
 ) -> Result<ChatTurnResult>;
 
+// ChatTurnOptions gains (Task 2), beside provider_fallback_used:
+//   round_budget_extension: u32  — seeds run_agentic_turn's local from rounds_granted
+//   round_budget_answer_now: bool — the Answer-now re-entry skips the §5.1 pause
+// Both #[serde(default)]; callers leave them at their defaults.
+
 // PausedTurns gains (Task 4), mirroring provider_fallback_target:
 pub fn round_budget_pause(&self, proposal_id: &str) -> Option<RoundBudgetPause>;
 
@@ -176,7 +181,9 @@ RoundBudget {
 },
 ```
 
-The audit record (Task 3) mirrors `turn_continued` (`chat.rs:2400`):
+The audit record mirrors `turn_continued` (`chat.rs:2400`). The record call is
+written by Task 2's *Continue* branch; Task 3 asserts it and adds
+`ABSOLUTE_TURN_ROUND_CAP`:
 
 ```text
 turn_budget_extended  actor=user  sessionId  taskId  round  roundsGranted  roundsTotal
@@ -255,7 +262,7 @@ beside spec 59, 60 or 64, which also edit `chat.rs`.
 **Requirements:** 2, 3. **Proposal:** §5.2. **Corrections:** C3, C5, C6.
 **Files:** `chat.rs`.
 
-- [ ] **Step 1: Write the failing tests** (continue in `round_budget.rs`):
+- [x] **Step 1: Write the failing tests** (continue in `round_budget.rs`):
   - `continue_resumes_the_same_task_with_more_rounds`: `resume_round_budget(..,
     Continue)` re-enters `run_agentic_turn` with the saved `messages` and `round`
     and the same task id; `rounds_granted` grows by `agent_max_tool_rounds` and
@@ -271,22 +278,22 @@ beside spec 59, 60 or 64, which also edit `chat.rs`.
   - `command_and_fallback_resume_refuse_a_round_budget_pause`: the existing
     `resume_after_command_decision` and `resume_after_fallback_decision` return
     `InvalidInput` for a `round_budget` pending turn (C5).
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Add `RoundBudgetDecision` and `resume_round_budget`**, taking the
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: Add `RoundBudgetDecision` and `resume_round_budget`**, taking the
       pending turn, refusing a non-`round_budget` kind, and dispatching:
       *Continue* appends the "You have N more tool rounds. Continue the task."
       user message, seeds `round_budget_extension` from `rounds_granted`, and
       re-enters; *Answer now* re-enters with `force_final` set. Record the
       decision and audit `turn_budget_extended` (the audit itself is Task 3's
       constant; add the record call here so Task 3 can assert it).
-- [ ] **Step 4: Extend the kind refusals** in `resume_after_command_decision_with_options`
+- [x] **Step 4: Extend the kind refusals** in `resume_after_command_decision_with_options`
       and `resume_after_fallback_decision` (C5), mirroring the existing
       `plan_review` / `provider_fallback` guards.
-- [ ] **Step 5: Falsify.** Reset `round_budget_extension` to zero on resume and
+- [x] **Step 5: Falsify.** Reset `round_budget_extension` to zero on resume and
       confirm the "more rounds" test fails. Answer-now without `force_final`
       fails the "exactly one forced call" test. Revert.
-- [ ] **Step 6: Update the proposal** for C3, C5, C6.
-- [ ] **Step 7: Scoped checks.** `cargo nextest run -p workspace-engine`,
+- [x] **Step 6: Update the proposal** for C3, C5, C6.
+- [x] **Step 7: Scoped checks.** `cargo nextest run -p workspace-engine`,
       scoped clippy, fast checks. Show and ask.
 
 ## Task 3: `ABSOLUTE_TURN_ROUND_CAP` and the `turn_budget_extended` audit

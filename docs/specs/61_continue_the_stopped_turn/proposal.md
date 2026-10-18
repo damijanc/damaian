@@ -151,14 +151,20 @@ pending turn and:
   forced final call with tools dropped, and the turn ends as today: answered, or
   `ToolBudgetExhausted` if the model still asks for a tool.
 
-`round_budget_extension` is a *local* of `run_agentic_turn` (`chat.rs:1981`), not
+`resume_round_budget` refuses a pending turn of any other kind, and the existing
+`resume_after_command_decision` / `resume_after_plan_decision` /
+`resume_after_fallback_decision` refuse a `round_budget` one, mirroring the rule
+specs 23 and 50 record for their own kinds (C5). A pause can only be answered by
+its own entry point.
+
+`round_budget_extension` is a *local* of `run_agentic_turn` (`chat.rs:2139`), not
 part of the persisted turn. The `round_budget` field's `rounds_granted` is the
 running total, and the resumed turn seeds `round_budget_extension` from it so its
 `max_rounds` continues where it stopped rather than resetting to the base limit.
 
 The request the user typed reaches the model inside the assembled prompt, which
 is the **second** message of the saved array (`[system prompt, user request, …]`,
-`chat.rs:842`), not the first; the raw text is also held on `task.user_prompt`.
+`chat.rs:889`), not the first; the raw text is also held on `task.user_prompt`.
 Nothing about it depends on the eight-message window, because the in-turn
 `messages` array is what is replayed, not `build_model_prompt`'s sliding window.
 

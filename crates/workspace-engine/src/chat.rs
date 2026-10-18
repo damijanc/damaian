@@ -378,6 +378,16 @@ pub struct AgentRoundBudgetProposal {
     pub at_hard_cap: bool,
 }
 
+/// How the user answers a round-budget pause (spec 61 §5.2).
+///
+/// `Continue` grants the same turn another `agent_max_tool_rounds`;
+/// `AnswerNow` makes the forced final call with tools dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundBudgetDecision {
+    Continue,
+    AnswerNow,
+}
+
 /// One step of a user's revision to a proposed plan.
 ///
 /// Identifies the step by id rather than position so a reorder and a deletion
@@ -466,6 +476,17 @@ pub struct ChatTurnOptions {
     /// later — fails safe: nothing waits forever for an answer.
     #[serde(default)]
     pub user_present: bool,
+    /// Extra tool rounds granted to this turn across round-budget continuations
+    /// (spec 61 §5.2). Seeded on resume from the pending turn's running
+    /// `rounds_granted`, so the resumed turn's `max_rounds` continues where it
+    /// stopped instead of resetting to the base segment. Callers leave it `0`.
+    #[serde(default)]
+    pub round_budget_extension: u32,
+    /// The user chose *Answer now* on a round-budget pause: this re-entry is
+    /// the forced final call, so it must not pause again at the limit
+    /// (spec 61 §5.2). Callers leave it `false`.
+    #[serde(default)]
+    pub round_budget_answer_now: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -937,6 +958,14 @@ impl ChatOrchestrator {
             self.pending_commands.save(&pending)?;
             return Err(ClientError::InvalidInput(format!(
                 "Proposal {proposal_id} is a provider fallback offer; resume it with resume_after_fallback_decision"
+            )));
+        }
+        // Same reasoning for a round-budget pause (spec 61): nothing was
+        // dispatched, and `last_content` is empty rather than a command.
+        if pending.round_budget.is_some() {
+            self.pending_commands.save(&pending)?;
+            return Err(ClientError::InvalidInput(format!(
+                "Proposal {proposal_id} is a round-budget pause; resume it with resume_round_budget"
             )));
         }
         let repository_root = PathBuf::from(&pending.repository_root);
@@ -1479,6 +1508,134 @@ impl ChatOrchestrator {
         )
     }
 
+    /// Decides a round-budget pause (spec 61 §5.2).
+    ///
+    /// *Continue* grants the turn another segment of tool rounds and re-enters
+    /// with the saved messages and round, seeding `round_budget_extension` from
+    /// the running `rounds_granted` total so the limit continues where it
+    /// stopped. *Answer now* re-enters with the forced final call and no extra
+    /// rounds; the turn ends answered or `ToolBudgetExhausted`, exactly as the
+    /// forced call would have before this spec.
+    ///
+    /// Refuses any other kind of pause, and the other resume entry points
+    /// refuse a round-budget one (C5), so a pause can only be answered by its
+    /// own entry point.
+    pub fn resume_round_budget(
+        &self,
+        proposal_id: &str,
+        decision: RoundBudgetDecision,
+        approved_by: &str,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let pending = self.pending_commands.take(proposal_id)?;
+        let Some(pause) = pending.round_budget.clone() else {
+            self.pending_commands.save(&pending)?;
+            return Err(ClientError::InvalidInput(format!(
+                "Proposal {proposal_id} is not a round-budget pause"
+            )));
+        };
+        let repository_root = PathBuf::from(&pending.repository_root);
+
+        match decision {
+            RoundBudgetDecision::Continue => {
+                // The segment granted is the same one a token-ceiling
+                // continuation adds (`default_tool_round_limit`), and the
+                // running total is what the resumed turn seeds its extension
+                // from — the two must agree or the limit would reset.
+                let granted = self.default_tool_round_limit();
+                let rounds_granted = pause.rounds_granted + granted;
+                let note = format!("You have {granted} more tool rounds. Continue the task.");
+
+                self.audit_log.record(
+                    "round_budget_decision",
+                    &[
+                        ("actor", approved_by.to_string()),
+                        ("sessionId", pending.session.id.clone()),
+                        ("taskId", pending.task.id.clone()),
+                        ("proposalId", proposal_id.to_string()),
+                        ("decision", "continue".to_string()),
+                    ],
+                )?;
+                // The audit record Task 3's tests assert (§5.4): who granted
+                // it, the round, the delta, and the running total.
+                self.audit_log.record(
+                    "turn_budget_extended",
+                    &[
+                        ("actor", approved_by.to_string()),
+                        ("sessionId", pending.session.id.clone()),
+                        ("taskId", pending.task.id.clone()),
+                        ("round", pending.round.to_string()),
+                        ("roundsGranted", granted.to_string()),
+                        ("roundsTotal", rounds_granted.to_string()),
+                    ],
+                )?;
+                self.session_store.append_message(
+                    &pending.session.id,
+                    Some(&pending.task.id),
+                    "user",
+                    &note,
+                )?;
+                self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
+                let task = self.session_store.update_task_status(
+                    &pending.task,
+                    TaskStatus::PreparingContext,
+                    None,
+                )?;
+                let mut messages = pending.messages;
+                messages.push(ModelMessage::user(note));
+                let turn_options = ChatTurnOptions {
+                    round_budget_extension: rounds_granted,
+                    ..pending.turn_options
+                };
+                self.run_agentic_turn(
+                    &repository_root,
+                    pending.session,
+                    task,
+                    pending.context_files,
+                    messages,
+                    pending.round,
+                    model_adapter,
+                    sink,
+                    turn_options,
+                )
+            }
+            RoundBudgetDecision::AnswerNow => {
+                self.audit_log.record(
+                    "round_budget_decision",
+                    &[
+                        ("actor", approved_by.to_string()),
+                        ("sessionId", pending.session.id.clone()),
+                        ("taskId", pending.task.id.clone()),
+                        ("proposalId", proposal_id.to_string()),
+                        ("decision", "answer_now".to_string()),
+                    ],
+                )?;
+                self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
+                let task = self.session_store.update_task_status(
+                    &pending.task,
+                    TaskStatus::PreparingContext,
+                    None,
+                )?;
+                let turn_options = ChatTurnOptions {
+                    round_budget_answer_now: true,
+                    ..pending.turn_options
+                };
+                self.run_agentic_turn(
+                    &repository_root,
+                    pending.session,
+                    task,
+                    pending.context_files,
+                    pending.messages,
+                    pending.round,
+                    model_adapter,
+                    sink,
+                    turn_options,
+                )
+            }
+        }
+    }
+
     /// Takes the checkpoint the turn can be rewound to. Best-effort: a store
     /// that cannot be written is recorded in the audit log and the turn still
     /// runs, because refusing to answer at all would be a worse failure than
@@ -1974,10 +2131,12 @@ impl ChatOrchestrator {
             .read_plan_approved(&session.id, &task.id)
             .unwrap_or(false);
 
-        // Extra rounds a turn may take past its configured segment because a
-        // token ceiling is set (requirement 6). Bounded by the absolute round
-        // cap so a provider that reports no usage cannot loop forever.
-        let mut round_budget_extension: u32 = 0;
+        // Extra rounds a turn may take past its configured segment: granted by
+        // a token ceiling (requirement 6) or by a round-budget *Continue*
+        // (spec 61 §5.2), which seeds this from the pending turn's running
+        // `rounds_granted`. Bounded by the absolute round cap so a provider
+        // that reports no usage cannot loop forever.
+        let mut round_budget_extension: u32 = turn_options.round_budget_extension;
         let (final_run, response, proposals, stop_reason) = loop {
             // Spec 57 §5.4, in its order: a pause holds here, before the
             // cancel check, so a stop that arrives while paused ends the turn
@@ -2102,6 +2261,7 @@ impl ChatOrchestrator {
             // applies when a ceiling is set and the absolute cap is not yet
             // reached, so the forced call proceeds on that path.
             if force_final
+                && !turn_options.round_budget_answer_now
                 && (self.config.agent_max_task_tokens.is_none() || round >= ABSOLUTE_TOOL_ROUND_CAP)
             {
                 return self.pause_for_round_budget(
