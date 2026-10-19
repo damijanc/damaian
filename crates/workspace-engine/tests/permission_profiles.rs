@@ -122,6 +122,24 @@ fn the_preference_keys_are_exactly_spec_34s_free_keys() {
     assert_eq!(fields_of(ConfigKeyKind::Preference), free);
 }
 
+#[test]
+fn agent_max_exploration_rounds_is_a_capability_key_with_a_human_name() {
+    let kind_of = |name: &str| {
+        overlay_field_kinds()
+            .into_iter()
+            .find(|(field, _)| *field == name)
+            .map(|(_, kind)| kind)
+    };
+    assert_eq!(
+        kind_of("agent_max_exploration_rounds"),
+        Some(ConfigKeyKind::Capability)
+    );
+    assert_eq!(
+        workspace_engine::rule_label("agent_max_exploration_rounds").as_deref(),
+        Some("Read-only rounds per turn")
+    );
+}
+
 /// How a capability key resists a weakening repository value.
 enum Resists {
     /// Spec 34 refused the key and reported it under this name.
@@ -306,6 +324,15 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "agent_max_turn_messages=24\n",
             "agent_max_turn_messages=1000\n",
             Reported("agent_max_turn_messages"),
+        ),
+        // Spec 59: the read allowance is a capability a repository may lower
+        // but never raise, because raising it spends the user's money on the
+        // repository's say-so (§5.4).
+        case(
+            "agent_max_exploration_rounds",
+            "agent_max_exploration_rounds=8\n",
+            "agent_max_exploration_rounds=32\n",
+            Reported("agent_max_exploration_rounds"),
         ),
         case(
             "shell",
@@ -2573,6 +2600,7 @@ const EVERY_PROFILE_KEY: &str = concat!(
     "checkpoint_retention_days=7\n",
     "agent_max_task_tokens=5000\n",
     "agent_max_turn_messages=12\n",
+    "agent_max_exploration_rounds=8\n",
     "mcp_enabled=false\n",
     "mcp_server_allowlist=blessed\n",
     "mcp_server.helper.enabled=false\n",
