@@ -81,6 +81,7 @@ Each one names the task that owns it.
 | C4 | §5.6 says the audit records gain fields "beside `roundLimit`" on "forced-final, continued and exhausted paths" | The round fields are `toolRound`/`toolRoundLimit` in `model_request_prepared` (`chat.rs:2108`) and `round`/`roundLimit` in `turn_continued` (`chat.rs:2358`); there is no separate forced-final or exhausted audit event | Name the two records precisely; exhaustion is visible through `model_request_prepared` at `toolRound == toolRoundLimit` plus the stop reason. §5.6 updated. **Task 5** |
 | C5 | §5.2 lists "the progress phase's position in the turn" as a `model_calls` role | §5.5 says `TurnPhase.round`/`max_rounds` "now mean action rounds" | §5.5 wins: `TurnPhase.round` = action rounds; `model_calls` feeds spec 57's pause/steer boundary and the audit round markers only. §5.2 updated. **Tasks 2, 4** |
 | C6 | §2's `chat.rs` line references (523, 535, 2053, 2324, 2334, 4380, 5238, 162) | Drifted after spec 60/63/64 merged into `chat.rs` (now 530, 542, 2072, 2340, 2350, 4465, 5443, 168) | Re-checked and corrected on 2026-10-18; will drift again when spec 61 lands. Not a design change. **all** |
+| C7 | §5.3's canonical form named only a repository-relative path, a line range and search arguments | Spec 60 gave five read tools a `worktree` argument and added `read_git_diff`'s `paths`/`stat`/`base`, `list_worktrees` and `read_git_log`; keyed by path alone, `README.md` in a worktree repeats `README.md` in the main checkout, and a `read_git_status` after a command repeats the one before it | §5.3 now keys every call by its checkout, gives a canonical row per read tool, and clears the seen-call set after a round that writes. Found reviewing #65 on 2026-10-19, whose elision notice prints this form. **Task 3** |
 
 ## File Structure
 
@@ -212,13 +213,23 @@ beside #61 Tasks 1–3 (Global Constraints) or another spec's `chat.rs` task
     (`1 + agent_max_tool_rounds` rounds plus the forced final call);
   - a continued range read (lines 400–468 after 1–400) is **not** a repeat;
   - two identical calls in the same round make it an action round;
+  - the same path read in the main checkout and in a registered worktree is
+    **not** a repeat, and two `worktree` spellings that resolve to the same
+    registered worktree **are**;
+  - `read_git_diff` with the same `paths` in a different order is a repeat,
+    and one with a different `base`, `stat` or `staged` is not;
+  - `read_git_status` repeated after a round that ran a command is **not** a
+    repeat, and repeated with only reads between is;
   - a read of a different path (or a different search pattern/glob/match cap)
     is not a repeat.
 - [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: The seen-call set.** A turn-local set keyed by canonical call —
-      the tool, the path resolved through `PathPolicy` to a repository-relative
-      path, the line range as given, and for search the pattern/glob/match cap
-      as given. Populated as each call dispatches; empty for a resumed turn.
+- [ ] **Step 3: The seen-call set.** A turn-local set keyed by canonical call
+      as §5.3's table defines it per tool — the checkout (#60's resolved
+      `worktree`, or the session's checkout), paths resolved through
+      `PathPolicy` relative to that checkout, `read_git_diff`'s `paths` sorted,
+      every other argument as given. Populated as each call dispatches;
+      cleared when a round with a `WritesRepository` call or an applied
+      edit/patch completes; empty for a resumed turn.
 - [ ] **Step 4: Wire it into classification** (§5.3, via Task 2's Step 4): a
       read-only call that matches a seen call makes its round an action round.
 - [ ] **Step 5: Falsify** — treat a continued range read as a repeat, and let a

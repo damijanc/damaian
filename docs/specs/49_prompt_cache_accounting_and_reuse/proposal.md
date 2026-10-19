@@ -239,6 +239,39 @@ is the measurement: with accounting in place, the hit rate under today's order
 is a number, and the case for reordering can be made from it rather than from
 first principles.
 
+### 5.9 The same problem inside a turn: stepped cutting
+
+Added 2026-10-19, moved here from
+[#65](../65_exploration_memory_within_a_turn.md). Not a requirement yet; an
+idea for the reuse slice to measure.
+
+Inside a turn, `bounded_messages` keeps the newest rounds that fit
+`agent_max_turn_messages`. Once the window is full, every new round drops the
+oldest one, so everything after the seed sits at a new position in every
+request — the in-turn version of the sliding window above. A long turn (#59's
+allowance, #61's continuations up to 64 rounds) makes many such calls.
+
+**The idea.** Cut in steps: when the tail goes over the window, drop rounds
+until it is at most half full, keep that cut position in the loop, and move it
+again only when the window fills. Between cuts, consecutive requests share
+their whole prefix up to the newest round. `bounded_messages` stays pure, with
+the cut position passed in and returned, and `model_request_prepared` records
+`elidedThrough` and `cutMoved` so the effect is measurable.
+
+**The cost, which is why #65 dropped it.** A full window holds about seven
+rounds today. With steps the model sees about seven just before a cut, three
+just after, and about five on average — less history, never more. #65 exists
+to make the agent remember more of a long investigation, so it cannot also
+make it forget sooner.
+
+**What would justify it.** Slice 1's `cache_hit_rate` on long turns, before and
+after, on a provider that caches automatically, weighed against #65's live
+measure of answers that use pre-cut findings. Only a clear cache gain with no
+loss on that measure would. A gentler step (cutting to two thirds) is the
+first variant to try. It belongs with requirement 4, because it is the same
+question — what makes a prefix stable — asked of the in-turn array instead of
+`build_model_prompt`.
+
 ## 6. Acceptance Criteria
 
 ### Slice 1 — accounting

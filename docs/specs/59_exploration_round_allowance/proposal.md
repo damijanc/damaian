@@ -184,11 +184,49 @@ count; see §5.5.)
 ### 5.3 What counts as a repeat
 
 A repeat is a read-only call whose tool and canonical arguments equal those of
-a call already dispatched in this turn. Canonical means: the path resolved
-through `PathPolicy` to a repository-relative path; the line range as given (a
-read of lines 400–468 after 1–400 is not a repeat — that is how a truncated
-read continues); and for search, the pattern, glob and match cap as given. Two
-calls in the same round that are identical make it an action round as well.
+a call already dispatched in this turn. Two calls in the same round that are
+identical make it an action round as well.
+
+The canonical form covers every argument that changes what the call returns,
+so two calls that can return different results are never the same call:
+
+- **Checkout.** Every tool that takes [#60](../60_worktree_aware_read_tools/proposal.md)'s
+  `worktree` argument is keyed by the checkout it reads: the registered
+  worktree's canonical path as #60's resolver returns it, or "the session's
+  checkout" when `worktree` is omitted. `README.md` in the main checkout and
+  `README.md` in a worktree are different calls. A `worktree` the resolver
+  refuses is kept as given, so a model retrying the same refused argument is
+  still caught.
+- **Paths** are resolved through `PathPolicy` to a path relative to that
+  checkout. An omitted `list_directory` `dir` is the checkout root.
+- **Everything else is compared as given**, and an omitted optional argument
+  is distinct from an explicit default. The line range is the reason for this
+  narrowness: a read of lines 400–468 after 1–400 is not a repeat — that is how
+  a truncated read continues.
+
+Per tool, the key is the tool name plus:
+
+| Tool | Canonical arguments |
+|---|---|
+| `read_file` | checkout, path, line range |
+| `list_directory` | checkout, dir, depth |
+| `search_content` | checkout, pattern, path glob, match cap |
+| `search_codebase` | query, semantic flag, limit |
+| `read_git_status` | checkout |
+| `read_git_diff` | checkout, staged, stat, base, and `paths` each resolved as above and sorted (their order does not change the diff) |
+| `list_worktrees` | base |
+| `read_git_log` | checkout, base, max count |
+
+A tool `action_effect` classifies `ReadOnly` later must add its row here; a
+tool without one is never a repeat, which errs toward exploration and is caught
+by the review of the row, not by the budget.
+
+**Writes clear the set.** Git reads and file reads report state that a write
+changes, and checking state again after changing it — `read_git_status` after
+a command — is the ordinary verify step, not a loop. So the seen-call set is
+cleared when a round containing a `WritesRepository` call, or an edit or patch
+that was applied, completes. A loop of reads with no write between them is
+still caught.
 
 This is deliberately narrow. It catches a model stuck re-reading the same
 thing, and nothing that reads something new. A legitimate re-read — for
