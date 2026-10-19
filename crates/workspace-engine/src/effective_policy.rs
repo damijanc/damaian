@@ -153,6 +153,7 @@ pub fn rule_label(key: &str) -> Option<String> {
         "enable_semantic_search" => "Semantic search",
         "enable_worker_sessions" => "Worker sessions",
         "agent_max_tool_rounds" => "Tool rounds per turn",
+        "agent_max_exploration_rounds" => "Read-only rounds per turn",
         "agent_web_debug_max_tool_rounds" => "Tool rounds per browser-debugging turn",
         "agent_tool_retry_limit" => "Retries of a failing tool call",
         "agent_max_questions_per_turn" => "Questions the model may ask per turn",

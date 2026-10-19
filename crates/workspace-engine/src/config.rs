@@ -309,6 +309,12 @@ pub struct Config {
     /// Default number of tool/model rounds an agentic chat turn may spend
     /// before the model is asked to answer with the evidence it has.
     pub agent_max_tool_rounds: u32,
+    /// Read-only rounds one turn may spend before they begin to count against
+    /// [`Self::agent_max_tool_rounds`] (spec 59). Restrict-only, lower wins: a
+    /// repository may lower it, never raise it, because raising it spends the
+    /// user's money on the repository's say-so. `0` restores today's behaviour,
+    /// where every read counts as an action round.
+    pub agent_max_exploration_rounds: u32,
     /// Larger budget for turns that are explicitly debugging a web page or
     /// that call a first-class browser diagnostic tool.
     pub agent_web_debug_max_tool_rounds: u32,
@@ -1108,6 +1114,7 @@ impl Config {
             agent_max_questions_per_turn,
             agent_max_task_tokens,
             agent_max_turn_messages,
+            agent_max_exploration_rounds,
             project_roots_added,
             project_roots_removed,
             shell,
@@ -1561,6 +1568,23 @@ impl Config {
             )
         {
             outcome.record(scope, "agent_max_task_tokens", None, loosened);
+        }
+
+        // Restrict-only, lower wins, for the same reason as the token ceiling:
+        // a repository may shrink the read allowance, never widen it, because
+        // raising it spends the user's money on the repository's say-so (spec
+        // 59 §5.4). A `u32` apply block because the read caps' loop below is
+        // `usize`-typed.
+        if let Some(value) = agent_max_exploration_rounds
+            && let Some(loosened) = restrict_only_u32(
+                &mut self.agent_max_exploration_rounds,
+                value,
+                "agent_max_exploration_rounds",
+                trusted,
+                rejected,
+            )
+        {
+            outcome.record(scope, "agent_max_exploration_rounds", None, loosened);
         }
 
         // Restrict-only like the token ceiling: a repository may shrink the
@@ -2450,6 +2474,11 @@ impl Config {
         );
         push_line(
             &mut output,
+            "agent_max_exploration_rounds",
+            &self.agent_max_exploration_rounds.to_string(),
+        );
+        push_line(
+            &mut output,
             "agent_web_debug_max_tool_rounds",
             &self.agent_web_debug_max_tool_rounds.to_string(),
         );
@@ -2571,6 +2600,11 @@ impl Default for Config {
             agent_web_debug_max_tool_rounds: 12,
             agent_tool_retry_limit: 2,
             agent_max_questions_per_turn: 2,
+            // Three times the action budget, so a discovery turn can read
+            // roughly what the motivating session needed several times over
+            // (spec 59 §5.4). The number is a starting point; the long-task
+            // scenario is what checks it.
+            agent_max_exploration_rounds: 24,
             // No ceiling by default: this must not change what an existing
             // configuration does on upgrade (§5.4).
             agent_max_task_tokens: None,
@@ -2640,6 +2674,7 @@ pub struct ConfigOverlay {
     pub agent_max_questions_per_turn: Option<u32>,
     pub agent_max_task_tokens: Option<u64>,
     pub agent_max_turn_messages: Option<usize>,
+    pub agent_max_exploration_rounds: Option<u32>,
     pub project_roots_added: Option<Vec<String>>,
     pub project_roots_removed: Option<Vec<String>>,
     pub shell: Option<String>,
@@ -2775,6 +2810,9 @@ classify_overlay_fields! {
     agent_max_questions_per_turn => Preference,
     agent_max_task_tokens => Capability,
     agent_max_turn_messages => Capability,
+    // Spec 59: restrict-only, so a capability — a repository may lower the
+    // read allowance, never raise it (§5.4).
+    agent_max_exploration_rounds => Capability,
     // A root changes which directory an approved command runs in, never
     // whether it needs approval or what is readable, and committing a
     // manifest makes the same root (spec 24, context.md §6).
@@ -2993,6 +3031,9 @@ impl ConfigOverlay {
             "project_roots_removed" => self.project_roots_removed = Some(split_list(value)),
             "agent_max_turn_messages" => {
                 self.agent_max_turn_messages = Some(parse_read_lines(key, value)?)
+            }
+            "agent_max_exploration_rounds" => {
+                self.agent_max_exploration_rounds = Some(parse_exploration_round_count(key, value)?)
             }
             "shell" => self.shell = Some(value.to_string()),
             "model_provider" => self.model_provider = Some(normalize_model_provider(value)?),
@@ -3342,6 +3383,7 @@ impl ConfigOverlay {
             agent_max_questions_per_turn,
             agent_max_task_tokens,
             agent_max_turn_messages,
+            agent_max_exploration_rounds,
             project_roots_added,
             project_roots_removed,
             shell,
@@ -3485,6 +3527,13 @@ impl ConfigOverlay {
         }
         if let Some(value) = agent_max_tool_rounds {
             push_line(&mut output, "agent_max_tool_rounds", &value.to_string());
+        }
+        if let Some(value) = agent_max_exploration_rounds {
+            push_line(
+                &mut output,
+                "agent_max_exploration_rounds",
+                &value.to_string(),
+            );
         }
         if let Some(value) = agent_web_debug_max_tool_rounds {
             push_line(
@@ -4376,6 +4425,17 @@ fn parse_round_count(key: &str, value: &str) -> Result<u32> {
     }
 }
 
+/// The exploration allowance differs from `parse_round_count`: `0` is valid
+/// ("no exploration allowance", spec 59 requirement 6) and a value above the
+/// ceiling is clamped to it rather than refused (requirement 5). The ceiling is
+/// `ABSOLUTE_EXPLORATION_ROUND_CAP` (32), defined beside
+/// `ABSOLUTE_TOOL_ROUND_CAP` in `chat.rs`; the round loop clamps again at
+/// runtime via `default_exploration_round_limit`.
+fn parse_exploration_round_count(key: &str, value: &str) -> Result<u32> {
+    let parsed = parse_u64(key, value)?;
+    Ok(parsed.min(32) as u32)
+}
+
 /// Takes the *lower* of the two at an untrusted scope, and whatever was given
 /// at a trusted one.
 ///
@@ -4423,6 +4483,28 @@ fn parse_timeout_seconds(key: &str, value: &str) -> Result<usize> {
 fn restrict_only_limit(
     current: &mut usize,
     value: usize,
+    key: &str,
+    trusted: bool,
+    rejected: &mut Vec<RejectedConfigKey>,
+) -> Option<bool> {
+    if trusted || value < *current {
+        let loosens = value > *current;
+        *current = value;
+        return Some(loosens);
+    }
+    rejected.push(RejectedConfigKey::new(
+        key,
+        RepositoryKeyClass::RestrictOnly,
+    ));
+    None
+}
+
+/// [`restrict_only_limit`] for a `u32` value: the read allowance and the round
+/// bounds are `u32`-typed, while the read caps' loop above is `usize`-typed, so
+/// they cannot share that helper. Spec 59 §5.4.
+fn restrict_only_u32(
+    current: &mut u32,
+    value: u32,
     key: &str,
     trusted: bool,
     rejected: &mut Vec<RejectedConfigKey>,

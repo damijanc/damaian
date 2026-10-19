@@ -1,8 +1,9 @@
 # Feature Spec: Exploration Round Allowance
 
-Status: Planned, not started. Specified on 2026-10-17 from a session that ran out of tool
+Status: In progress. Task 1 of 6 done 2026-10-18 (the `agent_max_exploration_rounds`
+config key); see [`tasks.md`](tasks.md). Specified on 2026-10-17 from a session that ran out of tool
 rounds on a reporting-only request; the evidence is in
-[`context.md`](context.md) §1. Planned on 2026-10-18; see [`tasks.md`](tasks.md).
+[`context.md`](context.md) §1. Planned on 2026-10-18.
 Order: 59 of 59
 Plan: none. Like [#47](../47_agent_working_capability/proposal.md), this spec is
 evidence-driven rather than a roadmap graduation — an exception to the rule in

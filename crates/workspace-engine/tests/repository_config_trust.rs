@@ -1418,3 +1418,62 @@ fn repository_config_may_shrink_the_turn_message_window_but_not_widen_it() {
         "a repository widening the window must be refused and the user's value kept"
     );
 }
+
+/// Spec 59 §5.4. The exploration allowance is restrict-only: a repository may
+/// lower it, because a restriction is always safe, but raising it spends the
+/// user's money on the repository's say-so.
+#[test]
+fn repository_config_may_lower_the_exploration_allowance_but_not_raise_it() {
+    let lowered = fixture(
+        "exploration-lower",
+        "agent_max_exploration_rounds=24\n",
+        "agent_max_exploration_rounds=8\n",
+    );
+    assert_eq!(
+        lowered.load().agent_max_exploration_rounds,
+        8,
+        "a repository lowering the allowance is a restriction and must be honoured"
+    );
+
+    let raised = fixture(
+        "exploration-raise",
+        "agent_max_exploration_rounds=24\n",
+        "agent_max_exploration_rounds=32\n",
+    );
+    assert_eq!(
+        raised.load().agent_max_exploration_rounds,
+        24,
+        "a repository raising the allowance must be refused and the user's value kept"
+    );
+
+    // And the refusal is audited as a restrict-only weakening, with the class
+    // but never the value (the audit records only the key name and class).
+    let engine = WorkspaceEngine::new(raised.base());
+    let (_, report) = raised.load_reporting();
+    assert_eq!(
+        report
+            .rejected_keys
+            .iter()
+            .find(|rejected| rejected.key == "agent_max_exploration_rounds")
+            .map(|rejected| rejected.class),
+        Some(RepositoryKeyClass::RestrictOnly)
+    );
+    engine
+        .repository_trust
+        .review(&report, &engine.audit_log)
+        .unwrap()
+        .expect("a restrict-only weakening should produce a notice");
+    let events = audit_events(&raised);
+    assert!(
+        events.contains("repository_config_key_rejected"),
+        "{events}"
+    );
+    assert!(
+        events.contains("\"key\":\"agent_max_exploration_rounds\""),
+        "{events}"
+    );
+    assert!(events.contains("\"class\":\"restrict_only\""), "{events}");
+
+    lowered.cleanup();
+    raised.cleanup();
+}

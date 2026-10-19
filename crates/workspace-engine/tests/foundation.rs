@@ -5196,6 +5196,61 @@ fn config_rejects_out_of_range_tool_round_limits() {
 }
 
 #[test]
+fn exploration_round_allowance_accepts_zero_where_the_action_budget_refuses_it() {
+    // Spec 59 requirement 6: `0` means "no exploration allowance" and must be
+    // accepted, unlike `agent_max_tool_rounds`, whose parser refuses 0.
+    let overlay = ConfigOverlay::parse("agent_max_exploration_rounds=0\n").expect("0 must parse");
+    let mut config = Config::default();
+    config.apply_overlay(overlay);
+    assert_eq!(config.agent_max_exploration_rounds, 0);
+    assert!(ConfigOverlay::parse("agent_max_tool_rounds=0\n").is_err());
+}
+
+#[test]
+fn exploration_round_allowance_clamps_values_above_its_ceiling_to_32() {
+    let at_ceiling = ConfigOverlay::parse("agent_max_exploration_rounds=32\n").unwrap();
+    let mut config = Config::default();
+    config.apply_overlay(at_ceiling);
+    assert_eq!(config.agent_max_exploration_rounds, 32);
+
+    for too_big in ["33", "100", "1000"] {
+        let overlay =
+            ConfigOverlay::parse(&format!("agent_max_exploration_rounds={too_big}\n")).unwrap();
+        let mut config = Config::default();
+        config.apply_overlay(overlay);
+        assert_eq!(
+            config.agent_max_exploration_rounds, 32,
+            "a value above 32 must clamp to 32"
+        );
+    }
+}
+
+#[test]
+fn exploration_round_allowance_defaults_to_24() {
+    assert_eq!(Config::default().agent_max_exploration_rounds, 24);
+}
+
+#[test]
+fn exploration_round_allowance_round_trips_through_config_show_and_the_overlay_serializer() {
+    let config = Config::default();
+    assert!(
+        config
+            .to_policy_text()
+            .contains("agent_max_exploration_rounds=24"),
+        "got: {}",
+        config.to_policy_text()
+    );
+
+    let overlay = ConfigOverlay::parse("agent_max_exploration_rounds=16\n").unwrap();
+    let text = overlay.to_policy_text();
+    assert!(
+        text.contains("agent_max_exploration_rounds=16"),
+        "got: {text}"
+    );
+    assert_eq!(ConfigOverlay::parse(&text).unwrap(), overlay);
+}
+
+#[test]
 fn provider_defaults_preserve_keychain_references() {
     let overlay =
         ConfigOverlay::parse("model_api_key_env=keychain:model-api-key\nmodel_provider=deepseek\n")

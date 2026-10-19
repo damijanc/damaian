@@ -1,13 +1,13 @@
 # Exploration Round Allowance Implementation Plan
 
 **Implements:** [`proposal.md`](proposal.md) · background in [`context.md`](context.md)
-**Status:** Planned, not started (planned 2026-10-18; references checked against the tree the same day)
+**Status:** In progress. Task 1 done 2026-10-18; tasks 2–6 remain.
 
 ## Progress
 
 | Task | State | Notes |
 |---|---|---|
-| 1 · The `agent_max_exploration_rounds` config key | Not started | |
+| 1 · The `agent_max_exploration_rounds` config key | Done 2026-10-18 | **Landed:** the `Config` field `agent_max_exploration_rounds: u32` (default 24) and the `ConfigOverlay` field `Option<u32>`, the exhaustive destructure, a `u32` restrict-only apply block via a new `restrict_only_u32` helper (C3), the dedicated `parse_exploration_round_count` parser (accepts `0..=32`, clamps above 32 to 32 — C2), `config_show`/`to_policy_text` for both `Config` and `ConfigOverlay`, `=> Capability` in `classify_overlay_fields!`, the carried profile key (`split_profile_keys` destructure + `carried` overlay + `equals_base_limit`), and the `effective_policy` label "Read-only rounds per turn". **Tests:** 4 new in `tests/foundation.rs` (`exploration_round_allowance_accepts_zero_where_the_action_budget_refuses_it`, `…_clamps_values_above_its_ceiling_to_32`, `…_defaults_to_24`, `…_round_trips_through_config_show_and_the_overlay_serializer`), 1 new in `tests/repository_config_trust.rs` (`repository_config_may_lower_the_exploration_allowance_but_not_raise_it`, including the audit assertion), 1 new in `tests/permission_profiles.rs` (`agent_max_exploration_rounds_is_a_capability_key_with_a_human_name`), plus a `weakening_cases` entry so `every_capability_key_resists_weakening_from_repository_scope` and the profile-carry/import tests hold. `cargo nextest run -p workspace-engine --test permission_profiles --test repository_config_trust --test foundation`: 275 passed, 1 skipped. Scoped `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `scripts/quality-gate.sh fmt node lint typos deny` clean. **Falsified:** classified `Preference` → `agent_max_exploration_rounds_is_a_capability_key_with_a_human_name` fails; applied as a Free preference → `repository_config_may_lower_the_exploration_allowance_but_not_raise_it` fails (32 applied instead of refused); parse refused 0 → `…_accepts_zero_…` fails; clamp removed → `…_clamps_values_above_its_ceiling_to_32` fails. All reverted. **Deviations:** none of design; the ceiling constant is not yet defined — the parser clamps to the literal 32 with a comment naming `ABSOLUTE_EXPLORATION_ROUND_CAP`, which Task 2 defines beside `ABSOLUTE_TOOL_ROUND_CAP` in `chat.rs` (the `parse_round_count` precedent also hardcodes 16 rather than referencing the constant). |
 | 2 · Round classification and two counters | Not started | |
 | 3 · Repeat detection | Not started | |
 | 4 · What the user sees | Not started | |
@@ -120,7 +120,7 @@ beside #61 Tasks 1–3 (Global Constraints) or another spec's `chat.rs` task
 `tests/permission_profiles.rs`, `tests/repository_config_trust.rs`,
 `tests/foundation.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - Parse accepts `0` (`ConfigOverlay::parse("agent_max_exploration_rounds=0\n")`
     is `Ok`), unlike `agent_max_tool_rounds=0`, which errs (`foundation.rs:5196`).
   - Parse accepts up to 32, and clamps a value above 32 to 32 (acceptance
@@ -135,22 +135,22 @@ beside #61 Tasks 1–3 (Global Constraints) or another spec's `chat.rs` task
     one applies (`repository_config_trust.rs:497` pattern).
   - The effective-policy label is "Read-only rounds per turn", and `profile.rs`
     carries it as a capability key like the other `agent_*` Capability keys.
-- [ ] **Step 2: Run them and confirm they fail** (the field does not exist, so
+- [x] **Step 2: Run them and confirm they fail** (the field does not exist, so
       they fail to compile).
-- [ ] **Step 3: Add the field** to `Config` (`agent_max_exploration_rounds: u32`)
+- [x] **Step 3: Add the field** to `Config` (`agent_max_exploration_rounds: u32`)
       and `ConfigOverlay` (`Option<u32>`), the destructure, `Default` (24), the
       key parser, `config_show`, and the overlay serializer.
-- [ ] **Step 4: The apply block and partition.** A `u32` restrict-only apply
+- [x] **Step 4: The apply block and partition.** A `u32` restrict-only apply
       (C3) so a lower value wins and a higher one is rejected; `=> Capability`
       in `classify_overlay_fields!`; the carried capability key in `profile.rs`
       and the label in `effective_policy.rs`.
-- [ ] **Step 5: The parser (C2).** Accept `0..=32`, clamping larger values to
+- [x] **Step 5: The parser (C2).** Accept `0..=32`, clamping larger values to
       32. Reuse the existing "refuse a nonsense value" reasoning but not
       `parse_round_count`, which rejects 0 and >16.
-- [ ] **Step 6: Falsify** — classify it as `Preference`, apply it as a Free
+- [x] **Step 6: Falsify** — classify it as `Preference`, apply it as a Free
       preference instead of restrict-only, refuse 0 at parse, and leave the
       clamp off. Confirm a named test fails for each, and revert.
-- [ ] **Step 7: Scoped checks.** `cargo nextest run -p workspace-engine --test
+- [x] **Step 7: Scoped checks.** `cargo nextest run -p workspace-engine --test
       permission_profiles --test repository_config_trust --test foundation`,
       scoped clippy for `workspace-engine`, and the fast checks.
 
