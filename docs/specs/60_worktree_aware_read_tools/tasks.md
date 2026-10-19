@@ -14,7 +14,7 @@
 | 3 · `worktree` on the five read tools | Done 2026-10-18 | Details in the note below the table. |
 | 4 · `list_worktrees` and `read_git_log` | Done 2026-10-18 | Details in the note below the table. |
 | 5 · `worktree_survey` eval scenario | Done 2026-10-18 | Details in the note below the table. |
-| 6 · Docs, live re-run and close-out | Not started | |
+| 6 · Docs, live re-run and close-out | In progress 2026-10-19 | Docs and cross-references done; live re-run, CI and the Done close-out remain. Details in the note below the table. |
 
 **Task 1 (Done 2026-10-17).** New module `worktree_access.rs`:
 `parse_worktree_list` reads `git worktree list --porcelain -z` (NUL-terminated
@@ -284,6 +284,48 @@ over the 6 real calls.
 `eval-harness` and `workspace-engine` is clean; `cargo nextest run -p
 eval-harness --locked` passes; `cargo run -p eval-harness -- run --tier
 deterministic` passes. Workspace clippy and tests are left to CI.
+
+**Task 6 (in progress, 2026-10-19).** Steps 2 (docs) and 3 (cross-references)
+are done; Steps 1 (live re-run), 4 (Done close-out) and 5's CI record remain.
+`docs/USER_GUIDE.md` now says what the agent can read without asking, including
+registered worktrees, `list_worktrees` and `read_git_log`, and that a worktree
+read applies the session's own policy. `docs/TROUBLESHOOTING.md` documents a
+refused `worktree` argument and all seven reasons the resolver produces
+(`does not exist`, `is not a registered worktree of this repository`, the
+session's own checkout, `bare`, `prunable`, `does not exist on disk`, and
+``outside the repository root and no `allowed_roots` entry contains it``).
+`SECURITY.md` documents the git read hardening (§5.4): restricted-path
+exclusion, output bounds with the cut reported, no `core.fsmonitor`/ext-diff/
+textconv, no `index.lock` (`--no-optional-locks`,
+`diff.autoRefreshIndex=false`), and `base`/`paths` validated and passed after
+`--end-of-options`/`--`. `docs/specs/52_mcp_server_mode.md` records that the
+read tools now take `worktree` and that #52 must decide whether its server
+exposes it (recorded, not decided). #64's dependency on #60 was already correct
+— it says the read tools are merged and requirement 5 shipped — and needed no
+change.
+
+**The eval baseline was not regenerated.** `cargo run -p eval-harness -- run
+--tier deterministic --format json` produces a report whose diff against
+`evals/baseline.json` is far wider than the new scenario, so per the task
+instruction I stopped rather than commit a regenerated baseline. The extra churn
+is not worktree_survey's: every existing scenario's `tokens.input` grows
+(~+1.5k to +12k) because the prompt now carries the new tool definitions and
+the revised command text; every record gains the `findingsByPurpose` field and
+`failed_validation_retry` gains the `exploration_findings` assertion (both spec
+63); `preserve_user_modified`'s `apply_patch` ref is a fresh per-run id; and all
+durations are re-measured (the machine was ~30x slower during this run, moving
+latency median 44→1373 ms). A minimal `worktree_survey`-only edit would mix two
+prompt versions' token counts and two record schemas. `evals/baseline.json` is
+left unchanged; regenerating it cleanly is follow-up for the final close-out.
+
+**Checks (local, 2026-10-19):** `cargo fmt --all`; `scripts/quality-gate.sh fmt
+node lint typos deny` (all pass); `npm run --silent specs:check` (65 specs,
+dependency lines agree); `cargo run -p eval-harness -- run --tier deterministic`
+(17 scenarios, exit 0). Workspace clippy and tests are left to CI.
+
+**Still to do:** the live re-run (Step 1), a green CI run recorded here (Step
+5), then the Done close-out (Step 4) — status flips, `Depends on:` search,
+What-to-build-next, and the CHANGELOG change.
 
 ## Global Constraints
 
@@ -579,9 +621,9 @@ runner only if it cannot yet create linked worktrees or a symlink in a fixture.
 - [ ] **Step 1: Live re-run** of the motivating prompt against
       `deepseek-v4-flash` on this repository. Record approvals made and why in
       proposal §6/§7.
-- [ ] **Step 2: Docs** (§5.8): `USER_GUIDE.md`, `TROUBLESHOOTING.md` (the
+- [x] **Step 2: Docs** (§5.8): `USER_GUIDE.md`, `TROUBLESHOOTING.md` (the
       refusal reasons from Task 1), `SECURITY.md` (§5.4).
-- [ ] **Step 3: Cross-references.** #52 records whether its server exposes
+- [x] **Step 3: Cross-references.** #52 records whether its server exposes
       `worktree`; #64's requirement 5 dependency on #60 is updated.
 - [ ] **Step 4: Close the spec** per AGENTS.md "When a spec becomes Done":
       status in the proposal, README row and this file; `Depends on:` search;
