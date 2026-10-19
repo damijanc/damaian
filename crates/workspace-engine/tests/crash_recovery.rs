@@ -649,6 +649,150 @@ fn a_task_awaiting_approval_with_no_recorded_link_fails() {
     }
 }
 
+/// A task paused for a round-budget stop, with — unless `paused_turn_survives`
+/// is false — the paused turn on disk where `PendingCommandStore` writes it.
+/// The file is written by hand as loose JSON because `PendingChatTurn` is
+/// private: `PausedTurns` reads it as loose JSON, so the field names are the
+/// contract (spec 61 §5.5).
+fn task_awaiting_round_budget(
+    fixture: &Fixture,
+    proposal_id: &str,
+    rounds_used: u32,
+    rounds_granted: u32,
+    paused_turn_survives: bool,
+) -> Task {
+    let task = fixture
+        .store
+        .create_task(&fixture.session_id, "look at the source", "mock", "m")
+        .unwrap();
+    if paused_turn_survives {
+        let pending = fixture.data_dir.join("chat").join("pending");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(
+            pending.join(format!("{proposal_id}.json")),
+            format!(
+                r#"{{"proposal_id":"{proposal_id}","round_budget":{{"rounds_used":{rounds_used},"rounds_granted":{rounds_granted}}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+    fixture
+        .store
+        .await_approval(
+            &task,
+            &workspace_engine::PendingApprovalRef {
+                kind: "round_budget".to_string(),
+                proposal_id: proposal_id.to_string(),
+            },
+        )
+        .unwrap();
+    task
+}
+
+/// §5.5 / requirement 6: a turn paused at its round budget survives a restart
+/// with the rounds it had used and been granted, so the same pause can still be
+/// continued or answered.
+#[test]
+fn a_paused_round_budget_reattaches_after_a_restart() {
+    let fixture = fixture("round-budget-reattach");
+    let task = task_awaiting_round_budget(&fixture, "rb_1", 8, 16, true);
+
+    let reattached = reattach(&fixture);
+
+    match &reattached[0] {
+        workspace_engine::ReattachedApproval::RoundBudget {
+            task_id,
+            proposal_id,
+            rounds_used,
+            rounds_granted,
+        } => {
+            assert_eq!(task_id, &task.id);
+            assert_eq!(proposal_id, "rb_1");
+            assert_eq!(*rounds_used, 8);
+            assert_eq!(*rounds_granted, 16);
+        }
+        other => panic!("a round-budget pause should be reattached, got {other:?}"),
+    }
+    // Still the user's to answer; failing it would be the dead-card bug.
+    assert_eq!(
+        fixture
+            .store
+            .read_task_statuses(&fixture.session_id)
+            .unwrap()
+            .get(&task.id)
+            .map(String::as_str),
+        Some("waiting_for_approval")
+    );
+}
+
+/// The half that keeps §5.5's rule: a round-budget pause whose paused turn is
+/// gone cannot be resumed, so presenting it would give the user buttons that
+/// have nothing to continue. That fails the task, with the reason said out loud.
+#[test]
+fn a_missing_round_budget_file_fails_the_task() {
+    let fixture = fixture("round-budget-orphan");
+    let task = task_awaiting_round_budget(&fixture, "rb_2", 8, 0, false);
+
+    let reattached = reattach(&fixture);
+
+    match &reattached[0] {
+        workspace_engine::ReattachedApproval::Unavailable { task_id, reason } => {
+            assert_eq!(task_id, &task.id);
+            assert!(
+                reason.contains("round-budget"),
+                "the reason must name the kind, got: {reason}"
+            );
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+    assert_eq!(
+        fixture
+            .store
+            .read_task_statuses(&fixture.session_id)
+            .unwrap()
+            .get(&task.id)
+            .map(String::as_str),
+        Some("failed"),
+        "the task must be failed, not left waiting on something that is gone"
+    );
+    assert!(audit_log_text(&fixture).contains("pending_approval_unavailable"));
+}
+
+/// The `round_budget` arm must not swallow a kind it does not recognise: the
+/// `Some(PendingApprovalRef { kind, .. })` fallback still fails unknown kinds
+/// rather than guessing what they were.
+#[test]
+fn an_unknown_round_budget_kind_is_not_reattached() {
+    let fixture = fixture("unknown-kind");
+    let task = fixture
+        .store
+        .create_task(&fixture.session_id, "do the thing", "mock", "m")
+        .unwrap();
+    fixture
+        .store
+        .await_approval(
+            &task,
+            &workspace_engine::PendingApprovalRef {
+                kind: "something_else".to_string(),
+                proposal_id: "whatever".to_string(),
+            },
+        )
+        .unwrap();
+
+    let reattached = reattach(&fixture);
+
+    match &reattached[0] {
+        workspace_engine::ReattachedApproval::Unavailable { task_id, reason } => {
+            assert_eq!(task_id, &task.id);
+            assert!(
+                reason.contains("unknown pending approval kind"),
+                "got: {reason}"
+            );
+        }
+        other => panic!("an unknown kind must not be reattached, got {other:?}"),
+    }
+}
+
 fn classify_one(fixture: &Fixture) -> workspace_engine::RecoveredTask {
     classify_session(&fixture.store, &fixture.audit, &fixture.session_id)
         .unwrap()

@@ -295,6 +295,16 @@ pub enum ReattachedApproval {
         proposal_id: String,
         fallback_provider: String,
     },
+    /// A round-budget pause the turn had reached before its forced final call
+    /// (spec 61). Like a provider-fallback offer its paused turn is on disk, so
+    /// the pause is re-presented rather than lost; a paused turn that is gone
+    /// fails the task instead, because resuming would have nothing to continue.
+    RoundBudget {
+        task_id: String,
+        proposal_id: String,
+        rounds_used: u32,
+        rounds_granted: u32,
+    },
     /// The link or the proposal file is gone, so the task was failed.
     ///
     /// §5.5: never an approval card reconstructed from partial data. The user
@@ -360,6 +370,17 @@ pub fn reattach_pending_approvals(
                 })
                 .ok_or_else(|| {
                     format!("the paused turn behind fallback offer {proposal_id} is gone")
+                }),
+            Some(PendingApprovalRef { kind, proposal_id }) if kind == "round_budget" => paused
+                .round_budget_pause(proposal_id)
+                .map(|pause| ReattachedApproval::RoundBudget {
+                    task_id: task_id.clone(),
+                    proposal_id: proposal_id.clone(),
+                    rounds_used: pause.rounds_used,
+                    rounds_granted: pause.rounds_granted,
+                })
+                .ok_or_else(|| {
+                    format!("the paused turn behind round-budget pause {proposal_id} is gone")
                 }),
             Some(PendingApprovalRef { kind, .. }) => {
                 Err(format!("unknown pending approval kind {kind}"))

@@ -5,15 +5,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    ApprovalCause, AuditLog, CancelToken, ChatTurnOptions, ChatTurnResult, ClientError,
-    CommandPolicy, CommandRisk, Config, ConfigOverlay, ConfigScope, DEFAULT_CONTEXT_TOKEN_BUDGET,
-    IndexCache, McpClient, McpServerConfig, McpTransport, MockModelAdapter, MockModelTransport,
-    ModelAdapter, ModelMessage, ModelProviderConfig, ModelRequest, ModelTransport,
-    OpenAICompatibleAdapter, PatchEngine, PatchStore, PathPolicy, PhaseKind, ProjectIndexer,
-    ProposedChange, Result, ResumeDecisionOptions, SecretScanner, SessionStore, TaskStatus,
-    TokenUsage, ToolCall, TurnProgress, TurnSink, UsageSource, WebDiagnosticCall,
-    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
-    extract_model_tokens, model_request_json, parse_generated_edit,
+    ApprovalCause, AuditLog, CancelToken, ChatTurnResult, ClientError, CommandPolicy, CommandRisk,
+    Config, ConfigOverlay, ConfigScope, DEFAULT_CONTEXT_TOKEN_BUDGET, IndexCache, McpClient,
+    McpServerConfig, McpTransport, MockModelAdapter, MockModelTransport, ModelAdapter,
+    ModelMessage, ModelProviderConfig, ModelRequest, ModelTransport, OpenAICompatibleAdapter,
+    PatchEngine, PatchStore, PathPolicy, PhaseKind, ProjectIndexer, ProposedChange, Result,
+    ResumeDecisionOptions, SecretScanner, SessionStore, TaskStatus, TokenUsage, ToolCall,
+    TurnProgress, TurnSink, UsageSource, WebDiagnosticCall, WebDiagnosticReport,
+    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, extract_model_tokens,
+    model_request_json, parse_generated_edit,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -3386,8 +3386,11 @@ fn repeated_failed_browser_diagnostics_are_stopped() {
 }
 
 #[test]
-fn tool_round_exhaustion_is_terminal_when_model_still_requests_tools() {
-    let repo = temp_dir("chat-tool-budget-exhausted");
+fn tool_round_exhaustion_pauses_when_model_still_requests_tools() {
+    // Spec 61: at the round cap with no token ceiling, the turn pauses as a
+    // `round_budget` approval before the forced final call, instead of ending
+    // `ToolBudgetExhausted`. The forced call is made only on *Answer now*.
+    let repo = temp_dir("chat-tool-budget-paused");
     write_fixture(&repo, "README.md", "# Tool budget\n");
     let mut config = test_config(&repo);
     config.agent_max_tool_rounds = 1;
@@ -3415,9 +3418,13 @@ fn tool_round_exhaustion_is_terminal_when_model_still_requests_tools() {
         .ask(&repo, "Check status.", &[], &mut adapter, &mut on_token)
         .unwrap();
 
-    assert_eq!(result.task.status, TaskStatus::ToolBudgetExhausted);
-    assert!(result.response.contains("tool round limit"));
-    assert!(adapter.requests[1].tools.is_none());
+    assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+    assert!(result.round_budget_proposal.is_some());
+    assert_eq!(
+        adapter.requests.len(),
+        1,
+        "no forced final call before the choice"
+    );
 
     fs::remove_dir_all(repo).unwrap();
 }
@@ -3447,54 +3454,6 @@ fn web_debug_prompts_use_the_web_round_limit() {
         })
         .expect("a model phase");
     assert_eq!(first_model_phase.max_rounds, 12);
-
-    fs::remove_dir_all(repo).unwrap();
-}
-
-#[test]
-fn continue_debugging_turns_use_the_absolute_round_cap() {
-    let repo = temp_dir("chat-continue-debugging-limit");
-    write_fixture(&repo, "README.md", "# Continue debug\n");
-    let mut config = test_config(&repo);
-    config.agent_max_tool_rounds = 8;
-    config.agent_web_debug_max_tool_rounds = 12;
-    let engine = WorkspaceEngine::new(config);
-    let mut adapter = MockModelAdapter::new("Continuing.");
-    let cancel = CancelToken::new();
-    let mut progress = Vec::new();
-    let mut on_token = |_token: &str| {};
-    let mut on_progress = |event: TurnProgress| progress.push(event);
-    let mut sink = TurnSink {
-        on_token: &mut on_token,
-        on_progress: &mut on_progress,
-        cancel: &cancel,
-        steering: None,
-    };
-
-    engine
-        .chat_orchestrator
-        .ask_with_session_with_options(
-            &repo,
-            "Continue debugging.",
-            &[],
-            None,
-            &mut adapter,
-            &mut sink,
-            ChatTurnOptions {
-                continue_debugging: true,
-                ..ChatTurnOptions::default()
-            },
-        )
-        .unwrap();
-
-    let first_model_phase = progress
-        .iter()
-        .find_map(|event| match event {
-            TurnProgress::Phase(phase) if phase.kind == PhaseKind::Model => Some(phase),
-            _ => None,
-        })
-        .expect("a model phase");
-    assert_eq!(first_model_phase.max_rounds, 16);
 
     fs::remove_dir_all(repo).unwrap();
 }

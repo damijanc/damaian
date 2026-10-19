@@ -626,16 +626,20 @@ fn a_turn_continues_past_its_round_cap_under_the_ceiling() {
 }
 
 /// The complement: with no ceiling there is no bound to continue under, so the
-/// fixed round cap still stops the turn exactly as before, and nothing is
-/// recorded as a continuation.
+/// round cap now pauses the turn as a `round_budget` approval (spec 61) instead
+/// of stopping it dead, and nothing is recorded as a continuation.
 #[test]
-fn without_a_ceiling_the_round_cap_still_stops_the_turn() {
+fn without_a_ceiling_the_round_cap_pauses_the_turn() {
     let repo = temp_repo("no-continue");
     let engine = engine_with_ceiling_and_rounds(&repo, None, 2);
     let (result, calls) = ask(&engine, &repo, "Look at the source", &mut keeps_working());
 
-    assert_eq!(result.task.status, TaskStatus::ToolBudgetExhausted);
-    assert_eq!(calls, 3, "rounds 0 and 1, then the forced-final round");
+    assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+    assert_eq!(
+        calls, 2,
+        "rounds 0 and 1, then the pause before the forced-final round"
+    );
+    assert!(result.round_budget_proposal.is_some());
     assert!(
         !audit_events(&repo).contains("turn_continued"),
         "no ceiling means no continuation to record"

@@ -242,7 +242,8 @@ pub enum ExportFormat {
 /// link back to the task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingApprovalRef {
-    /// `"command"`, `"patch"`, `"plan"` or `"provider_fallback"`.
+    /// `"command"`, `"patch"`, `"plan"`, `"provider_fallback"` or
+    /// `"round_budget"`.
     pub kind: String,
     pub proposal_id: String,
 }

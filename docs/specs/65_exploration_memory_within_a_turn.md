@@ -21,7 +21,7 @@ prerequisite.
 Related implementation specs:
 [`55_conversation_compaction.md`](55_conversation_compaction.md) (keeps the
 objective **across** turns; this spec is the in-turn counterpart),
-[`61_continue_the_stopped_turn.md`](61_continue_the_stopped_turn.md) (a paused
+[`61_continue_the_stopped_turn/`](61_continue_the_stopped_turn/proposal.md) (a paused
 turn keeps its state, which now includes its notes),
 [`49_prompt_cache_accounting_and_reuse`](49_prompt_cache_accounting_and_reuse/proposal.md)
 (prefix stability; §5.4 here changes where the in-turn cut lands),

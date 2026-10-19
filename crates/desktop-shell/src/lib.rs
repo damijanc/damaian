@@ -9,19 +9,19 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use workspace_engine::finding::{FindingStatus, RepairRequest};
 use workspace_engine::{
-    AgentFallbackProposal, AgentPlanProposal, CURRENT_DATA_SCHEMA_VERSION, CancelToken,
-    ChatMessage, ChatTurnOptions, ChatTurnResult, Config, CostEstimate, CurlModelTransport,
-    DataSchemaOutcome, EffectivePolicy, ExportFormat, GeneratedSecretWarning, McpClient,
-    McpServerConfig, McpTokenResolver, McpTransport, ModelAdapter, ModelRequest, ModelRun,
-    OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId,
-    ProposedFilePatch, ResumeDecisionOptions, SearchOptions, Session, SessionMode, StepStatus,
-    TaskPlan, TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall,
-    WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
-    WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible, command_approval_prompt,
-    custom_profile_ids, ensure_data_dir_schema, export_profile, import_profile,
-    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
-    parse_hunk_selection, parse_mcp_transport, patch_diff_text, profile_import_base,
-    review_profile_import, review_profile_rejections, select_profile,
+    AgentFallbackProposal, AgentPlanProposal, AgentRoundBudgetProposal,
+    CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult, Config,
+    CostEstimate, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExportFormat,
+    GeneratedSecretWarning, McpClient, McpServerConfig, McpTokenResolver, McpTransport,
+    ModelAdapter, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep,
+    ProcessRegistry, ProfileId, ProposedFilePatch, ResumeDecisionOptions, RoundBudgetDecision,
+    SearchOptions, Session, SessionMode, StepStatus, TaskPlan, TaskUsage, TokenUsage, TurnPhase,
+    TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
+    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
+    allow_always_eligible, command_approval_prompt, custom_profile_ids, ensure_data_dir_schema,
+    export_profile, import_profile, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    profile_import_base, review_profile_import, review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -344,6 +344,9 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/resume-command-stream") => handle_resume_command_stream(stream, &request),
         ("POST", "/api/resume-plan-stream") => handle_resume_plan_stream(stream, &request),
         ("POST", "/api/resume-fallback-stream") => handle_resume_fallback_stream(stream, &request),
+        ("POST", "/api/resume-round-budget-stream") => {
+            handle_resume_round_budget_stream(stream, &request)
+        }
         ("POST", "/api/ask") => handle_ask(stream, &request),
         ("POST", "/api/propose-edit") => handle_propose_edit(stream, &request),
         ("POST", "/api/apply-patch") => handle_apply_patch(stream, &request),
@@ -1576,6 +1579,17 @@ fn handle_resume_fallback_stream(stream: &mut TcpStream, request: &Request) -> R
     })
 }
 
+fn handle_resume_round_budget_stream(
+    stream: &mut TcpStream,
+    request: &Request,
+) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    write_event_stream_headers(stream, request)?;
+    stream_turn(stream, move |cancel, events| {
+        run_resume_round_budget_request(&form, cancel, events)
+    })
+}
+
 /// Encode raw pty bytes for transport across the IPC boundary as UTF-8-safe
 /// text. Shared with the desktop app's terminal commands.
 pub fn base64_encode(input: &[u8]) -> String {
@@ -1811,6 +1825,73 @@ fn resume_fallback_decision(
         .map_err(|error| error.to_string())
 }
 
+/// Continues a turn paused at its round budget (spec 61 §5.6). Unlike the
+/// fallback there is no provider switch: the decision is only *Continue* or
+/// *Answer now*, and the engine is the repository's configured one.
+fn run_resume_round_budget_request(
+    form: &HashMap<String, String>,
+    cancel: &CancelToken,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
+) -> Result<ChatTurnResult, String> {
+    let repo = required_form(form, "repo")?;
+    resume_round_budget_decision(
+        form,
+        cancel,
+        events,
+        &|| {
+            let engine = chat_engine(config_for_repo(&repo)?);
+            Ok(engine)
+        },
+        &mut |config| {
+            chat_model_adapter(config, || resolve_model_api_key(&config.model_api_key_env))
+        },
+    )
+}
+
+/// The decision itself, with how the engine and adapter are built passed in so
+/// a test can resume a paused turn without touching the user's config or
+/// Keychain.
+fn resume_round_budget_decision(
+    form: &HashMap<String, String>,
+    cancel: &CancelToken,
+    events: &std::sync::mpsc::Sender<TurnEvent>,
+    engine_for: &dyn Fn() -> Result<WorkspaceEngine, String>,
+    adapter_for: &mut AdapterFor<'_>,
+) -> Result<ChatTurnResult, String> {
+    let proposal_id = required_form(form, "proposal_id")?;
+    let decision = match form.get("decision").map(String::as_str) {
+        Some("continue") => RoundBudgetDecision::Continue,
+        Some("answer_now") => RoundBudgetDecision::AnswerNow,
+        _ => return Err("decision must be \"continue\" or \"answer_now\"".to_string()),
+    };
+    let engine = engine_for()?;
+    let mut adapter = adapter_for(&engine.config)?;
+    let mut on_token = |token: &str| {
+        let _ = events.send(TurnEvent::Token(token.to_string()));
+    };
+    let mut on_progress = |progress: TurnProgress| {
+        if let Some(event) = turn_progress_event(progress) {
+            let _ = events.send(event);
+        }
+    };
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .resume_round_budget(
+            &proposal_id,
+            decision,
+            "desktop_user",
+            adapter.as_mut(),
+            &mut sink,
+        )
+        .map_err(|error| error.to_string())
+}
+
 /// The adapter handed to a declined fallback offer. The engine fails the task
 /// before any model call, so reaching this is a bug, and it says so rather
 /// than answering.
@@ -1886,12 +1967,31 @@ fn run_chat_request_with(
     adapter_for: &mut AdapterFor<'_>,
 ) -> Result<ChatTurnResult, String> {
     let repo = required_form(form, "repo")?;
-    let prompt = required_form(form, "prompt")?;
     let session_id = form
         .get("session_id")
         .map(String::as_str)
         .filter(|value| !value.is_empty());
     let engine = chat_engine(config_for_repo_with_model_options(&repo, form)?);
+    // The *Ask again* prompt is built by the engine from the stopped task's own
+    // request (spec 61 §5.7), not by the client: the original request may have
+    // scrolled out of what the client can see, and only `task.user_prompt` still
+    // holds it verbatim.
+    let prompt = match form
+        .get("ask_again_task_id")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        Some(task_id) => {
+            let session = session_id.ok_or_else(|| {
+                "ask_again_task_id requires the session the stopped task belongs to".to_string()
+            })?;
+            engine
+                .chat_orchestrator
+                .tool_budget_ask_again_prompt(session, task_id)
+                .map_err(|error| error.to_string())?
+        }
+        None => required_form(form, "prompt")?,
+    };
     let context_files = form
         .get("context_files")
         .map(|value| validate_context_files(&engine, &repo, value))
@@ -1914,7 +2014,6 @@ fn run_chat_request_with(
         steering: None,
     };
     let turn_options = ChatTurnOptions {
-        continue_debugging: form.get("continue_debugging").map(String::as_str) == Some("true"),
         // Not yet: nothing can deliver an answer until spec 50's answer route
         // exists, so offering `ask_user` here would only ever refuse it. Spec
         // 50 Task 6 sets this to `true`.
@@ -3628,6 +3727,23 @@ fn fallback_proposal_json(proposal: Option<&AgentFallbackProposal>) -> String {
     )
 }
 
+/// Spec 61's round-budget pause: the rounds used and granted, and whether the
+/// turn is at the hard cap (so the shell can offer only *Answer now*).
+fn round_budget_proposal_json(proposal: Option<&AgentRoundBudgetProposal>) -> String {
+    let Some(proposal) = proposal else {
+        return "null".to_string();
+    };
+    format!(
+        "{{\"proposalId\":\"{}\",\"roundsUsed\":{},\"roundsTotal\":{},\"roundsGranted\":{},\"roundsMore\":{},\"atHardCap\":{}}}",
+        escape_json(&proposal.id),
+        proposal.rounds_used,
+        proposal.rounds_total,
+        proposal.rounds_granted,
+        proposal.rounds_more,
+        proposal.at_hard_cap,
+    )
+}
+
 /// Forwards a turn's events to the client as SSE, and stops the turn if the
 /// client goes away.
 ///
@@ -3731,7 +3847,7 @@ where
 
 fn chat_result_json(result: &ChatTurnResult) -> String {
     format!(
-        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"usage\":{}}}",
+        "{{\"response\":\"{}\",\"contextFiles\":[{}],\"sessionId\":\"{}\",\"taskId\":\"{}\",\"taskStatus\":\"{}\",\"modelRunId\":\"{}\",\"incomplete\":{},\"cancelled\":{},\"commandProposal\":{},\"patchProposal\":{},\"planProposal\":{},\"fallbackProposal\":{},\"roundBudgetProposal\":{},\"usage\":{}}}",
         escape_json(&result.response),
         json_string_array(&result.context_files),
         escape_json(&result.session.id),
@@ -3744,6 +3860,7 @@ fn chat_result_json(result: &ChatTurnResult) -> String {
         patch_proposal_json(result),
         plan_proposal_json(result.plan_proposal.as_ref()),
         fallback_proposal_json(result.fallback_proposal.as_ref()),
+        round_budget_proposal_json(result.round_budget_proposal.as_ref()),
         task_usage_json(result.usage.as_ref(), result.estimated_cost)
     )
 }
@@ -8477,6 +8594,14 @@ mod tests {
         const PWD: &str = r#"{"command":"pwd","reason":"See where the turn runs"}"#;
         const TOUCH: &str = r#"{"command":"touch approved.txt","reason":"Mark the tree"}"#;
 
+        /// A read-only command envelope the policy runs automatically, so a
+        /// turn of it walks the round budget without pausing for a command
+        /// approval (spec 61).
+        fn read_only_round() -> String {
+            "DAMAIAN_COMMAND_V1\nCOMMAND: pwd\nREASON: Confirm the working directory.\nEND_COMMAND\n"
+                .to_string()
+        }
+
         /// The worker builds an adapter per job; sharing one script across
         /// them lets a turn and its resume read one sequence, as one turn.
         #[derive(Clone)]
@@ -8959,6 +9084,49 @@ mod tests {
                 false,
                 "a decision resumes once"
             );
+        }
+
+        /// Spec 61 §5.5: a turn paused at its round budget is answered in the
+        /// worker's own process through `resume_round_budget`, never by the
+        /// shell reading the pending file. `approve` means *Continue*, so the
+        /// turn re-enters with more rounds and completes as the same task.
+        #[test]
+        fn a_worker_answers_a_round_budget_pause_in_process() {
+            let repo = fixture("rb");
+            // Eight read-only rounds hit the default eight-round budget; the
+            // ninth response answers after *Continue* re-enters the turn.
+            let responses: Vec<String> = (0..8)
+                .map(|_| read_only_round())
+                .chain(std::iter::once("Done looking.".to_string()))
+                .collect();
+            let script = Scripted::new(MockModelAdapter::new_sequence(responses));
+            let (host, session) = hosted(&repo, script);
+
+            assert_eq!(send(&host, message("Look at the files."))["ok"], true);
+            let waiting = settle(&host);
+            assert_eq!(waiting["state"], "waiting_for_approval", "{waiting}");
+            let proposal_id = waiting["proposalId"].as_str().unwrap().to_string();
+
+            let approvals = payloads(&progress(&session), "approval");
+            assert_eq!(approvals.len(), 1, "{approvals:?}");
+            assert_eq!(approvals[0]["kind"], "round_budget");
+            assert_eq!(approvals[0]["proposal"]["proposalId"], proposal_id.as_str());
+
+            assert_eq!(
+                send(&host, ControlCommand::Approve { proposal_id })["ok"],
+                true
+            );
+            let done = settle(&host);
+            assert_eq!(done["state"], "idle", "{done}");
+            assert_eq!(
+                done["pid"],
+                std::process::id(),
+                "the same process resumed it"
+            );
+
+            let tasks = store().read_tasks(&session).unwrap();
+            assert_eq!(tasks.len(), 1, "one turn, resumed, not a second one");
+            assert_eq!(tasks[0].status, TaskStatus::Complete);
         }
 
         /// §5.6: a patch ends the turn; the worker stays alive and idle, and
@@ -10717,5 +10885,116 @@ mod provider_fallback_tests {
             "C1: the key and the request belong to the fallback"
         );
         assert_eq!(task_status(&repo, &offer), "complete");
+    }
+}
+
+/// The shell half of spec 61's round-budget pause: the route that resumes it.
+#[cfg(test)]
+mod round_budget_tests {
+    use super::{TurnEvent, resume_round_budget_decision};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use workspace_engine::{
+        CancelToken, ChatTurnResult, Config, MockModelAdapter, ModelAdapter, TaskStatus,
+        TurnProgress, TurnSink, WorkspaceEngine,
+    };
+
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_repo() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "damaian-shell-roundbudget-{}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/a.rs"), "fn main() {}\n").unwrap();
+        dir
+    }
+
+    fn config(repo: &Path) -> Config {
+        Config {
+            data_dir: repo.join(".damaian"),
+            agent_max_tool_rounds: 8,
+            enable_index_watcher: false,
+            ..Config::default()
+        }
+    }
+
+    fn read_only_round() -> String {
+        "DAMAIAN_COMMAND_V1\nCOMMAND: ls src\nREASON: Look again.\nEND_COMMAND\n".to_string()
+    }
+
+    fn form(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// A turn that hit its round budget and paused for the user.
+    fn paused_turn(repo: &Path) -> ChatTurnResult {
+        let engine = WorkspaceEngine::new(config(repo));
+        let cancel = CancelToken::new();
+        let mut on_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        let result = engine
+            .chat_orchestrator
+            .ask_with_session(
+                repo,
+                "Look at the source",
+                &[],
+                None,
+                &mut MockModelAdapter::new_sequence((0..8).map(|_| read_only_round()).collect()),
+                &mut sink,
+            )
+            .expect("the turn pauses");
+        assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+        result
+    }
+
+    #[test]
+    fn the_round_budget_route_resumes_the_pause() {
+        let repo = temp_repo();
+        let paused = paused_turn(&repo);
+        let proposal_id = paused
+            .round_budget_proposal
+            .as_ref()
+            .expect("the pause surfaces a proposal")
+            .id
+            .clone();
+
+        let (events, _receiver) = std::sync::mpsc::channel::<TurnEvent>();
+        let mut adapters = 0;
+        let result = resume_round_budget_decision(
+            &form(&[("proposal_id", &proposal_id), ("decision", "continue")]),
+            &CancelToken::new(),
+            &events,
+            &|| Ok(WorkspaceEngine::new(config(&repo))),
+            &mut |_config| {
+                adapters += 1;
+                Ok(Box::new(MockModelAdapter::new("Done.")) as Box<dyn ModelAdapter>)
+            },
+        );
+
+        let resumed = result.expect("the decision resumes the pause");
+        assert_eq!(
+            resumed.task.id, paused.task.id,
+            "resuming continues the same task, never a new one"
+        );
+        assert_eq!(resumed.task.status, TaskStatus::Complete);
+        assert_eq!(adapters, 1, "one adapter for the resumed turn");
     }
 }

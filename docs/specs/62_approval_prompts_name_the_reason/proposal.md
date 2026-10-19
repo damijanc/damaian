@@ -3,7 +3,7 @@
 Status: In progress. Tasks 1 (`ApprovalCause` and structured causes) and 2
 (`Setting` and profile-block causes) landed 2026-10-18. Specified on 2026-10-17
 from the session behind
-[#59](../59_exploration_round_allowance/proposal.md)–[#61](../61_continue_the_stopped_turn.md),
+[#59](../59_exploration_round_allowance/proposal.md)–[#61](../61_continue_the_stopped_turn/proposal.md),
 in which the user answered 40 approval prompts that all gave the same reason,
 "because it cannot run in sandbox mode", and none gave the real one.
 Order: 62 of 62
