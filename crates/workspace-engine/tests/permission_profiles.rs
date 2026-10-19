@@ -1464,12 +1464,16 @@ fn each_command_access_level_blocks_exactly_its_row() {
                 "{command} (allowlisted: {allowlisted}) under command_access={}",
                 access.as_str()
             );
-            let reason = format!(
-                "Blocked by permission profile: command_access={}",
-                access.as_str()
+            let cause = ApprovalCause::ProfileBlocked { access: *access };
+            assert_eq!(
+                classification.causes.contains(&cause),
+                *blocked,
+                "{command} under {}: {:?}",
+                access.as_str(),
+                classification.causes
             );
             assert_eq!(
-                classification.reasons.contains(&reason),
+                classification.reasons.contains(&cause.plain_words()),
                 *blocked,
                 "{command} under {}: {:?}",
                 access.as_str(),
@@ -1477,6 +1481,162 @@ fn each_command_access_level_blocks_exactly_its_row() {
             );
         }
     }
+}
+
+// Spec 62 Task 2: a `require_approval_for_*` setting that raises approval is
+// a `Setting` cause naming the key and where it came from; a `command_access`
+// block is a `ProfileBlocked` cause, not a free-text reason.
+
+#[test]
+fn require_approval_for_all_commands_names_the_setting_and_its_source() {
+    // Set by the user.
+    let user = profile_fixture("all-commands-user");
+    user.write_user("require_approval_for_all_commands=true\n");
+    let (config, report) = user.load();
+    let classification =
+        CommandPolicy::new_with_report(config, &report).classify("git status", &user.root);
+    let expected = ApprovalCause::Setting {
+        key: "require_approval_for_all_commands".to_string(),
+        source: Some("user".to_string()),
+    };
+    assert!(classification.requires_approval);
+    assert_eq!(classification.causes, vec![expected.clone()]);
+    assert_eq!(classification.reasons, vec![expected.plain_words()]);
+    assert!(classification.reasons[0].contains("Ask before every command"));
+    user.cleanup();
+
+    // Set by the repository.
+    let repository = profile_fixture("all-commands-repository");
+    repository.write_repository("require_approval_for_all_commands=true\n");
+    let (config, report) = repository.load();
+    let classification =
+        CommandPolicy::new_with_report(config, &report).classify("git status", &repository.root);
+    assert_eq!(
+        classification.causes,
+        vec![ApprovalCause::Setting {
+            key: "require_approval_for_all_commands".to_string(),
+            source: Some("repository".to_string()),
+        }]
+    );
+    repository.cleanup();
+
+    // Set by a selected profile.
+    let profile = profile_fixture("all-commands-profile");
+    profile.write_user(&profile.select("mine"));
+    profile.write_custom_profile("mine", "require_approval_for_all_commands=true\n");
+    let (config, report) = profile.load();
+    let classification =
+        CommandPolicy::new_with_report(config, &report).classify("git status", &profile.root);
+    assert_eq!(
+        classification.causes,
+        vec![ApprovalCause::Setting {
+            key: "require_approval_for_all_commands".to_string(),
+            source: Some("profile".to_string()),
+        }]
+    );
+    profile.cleanup();
+}
+
+#[test]
+fn require_approval_for_risky_commands_names_the_setting() {
+    let fixture = profile_fixture("risky-user");
+    fixture.write_user("require_approval_for_risky_commands=true\n");
+    let (config, report) = fixture.load();
+    let classification =
+        CommandPolicy::new_with_report(config, &report).classify("cargo test", &fixture.root);
+    assert!(classification.requires_approval);
+    assert_eq!(
+        classification.causes,
+        vec![ApprovalCause::Setting {
+            key: "require_approval_for_risky_commands".to_string(),
+            source: Some("user".to_string()),
+        }]
+    );
+    assert!(
+        classification.reasons[0].contains("Ask before test, build and lint commands"),
+        "{:?}",
+        classification.reasons
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_command_access_block_is_a_profile_blocked_cause() {
+    for (command, allowlisted, expected) in ACCESS_TABLE {
+        for (access, blocked) in ACCESS_LEVELS.iter().zip(expected) {
+            let classification = classify_under(*access, command, *allowlisted);
+            assert_eq!(
+                classification
+                    .causes
+                    .contains(&ApprovalCause::ProfileBlocked { access: *access }),
+                *blocked,
+                "{command} (allowlisted: {allowlisted}) under {}: {:?}",
+                access.as_str(),
+                classification.causes
+            );
+        }
+    }
+}
+
+#[test]
+fn a_low_risk_command_that_needs_approval_only_from_a_setting_names_that_setting_first() {
+    let fixture = profile_fixture("low-risk-setting");
+    fixture.write_user("require_approval_for_all_commands=true\n");
+    let (config, report) = fixture.load();
+    let classification =
+        CommandPolicy::new_with_report(config, &report).classify("ls", &fixture.root);
+    assert_eq!(classification.risk, CommandRisk::Low);
+    assert!(classification.requires_approval);
+    assert_eq!(
+        classification.causes,
+        vec![ApprovalCause::Setting {
+            key: "require_approval_for_all_commands".to_string(),
+            source: Some("user".to_string()),
+        }]
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn a_setting_cause_without_a_report_does_not_name_a_source() {
+    let policy = CommandPolicy::new(Config {
+        require_approval_for_all_commands: true,
+        ..Config::default()
+    });
+    let classification = policy.classify("git status", Path::new("/Users/example/project"));
+    assert_eq!(
+        classification.causes,
+        vec![ApprovalCause::Setting {
+            key: "require_approval_for_all_commands".to_string(),
+            source: None,
+        }]
+    );
+    assert!(classification.reasons[0].contains("Ask before every command"));
+    assert!(
+        !classification.reasons[0].contains("set by"),
+        "the source is unknown, so it must not be attributed: {:?}",
+        classification.reasons
+    );
+}
+
+#[test]
+fn a_setting_cause_with_a_report_and_no_override_names_the_default() {
+    // No config sets `require_approval_for_risky_commands`, so it stays at its
+    // built-in default of `true`; the report is present, so that default is a
+    // real source to name.
+    let fixture = profile_fixture("risky-default");
+    let (config, report) = fixture.load();
+    let classification =
+        CommandPolicy::new_with_report(config, &report).classify("cargo test", &fixture.root);
+    assert_eq!(
+        classification.causes,
+        vec![ApprovalCause::Setting {
+            key: "require_approval_for_risky_commands".to_string(),
+            source: Some("default".to_string()),
+        }]
+    );
+    assert!(classification.reasons[0].contains("set by default"));
+    fixture.cleanup();
 }
 
 /// `read_only` is Plan mode's predicate, approval check included: when every
