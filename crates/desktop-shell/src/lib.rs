@@ -1843,8 +1843,7 @@ fn run_resume_round_budget_request(
             Ok(engine)
         },
         &mut |config| {
-            let api_key = resolve_model_api_key(&config.model_api_key_env)?;
-            chat_model_adapter(config, || Ok(api_key))
+            chat_model_adapter(config, || resolve_model_api_key(&config.model_api_key_env))
         },
     )
 }
