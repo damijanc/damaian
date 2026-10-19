@@ -121,6 +121,15 @@ agent may do.
 | `read_git_status`, `read_git_diff` | Read-only; the diff redacts, and [spec 35](35_commit_preparation.md)'s warning about redacted diffs concerns *committing* from one, which this cannot do |
 | Repository map (Phase 3 WP2), symbol lookup (Phase 3 WP3) | Read-only, derived, when they exist |
 
+Since this was written, [#60](60_worktree_aware_read_tools/proposal.md) added a
+`worktree` argument to `read_file`, `list_directory`, `search_content`,
+`read_git_status` and `read_git_diff`, and two new read-only tools,
+`list_worktrees` and `read_git_log`. Whether a server exposes the `worktree`
+argument and those tools is a decision this spec must make, and it is recorded
+here rather than decided: a `worktree` argument would let a client reach a
+second checkout of the same repository, beyond the checkout the launch-time
+`--repository` fixes (requirement 2).
+
 The set is defined as the intersection of "tools marked read-only" and "tools the
 active profile permits" — computed, not listed, so a tool added later is
 excluded until someone marks it read-only, rather than included until someone

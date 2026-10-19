@@ -169,6 +169,27 @@ the same terms as a whole-file `propose_patch`. A large file read is reported as
 a range with the file's real line count ("lines 1–400 of 4420"), so a truncated
 result says so rather than reading as the whole file.
 
+The agent can also read the repository's git worktrees without asking.
+`list_worktrees` lists every worktree git has registered for the repository —
+each one's path, branch (or `detached`), short `HEAD`, count of changed files,
+and how far it is ahead of and behind the main branch — and `read_git_log` reads
+the commits a worktree's branch has that a base branch does not, as one-line
+summaries. The five read tools (`read_file`, `list_directory`, `search_content`,
+`read_git_status` and `read_git_diff`) each take an optional `worktree`
+argument: pass a path `list_worktrees` returned, and the tool reads that
+worktree instead of the main checkout. `read_git_diff` can also be limited to
+given paths, return a `--stat` summary, or compare against a base branch.
+
+Only worktrees git itself has registered are reachable. A directory that merely
+lives under `.claude/worktrees/` or `.damaian/worktrees/` without being
+registered, a symlink planted there, or a registered worktree outside the
+repository root and your `allowed_roots`, is refused with the reachable
+worktrees listed, so the assistant can correct itself. Reads inside a worktree
+apply the same policy as reads in the main checkout: restricted and ignore
+patterns, the read and search caps, and secret redaction. Git reads in a
+worktree or the main checkout exclude restricted paths and are bounded the same
+way.
+
 A command Damaian runs is stoppable and has a deadline: its output is streamed
 to the turn while it runs, Stop ends it, and `command_timeout_secs` (600 by
 default) kills it if it runs too long. A repository may shorten that deadline,

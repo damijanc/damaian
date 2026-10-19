@@ -1512,6 +1512,36 @@ Two independent filters, both visible in `config-show`:
 Confirm what was actually sent by reading `contextFiles` on the
 `model_request_prepared` event rather than reasoning about the patterns.
 
+### A `worktree` argument is refused
+
+The read tools take an optional `worktree` argument, but only a worktree git has
+registered for the repository is accepted (compared by canonical path). A
+refusal is a failed tool call of the form `Worktree <x> <reason>; reachable
+worktrees: <paths>`, and it lists the worktrees that *would* be accepted so the
+assistant can correct itself in the same round. The reasons the code produces:
+
+- `does not exist` — the argument does not resolve to an existing path.
+- `is not a registered worktree of this repository` — it resolves, but git has
+  not registered it. A directory under `.claude/worktrees/` or
+  `.damaian/worktrees/` that only looks like a worktree, and a symlink planted
+  there pointing elsewhere, both land here.
+- ``is this session's own checkout; omit `worktree` to read it`` — the argument
+  is the checkout the session already works in; read it without `worktree`.
+- `is a bare repository with no working tree` — a `bare` entry has nothing to
+  read.
+- `is prunable: git no longer considers it a valid worktree` — git lists it but
+  would prune it (its administrative files or directory are gone).
+- `does not exist on disk` — git lists it, but its path no longer resolves to a
+  directory.
+- ``is outside the repository root and no `allowed_roots` entry contains it`` — a
+  registered worktree outside the repository root is reachable only when an
+  `allowed_roots` entry contains it.
+
+Worktrees inside the repository root are reachable by default; ones outside it
+need an `allowed_roots` entry. A worktree is still subject to the session's own
+policy once reached: a restricted or ignored path inside it is refused or
+omitted exactly as in the main checkout.
+
 ### MCP server not working
 
 `POST /api/mcp-test` performs a live connect-and-list and returns either

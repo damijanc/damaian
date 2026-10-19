@@ -41,6 +41,38 @@ Model provider requests use `curl --config -` so the provider API key is passed 
 
 Patch rollback snapshots are redacted through the same secret scanner used for diffs and Git output before being written to disk, so pre-edit file content captured for rollback does not retain hardcoded credentials.
 
+## Git Read Hardening
+
+Every git read — `read_git_status`, `read_git_diff`, `read_git_log` and
+`list_worktrees`, in a worktree or the main checkout — runs through one hardened
+runner (`git_service.rs`), because the same function serves the model and the
+CLI and the gaps were the same on both sides. Four properties hold, and the CLI
+and desktop shell inherit them because they call the same functions:
+
+- **Restricted paths are excluded.** `status` and `diff` judge each changed path
+  with `PathPolicy::is_restricted` — the same matcher `read_file` refuses by —
+  and drop it, or any path below a restricted directory. A rename is dropped when
+  either name is restricted, and a status whose only changes are restricted reads
+  as clean. A restricted path's name or changed lines therefore never reach the
+  model through a git read.
+- **Output is bounded.** `status`, `diff` and `log` are cut to `max_read_lines`
+  and `max_file_bytes`, whichever binds first, and the cut result ends in a line
+  saying how much was cut. Output is redacted before it is cut, so a cut cannot
+  leave a secret's prefix the scanner no longer recognises.
+- **No repository-supplied code runs.** Every read passes
+  `-c core.fsmonitor=false`, and `diff` and `log` pass `--no-ext-diff
+  --no-textconv`. `.gitattributes` is repository content and can select a diff
+  driver, a textconv driver or an fsmonitor hook by name; those flags stop all
+  three. (Clean/smudge filters are not disabled: git has no flag for them, and
+  turning them off by name would make git-lfs or git-crypt files read as
+  modified. That gap is recorded in spec 60 §7.)
+- **A read takes no lock, and arguments cannot become options.** Every read
+  passes `--no-optional-locks` and `-c diff.autoRefreshIndex=false`, so a read
+  cannot take `index.lock` from another agent working in the same checkout.
+  `base` is validated against git's ref-name rules and passed after
+  `--end-of-options`; `paths` are resolved through `PathPolicy` against the
+  checkout and passed after `--`, so neither can be read as an option.
+
 ## Repository Config Trust Boundary
 
 Configuration comes from three files, applied in order: user (`<data_dir>/config/user.conf`), repository (`<repo>/.damaian/config.conf`), and admin (`DAMAIAN_ADMIN_CONFIG` or `<data_dir>/config/admin.conf`). Only the repository file arrives with a clone, so **repository config is untrusted input**: it may add restrictions and never remove one.
