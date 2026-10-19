@@ -3,14 +3,14 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md)
-**Status:** In progress. Task 1 done 2026-10-18; tasks 2–7 remain.
+**Status:** In progress. Tasks 1–2 done 2026-10-18; tasks 3–7 remain.
 
 ## Progress
 
 | Task | State | Notes |
 |---|---|---|
 | 1 · `ApprovalCause` and structured causes | Done 2026-10-18 | **Landed:** `ApprovalCause` (all 11 §5.1 variants), `CommandClassification.causes`, `reasons` rendered from `causes` via `plain_words()` (one source, no drift), the `Network`/`HighRisk`/`Unknown` split (C2), the `Blocklisted`/`Destructive` split, and `ShellControl`/`Docker`/`RestrictedPath`/`OutsideRepository` causes for each escalation. Helpers: `network_keyword`, `high_risk_keyword`, `destructive_pattern`, `configured_prefix_match` (returns the matched rule), `shell_control_constructs`, `first_word`, and `escaping_path_outside_root` (returns the escaping token so the cause can name it). `read_only_classification` no longer sets a `READ_ONLY_REASON` marker; `classify_text` returns an `admitted_read_only` bool instead, so `classify_pattern` no longer sniffs a reason string. **Tests:** 12 new in `tests/permission_profiles.rs` (one per cause + `reasons_are_derived_from_causes` + the regression guard over a 18-command table). `cargo nextest run -p workspace-engine --locked`: 1314 passed, 24 skipped. Scoped `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `scripts/quality-gate.sh fmt node lint typos deny` clean. **Falsified:** `reasons` written directly (empty) → `reasons_are_derived_from_causes` fails; `network_keyword` returning `None` → `a_curl_command_names_the_network_keyword` fails (curl falls to `Unknown`); shell-control branch pushing no cause → `a_shell_control_command_names_its_constructs` fails. All reverted. **Deviations:** (1) The shell-control branch's secondary read-only refusal is dropped — `ShellControl` is the deciding cause — so spec 64's two-reason shell-control output collapses to one cause. (2) `cd <dir>`-not-a-directory maps to `Unknown { program: "cd" }` and `ls -R` of the root maps to `RestrictedPath { path }`, because the closed enum has no dedicated variant for either; neither is in Task 1's test list. (3) The spec-64 refusal that named `read_git_diff`/`read_git_log` now maps to `Unknown { program: "git" }` per C1, so that tool pointer survives only in the model-facing description (Task 3); `git_diff_show_and_log_patch_ask_and_name_the_replacement_tool` was repurposed to assert the `Unknown` mapping. (4) Necessary ripple beyond the two named files: `causes: Vec::new()` added to `CommandClassification` literals in `mode.rs` (3) and `chat.rs` (1); `ApprovalCause` re-exported in `lib.rs`; classifier reason-string assertions in `foundation.rs` and `repository_map.rs` moved from `reasons` to `causes`. **Discoveries for later tasks:** Task 2 wires `Setting`/`ProfileBlocked` (declared, unconstructed) and must convert the `command_access` block, which still pushes its literal `Blocked by permission profile: command_access=…` string, and the `require_approval_for_*` settings, which currently leave allowlisted/admitted/validation commands with empty `causes`; `reasons_are_derived_from_causes` is scoped to the default `command_access=all` config so it does not trip on that block today. |
-| 2 · Setting and profile-block causes | Not started | |
+| 2 · Setting and profile-block causes | Done 2026-10-18 | **Landed:** `CommandPolicy` gains `sources: Option<BTreeMap<String, ConfigScope>>` derived from `RepositoryConfigReport.applied` (last scope per key, the same attribution `EffectivePolicy::from_load` derives) and a `new_with_report` constructor; `WorkspaceEngine::new_with_report` threads it (C4), and `new` delegates with `sources: None`. The `Setting { key, source: Option<String> }` cause is added in the three branches where a setting alone raises approval — the allowlist and read-only branches (`require_approval_for_all_commands`) and the validation branch (`require_approval_for_all_commands`, else `require_approval_for_risky_commands`) — naming the `rule_label` and the source (`Some("user")`/`Some("repository")`/`Some("admin")`/`Some("profile")`, or `Some("default")` when a report is present and no scope set the key). `source` is `None` when no report was threaded (a bare `Config`), and the plain words then omit " (set by …)" rather than falsely blaming "default". The `command_access` block now pushes `ProfileBlocked { access }` instead of the free-text "Blocked by permission profile" reason. **Tests:** 6 new in `tests/permission_profiles.rs` (`require_approval_for_all_commands_names_the_setting_and_its_source`, `require_approval_for_risky_commands_names_the_setting`, `a_command_access_block_is_a_profile_blocked_cause`, `a_low_risk_command_that_needs_approval_only_from_a_setting_names_that_setting_first`, `a_setting_cause_without_a_report_does_not_name_a_source`, `a_setting_cause_with_a_report_and_no_override_names_the_default`) plus `each_command_access_level_blocks_exactly_its_row` extended to assert the cause. `cargo nextest run -p workspace-engine --locked`: 1320 passed, 24 skipped. Scoped `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `cargo fmt --all` clean; `scripts/quality-gate.sh fmt node lint typos deny` clean; `npm run specs:check` clean. **Falsified (all reverted, all caught):** `setting_source` returning empty → `require_approval_for_all_commands_names_the_setting_and_its_source` fails; the `command_access` block pushing the free-text string → `a_command_access_block_is_a_profile_blocked_cause` fails; `new_with_report` dropping the report → `a_setting_cause_without_a_report_does_not_name_a_source` fails. **Deviations/discoveries:** (1) `require_approval_for_risky_commands` defaults to `true`, so a validation command (`cargo test`/`npm test`) carries `Setting { require_approval_for_risky_commands, … }` even under `Config::default()` — with a report its source is `Some("default")`; `risk`/`requires_approval`/`blocked` are unchanged. (2) `validation.rs` needed no change; its `CommandProposal.causes`/serialize/audit work belongs to Task 5. (3) **Review fix (2026-10-18):** reporting "default" for a bare `Config` was a false statement — a user-set key would have been blamed on the default in the card's Why-this-command; the source is now `None` there and the plain words omit " (set by …)". **Hand-off to Task 3 Step 1:** production still builds with `WorkspaceEngine::new`, so in the app the source stays `None` until Task 3 threads `Config::load_for_repository_reporting` + `WorkspaceEngine::new_with_report` into `desktop-shell/src/lib.rs` `config_for_repo` (used by `engine_for_repo`, `config_for_repo_with_model_options`, `config_for_repo_with_provider`) and `damaian-cli/src/main.rs` `default_engine`/`engine_for_repo`. |
 | 3 · Prompt and model-facing wording | Not started | |
 | 4 · The card names the cause and the model's reason | Not started | |
 | 5 · Recording causes in the proposal and audit record | Not started | |
@@ -109,7 +109,7 @@ pub enum ApprovalCause {
     Unknown { program: String },
     RestrictedPath { path: String },
     OutsideRepository { path: String },
-    Setting { key: String, source: String },
+    Setting { key: String, source: Option<String> },
     ProfileBlocked { access: CommandAccess },
 }
 
@@ -191,8 +191,9 @@ Tasks 3 and 4 both edit `chat.rs`. No task may run beside #59, #60 or #63
 **Proposal:** §5.1 (Setting, ProfileBlocked). **Corrections:** C4.
 **Files:** `command_policy.rs`, `workspace_engine.rs`, `validation.rs`,
 `tests/permission_profiles.rs`.
+**Started:** 2026-10-18 — **Done:** 2026-10-18.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `require_approval_for_all_commands_names_the_setting_and_its_source`
     (`git status` under that key → `Setting { key: "require_approval_for_all_commands" }`
     whose plain words are "Ask before every command", and the source is
@@ -203,28 +204,39 @@ Tasks 3 and 4 both edit `chat.rs`. No task may run beside #59, #60 or #63
     `each_command_access_level_blocks_exactly_its_row` table extended to assert
     the cause, `ProfileBlocked { access }`, not a free-text reason);
   - `a_low_risk_command_that_needs_approval_only_from_a_setting_names_that_setting_first`.
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Thread the source (C4).** Give `CommandPolicy` (or the proposal
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: Thread the source (C4).** Give `CommandPolicy` (or the proposal
       path) the `RepositoryConfigReport`'s attribution for the two
       `require_approval_for_*` keys and for `command_access`, reusing
       `effective_policy.rs` rather than re-resolving config.
-- [ ] **Step 4: `Setting` and `ProfileBlocked`.** Build the two causes in
+- [x] **Step 4: `Setting` and `ProfileBlocked`.** Build the two causes in
       `classify_at` where the settings currently flip `requires_approval`/`blocked`
       without a reason, naming the `rule_label` and the source.
-- [ ] **Step 5: Falsify.** A `Setting` cause with no source, a `ProfileBlocked`
+- [x] **Step 5: Falsify.** A `Setting` cause with no source, a `ProfileBlocked`
       cause with the free-text string instead of the variant, and a source that
       re-resolves config all fail a named test; revert each.
-- [ ] **Step 6: Update the proposal** for C4 (already folded in).
-- [ ] **Step 7: Scoped checks.** `cargo nextest run -p workspace-engine --test
+- [x] **Step 6: Update the proposal** for C4 (already folded in).
+- [x] **Step 7: Scoped checks.** `cargo nextest run -p workspace-engine --test
       permission_profiles`, scoped clippy for `workspace-engine`, fast checks.
 
 ## Task 3: Prompt and model-facing wording
 
 **Requirements:** 2 (the first-line sentence), 4.
 **Proposal:** §5.2 (message), §5.3 (wording). **Corrections:** C3, C5.
-**Files:** `chat.rs`, `tests/foundation.rs`.
+**Files:** `chat.rs`, `tests/foundation.rs`, `crates/desktop-shell/src/lib.rs`,
+`crates/damaian-cli/src/main.rs`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [ ] **Step 1: Thread the report into production (C4 hand-off).** Without
+      this the app and CLI build their engine with `WorkspaceEngine::new`,
+      which leaves `Setting.source` `None`, so a setting's prompt never names
+      who set it. Load with `Config::load_for_repository_reporting` and build
+      with `WorkspaceEngine::new_with_report` at the repository-scoped call
+      sites: `desktop-shell/src/lib.rs` `config_for_repo` (used by
+      `engine_for_repo`, `config_for_repo_with_model_options` and
+      `config_for_repo_with_provider`), and `damaian-cli/src/main.rs`
+      `default_engine` and `engine_for_repo` — all of which today call
+      `Config::load_for_repository` then `WorkspaceEngine::new`.
+- [ ] **Step 2: Write the failing tests.**
   - `command_proposal_response_leads_with_the_deciding_cause` (a shell-control
     proposal's first line names `&&` and `|`; a blocklisted one names its rule
     and offers no approval);
@@ -234,24 +246,25 @@ Tasks 3 and 4 both edit `chat.rs`. No task may run beside #59, #60 or #63
     mode, and the `approved_by`/separator/status strings in Correction C3);
   - `the_auto_run_description_says_the_policy_runs_it_without_asking` (the new
     wording replaces "sandbox-safe").
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Rewrite `command_proposal_response`** to lead with the first
+- [ ] **Step 3: Run them and confirm they fail.**
+- [ ] **Step 4: Rewrite `command_proposal_response`** to lead with the first
       cause's plain words, then the command; a blocked command says what blocked
       it and that nothing runs.
-- [ ] **Step 4: Remove "sandbox" (C3).** The tool description and envelope
+- [ ] **Step 5: Remove "sandbox" (C3).** The tool description and envelope
       paragraphs describe auto-run as "a short list of read-only commands the
       policy runs without asking"; rename `approved_by` `"sandbox"`, the
       `--- sandbox_command_result ---` separator and the `complete_with_sandbox_command`
       status.
-- [ ] **Step 5: Update the pinned wording (C5).** Change `TODAYS_CODE_SYSTEM_PROMPT`
+- [ ] **Step 6: Update the pinned wording (C5).** Change `TODAYS_CODE_SYSTEM_PROMPT`
       and the `CODE_PARAGRAPH_BEFORE_SPEC_50`/`READ_ONLY_PARAGRAPH_BEFORE_SPEC_50`
       fixtures in the same change, and update
       `ask_mode_system_prompt_has_no_command_envelope`'s assertion string.
-- [ ] **Step 6: Falsify** (a string that keeps "sandbox", a first line that does
+- [ ] **Step 7: Falsify** (a string that keeps "sandbox", a first line that does
       not name the cause) and revert.
-- [ ] **Step 7: Scoped checks.** `cargo nextest run -p workspace-engine --test
-      foundation`, the `chat.rs` unit tests, scoped clippy for `workspace-engine`,
-      and the fast checks (which include `node --check` and web lint).
+- [ ] **Step 8: Scoped checks.** `cargo nextest run -p workspace-engine --test
+      foundation`, the `chat.rs` unit tests, scoped clippy for `workspace-engine`
+      and the two touched binaries, and the fast checks (which include
+      `node --check` and web lint).
 
 ## Task 4: The card names the cause and the model's reason
 

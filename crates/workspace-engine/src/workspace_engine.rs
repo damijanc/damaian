@@ -3,7 +3,7 @@ use crate::chat::ChatOrchestrator;
 use crate::checkpoint::CheckpointStore;
 use crate::command_policy::CommandPolicy;
 use crate::command_runner::CommandRunner;
-use crate::config::Config;
+use crate::config::{Config, RepositoryConfigReport};
 use crate::context_manager::{ContextManager, RepositoryMapSource};
 use crate::edit::{EditOrchestrator, PatchStore};
 use crate::error::Result;
@@ -54,6 +54,23 @@ pub struct WorkspaceEngine {
 
 impl WorkspaceEngine {
     pub fn new(config: Config) -> Self {
+        // No `RepositoryConfigReport`, so the classifier cannot attribute a
+        // setting's source; `CommandPolicy::new` leaves it `None` (unknown)
+        // rather than falsely blaming "default" (spec 62 Correction C4).
+        Self::build(config.clone(), CommandPolicy::new(config))
+    }
+
+    /// [`Self::new`] with the source attribution recorded at load, so the
+    /// classifier's `Setting` cause can name where each `require_approval_for_*`
+    /// key came from without re-resolving config (spec 62 Correction C4).
+    pub fn new_with_report(config: Config, report: &RepositoryConfigReport) -> Self {
+        Self::build(
+            config.clone(),
+            CommandPolicy::new_with_report(config, report),
+        )
+    }
+
+    fn build(config: Config, command_policy: CommandPolicy) -> Self {
         let scanner = SecretScanner::new(config.secret_patterns.clone());
         let audit_log = AuditLog::with_retention(
             &config.data_dir,
@@ -75,7 +92,6 @@ impl WorkspaceEngine {
             scanner.clone(),
             path_policy.clone(),
         );
-        let command_policy = CommandPolicy::new(config.clone());
         let context_manager = ContextManager::new(
             file_access.clone(),
             scanner.clone(),

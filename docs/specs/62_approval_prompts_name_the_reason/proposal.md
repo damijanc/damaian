@@ -1,7 +1,8 @@
 # Feature Spec: Approval Prompts Name the Reason
 
-Status: In progress. Task 1 (`ApprovalCause` and structured causes) landed
-2026-10-18. Specified on 2026-10-17 from the session behind
+Status: In progress. Tasks 1 (`ApprovalCause` and structured causes) and 2
+(`Setting` and profile-block causes) landed 2026-10-18. Specified on 2026-10-17
+from the session behind
 [#59](../59_exploration_round_allowance/proposal.md)–[#61](../61_continue_the_stopped_turn.md),
 in which the user answered 40 approval prompts that all gave the same reason,
 "because it cannot run in sandbox mode", and none gave the real one.
@@ -144,7 +145,7 @@ A new enum in `command_policy.rs`:
 | `Unknown { program }` | "Asks first: Damaian does not know what `<program>` does" |
 | `RestrictedPath { path }` | "Asks first: reads `<path>`, which the policy restricts" |
 | `OutsideRepository { path }` | "Asks first: refers to `<path>`, outside the repository" |
-| `Setting { key, source }` | "Asks first: *<rule_label(key)>* is on (set by <source>)" |
+| `Setting { key, source: Option<String> }` | "Asks first: *<rule_label(key)>* is on (set by <source>)", omitting " (set by …)" when the source is unknown |
 | `ProfileBlocked { access }` | "Blocked: the permission profile allows <access> commands only" |
 
 `RestrictedPath` is added for the reason spec 64 already emits
@@ -168,6 +169,10 @@ the command, raised `requires_approval` (`require_approval_for_all_commands`,
 is not available where `classify_at` runs today (`CommandPolicy` holds `Config`
 only) — the task threads the `RepositoryConfigReport` (or a derived source map)
 into the classifier or the proposal path rather than resolving it a second time.
+`source` is `None` (unknown) when no report was threaded, and the plain words
+then omit " (set by …)": reporting "default" there would misattribute a key the
+user turned on themselves. With a report, a key no scope set is genuinely the
+default and may say so.
 
 ### 5.2 The message and the card
 

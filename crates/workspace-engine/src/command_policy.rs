@@ -1,8 +1,9 @@
-use crate::config::{CommandAccess, Config};
+use crate::config::{CommandAccess, Config, ConfigScope, RepositoryConfigReport};
 use crate::error::Result;
 use crate::path_policy::PathPolicy;
 use crate::repository_map::RootCommand;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -41,7 +42,7 @@ pub enum ApprovalCause {
     Unknown { program: String },
     RestrictedPath { path: String },
     OutsideRepository { path: String },
-    Setting { key: String, source: String },
+    Setting { key: String, source: Option<String> },
     ProfileBlocked { access: CommandAccess },
 }
 
@@ -72,7 +73,12 @@ impl ApprovalCause {
             }
             Self::Setting { key, source } => {
                 let label = crate::effective_policy::rule_label(key).unwrap_or_else(|| key.clone());
-                format!("Asks first: *{label}* is on (set by {source})")
+                match source {
+                    Some(source) => format!("Asks first: *{label}* is on (set by {source})"),
+                    // No report was threaded in, so the source is unknown;
+                    // claiming "default" would misattribute a key the user set.
+                    None => format!("Asks first: *{label}* is on"),
+                }
             }
             Self::ProfileBlocked { access } => format!(
                 "Blocked: the permission profile allows {} commands only",
@@ -158,11 +164,39 @@ pub const PROJECT_MANIFESTS: [&str; 7] = [
 #[derive(Debug, Clone)]
 pub struct CommandPolicy {
     config: Config,
+    /// Where each scalar policy key came from, derived from the
+    /// [`RepositoryConfigReport`] at load time so the `Setting` cause can name
+    /// the source without re-resolving config (spec 62 Correction C4). `None`
+    /// when the policy was built from a bare [`Config`], in which case the
+    /// source is unknown and the `Setting` plain words omit it.
+    sources: Option<BTreeMap<String, ConfigScope>>,
 }
 
 impl CommandPolicy {
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            sources: None,
+        }
+    }
+
+    /// [`Self::new`] with the source attribution `report` recorded, so the
+    /// `Setting` cause can name user/repository/profile without a second
+    /// resolver. A key absent from the report is left at its built-in default,
+    /// which is still a real source worth naming.
+    pub fn new_with_report(config: Config, report: &RepositoryConfigReport) -> Self {
+        // `applied` is in scope order (user, repository, admin, profile), so
+        // the last entry for a key is the scope that holds it now — the same
+        // attribution `EffectivePolicy::from_load` derives.
+        let sources = report
+            .applied
+            .iter()
+            .map(|applied| (applied.key.clone(), applied.scope))
+            .collect();
+        Self {
+            config,
+            sources: Some(sources),
+        }
     }
 
     /// The policy configuration in effect, so callers that need to reason
@@ -170,6 +204,32 @@ impl CommandPolicy {
     /// risking a different answer than the one this policy is enforcing.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The `Setting` cause for a `require_approval_for_*` key, naming the key
+    /// and where it came from (spec 62 §5.1).
+    fn setting_cause(&self, key: &str) -> ApprovalCause {
+        ApprovalCause::Setting {
+            key: key.to_string(),
+            source: self.setting_source(key),
+        }
+    }
+
+    /// The source of `key` as a person reads it: `Some("user")`,
+    /// `Some("repository")`, `Some("admin")`, `Some("profile")`, or
+    /// `Some("default")` when a report was supplied and no scope set the key.
+    /// `None` when no report was supplied, because the source is genuinely
+    /// unknown then — reporting "default" would misattribute a key the user
+    /// turned on themselves.
+    fn setting_source(&self, key: &str) -> Option<String> {
+        let sources = self.sources.as_ref()?;
+        Some(
+            sources
+                .get(key)
+                .map(|scope| scope_source(*scope))
+                .unwrap_or("default")
+                .to_string(),
+        )
     }
 
     /// Classifies a command run at the repository root. Every caller that
@@ -286,16 +346,17 @@ impl CommandPolicy {
         // After the whole classification, so the block never has to invent a
         // risk (spec 31 proposal §4) and sees the outside-root approval, the way
         // Plan mode does. After the allowlist too: Allow Always cannot outrank
-        // a profile. Task 2 turns this into a `ProfileBlocked` cause; until
-        // then it keeps its literal reason string.
+        // a profile. The block is a `ProfileBlocked` cause (spec 62 §5.1), so
+        // the reason and the value cannot drift.
         if !classification.blocked
             && !command_access_permits(self.config.command_access, &classification)
         {
             classification.blocked = true;
-            classification.reasons.push(format!(
-                "Blocked by permission profile: command_access={}",
-                self.config.command_access.as_str()
-            ));
+            let cause = ApprovalCause::ProfileBlocked {
+                access: self.config.command_access,
+            };
+            classification.reasons.push(cause.plain_words());
+            classification.causes.push(cause);
         }
         classification
     }
@@ -393,13 +454,18 @@ impl CommandPolicy {
             None => false,
         };
         if allowlisted {
+            let causes = if self.config.require_approval_for_all_commands {
+                vec![self.setting_cause("require_approval_for_all_commands")]
+            } else {
+                Vec::new()
+            };
             return (
                 CommandClassification::new(
                     normalized,
                     CommandRisk::Low,
                     false,
                     self.config.require_approval_for_all_commands,
-                    Vec::new(),
+                    causes,
                     "Configured safe command".to_string(),
                     false,
                 ),
@@ -434,8 +500,16 @@ impl CommandPolicy {
         }
 
         if is_validation_command(&normalized) {
-            // A validation command asks only when a setting raises it; Task 2
-            // adds the `Setting` cause, so this branch carries no cause yet.
+            // A validation command asks only when a setting raises it, so the
+            // cause names that setting (spec 62 §5.1). `require_approval_for_all_commands`
+            // is the broader rule and wins when both are on.
+            let causes = if self.config.require_approval_for_all_commands {
+                vec![self.setting_cause("require_approval_for_all_commands")]
+            } else if self.config.require_approval_for_risky_commands {
+                vec![self.setting_cause("require_approval_for_risky_commands")]
+            } else {
+                Vec::new()
+            };
             return (
                 CommandClassification::new(
                     normalized,
@@ -443,7 +517,7 @@ impl CommandPolicy {
                     false,
                     self.config.require_approval_for_all_commands
                         || self.config.require_approval_for_risky_commands,
-                    Vec::new(),
+                    causes,
                     "Runs project validation and may create local artifacts".to_string(),
                     false,
                 ),
@@ -517,15 +591,21 @@ impl CommandPolicy {
     }
 
     /// An admitted read-only command or pipeline (spec 64 §5.5): Low, and
-    /// needing approval only when every command does. No cause: a command that
-    /// runs without asking has no "why approval" to name.
+    /// needing approval only when every command does, which is then a
+    /// `Setting` cause naming that key (spec 62 §5.1). No other cause: a
+    /// command that runs without asking has no "why approval" to name.
     fn read_only_classification(&self, normalized: String) -> CommandClassification {
+        let causes = if self.config.require_approval_for_all_commands {
+            vec![self.setting_cause("require_approval_for_all_commands")]
+        } else {
+            Vec::new()
+        };
         CommandClassification::new(
             normalized,
             CommandRisk::Low,
             false,
             self.config.require_approval_for_all_commands,
-            Vec::new(),
+            causes,
             "Reads workspace or Git metadata".to_string(),
             false,
         )
@@ -656,6 +736,16 @@ fn escalate(classification: &mut CommandClassification, cause: ApprovalCause) {
     }
     classification.reasons.push(cause.plain_words());
     classification.causes.push(cause);
+}
+
+/// The short source name a person reads in a `Setting` cause's plain words.
+fn scope_source(scope: ConfigScope) -> &'static str {
+    match scope {
+        ConfigScope::User => "user",
+        ConfigScope::Repository => "repository",
+        ConfigScope::Admin => "admin",
+        ConfigScope::Profile => "profile",
+    }
 }
 
 /// The allowlist entry that authorises `command` in the directory `relative`
