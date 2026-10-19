@@ -4395,7 +4395,7 @@ function renderMessages(messages, tasks = []) {
         if (cancelledTasks.has(message.taskId)) {
           markMessageStopped(bubble);
         } else if (toolBudgetExhaustedTasks.has(message.taskId)) {
-          markMessageToolBudgetExhausted(bubble, message.sessionId);
+          markMessageToolBudgetExhausted(bubble, message.sessionId, message.taskId);
         } else if (tokenBudgetExhaustedTasks.has(message.taskId)) {
           markMessageTokenBudgetExhausted(bubble);
         }
@@ -4762,6 +4762,7 @@ function createReattachedApprovalCard(approval) {
     patch: "A patch was waiting for your review when Damaian stopped",
     plan: "A plan was waiting for your review when Damaian stopped",
     provider_fallback: "An offer to switch providers was waiting when Damaian stopped",
+    round_budget: "A turn was waiting for your decision when Damaian stopped",
   };
   const notes = {
     command:
@@ -4779,6 +4780,11 @@ function createReattachedApprovalCard(approval) {
       "A provider refused this turn, and the turn was saved while you decided. Keeping it " +
       "failed closes the turn; answering with the other provider continues it, for this turn " +
       "only.",
+    // Saved like a plan review, so answering continues the same turn. Only the
+    // rounds are known after a restart, not the full offer.
+    round_budget:
+      "This turn reached its round budget and was saved while you decided. Continue grants " +
+      "it more rounds; Answer now ends it.",
   };
   headline.textContent = headlines[approval.kind];
   note.textContent = notes[approval.kind];
@@ -4801,6 +4807,9 @@ function createReattachedApprovalCard(approval) {
   } else if (approval.kind === "provider_fallback") {
     // No `onResolved`, for the plan's reason: either answer ends the task.
     wrapper.append(createFallbackOffer(approval.payload, repo()));
+  } else if (approval.kind === "round_budget") {
+    // No `onResolved`, for the plan's reason: either answer ends the task.
+    wrapper.append(createRoundBudgetOffer(approval.payload, repo()));
   } else {
     wrapper.append(
       createPatchPreview(approval.payload, repo(), {
@@ -6964,7 +6973,7 @@ function markMessageStopped(target) {
   target.body.after(row);
 }
 
-function markMessageToolBudgetExhausted(target, sessionId = currentSessionId) {
+function markMessageToolBudgetExhausted(target, sessionId = currentSessionId, taskId = null) {
   if (target.body.nextElementSibling?.dataset?.state === "incomplete") return;
   const row = document.createElement("div");
   row.className = "turn-indicator";
@@ -6975,17 +6984,22 @@ function markMessageToolBudgetExhausted(target, sessionId = currentSessionId) {
   const button = document.createElement("button");
   button.type = "button";
   button.className = "turn-indicator-action";
-  button.textContent = "Continue debugging";
+  // *Ask again* (spec 61 §5.7): starts a new turn whose prompt the engine
+  // builds from the stopped task's own request, not a fixed "continue
+  // debugging" string. Without a task id there is nothing to re-ask, so the
+  // button is only offered when one is known.
+  button.textContent = "Ask again";
   button.addEventListener("click", async () => {
     try {
       button.disabled = true;
-      await continueDebuggingFromExhausted(sessionId);
+      await askAgainFromExhausted(sessionId, taskId);
     } catch (error) {
       button.disabled = false;
       toast(error.message);
     }
   });
-  row.append(label, button);
+  if (taskId) row.append(label, button);
+  else row.append(label);
   target.body.after(row);
 }
 
@@ -7016,7 +7030,7 @@ function markMessageTokenBudgetExhausted(target) {
 // site that knew about it.
 function markMessageTurnStop(target, payload, sessionId = currentSessionId) {
   if (payload.taskStatus === "tool_budget_exhausted") {
-    markMessageToolBudgetExhausted(target, payload.sessionId || sessionId);
+    markMessageToolBudgetExhausted(target, payload.sessionId || sessionId, payload.taskId || null);
   } else if (payload.taskStatus === "token_budget_exhausted") {
     markMessageTokenBudgetExhausted(target);
   } else if (payload.incomplete) {
@@ -8398,6 +8412,9 @@ function appendProposals(message, payload, repo) {
   if (payload.fallbackProposal) {
     message.body.append(createFallbackOffer(payload.fallbackProposal, repo));
   }
+  if (payload.roundBudgetProposal) {
+    message.body.append(createRoundBudgetOffer(payload.roundBudgetProposal, repo));
+  }
 }
 
 // What a refusal code means, for the fallback offer's heading. An unknown code
@@ -8561,6 +8578,138 @@ function createFallbackOffer(proposal, proposalRepo) {
   // answer is the one a stray Enter should give.
   requestAnimationFrame(() => {
     if (wrapper.isConnected && !keepButton.disabled) keepButton.focus();
+  });
+  return wrapper;
+}
+
+// Spec 61: a turn paused at its round budget. The transcript already names the
+// rounds ("Used 8 of 8 tool rounds." is the pause response); the two buttons
+// here carry the decision, and neither says anything about debugging
+// (requirement 3).
+//
+// Two shapes: a live pause carries the full proposal (roundsUsed, roundsTotal,
+// roundsGranted, roundsMore, atHardCap), while a reattached pause (after a
+// restart) carries only roundsUsed and roundsGranted — all `PausedTurns`
+// exposes. For the reattached shape the hard cap is derived from roundsUsed,
+// duplicating `ABSOLUTE_TURN_ROUND_CAP` (64) from chat.rs, so a reattached
+// pause at the cap is never offered a Continue the engine would refuse.
+function createRoundBudgetOffer(proposal, proposalRepo) {
+  const more = proposal.roundsMore;
+  const atHardCap = proposal.atHardCap === true || (proposal.roundsUsed ?? 0) >= 64;
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "command-approval round-budget-offer";
+
+  const note = document.createElement("p");
+  note.className = "plan-review-note";
+  note.textContent = atHardCap
+    ? "This turn has reached its hard cap: it can be answered now, but not continued."
+    : "Continue grants this same turn another segment of tool rounds; Answer now makes the final call with tools dropped.";
+
+  const actions = document.createElement("div");
+  actions.className = "command-approval-actions";
+
+  const answerButton = document.createElement("button");
+  answerButton.type = "button";
+  answerButton.className = "btn-sm btn-primary";
+  answerButton.textContent = "Answer now";
+  actions.append(answerButton);
+
+  const continueButton = document.createElement("button");
+  if (!atHardCap) {
+    continueButton.type = "button";
+    continueButton.className = "btn-sm btn-quiet";
+    continueButton.textContent = typeof more === "number" ? `Continue — ${more} more` : "Continue";
+    actions.append(continueButton);
+  }
+
+  const output = document.createElement("pre");
+  output.className = "command-approval-output";
+  output.hidden = true;
+
+  async function decide(decision) {
+    answerButton.disabled = true;
+    if (!atHardCap) continueButton.disabled = true;
+    output.hidden = false;
+    output.textContent = decision === "continue" ? "Continuing…" : "Answering now…";
+
+    const assistantMessage = appendChatMessage("assistant", "");
+    const indicator = startTurnIndicator(assistantMessage);
+    let assistantText = "";
+    let streamError = null;
+    try {
+      await streamResumeRoundBudgetRequest(
+        {
+          repo: proposalRepo,
+          proposal_id: proposal.proposalId,
+          decision,
+        },
+        {
+          phase(payload) {
+            indicator.phase(payload);
+          },
+          plan(planPayload) {
+            renderPlanPanel(assistantMessage, planPayload);
+          },
+          webDiagnostic(record) {
+            sessionHasRecordedDiagnostics = true;
+            renderWebDiagnosticCard(assistantMessage, record);
+          },
+          token(token) {
+            assistantText += token;
+            updateChatMessage(assistantMessage, assistantText);
+            indicator.streaming();
+          },
+          done(payload) {
+            if (payload.response && payload.response !== assistantText) {
+              assistantText = payload.response;
+              updateChatMessage(assistantMessage, assistantText);
+            }
+            appendProposals(assistantMessage, payload, proposalRepo);
+            if (payload.sessionId) {
+              currentSessionId = payload.sessionId;
+              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+            }
+            appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+            markMessageUsage(assistantMessage, payload.usage);
+            indicator.finish(chatCompletionState(payload));
+            markMessageTurnStop(assistantMessage, payload);
+          },
+          error(payload) {
+            streamError = payload.error || "The round-budget decision failed";
+          },
+        },
+      );
+    } catch (error) {
+      renderChatMessageError(assistantMessage, error);
+      throw error;
+    } finally {
+      indicator.finish("failed");
+    }
+    if (streamError) {
+      updateChatMessage(assistantMessage, streamError);
+      output.textContent = streamError;
+      answerButton.disabled = false;
+      if (!atHardCap) continueButton.disabled = false;
+    } else {
+      output.textContent = decision === "continue" ? "Continued." : "Answered.";
+    }
+    await loadSessions(currentSessionId, false);
+    void refreshRepoBar();
+  }
+
+  answerButton.addEventListener("click", () =>
+    decide("answer_now").catch((error) => toast(error.message)),
+  );
+  if (!atHardCap) {
+    continueButton.addEventListener("click", () =>
+      decide("continue").catch((error) => toast(error.message)),
+    );
+  }
+
+  wrapper.append(note, actions, output);
+  requestAnimationFrame(() => {
+    if (wrapper.isConnected && !answerButton.disabled) answerButton.focus();
   });
   return wrapper;
 }
@@ -9558,6 +9707,12 @@ async function streamResumeFallbackRequest(data, handlers) {
   return streamRequest("/api/resume-fallback-stream", null, data, handlers);
 }
 
+// Like a fallback decision, answering a round-budget pause *is* a turn, so
+// there is no one-shot endpoint to fall back to.
+async function streamResumeRoundBudgetRequest(data, handlers) {
+  return streamRequest("/api/resume-round-budget-stream", null, data, handlers);
+}
+
 async function streamRequest(streamPath, fallbackPath, data, handlers, signal) {
   const options = withApiToken(streamPath, form(data));
   // Aborting closes the socket, which is what the server notices on its next
@@ -10031,7 +10186,6 @@ async function sendChatPrompt(options = {}) {
         prompt,
         session_id: currentSessionId,
         context_files: pinnedContextFiles.join("\n"),
-        continue_debugging: options.continueDebugging ? "true" : "false",
         ...chatModelFormFields(),
       },
       {
@@ -10116,18 +10270,96 @@ async function sendChatPrompt(options = {}) {
   }
 }
 
-async function continueDebuggingFromExhausted(sessionId) {
+async function askAgainFromExhausted(sessionId, taskId) {
   if (chatSubmitting) throw new Error("A turn is already running");
   if (!sessionId && !currentSessionId) throw new Error("No session selected");
+  if (!taskId) throw new Error("This turn has nothing to re-ask");
   if (sessionId && sessionId !== currentSessionId) {
     await loadSession(sessionId);
   }
-  await sendChatPrompt({
-    prompt:
-      "Continue debugging from the last tool-budget exhaustion. Use the prior session evidence and continue from the unresolved diagnostic state.",
-    continueDebugging: true,
-    restorePrompt: false,
-  });
+  chatSubmitting = true;
+  setComposerBusy(true);
+  await ensureDesktopApiReady();
+  const chatRepo = requireRepo();
+  const assistantMessage = appendChatMessage("assistant", "");
+  const indicator = startTurnIndicator(assistantMessage, stopCurrentTurn);
+  const controller = new AbortController();
+  currentTurn = { controller, stopped: false };
+  let assistantText = "";
+  let streamError = null;
+  try {
+    await streamChatRequest(
+      {
+        repo: chatRepo,
+        session_id: sessionId || currentSessionId,
+        ask_again_task_id: taskId,
+        context_files: pinnedContextFiles.join("\n"),
+        ...chatModelFormFields(),
+      },
+      {
+        session(newSessionId) {
+          if (newSessionId) currentSessionId = newSessionId;
+        },
+        phase(payload) {
+          indicator.phase(payload);
+        },
+        plan(payload) {
+          renderPlanPanel(assistantMessage, payload);
+        },
+        webDiagnostic(record) {
+          sessionHasRecordedDiagnostics = true;
+          renderWebDiagnosticCard(assistantMessage, record);
+        },
+        token(token) {
+          assistantText += token;
+          updateChatMessage(assistantMessage, assistantText);
+          indicator.streaming();
+        },
+        async done(payload) {
+          currentSessionId = payload.sessionId;
+          localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+          persistPinnedContextForSession(currentSessionId);
+          if (payload.response && payload.response !== assistantText) {
+            assistantText = payload.response;
+          }
+          await finalizeChatMessage(assistantMessage, assistantText);
+          appendProposals(assistantMessage, payload, chatRepo);
+          appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+          markMessageUsage(assistantMessage, payload.usage);
+          if (payload.cancelled) {
+            indicator.finish("stopped");
+            return;
+          }
+          indicator.finish(chatCompletionState(payload));
+          markMessageTurnStop(assistantMessage, payload);
+        },
+        error(payload) {
+          streamError = new Error(payload.error || "Model request failed");
+        },
+      },
+      controller.signal,
+    );
+    if (streamError) throw streamError;
+    dismissContextChips();
+    await loadSessionCheckpoints(currentSessionId);
+    await loadSessions(currentSessionId, false);
+    await refreshFindings();
+  } catch (error) {
+    if (currentTurn?.stopped || error.name === "AbortError") {
+      indicator.finish("stopped");
+      await loadSessions(currentSessionId, false);
+      await refreshFindings();
+    } else {
+      indicator.finish("failed");
+      toast(error.message);
+      renderChatMessageError(assistantMessage, error);
+    }
+  } finally {
+    chatSubmitting = false;
+    currentTurn = null;
+    setComposerBusy(false);
+    void refreshRepoBar();
+  }
 }
 
 $("ask-btn").addEventListener("click", () => {

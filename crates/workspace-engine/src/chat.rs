@@ -371,6 +371,10 @@ pub struct AgentRoundBudgetProposal {
     pub rounds_total: u32,
     /// The running total of extra rounds granted across continuations.
     pub rounds_granted: u32,
+    /// How many more rounds a *Continue* grants (`default_tool_round_limit`).
+    /// Surfaced so the button can say "Continue — 8 more" without the client
+    /// guessing a config value.
+    pub rounds_more: u32,
     /// `ABSOLUTE_TURN_ROUND_CAP` reached, so only *Answer now* is offered.
     pub at_hard_cap: bool,
 }
@@ -453,8 +457,6 @@ struct TurnProposals {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ChatTurnOptions {
-    #[serde(default)]
-    pub continue_debugging: bool,
     /// This turn has already been offered — and has approved — a provider
     /// fallback, so a second refusal fails rather than offering again
     /// (spec 56 §5.5: a loop of offers is the failure mode the offer exists
@@ -582,10 +584,8 @@ impl ChatOrchestrator {
             .clamp(self.default_tool_round_limit(), ABSOLUTE_TOOL_ROUND_CAP)
     }
 
-    fn tool_round_limit(&self, web_debug_mode: bool, options: ChatTurnOptions) -> u32 {
-        if options.continue_debugging {
-            ABSOLUTE_TOOL_ROUND_CAP
-        } else if web_debug_mode {
+    fn tool_round_limit(&self, web_debug_mode: bool) -> u32 {
+        if web_debug_mode {
             self.web_debug_tool_round_limit()
         } else {
             self.default_tool_round_limit()
@@ -839,13 +839,14 @@ impl ChatOrchestrator {
         // otherwise start with no plan at all (`context.md` §3.1).
         //
         // The same is true of a turn a crash interrupted and the user chose to
-        // continue (`docs/specs/45_crash_recovery_prompt.md` §5.8).
+        // continue (`docs/specs/45_crash_recovery_prompt.md` §5.8), and of a
+        // tool-round stop the user asked again after (spec 61 §5.7).
         //
         // Narrow on purpose: only a task that actually handed its work to this
-        // one — a ceiling stop or a recorded supersession — and only while its
-        // plan still has work outstanding. Carrying a plan into an unrelated
-        // next question would put steps on the panel the user never asked for,
-        // and a normally-completed task has nothing to resume.
+        // one — a ceiling stop, a tool-round stop or a recorded supersession —
+        // and only while its plan still has work outstanding. Carrying a plan
+        // into an unrelated next question would put steps on the panel the user
+        // never asked for, and a normally-completed task has nothing to resume.
         self.carry_plan_from_the_previous_turn(&session.id, &task)?;
         let user_message =
             self.session_store
@@ -866,7 +867,7 @@ impl ChatOrchestrator {
             PhaseKind::Context,
             "",
             0,
-            self.tool_round_limit(prompt_enters_web_debug_mode(prompt), options),
+            self.tool_round_limit(prompt_enters_web_debug_mode(prompt)),
         );
 
         let context = self.context_manager.build_context(
@@ -1125,7 +1126,7 @@ impl ChatOrchestrator {
                     .checkpoint_store
                     .begin_command_census(&repository_root)
                     .unwrap_or_else(|_| CommandCensus::unavailable());
-                let max_rounds = self.tool_round_limit(false, pending.turn_options);
+                let max_rounds = self.tool_round_limit(false);
                 let cancel = sink.cancel;
                 // Borrow only the progress field, so `cancel` can be read for
                 // the same call without two conflicting borrows of the sink.
@@ -1642,6 +1643,29 @@ impl ChatOrchestrator {
         }
     }
 
+    /// Builds the prompt that continues a stored `ToolBudgetExhausted` turn
+    /// (spec 61 §5.7). The original request is read from the task record, not
+    /// reconstructed by the client: a turn stopped after many messages has long
+    /// since pushed its request out of the window a client could re-read, and
+    /// only `task.user_prompt` still holds it verbatim.
+    pub fn tool_budget_ask_again_prompt(&self, session_id: &str, task_id: &str) -> Result<String> {
+        let task = self
+            .session_store
+            .read_tasks(session_id)?
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| ClientError::InvalidInput(format!("Unknown task: {task_id}")))?;
+        if task.status != TaskStatus::ToolBudgetExhausted {
+            return Err(ClientError::InvalidInput(format!(
+                "Task {task_id} is not waiting on its tool budget"
+            )));
+        }
+        Ok(format!(
+            "Continue this earlier request: {}",
+            task.user_prompt
+        ))
+    }
+
     /// Takes the checkpoint the turn can be rewound to. Best-effort: a store
     /// that cannot be written is recorded in the audit log and the turn still
     /// runs, because refusing to answer at all would be a worse failure than
@@ -1854,9 +1878,10 @@ impl ChatOrchestrator {
     /// Carries a plan onto `task` when the previous task in the session handed
     /// its work to this one with steps still outstanding.
     ///
-    /// Two ways that happens, and they are the only two: the previous turn hit
-    /// the token ceiling and the user raised it (spec 21 §5.4), or it was
-    /// interrupted by a crash and the user pressed `Continue`
+    /// Three ways that happens, and they are the only three: the previous turn
+    /// hit the token ceiling and the user raised it (spec 21 §5.4), it stopped
+    /// at its tool-round budget and the user asked again (spec 61 §5.7), or it
+    /// was interrupted by a crash and the user pressed `Continue`
     /// (`docs/specs/45_crash_recovery_prompt.md` §5.4), which re-sends the same
     /// request as a new turn and records the old task as superseded.
     ///
@@ -1879,6 +1904,7 @@ impl ChatOrchestrator {
             return Ok(());
         };
         let handed_over = previous.status == TaskStatus::TokenBudgetExhausted
+            || previous.status == TaskStatus::ToolBudgetExhausted
             || self
                 .session_store
                 .superseded_task_ids(session_id)?
@@ -2100,8 +2126,7 @@ impl ChatOrchestrator {
         // Whether any model call in this turn has been accounted for, so a
         // stop between rounds does not record a zero on top of real spending.
         let mut recorded_any_usage = false;
-        let mut web_debug_mode =
-            turn_options.continue_debugging || prompt_enters_web_debug_mode(&task.user_prompt);
+        let mut web_debug_mode = prompt_enters_web_debug_mode(&task.user_prompt);
         let mut failed_browser_calls = HashMap::new();
         // The turn's plan, once the model has proposed one, and the evidence
         // accrued since the current step started.
@@ -2256,8 +2281,7 @@ impl ChatOrchestrator {
                 }
             }
 
-            let max_rounds = (self.tool_round_limit(web_debug_mode, turn_options)
-                + round_budget_extension)
+            let max_rounds = (self.tool_round_limit(web_debug_mode) + round_budget_extension)
                 .min(ABSOLUTE_TURN_ROUND_CAP);
             let force_final = round >= max_rounds;
             // Spec 61 §5.1: at the round budget, with no token ceiling to
@@ -2790,8 +2814,7 @@ impl ChatOrchestrator {
                 if matches!(tool_action, ToolAction::WebDiagnostic(_)) {
                     web_debug_mode = true;
                 }
-                let max_rounds = (self.tool_round_limit(web_debug_mode, turn_options)
-                    + round_budget_extension)
+                let max_rounds = (self.tool_round_limit(web_debug_mode) + round_budget_extension)
                     .min(ABSOLUTE_TURN_ROUND_CAP);
                 sink.phase(
                     PhaseKind::Tool,
@@ -3887,6 +3910,7 @@ impl ChatOrchestrator {
                 rounds_used: round,
                 rounds_total: max_rounds,
                 rounds_granted,
+                rounds_more: self.default_tool_round_limit(),
                 at_hard_cap,
             }),
             cancelled: false,

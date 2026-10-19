@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::{
-    CancelToken, ChatTurnResult, ClientError, Config, MockModelAdapter, RoundBudgetDecision,
-    TaskStatus, TurnProgress, TurnSink, WorkspaceEngine,
+    CancelToken, ChatTurnResult, ClientError, Config, MockModelAdapter, PhaseKind,
+    RoundBudgetDecision, TaskStatus, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -637,5 +637,174 @@ fn a_repeatedly_continued_turn_still_ends() {
     assert!(
         !pending_file(&repo, &proposal.id).is_empty(),
         "the pending turn must remain for Answer now"
+    );
+}
+
+/// Reaches a stored `ToolBudgetExhausted` task: propose a plan, run read-only
+/// rounds to the budget, then answer now with a model that still wants a tool.
+fn exhausted_turn_with_a_plan(repo: &Path, engine: &WorkspaceEngine) -> (ChatTurnResult, String) {
+    let responses: Vec<String> = std::iter::once(String::new())
+        .chain((0..8).map(|_| read_only_round()))
+        .collect();
+    let mut tool_calls = vec![vec![ToolCall {
+        id: "plan_1".to_string(),
+        name: "propose_plan".to_string(),
+        arguments_json: r#"{"steps":[{"title":"Look around"},{"title":"Report back"}]}"#
+            .to_string(),
+    }]];
+    tool_calls.extend((0..8).map(|_| Vec::new()));
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(responses, tool_calls);
+
+    let (paused, _) = ask(engine, repo, "Look at the source", &mut adapter);
+    let proposal = paused
+        .round_budget_proposal
+        .as_ref()
+        .expect("the pause surfaces a proposal");
+    let exhausted = resume_round_budget(
+        engine,
+        &proposal.id,
+        RoundBudgetDecision::AnswerNow,
+        &mut adapter,
+    );
+    assert_eq!(
+        exhausted.task.status,
+        TaskStatus::ToolBudgetExhausted,
+        "the answer-now forced call still wants a tool"
+    );
+    let prompt = engine
+        .chat_orchestrator
+        .tool_budget_ask_again_prompt(&exhausted.session.id, &exhausted.task.id)
+        .expect("the ask-again prompt should build");
+    (exhausted, prompt)
+}
+
+#[test]
+fn asking_again_after_a_tool_budget_stop_carries_the_request_and_plan() {
+    // §5.7: a stored `ToolBudgetExhausted` task keeps a way on, and that way
+    // carries the original request (built by the engine from `task.user_prompt`,
+    // not the client) and the plan — a tool-round stop now hands the plan over
+    // exactly as a token-ceiling stop does.
+    let repo = temp_repo("askagain");
+    let engine = engine(&repo, 8, None);
+    let (exhausted, prompt) = exhausted_turn_with_a_plan(&repo, &engine);
+
+    let first_plan = engine
+        .session_store
+        .read_task_plan(&exhausted.session.id, &exhausted.task.id)
+        .unwrap()
+        .expect("the exhausted turn had a plan");
+    assert_eq!(first_plan.steps.len(), 2);
+
+    assert!(prompt.contains("Look at the source"), "{prompt}");
+    assert!(
+        prompt.starts_with("Continue this earlier request:"),
+        "{prompt}"
+    );
+
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    let resumed = engine
+        .chat_orchestrator
+        .ask_with_session(
+            &repo,
+            &prompt,
+            &[],
+            Some(&exhausted.session.id),
+            &mut MockModelAdapter::new("Done."),
+            &mut sink,
+        )
+        .expect("the asked-again turn should run");
+
+    assert_ne!(
+        resumed.task.id, exhausted.task.id,
+        "ask-again is a new task, never the stopped one"
+    );
+    let carried = engine
+        .session_store
+        .read_task_plan(&resumed.session.id, &resumed.task.id)
+        .unwrap()
+        .expect("the plan carried onto the asked-again task");
+    assert_eq!(carried.steps.len(), 2);
+    assert_eq!(carried.steps[0].title, first_plan.steps[0].title);
+}
+
+#[test]
+fn a_continued_turn_stays_out_of_web_debug_mode() {
+    // Requirement 3 / C4: continuing must not switch on web debug mode. The old
+    // *Continue debugging* button forced it on through the `continue_debugging`
+    // turn option; the *Ask again* path must let the round limit come from the
+    // prompt alone, so a plain request keeps the default limit — not the
+    // web-debug limit (12) or the absolute cap (16).
+    let repo = temp_repo("nowebdebug");
+    let engine = WorkspaceEngine::new(Config {
+        data_dir: repo.join(".damaian"),
+        agent_max_tool_rounds: 8,
+        agent_web_debug_max_tool_rounds: 12,
+        enable_index_watcher: false,
+        ..Config::default()
+    });
+
+    let responses: Vec<String> = (0..8)
+        .map(|_| read_only_round())
+        .chain(std::iter::once(read_only_round()))
+        .collect();
+    let mut adapter = MockModelAdapter::new_sequence(responses);
+    let (paused, _) = ask(&engine, &repo, "Look at the source", &mut adapter);
+    let proposal = paused
+        .round_budget_proposal
+        .as_ref()
+        .expect("the pause surfaces a proposal");
+    let exhausted = resume_round_budget(
+        &engine,
+        &proposal.id,
+        RoundBudgetDecision::AnswerNow,
+        &mut adapter,
+    );
+    assert_eq!(exhausted.task.status, TaskStatus::ToolBudgetExhausted);
+
+    let prompt = engine
+        .chat_orchestrator
+        .tool_budget_ask_again_prompt(&exhausted.session.id, &exhausted.task.id)
+        .expect("the ask-again prompt should build");
+
+    let cancel = CancelToken::new();
+    let mut progress = Vec::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |event: TurnProgress| progress.push(event);
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine
+        .chat_orchestrator
+        .ask_with_session(
+            &repo,
+            &prompt,
+            &[],
+            Some(&exhausted.session.id),
+            &mut MockModelAdapter::new("Done."),
+            &mut sink,
+        )
+        .expect("the asked-again turn should run");
+
+    let max_rounds = progress
+        .iter()
+        .find_map(|event| match event {
+            TurnProgress::Phase(phase) if phase.kind == PhaseKind::Model => Some(phase.max_rounds),
+            _ => None,
+        })
+        .expect("a model phase reports the round limit");
+    assert_eq!(
+        max_rounds, 8,
+        "a continued turn keeps the default limit, not web-debug or the cap"
     );
 }
