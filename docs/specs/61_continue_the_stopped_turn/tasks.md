@@ -3,6 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md) · background in §2 of the proposal
+**Started:** 2026-10-18
 **Status:** In progress. Planned 2026-10-18; Task 1 done 2026-10-18, Task 2 done 2026-10-18, Task 3 done 2026-10-18, Task 4 done 2026-10-18, Task 5 done 2026-10-18.
 
 ## Progress

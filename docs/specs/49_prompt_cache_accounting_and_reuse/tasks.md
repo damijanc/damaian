@@ -4,7 +4,8 @@
 
 **Implements:** [`proposal.md`](proposal.md) §5.1's first slice · background and
 corrections in [`context.md`](context.md)
-**Started:** 2026-09-19 — **Done:** 2026-09-23
+**Started:** 2026-09-19 — **Done:** 2026-09-23 (the accounting slice only; the
+reuse half of the spec is not planned here and the spec stays In progress)
 
 ## Progress
 

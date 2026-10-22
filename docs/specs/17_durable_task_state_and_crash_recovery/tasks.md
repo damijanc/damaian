@@ -3,6 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md) · background in [`context.md`](context.md)
+**Started:** 2026-09-08 — **Done:** 2026-09-09
 **Status:** Done — all twelve tasks landed. See the progress table.
 
 **Goal:** Make a crash classifiable. After this lands, every task interrupted by a crash is

@@ -1,6 +1,7 @@
 # Exploration Round Allowance Implementation Plan
 
 **Implements:** [`proposal.md`](proposal.md) · background in [`context.md`](context.md)
+**Started:** 2026-10-18
 **Status:** In progress. Task 1 done 2026-10-18; tasks 2–6 remain.
 
 ## Progress

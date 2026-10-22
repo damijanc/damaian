@@ -1,6 +1,6 @@
 # Feature Spec: Model-Initiated Clarification
 
-Status: In progress (Task 1 of 8 done 2026-10-09). Split into a folder and
+Status: In progress (Tasks 1–3 of 8 done, the last on 2026-10-14). Split into a folder and
 planned on 2026-10-07. Design
 unchanged from the original flat spec. Corrections where it no longer matches
 the code, and the decisions it leaves open, are in [`context.md`](context.md),

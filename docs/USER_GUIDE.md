@@ -117,13 +117,13 @@ Commands are entered manually by the user and run directly on the local machine.
 
 ## Chat
 
-Use the `Chat` tab to ask questions about the selected repository. Damaian retrieves relevant local files, redacts detected secrets, streams the answer, and shows the context files used for the response.
+Type in the prompt box at the bottom of the window to ask questions about the selected repository. Damaian retrieves relevant local files, redacts detected secrets, streams the answer, and shows the context files used for the response.
 
 Press `Enter` to send a chat message. Press `Shift+Enter` to insert a new line.
 
 Questions stream read-only answers. Code and file change requests, such as `create a test file` or `update the README`, generate an inline patch preview in the conversation. With Worker sessions on, a request to plan, split or hand off work stays in the conversation instead (see [Worker Sessions](#worker-sessions)).
 
-Use `+ File` above the prompt to pin specific repository files into the next chat request. Pinned files appear as chips above the prompt and are included before automatic retrieval. Use the `x` on a chip to remove one file, or `Clear` to remove all pinned files.
+To pin specific repository files into the next chat request, select **+** at the bottom left of the prompt and then **Add file**, or drag files onto the window. Pinned files appear as chips above the prompt and are included before automatic retrieval. Select `×` on a chip to remove that file.
 
 If you name a file in your prompt, such as `USER_GUIDE.md` or `docs/USER_GUIDE.md`, Damaian attempts to include that file in the model context. A filename without a directory must uniquely match one file in the selected repository.
 
@@ -137,11 +137,11 @@ If the assistant needs a local command result to answer a question, it can ask D
 
 `git diff` and `git show` ask first, because they print file contents a command line cannot bound or keep restricted paths out of. The assistant reads changes through its own diff tool instead, which does both.
 
-Every other command appears as an approval card in the conversation. Review the command, risk, working directory, and reason, then select **Approve** or **Reject**. Destructive commands blocked by policy cannot be approved from the UI.
+Every other command appears as an approval card in the conversation. Review the command, risk, and working directory (the reason is under **Why this command**), then select **Approve** or **Reject**. Destructive commands blocked by policy cannot be approved from the UI.
 
 Docker commands, including `docker ps`, `docker compose ...`, and `docker-compose ...`, always ask for approval. They can inspect or change a privileged local daemon, use the network, start background services, mount host paths, expose ports, and mutate images or volumes, so Damaian never treats them as read-only.
 
-`Allow Always` runs the command and records it in your own config as `command_allowlist.<repository_id>`, so that command stops asking. The allowance covers the exact command only: allowing `npm run test:unit` does not allow `npm run test:unit --watch`, and allowing `git push` does not allow `git push --force`. It applies to that working folder alone, and not to another clone of the same project at a different path. Remove an entry by editing the `command_allowlist.<repository_id>` line in `~/Library/Application Support/DamaianClient/config/user.conf`.
+**Always allow in this project**, in the approval card's ⋯ menu, runs the command and records it in your own config as `command_allowlist.<repository_id>`, so that command stops asking. The rest of this guide, and the policy view, call this grant *Allow Always*. The allowance covers the exact command only: allowing `npm run test:unit` does not allow `npm run test:unit --watch`, and allowing `git push` does not allow `git push --force`. It applies to that working folder alone, and not to another clone of the same project at a different path. Remove an entry by editing the `command_allowlist.<repository_id>` line in `~/Library/Application Support/DamaianClient/config/user.conf`.
 
 The decision is stored in your config rather than in the repository because Damaian could not otherwise tell a command you allowed from one that arrived with the clone. A `command_allowlist` in a repository's `.damaian/config.conf` is never honoured; if a repository you open already has one, Damaian shows the exact commands once and asks which to keep.
 
@@ -153,7 +153,9 @@ Sessions are shown under their project folder in the sidebar. Select an existing
 
 Progress is shown inside the reply, not in the header. While a turn runs, a line in the assistant's message shows what it is doing ("Waiting for model", a tool's own label, "Streaming", "round 2/8", or "Generating patch" for a file-change request), how long it has been running, and **Stop** when that kind of turn can be stopped. A chat message you send can be stopped. A turn that resumes after you approve a command, a plan or a fallback offer, and a patch being generated, show the line without Stop. When a turn finishes normally, the line disappears.
 
-A turn that ends any other way leaves a mark on its message: **Stopped by you**, **Tool budget exhausted**, **Token budget exhausted**, **Stopped before finishing**, or the error itself when the request failed. The stop and budget marks are still there when you reopen the session. **Stopped before finishing** and a failure's error are shown only in the window where the turn ran; after a reload, a stopped turn reads **Stopped by you** and a failed one has no mark.
+A turn that reaches its tool-round limit (`agent_max_tool_rounds`, 8 by default) while the assistant still wants a tool does not stop: it pauses and says "Used N of M tool rounds." Select **Continue — N more** to give the same turn another set of rounds, or **Answer now** to have the assistant answer with what it has, without tools. A turn can be continued up to 64 rounds in total; at that cap only **Answer now** is offered. The pause is saved, so it is still waiting after a restart.
+
+A turn that ends any other way leaves a mark on its message: **Stopped by you**, **Tool budget exhausted** (after **Answer now**; select **Ask again** to start a new turn on the same request), **Token budget exhausted**, **Stopped before finishing**, or the error itself when the request failed. The stop and budget marks are still there when you reopen the session. **Stopped before finishing** and a failure's error are shown only in the window where the turn ran; after a reload, a stopped turn reads **Stopped by you** and a failed one has no mark.
 
 If the app cannot reach its own background service, a red banner above the conversation says **Desktop API unavailable**. It stays until a request succeeds again.
 
@@ -161,11 +163,12 @@ Context file buttons open the referenced file in Visual Studio Code.
 
 ### Agent tools for reading and navigating
 
-With native tool-calling enabled, Damaian offers the assistant four tools that
-need no approval and never touch the working folder: `read_file` (with an
-optional line range), `list_directory`, `search_content`, and `edit_file`. The
-first three only read, so they can never change a file or run a command.
-`edit_file` proposes a change to a snippet of a file, but nothing is written to
+With native tool-calling enabled, Damaian offers the assistant tools that need
+no approval and never change anything: `read_file` (with an optional line
+range), `list_directory`, `search_content`, `search_codebase`,
+`read_git_status`, `read_git_diff`, `list_worktrees`, and `read_git_log`. They
+only read, so they can never change a file or run a command. A further tool,
+`edit_file`, proposes a change to a snippet of a file, but nothing is written to
 disk — the proposal appears as a patch preview and waits for your approval, on
 the same terms as a whole-file `propose_patch`. A large file read is reported as
 a range with the file's real line count ("lines 1–400 of 4420"), so a truncated
@@ -197,8 +200,8 @@ to the turn while it runs, Stop ends it, and `command_timeout_secs` (600 by
 default) kills it if it runs too long. A repository may shorten that deadline,
 never lengthen it. When one model message asks for several read-only tools, they
 run together and their results are reported in the order the model asked for
-them. A turn that reaches its tool-round limit can continue under a token
-ceiling (`agent_max_task_tokens`) rather than stopping, and the messages it
+them. With a token ceiling set (`agent_max_task_tokens`), a turn that reaches
+its tool-round limit continues on its own instead of pausing, and the messages it
 sends are bounded by `agent_max_turn_messages` so a long turn does not grow
 without limit.
 
@@ -526,8 +529,8 @@ Use the conversation box to request file changes.
 
 1. Enter a request such as `create a test file for the config parser`.
 2. Review the inline patch preview returned by the assistant.
-3. Keep checked only the files you want to act on.
-4. Select `Apply Selected` to write those files, or `Reject Selected` to record selected files as rejected without changing the workspace.
+3. Keep checked only the files you want to act on. Each file's hunks have their own checkboxes, so you can also leave out part of a file.
+4. Select **Apply N** to write the checked changes, or **Reject** to record the checked files as rejected without changing the workspace.
 
 Damaian checks file hashes before applying a stored patch. If a target file changed after preview, that file is blocked instead of overwriting newer local work.
 
@@ -565,7 +568,7 @@ A rewind never rewrites history you can audit. The conversation moves back by ap
 
 ## Search and Export
 
-The search icon in the sidebar, beside the `+` next to `Projects`, opens a search box that finds text across the sessions of the current working folder; Escape, the button again, or a click elsewhere closes it. Type and matches appear live, each with the session title and a short snippet. Choosing one opens that session and scrolls to the matching message. Search is a plain text search — it is not code search and it is not semantic — and it defaults to the current folder, because a session from another folder can contain that folder's file contents. Search only ever reads the session log; it never changes a session.
+The search icon in the sidebar, beside the `+` next to `Projects`, opens a search box that finds text across the sessions of the current working folder; Escape, the button again, or a click elsewhere closes it. Type and matches appear live, each with the session title and a short snippet. Choosing one opens that session and scrolls to the matching message. Search is a plain text search — it is not code search and it is not semantic — and it only searches the current folder's sessions, because a session from another folder can contain that folder's file contents. Search only ever reads the session log; it never changes a session.
 
 **Export as Markdown**, in a session's ⋮ menu in the sidebar or in the conversation header's ⋮ menu for the open session, saves the conversation as Markdown. Exports contain the title, the time range, the conversation in order, what each task came to, the plan steps and their evidence, and token and cost totals.
 
@@ -624,7 +627,7 @@ A **worker** is a session that runs on its own: it gets a prompt, works in a new
 
 ## Settings
 
-Use the `Settings` tab to inspect and edit user configuration values, then select `Load`.
+Open Settings with `⌘,` or **Damaian › Settings...**; Escape or `×` closes it. It opens on **Providers**, and its other pages are General, Shortcuts, Checkpoints, MCP Servers and Models. Your user configuration is under **General › User configuration**: edit it and select **Save**, or select **Load** to re-read the file from disk.
 
 These are your user-scope settings, and they are kept in one file:
 
@@ -632,7 +635,7 @@ These are your user-scope settings, and they are kept in one file:
 ~/Library/Application Support/DamaianClient/config/user.conf
 ```
 
-Editing that file by hand does the same thing as editing it in `Settings`, which is how you configure Damaian for the CLI, where there is no `Settings` tab. Note the `config/` directory in the middle of that path, and the `.conf` name: a file dropped next to it as `config.conf` is not user config and is read by nothing.
+Editing that file by hand does the same thing as editing it in `Settings`, which is how you configure Damaian for the CLI, which has no Settings window. Note the `config/` directory in the middle of that path, and the `.conf` name: a file dropped next to it as `config.conf` is not user config and is read by nothing.
 
 Configuration uses one `key=value` entry per line. Edit values directly and select `Save`. Delete a line and save to remove that user-level override.
 
@@ -653,12 +656,12 @@ Repository-scoped settings are not edited from Settings. Put repository defaults
 
 Because that file arrives with a clone, a repository can only make Damaian *more* careful, never less:
 
-- `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
+- `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, every `language_server.<language>` key, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
 - `restricted_patterns`, `ignore_patterns`, and `command_blocklist` are added to yours rather than replacing them.
 - The `require_approval_for_*` flags can be turned on by a repository, not off. MCP and individual MCP servers can be turned off, not on.
 - `command_allowlist` is never taken from repository config; `Allow Always` writes to your own config instead. See [Chat](#chat).
-- Budgets and preferences — `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, the `agent_*` round limits, and the root overrides `project_roots_added` and `project_roots_removed` ([Repository Roots](#repository-roots)) — apply as written.
-- The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — and the repository map's `repository_map_max_tokens` (800) can be lowered by a repository but never raised. They bound how much of your repository a single tool call, or the map, puts into a model request, so raising one would widen what leaves your machine. A repository that tries is told to you like any other rejected key.
+- Budgets and preferences — `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, `agent_max_tool_rounds`, and the root overrides `project_roots_added` and `project_roots_removed` ([Repository Roots](#repository-roots)) — apply as written.
+- The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — and the repository map's `repository_map_max_tokens` (800) can be lowered by a repository but never raised. The same holds for `command_timeout_secs`, `agent_max_task_tokens`, `agent_max_turn_messages`, and `agent_max_exploration_rounds`. They bound how much of your repository a single tool call, or the map, puts into a model request, so raising one would widen what leaves your machine. A repository that tries is told to you like any other rejected key.
 
 ## Model Providers and API Keys
 
@@ -746,6 +749,7 @@ Leave a field blank to use the built-in default for the selected model. The defa
 
 - `deepseek-v4-flash` and `deepseek-v4-pro`: 65536 output tokens, 64000 context budget.
 - `deepseek-chat` and `deepseek-reasoner` (retired aliases): 8192 output tokens, 16000 context budget.
+- Other DeepSeek models: 8192 output tokens, 16000 context budget.
 - All other models: no output cap is sent, and the context budget is 16000.
 
 The built-in context budgets are deliberately well below what these models technically accept. DeepSeek's V4 models allow up to 384000 output tokens and a 1M-token context window, but requesting the maximum on every turn is rarely worth the cost. Raise the values if your repository or your patches need more.
@@ -782,8 +786,10 @@ Every finished step carries one of four outcomes:
   behind it. "Understand the retry logic" is a real step with nothing to
   measure. Damaian says so rather than implying a confirmation it does not
   have.
-- **Blocked** — a command the step ran did not succeed. The steps after it stay
-  pending: continuing would build on work that did not happen.
+- **Blocked** — a check or other command the step ran did not succeed. The
+  steps after it stay pending: continuing would build on work that did not
+  happen. A look-around command that fails, such as a `grep` with no match or an
+  `ls` of a missing path, is kept as evidence but does not block the step.
 - **Skipped** — the step was not needed.
 
 The one-line summary at the top of the panel **never says "complete" while any
@@ -838,8 +844,8 @@ leaves a button with nothing attached to it.
 - **Inspecting a local page** (`localhost`, `127.0.0.1`, `[::1]`) runs
   without asking. It only opens the page and reads it.
 - **A scenario on a local page** asks first, because it types and clicks. The
-  prompt shows the steps and the target origin. **Allow browser diagnostics
-  for this session** covers later local scenarios in the same session.
+  prompt shows the steps and the target origin. **Allow for this session**, in
+  the card's ⋯ menu, covers later local scenarios in the same session.
 - **Anything outside your machine**, whether an inspection or a scenario, asks
   every time and shows the origin it will reach. The session option never
   covers a remote URL.
@@ -1002,11 +1008,11 @@ and the reply names what was finished and what was left. Nothing is lost:
 raise the cap and ask again, and the turn picks the plan up where it stopped,
 keeping the evidence its earlier steps had already gathered.
 
-This is different from **Tool budget exhausted**, which means the work needed
-more tool rounds than `agent_max_tool_rounds` allows. One ran out of rounds;
-the other ran out of money.
+This is different from **Tool budget exhausted**, which means the turn used its
+tool rounds and you chose **Answer now**. One ran out of rounds; the other ran
+out of money.
 
-A repository's own `.damaian/config.toml` may only tighten this cap: it can
+A repository's own `.damaian/config.conf` may only tighten this cap: it can
 lower one you set, or introduce one where you had none, but it can never raise
 or remove yours. A repository you cloned cannot widen what an agent may spend
 on your machine.
@@ -1016,7 +1022,7 @@ on your machine.
 Every assistant reply carries a line underneath it saying what the turn used:
 
 ```text
-~12,714 tokens (estimated) · 3 model calls
+12,714 tokens · 3 model calls
 ```
 
 The count covers the whole turn, not the last request. A turn that used tools
@@ -1040,8 +1046,9 @@ exact; treat it as a rough scale, not a bill.
 ### Showing a cost
 
 Damaian ships no price list. Prices change, and a stale table would report
-confident wrong numbers. If you want a cost figure, give it your own rates —
-per million tokens, in whatever currency you are billed in:
+confident wrong numbers. If you want a cost figure, give it your own rates per
+million tokens. The figure is always shown with a `$` sign, so enter your
+rates in US dollars:
 
 ```text
 model_provider.deepseek.price_per_million_input_tokens=0.27
@@ -1071,7 +1078,7 @@ Where a provider serves part of a request's input tokens from its own prompt
 cache and reports the split, the turn's usage line adds a hit rate:
 
 ```text
-~12,714 tokens (estimated) · 3 model calls · at most $0.0018 at your rates · 75% cached
+12,714 tokens · 3 model calls · at most $0.0018 at your rates · 75% cached
 ```
 
 **The hit count is measured only — never estimated.** There is no way to

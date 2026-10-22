@@ -4,7 +4,8 @@ Status: In progress (started 2026-10-17). Tasks 1–5 of 6 are done: registered
 worktrees are resolved and refused (§5.1), the git reads are hardened (§5.4),
 the five read tools take `worktree` (§5.3), `list_worktrees` and
 `read_git_log` are live (§5.2), and the `worktree_survey` eval scenario passes
-(§5.7). Plan and progress in
+(§5.7). Task 6 is in progress since 2026-10-19: its docs and
+cross-references are merged; the live re-run, CI and the close-out remain. Plan and progress in
 [`tasks.md`](tasks.md). Specified on 2026-10-17 from the same
 session as [#59](../59_exploration_round_allowance/proposal.md), after it was
 continued three times and still did not finish: 35 of its 40 approval prompts
