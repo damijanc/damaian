@@ -11,6 +11,12 @@
 // A tag whose range contains no commits is omitted entirely: it recorded no
 // change, so it is not a release worth a heading.
 //
+// Merge commits are skipped. Their subjects name a branch or a task ("Merge
+// branch 'worktree-spec25-task3'"), not a change, and the commits they merge
+// are in the same range and listed on their own. Skipping is decided by
+// parent count, not by the word "Merge", so a commit that merely says "merge"
+// is kept.
+//
 // The generated prose is your commit subjects, tidied. That is the point — the
 // one-line commit convention in AGENTS.md is what makes this readable. Edit a
 // section afterwards if a release deserves better than its commit log; the
@@ -134,7 +140,7 @@ function commitsBetween(from, to) {
   // to split on and is not worth it: the formatter rewrites the escape into a
   // literal invisible byte in this file, which is a trap for whoever reads it
   // next. A subject cannot contain a newline, so the first space is enough.
-  const raw = git("log", "--format=%H %s", range);
+  const raw = git("log", "--no-merges", "--format=%H %s", range);
   return raw
     .split("\n")
     .filter((line) => line.trim())
