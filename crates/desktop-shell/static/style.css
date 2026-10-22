@@ -5,7 +5,7 @@
   --surface-soft: #fbfbfa;
   --sidebar: #f0f0ed;
   --ink: #1f2428;
-  --muted: #6c737f;
+  --muted: #646b77;
   --line: #deded8;
   --line-strong: #c8c8c0;
   --accent: #176b5d;
@@ -814,7 +814,7 @@ button:disabled {
   padding: 10px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: var(--panel, #ffffff);
+  background: var(--surface);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.12);
 }
 
@@ -940,7 +940,7 @@ button:disabled {
   overflow: hidden;
   padding: 7px 8px;
   color: var(--muted);
-  font-family: var(--mono);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2782,7 +2782,7 @@ button:disabled {
   align-items: center;
   gap: 8px;
   font-size: 12px;
-  color: var(--text);
+  color: var(--ink);
 }
 
 .field-checkbox input {
@@ -3846,7 +3846,7 @@ body.worker-view #chat-model-menu {
 .app-dialog-checkitem code {
   flex: 1 1 auto;
   overflow-wrap: anywhere;
-  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .app-dialog-title {

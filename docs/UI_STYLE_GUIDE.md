@@ -55,7 +55,7 @@ Defined on `:root` in `style.css`. Use the token, never the literal.
 | `--surface-soft` | `#fbfbfa` | Recessed areas within a surface |
 | `--sidebar` | `#f0f0ed` | Sidebar background |
 | `--ink` | `#1f2428` | Primary text |
-| `--muted` | `#6c737f` | Secondary text, quiet controls |
+| `--muted` | `#646b77` | Secondary text, quiet controls |
 | `--line` | `#deded8` | Dividers, low-emphasis borders |
 | `--line-strong` | `#c8c8c0` | Control borders |
 | `--accent` | `#176b5d` | Primary actions, focus |
@@ -134,12 +134,16 @@ scale.
 - Focus is always visible: `box-shadow: 0 0 0 3px var(--accent-soft)` with
   `border-color: var(--accent)`. Never remove the focus ring to tidy a layout.
 
-**Contrast floors** (measured against `--surface`)
+**Contrast floors**
 
 - White on `--accent` — 6.4:1. Passes AA for all sizes.
 - `--danger` on `--surface` — 6.6:1. Passes AA for all sizes.
-- `--muted` on white — 4.8:1. Passes AA for normal text, with little headroom.
-  `.btn-quiet` text must not be lightened past `--muted`.
+- `--muted` is the floor for secondary text, and it sits on every background,
+  so it is measured against each: 5.4:1 on `--surface`, 5.0:1 on `--bg`, 4.7:1
+  on `--sidebar` (the sidebar and the repo bar), and 4.7:1 on `--accent-soft`
+  (your own messages, hovered search results, a pressed terminal toggle). All pass AA for normal text. The weakest pair sets the
+  limit: `--muted` must not be lightened, and secondary text must not be put on
+  a background darker than `--sidebar`, without re-measuring.
 
 ---
 
