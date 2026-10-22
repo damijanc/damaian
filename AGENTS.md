@@ -807,7 +807,7 @@ A development package may be ad-hoc signed rather than Developer ID signed and n
 
 Gatekeeper blocking first launch is therefore not automatically a packaging bug.
 
-Read [docs/MACOS_INSTALLATION.md](docs/MACOS_INSTALLATION.md) before attempting to change signing behavior.
+Read [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#build-a-macos-dmg) (local builds) and [docs/MACOS_INSTALLATION.md](docs/MACOS_INSTALLATION.md) (releases) before attempting to change signing behavior.
 
 ### Vendored terminal assets
 

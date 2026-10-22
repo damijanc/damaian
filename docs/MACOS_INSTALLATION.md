@@ -1,112 +1,69 @@
 # macOS Installation
 
-This document covers installing Damaian on macOS.
+This document covers installing a released build of Damaian. To build it from
+source instead, see [Development](DEVELOPMENT.md).
 
 ## System Requirements
 
-- macOS 14 Sonoma or newer recommended.
+- A Mac with Apple Silicon. Release builds are made for Apple Silicon only.
+- macOS 14 Sonoma or newer.
 - Git installed and available on the command line.
-- Network access only when calling a configured model provider.
-- A local Git repository you want Damaian to inspect.
+- An API key for a supported model provider (OpenAI, DeepSeek, or any
+  OpenAI-compatible endpoint), or a local Ollama.
 
-## Install From DMG
+## Install
 
-Download the DMG from the GitHub Release page, or use a DMG you built locally.
-
-1. Open the downloaded `Damaian_<version>_*.dmg` file.
-2. Drag `Damaian.app` into `Applications`.
+1. Download `Damaian_<version>_aarch64.dmg` from the
+   [latest release](https://github.com/damijanc/damaian/releases/latest).
+2. Open the DMG and drag `Damaian.app` into `Applications`.
 3. Eject the mounted disk image.
 4. Open `Damaian` from `Applications`.
 
-## Signing and Gatekeeper
+Release builds are Developer ID signed and notarized, so macOS opens them
+without a Gatekeeper prompt. If macOS warns that the developer cannot be
+verified, or says the app is damaged, do not work around it: download the DMG
+again from the release page, and if the warning persists, report it as an
+issue.
 
-Release DMGs are Developer ID signed, notarized and stapled, and the release
-workflow fails closed if any of that does not verify. A downloaded release
-should open without a Gatekeeper prompt.
+## First Steps
 
-If macOS does warn that the developer cannot be verified, you are almost
-certainly running a locally built DMG — local builds are ad-hoc signed unless
-you supply signing credentials. To open one:
+1. Open Settings with `⌘,` (or **Damaian › Settings...**). It opens on
+   **Providers**.
+2. Pick one of the **Popular providers**, or select **New** for another
+   OpenAI-compatible endpoint. Under **Provider details**, paste your key into
+   **API Key**; Damaian stores it in the macOS Keychain and keeps only a
+   reference to it in its config. Turn on **Native tool-calling**: without it
+   the assistant can answer questions but cannot propose file changes or use
+   tools. Select **Save Provider**.
+3. Close Settings, select `+` beside **Projects**, and pick the local Git
+   repository you want to work in.
+4. Ask a question in the prompt box.
 
-1. Open `System Settings`.
-2. Go to `Privacy & Security`.
-3. Find the blocked `Damaian` launch message.
-4. Select `Open Anyway`.
-5. Confirm the launch prompt.
-
-Only do this for builds you created yourself or received from a trusted source.
-A *release* build should never need it; if one does, treat that as a signing
-problem worth reporting rather than something to click through.
-
-You can also open a locally built app from Finder:
-
-1. Open `Applications` in Finder.
-2. Control-click `Damaian.app`.
-3. Select `Open`.
-4. Confirm the launch prompt.
-
-For a local build you created yourself, you can remove the quarantine attribute from Terminal:
-
-```sh
-xattr -dr com.apple.quarantine /Applications/Damaian.app
-open /Applications/Damaian.app
-```
-
-Do not remove quarantine from apps downloaded from sources you do not trust.
-
-If macOS says the application is damaged, the bundle signature did not verify. Replace it with a current release build rather than working around the warning.
+The [User Guide](USER_GUIDE.md) covers everything from there.
 
 ## Updates
 
-Damaian checks GitHub Releases for updates when the desktop app starts, and on demand from **Damaian › Check for Updates...**. If a newer signed release is available, the button at the bottom of the sidebar changes to `Update <version>`. Select it and confirm **Install**: Damaian downloads the update, verifies its updater signature, and installs it. Quit and reopen Damaian to finish.
+Damaian checks GitHub Releases for updates when it starts, and on demand from
+**Damaian › Check for Updates...**. When a newer release is available, the
+button at the bottom of the sidebar changes to `Update <version>`. Select it and
+confirm **Install**: Damaian downloads the update, verifies its signature, and
+installs it. Quit and reopen Damaian to finish.
 
-Automatic updates require a build that already includes the updater. If you installed an older developer-preview DMG before automatic updates were added, replace it manually with a newer DMG once.
+## If Damaian Does Not Start
 
-## Selecting a Working Folder
+- **"refuses to start because 127.0.0.1:4765 is already in use"**: Damaian
+  serves its interface on that local port, and another program, or another
+  copy of Damaian, already holds it. Quit the other program and try again.
+- **"Damaian cannot use its data directory"**: the data directory was written
+  by a newer version of Damaian. Install the latest release.
 
-Select `+` beside `Projects` to open the native macOS folder picker. Pick the local Git repository or working folder you want Damaian to inspect. The folder appears under `Projects`, and its chat sessions are grouped underneath it. Use the `+` beside a project folder to start a new session for that project.
-
-Use the conversation header's ⋮ menu, **Open in › VS Code**, to open the selected working folder in Visual Studio Code. Damaian keeps AI orchestration and safety controls in the app while code navigation and IDE work happen in VS Code.
-
-Select the terminal icon in the conversation header to open the bottom terminal panel. It starts in the selected working folder, or in your home directory when no folder is selected yet.
-
-## Model API Key
-
-The packaged desktop app can store model credentials in macOS Keychain from Settings.
-
-1. Open Settings.
-2. Configure `model_base_url` and `model_name`.
-3. Enter a Keychain account name such as `model-api-key`.
-4. Paste the API key into `API Key`.
-5. Select `Save Key`.
-
-Damaian stores the secret in Keychain and writes only a reference such as this to user config:
-
-```text
-model_api_key_env=keychain:model-api-key
-```
-
-Environment variables are still supported for CLI and development workflows. In that mode, set `model_api_key_env` to an environment variable name, such as `OPENAI_API_KEY`, before launching.
-
-Repository config can still be provided manually at `.damaian/config.conf`, but it cannot change the model connection: `model_api_key_env`, `model_base_url`, `model_provider`, `model_name`, and `model_reasoning_level` are ignored there, so the Keychain reference shown above stands whatever a cloned repository asks for. See [Repository Config Trust Boundary](../SECURITY.md#repository-config-trust-boundary).
-
-Do not paste raw API keys into config files. `model_api_key_env` must be a Keychain reference or an environment variable name.
+[Troubleshooting](TROUBLESHOOTING.md) covers other failures.
 
 ## Uninstall
 
 1. Quit Damaian.
 2. Delete `Damaian.app` from `Applications`.
-3. Delete any local Damaian data directory you configured for testing, such as `.damaian` in a repository.
-
-## Package Contents
-
-The installer contains:
-
-- `Damaian.app`: Native Tauri desktop wrapper.
-- Local workspace engine: Repository indexing, file access, patch preview/apply, Git status, and audit logging.
-- Embedded static UI: Chat, inline patch preview, terminal panel, settings, and Visual Studio Code handoff.
-
-## Current Limitations
-
-- Repository selection uses a native folder picker from the Projects sidebar.
-- The app uses a local in-process server on `127.0.0.1:4765` as the temporary bridge between Tauri and the workspace engine.
+3. To remove your sessions, settings and audit log too, delete
+   `~/Library/Application Support/DamaianClient`.
+4. To remove stored API keys, open **Keychain Access** and delete the items
+   whose name is `DamaianClient`.

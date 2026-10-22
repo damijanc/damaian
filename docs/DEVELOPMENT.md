@@ -201,9 +201,27 @@ Artifacts are written to:
 - `target/release/bundle/macos/Damaian.app`
 - `target/release/bundle/dmg/Damaian_<version>_aarch64.dmg`
 
-The developer-preview package is ad-hoc signed for bundle integrity but is not
-Developer ID signed or notarized. See [macOS Installation](MACOS_INSTALLATION.md)
-for the first-launch steps macOS requires.
+This package is ad-hoc signed for bundle integrity but is not Developer ID
+signed or notarized, and neither is a DMG from a manually triggered `preview`
+run of the release workflow (below). Gatekeeper blocks the first launch of
+either. That is expected, not a packaging bug. To open a build you made or
+trust:
+
+1. Try to open `Damaian.app` once, and dismiss the warning.
+2. Open **System Settings › Privacy & Security**.
+3. Find the message about `Damaian` being blocked and select **Open Anyway**.
+4. Confirm the launch prompt.
+
+Or remove the quarantine attribute from Terminal:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Damaian.app
+open /Applications/Damaian.app
+```
+
+Control-click → **Open** no longer bypasses Gatekeeper on macOS 15 and later.
+Never do any of this for an app from a source you do not trust, or for a
+release build: a release that needs it has a signing problem worth reporting.
 
 `npm run desktop:build` is the stable path and does **not** default the signing
 identity. With no `APPLE_SIGNING_IDENTITY` in the environment it produces an

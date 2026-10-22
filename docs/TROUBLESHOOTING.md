@@ -1810,7 +1810,7 @@ on anything you configured.
 Release DMGs are Developer ID signed and notarized, so they open without a
 Gatekeeper prompt. A blocked first launch usually means a DMG built locally or
 by a manually triggered preview run, which is ad-hoc signed. That is expected,
-not a bug; the workaround is in [macOS Installation](MACOS_INSTALLATION.md). Do
+not a bug; the workaround is in [Development](DEVELOPMENT.md#build-a-macos-dmg). Do
 not try to "fix" it in code.
 
 ### The quality gate is slow locally
