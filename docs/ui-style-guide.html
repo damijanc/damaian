@@ -976,6 +976,153 @@ error[E0308]: mismatched types
     </section>
 
     <section class="sg-section">
+      <h2>Worker sessions</h2>
+      <p class="sg-hint">
+        Spec 57 (guide §4, Worker sessions). One status dot across the sidebar, the board and the
+        strip; the dot never carries its state alone.
+      </p>
+      <div class="sg-grid">
+        <span class="sg-rowlabel">Status dots</span>
+        <div class="sg-row">
+          <span class="worker-dot" data-state="running" role="img" aria-label="Running" title="Running"></span>Running
+          <span class="worker-dot" data-state="needs-you" role="img" aria-label="Needs you" title="Needs you"></span>Needs you
+          <span class="worker-dot" data-state="paused" role="img" aria-label="Paused" title="Paused"></span>Paused
+          <span class="worker-dot" data-state="finished" role="img" aria-label="Finished" title="Finished"></span>Finished
+          <span class="worker-dot" data-state="failed" role="img" aria-label="Failed" title="Failed"></span>Failed
+        </div>
+
+        <span class="sg-rowlabel">Sidebar</span>
+        <div style="width: 280px; padding: 8px; background: var(--sidebar); border-radius: 8px">
+          <button type="button" class="project-workers-entry" aria-label="Workers, 1 need you">
+            <span>Workers</span><span class="workers-badge">1</span>
+          </button>
+          <div class="session-item project-session-item project-worker-item nested">
+            <button type="button" class="project-session-open project-worker-open">
+              <span class="worker-dot" data-state="needs-you" role="img" aria-label="Needs you" title="Needs you"></span>
+              <span class="project-worker-title">Add retry to the fetch client</span>
+            </button>
+            <button type="button" class="project-menu-btn project-session-menu-btn" aria-label="More options for worker Add retry to the fetch client" aria-haspopup="menu" aria-expanded="false">
+              <span class="dots-icon" aria-hidden="true"></span>
+            </button>
+          </div>
+        </div>
+
+        <span class="sg-rowlabel">Worker strip</span>
+        <div style="display: grid; gap: 8px; max-width: 720px">
+          <div class="worker-strip">
+            <span class="worker-pill" data-state="running"><span class="worker-dot" data-state="running" aria-hidden="true"></span>Running</span>
+            <span class="worker-round"><span class="workers-rounds-bar" aria-hidden="true"><span style="width: 38%"></span></span>Round 3/8</span>
+            <span class="worker-strip-note" title="Note received: keep the public API unchanged">Note received: keep the public API unchanged</span>
+            <div class="inline-actions worker-strip-actions">
+              <button type="button" class="btn-sm">Pause</button>
+              <button type="button" class="btn-sm btn-danger">Stop</button>
+            </div>
+          </div>
+          <div class="worker-strip">
+            <span class="worker-pill" data-state="paused"><span class="worker-dot" data-state="paused" aria-hidden="true"></span>Paused</span>
+            <span class="worker-round"><span class="workers-rounds-bar" aria-hidden="true"><span style="width: 50%"></span></span>Round 4/8</span>
+            <div class="inline-actions worker-strip-actions">
+              <button type="button" class="btn-sm btn-primary">Resume</button>
+              <button type="button" class="btn-sm btn-danger">Stop</button>
+            </div>
+          </div>
+        </div>
+
+        <span class="sg-rowlabel">Composer button</span>
+        <div class="sg-row">
+          <button type="button" class="send-button is-worker-command" aria-label="Send note">Send note</button>
+          <button type="button" class="send-button is-worker-command" aria-label="Resume with note">Resume with note</button>
+          <button type="button" class="send-button is-worker-command" aria-label="Send message">Send message</button>
+        </div>
+
+        <span class="sg-rowlabel">Parent conversation</span>
+        <div>
+          <div class="worker-prompt-footer" style="margin: 0">
+            <button type="button" class="btn-sm">Start worker</button>
+            <button type="button" class="worker-link">Started <em>Add retry to the fetch client</em></button>
+          </div>
+          <p class="worker-spawned-entry">
+            <button type="button" class="worker-link">Spawned worker <em>Add retry to the fetch client</em></button>
+          </p>
+        </div>
+      </div>
+
+      <div class="workers-board" style="padding: 18px 0 0">
+        <table class="workers-table">
+          <thead>
+            <tr>
+              <th scope="col"><span class="visually-hidden">Status</span></th>
+              <th scope="col">Worker</th>
+              <th scope="col">Planner</th>
+              <th scope="col">Rounds</th>
+              <th scope="col">Doing</th>
+              <th scope="col">Elapsed</th>
+              <th scope="col"><span class="visually-hidden">Actions</span></th>
+            </tr>
+          </thead>
+          <tbody class="workers-group" data-group="needs_you">
+            <tr><th scope="rowgroup" colspan="7">Needs you · 1</th></tr>
+            <tr class="workers-row" data-state="needs-you">
+              <td class="workers-cell-dot"><span class="worker-dot" data-state="needs-you" role="img" aria-label="Needs you" title="Needs you"></span></td>
+              <td class="workers-cell-worker"><span class="workers-title">Add retry to the fetch client</span><span class="workers-branch">damaian/add-retry</span></td>
+              <td class="workers-cell-planner">Plan the networking work</td>
+              <td class="workers-cell-rounds"><span class="workers-rounds-bar" aria-hidden="true"><span style="width: 50%"></span></span><span>4/8</span></td>
+              <td class="workers-cell-doing"><span class="workers-doing">Waiting for approval: cargo test -p net</span></td>
+              <td class="workers-cell-elapsed">6m</td>
+              <td class="workers-cell-actions">
+                <button type="button" class="btn-sm">Review</button><button type="button" class="btn-icon workers-menu-btn" aria-label="More options for worker Add retry to the fetch client" aria-haspopup="menu" aria-expanded="false"><span class="dots-icon" aria-hidden="true"></span></button>
+              </td>
+            </tr>
+          </tbody>
+          <tbody class="workers-group" data-group="running">
+            <tr><th scope="rowgroup" colspan="7">Running · 1</th></tr>
+            <tr class="workers-row" data-state="running">
+              <td class="workers-cell-dot"><span class="worker-dot" data-state="running" role="img" aria-label="Running" title="Running"></span></td>
+              <td class="workers-cell-worker"><span class="workers-title">Document the config keys</span><span class="workers-branch">damaian/config-docs</span></td>
+              <td class="workers-cell-planner">Plan the networking work</td>
+              <td class="workers-cell-rounds"><span class="workers-rounds-bar" aria-hidden="true"><span style="width: 25%"></span></span><span>2/8</span></td>
+              <td class="workers-cell-doing"><span class="workers-doing">Reading docs/USER_GUIDE.md</span></td>
+              <td class="workers-cell-elapsed">2m</td>
+              <td class="workers-cell-actions">
+                <button type="button" class="btn-sm">Pause</button><button type="button" class="btn-icon workers-menu-btn" aria-label="More options for worker Document the config keys" aria-haspopup="menu" aria-expanded="false"><span class="dots-icon" aria-hidden="true"></span></button>
+              </td>
+            </tr>
+          </tbody>
+          <tbody class="workers-group" data-group="finished">
+            <tr><th scope="rowgroup" colspan="7">Finished · 2</th></tr>
+            <tr class="workers-row" data-state="finished">
+              <td class="workers-cell-dot"><span class="worker-dot" data-state="finished" role="img" aria-label="Finished" title="Finished"></span></td>
+              <td class="workers-cell-worker"><span class="workers-title">Rename the session store</span><span class="workers-branch">damaian/rename-store</span></td>
+              <td class="workers-cell-planner is-empty">—</td>
+              <td class="workers-cell-rounds"><span class="workers-rounds-bar" aria-hidden="true"><span style="width: 75%"></span></span><span>6/8</span></td>
+              <td class="workers-cell-doing"><span class="workers-doing">Done</span><span class="workers-meta">4 files changed · 1 commit ahead</span></td>
+              <td class="workers-cell-elapsed">14m</td>
+              <td class="workers-cell-actions">
+                <button type="button" class="btn-sm">Open</button><button type="button" class="btn-icon workers-menu-btn" aria-label="More options for worker Rename the session store" aria-haspopup="menu" aria-expanded="false"><span class="dots-icon" aria-hidden="true"></span></button>
+              </td>
+            </tr>
+            <tr class="workers-row" data-state="failed">
+              <td class="workers-cell-dot"><span class="worker-dot" data-state="failed" role="img" aria-label="Failed" title="Failed"></span></td>
+              <td class="workers-cell-worker"><span class="workers-title">Upgrade the HTTP client</span><span class="workers-branch">damaian/http-upgrade</span></td>
+              <td class="workers-cell-planner is-empty">—</td>
+              <td class="workers-cell-rounds is-empty">—</td>
+              <td class="workers-cell-doing"><span class="workers-doing">Interrupted: its process ended mid-turn</span></td>
+              <td class="workers-cell-elapsed">31m</td>
+              <td class="workers-cell-actions">
+                <button type="button" class="btn-sm">Open</button><button type="button" class="btn-icon workers-menu-btn" aria-label="More options for worker Upgrade the HTTP client" aria-haspopup="menu" aria-expanded="false"><span class="dots-icon" aria-hidden="true"></span></button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="sg-note">
+        The board, grouped by state: one unfilled action per row plus the ⋮ menu. A failed row's
+        Doing text turns <code>--danger</code>. The worker strip shows running and paused; an
+        ended worker shows only Restart worker.
+      </p>
+    </section>
+
+    <section class="sg-section">
       <h2>Effective policy table</h2>
       <p class="sg-hint">
         Settings › General. Consecutive list entries from one source share a row. A refused

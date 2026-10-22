@@ -141,9 +141,10 @@ scale.
 - `--muted` is the floor for secondary text, and it sits on every background,
   so it is measured against each: 5.4:1 on `--surface`, 5.0:1 on `--bg`, 4.7:1
   on `--sidebar` (the sidebar and the repo bar), and 4.7:1 on `--accent-soft`
-  (your own messages, hovered search results, a pressed terminal toggle). All pass AA for normal text. The weakest pair sets the
-  limit: `--muted` must not be lightened, and secondary text must not be put on
-  a background darker than `--sidebar`, without re-measuring.
+  (your own messages, hovered search results, a pressed terminal toggle). All
+  pass AA for normal text. The weakest pair sets the limit: `--muted` must not
+  be lightened, and secondary text must not be put on a background darker than
+  `--sidebar`, without re-measuring.
 
 ---
 
@@ -270,6 +271,76 @@ group. Two rules matter:
 - **The action anchors the right edge and does not move.** Settings grow
   leftward as their values lengthen, so the button the user aims at is always
   in the same place — including when it changes into Stop mid-turn.
+
+### Worker sessions
+
+Worker sessions ([spec 57](specs/57_worker_sessions/proposal.md) §5.7) appear
+on four surfaces — the sidebar, the Workers board, the strip at the top of a
+worker's own session, and its composer — and all four share one status mark.
+
+**The status dot.** `.worker-dot` is an 8px circle whose `data-state` picks its
+look. State colours only (§2):
+
+| `data-state` | Look | Means |
+|---|---|---|
+| `running` | `--accent` fill | A turn is in progress |
+| `needs-you` | `--warn` fill | Waiting for an approval |
+| `paused` | Hollow, 1.5px `--warn` ring | Paused: it needs you, but it is not asking |
+| `finished` | `--line-strong` fill | Idle, or ended cleanly |
+| `failed` | `--danger` fill | Failed, interrupted, or its outcome is unknown |
+
+- **Finished is neutral, not `--ok`.** Green beside the accent reads as a
+  second "running".
+- **The dot never carries the state alone.** In the sidebar and on the board it
+  is `role="img"` with an `aria-label` and `title` naming the state; in the
+  strip it sits inside `.worker-pill` beside the state's text and is
+  `aria-hidden`. Keep it that way: the finished dot is about 1.5:1 against
+  `--sidebar`, too faint to be the only signal.
+
+**Sidebar.** A project with workers gets a `.project-workers-entry` ("Workers")
+at the top of its sessions, with a `.workers-badge` counting the workers that
+need you — white on `--warn`, 5.2:1. A worker's session is listed under the
+session that started it as `.project-worker-item.nested`, indented one 14px
+step, with its dot where a child's bullet would be.
+
+**The Workers board.** `.workers-board` takes the conversation's place: while
+`body.workers-board-open` is set, the log, the composer and the worker strip
+are hidden, and the board uses the conversation gutters (§6). Its
+`.workers-table` is grouped into one `tbody.workers-group` per state — *Needs
+you*, *Running*, *Finished* — each headed by an uppercase eyebrow row with its
+count. Columns: dot, worker (title, then its branch in muted monospace),
+planner, rounds (`.workers-rounds-bar`, 48×4px, `--accent` on `--line`, then
+`n/m`), what it is doing, elapsed time, and actions.
+
+- **One `.btn-sm` per row, unfilled** — *Review* when it needs you, *Pause*
+  while it runs, otherwise *Open* — plus the ⋮ menu (§4) with *Reveal worktree
+  in Finder*, *Dismiss from board* and, last, *Stop*. A board is many surfaces
+  at once, so no row takes a fill.
+- Text cells truncate on one line; the board redraws only when what it shows
+  changed, so a focused button or open menu is not replaced every second.
+
+**The worker strip.** `.worker-strip` sits under the header of a worker's own
+session: one row at least 40px tall, on `--surface-soft`. Left to right: the
+`.worker-pill` (dot and state), `.worker-round` (the rounds bar and
+*Round n/m*), an optional `.worker-strip-note` that truncates, and
+`.worker-strip-actions` pushed right. The actions follow §4: *Pause* is a
+`.btn-sm`, *Resume* is the one `.btn-primary`, *Stop* is `.btn-danger`; an
+ended worker shows only *Restart worker*.
+
+**The worker's composer.** The round send button becomes
+`.send-button.is-worker-command`, a labelled pill that says what it sends —
+*Send note* while running, *Resume with note* while paused, *Send message*
+when idle — and stays the row's one filled control. `body.worker-view` hides
+the attach and model menus, because neither reaches a worker.
+
+**In the parent conversation.** A `worker-prompt` code block gets a
+`.worker-prompt-footer` under it: a *Start worker* `.btn-sm`, then a
+`.worker-link` (accent text, no button chrome) to each worker it started. A
+`.worker-spawned-entry`, one quiet `--muted` line, follows the message. The
+*New worker* dialog is `.app-dialog-worker`, 640px wide because the prompt is
+its content, edited in a monospace `.worker-dialog-prompt`. When the working
+tree has uncommitted changes, `.worker-dialog-dirty` (a `--warn` left border on
+`--surface-soft`) names them and asks whether the worker starts from them.
 
 ---
 
