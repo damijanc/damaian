@@ -58,7 +58,7 @@ If macOS says the application is damaged, the bundle signature did not verify. R
 
 ## Updates
 
-Damaian checks GitHub Releases for updates when the desktop app starts. If a newer signed release is available, an `Update <version>` button appears in the conversation header. Select it to download the update, verify its updater signature, install it, and restart the app.
+Damaian checks GitHub Releases for updates when the desktop app starts, and on demand from **Damaian › Check for Updates...**. If a newer signed release is available, the button at the bottom of the sidebar changes to `Update <version>`. Select it and confirm **Install**: Damaian downloads the update, verifies its updater signature, and installs it. Quit and reopen Damaian to finish.
 
 Automatic updates require a build that already includes the updater. If you installed an older developer-preview DMG before automatic updates were added, replace it manually with a newer DMG once.
 
@@ -66,7 +66,7 @@ Automatic updates require a build that already includes the updater. If you inst
 
 Select `+` beside `Projects` to open the native macOS folder picker. Pick the local Git repository or working folder you want Damaian to inspect. The folder appears under `Projects`, and its chat sessions are grouped underneath it. Use the `+` beside a project folder to start a new session for that project.
 
-Select the Visual Studio Code icon in the conversation header to open the selected working folder in Visual Studio Code. Damaian keeps AI orchestration and safety controls in the app while code navigation and IDE work happen in VS Code.
+Use the conversation header's ⋮ menu, **Open in › VS Code**, to open the selected working folder in Visual Studio Code. Damaian keeps AI orchestration and safety controls in the app while code navigation and IDE work happen in VS Code.
 
 Select the terminal icon in the conversation header to open the bottom terminal panel. It starts in the selected working folder, or in your home directory when no folder is selected yet.
 

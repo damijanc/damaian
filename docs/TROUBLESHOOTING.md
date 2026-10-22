@@ -1667,9 +1667,11 @@ on anything you configured.
 
 ### The packaged app will not launch
 
-Expected, not a bug. The developer preview is ad-hoc signed, not Developer ID
-signed or notarized, so Gatekeeper blocks first launch. The workaround is in
-[macOS Installation](MACOS_INSTALLATION.md). Do not try to "fix" it in code.
+Release DMGs are Developer ID signed and notarized, so they open without a
+Gatekeeper prompt. A blocked first launch usually means a DMG built locally or
+by a manually triggered preview run, which is ad-hoc signed. That is expected,
+not a bug; the workaround is in [macOS Installation](MACOS_INSTALLATION.md). Do
+not try to "fix" it in code.
 
 ### The quality gate is slow locally
 

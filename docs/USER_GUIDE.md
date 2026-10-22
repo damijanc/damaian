@@ -2,7 +2,7 @@
 
 Damaian is a local-first AI coding assistant for macOS. It indexes a local Git repository, prepares focused context for coding questions, previews generated edits as diffs, and records local audit data.
 
-This build is a developer preview. It is usable for local workflows and can offer signed in-app updates from GitHub Releases, but it is not yet Developer ID signed or notarized.
+This build is a developer preview. Release builds are Developer ID signed and notarized, and update themselves from GitHub Releases. The feature set is still moving, and configuration and stored data may change shape between releases.
 
 ## First Run
 
@@ -13,7 +13,7 @@ This build is a developer preview. It is usable for local workflows and can offe
 
 ## Updates
 
-Damaian checks for updates when the desktop app starts. If a newer GitHub Release is available, an `Update <version>` button appears in the conversation header. Select it to download the signed update, install it, and restart the app.
+Damaian checks for updates when the desktop app starts, and on demand from **Damaian › Check for Updates...**. If a newer GitHub Release is available, the button at the bottom of the sidebar changes to `Update <version>`. Select it and confirm **Install** to download and install the signed update, then quit and reopen Damaian to finish.
 
 The first installed version must already include the updater. If you installed an older developer-preview DMG before automatic updates were added, download and install one newer DMG manually once.
 
@@ -133,11 +133,13 @@ under their directory, and more specific nested instructions override broader
 ones. These instructions are sent for chat answers and edit proposals, but they
 do not override your request or Damaian's safety policy.
 
-If the assistant needs a local command result to answer a question, it can request one command from Damaian. Sandbox-safe read-only commands, such as `pwd`, `ls`, `git status`, `git diff`, `git log`, and `git show`, run automatically in the selected working folder. Damaian redacts the output and sends it back to the model so it can finish answering.
+If the assistant needs a local command result to answer a question, it can ask Damaian to run commands. Read-only commands Damaian recognises, such as `pwd`, `ls`, `git status`, and `git log`, run without asking, in the selected working folder. They are not sandboxed: they run directly on your machine, which is why only commands Damaian classifies as read-only qualify. Simple pipelines made only of such commands, filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, or `grep`, also run without asking. Damaian redacts the output and sends it back to the model so it can finish answering.
 
-Commands that cannot run in sandbox mode appear as an approval card in the conversation. Review the command, risk, working directory, and reason, then select `Approve Run` or `Reject`. Destructive commands blocked by policy cannot be approved from the UI.
+`git diff` and `git show` ask first, because they print file contents a command line cannot bound or keep restricted paths out of. The assistant reads changes through its own diff tool instead, which does both.
 
-Docker commands, including `docker ps`, `docker compose ...`, and `docker-compose ...`, are approval-gated by default. They can inspect or change a privileged local daemon, use the network, start background services, mount host paths, expose ports, and mutate images or volumes, so Damaian never treats them as automatically sandbox-safe.
+Every other command appears as an approval card in the conversation. Review the command, risk, working directory, and reason, then select **Approve** or **Reject**. Destructive commands blocked by policy cannot be approved from the UI.
+
+Docker commands, including `docker ps`, `docker compose ...`, and `docker-compose ...`, always ask for approval. They can inspect or change a privileged local daemon, use the network, start background services, mount host paths, expose ports, and mutate images or volumes, so Damaian never treats them as read-only.
 
 `Allow Always` runs the command and records it in your own config as `command_allowlist.<repository_id>`, so that command stops asking. The allowance covers the exact command only: allowing `npm run test:unit` does not allow `npm run test:unit --watch`, and allowing `git push` does not allow `git push --force`. It applies to that working folder alone, and not to another clone of the same project at a different path. Remove an entry by editing the `command_allowlist.<repository_id>` line in `~/Library/Application Support/DamaianClient/config/user.conf`.
 
@@ -276,15 +278,9 @@ Sessions created before modes existed continue in Code mode, which is what they
 could already do, so none of them lost anything. Change one with the same
 control.
 
-Known limits:
-
-- `git diff`, `git log` and `git show` count as read-only commands, but all
-  three accept `--output=<file>`, which writes a file. In Plan or Review, a path
-  inside the repository is therefore not refused. A path outside it needs
-  approval and is refused.
-- The CLI's `propose-edit` runs outside any session, so no mode applies to it.
-  The repository's permission profile still does: under Read-only it is refused
-  before the model is asked anything.
+Known limit: the CLI's `propose-edit` runs outside any session, so no mode
+applies to it. The repository's permission profile still does: under Read-only
+it is refused before the model is asked anything.
 
 ## Permission Profiles
 
@@ -367,9 +363,8 @@ network. Because the check reads the command name, `local` also blocks every
 `cargo test` is allowed.
 
 A custom profile may also use `command_access=read_only`, which allows only the
-low-risk read-only commands Plan mode allows. It inherits that check's known gap
-(`git diff --output=<file>` counts as read-only). The built-in Read-only profile
-uses `none`, so it does not.
+low-risk read-only commands Plan mode allows. The built-in Read-only profile
+uses `none`, which allows no commands at all.
 
 **Offline private does not stop model traffic.** Your prompts and the code in
 context are network traffic to the model provider, and no profile can change
@@ -695,7 +690,7 @@ Every example below is user-scope configuration: enter it in `Settings`, or writ
 cargo run -p damaian-cli -- config-set user model_provider deepseek
 ```
 
-Naming a built-in provider is usually the only line you need. `model_provider=deepseek` or `model_provider=openai` fills in the base URL, the default model, and the key variable for that provider; set the other keys only to override one of those.
+Naming a built-in provider fills in most of the setup. `model_provider=deepseek` or `model_provider=openai` sets the base URL, the default model, and the key variable for that provider; set the other keys only to override one of those. You also need to turn on **Native tool-calling** for the provider (Settings › Providers › Provider details, or `model_provider.<id>.supports_native_tools=true`). Built-in providers leave it off, and without it the assistant can answer questions but cannot propose file changes, make plans, or use MCP or any other tools.
 
 Example DeepSeek configuration:
 
@@ -1150,8 +1145,8 @@ Damaian keeps the local app in control of important effects:
 - The model does not read files directly.
 - The model does not write files directly.
 - File edits are previewed before application.
-- Sandbox-safe assistant command requests are limited to read-only local commands.
-- Commands outside the sandbox require user approval before execution, unless the exact command was previously approved with `Allow Always` for that repository.
+- Assistant commands run without approval only when Damaian classifies them as read-only. They are not sandboxed.
+- Every other command requires your approval before it runs, unless you allowed that exact command always for that repository.
 - Restricted files and detected secrets are redacted or blocked by policy.
 - A [permission profile](#permission-profiles) per repository can narrow all of this further, and never widen it.
 - Important actions are recorded in a local audit trail.

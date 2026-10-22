@@ -29,9 +29,8 @@ API keys under your control.
   can run read-only commands (like `git status` or `git log`) on its own.
   Anything that writes, installs, or reaches the network waits for your approval
   in the conversation, showing the full command before you decide. Approve once,
-  or allow that command for the project. Docker is handled as its own
-  approval-gated family, with only sandbox-safe read-only calls running
-  unprompted.
+  or allow that command for the project. Docker commands, including read-only
+  ones such as `docker ps`, always ask.
 - **Stop a run that is going wrong.** Long turns report what they are doing and
   how long they have been doing it, and stop on `Escape` or the Stop button.
 - **Give the assistant project rules.** `AGENTS.md` files are read as scoped
@@ -46,12 +45,14 @@ API keys under your control.
   export a whole conversation as Markdown. Exports are secret-redacted and say
   at the top how many secrets were removed, so what you share is not what the
   session stored.
-- **Hand off to your editor.** Open the current folder in Visual Studio Code, or
-  use the built-in bottom terminal panel, in one click.
+- **Hand off to your editor.** Open the current folder in Visual Studio Code or
+  Finder from the conversation header's ⋮ menu, or open the built-in terminal
+  panel beside it.
 - **Keep secrets safe.** Detected credentials are redacted from context, command
   output, and diffs, and your model API key is stored in the macOS Keychain.
-- **Update in place.** When a newer signed release is available, an update button
-  appears in the app.
+- **Update in place.** When a newer signed release is available, the update
+  button at the bottom of the sidebar installs it after you confirm; restart
+  Damaian to finish.
 
 ## Requirements
 

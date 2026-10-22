@@ -4,7 +4,7 @@ Damaian is a developer preview. It is designed to keep repository access, file w
 
 ## Supported Versions
 
-Security fixes target the current `main` branch. Published preview builds should be treated as experimental until Developer ID signing and notarization are in place.
+Security fixes target the current `main` branch and ship in the next release. Only the latest release is supported. Release builds are Developer ID signed and notarized; locally built DMGs are ad-hoc signed.
 
 ## Reporting a Vulnerability
 
@@ -39,7 +39,7 @@ The desktop API token is never served over HTTP. It is delivered to the webview 
 
 Model provider requests use `curl --config -` so the provider API key is passed through the child process stdin configuration, not as a command-line argument.
 
-Patch rollback snapshots are redacted through the same secret scanner used for diffs and Git output before being written to disk, so pre-edit file content captured for rollback does not retain hardcoded credentials.
+Patch rollback snapshots and session checkpoints store pre-edit file content unredacted, under `<data_dir>/rollback/` and the checkpoint store. That is deliberate: redaction covers what leaves your control (model context, command output, diffs, the audit log), and a snapshot is a local copy kept so a file can be put back exactly. Redacting it would corrupt the restore. Treat the data directory as sensitive and do not share it.
 
 ## Git Read Hardening
 
