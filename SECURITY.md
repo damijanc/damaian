@@ -10,7 +10,7 @@ Security fixes target the current `main` branch and ship in the next release. On
 
 If you find a security issue, avoid posting exploit details, API keys, repository contents, or private user data in a public issue.
 
-Use GitHub private vulnerability reporting if it is enabled for the repository. If private reporting is not available, open a public issue with a short, non-sensitive summary and offer to share details privately.
+Report it privately through GitHub: open the repository's **Security** tab and select **Report a vulnerability**, or go straight to <https://github.com/damijanc/damaian/security/advisories/new>. Only the maintainers can see the report. Please do not open a public issue for a security problem.
 
 Useful reports include:
 
