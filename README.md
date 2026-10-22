@@ -56,17 +56,17 @@ API keys under your control.
 
 ## Requirements
 
-- macOS 14 (Sonoma) or newer
+- A Mac with Apple Silicon, running macOS 14 (Sonoma) or newer
 - Git installed and on your `PATH`
-- An API key for an OpenAI-compatible model provider (e.g. OpenAI, or a local
-  provider such as Ollama)
+- An API key for a supported model provider (OpenAI, DeepSeek, or any
+  OpenAI-compatible endpoint), or a local Ollama
 
 No Node.js runtime is required to run the packaged app.
 
 ## Install
 
-1. Download the latest `Damaian_<version>_aarch64.dmg` from the GitHub Releases
-   page (Apple Silicon).
+1. Download `Damaian_<version>_aarch64.dmg` from the
+   [latest release](https://github.com/damijanc/damaian/releases/latest).
 2. Open the DMG and drag `Damaian.app` into `Applications`.
 3. Launch it. Builds are Developer ID signed and notarized, so macOS should open
    them without a Gatekeeper prompt — see
@@ -82,7 +82,7 @@ No Node.js runtime is required to run the packaged app.
    such as "add a test for the config parser" and review the diff preview.
 
 The [Damaian User Guide](docs/USER_GUIDE.md) walks through each of these in
-detail.
+detail. To build Damaian from source, see [Development](docs/DEVELOPMENT.md).
 
 ## Documentation
 

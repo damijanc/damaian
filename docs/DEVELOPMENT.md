@@ -14,26 +14,30 @@ repository.
 
 ## Workspace layout
 
-| Crate | Purpose |
-|-------|---------|
-| `crates/workspace-engine` | Core services: indexing, context assembly, secret redaction, patch engine, command policy, model adapters, audit log. |
-| `crates/damaian-cli` | Command-line front end over the workspace engine. |
-| `crates/desktop-shell` | Local HTTP shell and web UI served on `127.0.0.1:4765`. |
-| `crates/desktop-app` | Native Tauri wrapper (macOS folder picker, Keychain, updater). |
-| `crates/eval-harness` | Evaluation harness and the `damaian-eval` binary. See [Evaluation harness](#evaluation-harness). |
+| Crate | Binary | Purpose |
+|-------|--------|---------|
+| `crates/workspace-engine` | — | Core services: indexing, context assembly, secret redaction, patch engine, command policy, model adapters, audit log. |
+| `crates/damaian-cli` | `damaian` | Command-line front end over the workspace engine. |
+| `crates/desktop-shell` | `damaian-desktop-shell` | Local HTTP shell and web UI served on `127.0.0.1:4765`, plus Keychain access, the terminal panel's PTY, and worker sessions. |
+| `crates/desktop-app` | `damaian-desktop` | Native Tauri wrapper. It embeds the desktop shell and adds the window, folder picker, updater and terminal IPC, and re-launches itself as a worker. |
+| `crates/eval-harness` | `damaian-eval` | Evaluation harness. See [Evaluation harness](#evaluation-harness). |
 
 ## Run locally
 
 ```sh
-# Run the test suite
-cargo test
+# Run one crate's tests (the full suite runs on CI; see Quality checks)
+cargo nextest run -p workspace-engine
 
 # Native Tauri desktop app (development)
 DAMAIAN_REPO=/path/to/repo npm run desktop:dev
 
 # Local desktop shell prototype (no Tauri wrapper)
-cargo run -p desktop-shell -- --repo /path/to/repo --port 4765
+DAMAIAN_DATA_DIR=/tmp/damaian-dev cargo run -p desktop-shell -- --repo /path/to/repo --port 4900
 ```
+
+The standalone shell uses port 4900 and its own data directory so it never
+collides with an installed Damaian, which holds port 4765 and your real
+sessions.
 
 ## Evaluation harness
 
@@ -109,15 +113,21 @@ sample size, or an explicit null with a reason — they are never computed.
 
 Every pull request and every push to `main` runs
 [`.github/workflows/quality.yml`](../.github/workflows/quality.yml). The same
-checks run locally:
+seven checks, in the order `scripts/quality-gate.sh` runs them:
 
 ```sh
 cargo fmt --all -- --check                                   # formatting
 cargo clippy --workspace --all-targets --locked -- -D warnings  # lints (warnings fail)
 cargo nextest run --workspace --locked                       # test suite
+node --check crates/desktop-shell/static/app.js              # app.js parses
 npm run lint:web                                             # app.js / style.css
+typos                                                        # spelling
 cargo deny check                                             # advisories + licenses
 ```
+
+CI also runs `npm run specs:check`, which reports specs whose `Depends on:`
+lines disagree with their dependencies' statuses. It is advisory and does not
+fail the build.
 
 The two workspace-wide commands are left to CI on the development Mac, where
 they can take over an hour; run the fast checks and scoped clippy and tests
@@ -130,11 +140,12 @@ the reason.
 if you have not installed the Node dev dependencies; Biome is the only one, and
 it is pinned in `package-lock.json`.
 
-Two tools are needed only for the last check and are installed on demand in CI:
+Three tools are installed on demand in CI and need installing once locally:
 
 ```sh
+cargo install cargo-nextest --locked
+cargo install typos-cli --locked
 cargo install cargo-deny --locked
-cargo install typos-cli --locked   # spell check, also run in CI
 ```
 
 Configuration lives in [`deny.toml`](../deny.toml) (scoped to

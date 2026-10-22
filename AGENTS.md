@@ -21,8 +21,9 @@ Two constraints shape most architectural decisions:
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `crates/workspace-engine`      | Core services: indexing, context assembly, secret redaction, patch engine, command policy, model adapters, audit log, and most application logic. |
 | `crates/damaian-cli`           | Command-line interface over the workspace engine. Binary: `damaian`.                                                                              |
-| `crates/desktop-shell`         | Local HTTP shell and web UI on `127.0.0.1:4765`. Binary: `damaian-desktop-shell`.                                                                 |
-| `crates/desktop-app`           | Native Tauri wrapper: folder picker, Keychain integration, updater, PTY terminal. Binary: `damaian-desktop`.                                      |
+| `crates/desktop-shell`         | Local HTTP shell and web UI on `127.0.0.1:4765`, Keychain access, the terminal PTY, worker sessions. Binary: `damaian-desktop-shell`.             |
+| `crates/desktop-app`           | Native Tauri wrapper: embeds the shell; window, folder picker, updater, terminal IPC, worker host. Binary: `damaian-desktop`.                      |
+| `crates/eval-harness`          | Evaluation harness over fixture repositories. Binary: `damaian-eval`.                                                                             |
 | `crates/desktop-shell/static/` | Vanilla JavaScript and CSS web UI. No framework, bundler, or runtime build step.                                                                  |
 
 ## Before you change a feature
@@ -499,7 +500,7 @@ Nothing is complete until all seven checks pass.
 
 ### The full gate runs on CI, not locally
 
-Policy since 2026-10-15: do not run the full seven-check gate locally. The workspace-wide `cargo clippy --workspace` and `cargo nextest run --workspace` take minutes on CI and anywhere from minutes to over an hour on the development Mac, because its endpoint security software stalls process launches and file writes (see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#the-quality-gate-is-slow-locally)). Waiting on them locally buys nothing CI does not already give.
+Policy since 2026-10-15: do not run the full seven-check gate locally. The workspace-wide `cargo clippy --workspace` and `cargo nextest run --workspace` take minutes on CI and anywhere from minutes to over an hour on the development Mac, because process launches and file writes stall intermittently there, most likely because of its endpoint security software (see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#the-quality-gate-is-slow-locally)). Waiting on them locally buys nothing CI does not already give.
 
 This overrides any task in a `tasks.md` that says to run the full gate locally, including final close-out tasks.
 
@@ -566,7 +567,7 @@ Plain `cargo test` remains acceptable when iterating on a single test.
 Install with:
 
 ```bash
-cargo install typos-cli
+cargo install typos-cli --locked
 ```
 
 Prefer fixing prose rather than adding dictionary exceptions.
@@ -653,7 +654,7 @@ Tests that:
 
 must be `#[ignore]` unless there is a compelling reason otherwise.
 
-Known examples: `serves_the_ui_for_manual_inspection` (serves the real web UI on port 4899 with a known API token), `live_tier_runs_one_scenario_against_a_real_provider` (calls a real model provider over the network), and `a_real_sigkill_mid_action_leaves_a_readable_log_and_an_unknown_outcome` (spawns a child process and `SIGKILL`s it, plus the helper test it re-executes into), the two `semantic_search` tests (download the embedding model from huggingface.co on first run), alongside tests that open Finder, spawn a real login shell, or read your own checkout to measure census cost.
+Known examples: `serves_the_ui_for_manual_inspection` (serves the real web UI on port 4899 with a known API token), `live_tier_runs_one_scenario_against_a_real_provider` (calls a real model provider over the network), and `a_real_sigkill_mid_action_leaves_a_readable_log_and_an_unknown_outcome` (spawns a child process and `SIGKILL`s it, plus the helper test it re-executes into), the two tests in `workspace-engine/tests/semantic_search.rs` (download the embedding model from huggingface.co on first run), alongside tests that open Finder, spawn a real login shell, or read your own checkout to measure census cost.
 
 Every ignored test with side effects must include a doc comment explaining the command needed to run it manually.
 

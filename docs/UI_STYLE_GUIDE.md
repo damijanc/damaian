@@ -129,14 +129,15 @@ scale.
   computes to roughly 29px tall — do not shrink its padding further.
   `.btn-trigger` computes to 27px on the same arithmetic.
 - Border radius stays at the existing 8px across all steps. The scale changes
-  size and weight, not shape.
+  size and weight, not shape. The one exception is `.btn-trigger`, which is
+  borderless and uses 6px.
 - Focus is always visible: `box-shadow: 0 0 0 3px var(--accent-soft)` with
   `border-color: var(--accent)`. Never remove the focus ring to tidy a layout.
 
 **Contrast floors** (measured against `--surface`)
 
 - White on `--accent` — 6.4:1. Passes AA for all sizes.
-- `--danger` on `--surface` — 5.9:1. Passes AA for all sizes.
+- `--danger` on `--surface` — 6.6:1. Passes AA for all sizes.
 - `--muted` on white — 4.8:1. Passes AA for normal text, with little headroom.
   `.btn-quiet` text must not be lightened past `--muted`.
 

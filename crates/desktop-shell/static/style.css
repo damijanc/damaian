@@ -249,7 +249,7 @@ button:disabled {
 
 /* Quiet weight carrying the danger colour: a destructive action should be
    findable, not loud. Signalling only — every caller keeps its confirm dialog.
-   --danger on --surface is 5.9:1. */
+   --danger on --surface is 6.6:1. */
 .btn-danger {
   border-color: transparent;
   background: transparent;

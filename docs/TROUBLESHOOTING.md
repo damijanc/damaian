@@ -1723,9 +1723,11 @@ force a clean re-download.
 ### Terminal panel problems
 
 The PTY terminal spawns a login shell from `$SHELL` (falling back to
-`/bin/zsh`) on a pseudo-terminal owned by the Tauri wrapper
+`/bin/zsh`) on a pseudo-terminal. The PTY code is in the desktop-shell crate
 (`terminal::open` in
-[terminal.rs](../crates/desktop-shell/src/terminal.rs)). Failures surface
+[terminal.rs](../crates/desktop-shell/src/terminal.rs)) and runs inside the
+desktop app's process, which the webview reaches through the Tauri
+`terminal_*` commands. Failures surface
 as `failed to start shell: <error>`. Sessions are held in a process-global map,
 so they do not survive a restart. `crates/desktop-shell/static/xterm*` is
 vendored and minified — never edit or reformat it.
