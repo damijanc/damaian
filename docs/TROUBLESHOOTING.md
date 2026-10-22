@@ -27,13 +27,15 @@ Work top to bottom. Each step is cheap and rules out a whole class of causes.
 
 ## Process model
 
-Three processes can be involved, and knowing which one owns a symptom saves
-most of the time:
+Four kinds of process can be involved, and knowing which one owns a symptom
+saves most of the time. In the packaged app the first two are one process: the
+shell runs as a thread (`damaian-shell`) inside `damaian-desktop`, so a shell
+panic or a shell message shows up under `damaian-desktop`.
 
 | Process | Binary | Role |
 |---------|--------|------|
 | Native wrapper | `damaian-desktop` | Tauri app: window, menus, folder picker, Keychain, updater, PTY terminal. Spawns the shell in a background thread. |
-| Local shell | `damaian-desktop-shell` | HTTP server on `127.0.0.1:4765` serving the web UI and the `/api/*` surface. Also runnable standalone. |
+| Local shell | `damaian-desktop-shell` standalone; a thread inside `damaian-desktop` in the app | HTTP server on `127.0.0.1:4765` serving the web UI and the `/api/*` surface. |
 | CLI | `damaian` | Same workspace engine, no HTTP, no UI. |
 | Worker | `damaian-desktop --worker` (or `damaian-desktop-shell --worker` in development) | One per running worker session ([spec 57](specs/57_worker_sessions/proposal.md)): the app's own binary re-launched by the shell, with no window and no HTTP server. See [Worker sessions](#worker-sessions). |
 
@@ -45,9 +47,10 @@ to a local HTTP server, so browser-side debugging applies (see
 > name. The user's own running app shares those names. Track the PID you
 > spawned and kill that one.
 
-Each of the three spawns children of its own — MCP stdio servers, `curl` model
-calls, PTY shells and shell commands — and records them under `processes/` so a
-crash cannot leak them. That registry is the mechanical form of the rule above:
+Each of them spawns children of its own — MCP stdio servers, `curl` model
+calls, PTY shells, shell commands, hook executables, worker processes and
+language servers — and records them under `processes/` so a crash cannot leak
+them. That registry is the mechanical form of the rule above:
 it kills by PID and start time, never by name. See
 [After a crash: what was still running](#after-a-crash-what-was-still-running).
 
@@ -56,7 +59,7 @@ it kills by PID and start time, never by name. See
 ### Global data directory
 
 Default location, resolved in `Config::default_data_dir()`
-([config.rs:182](../crates/workspace-engine/src/config.rs:182)):
+([config.rs](../crates/workspace-engine/src/config.rs)):
 
 ```text
 ~/Library/Application Support/DamaianClient
@@ -68,26 +71,26 @@ isolated tree — that is the intended way to test without touching real data.
 
 | Path | Contents | Written by |
 |------|----------|------------|
-| `config/user.conf` | User-scope config overlay | [config.rs:233](../crates/workspace-engine/src/config.rs:233) |
-| `config/admin.conf` | Admin-scope overlay (highest precedence) | [config.rs:237](../crates/workspace-engine/src/config.rs:237) |
-| `audit/events.jsonl` | Append-only audit trail, secret-redacted | [audit.rs:58](../crates/workspace-engine/src/audit.rs:58) |
-| `sessions/<session-id>.jsonl` | Per-conversation event log: sessions, tasks, messages | [session.rs:244](../crates/workspace-engine/src/session.rs:244) |
-| `patches/pending/` | Proposed patches awaiting approval | [edit.rs:129](../crates/workspace-engine/src/edit.rs:129) |
-| `patches/rejected/` | Rejected patches, kept for inspection | [edit.rs:104](../crates/workspace-engine/src/edit.rs:104) |
-| `rollback/<patch-id>/` | Pre-edit file copies backing patch rollback, **unredacted** | [patch_engine.rs:315](../crates/workspace-engine/src/patch_engine.rs:315) |
+| `config/user.conf` | User-scope config overlay | `Config::user_config_path` ([config.rs](../crates/workspace-engine/src/config.rs)) |
+| `config/admin.conf` | Admin-scope overlay (highest precedence) | `Config::admin_config_path` ([config.rs](../crates/workspace-engine/src/config.rs)) |
+| `audit/events.jsonl` | Append-only audit trail, secret-redacted | `AuditLog::record` ([audit.rs](../crates/workspace-engine/src/audit.rs)) |
+| `sessions/<session-id>.jsonl` | Per-conversation event log: sessions, tasks, messages | `SessionStore` ([session.rs](../crates/workspace-engine/src/session.rs)) |
+| `patches/pending/` | Proposed patches awaiting approval | `PatchStore::save` ([edit.rs](../crates/workspace-engine/src/edit.rs)) |
+| `patches/rejected/` | Rejected patches, kept for inspection | `PatchStore::mark_rejected` ([edit.rs](../crates/workspace-engine/src/edit.rs)) |
+| `rollback/<patch-id>/` | Pre-edit file copies backing patch rollback, **unredacted** | `PatchEngine::apply_patch` ([patch_engine.rs](../crates/workspace-engine/src/patch_engine.rs)) |
 | `checkpoints/<repo-id>/objects/` | Session checkpoint content, a Damaian-owned Git object store, **unredacted** | [checkpoint.rs](../crates/workspace-engine/src/checkpoint.rs) |
 | `checkpoints/<repo-id>/manifests/<checkpoint-id>.json` | What one checkpoint covers: paths, hashes, origins. No file content | [checkpoint.rs](../crates/workspace-engine/src/checkpoint.rs) |
-| `commands/pending/<id>.dcmd` | Command proposals awaiting approval | [validation.rs:108](../crates/workspace-engine/src/validation.rs:108) |
-| `commands/output/<exec-id>/` | `stdout.log`, `stderr.log`, `summary.dcmd` per execution | [validation.rs:67](../crates/workspace-engine/src/validation.rs:67) |
-| `commands/rejected/<id>.dcmd` | Rejected command proposals | [validation.rs:93](../crates/workspace-engine/src/validation.rs:93) |
-| `chat/pending/<proposal-id>.json` | Suspended chat turn awaiting a command decision | [chat.rs:859](../crates/workspace-engine/src/chat.rs:859) |
+| `commands/pending/<id>.dcmd` | Command proposals awaiting approval | `CommandStore::save_proposal` ([validation.rs](../crates/workspace-engine/src/validation.rs)) |
+| `commands/output/<exec-id>/` | `stdout.log`, `stderr.log`, `summary.dcmd` per execution | `CommandStore::save_execution` ([validation.rs](../crates/workspace-engine/src/validation.rs)) |
+| `commands/rejected/<id>.dcmd` | Rejected command proposals | `CommandStore::mark_rejected` ([validation.rs](../crates/workspace-engine/src/validation.rs)) |
+| `chat/pending/<proposal-id>.json` | Suspended chat turn awaiting a command decision | `PendingCommandStore` ([chat.rs](../crates/workspace-engine/src/chat.rs)) |
 | `sessions/<session-id>.progress.jsonl` | A worker's live progress, the board's and control strip's source. Secret-redacted, truncated when the worker starts, deleted with the session | [worker_progress.rs](../crates/workspace-engine/src/worker_progress.rs) |
 | `workers/<hash>.sock` | A running worker's control socket (`0600` in a `0700` directory), removed when it exits cleanly | [worker.rs](../crates/desktop-shell/src/worker.rs) |
-| `processes/<pid>-<start-time-us>.json` | One live child process this instance spawned, written **before** the child is returned to its caller and unlinked on clean exit | [process_registry.rs:164](../crates/workspace-engine/src/process_registry.rs:164) |
+| `processes/<pid>-<start-time-us>.json` | One live child process this instance spawned, written **before** the child is returned to its caller and unlinked on clean exit | `ProcessRegistry::register` ([process_registry.rs](../crates/workspace-engine/src/process_registry.rs)) |
 | `web-diagnostics/<session-id>/<task-id>/run-<ms>/` | Browser diagnostic screenshots, copied out of the browser server's own output. Images are **not** secret-scanned; they show whatever the page showed | `materialize_browser_artifacts` ([desktop-shell/src/lib.rs](../crates/desktop-shell/src/lib.rs)) |
 | `repository-map/<repo-id>.json` | The repository map: roots, their evidence and commands, and excluded paths. Derived, safe to delete | `RepositoryMapStore` ([repository_map.rs](../crates/workspace-engine/src/repository_map.rs)) |
-| `vector-index/<repo-id>.bin` | Semantic-search embeddings cache | [vector_index.rs:149](../crates/workspace-engine/src/vector_index.rs:149) |
-| `models/all-MiniLM-L6-v2/` | Downloaded embedding model (semantic search only) | [embeddings.rs:27](../crates/workspace-engine/src/embeddings.rs:27) |
+| `vector-index/<repo-id>.bin` | Semantic-search embeddings cache | `vector_index_path` ([vector_index.rs](../crates/workspace-engine/src/vector_index.rs)) |
+| `models/all-MiniLM-L6-v2/` | Downloaded embedding model (semantic search only) | `EmbeddingModel::load` ([embeddings.rs](../crates/workspace-engine/src/embeddings.rs)) |
 
 Not on disk: the **repository index** is an in-memory cache with a file watcher
 ([index_cache.rs](../crates/workspace-engine/src/index_cache.rs)), rebuilt on a
@@ -114,8 +117,9 @@ development).
 
 A missing file is skipped silently, not an error. The format is flat
 `key=value`, one per line; blank lines and `#` comments are ignored
-([config.rs:699](../crates/workspace-engine/src/config.rs:699)). List-valued
-keys use `|` as the separator. Nested keys are dotted:
+(`ConfigOverlay::parse` in
+[config.rs](../crates/workspace-engine/src/config.rs)). List-valued keys use
+`|` as the separator. Nested keys are dotted:
 
 ```conf
 model_provider=deepseek
@@ -130,9 +134,10 @@ Provider and MCP-server entries are **upserted by id**, so a repo-scope file can
 change one field of a provider defined at user scope without restating the rest.
 
 The desktop Settings UI only ever writes **user** scope
-([lib.rs:1048](../crates/desktop-shell/src/lib.rs:1048)). If a setting will not
-stick, something at admin scope is overriding it, or repository scope is adding
-a restriction on top of it.
+(`desktop_settings_config_path` in
+[lib.rs](../crates/desktop-shell/src/lib.rs)). If a setting will not stick,
+something at admin scope is overriding it, or repository scope is adding a
+restriction on top of it.
 
 #### A repository config key had no effect
 
@@ -143,14 +148,17 @@ remove one
 
 | Key | In repository config |
 |-----|----------------------|
-| `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, any `model_*` (including `model_provider.<id>.*`) | Ignored, audited, reported to the user once per repository |
-| `command_allowlist` | Never honoured — `Allow Always` writes user scope instead |
+| `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `language_server.<lang>`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, any `model_*` (including `model_provider.<id>.*`) | Ignored, audited, reported to the user once per repository |
+| `command_allowlist`, `command_allowlist.<repo_id>`, `permission_profile.<repo_id>`, `hook_review.<repo_id>.<hook_id>` | Never honoured: they are the user's decisions, and `Allow Always` writes user scope instead |
+| `hook.<id>.*` | A new hook is kept, and runs only after you review it; one that names a hook you or an admin defined is ignored |
 | `restricted_patterns`, `ignore_patterns`, `command_blocklist` | Added to the user's list, never replacing it |
 | `require_approval_for_*` | May be set `true`, never `false` |
+| `allow_file_edits`, `allow_browser_diagnostics`, `allow_mutating_mcp_tools`, `command_access` | May be turned down, never up |
 | `mcp_enabled`, `mcp_server.<id>.enabled` | May be turned off, never on |
 | `mcp_server_allowlist` | May be narrowed, never widened |
 | `mcp_server.<id>.*` for a server the user already configured | Ignored: it would redirect a process the user trusts |
-| Everything else (budgets, `enable_semantic_search`, `agent_*`) | Applied as written |
+| `command_timeout_secs`, `max_read_lines`, `max_list_entries`, `max_search_matches`, `max_match_line_chars`, `repository_map_max_tokens`, `agent_max_task_tokens`, `agent_max_turn_messages`, `agent_max_exploration_rounds` | May be lowered, never raised |
+| Everything else (`max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, `agent_max_tool_rounds`, `agent_web_debug_max_tool_rounds`, `agent_tool_retry_limit`, `agent_max_questions_per_turn`, `project_roots_added`, `project_roots_removed`) | Applied as written |
 
 Ask which keys a repository asked for and did not get — this also records them
 in the audit log, so it answers once per repository and then reports nothing
@@ -242,9 +250,9 @@ Either way the repository's own file is left exactly as it is.
 ### Secrets
 
 API keys live in the macOS Keychain under service `DamaianClient`
-([keychain.rs:3](../crates/desktop-shell/src/keychain.rs:3)). Config holds only
-a reference: `keychain:<account>`, or the name of an environment variable —
-never a raw key.
+(`KEYCHAIN_SERVICE` in [keychain.rs](../crates/desktop-shell/src/keychain.rs)).
+Config holds only a reference: `keychain:<account>`, or the name of an
+environment variable — never a raw key.
 
 ```bash
 security find-generic-password -s DamaianClient -a model-api-key -w
@@ -276,7 +284,8 @@ never content.
 ### Web UI state (localStorage)
 
 Project list, last folder, and per-repo preferences are browser state, not
-config. Keys (`app.js:31`):
+config. Keys (the `…StorageKey` and `…StoragePrefix` constants in
+[`app.js`](../crates/desktop-shell/static/app.js)):
 
 | Key | Contents |
 |-----|----------|
@@ -285,8 +294,9 @@ config. Keys (`app.js:31`):
 | `damaian:projectDisplayNames` | Renamed projects |
 | `damaian:expandedProjects`, `damaian:projectsCollapsed` | Sidebar UI state |
 | `damaian:lastSession:<repo>` | Last open conversation per repo |
-| `damaian:pinnedContext:<repo>:<session>` | Pinned context files |
-| `damaian:chatModelPrefs:<repo>` | Selected provider/model per repo |
+| `damaian:pinnedContextFiles:<repo>:<session>` | Pinned context files (`draft` before a session exists) |
+| `damaian:chatModelPrefs:<repo>` | Selected provider/model per repo (`global` with no repository open) |
+| `damaian:dismissedWorkers` | Finished workers dismissed from the board, by session id. The sessions themselves stay |
 
 Physically stored in the WebKit data store for the bundle id, not in the data
 directory:
@@ -313,9 +323,10 @@ come from four separate places, and confusing them wastes time:
 
 ### Capturing stdout and stderr
 
-Every runtime error the wrapper reports goes to stderr via `eprintln!`
-([desktop-app/src/main.rs:29](../crates/desktop-app/src/main.rs:29)) and is lost
-if nothing is attached to the process.
+Every runtime error the wrapper reports goes to stderr via `eprintln!` (in
+`main` and its `setup` closure,
+[desktop-app/src/main.rs](../crates/desktop-app/src/main.rs)) and is lost if
+nothing is attached to the process.
 
 Development — output appears in the terminal:
 
@@ -323,17 +334,18 @@ Development — output appears in the terminal:
 DAMAIAN_REPO=/path/to/repo npm run desktop:dev
 ```
 
-Packaged app — launch the binary directly instead of double-clicking:
+Packaged app — launch the binary directly instead of double-clicking. The
+executable is the `damaian-desktop` Cargo binary, not the product name:
 
 ```bash
-/Applications/Damaian.app/Contents/MacOS/Damaian
+/Applications/Damaian.app/Contents/MacOS/damaian-desktop
 ```
 
 Already-running GUI instance — read the unified log, which captures stderr from
 GUI-launched processes:
 
 ```bash
-log show --predicate 'process == "Damaian"' --last 30m --info
+log show --predicate 'process == "damaian-desktop"' --last 30m --info
 ```
 
 Standalone shell, no Tauri wrapper, on a port of your own so you do not collide
@@ -343,28 +355,41 @@ with the user's app:
 DAMAIAN_DATA_DIR=/tmp/damaian-debug cargo run -p desktop-shell -- --repo /path/to/repo --port 4900
 ```
 
-Messages worth recognising on startup
-([desktop-app/src/main.rs:60](../crates/desktop-app/src/main.rs:60)):
+Messages worth recognising on startup. The shell's own lines come from
+`run_server_with_ready` and the functions it calls in
+[desktop-shell/src/lib.rs](../crates/desktop-shell/src/lib.rs), and are printed
+to stdout; the wrapper's come from the `setup` closure in
+[desktop-app/src/main.rs](../crates/desktop-app/src/main.rs), on stderr:
 
 | Message | Meaning |
 |---------|---------|
-| `Damaian desktop shell listening at http://127.0.0.1:<port>` | Shell is up |
+| `Damaian desktop shell listening at http://127.0.0.1:<port>` | Shell is up (stdout) |
+| `Default repository: <path>` | The repository the shell was started with (stdout) |
+| `Data directory <path> adopted at schema version 1` | An existing data directory with no `schema.conf` was marked as the current layout; see [The data directory is refused at startup](#the-data-directory-is-refused-at-startup) |
+| `Orphan sweep: killed <n>, refused <m> on a start-time mismatch` | The launch sweep cleaned up after a crash; see [After a crash: what was still running](#after-a-crash-what-was-still-running). Printed only when it killed or refused something |
+| `Damaian cannot use its data directory: <error>` | The data directory's schema marker is one this build cannot read. The app also shows a dialog and quits |
 | `...refuses to start because 127.0.0.1:4765 is already in use` | Port conflict; see [Port 4765](#port-4765) |
+| `Damaian shell server stopped: bind 127.0.0.1:<port>: <error>` together with `Damaian shell did not start: …` | The shell could not bind its port, or failed another startup step before it was ready |
 | `Damaian shell did not report readiness` | Shell did not bind within the 2-second startup timeout |
 | `Damaian shell server stopped: <error>` | Server thread died after startup |
 
 ### Audit log
 
 Append-only JSONL, one event per line, every field passed through the secret
-scanner before being written ([audit.rs:42](../crates/workspace-engine/src/audit.rs:42)).
+scanner before being written (`AuditLog::record` in
+[audit.rs](../crates/workspace-engine/src/audit.rs)).
 Records **metadata about actions** — file paths, commands, exit codes, token
 estimates, provider and model names, status — deliberately **not** prompt or
 response bodies. Disabled entirely when `audit_enabled=false`.
 
-Retention prunes files in `audit/` whose mtime is older than
-`audit_retention_days` (default 90). Because `events.jsonl` is appended to, its
-mtime is always current, so in practice the active log grows without bound and
-is never pruned. Do not expect it to self-trim.
+Retention (`AuditLog::cleanup_retention`) runs before every append. It deletes
+each file in `audit/` whose mtime is older than `audit_retention_days`
+(default 90); `0` turns pruning off. It deletes whole files and never trims one.
+While Damaian is in use, `events.jsonl` is appended to and its mtime stays
+current, so the active log grows without bound. After an idle period longer
+than `audit_retention_days`, though, its mtime is past the cutoff, and the next
+event deletes the **whole** `events.jsonl` before starting a new one. Copy the
+file first if you need history from before a long break.
 
 Every line carries `eventId`, `timestampMs`, `userId` (`local_user`), and
 `eventType`.
@@ -419,12 +444,19 @@ Event types grouped by what they tell you:
 
 | Area | Event types |
 |------|-------------|
-| Model turn | `model_request_prepared`, `model_response_completed`, `edit_model_request_prepared` |
+| Model turn | `model_request_prepared`, `model_response_completed`, `edit_model_request_prepared`, `chat_turn_cancelled`, `model_usage_reporting_unsupported`, `turn_continued` |
+| Round budget | `round_budget_paused`, `round_budget_decision`, `turn_budget_extended` |
+| Plan review | `plan_review_decision` |
 | Patches | `patch_proposed`, `edit_patch_ready_for_approval`, `edit_failed`, `patch_applied`, `patch_hunks_rejected`, `patch_rollback_started`, `patch_rolled_back`, `stored_patch_applied`, `stored_patch_files_rejected`, `stored_patch_rejected`, `stored_patch_rolled_back` |
-| Commands | `command_proposed`, `command_proposal_stored`, `command_executed`, `stored_command_executed`, `stored_command_rejected` |
-| Files & repo | `file_read`, `file_modified`, `file_restored`, `repository_indexed`, `git_status_read`, `git_diff_read` |
+| Commands | `command_proposed`, `command_proposal_stored`, `command_executed`, `stored_command_executed`, `stored_command_rejected`, `command_allowlisted`, `repository_allowlist_migrated` |
+| Files & repo | `file_read`, `file_modified`, `file_restored`, `directory_listed`, `content_searched`, `repository_indexed`, `repository_map_rebuilt`, `symbol_index_rebuilt`, `git_status_read`, `git_diff_read`, `git_log_read`, `git_worktrees_listed` |
+| Checkpoints | `checkpoint_created`, `checkpoint_creation_failed`, `checkpoint_files_skipped`, `checkpoint_paths_added`, `checkpoint_restored`, `checkpoint_conflicted`, `checkpoint_cleanup` |
 | MCP | `mcp_tools_listed`, `mcp_tool_called`, `mcp_tool_call_failed`, `mcp_discovery_failed` |
 | Provider refusals | `provider_refusal`, `provider_fallback_offered`, `provider_fallback_decision` |
+| Browser diagnostics | `browser_diagnostic_approval_decision`, `browser_diagnostic_session_approval_used` |
+| Config and profiles | `repository_config_key_rejected`, `permission_profile_set`, `permission_profile_key_rejected`, `permission_profile_imported` |
+| Crash recovery | `task_recovered`, `task_recovery_decision`, `session_log_truncated_tail`, `pending_approval_unavailable`, `reattached_approval_resolved`, `task_usage_recorded_for_lost_call` |
+| Workers | `worker_spawned`, `worker_spawn_failed`, `worker_restarted`, `worker_terminated`, `worker_worktree_removed` |
 | Orphan sweep | `orphan_process_killed`, `orphan_process_kill_refused`, `orphan_process_already_exited`, `process_registry_entry_unreadable` |
 
 Useful reads:
@@ -462,11 +494,13 @@ One JSONL file per conversation, `sessions/<session-id>.jsonl`, appended as
 events. This is where **message content** lives.
 
 Event types: `session_created`, `session_renamed`, `task_created`,
-`task_status_updated`, `message_appended`, `action_started`, `action_finished`,
+`task_status_updated`, `task_superseded`, `task_usage_recorded`,
+`message_appended`, `steering_note_added`, `action_started`, `action_finished`,
 `browser_diagnostics_approval_updated`, `conversation_rewound`, `plan_created`,
 `plan_revised`, `plan_resumed`, `plan_step_updated`, `plan_approved`,
+`question_asked`, `question_answered`, `provider_fallback`,
 `session_mode_set`, `web_diagnostic_recorded`, `finding_recorded`,
-`finding_status_changed`.
+`finding_status_changed`, `worker_spawned`.
 
 Every event carries a monotonic `seq`. Events written before that field existed
 are numbered by line order on read, which is their append order, so old
@@ -486,7 +520,11 @@ jq -r 'select(.eventType=="message_appended") | "[\(.payload.role)] \(.payload.c
 
 Follow task state, which is how you spot a turn that died mid-flight — a task
 whose last status is not `complete`, `failed`, `cancelled`,
-`tool_budget_exhausted` or `token_budget_exhausted` never finished:
+`tool_budget_exhausted` or `token_budget_exhausted` never finished. The
+exception is `waiting_for_approval`: a task paused on a proposal (a command, a
+plan review, a provider fallback, or a `roundbudget_…` round-budget pause, see
+[A turn stopped early](#a-turn-stopped-early-which-budget-ran-out)) is waiting
+for you, not dead:
 
 ```bash
 jq -r 'select(.eventType=="task_status_updated") | "\(.payload.task.status // .payload.status) \(.payload.task.id // .payload.id)"' "$SESSION_FILE"
@@ -504,7 +542,8 @@ phantom message. The count of discarded lines is available
 as `session_log_truncated_tail`, so a torn write shows up as evidence of the
 crash rather than as silent corruption. `list_sessions` still returns an empty
 list rather than failing when the directory is unreadable
-([session.rs:151](../crates/workspace-engine/src/session.rs:151)), so an
+(`SessionStore::list_sessions` in
+[session.rs](../crates/workspace-engine/src/session.rs)), so an
 unreadable *directory* is the case that stays quiet. To check a file yourself:
 
 ```bash
@@ -521,7 +560,7 @@ showed:
 |-------|--------------|
 | `plan_created` | the model proposed the plan |
 | `plan_revised` | the user edited it at the review gate |
-| `plan_resumed` | a plan was carried onto a new task after a token stop |
+| `plan_resumed` | a plan was carried onto a new task after a token stop, a tool-budget stop, or a crash-recovery `Continue` |
 | `plan_step_updated` | one step changed status or gained evidence |
 | `plan_approved` | the user cleared the review gate |
 
@@ -804,25 +843,58 @@ is read-only, it is left out of the request and the turn goes on.
 
 ### A turn stopped early: which budget ran out
 
-Two statuses look alike in the UI and mean different things:
+What happens at `agent_max_tool_rounds` (default 8) depends on whether a token
+ceiling is set ([spec 61](specs/61_continue_the_stopped_turn/proposal.md)):
 
-- `tool_budget_exhausted` — the work needed more tool rounds than
-  `agent_max_tool_rounds` allows (default 8, plus one closing model call). The
-  agent was going round in circles, or the task genuinely needs more steps.
+- **No `agent_max_task_tokens` (the default).** When the turn reaches its round
+  budget and the model still wants a tool, the turn **pauses** instead of
+  stopping. The task goes to `waiting_for_approval` on a
+  `chat/pending/roundbudget_<id>.json` proposal, and the conversation shows
+  `Used N of M tool rounds.` with **Answer now** and **Continue — N more**.
+  Continue grants the same turn another `agent_max_tool_rounds` rounds; Answer
+  now makes one final call with tools dropped. A turn never runs past 64 rounds
+  in all: at that cap only Answer now is offered.
+- **With `agent_max_task_tokens` set.** The turn continues on its own,
+  another `agent_max_tool_rounds` at a time, and records `turn_continued` each
+  time, until the token ceiling stops it or it reaches 16 rounds. At 16 rounds
+  it pauses as above.
+
+Two terminal statuses look alike in the UI and mean different things:
+
+- `tool_budget_exhausted` — written only after **Answer now**, when the final
+  call still asked for a tool instead of answering. The UI shows **Tool budget
+  exhausted** with **Ask again**, which starts a new turn from the stopped
+  task's own request.
 - `token_budget_exhausted` — the turn reached `agent_max_task_tokens`, which is
   **per turn**, not per session. Nothing is wrong; it cost more than the cap
   allows.
 
-Tell them apart in the log:
+A paused turn is in the audit log as `round_budget_paused` (`proposalId`,
+`roundsUsed`, `roundsTotal`). The answer is `round_budget_decision` with
+`decision` `continue` or `answer_now`, and a Continue also writes
+`turn_budget_extended` with the rounds granted and the running total:
+
+```bash
+jq -c 'select(.eventType|test("^(round_budget_|turn_budget_extended|turn_continued)"))' ~/Library/Application\ Support/DamaianClient/audit/events.jsonl
+```
+
+A pause survives a restart: crash recovery reattaches the `roundbudget_`
+proposal rather than treating the task as interrupted. If its file under
+`chat/pending/` is gone, recovery fails the task with that reason
+(`pending_approval_unavailable` in the audit log).
+
+Tell the terminal statuses apart in the log:
 
 ```bash
 jq -r 'select(.eventType=="task_status_updated") | .payload.task.status // .payload.status' "$SESSION_FILE" | sort | uniq -c
 ```
 
-A token stop is recoverable without losing work. Raise the cap and ask again:
-the next turn reads the stopped task's plan, carries it forward as
-`plan_resumed`, and keeps the evidence the earlier steps had already gathered.
-Confirm the carry happened:
+A stop is recoverable without losing work. After a token stop, raise the cap
+and ask again; after a tool-budget stop, press **Ask again**. The next turn
+reads the stopped task's plan, carries it forward as `plan_resumed`, and keeps
+the evidence the earlier steps had already gathered. The same carry happens
+when crash recovery's `Continue` supersedes an interrupted task. Confirm the
+carry happened:
 
 ```bash
 jq -r 'select(.eventType=="plan_resumed") | "\(.payload.taskId) resumed from \(.payload.resumedFrom)"' "$SESSION_FILE"
@@ -902,10 +974,16 @@ marked safe. Every card the UI then shows is `GET /api/recovery` output;
 `POST /api/recovery-decision` applies one choice, re-classifying first, so a
 decision cannot be made on a claim the webview supplied.
 
-To see what the sweep concluded without the UI:
+The running app's API cannot be reached from curl (see
+[The API token blocks curl](#the-api-token-blocks-curl)), so read a real
+session's verdict from the two audit events above. To watch the sweep's JSON,
+use the manual-inspection server, which is seeded with three tasks left
+mid-flight and prints a fixed token:
 
 ```bash
-curl -s -H "x-damaian-api-token: $TOKEN" http://127.0.0.1:4765/api/recovery | jq
+cargo test -p desktop-shell --lib -- --ignored --nocapture serves_the_ui
+# in another terminal, with the apiToken it printed:
+curl -s -H "x-damaian-api-token: damaian-ui-inspection-token" http://127.0.0.1:4899/api/recovery | jq
 ```
 
 A task that was resumed shows as `preparing_context` afterwards. That is
@@ -930,8 +1008,10 @@ and commands themselves remain on disk and stay usable.
 
 A separate question from the one above, and a separate sweep. That one asks what
 a *task* was doing; this one asks which **child processes** outlived the crash —
-MCP stdio servers, `curl` model calls, PTY shells and shell commands. Damaian
-records each one at spawn under `processes/`, and kills the leftovers at the
+MCP stdio servers, `curl` model calls, PTY shells, shell commands, hooks,
+workers and language servers (`kind` is `mcp_server`, `model_call`, `terminal`,
+`command`, `hook`, `worker` or `language_server`). Damaian records each one at
+spawn under `processes/`, and kills the leftovers at the
 next launch ([spec 46](specs/46_process_registry_and_orphan_sweep/proposal.md)).
 
 Each file is named `<pid>-<start-time-us>.json`, and **both halves matter**. A
@@ -1006,13 +1086,22 @@ to a separate worker log.
 | Control socket | `workers/<first 16 hex of sha256(session id)>.sock` |
 | Its process | a `processes/*.json` entry with `kind` `worker`, owned by the shell. The worker's own commands and model calls are entries owned by the worker's pid |
 
-Every worker of a source repository, with its state, as the board reads it:
+The board reads `GET /api/workers?repo=<source repo>`, which the running app
+does not serve to curl (see
+[The API token blocks curl](#the-api-token-blocks-curl)). In the app, read the
+board itself, or call the route from the webview console. On the
+manual-inspection server, against its own seeded repository and data
+directory, the same route is:
 
 ```bash
-curl -s -H "x-damaian-api-token: $TOKEN" \
-  "http://127.0.0.1:4765/api/workers?repo=$(jq -rn --arg r "$REPO" '$r|@uri')" \
+curl -s -H "x-damaian-api-token: damaian-ui-inspection-token" \
+  "http://127.0.0.1:4899/api/workers?repo=$(jq -rn --arg r "$REPO" '$r|@uri')" \
   | jq -r '.workers[] | "\(.group) \(.state) \(.taskStatus // "-") \(.sessionId) \(.branch)"'
 ```
+
+`$REPO` there is the `repository` path the server printed. It has no workers
+of its own, so expect an empty list unless you start one from its UI with
+Worker sessions turned on.
 
 Worker lifecycle events in the audit log:
 
@@ -1160,7 +1249,8 @@ can be set by repository config.
 ### Command output
 
 Approved command executions store their full output on disk
-([validation.rs:67](../crates/workspace-engine/src/validation.rs:67)):
+(`CommandStore::save_execution` in
+[validation.rs](../crates/workspace-engine/src/validation.rs)):
 
 ```text
 commands/output/<execution-id>/stdout.log
@@ -1205,7 +1295,7 @@ Write to a specific scope — this reports the exact file it touched, which is
 also a quick way to confirm where a scope resolves:
 
 ```bash
-cargo run -p damaian-cli -- config-set user model_name deepseek-chat
+cargo run -p damaian-cli -- config-set user model_name deepseek-v4-flash
 ```
 
 To check overlay precedence, print the raw files rather than the merged view:
@@ -1232,14 +1322,31 @@ Relevant environment variables:
 ### The API token blocks curl
 
 Every `/api/*` path requires the `x-damaian-api-token` header
-([lib.rs:1740](../crates/desktop-shell/src/lib.rs:1740)). The token is 32 random
+(`require_api_token` in
+[lib.rs](../crates/desktop-shell/src/lib.rs)). The token is 32 random
 bytes generated per process, kept in memory, handed to the webview over the
 Tauri IPC command `damaian_desktop_bootstrap`, and **never written to disk or
 printed**. You cannot curl a running app's API from outside it, and there is no
 flag to set the token.
 
 So: use `damaian-cli` to reproduce engine behaviour, and the webview console to
-reproduce shell behaviour. Do not spend time trying to authenticate curl.
+reproduce shell behaviour. Do not spend time trying to authenticate curl
+against the app.
+
+The one server curl can reach is the ignored test
+`serves_the_ui_for_manual_inspection`
+([desktop-shell/src/lib.rs](../crates/desktop-shell/src/lib.rs)). It serves the
+real UI on `127.0.0.1:4899` with its own isolated data directory and a seeded
+repository, and prints `apiToken = "damaian-ui-inspection-token"`, a fixed test
+token, with the repository and data paths:
+
+```bash
+cargo test -p desktop-shell --lib -- --ignored --nocapture serves_the_ui
+```
+
+It runs until you stop it. Pass that token as `x-damaian-api-token`, or in the
+browser console set `apiToken` to it and call `setRepository` with the printed
+repository path. It shows only its own seeded state, never the user's.
 
 ### CLI reproduction
 
@@ -1287,7 +1394,7 @@ not a bug.
 Error-surfacing behaviour worth knowing:
 
 - A `401` on a protected path triggers exactly one automatic re-bootstrap and
-  retry (`app.js:157`). A second failure surfaces to the user.
+  retry (the `401` branch of `api()` in `app.js`). A second failure surfaces to the user.
 - Failures reach the user as a toast and a `Desktop API unavailable` banner
   above the conversation (`#desktop-api-banner`), which clears on the next
   successful `/api/*` response; the underlying message is in the console.
@@ -1301,7 +1408,8 @@ Error-surfacing behaviour worth knowing:
 ### Port 4765
 
 The Tauri app probes the port before starting and **refuses to start** if it is
-taken ([desktop-app/src/main.rs:290](../crates/desktop-app/src/main.rs:290)),
+taken (`shell_port_for_status` in
+[desktop-app/src/main.rs](../crates/desktop-app/src/main.rs)),
 because the CSP and Tauri capability are scoped to that exact origin. There is
 no fallback by design.
 
@@ -1315,6 +1423,27 @@ not take the port and do not kill by name. Run your own instance elsewhere:
 ```bash
 DAMAIAN_DATA_DIR=/tmp/damaian-debug cargo run -p desktop-shell -- --port 4900 --repo /path/to/repo
 ```
+
+### The data directory is refused at startup
+
+The data directory carries a schema marker, `schema.conf`, holding one line,
+`schema_version=1` ([data_schema.rs](../crates/workspace-engine/src/data_schema.rs),
+`ensure_data_dir_schema`). It is checked before the shell serves anything. A
+directory with content and no marker is adopted as version 1 and the startup
+line says so. A marker that names a newer version, `0`, or something that is
+not a number, or has no `schema_version` line, is refused, and nothing in the
+directory is touched:
+
+```text
+The data directory at <path> declares data schema version "<found>", and this version of Damaian supports version 1. Nothing in it was changed. …
+```
+
+The app shows this in a dialog titled `Damaian cannot use its data directory`
+and quits; the standalone shell prints it and exits. The usual cause is running
+an older build against a directory a newer build wrote. Run a build that
+supports it, or point `DAMAIAN_DATA_DIR` somewhere else. Do not delete the
+directory or edit the marker to get past it: the refusal exists because an
+older build writing over a newer layout loses sessions.
 
 ### Model calls fail
 
@@ -1346,7 +1475,7 @@ retries, and it is recorded as the task's `failureKind` and in the audit log.
 |---|---|---|---|
 | `provider_rate_limited` | 429 | Yes, up to 4 attempts / 90s | Wait, or retry later by resuming the task. |
 | `provider_overloaded` | 500, 502, 503, 504 | Yes, up to 4 attempts / 90s | Wait; it is the provider, not your request. |
-| `provider_quota_exhausted` | 402, or a body naming quota | No | Top up the account; the provider's message says what is owed. |
+| `provider_quota_exhausted` | 402; another 4xx (not 400/404/422) whose error `code` or `type` names quota, billing or balance; or such an error object with no classifying status | No | Top up the account; the provider's message says what is owed. |
 | `provider_auth_failed` | 401, 403 | No | The key is wrong, expired, or lacks access. |
 | `provider_bad_request` | 400, 404, 422 | No | The request will not succeed if repeated. |
 | `provider_refused` | other 4xx/5xx | No | Recognised as a refusal but not classified further; treated as permanent. |
@@ -1408,9 +1537,14 @@ Usually one of three things, distinguishable from the logs:
 - **Native tool-calling is off** for the provider. `propose_patch` and MCP tools
   require it; the fallback text envelopes are less reliable. Check
   `model_provider.<id>.supports_native_tools`.
-- **The response was truncated** at the provider's output limit. DeepSeek
-  defaults to 4096 tokens, and a truncated `propose_patch` call leaves unusable
-  partial JSON. Set `model_provider.<id>.max_output_tokens`.
+- **The response was truncated** at the output ceiling, and a truncated
+  `propose_patch` call leaves unusable partial JSON. With no
+  `model_provider.<id>.max_output_tokens` set, Damaian sends a built-in
+  ceiling: 65,536 for `deepseek-v4-flash` and `deepseek-v4-pro`, and 8,192 for
+  the retired `deepseek-chat`/`deepseek-reasoner` aliases and any other
+  DeepSeek model. A provider with no ceiling, configured or built in, gets
+  none, and its own default applies, which can be low. Set
+  `model_provider.<id>.max_output_tokens` to raise it.
 - **The turn ended `complete`** rather than `patch_proposal_ready` — the model
   simply answered in prose. Confirm with `model_response_completed.status`.
 
@@ -1454,8 +1588,9 @@ Permission Profiles sections), and the wording tells them apart:
   repository's may also have set; [Why a rule is in force](#why-a-rule-is-in-force)
   finds its source. When both mode and profile refuse, the mode is named.
   A command `command_access` blocks is refused before any proposal or card in a
-  turn, and a stored proposal run by id is re-classified and blocked with
-  `Blocked by permission profile: command_access=<level>`.
+  turn. A stored proposal run by id is re-classified and refused as blocked by
+  policy; the reason its classification carries reads `Blocked: the
+  permission profile allows <level> commands only`.
 - **A command-policy refusal** names no mode. It reads `local policy blocks this
   command`, or `Command proposal is blocked by policy` at run time, and it
   happens in Code mode too.
@@ -1579,7 +1714,8 @@ If an approved Docker command fails:
 
 `enable_semantic_search` is off by default because enabling it downloads an
 embedding model on first use. The download uses `curl`
-([embeddings.rs:117](../crates/workspace-engine/src/embeddings.rs:117)) and
+(`download_if_missing` in
+[embeddings.rs](../crates/workspace-engine/src/embeddings.rs)) and
 writes to `models/all-MiniLM-L6-v2/`. If that directory is missing or partial,
 the first search after enabling is doing the fetch. Delete the directory to
 force a clean re-download.
@@ -1588,7 +1724,8 @@ force a clean re-download.
 
 The PTY terminal spawns a login shell from `$SHELL` (falling back to
 `/bin/zsh`) on a pseudo-terminal owned by the Tauri wrapper
-([terminal.rs:49](../crates/desktop-shell/src/terminal.rs:49)). Failures surface
+(`terminal::open` in
+[terminal.rs](../crates/desktop-shell/src/terminal.rs)). Failures surface
 as `failed to start shell: <error>`. Sessions are held in a process-global map,
 so they do not survive a restart. `crates/desktop-shell/static/xterm*` is
 vendored and minified — never edit or reformat it.
@@ -1650,8 +1787,11 @@ None of these are a malfunction:
   ([spec 49](specs/49_prompt_cache_accounting_and_reuse/proposal.md) §5.7);
   toggling a tool or anything that edits the system prompt changes the first
   bytes of every request after it, and the cache starts over from there.
-- **A compaction ran.** Rewriting earlier turns is itself a change to the
-  request and a fresh prefix to warm.
+- **A long turn outgrew its message window.** Within one turn, a request
+  carries at most `agent_max_turn_messages` (default 24) of the turn's
+  messages, so once a turn passes that, earlier rounds drop out of the request.
+  That changes the request's prefix, which the provider then has to warm
+  again. The session log still holds every round.
 - **The provider expired the cached prefix on its own schedule.** Providers
   hold a cached prefix for a limited window — commonly a few minutes of
   inactivity — and nothing in Damaian controls or extends it.
@@ -1679,7 +1819,7 @@ CI runs the whole gate in a few minutes. On this project's development Mac the
 same runs have ranged from that to well over an hour, on the same code, minutes
 apart. A fresh worktree's cold `target/` is not the cause: on 2026-10-14 a
 clippy run into an empty target directory took 45s, and
-`cargo nextest run --workspace` 33s for 1186 tests. When a gate step runs past
+`cargo nextest run --workspace` 33s. When a gate step runs past
 about ten minutes, stop waiting and find out why.
 
 **Measure it with `scripts/quality-gate.sh`.** It runs the same seven checks
@@ -1793,7 +1933,8 @@ Enough for someone else to work the problem without the machine in front of
 them:
 
 1. Version from the About dialog, and whether it is a dev run or a packaged DMG.
-2. Steps to reproduce, and which of the three processes is involved.
+2. Steps to reproduce, and which of the processes in
+   [Process model](#process-model) is involved.
 3. stderr from a terminal-attached run, captured as described in
    [Logs](#logs).
 4. The audit timeline around the failure — the `jq` timeline command above,

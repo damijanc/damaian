@@ -33,13 +33,47 @@ Assignment-shaped detection (`password=`, `api_key:`, database URL credentials) 
 
 ## Local App Boundary
 
-The desktop shell binds to loopback on the fixed app origin `http://127.0.0.1:4765`. Startup refuses to continue if that port is already occupied, and the Tauri capability is scoped to that exact localhost origin.
+The desktop shell binds to loopback on the fixed app origin `http://127.0.0.1:4765`. Startup refuses to continue if that port is already occupied. The Tauri capability admits only that origin, as `http://127.0.0.1:4765` and `http://localhost:4765`, and only the `main` window. It grants the bootstrap command, the dialog and updater plugins, and the terminal panel's commands (`terminal_open`, `terminal_write`, `terminal_resize`, `terminal_close`), so the terminal panel is reachable from that origin and from nowhere else.
 
 The desktop API token is never served over HTTP. It is delivered to the webview through a Tauri IPC command (`damaian_desktop_bootstrap`), which only the app's own webview process can invoke, so no local HTTP request against the shell server can retrieve it. Local `/api/*` requests require that token.
 
 Model provider requests use `curl --config -` so the provider API key is passed through the child process stdin configuration, not as a command-line argument.
 
 Patch rollback snapshots and session checkpoints store pre-edit file content unredacted, under `<data_dir>/rollback/` and the checkpoint store. That is deliberate: redaction covers what leaves your control (model context, command output, diffs, the audit log), and a snapshot is a local copy kept so a file can be put back exactly. Redacting it would corrupt the restore. Treat the data directory as sensitive and do not share it.
+
+## Command Execution
+
+Damaian classifies every command before it runs, and the classification, not the model, decides whether you are asked:
+
+- **Runs without asking:** commands Damaian recognises as read-only, such as `pwd`, `ls`, `git status` and `git log` with listed options, and simple pipelines of them filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut` or `grep`. They are not sandboxed; they run in your login shell in the working folder, which is why the admitted set is a closed list of programs and options rather than a heuristic.
+- **Asks first:** everything else, including anything that writes, installs, reaches the network or uses shell control syntax. `git diff` and `git show` ask too, because they print file contents a command line cannot bound or keep restricted paths out of; the agent's `read_git_diff` tool does both. Every Docker command asks, `docker ps` included, because the daemon is privileged.
+- **Blocked:** commands matching `command_blocklist` or a destructive pattern are refused and cannot be approved from the UI.
+
+`require_approval_for_all_commands` makes every command ask. *Allow Always* records one exact command for one checkout in user config (see the trust boundary below) and is not offered for blocked commands or commands with shell control syntax. A working mode or permission profile can only narrow what runs. Output of every command is redacted before the model or the UI sees it, and each command runs under `command_timeout_secs` and is registered in the process registry. A command left running by a crash is found by the sweep at the next launch and killed by its recorded pid, only while its recorded start time still matches, and never by name.
+
+## File Access
+
+Reads and writes go through one path policy:
+
+- A path that resolves outside the selected repository is refused, for reads and writes alike. For writes, every existing component of the target is checked, so a symlink inside the repository that points outside it cannot be written through. Additional directories are reachable only through `allowed_roots`, which a repository cannot set.
+- `restricted_patterns` are refused to the agent's read tools and excluded from search, context and git reads. The defaults cover `.env` and `.env.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, SSH private key names (`id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`), and `secrets/` and `credentials/` directories at any depth. A repository may add patterns, never remove them.
+
+## Patch Application
+
+The model never writes files. An edit comes back as a patch preview, and nothing is written until you apply it. Each file in a patch records the hash of the content it was generated against; at apply time a file whose current hash differs is blocked rather than overwritten, so a patch approved earlier cannot silently replace changes made after the preview. Generated content is scanned for hardcoded secrets before apply, as described above.
+
+## Audit Log
+
+Security-relevant actions — commands run or refused, patches applied or rejected, approvals, rejected repository config keys, worker spawns and terminations — are appended to `<data_dir>/audit/events.jsonl` (by default under `~/Library/Application Support/DamaianClient/`). Fields are redacted before they are written, and attacker-controlled values such as a rejected repository key's value are never recorded. Files older than `audit_retention_days` are pruned. The log stays on your machine; nothing sends it anywhere.
+
+## Data That Leaves Your Machine
+
+Prompts and the context Damaian assembles go to the model provider you configured, and only there. Two cases can reach somewhere else, and both need you each time:
+
+- **Provider fallback.** When a provider refuses a turn and a second qualifying provider is configured, the desktop app offers to answer that one turn with it. The offer is refused unless you accept it, it never becomes permanent, and it covers only the turn it was offered for.
+- **Browser diagnostics on a remote URL.** Inspecting a local page (`localhost`, `127.0.0.1`, `[::1]`) runs without asking. Any page outside your machine asks every time and shows the origin it will reach; the per-session grant never covers a remote URL.
+
+The provider API key is stored in the macOS Keychain under the service `DamaianClient`, or read from an environment variable you name. Config holds only a reference to it (`keychain:<account>` or the variable's name), never the key itself.
 
 ## Git Read Hardening
 
@@ -77,9 +111,11 @@ and desktop shell inherit them because they call the same functions:
 
 Configuration comes from three files, applied in order: user (`<data_dir>/config/user.conf`), repository (`<repo>/.damaian/config.conf`), and admin (`DAMAIAN_ADMIN_CONFIG` or `<data_dir>/config/admin.conf`). Only the repository file arrives with a clone, so **repository config is untrusted input**: it may add restrictions and never remove one.
 
-A repository cannot set `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, or any `model_*` key including a `model_provider.<id>` entry. Those keys redirect where commands run, where model traffic and the API key reference go, where data is written, or which defences are active; a repository has no legitimate use for any of them. They are ignored, recorded in the audit log as `repository_config_key_rejected` with the key name and class — never the value, which is attacker-controlled text — and reported to the user once per repository. There is deliberately no override.
+A repository cannot set `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, any `language_server.<language>` command, or any `model_*` key including a `model_provider.<id>` entry. Those keys redirect where commands run, which programs start unprompted, where model traffic and the API key reference go, where data is written or how long it is kept, or which defences are active; a repository has no legitimate use for any of them. They are ignored, recorded in the audit log as `repository_config_key_rejected` with the key name and class — never the value, which is attacker-controlled text — and reported to the user once per repository. There is deliberately no override.
 
-`restricted_patterns`, `ignore_patterns`, and `command_blocklist` are unioned with the user's, so a repository may add a restriction but never drop one. `require_approval_for_file_edits`, `require_approval_for_risky_commands`, and `require_approval_for_all_commands` may be turned on by a repository, never off. `mcp_enabled` and a server's `enabled` may be turned off, never on, and `mcp_server_allowlist` may only be narrowed. A repository may *define* an MCP server — a useful suggestion — but the definition is created disabled and approval-gated, and it cannot redefine a server the user has already configured.
+`restricted_patterns`, `ignore_patterns`, and `command_blocklist` are unioned with the user's, so a repository may add a restriction but never drop one. `require_approval_for_file_edits`, `require_approval_for_risky_commands`, and `require_approval_for_all_commands` may be turned on by a repository, never off. `mcp_enabled` and a server's `enabled` may be turned off, never on, and `mcp_server_allowlist` may only be narrowed. A repository may *define* an MCP server — a useful suggestion — but the definition is created disabled and approval-gated, and it cannot redefine a server the user has already configured. The same holds for hooks: a repository may define a hook of its own, but cannot change a hook the user or admin config already defines.
+
+Limits on how much one tool call, command or turn may read, run or spend may be lowered by a repository and never raised: `command_timeout_secs`, `max_read_lines`, `max_list_entries`, `max_search_matches`, `max_match_line_chars`, `repository_map_max_tokens`, `agent_max_task_tokens`, `agent_max_turn_messages`, and `agent_max_exploration_rounds`. Raising one would widen what leaves your machine or how long a command may run.
 
 `command_allowlist` is never taken from repository config. An `Allow Always` decision is the user's decision about a repository, so it is stored in user config as `command_allowlist.<repository_id>`, keyed per checkout. The repository's own file cannot grant its commands no-approval execution, and a `command_allowlist` already present in a repository file is offered once for itemised keep-or-discard rather than honoured.
 
@@ -99,7 +135,7 @@ A worker ([spec 57](docs/specs/57_worker_sessions/proposal.md)) is the app's own
 
 ## Permission Profiles Narrow Only
 
-A permission profile (built in, or a custom file under `<data_dir>/config/profiles/`) is applied after user, repository and admin config, and only ever narrows the result. A profile value that would loosen what is already in force has no effect. A profile cannot carry the redirecting keys (`shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, any `model_*`), `command_allowlist`, or an MCP server definition; such keys are ignored and audited by key and class, never by value. The selection is the user's, stored in user config per checkout, so a repository cannot choose its own profile. Admin config cannot undo a narrower profile the user picked. The capability a session has is the profile intersected with the session's working mode, checked at every refusal point, and a command the profile blocks is also blocked in the command policy, so a stored proposal run by id is re-classified and refused.
+A permission profile (built in, or a custom file under `<data_dir>/config/profiles/`) is applied after user, repository and admin config, and only ever narrows the result. A profile value that would loosen what is already in force has no effect. A profile cannot carry the redirecting keys (`shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, any `language_server.<language>`, any `model_*`), `command_allowlist`, or an MCP server definition; such keys are ignored and audited by key and class, never by value. The selection is the user's, stored in user config per checkout, so a repository cannot choose its own profile. Admin config cannot undo a narrower profile the user picked. The capability a session has is the profile intersected with the session's working mode, checked at every refusal point, and a command the profile blocks is also blocked in the command policy, so a stored proposal run by id is re-classified and refused.
 
 An exported profile contains only keys a profile may carry, so it never names a credential reference (`model_api_key_env`, an MCP server's `auth_token_env`). An imported profile is untrusted input: keys a profile cannot carry are not written, keys that would loosen are listed and, like any profile key, cannot widen anything, and importing never selects the profile.
 
