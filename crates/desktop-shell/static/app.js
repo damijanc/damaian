@@ -9342,9 +9342,28 @@ function createCommandApprovalPreview(
   meta.dataset.blocked = proposal.blocked ? "true" : "false";
   header.append(title, meta);
 
+  // The policy's deciding cause and the agent's own reason sit outside the
+  // rationale disclosure (spec 62 §5.2). They are what tells the user whether
+  // a prompt is routine before they spend attention opening "Why this
+  // command"; that disclosure still carries the full prompt, every cause.
+  // MCP and browser-diagnostic proposals have neither field set, so both lines
+  // stay hidden rather than showing an empty label.
+  const cause = document.createElement("p");
+  cause.className = "command-approval-cause";
+  cause.textContent = proposal.cause || "";
+  cause.hidden = !proposal.cause;
+
   const command = document.createElement("code");
   command.className = "command-approval-command";
   command.textContent = proposal.command || "";
+
+  const agentReason = document.createElement("p");
+  agentReason.className = "command-approval-reason";
+  if (proposal.reason) {
+    agentReason.textContent = `The agent says: ${proposal.reason}`;
+  } else {
+    agentReason.hidden = true;
+  }
 
   // The card payload comes from `chat.rs`'s `AgentCommandProposal`, which
   // carries no working directory (spec 24 Task 8), so the shell reads it from
@@ -9622,7 +9641,7 @@ function createCommandApprovalPreview(
   });
 
   footer.append(disclosure, actions);
-  wrapper.append(header, command, location, details, footer, output);
+  wrapper.append(header, cause, command, agentReason, location, details, footer, output);
   return wrapper;
 }
 

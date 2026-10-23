@@ -2,7 +2,8 @@
 
 Status: In progress. Tasks 1 (`ApprovalCause` and structured causes) and 2
 (`Setting` and profile-block causes) landed 2026-10-18; Task 3 (prompt and
-model-facing wording) landed 2026-10-23. Specified on 2026-10-17
+model-facing wording) landed 2026-10-23; Task 4 (the card names the cause and
+the model's reason) landed 2026-10-23. Specified on 2026-10-17
 from the session behind
 [#59](../59_exploration_round_allowance/proposal.md)–[#61](../61_continue_the_stopped_turn/proposal.md),
 in which the user answered 40 approval prompts that all gave the same reason,
@@ -50,7 +51,9 @@ believes auto-run commands are sandboxed will trust them more than they should.
 > `ApprovalCause` replaces. The `tasks.md` Corrections table records where the
 > code now differs from this section; the bullets below are the corrected view.
 > Task 3 has since rewritten the wording and removed the strings named here;
-> the line references point at the current source for that pre-Task-3 state.
+> Task 4 has since shown the first cause and the model's reason on the card.
+> The line references point at the current source for the pre-Task-3 state, and
+> the card bullet below describes the pre-Task-4 card.
 
 - `command_proposal_response` (`chat.rs:6249`) returns one of two fixed
   sentences, both claiming "sandbox mode", whatever the proposal says.
@@ -80,10 +83,10 @@ believes auto-run commands are sandboxed will trust them more than they should.
 - `require_approval_for_all_commands` and `require_approval_for_risky_commands`
   set `requires_approval` without adding a reason. A low-risk command that needs
   approval only because of them still reads "Read-only command".
-- The approval card (`createCommandApprovalPreview`, `app.js:9170`) shows the
+- The approval card (`createCommandApprovalPreview`, `app.js:9325`) shows the
   command and a risk badge, and puts the plain-text `command_approval_prompt`,
   which includes the reasons, behind a **Why this command** disclosure. The
-  model's own stated reason is not shown; `AgentCommandProposal` (`chat.rs:287`)
+  model's own stated reason is not shown; `AgentCommandProposal` (`chat.rs:314`)
   carries no `reason` field to show.
 - `effective_policy.rs`'s `rule_label` names configuration keys in plain words
   ("Ask before every command", "Commands that are always blocked"). It does not

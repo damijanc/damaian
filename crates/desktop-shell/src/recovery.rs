@@ -604,13 +604,15 @@ fn describe_approval(
 /// card is the same component rather than a second one.
 fn command_proposal_json(engine: &WorkspaceEngine, proposal: &CommandProposal) -> String {
     format!(
-        "{{\"proposalId\":\"{}\",\"command\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"allowAlways\":{},\"allowBrowserDiagnosticsForSession\":false}}",
+        "{{\"proposalId\":\"{}\",\"command\":\"{}\",\"prompt\":\"{}\",\"risk\":\"{}\",\"requiresApproval\":{},\"blocked\":{},\"cause\":\"{}\",\"reason\":\"{}\",\"allowAlways\":{},\"allowBrowserDiagnosticsForSession\":false}}",
         escape_json(&proposal.id),
         escape_json(&proposal.command),
         escape_json(&command_approval_prompt(proposal)),
         proposal.risk.as_str(),
         proposal.requires_approval,
         proposal.blocked,
+        escape_json(proposal.reasons.first().map(String::as_str).unwrap_or("")),
+        escape_json(&proposal.reason),
         allow_always_eligible(&engine.config, &proposal.command, proposal.blocked)
     )
 }

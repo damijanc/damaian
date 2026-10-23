@@ -318,6 +318,15 @@ pub struct AgentCommandProposal {
     pub risk: String,
     pub requires_approval: bool,
     pub blocked: bool,
+    /// The policy's deciding cause in plain words (spec 62 §5.2): the first
+    /// rendered `reasons` entry, which is derived from the classification's
+    /// causes. Shown beside the risk badge, outside the rationale disclosure,
+    /// because it is what tells the user whether this prompt is routine.
+    pub cause: String,
+    /// The model's own stated reason for wanting the command (spec 62 §5.2).
+    /// Stored on the proposal all along; the card shows it as "The agent says:
+    /// …" so the user sees both what the agent wants and why Damaian asks.
+    pub reason: String,
     /// Whether the approval UI may offer "allow always" for this proposal.
     /// Always false for MCP tool calls, which aren't shell commands and so
     /// have no `command_allowlist` entry to write.
@@ -6272,6 +6281,11 @@ fn agent_command_proposal(config: &Config, proposal: &CommandProposal) -> AgentC
         risk: proposal.risk.as_str().to_string(),
         requires_approval: proposal.requires_approval,
         blocked: proposal.blocked,
+        // `reasons` is rendered from the classification's causes, so the first
+        // entry is the deciding cause's plain words. Task 5 adds the causes to
+        // the stored proposal; until then this is the one source for the words.
+        cause: proposal.reasons.first().cloned().unwrap_or_default(),
+        reason: proposal.reason.clone(),
         allow_always: allow_always_eligible(config, &proposal.command, proposal.blocked),
         allow_browser_diagnostics_for_session: false,
     }
@@ -6438,6 +6452,10 @@ fn mcp_approval_proposal(
         risk: "mcp".to_string(),
         requires_approval: true,
         blocked: false,
+        // Not a local command: the command policy produced no cause, and the
+        // card already says what this MCP call is in `prompt`.
+        cause: String::new(),
+        reason: String::new(),
         // An MCP tool call is not a shell command, so `command_allowlist` has
         // nothing to say about it. Per-server `require_approval` in the MCP
         // config is the knob for making these stop prompting.
@@ -6472,6 +6490,10 @@ fn web_diagnostic_approval_proposal(
         risk: risk.to_string(),
         requires_approval: true,
         blocked: false,
+        // Not a local command: its policy cause does not exist, and `prompt`
+        // already names the target and what the diagnostic may do.
+        cause: String::new(),
+        reason: String::new(),
         allow_always: false,
         // The session grant covers loopback only, so a remote URL is never
         // offered it: each remote diagnostic is approved on its own.
@@ -9119,12 +9141,21 @@ mod approval_prompt_wording_tests {
     use crate::mode::SessionMode;
 
     fn proposal(command: &str, blocked: bool, causes: Vec<ApprovalCause>) -> CommandProposal {
+        proposal_saying(command, blocked, causes, "The model's own reason.")
+    }
+
+    fn proposal_saying(
+        command: &str,
+        blocked: bool,
+        causes: Vec<ApprovalCause>,
+        reason: &str,
+    ) -> CommandProposal {
         CommandProposal {
             id: "cmdprop_test".to_string(),
             command: command.to_string(),
             working_directory: "/repo".to_string(),
             repository_root: "/repo".to_string(),
-            reason: "The model's own reason.".to_string(),
+            reason: reason.to_string(),
             risk: if blocked {
                 CommandRisk::Blocked
             } else {
@@ -9139,6 +9170,51 @@ mod approval_prompt_wording_tests {
             status: "pending".to_string(),
             purpose: CommandPurpose::Other,
         }
+    }
+
+    #[test]
+    fn the_card_payload_carries_the_first_cause_and_the_models_reason() {
+        let causes = vec![
+            ApprovalCause::ShellControl {
+                constructs: "`&&`, `|`".to_string(),
+            },
+            ApprovalCause::Setting {
+                key: "require_approval_for_all_commands".to_string(),
+                source: Some("user".to_string()),
+            },
+        ];
+        let proposal = proposal_saying(
+            "cd x && git diff | head",
+            false,
+            causes.clone(),
+            "Compare the worktree with the index.",
+        );
+
+        let payload = agent_command_proposal(&Config::default(), &proposal);
+
+        assert_eq!(payload.reason, "Compare the worktree with the index.");
+        assert_eq!(payload.cause, causes[0].plain_words());
+        assert_ne!(payload.cause, causes[1].plain_words());
+        assert!(payload.cause.contains("`&&`"), "{}", payload.cause);
+        assert!(payload.cause.contains("`|`"), "{}", payload.cause);
+    }
+
+    #[test]
+    fn a_blocked_command_still_names_its_cause_on_the_card() {
+        let proposal = proposal_saying(
+            "echo forbidden",
+            true,
+            vec![ApprovalCause::Blocklisted {
+                rule: "echo forbidden".to_string(),
+            }],
+            "Try it anyway.",
+        );
+
+        let payload = agent_command_proposal(&Config::default(), &proposal);
+
+        assert!(payload.blocked);
+        assert!(payload.cause.starts_with("Blocked: matches"));
+        assert_eq!(payload.reason, "Try it anyway.");
     }
 
     #[test]

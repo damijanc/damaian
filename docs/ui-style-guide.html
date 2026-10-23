@@ -427,7 +427,11 @@
 
     <section class="sg-section">
       <h2>Command approval</h2>
-      <p class="sg-hint">Collapsed left, expanded with a long wrapped command right.</p>
+      <p class="sg-hint">
+        Collapsed left, expanded with a long wrapped command right. The policy's deciding cause and
+        the agent's own reason are outside the disclosure; “Why this command” keeps the full
+        prompt.
+      </p>
       <div class="sg-pair">
         <div>
           <div class="sg-card">
@@ -435,7 +439,11 @@
               <strong>Run command</strong
               ><span class="command-approval-risk" data-blocked="false">review</span>
             </div>
+            <p class="command-approval-cause">
+              Asks first: *Ask before test, build and lint commands* is on (set by default)
+            </p>
             <code class="command-approval-command">cargo test -p damaian-core</code>
+            <p class="command-approval-reason">The agent says: Run the package's tests.</p>
             <p class="command-approval-location">Runs in <code>crates/engine</code></p>
             <div class="command-approval-footer">
               <button type="button" class="disclosure" aria-expanded="false">
@@ -457,7 +465,9 @@
               <strong>Run command</strong
               ><span class="command-approval-risk" data-blocked="false">review</span>
             </div>
+            <p class="command-approval-cause">Asks first: Docker commands always ask</p>
             <code class="command-approval-command">docker run --rm -v "$PWD":/w -w /w --network host -e RUST_LOG=debug rust:1.79 cargo build --release --target x86_64-unknown-linux-musl</code>
+            <p class="command-approval-reason">The agent says: Reproduce the CI build.</p>
             <pre class="command-approval-details">Cross-compiling for musl so the release artifact runs on the CI image.</pre>
             <div class="command-approval-footer">
               <button type="button" class="disclosure" aria-expanded="true">
@@ -479,14 +489,19 @@
       <h2>Blocked approval</h2>
       <p class="sg-hint">
         Disabled primary, danger-toned risk pill, and no overflow trigger at all — a blocked
-        proposal cannot be approved through a menu that does not exist.
+        proposal cannot be approved through a menu that does not exist. The cause line says what
+        blocked it.
       </p>
       <div class="sg-card">
         <div class="command-approval-header">
           <strong>Run command</strong
           ><span class="command-approval-risk" data-blocked="true">blocked</span>
         </div>
+        <p class="command-approval-cause">
+          Blocked: matches *Commands that are always blocked* (`rm -rf /`)
+        </p>
         <code class="command-approval-command">rm -rf / --no-preserve-root</code>
+        <p class="command-approval-reason">The agent says: Clean the build directory.</p>
         <div class="command-approval-footer">
           <button type="button" class="disclosure" aria-expanded="false">
             <span class="disclosure-caret" aria-hidden="true"></span> Why this command

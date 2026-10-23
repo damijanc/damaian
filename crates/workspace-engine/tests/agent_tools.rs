@@ -1145,3 +1145,52 @@ fn repeated_read_only_rounds_produce_the_same_session_sequence() {
         "a concurrent round must log the same order every run"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Spec 62 Task 4 · the card names the cause and the model's reason
+// ---------------------------------------------------------------------------
+
+/// A network command needs approval, so the turn stops with a card payload.
+/// The payload must carry both the policy's deciding cause (the first one) and
+/// the agent's own stated reason: the card shows them without opening the
+/// "Why this command" disclosure, so neither may live only in the full prompt.
+#[test]
+fn a_network_command_reaches_the_card_with_its_cause_and_the_models_reason() {
+    let repo = temp_dir("card-cause-reason");
+    write_fixture(&repo, "src/lib.rs", "pub fn card() {}\n");
+    let mut config = test_config(&repo);
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+
+    let reason = "Check the upstream changelog.";
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![ToolCall {
+            id: "call_curl".to_string(),
+            name: "run_command".to_string(),
+            arguments_json: format!(
+                "{{\"command\":\"curl https://example.com\",\"reason\":\"{reason}\"}}"
+            ),
+        }]],
+    );
+    let mut on_token = |_token: &str| {};
+
+    let result = engine
+        .chat_orchestrator
+        .ask(
+            &repo,
+            "Fetch the upstream changelog.",
+            &[],
+            &mut adapter,
+            &mut on_token,
+        )
+        .unwrap();
+
+    let proposal = result
+        .command_proposal
+        .expect("a network command stops for approval");
+    assert_eq!(proposal.reason, reason);
+    assert_eq!(proposal.cause, "Asks first: may use the network (`curl`)");
+
+    fs::remove_dir_all(repo).unwrap();
+}

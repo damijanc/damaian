@@ -2945,6 +2945,25 @@ button:disabled {
   color: var(--danger);
 }
 
+/* The policy's deciding cause and the agent's own reason (spec 62 §5.2). They
+   sit outside "Why this command" on purpose: with every prompt hiding its
+   reason, forty prompts in a row looked alike. The cause is body ink because
+   it is the line that decides whether the user reads on; the agent's reason is
+   secondary to it. */
+.command-approval-cause {
+  margin: 0;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.command-approval-reason {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 /* Wrapped and uncapped, deliberately. This is a consent surface: the user has
    to be able to read the whole command before approving it, so it is never
    horizontally scrolled, elided, or capped behind a scroll container. A

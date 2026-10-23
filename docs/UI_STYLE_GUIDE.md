@@ -353,9 +353,13 @@ the UI, because the user is granting consent rather than navigating.
   in its entirety — never horizontally scrolled, elided, or capped behind a
   scroll container. The user must be able to read everything they are
   approving without interacting first.
-- **Rationale is progressive.** Explanatory prose sits behind a collapsed
-  disclosure. It renders collapsed every time; disclosure state is not
-  remembered between proposals.
+- **The deciding reason is not progressive.** The policy's first cause and the
+  agent's own stated reason sit on the card outside any disclosure (spec 62):
+  they are what tells the user whether a prompt is routine, and hiding them is
+  what made forty prompts read alike. The full prompt, with every cause, stays
+  behind a collapsed **Why this command** disclosure. Explanatory prose beyond
+  those two lines is progressive; it renders collapsed every time, and
+  disclosure state is not remembered between proposals.
 - **Escalations live in the overflow.** "Always allow", session-wide grants,
   and anything else that outlives the turn.
 - **Nothing is pre-selected toward approval.** Focus does not land on the
