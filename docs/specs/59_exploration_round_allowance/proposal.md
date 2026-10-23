@@ -51,7 +51,7 @@ and bound what it *reads* separately and more generously.
 
 - `agent_max_tool_rounds` (default 8) is clamped to
   `ABSOLUTE_TOOL_ROUND_CAP` (16) by `default_tool_round_limit`
-  ([chat.rs:530](../../../crates/workspace-engine/src/chat.rs:530)). Web debug
+  ([chat.rs:530](../../../crates/workspace-engine/src/chat.rs)). Web debug
   mode uses `agent_web_debug_max_tool_rounds` (12), and *Continue debugging*
   uses the cap itself (`tool_round_limit`, `chat.rs:542`).
 - The turn loop counts every model call that returns tool calls as one round.
@@ -61,7 +61,7 @@ and bound what it *reads* separately and more generously.
 - With `agent_max_task_tokens` set, spec 47 requirement 6 continues past the
   cap in further segments, bounded by the token ceiling and by
   `round < ABSOLUTE_TOOL_ROUND_CAP` (`chat.rs:2350`).
-- `action_effect` ([chat.rs:4465](../../../crates/workspace-engine/src/chat.rs:4465))
+- `action_effect` ([chat.rs:4465](../../../crates/workspace-engine/src/chat.rs))
   already classifies every tool. `ReadFile`, `ListDirectory`, `SearchContent`,
   `SearchCodebase`, `ReadGitStatus` and `ReadGitDiff` — all now carrying spec
   60's `worktree` argument, and to be joined by that spec's `list_worktrees`

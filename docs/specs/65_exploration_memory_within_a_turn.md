@@ -81,7 +81,7 @@ rounds, about nine tenths. The model then has three options, all bad:
 decided", then "add a cause for X", then "now test it". A new turn sees the
 earlier ones only through `build_model_prompt`, which gives it the last eight
 session messages, each cut to 2,000 characters
-([chat.rs:4762](../../crates/workspace-engine/src/chat.rs:4762)). However well
+([chat.rs:4762](../../crates/workspace-engine/src/chat.rs)). However well
 the investigating turn went, the turn that acts on it starts from a
 2,000-character fragment of its answer and has to investigate again. #55 would
 replace that window with a summary, but it is not started and waits on #26.
@@ -94,7 +94,7 @@ the agent that learned it, that survives the cut and reaches the next turn.
 
 ## 2. Current State
 
-- `bounded_messages` ([chat.rs:4802](../../crates/workspace-engine/src/chat.rs:4802))
+- `bounded_messages` ([chat.rs:4802](../../crates/workspace-engine/src/chat.rs))
   keeps `messages[..2]` (system, user), adds one system notice, and keeps the
   newest rounds that fit `max_messages - 3`. It cuts at round starts so a tool
   result never loses its call. If the newest round alone is larger than the

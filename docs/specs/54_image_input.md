@@ -20,7 +20,7 @@ image enters through),
 [`27_context_inspector.md`](27_context_inspector.md) (where a user sees what was
 sent), [`44_composer_control_density/proposal.md`](44_composer_control_density/proposal.md)
 (owns the composer surface the attach control lives on),
-[`53_session_search_and_export.md`](53_session_search_and_export.md) (the export
+[`53_session_search_and_export.md`](53_session_search_and_export/proposal.md) (the export
 path an image changes the guarantees of),
 [`19_token_and_cost_accounting/proposal.md`](19_token_and_cost_accounting/proposal.md)
 (the accounting an image breaks the `len / 4` assumption of).
@@ -99,7 +99,7 @@ and this spec's real work is deciding honestly what to say instead.
 6. **No image the user has not seen is ever sent.** An agent-captured screenshot
    is shown before it goes, because the user did not choose its contents.
 7. An exported or searched transcript makes the presence of an image explicit,
-   so [spec 53](53_session_search_and_export.md)'s redaction notice is not read
+   so [spec 53](53_session_search_and_export/proposal.md)'s redaction notice is not read
    as covering something it cannot cover.
 8. Every image sent is audited by hash, size, dimensions and origin — never by
    content.
@@ -113,7 +113,7 @@ and this spec's real work is deciding honestly what to say instead.
   indexer walked past a PNG.
 - **Video, audio, or PDF.** PDFs are a recorded non-goal in the roadmap's
   deferred-work section and this spec does not reopen them.
-- **Making images searchable.** [Spec 53](53_session_search_and_export.md)
+- **Making images searchable.** [Spec 53](53_session_search_and_export/proposal.md)
   searches text; an image is found by the message around it.
 - **A second attachment surface.** [Spec 44](44_composer_control_density/proposal.md)
   owns the composer's control row, and this extends the existing attach control
@@ -285,7 +285,7 @@ be reached by two screenshots.
 An image is part of the conversation and is rendered in the transcript as a
 thumbnail that opens full size.
 
-[Spec 53](53_session_search_and_export.md)'s export is where requirement 7
+[Spec 53](53_session_search_and_export/proposal.md)'s export is where requirement 7
 bites. That spec's notice says the export was redacted and how many redactions
 were made; an export containing a screenshot must additionally say that images
 are included and were **not** scanned — otherwise the notice reads as a
@@ -315,7 +315,7 @@ the content, and never a derived description of it.
 - The estimated token cost of an image is computed from its dimensions by the
   provider's rule, is shown before sending, and is labelled estimated.
 - An export containing an image states that images were not scanned for
-  secrets, in addition to [spec 53](53_session_search_and_export.md)'s
+  secrets, in addition to [spec 53](53_session_search_and_export/proposal.md)'s
   redaction notice.
 - Audit records hash, size, dimensions and provenance, and no image content
   appears in any log.

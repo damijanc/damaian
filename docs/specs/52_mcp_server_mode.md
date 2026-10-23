@@ -145,7 +145,7 @@ repository at 14:20 finds it in the same place they would find anything else.
 
 Sessions from server processes are distinguishable in the session list so they
 do not clutter the user's own — a distinction
-[spec 53](53_session_search_and_export.md) has to accommodate, which is why the
+[spec 53](53_session_search_and_export/proposal.md) has to accommodate, which is why the
 two are written in the same pass.
 
 ### 5.4 The client is untrusted, in both directions

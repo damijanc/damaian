@@ -8,19 +8,19 @@ Order: 53 of 53
 Plan: `docs/PLAN/01_phase_1_trust_and_recovery.md`, Phase 1, Work
 Package 9 (Should). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#17](17_durable_task_state_and_crash_recovery/proposal.md) (the
+Depends on: [#17](../17_durable_task_state_and_crash_recovery/proposal.md) (the
 session log it searches) — built. Everything else named below is a
 cross-reference, not a prerequisite.
 Related implementation specs:
-[`16_session_checkpoints_and_rewind.md`](16_session_checkpoints_and_rewind.md)
+[`16_session_checkpoints_and_rewind.md`](../16_session_checkpoints_and_rewind.md)
 (settled the redaction-versus-faithful-restore conflict this spec inherits),
-[`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
+[`17_durable_task_state_and_crash_recovery/proposal.md`](../17_durable_task_state_and_crash_recovery/proposal.md)
 (owns the session log format and the parse-first reader this reuses),
-[`42_conversation_column_density/proposal.md`](42_conversation_column_density/proposal.md)
+[`42_conversation_column_density/proposal.md`](../42_conversation_column_density/proposal.md)
 (owns the thread header a search entry point sits in; placement superseded by
 [#58](../58_header_repo_bar_and_menus/proposal.md), which moved search to the
 sidebar header and export into the session ⋮ menus),
-[`52_mcp_server_mode.md`](52_mcp_server_mode.md) (creates sessions this must not
+[`52_mcp_server_mode.md`](../52_mcp_server_mode.md) (creates sessions this must not
 mix into the user's own).
 
 ## 1. Motivation
@@ -41,7 +41,7 @@ reasoning into a pull request, keep a decision alongside the code, or send a
 colleague what happened has no path that is not a screenshot.
 
 Both are small features whose absence is felt daily, and both are cheap because
-[spec 17](17_durable_task_state_and_crash_recovery/proposal.md) already built
+[spec 17](../17_durable_task_state_and_crash_recovery/proposal.md) already built
 the durable, replayable log they read from. This is a surface over existing
 storage, not new storage.
 
@@ -56,13 +56,13 @@ storage, not new storage.
   second chance to invent a message that was never written.
 - **Messages are stored verbatim.** `SessionStore::append_message` writes
   `content` unchanged — no `SecretScanner`. This is deliberate:
-  [spec 16](16_session_checkpoints_and_rewind.md) settled the conflict between
+  [spec 16](../16_session_checkpoints_and_rewind.md) settled the conflict between
   redaction and faithful restore in favour of restoring what was actually said,
   because a rewind that restores `[REDACTED]` has destroyed the conversation.
   **The consequence for this spec is the whole of §5.4: the log is not safe to
   copy out as-is.**
 - **Search exists for code, not for conversation.** `vector_index.rs` and
-  `embeddings.rs` serve [spec 02](02_semantic_search.md)'s codebase search, over
+  `embeddings.rs` serve [spec 02](../02_semantic_search.md)'s codebase search, over
   repository files.
 - **There is no export of anything.** No Markdown, no JSON, no copy of a
   transcript.
@@ -73,19 +73,19 @@ storage, not new storage.
    reach the matching point in the matching session.
 2. Results state which session, when, and enough surrounding text to recognise
    the match.
-3. Search reads through [spec 17](17_durable_task_state_and_crash_recovery/proposal.md)'s
+3. Search reads through [spec 17](../17_durable_task_state_and_crash_recovery/proposal.md)'s
    reader and tolerates a truncated or torn log without failing the search.
 4. A session exports to Markdown and to JSON.
 5. **Exported and displayed content is redacted**, even though the stored
    content is not. An export states that it was redacted.
 6. Searching and exporting are read-only: no session is modified, and no export
    leaves the machine on its own.
-7. Sessions created by [MCP server mode](52_mcp_server_mode.md) are excluded
+7. Sessions created by [MCP server mode](../52_mcp_server_mode.md) are excluded
    from the user's search and session list by default.
 
 ## 4. Non-goals
 
-- **Semantic or embedding-based search over conversations.** [Spec 02](02_semantic_search.md)'s
+- **Semantic or embedding-based search over conversations.** [Spec 02](../02_semantic_search.md)'s
   index is for code. Conversation search is a text search, and a user looking
   for "that thing about the keychain" is looking for the word.
 - **A second index.** §5.2 scans logs. If that proves too slow at real volumes,
@@ -93,11 +93,11 @@ storage, not new storage.
   index is a second persisted artifact that can disagree with the log.
 - **Cross-session context.** Search finds a session; it does not feed one
   session's content into another's context. That is memory
-  ([spec 28](28_memory_model_and_storage.md) onward) with its own consent rules.
+  ([spec 28](../28_memory_model_and_storage.md) onward) with its own consent rules.
 - **Sharing, uploading, or publishing.** Export writes a file the user chose.
   There is no link, no service and no account.
 - **Editing a transcript.** The log is append-only and stays that way; a rewind
-  ([spec 16](16_session_checkpoints_and_rewind.md)) is the only sanctioned way to
+  ([spec 16](../16_session_checkpoints_and_rewind.md)) is the only sanctioned way to
   change conversation position.
 - **Searching audit records or command output.** Conversation and task events
   only.
@@ -151,7 +151,7 @@ ordering key.
 Requirement 5, and the reason it is not optional.
 
 The session log contains exactly what was said, unredacted, by design
-([spec 16](16_session_checkpoints_and_rewind.md)). Every existing display path
+([spec 16](../16_session_checkpoints_and_rewind.md)). Every existing display path
 redacts on the way out. An export is a display path that writes a file, and it
 is the one that matters most, because the resulting file is the artifact people
 paste into a pull request or send to someone.
@@ -171,7 +171,7 @@ contains it without the search results becoming a second copy of it.
 
 | Format | Contains | For |
 |---|---|---|
-| Markdown | Title, repository, time range, the conversation in order, task outcomes, plan steps and their evidence, token and cost totals ([spec 19](19_token_and_cost_accounting/proposal.md)) | Reading, pasting into a review |
+| Markdown | Title, repository, time range, the conversation in order, task outcomes, plan steps and their evidence, token and cost totals ([spec 19](../19_token_and_cost_accounting/proposal.md)) | Reading, pasting into a review |
 | JSON | The same content as structured records, with `seq` preserved | Tooling |
 
 Neither format is the log. Recovery markers, internal action markers and torn
@@ -183,12 +183,12 @@ being the only one.
 
 Where a plan exists, its steps and evidence are included, since "what was
 actually verified" is the most useful part of a session to keep and the part
-[spec 21](21_task_plan_progress_and_budget/proposal.md) works hardest to
+[spec 21](../21_task_plan_progress_and_budget/proposal.md) works hardest to
 establish.
 
 ### 5.6 Server-mode sessions
 
-[Spec 52](52_mcp_server_mode.md) opens a session per server process so its reads
+[Spec 52](../52_mcp_server_mode.md) opens a session per server process so its reads
 are attributable. Those are machine activity and would swamp a human's session
 list, so the session record carries its origin and the default filter excludes
 anything that is not a user session. A control shows them, because "what did
