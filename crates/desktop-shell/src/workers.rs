@@ -1095,6 +1095,10 @@ fn worker_row(
         "group": group.as_str(),
         "round": phase["round"],
         "maxRounds": phase["maxRounds"],
+        // Additive for spec 59 §5.5: a row written before the exploration
+        // allowance landed has no such fields, and both are `null` then.
+        "explorationRound": phase["explorationRound"],
+        "maxExplorationRounds": phase["maxExplorationRounds"],
         "doing": doing,
         "createdAtMs": session.created_at_ms as u64,
         "updatedAtMs": session.updated_at_ms as u64,

@@ -3627,13 +3627,17 @@ enum TurnEvent {
     Failed(String),
 }
 
+/// Adds `explorationRound`/`maxExplorationRounds` beside the action counts;
+/// older readers ignore the new fields (spec 59 §5.5).
 fn phase_json(phase: &TurnPhase) -> String {
     format!(
-        "{{\"phase\":\"{}\",\"label\":\"{}\",\"round\":{},\"maxRounds\":{}}}",
+        "{{\"phase\":\"{}\",\"label\":\"{}\",\"round\":{},\"maxRounds\":{},\"explorationRound\":{},\"maxExplorationRounds\":{}}}",
         phase.kind.as_str(),
         escape_json(&phase.label),
         phase.round,
-        phase.max_rounds
+        phase.max_rounds,
+        phase.exploration_round,
+        phase.max_exploration_rounds
     )
 }
 
@@ -8932,8 +8936,11 @@ mod tests {
             assert!(!phases.is_empty());
             for phase in &phases {
                 assert!(
-                    phase["round"].is_u64() && phase["maxRounds"].is_u64(),
-                    "{phase}"
+                    phase["round"].is_u64()
+                        && phase["maxRounds"].is_u64()
+                        && phase["explorationRound"].is_u64()
+                        && phase["maxExplorationRounds"].is_u64(),
+                    "phase must carry both the action and exploration counts: {phase}"
                 );
             }
             let tool_phases: Vec<_> = phases
@@ -10096,7 +10103,14 @@ exec /bin/cat > /dev/null
                     (ProgressKind::Status, json!({"state": "running"})),
                     (
                         ProgressKind::Phase,
-                        json!({"phase": "tool", "label": "Running cargo test", "round": 2, "maxRounds": 8}),
+                        json!({
+                            "phase": "tool",
+                            "label": "Running cargo test",
+                            "round": 2,
+                            "maxRounds": 8,
+                            "explorationRound": 3,
+                            "maxExplorationRounds": 24,
+                        }),
                     ),
                 ],
             );
@@ -10171,6 +10185,11 @@ exec /bin/cat > /dev/null
             assert_eq!(running_row["parentTitle"], Value::Null);
             assert_eq!(running_row["round"], 2);
             assert_eq!(running_row["maxRounds"], 8);
+            assert_eq!(
+                running_row["explorationRound"], 3,
+                "the board row mirrors the phase's read count additively"
+            );
+            assert_eq!(running_row["maxExplorationRounds"], 24);
             assert_eq!(running_row["doing"], "Running cargo test");
             assert_eq!(running_row["branch"], running.branch);
             let gone_row = by_title(&rows, "Gone one");
