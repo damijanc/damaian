@@ -307,6 +307,14 @@ fn weakening_cases() -> Vec<WeakeningCase> {
             "repository_map_max_tokens=100000\n",
             Reported("repository_map_max_tokens"),
         ),
+        // Spec 25: the symbols ceiling bounds how much of the repository's
+        // declarations leaves the machine per turn (25 context.md §9).
+        case(
+            "symbol_context_max_tokens",
+            "symbol_context_max_tokens=1600\n",
+            "symbol_context_max_tokens=100000\n",
+            Reported("symbol_context_max_tokens"),
+        ),
         case(
             "command_timeout_secs",
             "command_timeout_secs=600\n",
@@ -2398,6 +2406,10 @@ fn every_rule_has_a_human_name() {
         policy.rule("language_server.rust").unwrap().label,
         "Language server for rust"
     );
+    assert_eq!(
+        policy.rule("symbol_context_max_tokens").unwrap().label,
+        "Tokens matching symbols may use per turn"
+    );
 
     let refused: Vec<_> = policy
         .rules
@@ -3379,4 +3391,40 @@ fn classification_results_are_unchanged_for_existing_policy_tests() {
         );
         assert_eq!(classification.blocked, *blocked, "{command}");
     }
+}
+
+/// Spec 25 Task 8: a repository may lower the `symbols` item's ceiling, or
+/// turn it off, but never raise it above the user's (25 `context.md` §9).
+#[test]
+fn a_repository_may_lower_the_symbol_context_ceiling_but_not_raise_it() {
+    let (config, report) = load(
+        "symbol-ceiling-raised",
+        "",
+        "symbol_context_max_tokens=100000\n",
+    );
+    assert_eq!(config.symbol_context_max_tokens, 1_600);
+    let refused = report
+        .rejected_keys
+        .iter()
+        .find(|rejected| rejected.key == "symbol_context_max_tokens")
+        .unwrap_or_else(|| panic!("not refused: {:?}", report.rejected_keys));
+    assert_eq!(refused.class, RepositoryKeyClass::RestrictOnly);
+
+    let (config, report) = load(
+        "symbol-ceiling-lowered",
+        "",
+        "symbol_context_max_tokens=50\n",
+    );
+    assert_eq!(config.symbol_context_max_tokens, 50);
+    assert!(
+        !report
+            .rejected_keys
+            .iter()
+            .any(|rejected| rejected.key == "symbol_context_max_tokens"),
+        "{:?}",
+        report.rejected_keys
+    );
+
+    let (config, _) = load("symbol-ceiling-off", "", "symbol_context_max_tokens=0\n");
+    assert_eq!(config.symbol_context_max_tokens, 0);
 }

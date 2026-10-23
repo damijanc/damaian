@@ -405,6 +405,184 @@ impl SymbolIndex {
         matches.truncate(limit);
         matches
     }
+
+    /// The symbols a prompt's identifiers name, for the `symbols` context
+    /// item (`context.md` §9), ordered as [`Self::find`] orders them. Every
+    /// identifier matches exactly. Only one shaped like code (an underscore,
+    /// a digit or an inner capital) also matches as a prefix, because a
+    /// prose word such as "the" would prefix-match much of the repository.
+    /// Nothing matches fuzzily. A symbol named by several identifiers is
+    /// listed once, at its best quality.
+    pub fn find_for_prompt(&self, prompt: &str) -> Vec<SymbolMatch> {
+        let identifiers = prompt_identifiers(prompt);
+        if identifiers.is_empty() {
+            return Vec::new();
+        }
+        let prefixes: Vec<String> = identifiers
+            .iter()
+            .filter(|identifier| shaped_like_code(identifier))
+            .map(|identifier| identifier.to_lowercase())
+            .collect();
+        let mut matches: Vec<SymbolMatch> = self
+            .symbols
+            .iter()
+            .filter_map(|symbol| {
+                let quality = if identifiers.contains(&symbol.name.as_str()) {
+                    MatchQuality::Exact
+                } else {
+                    let lowered = symbol.name.to_lowercase();
+                    prefixes
+                        .iter()
+                        .any(|prefix| lowered.starts_with(prefix.as_str()))
+                        .then_some(MatchQuality::Prefix)?
+                };
+                Some(SymbolMatch {
+                    symbol: symbol.clone(),
+                    quality,
+                })
+            })
+            .collect();
+        matches.sort_by(|left, right| {
+            (
+                left.symbol.provenance,
+                left.quality,
+                &left.symbol.path,
+                left.symbol.line,
+                &left.symbol.name,
+            )
+                .cmp(&(
+                    right.symbol.provenance,
+                    right.quality,
+                    &right.symbol.path,
+                    right.symbol.line,
+                    &right.symbol.name,
+                ))
+        });
+        matches
+    }
+
+    /// `matches` as the `symbols` context item's text, one line per symbol in
+    /// the order given, within `max_tokens` (estimated as `add_text` does).
+    /// A heuristic symbol carries [`HEURISTIC_HEDGE`] and a language-server
+    /// one carries nothing (proposal §5.7). The kind is the one the index
+    /// holds, so a Python method the heuristic tier calls a function says
+    /// `function`. When matches are dropped to fit, the last line says how
+    /// many were shown. Empty when nothing matched or not even one line fits.
+    pub fn render_for_model(&self, matches: &[SymbolMatch], max_tokens: usize) -> RenderedSymbols {
+        let total = matches.len();
+        let lines: Vec<String> = matches
+            .iter()
+            .map(|found| symbol_line(&found.symbol))
+            .collect();
+        let header_length = SYMBOLS_HEADER.len() + 1;
+        let all_length = header_length + lines.iter().map(|line| line.len() + 1).sum::<usize>();
+        let shown = if total > 0 && estimate_tokens(all_length) <= max_tokens {
+            total
+        } else {
+            let mut length = header_length;
+            let mut shown = 0;
+            for line in &lines {
+                let next = length + line.len() + 1;
+                if estimate_tokens(next + dropped_line(shown + 1, total).len()) > max_tokens {
+                    break;
+                }
+                length = next;
+                shown += 1;
+            }
+            shown
+        };
+        if shown == 0 {
+            return RenderedSymbols {
+                text: String::new(),
+                tokens: 0,
+                shown: 0,
+                total,
+            };
+        }
+        let mut text = format!("{SYMBOLS_HEADER}\n");
+        for line in &lines[..shown] {
+            text.push_str(line);
+            text.push('\n');
+        }
+        if shown < total {
+            text.push_str(&dropped_line(shown, total));
+        }
+        let tokens = estimate_tokens(text.len());
+        RenderedSymbols {
+            text,
+            tokens,
+            shown,
+            total,
+        }
+    }
+}
+
+/// What a heuristic symbol says about itself wherever the model sees it.
+pub const HEURISTIC_HEDGE: &str = "heuristic — may be inaccurate";
+
+const SYMBOLS_HEADER: &str = "Symbols the prompt names (a heuristic entry is a guess from source text; \
+a language-server entry is exact):";
+
+/// [`SymbolIndex::render_for_model`]'s result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedSymbols {
+    /// Empty when nothing is shown.
+    pub text: String,
+    /// `text.len().div_ceil(4)`, the estimate `build_context` uses.
+    pub tokens: usize,
+    pub shown: usize,
+    /// Every match passed in.
+    pub total: usize,
+}
+
+fn estimate_tokens(length: usize) -> usize {
+    length.div_ceil(4)
+}
+
+fn dropped_line(shown: usize, total: usize) -> String {
+    format!("{shown} of {total} matching symbols shown.")
+}
+
+fn symbol_line(symbol: &Symbol) -> String {
+    let kind = match &symbol.container {
+        Some(container) => format!("{} of {container}", symbol.kind.as_str()),
+        None => symbol.kind.as_str().to_string(),
+    };
+    let location = format!("{}:{}", symbol.path, symbol.line);
+    match symbol.provenance {
+        Provenance::LanguageServer => format!("{} ({kind}, {location})", symbol.name),
+        Provenance::Heuristic => format!("{} ({kind}, {location}, {HEURISTIC_HEDGE})", symbol.name),
+    }
+}
+
+/// How many distinct identifiers of a prompt are looked up, so a pasted log
+/// cannot make the lookup scan the index thousands of times.
+const MAX_PROMPT_IDENTIFIERS: usize = 64;
+
+/// The distinct identifiers in `prompt`, in order: runs of letters, digits
+/// and underscores that do not start with a digit, at least three long.
+/// `Store::put` and `upload.retry` give two each.
+fn prompt_identifiers(prompt: &str) -> Vec<&str> {
+    let mut identifiers: Vec<&str> = Vec::new();
+    for word in prompt.split(|character: char| !(character.is_alphanumeric() || character == '_')) {
+        if word.chars().count() < 3
+            || word.starts_with(|character: char| character.is_numeric())
+            || identifiers.contains(&word)
+        {
+            continue;
+        }
+        identifiers.push(word);
+        if identifiers.len() == MAX_PROMPT_IDENTIFIERS {
+            break;
+        }
+    }
+    identifiers
+}
+
+fn shaped_like_code(identifier: &str) -> bool {
+    identifier.contains('_')
+        || identifier.chars().any(|character| character.is_numeric())
+        || identifier.chars().skip(1).any(char::is_uppercase)
 }
 
 /// Matches as a JSON array, for front ends that do not depend on serde.

@@ -135,6 +135,7 @@ pub fn rule_label(key: &str) -> Option<String> {
         "max_search_matches" => "Matches returned per search",
         "max_match_line_chars" => "Characters kept per search match",
         "repository_map_max_tokens" => "Tokens the repository map may use per turn",
+        "symbol_context_max_tokens" => "Tokens matching symbols may use per turn",
         "max_command_output_bytes" => "Command output kept (bytes)",
         "command_timeout_secs" => "Time limit per command (seconds)",
         "allowed_roots" => "Folders Damaian may open as a repository",

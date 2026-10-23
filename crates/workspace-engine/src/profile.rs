@@ -328,6 +328,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         max_search_matches,
         max_match_line_chars,
         repository_map_max_tokens,
+        symbol_context_max_tokens,
         max_command_output_bytes,
         command_timeout_secs,
         allowed_roots,
@@ -526,6 +527,7 @@ pub fn split_profile_keys(overlay: ConfigOverlay) -> (ConfigOverlay, Vec<Rejecte
         max_search_matches,
         max_match_line_chars,
         repository_map_max_tokens,
+        symbol_context_max_tokens,
         command_timeout_secs,
         ignore_patterns,
         restricted_patterns,
@@ -666,6 +668,9 @@ fn equals_base_limit(key: &str, carried: &ConfigOverlay, base: &Config) -> bool 
         "max_match_line_chars" => carried.max_match_line_chars == Some(base.max_match_line_chars),
         "repository_map_max_tokens" => {
             carried.repository_map_max_tokens == Some(base.repository_map_max_tokens)
+        }
+        "symbol_context_max_tokens" => {
+            carried.symbol_context_max_tokens == Some(base.symbol_context_max_tokens)
         }
         "command_timeout_secs" => carried.command_timeout_secs == Some(base.command_timeout_secs),
         "agent_max_turn_messages" => {

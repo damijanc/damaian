@@ -83,7 +83,9 @@ pub use config::{
     normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
     overlay_field_kinds, parse_mcp_transport,
 };
-pub use context_manager::{ContextItem, ContextManager, ContextPlan, RepositoryMapSource};
+pub use context_manager::{
+    ContextItem, ContextManager, ContextPlan, RepositoryMapSource, SymbolSource,
+};
 pub use data_schema::{
     CURRENT_DATA_SCHEMA_VERSION, DataSchemaError, DataSchemaOutcome, ensure_data_dir_schema,
 };
@@ -171,9 +173,9 @@ pub use session::{
 };
 pub use steering::TurnSteering;
 pub use symbol_index::{
-    MERGE_LINE_TOLERANCE, MatchQuality, Provenance, Relation, RelationKind, RelationTarget,
-    SYMBOL_INDEX_SCHEMA_VERSION, Symbol, SymbolFile, SymbolIndex, SymbolIndexStore, SymbolLoad,
-    SymbolMatch, SymbolRef, merge, symbol_matches_json,
+    HEURISTIC_HEDGE, MERGE_LINE_TOLERANCE, MatchQuality, Provenance, Relation, RelationKind,
+    RelationTarget, RenderedSymbols, SYMBOL_INDEX_SCHEMA_VERSION, Symbol, SymbolFile, SymbolIndex,
+    SymbolIndexStore, SymbolLoad, SymbolMatch, SymbolRef, merge, symbol_matches_json,
 };
 pub use tree_walk::{WalkEvent, WalkFile, WalkSkip};
 pub use validation::{

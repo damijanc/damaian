@@ -1,8 +1,10 @@
 use crate::command_policy::CommandPolicy;
 use crate::file_access::FileAccessController;
 use crate::indexer::RepositoryIndex;
-use crate::repository_map::RepositoryMapStore;
+use crate::path_policy::PathPolicy;
+use crate::repository_map::{RepositoryMap, RepositoryMapStore};
 use crate::secret_scanner::SecretScanner;
+use crate::symbol_index::SymbolIndexStore;
 use crate::vector_index::VectorIndexCache;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -45,6 +47,7 @@ pub struct ContextManager {
     data_dir: PathBuf,
     enable_semantic_search: bool,
     repository_map: RepositoryMapSource,
+    symbols: SymbolSource,
 }
 
 /// What the `repository_map` item is built from (spec 24 `context.md` §5).
@@ -57,6 +60,16 @@ pub struct RepositoryMapSource {
     pub max_tokens: usize,
 }
 
+/// What the `symbols` item is built from (spec 25 `context.md` §9).
+#[derive(Debug, Clone)]
+pub struct SymbolSource {
+    pub store: SymbolIndexStore,
+    /// The engine's own, which keeps restricted files out of the index.
+    pub path_policy: PathPolicy,
+    /// `symbol_context_max_tokens`. `0` leaves the item out.
+    pub max_tokens: usize,
+}
+
 impl ContextManager {
     pub fn new(
         file_access: FileAccessController,
@@ -64,6 +77,7 @@ impl ContextManager {
         data_dir: PathBuf,
         enable_semantic_search: bool,
         repository_map: RepositoryMapSource,
+        symbols: SymbolSource,
     ) -> Self {
         Self {
             file_access,
@@ -71,6 +85,7 @@ impl ContextManager {
             data_dir,
             enable_semantic_search,
             repository_map,
+            symbols,
         }
     }
 
@@ -194,7 +209,8 @@ impl ContextManager {
 
         // After instructions and rules, before retrieved files: under a tight
         // budget the map displaces retrieved files, never instructions.
-        if let Some(map) = index.and_then(|index| self.repository_map_text(index)) {
+        let map = index.and_then(|index| self.load_map(index));
+        if let Some(text) = map.as_ref().and_then(|map| self.repository_map_text(map)) {
             add_text(
                 &self.scanner,
                 &mut items,
@@ -202,7 +218,24 @@ impl ContextManager {
                 token_budget,
                 "repository_map",
                 None,
-                &map,
+                &text,
+            );
+        }
+
+        // The symbols the prompt names, in the same place for the same
+        // reason: it displaces retrieved files, never instructions or the map.
+        if let Some(text) = index
+            .zip(map.as_ref())
+            .and_then(|(index, map)| self.symbols_text(index, map, prompt))
+        {
+            add_text(
+                &self.scanner,
+                &mut items,
+                &mut token_estimate,
+                token_budget,
+                "symbols",
+                None,
+                &text,
             );
         }
 
@@ -232,19 +265,54 @@ impl ContextManager {
         }
     }
 
-    /// The rendered map, or `None` when the ceiling is `0` or the map
-    /// cannot be loaded or stored. The map is an aid: a read-only or broken
-    /// data directory leaves it out rather than failing the turn.
-    fn repository_map_text(&self, index: &RepositoryIndex) -> Option<String> {
-        let source = &self.repository_map;
-        if source.max_tokens == 0 {
+    /// The map both items are built from, or `None` when both ceilings are
+    /// `0` or the map cannot be loaded or stored. The map is an aid: a
+    /// read-only or broken data directory leaves it out rather than failing
+    /// the turn.
+    fn load_map(&self, index: &RepositoryIndex) -> Option<RepositoryMap> {
+        if self.repository_map.max_tokens == 0 && self.symbols.max_tokens == 0 {
             return None;
         }
+        let source = &self.repository_map;
         let (map, _) = source
             .store
             .load_or_build(index, &source.command_policy)
             .ok()?;
-        Some(map.render_for_model(source.max_tokens).text)
+        Some(map)
+    }
+
+    /// The rendered map, or `None` when its ceiling is `0`.
+    fn repository_map_text(&self, map: &RepositoryMap) -> Option<String> {
+        let max_tokens = self.repository_map.max_tokens;
+        (max_tokens > 0).then(|| map.render_for_model(max_tokens).text)
+    }
+
+    /// The symbols the prompt's identifiers name, or `None` when the ceiling
+    /// is `0`, nothing matches, or the symbol index cannot be loaded or
+    /// stored, which leaves the item out rather than failing the turn. It
+    /// reads the stored index as it is, whatever an eager definition pass has
+    /// merged so far, and never waits on a language server (`context.md`
+    /// §8).
+    fn symbols_text(
+        &self,
+        index: &RepositoryIndex,
+        map: &RepositoryMap,
+        prompt: &str,
+    ) -> Option<String> {
+        let source = &self.symbols;
+        if source.max_tokens == 0 {
+            return None;
+        }
+        let (symbols, _) = source
+            .store
+            .load_or_build(index, map, &source.path_policy)
+            .ok()?;
+        let matches = symbols.find_for_prompt(prompt);
+        if matches.is_empty() {
+            return None;
+        }
+        let rendered = symbols.render_for_model(&matches, source.max_tokens);
+        (!rendered.text.is_empty()).then_some(rendered.text)
     }
 
     #[allow(clippy::too_many_arguments)]

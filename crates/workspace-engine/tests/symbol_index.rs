@@ -28,6 +28,11 @@
 //! `didOpen`: recorded once, 1-based, hashed, with no task; never for a
 //! restricted file or outside the root; a clearing set removes nothing; and a
 //! plan step is left alone.
+//!
+//! Task 8 pins the `symbols` context item on the rendered context string:
+//! its place, the hedge on a heuristic and none on a language-server symbol,
+//! its ceiling and the line that says how many were shown, and that a
+//! failure leaves it out of a turn that goes on.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -39,14 +44,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use workspace_engine::finding::{FindingSource, FindingStatus, Severity, SourceRange};
 use workspace_engine::language::extract_symbols;
 use workspace_engine::{
-    AuditLog, CommandPolicy, Config, ConfigOverlay, Declaration, LANGUAGE_SERVER_LANGUAGES,
-    LanguageServerError, LanguageServerHub, LanguageServerLaunch, LanguageServerLimits,
-    LanguageServerState, MERGE_LINE_TOLERANCE, MatchQuality, MockModelAdapter, PathPolicy,
-    ProcessIdentity, ProcessKind, ProcessRegistry, ProjectIndexer, Provenance, RebuildReason,
-    RegisteredProcess, RelationKind, RelationTarget, RepositoryIndex, RepositoryKeyClass,
-    RepositoryMap, RepositoryTrustStore, SYMBOL_INDEX_SCHEMA_VERSION, SecretScanner, SweepScope,
-    Symbol, SymbolIndex, SymbolIndexStore, SymbolKind, SymbolLoad, WorkspaceEngine,
-    extract_declarations, merge, read_message, run_definition_pass, write_message,
+    AuditLog, CommandPolicy, Config, ConfigOverlay, ContextPlan, Declaration,
+    LANGUAGE_SERVER_LANGUAGES, LanguageServerError, LanguageServerHub, LanguageServerLaunch,
+    LanguageServerLimits, LanguageServerState, MERGE_LINE_TOLERANCE, MatchQuality,
+    MockModelAdapter, PathPolicy, ProcessIdentity, ProcessKind, ProcessRegistry, ProjectIndexer,
+    Provenance, RebuildReason, RegisteredProcess, RelationKind, RelationTarget, RepositoryIndex,
+    RepositoryKeyClass, RepositoryMap, RepositoryTrustStore, SYMBOL_INDEX_SCHEMA_VERSION,
+    SecretScanner, SweepScope, Symbol, SymbolIndex, SymbolIndexStore, SymbolKind, SymbolLoad,
+    WorkspaceEngine, extract_declarations, merge, read_message, run_definition_pass, write_message,
 };
 use workspace_engine::{Evidence, FileDiagnostics, PlanStep, StepStatus, TaskPhase, TaskPlan};
 
@@ -2860,4 +2865,250 @@ fn fake_language_server_helper() {
             }
         }
     }
+}
+
+// ---- Task 8: the `symbols` context item ----
+
+/// `src/upload.rs` declares `upload_retry` on line 42 and `upload_once` on
+/// line 44. `src/main.rs` calls it, so a keyword search for the prompt
+/// retrieves files too.
+fn upload_repo(name: &str) -> Repo {
+    let mut upload = "// filler\n".repeat(41);
+    upload.push_str("pub fn upload_retry() {}\n\npub fn upload_once() {}\n");
+    Repo::new(
+        name,
+        &[
+            ("src/upload.rs", &upload),
+            ("src/main.rs", "fn main() {\n    upload_retry();\n}\n"),
+        ],
+    )
+}
+
+impl Repo {
+    fn engine_with(&self, symbol_context_max_tokens: usize) -> WorkspaceEngine {
+        WorkspaceEngine::new(Config {
+            symbol_context_max_tokens,
+            ..self.config()
+        })
+    }
+
+    fn context(&self, engine: &WorkspaceEngine, prompt: &str) -> ContextPlan {
+        let index = self.index();
+        engine.context_manager.build_context(
+            &self.root,
+            &index.repository_id,
+            "task_symbols",
+            prompt,
+            Some(&index),
+            &[],
+            16_000,
+        )
+    }
+}
+
+fn kinds(plan: &ContextPlan) -> Vec<&str> {
+    plan.items.iter().map(|item| item.kind.as_str()).collect()
+}
+
+/// The one `symbols` item's content, asserting there is exactly one.
+fn symbols_item(plan: &ContextPlan) -> &str {
+    let items: Vec<_> = plan
+        .items
+        .iter()
+        .filter(|item| item.kind == "symbols")
+        .collect();
+    assert_eq!(items.len(), 1, "{:?}", kinds(plan));
+    assert_eq!(items[0].path, None);
+    &items[0].content
+}
+
+const HEDGED_LINE: &str =
+    "upload_retry (function, src/upload.rs:42, heuristic — may be inaccurate)";
+
+#[test]
+fn a_prompt_naming_a_symbol_gets_one_hedged_symbols_item_after_the_map() {
+    let repo = upload_repo("symbols-item");
+    let engine = repo.engine_with(1_600);
+    let plan = repo.context(&engine, "Why does upload_retry give up so early?");
+
+    let content = symbols_item(&plan);
+    assert!(content.contains(HEDGED_LINE), "{content}");
+    // `upload_retry` is code-shaped, so it matches as a prefix too, but
+    // `upload_once` does not start with it.
+    assert!(!content.contains("upload_once"), "{content}");
+    assert!(!content.contains("matching symbols shown"), "{content}");
+
+    let kinds = kinds(&plan);
+    let symbols = kinds.iter().position(|kind| *kind == "symbols").unwrap();
+    let map = kinds
+        .iter()
+        .position(|kind| *kind == "repository_map")
+        .expect("the map is in the plan");
+    let first_retrieved = kinds
+        .iter()
+        .position(|kind| *kind == "retrieved_file")
+        .expect("the prompt retrieves files, or the order is not tested");
+    assert!(map < symbols && symbols < first_retrieved, "{kinds:?}");
+
+    // The same line, rendered through the public API.
+    let (index, _) = engine.symbol_index(&repo.root).unwrap();
+    let matches = index.find_for_prompt("upload_retry");
+    let rendered = index.render_for_model(&matches, 1_600);
+    assert_eq!((rendered.shown, rendered.total), (1, 1));
+    assert_eq!(rendered.tokens, rendered.text.len().div_ceil(4));
+    assert!(rendered.text.contains(HEDGED_LINE), "{}", rendered.text);
+}
+
+#[test]
+fn a_language_server_symbol_is_rendered_without_the_hedge() {
+    let repo = upload_repo("symbols-item-server");
+    let engine = repo.engine_with(1_600);
+    let (stored, _) = engine.symbol_index(&repo.root).unwrap();
+    let heuristic = stored
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "upload_retry")
+        .unwrap()
+        .clone();
+    let index = repo.index();
+    let hash = index
+        .files
+        .iter()
+        .find(|file| file.path == "src/upload.rs")
+        .unwrap()
+        .content_hash
+        .clone();
+    let merged = repo
+        .store()
+        .merge_language_server(
+            &index.repository_id,
+            "src/upload.rs",
+            &hash,
+            vec![Symbol {
+                provenance: Provenance::LanguageServer,
+                ..heuristic
+            }],
+        )
+        .unwrap();
+    assert!(merged);
+
+    let plan = repo.context(&engine, "Why does upload_retry give up so early?");
+    let content = symbols_item(&plan);
+    assert!(
+        content.contains("upload_retry (function, src/upload.rs:42)\n"),
+        "{content}"
+    );
+    assert!(!content.contains(HEDGED_LINE), "{content}");
+}
+
+#[test]
+fn no_symbols_item_at_ceiling_zero_or_for_a_prompt_that_names_nothing() {
+    let repo = upload_repo("symbols-item-none");
+    let prompt = "Why does upload_retry give up so early?";
+    // The control: the same prompt with the default ceiling has the item.
+    symbols_item(&repo.context(&repo.engine_with(1_600), prompt));
+
+    let off = repo.context(&repo.engine_with(0), prompt);
+    assert!(!kinds(&off).contains(&"symbols"), "{:?}", kinds(&off));
+    assert!(kinds(&off).contains(&"repository_map"), "{:?}", kinds(&off));
+
+    let nothing = repo.context(&repo.engine_with(1_600), "Please tidy the error messages.");
+    assert!(
+        !kinds(&nothing).contains(&"symbols"),
+        "{:?}",
+        kinds(&nothing)
+    );
+
+    // The two ceilings are independent: the map off leaves the symbols in,
+    // although both are built from the same stored map.
+    let map_off = repo.context(
+        &WorkspaceEngine::new(Config {
+            repository_map_max_tokens: 0,
+            ..repo.config()
+        }),
+        prompt,
+    );
+    assert!(
+        !kinds(&map_off).contains(&"repository_map"),
+        "{:?}",
+        kinds(&map_off)
+    );
+    assert!(symbols_item(&map_off).contains(HEDGED_LINE));
+}
+
+#[test]
+fn a_small_ceiling_drops_matches_and_says_how_many_were_shown() {
+    let mut source = String::new();
+    for number in 0..30 {
+        source.push_str(&format!("pub fn retry_step_{number:02}() {{}}\n"));
+    }
+    let repo = Repo::new("symbols-item-small", &[("src/steps.rs", &source)]);
+    let plan = repo.context(&repo.engine_with(120), "Which retry_step runs first?");
+
+    let item = plan
+        .items
+        .iter()
+        .find(|item| item.kind == "symbols")
+        .unwrap();
+    assert!(item.tokens <= 120, "{} tokens", item.tokens);
+    let shown = item
+        .content
+        .lines()
+        .filter(|line| line.starts_with("retry_step_"))
+        .count();
+    assert!(shown > 0 && shown < 30, "{}", item.content);
+    assert!(
+        item.content
+            .ends_with(&format!("{shown} of 30 matching symbols shown.")),
+        "{}",
+        item.content
+    );
+    // In lookup order: the first lines are kept, not an arbitrary subset.
+    assert!(item.content.contains("retry_step_00 ("), "{}", item.content);
+}
+
+#[test]
+fn a_symbol_index_that_cannot_be_stored_is_left_out_and_the_turn_goes_on() {
+    let repo = upload_repo("symbols-item-unwritable");
+    // A file where the index directory should be, so the store cannot write.
+    fs::write(repo.data_dir.join("symbol-index"), "not a directory").unwrap();
+    let plan = repo.context(
+        &repo.engine_with(1_600),
+        "Why does upload_retry give up so early?",
+    );
+    let kinds = kinds(&plan);
+    assert!(!kinds.contains(&"symbols"), "{kinds:?}");
+    assert!(kinds.contains(&"user_prompt"), "{kinds:?}");
+    assert!(kinds.contains(&"repository_map"), "{kinds:?}");
+    assert!(kinds.contains(&"retrieved_file"), "{kinds:?}");
+}
+
+#[test]
+fn prose_words_match_exactly_and_only_code_shaped_words_as_a_prefix() {
+    let repo = Repo::new(
+        "symbols-prompt-words",
+        &[(
+            "src/lib.rs",
+            "pub fn the_end() {}\npub fn upload() {}\npub fn uploadFile() {}\n",
+        )],
+    );
+    let (index, _) = repo.engine_with(1_600).symbol_index(&repo.root).unwrap();
+    let names = |prompt: &str| -> Vec<(String, MatchQuality)> {
+        index
+            .find_for_prompt(prompt)
+            .into_iter()
+            .map(|found| (found.symbol.name, found.quality))
+            .collect()
+    };
+    // "the" and "upload" are prose: exact only, so `the_end` is not listed.
+    assert_eq!(
+        names("fix the upload"),
+        vec![("upload".to_string(), MatchQuality::Exact)]
+    );
+    // `uploadF` is code-shaped (an inner capital), so it matches as a prefix.
+    assert_eq!(
+        names("rename uploadF"),
+        vec![("uploadFile".to_string(), MatchQuality::Prefix)]
+    );
+    assert!(names("").is_empty());
 }
