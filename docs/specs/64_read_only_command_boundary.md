@@ -19,9 +19,9 @@ Depends on: [#20](20_working_modes/proposal.md) (Plan and Review allow only
 commands that need no approval) — built;
 [#34](34_repository_config_trust_boundary.md) — built;
 [#60](60_worktree_aware_read_tools/proposal.md) (tools for git content and
-worktrees) — **not built**, but its `read_git_diff` and `read_git_log` tools
-are merged, which is all requirement 5 needs. Requirements 1–4 and 6–8 do not
-need #60 and shipped first. Requirement 5 waited for it, for the reason in
+worktrees) — built (Done 2026-10-23); its `read_git_diff` and `read_git_log`
+tools were merged earlier, which is all requirement 5 needed. Requirements 1–4
+and 6–8 do not need #60 and shipped first. Requirement 5 waited for it, for the reason in
 §5.4, and shipped once those tools landed. Everything else
 named below is a cross-reference, not a prerequisite.
 Related implementation specs:

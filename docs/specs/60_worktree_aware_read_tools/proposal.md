@@ -1,12 +1,12 @@
 # Feature Spec: Worktree-Aware Read Tools
 
-Status: In progress (started 2026-10-17). Tasks 1–5 of 6 are done: registered
-worktrees are resolved and refused (§5.1), the git reads are hardened (§5.4),
-the five read tools take `worktree` (§5.3), `list_worktrees` and
-`read_git_log` are live (§5.2), and the `worktree_survey` eval scenario passes
-(§5.7). Task 6 is in progress since 2026-10-19: its docs and
-cross-references are merged; the live re-run, CI and the close-out remain. Plan and progress in
-[`tasks.md`](tasks.md). Specified on 2026-10-17 from the same
+Status: Done 2026-10-23 (started 2026-10-17). Registered worktrees are
+resolved and refused (§5.1), the git reads are hardened (§5.4), the five read
+tools take `worktree` (§5.3), `list_worktrees` and `read_git_log` are live
+(§5.2), the `worktree_survey` eval scenario passes (§5.7), and the docs are
+written (§5.8). The motivating prompt, re-run live against
+`deepseek-v4-flash` on 2026-10-23, surveyed every worktree with no approval
+stop (§7). Plan and progress in [`tasks.md`](tasks.md). Specified on 2026-10-17 from the same
 session as [#59](../59_exploration_round_allowance/proposal.md), after it was
 continued three times and still did not finish: 35 of its 40 approval prompts
 were read-only commands the agent ran in worktrees because no tool could reach
@@ -356,3 +356,29 @@ and why: not registered, outside the allowed roots, or prunable), and
   git-crypt files read as modified, so §5.4's "no repository-supplied code
   runs" holds for diff drivers, textconv and fsmonitor, not for filters. It
   needs its own decision.
+- Live re-run (2026-10-23, Task 6). The motivating prompt, verbatim ("check
+  what specs are left to implement, also check worktrees to see specs that
+  are in progress, this is a reporting only task, no code changes"), against
+  `deepseek-v4-flash` on this repository with five registered worktrees,
+  native tools on and default budgets, driven through a desktop shell with an
+  isolated data directory. It made **no approval stop**: 9 model calls and 21
+  tool calls, all through tools — `list_worktrees` once, `read_git_diff` five
+  times (with `stat` and with `paths`, on three worktrees), `read_git_status`
+  three times (two worktrees and the session's checkout), `read_file` five
+  times (one with `worktree`), `search_content` five times, plus
+  `propose_plan` and `complete_step`. The turn hit the 8-round budget once and
+  paused (#61); after *Continue* it answered with a report that named every
+  in-progress spec and what each worktree held. Usage: 886,386 input tokens
+  (677,888 cached, 76%), 7,798 output tokens. Against the motivating session's
+  40 approvals and no report (`context.md` §1), the acceptance criterion holds.
+- Two earlier attempts that day are not evidence for or against #60, and are
+  recorded so they are not repeated. A CLI run on a fresh data directory got
+  the text envelope, not tools, because the built-in `deepseek` provider sets
+  `supports_native_tools: false` (`config.rs`); with no tools offered, the
+  model asked to run `git worktree list --porcelain`. A CLI run with native
+  tools on read the worktrees through `list_worktrees` without asking, then
+  stopped at `grep -H -m1 '^Status:' docs/specs/*.md … | sort` — rightly, under
+  #64 (a bare `grep` and an unquoted glob) — and `damaian ask` cannot resume a
+  turn after an approval, which is why the full run went through the desktop
+  shell. That approval's text still blamed "sandbox mode", which is
+  [#62](../62_approval_prompts_name_the_reason/proposal.md)'s defect.

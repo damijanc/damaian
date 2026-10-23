@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Implements:** [`proposal.md`](proposal.md) · background in [`context.md`](context.md)
-**Started:** 2026-10-17 (planned the same day; references checked against the tree on 2026-10-17)
+**Started:** 2026-10-17 — **Done:** 2026-10-23 (planned 2026-10-17; references checked against the tree on 2026-10-17)
 
 ## Progress
 
@@ -14,7 +14,7 @@
 | 3 · `worktree` on the five read tools | Done 2026-10-18 | Details in the note below the table. |
 | 4 · `list_worktrees` and `read_git_log` | Done 2026-10-18 | Details in the note below the table. |
 | 5 · `worktree_survey` eval scenario | Done 2026-10-18 | Details in the note below the table. |
-| 6 · Docs, live re-run and close-out | In progress 2026-10-19 | Docs and cross-references done; live re-run, CI and the Done close-out remain. Details in the note below the table. |
+| 6 · Docs, live re-run and close-out | Done 2026-10-23 | Docs and cross-references 2026-10-19; live re-run 2026-10-23 with no approval stop; spec closed. Details in the note below the table. |
 
 **Task 1 (Done 2026-10-17).** New module `worktree_access.rs`:
 `parse_worktree_list` reads `git worktree list --porcelain -z` (NUL-terminated
@@ -285,8 +285,9 @@ over the 6 real calls.
 eval-harness --locked` passes; `cargo run -p eval-harness -- run --tier
 deterministic` passes. Workspace clippy and tests are left to CI.
 
-**Task 6 (in progress, 2026-10-19).** Steps 2 (docs) and 3 (cross-references)
-are done; Steps 1 (live re-run), 4 (Done close-out) and 5's CI record remain.
+**Task 6 (Done 2026-10-23).** Steps 2 (docs) and 3 (cross-references) landed
+2026-10-19; Steps 1 (live re-run), 4 (close-out) and 5 (CI record) on
+2026-10-23.
 `docs/USER_GUIDE.md` now says what the agent can read without asking, including
 registered worktrees, `list_worktrees` and `read_git_log`, and that a worktree
 read applies the session's own policy. `docs/TROUBLESHOOTING.md` documents a
@@ -323,9 +324,34 @@ node lint typos deny` (all pass); `npm run --silent specs:check` (65 specs,
 dependency lines agree); `cargo run -p eval-harness -- run --tier deterministic`
 (17 scenarios, exit 0). Workspace clippy and tests are left to CI.
 
-**Still to do:** the live re-run (Step 1), a green CI run recorded here (Step
-5), then the Done close-out (Step 4) — status flips, `Depends on:` search,
-What-to-build-next, and the CHANGELOG change.
+**Live re-run (Step 1, 2026-10-23).** The motivating prompt, verbatim, against
+`deepseek-v4-flash` on this repository (five registered worktrees), native
+tools on, default budgets, through a desktop shell with an isolated data
+directory: **no approval stop**. 9 model calls, 21 tool calls, every worktree
+read through a tool (`list_worktrees`, `read_git_diff` with `stat` and
+`paths`, `read_git_status`, `read_file` with `worktree`). The turn paused once
+at the 8-round budget (#61), answered after *Continue*, and named every
+in-progress spec and what each worktree held. 886,386 input tokens (76%
+cached), 7,798 output. Two earlier CLI attempts, and why they are not
+evidence, are in proposal §7. **Discovery for later work:** the built-in
+`deepseek` provider sets `supports_native_tools: false`, so a fresh config
+offers DeepSeek none of #47's or this spec's tools; the user's own config
+turns it on. **Approvals made: none** in the full run.
+
+**Close-out (Step 4, 2026-10-23).** Status Done in the proposal, its README
+row and the README's current-state and What-to-build-next prose; #64's
+`Depends on:` entry, the only one naming #60, now says built; the CHANGELOG
+`Unreleased` item for worktree reads removed. #60 unblocked nothing, so no
+spec was promoted. The eval baseline is still not regenerated (see above);
+that churn spans specs 60, 63 and the prompt text, so it is recorded as an
+observation rather than done here.
+
+**CI (Step 5).** The full seven-check gate passed in CI on 2026-10-19 on the
+merge of this task's docs, the last change to #60's code or docs before this
+close-out; scoped checks passed locally at every task, as recorded above. This
+close-out is documentation only. Since 2026-10-22 `main`'s Quality run fails
+`cargo deny` on advisory RUSTSEC-2026-0382 (`rustls-webpki`), which no #60
+change touches.
 
 ## Global Constraints
 
@@ -618,15 +644,15 @@ runner only if it cannot yet create linked worktrees or a symlink in a fixture.
 
 ## Task 6: Docs, live re-run and close-out
 
-- [ ] **Step 1: Live re-run** of the motivating prompt against
+- [x] **Step 1: Live re-run** of the motivating prompt against
       `deepseek-v4-flash` on this repository. Record approvals made and why in
       proposal §6/§7.
 - [x] **Step 2: Docs** (§5.8): `USER_GUIDE.md`, `TROUBLESHOOTING.md` (the
       refusal reasons from Task 1), `SECURITY.md` (§5.4).
 - [x] **Step 3: Cross-references.** #52 records whether its server exposes
       `worktree`; #64's requirement 5 dependency on #60 is updated.
-- [ ] **Step 4: Close the spec** per AGENTS.md "When a spec becomes Done":
+- [x] **Step 4: Close the spec** per AGENTS.md "When a spec becomes Done":
       status in the proposal, README row and this file; `Depends on:` search;
       What to build next; remove the item from `CHANGELOG.md` Unreleased.
-- [ ] **Step 5: Checks.** Fast checks and scoped clippy/tests locally; the full
+- [x] **Step 5: Checks.** Fast checks and scoped clippy/tests locally; the full
       gate on CI. Record the CI result here when it is green.
