@@ -11,6 +11,7 @@ use crate::file_access::FileAccessController;
 use crate::finding::{Finding, FindingSource};
 use crate::git_service::{GitReadCaps, GitService};
 use crate::hash::{file_hash, repository_id_for_root};
+use crate::hooks::HookDispatcher;
 use crate::index_cache::IndexCache;
 use crate::indexer::ProjectIndexer;
 use crate::lsp::{
@@ -34,6 +35,7 @@ pub struct WorkspaceEngine {
     pub config: Config,
     pub scanner: SecretScanner,
     pub audit_log: AuditLog,
+    pub hooks: HookDispatcher,
     pub path_policy: PathPolicy,
     pub file_access: FileAccessController,
     pub indexer: ProjectIndexer,
@@ -78,6 +80,7 @@ impl WorkspaceEngine {
             config.audit_retention_days,
             scanner.clone(),
         );
+        let hooks = HookDispatcher::new(config.clone(), scanner.clone(), audit_log.clone());
         let path_policy = PathPolicy::new(&config);
         let file_access = FileAccessController::new(
             config.clone(),
@@ -165,6 +168,7 @@ impl WorkspaceEngine {
             config,
             scanner,
             audit_log,
+            hooks,
             path_policy,
             file_access,
             indexer,

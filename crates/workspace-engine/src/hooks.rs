@@ -9,17 +9,29 @@
 //! cleared environment, hands it the envelope, and kills it at its deadline
 //! or at the output ceiling. It does not read the answer; that is
 //! `parse_response`'s job.
+//!
+//! The dispatcher (`context.md` §7, §10, §11): `HookDispatcher` orders the
+//! hooks for an event, applies the review gate to a repository's own hooks,
+//! runs each one, audits every invocation, and turns answers into redacted
+//! findings, warnings, context and requested commands. It does not decide
+//! what a verdict means at an event; that is the call sites' job
+//! (`context.md` §4).
 
+use crate::audit::AuditLog;
 use crate::command_runner::kill_process_group;
-use crate::finding::Severity;
+use crate::config::Config;
+use crate::finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange};
+use crate::hash::{repository_id_for_root, sha256};
 use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
 use crate::secret_scanner::SecretScanner;
 use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
+use std::collections::BTreeSet;
 use std::fmt;
+use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -745,6 +757,553 @@ fn last_bytes(text: &str, max: usize) -> &str {
         start += 1;
     }
     &text[start..]
+}
+
+/// Whether a hook runs, and why not when it does not (`context.md` §7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookActivation {
+    Active,
+    /// A repository-defined hook the user has not reviewed yet.
+    PendingReview,
+    /// The user declined this repository hook.
+    Declined,
+    /// The definition is not the one the user approved.
+    ChangedSinceReview,
+    Disabled,
+}
+
+impl HookActivation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookActivation::Active => "active",
+            HookActivation::PendingReview => "pending_review",
+            HookActivation::Declined => "declined",
+            HookActivation::ChangedSinceReview => "changed_since_review",
+            HookActivation::Disabled => "disabled",
+        }
+    }
+}
+
+/// The definition hash a review records (`context.md` §7). It covers the
+/// definition's fields and the content of every command or argument that
+/// resolves to a file inside the repository, so a repository cannot keep an
+/// approved `command=./scripts/check.sh` and change the script after review.
+pub fn hook_definition_hash(
+    hook: &HookConfig,
+    repository_root: &Path,
+) -> crate::error::Result<String> {
+    let events: Vec<&str> = hook.events.iter().map(|event| event.as_str()).collect();
+    let timeout = hook
+        .timeout_ms
+        .map(|milliseconds| milliseconds.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let mut material = format!(
+        "command={}\nargs={}\nevents={}\nmode={}\norder={}\ntimeout_ms={timeout}\n",
+        hook.command,
+        hook.args.join("\u{1f}"),
+        events.join(","),
+        hook.mode.as_str(),
+        hook.order,
+    );
+
+    let root = fs::canonicalize(repository_root).unwrap_or_else(|_| repository_root.to_path_buf());
+    let mut named = Vec::with_capacity(hook.args.len() + 1);
+    named.push(Path::new(&hook.command).to_path_buf());
+    named.extend(hook.args.iter().map(PathBuf::from));
+    for path in named {
+        let candidate = if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        };
+        let Ok(resolved) = fs::canonicalize(&candidate) else {
+            continue;
+        };
+        if !resolved.starts_with(&root) || !resolved.is_file() {
+            continue;
+        }
+        let relative = resolved.strip_prefix(&root).unwrap_or(&resolved);
+        material.push_str(&format!(
+            "file={}={}\n",
+            relative.to_string_lossy(),
+            sha256(fs::read(&resolved)?)
+        ));
+    }
+    Ok(sha256(material))
+}
+
+/// Whether a hook runs now (`context.md` §7.1). A repository's `command` must
+/// resolve inside the repository or be an absolute system path, so a
+/// repository cannot point a relative path out of the clone. Failing that
+/// check is `ChangedSinceReview`: the definition is not one the user
+/// approved, and the fail direction is to block a mandatory hook rather than
+/// skip it silently.
+pub fn activation(
+    config: &Config,
+    hook: &HookConfig,
+    repository_id: &str,
+    repository_root: &Path,
+) -> HookActivation {
+    if !hook.enabled {
+        return HookActivation::Disabled;
+    }
+    if hook.source != HookSource::Repository {
+        return HookActivation::Active;
+    }
+    if !repository_command_is_contained(hook, repository_root) {
+        return HookActivation::ChangedSinceReview;
+    }
+    let Some(review) = config
+        .hook_reviews_by_repository
+        .get(repository_id)
+        .and_then(|reviews| reviews.get(&hook.id))
+    else {
+        return HookActivation::PendingReview;
+    };
+    match review {
+        crate::config::HookReview::Declined => HookActivation::Declined,
+        crate::config::HookReview::Approved { hash } => {
+            match hook_definition_hash(hook, repository_root) {
+                Ok(current) if &current == hash => HookActivation::Active,
+                // A hash that cannot be computed is not the reviewed one.
+                _ => HookActivation::ChangedSinceReview,
+            }
+        }
+    }
+}
+
+fn repository_command_is_contained(hook: &HookConfig, repository_root: &Path) -> bool {
+    let command = Path::new(&hook.command);
+    if command.is_absolute() {
+        return true;
+    }
+    let root = fs::canonicalize(repository_root).unwrap_or_else(|_| repository_root.to_path_buf());
+    fs::canonicalize(root.join(command)).is_ok_and(|resolved| resolved.starts_with(&root))
+}
+
+/// Where a dispatch sits in the recursion graph (`context.md` §9). Task 5
+/// increments `depth` and adds the requesting hook to `excluded`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookContext {
+    pub depth: u32,
+    pub excluded: BTreeSet<String>,
+}
+
+impl HookContext {
+    pub fn root() -> Self {
+        Self::default()
+    }
+}
+
+/// What a dispatch has to know besides the event and the repository. The
+/// dispatcher builds one envelope per hook from it.
+#[derive(Debug, Clone)]
+pub struct HookEnvelopeParts {
+    pub session_id: Option<String>,
+    pub task_id: Option<String>,
+    pub mode: String,
+    pub profile: String,
+    pub payload: Value,
+}
+
+/// A command a hook asked Damaian to run, kept with its requester so the
+/// nested dispatch can exclude the hook that asked (`context.md` §9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestedCommand {
+    pub hook_id: String,
+    /// Already redacted.
+    pub command: String,
+}
+
+/// What a dispatch decided, with every string already redacted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookOutcome {
+    pub verdict: Verdict,
+    /// The hook whose verdict set the outcome.
+    pub deciding_hook: Option<String>,
+    /// Denials and approval requests, by hook id. These are the reasons a
+    /// call site shows to the user.
+    pub reasons: Vec<(String, String)>,
+    /// Warnings, including an optional hook's failure and a `warn` reason.
+    /// Each one is also a `Finding` below.
+    pub warnings: Vec<String>,
+    pub findings: Vec<Finding>,
+    /// `(hook id, text)`, honoured only at `session_start` and
+    /// `before_context` (`context.md` §10).
+    pub context: Vec<(String, String)>,
+    pub commands: Vec<RequestedCommand>,
+    pub depth_exceeded: bool,
+}
+
+impl HookOutcome {
+    pub fn allow() -> Self {
+        HookOutcome {
+            verdict: Verdict::Allow,
+            deciding_hook: None,
+            reasons: Vec::new(),
+            warnings: Vec::new(),
+            findings: Vec::new(),
+            context: Vec::new(),
+            commands: Vec::new(),
+            depth_exceeded: false,
+        }
+    }
+}
+
+impl Default for HookOutcome {
+    fn default() -> Self {
+        Self::allow()
+    }
+}
+
+/// Runs the hooks for one event (`context.md` §7, §10, §11).
+#[derive(Debug, Clone)]
+pub struct HookDispatcher {
+    config: Config,
+    scanner: SecretScanner,
+    audit_log: AuditLog,
+    data_dir: PathBuf,
+}
+
+/// The fields of one `hook_invoked` event that depend on the run
+/// (`context.md` §11).
+struct InvocationAudit<'a> {
+    verdict: Verdict,
+    failure: Option<HookFailureKind>,
+    duration: Duration,
+    /// Denials and requests only.
+    reason: Option<&'a str>,
+}
+
+impl HookDispatcher {
+    pub fn new(config: Config, scanner: SecretScanner, audit_log: AuditLog) -> Self {
+        let data_dir = config.data_dir.clone();
+        Self {
+            config,
+            scanner,
+            audit_log,
+            data_dir,
+        }
+    }
+
+    /// Orders the active hooks for `event`, runs them, and resolves their
+    /// answers. With no hook left, nothing is spawned and nothing is
+    /// audited.
+    pub fn dispatch(
+        &self,
+        event: HookEvent,
+        parts: HookEnvelopeParts,
+        repository_root: &Path,
+        ctx: &HookContext,
+    ) -> HookOutcome {
+        let hooks: Vec<&HookConfig> = ordered(&self.config.hooks, event)
+            .into_iter()
+            .filter(|hook| !ctx.excluded.contains(&hook.id))
+            .collect();
+        let mut outcome = HookOutcome::allow();
+        if hooks.is_empty() {
+            return outcome;
+        }
+
+        let repository_id = repository_id_for_root(repository_root);
+        let registry_owner = parts
+            .task_id
+            .clone()
+            .or_else(|| parts.session_id.clone())
+            .unwrap_or_default();
+        for hook in hooks {
+            match activation(&self.config, hook, &repository_id, repository_root) {
+                HookActivation::Active => {}
+                // Not invoked and not audited per event (`context.md` §11).
+                HookActivation::PendingReview
+                | HookActivation::Declined
+                | HookActivation::Disabled => continue,
+                HookActivation::ChangedSinceReview => {
+                    let kind = HookFailureKind::ChangedSinceReview;
+                    self.record_failure(hook, event, &parts, kind, Duration::ZERO, &mut outcome);
+                    if short_circuits(outcome.verdict) {
+                        break;
+                    }
+                    continue;
+                }
+            }
+
+            let envelope = HookEnvelope {
+                event,
+                hook_api_version: HOOK_API_VERSION,
+                session_id: parts.session_id.clone(),
+                task_id: parts.task_id.clone(),
+                mode: parts.mode.clone(),
+                profile: parts.profile.clone(),
+                repository_root: repository_root.to_path_buf(),
+                hook_depth: ctx.depth,
+                payload: parts.payload.clone(),
+            };
+            let run = run_hook(
+                hook,
+                &envelope,
+                repository_root,
+                &self.data_dir,
+                &registry_owner,
+                &self.scanner,
+                Duration::from_millis(hook.deadline_ms(event)),
+            );
+
+            let mut failure = run.failure;
+            if failure.is_none() {
+                match parse_response(&run.stdout) {
+                    Ok(response) => {
+                        let reason = match response.verdict {
+                            Verdict::Deny | Verdict::RequestApproval => response
+                                .reason
+                                .as_deref()
+                                .map(|reason| self.scanner.redact(reason).text),
+                            Verdict::Allow | Verdict::Warn => None,
+                        };
+                        self.audit_invocation(
+                            hook,
+                            event,
+                            &parts,
+                            InvocationAudit {
+                                verdict: response.verdict,
+                                failure: None,
+                                duration: run.duration,
+                                reason: reason.as_deref(),
+                            },
+                        );
+                        self.apply_response(&mut outcome, hook, event, response);
+                        if short_circuits(outcome.verdict) {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(ResponseError::Widening { attempts }) => {
+                        self.audit_widening(hook, event, &attempts);
+                        failure = Some(HookFailureKind::Malformed);
+                    }
+                    Err(error) => failure = Some(error.failure_kind()),
+                }
+            }
+            let Some(kind) = failure else {
+                continue;
+            };
+            self.record_failure(hook, event, &parts, kind, run.duration, &mut outcome);
+            if short_circuits(outcome.verdict) {
+                break;
+            }
+        }
+        outcome
+    }
+
+    /// A mandatory failure denies; an optional one warns (`context.md` §4,
+    /// §5.5). Both are audited as `hook_invoked` with the failure kind.
+    fn record_failure(
+        &self,
+        hook: &HookConfig,
+        event: HookEvent,
+        parts: &HookEnvelopeParts,
+        kind: HookFailureKind,
+        duration: Duration,
+        outcome: &mut HookOutcome,
+    ) {
+        let reason = failure_text(hook, kind);
+        let verdict = match hook.mode {
+            HookMode::Mandatory => Verdict::Deny,
+            HookMode::Optional => Verdict::Warn,
+        };
+        let audit_reason = (hook.mode == HookMode::Mandatory).then_some(reason.as_str());
+        self.audit_invocation(
+            hook,
+            event,
+            parts,
+            InvocationAudit {
+                verdict,
+                failure: Some(kind),
+                duration,
+                reason: audit_reason,
+            },
+        );
+        match hook.mode {
+            HookMode::Mandatory => {
+                outcome.reasons.push((hook.id.clone(), reason));
+                outcome.verdict = Verdict::Deny;
+                outcome.deciding_hook = Some(hook.id.clone());
+            }
+            HookMode::Optional => self.push_warning(outcome, &hook.id, &reason),
+        }
+    }
+
+    fn apply_response(
+        &self,
+        outcome: &mut HookOutcome,
+        hook: &HookConfig,
+        event: HookEvent,
+        response: HookResponse,
+    ) {
+        for finding in response.findings {
+            let range = hook_finding_range(&finding);
+            let draft = FindingDraft {
+                source: FindingSource::Hook,
+                severity: finding.severity,
+                summary: finding.summary,
+                details: finding.details,
+                range,
+                code: None,
+            };
+            outcome.findings.push(
+                Finding::new(draft, &self.scanner).with_origin_ref(format!("hook:{}", hook.id)),
+            );
+        }
+
+        let context: Vec<String> = response
+            .context
+            .iter()
+            .map(|entry| self.scanner.redact(entry).text)
+            .collect();
+        if matches!(event, HookEvent::SessionStart | HookEvent::BeforeContext) {
+            for entry in context {
+                outcome.context.push((hook.id.clone(), entry));
+            }
+        } else if !context.is_empty() {
+            self.push_warning(
+                outcome,
+                &hook.id,
+                &format!(
+                    "hook `{}` returned context at {}; context is used only at session_start and before_context",
+                    hook.id,
+                    event.as_str()
+                ),
+            );
+        }
+
+        for command in response.commands {
+            outcome.commands.push(RequestedCommand {
+                hook_id: hook.id.clone(),
+                command: self.scanner.redact(&command).text,
+            });
+        }
+
+        if response.verdict > outcome.verdict {
+            outcome.verdict = response.verdict;
+            outcome.deciding_hook = Some(hook.id.clone());
+        }
+        match response.verdict {
+            Verdict::Allow => {}
+            Verdict::Warn => {
+                if let Some(reason) = response.reason {
+                    let reason = self.scanner.redact(&reason).text;
+                    self.push_warning(outcome, &hook.id, &reason);
+                }
+            }
+            Verdict::Deny | Verdict::RequestApproval => {
+                if let Some(reason) = response.reason {
+                    outcome
+                        .reasons
+                        .push((hook.id.clone(), self.scanner.redact(&reason).text));
+                }
+            }
+        }
+    }
+
+    fn push_warning(&self, outcome: &mut HookOutcome, hook_id: &str, text: &str) {
+        let text = self.scanner.redact(text).text;
+        outcome.warnings.push(text.clone());
+        let draft = FindingDraft {
+            source: FindingSource::Hook,
+            severity: Severity::Warning,
+            summary: text,
+            details: None,
+            range: None,
+            code: None,
+        };
+        outcome
+            .findings
+            .push(Finding::new(draft, &self.scanner).with_origin_ref(format!("hook:{hook_id}")));
+        if outcome.verdict < Verdict::Warn {
+            outcome.verdict = Verdict::Warn;
+            outcome.deciding_hook = Some(hook_id.to_string());
+        }
+    }
+
+    fn audit_invocation(
+        &self,
+        hook: &HookConfig,
+        event: HookEvent,
+        parts: &HookEnvelopeParts,
+        audit: InvocationAudit<'_>,
+    ) {
+        let mut fields = vec![
+            ("hookId", hook.id.clone()),
+            ("event", event.as_str().to_string()),
+            ("sessionId", parts.session_id.clone().unwrap_or_default()),
+            ("taskId", parts.task_id.clone().unwrap_or_default()),
+            ("classification", hook.mode.as_str().to_string()),
+            ("source", hook.source.as_str().to_string()),
+            ("verdict", audit.verdict.as_str().to_string()),
+            (
+                "outcome",
+                if audit.failure.is_some() {
+                    "failed"
+                } else {
+                    "ok"
+                }
+                .to_string(),
+            ),
+            ("durationMs", audit.duration.as_millis().to_string()),
+        ];
+        if let Some(kind) = audit.failure {
+            fields.push(("failureKind", kind.as_str().to_string()));
+        }
+        if let Some(reason) = audit.reason {
+            fields.push(("reason", reason.to_string()));
+        }
+        let _ = self.audit_log.record("hook_invoked", &fields);
+    }
+
+    /// Each attempt is audited by the name of the field or verdict, never by
+    /// the value the hook put there (`context.md` §5, §11).
+    fn audit_widening(&self, hook: &HookConfig, event: HookEvent, attempts: &[WideningAttempt]) {
+        for attempt in attempts {
+            let (field, name) = match attempt {
+                WideningAttempt::Field(name) => ("field", name),
+                WideningAttempt::Verdict(name) => ("verdict", name),
+            };
+            let _ = self.audit_log.record(
+                "hook_widening_attempt",
+                &[
+                    ("hookId", hook.id.clone()),
+                    ("event", event.as_str().to_string()),
+                    (field, name.clone()),
+                ],
+            );
+        }
+    }
+}
+
+fn failure_text(hook: &HookConfig, kind: HookFailureKind) -> String {
+    format!("hook `{}` failed: {}", hook.id, kind.as_str())
+}
+
+/// A finding's range only when its path is repository-relative and does not
+/// climb out, the rule `workspace_range` applies (`context.md` §5).
+fn hook_finding_range(finding: &HookFinding) -> Option<SourceRange> {
+    let path = finding.path.as_deref()?;
+    let path_ref = Path::new(path);
+    let outside = path_ref.is_absolute()
+        || path_ref
+            .components()
+            .any(|part| part == Component::ParentDir);
+    if outside {
+        return None;
+    }
+    Some(SourceRange {
+        path: path.to_string(),
+        start_line: finding.line?,
+        start_column: None,
+        end_line: None,
+        end_column: None,
+    })
 }
 
 #[cfg(test)]
