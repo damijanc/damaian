@@ -174,15 +174,29 @@ pub struct TurnPhase {
     /// **1-based**, unlike the loop counter it comes from.
     pub round: u32,
     pub max_rounds: u32,
+    /// Exploration rounds used so far this turn (spec 59 §5.5). A count, not a
+    /// position: the label shows it as "12 reads", and there is no "1-based"
+    /// variant of it.
+    pub exploration_round: u32,
+    pub max_exploration_rounds: u32,
 }
 
 impl TurnPhase {
-    fn new(kind: PhaseKind, label: impl Into<String>, round: u32, max_rounds: u32) -> Self {
+    fn new(
+        kind: PhaseKind,
+        label: impl Into<String>,
+        round: u32,
+        max_rounds: u32,
+        exploration_round: u32,
+        max_exploration_rounds: u32,
+    ) -> Self {
         Self {
             kind,
             label: label.into(),
             round: round + 1,
             max_rounds,
+            exploration_round,
+            max_exploration_rounds,
         }
     }
 }
@@ -241,9 +255,22 @@ impl TurnSink<'_> {
         (self.on_progress)(TurnProgress::Session(session_id.to_string()));
     }
 
-    fn phase(&mut self, kind: PhaseKind, label: impl Into<String>, round: u32, max_rounds: u32) {
+    fn phase(
+        &mut self,
+        kind: PhaseKind,
+        label: impl Into<String>,
+        round: u32,
+        max_rounds: u32,
+        exploration_round: u32,
+        max_exploration_rounds: u32,
+    ) {
         (self.on_progress)(TurnProgress::Phase(TurnPhase::new(
-            kind, label, round, max_rounds,
+            kind,
+            label,
+            round,
+            max_rounds,
+            exploration_round,
+            max_exploration_rounds,
         )));
     }
 
@@ -878,6 +905,8 @@ impl ChatOrchestrator {
             "",
             0,
             self.tool_round_limit(prompt_enters_web_debug_mode(prompt)),
+            0,
+            self.default_exploration_round_limit(),
         );
 
         let context = self.context_manager.build_context(
@@ -1139,6 +1168,7 @@ impl ChatOrchestrator {
                     .begin_command_census(&repository_root)
                     .unwrap_or_else(|_| CommandCensus::unavailable());
                 let max_rounds = self.tool_round_limit(false);
+                let max_exploration_rounds = self.default_exploration_round_limit();
                 let cancel = sink.cancel;
                 // Borrow only the progress field, so `cancel` can be read for
                 // the same call without two conflicting borrows of the sink.
@@ -1149,6 +1179,8 @@ impl ChatOrchestrator {
                         line,
                         pending.round,
                         max_rounds,
+                        pending.exploration_rounds,
+                        max_exploration_rounds,
                     )));
                 };
                 let record = self.validation_orchestrator.run_proposal(
@@ -2384,7 +2416,14 @@ impl ChatOrchestrator {
                 ],
             )?;
 
-            sink.phase(PhaseKind::Model, "", action_rounds, max_rounds);
+            sink.phase(
+                PhaseKind::Model,
+                "",
+                action_rounds,
+                max_rounds,
+                exploration_rounds,
+                max_exploration_rounds,
+            );
             // `sideEffecting: false` — §4 treats a cut stream as a lost call:
             // the task resumes by making a new one, and spec 19 reports the cost
             // of the lost one rather than hiding it. So a marker left dangling
@@ -2424,6 +2463,8 @@ impl ChatOrchestrator {
                         format!("Provider refused — retrying in {seconds}s"),
                         action_rounds,
                         max_rounds,
+                        exploration_rounds,
+                        max_exploration_rounds,
                     )));
                 };
                 model_adapter.stream_response(&request, sink.cancel, &mut accumulate, &mut on_wait)
@@ -2649,7 +2690,7 @@ impl ChatOrchestrator {
                         action_rounds += 1;
                         continue;
                     }
-                    let response = tool_budget_exhausted_response(max_rounds);
+                    let response = tool_budget_exhausted_response(max_rounds, exploration_rounds);
                     let mut exhausted_run = model_run;
                     exhausted_run.content = response.clone();
                     break (
@@ -2900,6 +2941,8 @@ impl ChatOrchestrator {
                     tool_action_label(&tool_action),
                     action_rounds,
                     max_rounds,
+                    exploration_rounds,
+                    max_exploration_rounds,
                 );
 
                 // Bracket the dispatch, not the leaf call: `ValidationOrchestrator`
@@ -3077,6 +3120,8 @@ impl ChatOrchestrator {
                                     line,
                                     action_rounds,
                                     max_rounds,
+                                    exploration_rounds,
+                                    max_exploration_rounds,
                                 )));
                             };
                             let record = self.validation_orchestrator.run_proposal(
@@ -3947,7 +3992,7 @@ impl ChatOrchestrator {
         turn_options: ChatTurnOptions,
     ) -> Result<ChatTurnResult> {
         let proposal_id = create_id("roundbudget");
-        let response = round_budget_pause_response(action_rounds, max_rounds);
+        let response = round_budget_pause_response(action_rounds, max_rounds, exploration_rounds);
         // The turn has spent its last segment: only *Answer now* is left.
         let at_hard_cap = action_rounds >= ABSOLUTE_TURN_ROUND_CAP;
         let pause = RoundBudgetPause {
@@ -6314,17 +6359,38 @@ fn token_budget_exhausted_response(
     message
 }
 
-fn tool_budget_exhausted_response(max_rounds: u32) -> String {
+/// "1 read-only round" / "2 read-only rounds": the count is often zero or one,
+/// and the label reads as a bare count in the progress stream too.
+fn read_only_rounds(count: u32) -> String {
+    if count == 1 {
+        "1 read-only round".to_string()
+    } else {
+        format!("{count} read-only rounds")
+    }
+}
+
+/// Names both budgets so the user can tell which one stopped the turn and what
+/// each had used (spec 59 requirement 8). Deliberately says nothing about
+/// debugging: a turn may have been reading, editing or running commands.
+fn tool_budget_exhausted_response(max_rounds: u32, exploration_rounds: u32) -> String {
     format!(
-        "This turn reached the configured tool round limit ({max_rounds}) while the model was still trying to call another tool. I stopped instead of treating the raw tool request as a completed answer. Continue debugging with a narrower next request or approve a larger diagnostic budget if available."
+        "This turn reached its budget of {max_rounds} action rounds and had used {} while the model was still trying to call another tool. I stopped instead of treating the raw tool request as a completed answer. Narrow the next request to finish within the budget.",
+        read_only_rounds(exploration_rounds)
     )
 }
 
 /// The pause message a round-budget stop leaves in the transcript (spec 61
-/// §5.6). Names the rounds so the user knows where the turn is; the buttons the
-/// shell renders beside it are what carry the decision.
-fn round_budget_pause_response(rounds_used: u32, rounds_total: u32) -> String {
-    format!("Used {rounds_used} of {rounds_total} tool rounds.")
+/// §5.6). Names both counts (spec 59 requirement 8) so the user knows where the
+/// turn is; the buttons the shell renders beside it are what carry the decision.
+fn round_budget_pause_response(
+    rounds_used: u32,
+    rounds_total: u32,
+    exploration_rounds: u32,
+) -> String {
+    format!(
+        "Used {rounds_used} of {rounds_total} action rounds and {}.",
+        read_only_rounds(exploration_rounds)
+    )
 }
 
 /// Builds the approval proposal surfaced to the user for a pending MCP tool

@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::{
     CancelToken, ChatTurnResult, Config, MockModelAdapter, ModelProviderConfig, PhaseKind,
-    RoundBudgetDecision, TaskStatus, ToolCall, TurnProgress, TurnSink, WorkspaceEngine,
+    RoundBudgetDecision, TaskStatus, ToolCall, TurnPhase, TurnProgress, TurnSink, WorkspaceEngine,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -636,6 +636,132 @@ fn phase_round_is_the_action_count() {
     assert!(
         rounds.iter().all(|&round| round == 1),
         "an all-read turn must never advance the action count: {rounds:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Requirement 8: the user can see both counts while a turn runs, and both
+// budget messages name them without assuming the turn was debugging.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn phases_carry_the_exploration_count_and_limit() {
+    let repo = temp_repo("phase-exploration");
+    let engine = engine(&repo, 8, 24);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), String::new(), "Done.".to_string()],
+        vec![
+            vec![read_file("src/a.rs")],
+            vec![list_directory()],
+            Vec::new(),
+        ],
+    );
+
+    let (_result, progress) = run_turn(&engine, &repo, "Look at the source", &mut adapter);
+
+    let phases: Vec<&TurnPhase> = progress
+        .iter()
+        .filter_map(|event| match event {
+            TurnProgress::Phase(phase) => Some(phase),
+            _ => None,
+        })
+        .collect();
+    assert!(!phases.is_empty(), "the turn should report progress");
+    assert!(
+        phases
+            .iter()
+            .all(|phase| phase.max_exploration_rounds == 24),
+        "every phase carries the turn's allowance: {:?}",
+        phases
+            .iter()
+            .map(|phase| phase.max_exploration_rounds)
+            .collect::<Vec<_>>()
+    );
+    // The phase is emitted *before* the round it describes, so the two read
+    // rounds show as 0 then 1, and the answer's phase sees both.
+    let read_counts: Vec<u32> = phases.iter().map(|phase| phase.exploration_round).collect();
+    assert!(
+        read_counts.contains(&0) && read_counts.contains(&2),
+        "the progress stream must report the reads the turn has used: {read_counts:?}"
+    );
+}
+
+#[test]
+fn the_pause_message_names_the_action_and_read_counts() {
+    let repo = temp_repo("pause-message");
+    // Two exploration rounds, then a third read spends the action budget. The
+    // pause text is the transcript's record of what stopped the turn.
+    let engine = engine(&repo, 1, 2);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), String::new(), String::new()],
+        vec![
+            vec![read_file("src/a.rs")],
+            vec![read_file("src/b.rs")],
+            vec![read_file("src/c.rs")],
+        ],
+    );
+
+    let (result, _) = run_turn(&engine, &repo, "Look at the source", &mut adapter);
+
+    let proposal = result
+        .round_budget_proposal
+        .as_ref()
+        .expect("the action budget pauses the turn");
+    assert_eq!(proposal.rounds_used, 1);
+    assert!(
+        result.response.contains("1 of 1 action rounds"),
+        "the pause message must name the action budget: {:?}",
+        result.response
+    );
+    assert!(
+        result.response.contains("2 read-only rounds"),
+        "the pause message must name the allowance's use: {:?}",
+        result.response
+    );
+    assert!(
+        !result.response.to_lowercase().contains("debugging"),
+        "the pause message must not assume the turn was debugging: {:?}",
+        result.response
+    );
+}
+
+#[test]
+fn the_stop_message_names_both_counts_without_mentioning_debugging() {
+    let repo = temp_repo("stop-message");
+    let engine = engine(&repo, 8, 24);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(); 10],
+        vec![vec![read_file_range("src/a.rs", 1, 1)]; 10],
+    );
+
+    let (paused, _) = run_turn(&engine, &repo, "Look at the source", &mut adapter);
+    let proposal = paused
+        .round_budget_proposal
+        .as_ref()
+        .expect("the repeated reads spend the action budget");
+
+    let exhausted = resume_round_budget(
+        &engine,
+        &proposal.id,
+        RoundBudgetDecision::AnswerNow,
+        &mut adapter,
+    );
+
+    assert_eq!(exhausted.task.status, TaskStatus::ToolBudgetExhausted);
+    assert!(
+        exhausted.response.contains("8 action rounds"),
+        "the stop message must name the action budget: {:?}",
+        exhausted.response
+    );
+    assert!(
+        exhausted.response.contains("1 read-only round"),
+        "the stop message must name the allowance's use: {:?}",
+        exhausted.response
+    );
+    assert!(
+        !exhausted.response.to_lowercase().contains("debugging"),
+        "the stop message must not assume the turn was debugging: {:?}",
+        exhausted.response
     );
 }
 

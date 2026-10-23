@@ -1,8 +1,9 @@
 # Feature Spec: Exploration Round Allowance
 
-Status: In progress. Tasks 1–3 of 6 done (2026-10-18, 2026-10-23) — the
+Status: In progress. Tasks 1–4 of 6 done (2026-10-18 to 2026-10-23) — the
 `agent_max_exploration_rounds` config key, then round classification and the two
-counters, then repeat detection; see [`tasks.md`](tasks.md). Specified on 2026-10-17 from a session that ran out of tool
+counters, then repeat detection, then the progress fields and both budget
+messages; see [`tasks.md`](tasks.md). Specified on 2026-10-17 from a session that ran out of tool
 rounds on a reporting-only request; the evidence is in
 [`context.md`](context.md) §1. Planned on 2026-10-18; §2, §5.2 and §5.5
 re-planned on 2026-10-23 against spec 61's round-budget pause, which landed
@@ -314,14 +315,22 @@ one uncaught repeat after a resume.
   are any: `round 3/8 · 12 reads`. Spec 57's progress file carries the two new
   fields additively; older readers ignore them.
 - **When stopped.** Since spec 61 a turn at its action budget pauses rather
-  than stops, with "Used N of M tool rounds." (`round_budget_pause_response`)
-  and *Continue — N more* / *Answer now* buttons, so the button this section
-  once asked for already exists. Both messages that report a budget name both
-  counts and assume nothing about the kind of task: the pause message (for
-  example "Used 8 of 8 action rounds and 24 read-only rounds."), and
-  `tool_budget_exhausted_response`, still reached through *Answer now* and the
-  token-ceiling path, which drops "Continue debugging". The exact wording is
-  settled in Task 4.
+  than stops, with *Continue — N more* / *Answer now* buttons, so the button
+  this section once asked for already exists and this spec changes no button.
+  Both messages that report a budget name both counts and assume nothing about
+  the kind of task. The exact wording, settled in Task 4:
+
+  - Pause (`round_budget_pause_response`): `Used {N} of {M} action rounds and
+    {R} read-only rounds.` — for example `Used 8 of 8 action rounds and 24
+    read-only rounds.`; singular `1 read-only round` when `R` is 1.
+  - Stop (`tool_budget_exhausted_response`, still reached through *Answer now*
+    and the token-ceiling path): `This turn reached its budget of {M} action
+    rounds and had used {R} read-only rounds while the model was still trying
+    to call another tool. I stopped instead of treating the raw tool request as
+    a completed answer. Narrow the next request to finish within the budget.`
+    The same singular form applies, and "Continue debugging" is gone.
+  - The progress label appends `· {R} reads` when `R` is non-zero (singular
+    `· 1 read`), after the unchanged `round {N}/{M}` part.
 
 ### 5.6 Recording
 

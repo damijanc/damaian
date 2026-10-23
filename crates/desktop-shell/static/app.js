@@ -4172,7 +4172,13 @@ function startTurnIndicator(target, onStop = null) {
         payload.phase !== "context" && payload.maxRounds > 1 && payload.round > 1
           ? ` · round ${payload.round}/${payload.maxRounds}`
           : "";
-      label.textContent = `${text}${rounds}`;
+      // Spec 59 §5.5: the round label keeps meaning action rounds, and the
+      // reads the allowance has covered are shown beside it when there are any.
+      const reads =
+        payload.phase !== "context" && payload.explorationRound > 0
+          ? ` · ${payload.explorationRound} ${payload.explorationRound === 1 ? "read" : "reads"}`
+          : "";
+      label.textContent = `${text}${rounds}${reads}`;
     },
     streaming() {
       if (done || streaming) return;
@@ -8583,9 +8589,9 @@ function createFallbackOffer(proposal, proposalRepo) {
 }
 
 // Spec 61: a turn paused at its round budget. The transcript already names the
-// rounds ("Used 8 of 8 tool rounds." is the pause response); the two buttons
-// here carry the decision, and neither says anything about debugging
-// (requirement 3).
+// counts ("Used 8 of 8 action rounds and 12 read-only rounds." is the pause
+// response); the two buttons here carry the decision, and neither says
+// anything about debugging (requirement 3).
 //
 // Two shapes: a live pause carries the full proposal (roundsUsed, roundsTotal,
 // roundsGranted, roundsMore, atHardCap), while a reattached pause (after a
