@@ -168,6 +168,11 @@ pub struct RunRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_applicable: Option<String>,
     pub tool_rounds: u64,
+    /// Rounds whose every dispatched tool was a read (spec 59 §5.6), read from
+    /// the session log by `trace::exploration_rounds` rather than derived from
+    /// the scenario script. Reported beside `tool_rounds` so a reader can see
+    /// how much of a turn was reading rather than acting.
+    pub exploration_rounds: u64,
     pub model_calls: u64,
     /// How many round-budget continuations the run granted, read from the
     /// `turn_budget_extended` audit records (spec 61 §5.4). Counted here rather
@@ -251,6 +256,7 @@ impl RunRecord {
             assertions: Vec::new(),
             not_applicable: None,
             tool_rounds: 0,
+            exploration_rounds: 0,
             model_calls: 0,
             continuations: 0,
             task_count: 0,

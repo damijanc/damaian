@@ -193,28 +193,48 @@ pub fn tool_actions(data_dir: &Path) -> Result<Vec<RecordedToolCall>> {
         .collect())
 }
 
-/// Rounds in which the run dispatched at least one tool, read from the session
-/// log for the same reason [`tool_actions`] is: the scenario script is not
-/// evidence of what happened.
+/// The action-marker names of the tools `action_effect` classifies
+/// `ActionEffect::ReadOnly` — the eight read tools in `tool_action_marker`
+/// (`crates/workspace-engine/src/chat.rs`).
 ///
-/// This was counted from `scenario.turns` until spec 47's A/B, where it read
-/// identically in every live run — before and after the tool surface changed —
-/// because the live tier ignores the script entirely, so the number described
-/// the scenario directory rather than a model. In the deterministic tier it was
-/// merely redundant, except where the engine dispatches more rounds than the
-/// script has turns: a retried command is one scripted turn and several rounds.
+/// This is the one place the harness repeats an engine list, because the session
+/// log carries marker names rather than the enum. Keep it in step with
+/// `tool_action_marker`: a read tool missing here makes an all-read round look
+/// like an action round, and leaving one in after it stops being read-only would
+/// over-count exploration. Every other name — `run_command`, `propose_patch`,
+/// `ask_user`, an MCP call — is an action, so an unknown marker is deliberately
+/// not exploration.
+const READ_ONLY_ACTION_MARKERS: [&str; 8] = [
+    "read_file",
+    "list_directory",
+    "search_content",
+    "search_codebase",
+    "read_git_status",
+    "read_git_diff",
+    "list_worktrees",
+    "read_git_log",
+];
+
+/// One round of the session log: the actions dispatched between two
+/// `model_call` markers. A round exists only if it dispatched something, which
+/// is what makes [`tool_rounds`] count tools rather than model calls.
+#[derive(Debug, Clone, Copy)]
+struct Round {
+    /// Every action in the round was a read tool (spec 59 §5.1).
+    read_only: bool,
+}
+
+/// Walks the session logs and groups action markers into rounds.
 ///
-/// A round is delimited by the `model_call` marker that opens it, and counts
-/// once however many tools it dispatched — so a provider that emits several
-/// tool calls in one message adds calls, not rounds, which is exactly the
-/// distinction the A/B needed and could not make. Tools dispatched before any
-/// `model_call` marker still open a round, so a count is never lost to an
-/// ordering this function did not expect.
-pub fn tool_rounds(data_dir: &Path) -> Result<u64> {
+/// A round opens on the `model_call` marker that precedes it and closes on the
+/// next one, so a provider that emits several calls in one message adds calls,
+/// not rounds. Tools dispatched before any `model_call` still open a round, so a
+/// count is never lost to an ordering this function did not expect.
+fn rounds(data_dir: &Path) -> Result<Vec<Round>> {
     let paths = session_log_paths(data_dir)?;
 
-    let mut rounds = 0;
-    let mut counted_this_round = false;
+    let mut rounds = Vec::new();
+    let mut current: Option<Round> = None;
     for path in &paths {
         let text = std::fs::read_to_string(path)
             .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
@@ -233,15 +253,56 @@ pub fn tool_rounds(data_dir: &Path) -> Result<u64> {
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
             if action == "model_call" {
-                counted_this_round = false;
-            } else if !counted_this_round {
-                rounds += 1;
-                counted_this_round = true;
+                if let Some(round) = current.take() {
+                    rounds.push(round);
+                }
+                continue;
+            }
+            let round = current.get_or_insert(Round { read_only: true });
+            if !READ_ONLY_ACTION_MARKERS.contains(&action) {
+                round.read_only = false;
             }
         }
     }
+    if let Some(round) = current {
+        rounds.push(round);
+    }
 
     Ok(rounds)
+}
+
+/// Rounds in which the run dispatched at least one tool, read from the session
+/// log for the same reason [`tool_actions`] is: the scenario script is not
+/// evidence of what happened.
+///
+/// This was counted from `scenario.turns` until spec 47's A/B, where it read
+/// identically in every live run — before and after the tool surface changed —
+/// because the live tier ignores the script entirely, so the number described
+/// the scenario directory rather than a model. In the deterministic tier it was
+/// merely redundant, except where the engine dispatches more rounds than the
+/// script has turns: a retried command is one scripted turn and several rounds.
+///
+/// A round is delimited by the `model_call` marker that opens it, and counts
+/// once however many tools it dispatched — so a provider that emits several
+/// tool calls in one message adds calls, not rounds, which is exactly the
+/// distinction the A/B needed and could not make.
+pub fn tool_rounds(data_dir: &Path) -> Result<u64> {
+    Ok(rounds(data_dir)?.len() as u64)
+}
+
+/// Rounds whose every dispatched tool was a read (spec 59 §5.1), derived from
+/// the session log exactly as [`tool_rounds`] is.
+///
+/// The engine classifies a round by `action_effect` before dispatch; the log
+/// carries the same decision as action-marker names, so a reader of the log can
+/// recover it without a second engine counter. A round that dispatched a command
+/// beside a read is an action round, and so is one whose marker this function
+/// does not recognise: only a round made entirely of read tools is exploration.
+pub fn exploration_rounds(data_dir: &Path) -> Result<u64> {
+    Ok(rounds(data_dir)?
+        .iter()
+        .filter(|round| round.read_only)
+        .count() as u64)
 }
 
 /// A run's command findings grouped by purpose (spec 63 §5.5).

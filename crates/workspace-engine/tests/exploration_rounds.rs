@@ -766,6 +766,135 @@ fn the_stop_message_names_both_counts_without_mentioning_debugging() {
 }
 
 // ---------------------------------------------------------------------------
+// Requirement 9: the turn's audit records name both counts (spec 59 §5.6,
+// corrections C4 and C10).
+// ---------------------------------------------------------------------------
+
+/// The audit events of one type, parsed in order. Values are strings because
+/// `AuditLog::record` takes `(key, String)` pairs and writes every one quoted.
+fn audit_events(repo: &Path, event_type: &str) -> Vec<serde_json::Value> {
+    let path = repo.join(".damaian").join("audit").join("events.jsonl");
+    let text = fs::read_to_string(path).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["eventType"].as_str() == Some(event_type))
+        .collect()
+}
+
+#[test]
+fn model_request_prepared_records_the_exploration_count_and_limit() {
+    let repo = temp_repo("audit-model-request");
+    let engine = engine(&repo, 8, 24);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), String::new(), "Done.".to_string()],
+        vec![
+            vec![read_file("src/a.rs")],
+            vec![read_file("src/b.rs")],
+            Vec::new(),
+        ],
+    );
+
+    let (result, _) = run_turn(&engine, &repo, "Look at the source", &mut adapter);
+    assert_eq!(result.task.status, TaskStatus::Complete);
+
+    let records = audit_events(&repo, "model_request_prepared");
+    assert_eq!(records.len(), 3, "one record per model call");
+    for record in &records {
+        assert_eq!(
+            record["explorationLimit"].as_str(),
+            Some("24"),
+            "every request record names the turn's allowance: {record}"
+        );
+    }
+    let counts: Vec<&str> = records
+        .iter()
+        .map(|record| record["explorationRounds"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        counts,
+        ["0", "1", "2"],
+        "the record is written before the round it describes, so it shows the reads already spent"
+    );
+}
+
+/// The continuation is a second audit record with its own round vocabulary
+/// (`round`/`roundLimit`, not `toolRound`/`toolRoundLimit`), so it needs the
+/// exploration fields spelled out too rather than inherited from the request.
+#[test]
+fn turn_continued_records_the_exploration_count_and_limit() {
+    let repo = temp_repo("audit-continued");
+    let mut config = Config {
+        data_dir: repo.join(".damaian"),
+        agent_max_task_tokens: Some(10_000_000),
+        agent_max_tool_rounds: 1,
+        agent_max_exploration_rounds: 24,
+        enable_index_watcher: false,
+        ..Config::default()
+    };
+    config.model_providers.push(native_tool_provider());
+    let engine = WorkspaceEngine::new(config);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![
+            String::new(),
+            String::new(),
+            String::new(),
+            "Done.".to_string(),
+        ],
+        vec![
+            // One exploration round.
+            vec![read_file("src/a.rs")],
+            // The action round that reaches the one-round budget.
+            vec![run_command("ls src")],
+            // The forced-final call still asks for a tool, which is what
+            // continues the turn under the ceiling.
+            vec![read_file("src/b.rs")],
+            Vec::new(),
+        ],
+    );
+
+    let (result, _) = run_turn(&engine, &repo, "Look at the source", &mut adapter);
+    assert_eq!(result.task.status, TaskStatus::Complete);
+
+    let records = audit_events(&repo, "turn_continued");
+    assert_eq!(records.len(), 1, "the ceiling grants one continuation");
+    assert_eq!(records[0]["round"].as_str(), Some("1"));
+    assert_eq!(
+        records[0]["explorationRounds"].as_str(),
+        Some("1"),
+        "the continuation record names the reads the turn had used: {}",
+        records[0]
+    );
+    assert_eq!(records[0]["explorationLimit"].as_str(), Some("24"));
+}
+
+/// C10's decision: the pause record carries the exploration count beside the
+/// action counts, because a user reading the audit trail to understand why a
+/// turn stopped needs both (`roundsUsed` alone would read as the whole turn).
+#[test]
+fn round_budget_paused_records_the_exploration_count_and_limit() {
+    let repo = temp_repo("audit-pause");
+    let engine = engine(&repo, 1, 24);
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), String::new()],
+        vec![vec![read_file("src/a.rs")], vec![run_command("ls src")]],
+    );
+
+    let (result, _) = run_turn(&engine, &repo, "Look at the source", &mut adapter);
+    assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+
+    let records = audit_events(&repo, "round_budget_paused");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["roundsUsed"].as_str(), Some("1"));
+    assert_eq!(
+        records[0]["explorationRounds"].as_str(),
+        Some("1"),
+        "the pause names the reads spent as well as the action rounds: {}",
+        records[0]
+    );
+    assert_eq!(records[0]["explorationLimit"].as_str(), Some("24"));
+}
+
+// ---------------------------------------------------------------------------
 // Requirement 4: a read that repeats an earlier call is an action round.
 // ---------------------------------------------------------------------------
 

@@ -1,0 +1,108 @@
+name = "read_loop"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Read src/upload.rs and summarise it."
+round_budget_decision = "answer_now"
+
+# Spec 59 §5.7's second scenario: the model reads the same file with the same
+# range every round. Round one is new, so it is an exploration round; every
+# round after it is a repeat (§5.3) and therefore an action round. The turn
+# stops after one exploration round plus the eight-round action budget — nine
+# dispatched rounds, not the thirty-two the allowance alone would permit.
+#
+# With no token ceiling the engine pauses at the action budget (spec 61), so the
+# scenario answers *Answer now*. The tenth scripted response is consumed by the
+# forced final call, which offers no tools; the script still asks for one, which
+# is what ends the turn `ToolBudgetExhausted` (C10).
+#
+# The range is explicit so "the same read" is unambiguous: a continued window
+# after a truncated read is not a repeat, and this scenario is not that.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 7 } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 7 } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 7 } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 7 } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 7 } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 7 } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 7 } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 7 } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 7 } },
+]
+
+# Consumed only by the Answer-now forced call. It asks for a tool even though
+# none was offered, which is the terminal outcome this scenario asserts.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "read_file", arguments = { path = "src/upload.rs", start_line = 1, end_line = 7 } },
+]
+
+[assert]
+continuations = 0
+task_count = 1
+final_task_status = "tool_budget_exhausted"
+# Nine dispatched rounds: one charged to the allowance, eight to the action
+# budget. The forced final call dispatches nothing, so the tool call count stays
+# at nine.
+#
+# `exploration_rounds` is the harness's log-derived figure: rounds whose every
+# dispatched tool was a read. It reads 9 because every round here read the same
+# file — the session log carries tool names, not the engine's charging decision,
+# so it cannot see that repeat detection moved rounds two onwards to the action
+# budget. The audit's `explorationRounds` (1) is the charged count; the stop at
+# nine rounds is what proves it.
+exploration_rounds = 9
+tool_rounds_at_most = 9
+tool_calls_at_least = 9
+model_calls_at_most = 10
+deterministic_only = [
+  "continuations",
+  "task_count",
+  "final_task_status",
+  "exploration_rounds",
+  "tool_rounds_at_most",
+  "tool_calls_at_least",
+  "model_calls_at_most",
+]

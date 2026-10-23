@@ -2413,6 +2413,11 @@ impl ChatOrchestrator {
                     ("tokenEstimate", token_estimate.to_string()),
                     ("toolRound", action_rounds.to_string()),
                     ("toolRoundLimit", max_rounds.to_string()),
+                    // Spec 59 §5.6: both budgets, so a reader of the audit trail
+                    // can see what the turn had read as well as what it had
+                    // acted on.
+                    ("explorationRounds", exploration_rounds.to_string()),
+                    ("explorationLimit", max_exploration_rounds.to_string()),
                 ],
             )?;
 
@@ -2674,6 +2679,11 @@ impl ChatOrchestrator {
                                 ("taskId", task.id.clone()),
                                 ("round", action_rounds.to_string()),
                                 ("roundLimit", max_rounds.to_string()),
+                                // Spec 59 §5.6: this record's round fields are
+                                // `round`/`roundLimit`, so the exploration
+                                // pair is named explicitly rather than shared.
+                                ("explorationRounds", exploration_rounds.to_string()),
+                                ("explorationLimit", max_exploration_rounds.to_string()),
                             ],
                         )?;
                         messages.push(
@@ -4046,6 +4056,13 @@ impl ChatOrchestrator {
                 ("roundsUsed", action_rounds.to_string()),
                 ("roundsTotal", max_rounds.to_string()),
                 ("roundsGranted", rounds_granted.to_string()),
+                // C10: the pause record names both budgets. `roundsUsed` alone
+                // would read as the whole turn when most of it was reads.
+                ("explorationRounds", exploration_rounds.to_string()),
+                (
+                    "explorationLimit",
+                    self.default_exploration_round_limit().to_string(),
+                ),
             ],
         )?;
         let usage = self

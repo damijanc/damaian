@@ -340,6 +340,18 @@ pub fn evaluate(
                 rounds.to_string(),
             );
         }
+
+        // Spec 59 §5.6: the exploration count beside the tool rounds, so a
+        // scenario can pin how much of the turn was reading rather than acting.
+        if let Some(expected) = asserts.exploration_rounds {
+            let rounds = run.record.exploration_rounds;
+            push(
+                "exploration_rounds",
+                rounds == expected,
+                expected.to_string(),
+                rounds.to_string(),
+            );
+        }
     }
 
     results
