@@ -11,6 +11,8 @@
 
 use crate::config::{AppliedKey, Config, ConfigScope, RejectedConfigKey, RepositoryConfigReport};
 use crate::error::Result;
+use crate::hash::repository_id_for_root;
+use crate::hooks::{HookActivation, activation as hook_activation};
 use crate::mode::SessionMode;
 use crate::profile::ProfileId;
 use serde::Serialize;
@@ -95,6 +97,10 @@ pub struct PolicyRule {
     /// Admin config loosened what user and repository config resolved.
     pub admin_widened: bool,
     pub refused: Vec<RefusedRequest>,
+    /// For a `hook.<id>.<field>` rule, whether the hook may run now
+    /// (`context.md` §7.1). `None` for every other rule, and when the load
+    /// named no repository root.
+    pub activation: Option<HookActivation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -311,6 +317,10 @@ impl EffectivePolicy {
         }
 
         let text = config.to_policy_text();
+        let repository = report
+            .repository_root
+            .as_deref()
+            .map(|root| (repository_id_for_root(root), root));
         let mut rules = Vec::new();
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
@@ -366,6 +376,11 @@ impl EffectivePolicy {
                 // recorded; it is not re-derived here.
                 admin_widened: applied.iter().any(|applied| applied.widened),
                 refused: refused.remove(key).unwrap_or_default(),
+                activation: repository.as_ref().and_then(|(repository_id, root)| {
+                    let id = key.strip_prefix("hook.")?.rsplit_once('.')?.0;
+                    let hook = config.hook(id)?;
+                    Some(hook_activation(config, hook, repository_id, root))
+                }),
             });
         }
 

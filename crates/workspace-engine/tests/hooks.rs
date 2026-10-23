@@ -16,20 +16,24 @@
 //! redacted and bounded.
 
 use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use workspace_engine::finding::Severity;
+use workspace_engine::finding::{FindingSource, Severity};
 use workspace_engine::hooks::{
-    self, HOOK_API_VERSION, HookEnvelope, HookFailureKind, HookRun, MAX_HOOK_COMMANDS,
+    self, HOOK_API_VERSION, HookActivation, HookContext, HookDispatcher, HookEnvelope,
+    HookEnvelopeParts, HookFailureKind, HookOutcome, HookRun, MAX_HOOK_COMMANDS,
     MAX_HOOK_CONTEXT_CHARS, MAX_HOOK_CONTEXT_ENTRIES, MAX_HOOK_FINDINGS, MAX_HOOK_REASON_CHARS,
     MAX_HOOK_STDERR_BYTES, MAX_HOOK_STDOUT_BYTES, ResponseError, Verdict, WideningAttempt,
+    activation, hook_definition_hash,
 };
 use workspace_engine::{
-    Config, ConfigOverlay, ConfigScope, EffectivePolicy, HookConfig, HookEvent, HookMode,
+    AuditLog, Config, ConfigOverlay, ConfigScope, EffectivePolicy, HookConfig, HookEvent, HookMode,
     HookReview, HookSource, MAX_HOOK_TIMEOUT_MS, ProcessRegistry, RepositoryConfigReport,
-    RepositoryKeyClass, SecretScanner, SourceKind, split_profile_keys,
+    RepositoryKeyClass, SecretScanner, SourceKind, WorkspaceEngine, repository_id_for_root,
+    split_profile_keys,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1414,5 +1418,774 @@ fn stderr_is_redacted_and_keeps_only_its_last_8_kib() {
         "stderr is {} bytes",
         run.stderr.len()
     );
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ---- Task 4: the dispatcher. `context.md` §7, §10, §11 ---------------------
+
+/// The config the dispatcher reads, pointed at a scratch data directory so
+/// the audit and PID registry never touch the user's own state.
+fn config_for(root: &Path, hooks: Vec<HookConfig>) -> Config {
+    let data_dir = root.join(".damaian-data");
+    fs::create_dir_all(&data_dir).unwrap();
+    Config {
+        data_dir,
+        enable_index_watcher: false,
+        hooks,
+        ..Config::default()
+    }
+}
+
+fn dispatcher_for(config: &Config) -> HookDispatcher {
+    let scanner = SecretScanner::new(Vec::new());
+    HookDispatcher::new(
+        config.clone(),
+        scanner.clone(),
+        AuditLog::new(&config.data_dir, true, scanner),
+    )
+}
+
+fn event_parts() -> HookEnvelopeParts {
+    HookEnvelopeParts {
+        session_id: Some("session_1".to_string()),
+        task_id: Some("task_1".to_string()),
+        mode: "code".to_string(),
+        profile: "default".to_string(),
+        payload: json!({}),
+    }
+}
+
+fn dispatch(dispatcher: &HookDispatcher, event: HookEvent, root: &Path) -> HookOutcome {
+    dispatcher.dispatch(event, event_parts(), root, &HookContext::root())
+}
+
+fn audit_events(data_dir: &Path) -> Vec<serde_json::Value> {
+    let path = data_dir.join("audit").join("events.jsonl");
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn events_of(data_dir: &Path, event_type: &str) -> Vec<serde_json::Value> {
+    audit_events(data_dir)
+        .into_iter()
+        .filter(|event| event["eventType"] == event_type)
+        .collect()
+}
+
+/// A hook script that answers with `body` as one JSON line.
+fn json_response(body: &str) -> String {
+    format!("cat <<'JSON'\n{body}\nJSON\n")
+}
+
+#[test]
+fn the_definition_hash_covers_the_definition_and_the_files_it_names() {
+    let root = temp_dir("definition-hash");
+    let check = script(&root, "check", "echo one\n");
+    let hook = sh_hook("check", &check);
+    let base = hook_definition_hash(&hook, &root).unwrap();
+    assert!(base.starts_with("sha256:"), "{base}");
+    assert_eq!(base, hook_definition_hash(&hook, &root).unwrap());
+
+    let mut mode = hook.clone();
+    mode.mode = HookMode::Optional;
+    let mut order = hook.clone();
+    order.order = 7;
+    let mut events = hook.clone();
+    events.events = vec![HookEvent::AfterTool];
+    let mut timeout = hook.clone();
+    timeout.timeout_ms = Some(1_234);
+    let mut command = hook.clone();
+    command.command = "/bin/true".to_string();
+    let mut args = hook.clone();
+    args.args.push("--strict".to_string());
+    for (field, changed) in [
+        ("mode", mode),
+        ("order", order),
+        ("events", events),
+        ("timeout_ms", timeout),
+        ("command", command),
+        ("args", args),
+    ] {
+        assert_ne!(
+            base,
+            hook_definition_hash(&changed, &root).unwrap(),
+            "{field} is not part of the hash"
+        );
+    }
+
+    // The script's content is part of the definition, because review would
+    // otherwise cover only the path to it.
+    write(&check, "echo two\n");
+    assert_ne!(base, hook_definition_hash(&hook, &root).unwrap());
+    write(&check, "echo one\n");
+    assert_eq!(base, hook_definition_hash(&hook, &root).unwrap());
+
+    // A file outside the repository is not the repository's to change.
+    let outside_root = temp_dir("definition-hash-outside");
+    let outside = script(&outside_root, "outside", "one\n");
+    let mut outside_hook = hook.clone();
+    outside_hook.args = vec![outside.to_string_lossy().to_string()];
+    let with_outside = hook_definition_hash(&outside_hook, &root).unwrap();
+    write(&outside, "two\n");
+    assert_eq!(
+        with_outside,
+        hook_definition_hash(&outside_hook, &root).unwrap()
+    );
+
+    let _ = fs::remove_dir_all(&outside_root);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_repository_hook_is_pending_until_reviewed_at_its_hash() {
+    let root = temp_dir("activation");
+    let check = script(&root, "check", "exit 0\n");
+    let mut hook = sh_hook("repo_check", &check);
+    hook.source = HookSource::Repository;
+    hook.events = vec![HookEvent::BeforeTool];
+    let repository_id = repository_id_for_root(&root);
+    let mut config = config_for(&root, vec![hook.clone()]);
+
+    assert_eq!(
+        activation(&config, &hook, &repository_id, &root),
+        HookActivation::PendingReview
+    );
+
+    let hash = hook_definition_hash(&hook, &root).unwrap();
+    config.hook_reviews_by_repository.insert(
+        repository_id.clone(),
+        BTreeMap::from([(hook.id.clone(), HookReview::Declined)]),
+    );
+    assert_eq!(
+        activation(&config, &hook, &repository_id, &root),
+        HookActivation::Declined
+    );
+    config.hook_reviews_by_repository.insert(
+        repository_id.clone(),
+        BTreeMap::from([(hook.id.clone(), HookReview::Approved { hash: hash.clone() })]),
+    );
+    assert_eq!(
+        activation(&config, &hook, &repository_id, &root),
+        HookActivation::Active
+    );
+
+    write(&check, "exit 1\n");
+    assert_eq!(
+        activation(&config, &hook, &repository_id, &root),
+        HookActivation::ChangedSinceReview
+    );
+
+    let mut disabled = hook.clone();
+    disabled.enabled = false;
+    assert_eq!(
+        activation(&config, &disabled, &repository_id, &root),
+        HookActivation::Disabled
+    );
+
+    let mut user = hook.clone();
+    user.source = HookSource::User;
+    assert_eq!(
+        activation(&config, &user, &repository_id, &root),
+        HookActivation::Active
+    );
+
+    // A relative command must resolve inside the repository. One that exists
+    // outside it is not made acceptable by being canonicalisable.
+    let outside_root = temp_dir("activation-outside");
+    let _outside = script(&outside_root, "escape", "exit 0\n");
+    let mut escaping = hook.clone();
+    escaping.command = format!(
+        "../{}/hooks/escape.sh",
+        outside_root.file_name().unwrap().to_string_lossy()
+    );
+    assert_eq!(
+        activation(&config, &escaping, &repository_id, &root),
+        HookActivation::ChangedSinceReview
+    );
+
+    let _ = fs::remove_dir_all(&outside_root);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_policy_view_shows_each_hooks_activation() {
+    let root = temp_dir("policy-activation");
+    let check = script(&root, "check", "exit 0\n");
+    let mut hook = sh_hook("repo_check", &check);
+    hook.source = HookSource::Repository;
+    let config = config_for(&root, vec![hook.clone()]);
+    let report = RepositoryConfigReport {
+        repository_root: Some(root.clone()),
+        ..RepositoryConfigReport::default()
+    };
+
+    let policy = EffectivePolicy::from_load(&config, &report, None);
+    for key in ["hook.repo_check.command", "hook.repo_check.events"] {
+        assert_eq!(
+            policy.rule(key).unwrap().activation,
+            Some(HookActivation::PendingReview),
+            "{key}"
+        );
+    }
+
+    let hash = hook_definition_hash(&hook, &root).unwrap();
+    let mut approved = config.clone();
+    approved.hook_reviews_by_repository.insert(
+        repository_id_for_root(&root),
+        BTreeMap::from([(hook.id.clone(), HookReview::Approved { hash })]),
+    );
+    let policy = EffectivePolicy::from_load(&approved, &report, None);
+    assert_eq!(
+        policy.rule("hook.repo_check.command").unwrap().activation,
+        Some(HookActivation::Active)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn deny_hook(root: &Path, id: &str, order: i64, marker: &str) -> HookConfig {
+    let body = format!(
+        "echo ran >> {marker}\n{}",
+        json_response(r#"{"hookApiVersion":1,"verdict":"deny","reason":"no"}"#)
+    );
+    let mut hook = sh_hook(id, &script(root, id, &body));
+    hook.order = order;
+    hook
+}
+
+#[test]
+fn a_deny_short_circuits_the_hooks_after_it() {
+    let root = temp_dir("short-circuit");
+    let first = deny_hook(&root, "first", 1, "first.log");
+    let second = deny_hook(&root, "second", 2, "second.log");
+    // Configured in the opposite order: the order field decides.
+    let config = config_for(&root, vec![second, first]);
+    let outcome = dispatch(&dispatcher_for(&config), HookEvent::BeforeTool, &root);
+
+    assert_eq!(outcome.verdict, Verdict::Deny);
+    assert_eq!(outcome.deciding_hook.as_deref(), Some("first"));
+    assert_eq!(outcome.reasons.len(), 1, "{:?}", outcome.reasons);
+    assert_eq!(outcome.reasons[0].0, "first");
+    assert!(
+        root.join("first.log").exists(),
+        "the first hook did not run"
+    );
+    assert!(!root.join("second.log").exists(), "a hook after a deny ran");
+    assert_eq!(events_of(&config.data_dir, "hook_invoked").len(), 1);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_mandatory_failure_denies_and_an_optional_failure_warns() {
+    let cases = [
+        ("non_zero_exit", Some("exit 3\n")),
+        ("timeout", Some("sleep 30\n")),
+        ("malformed", Some("printf 'not json'\n")),
+        ("version_mismatch", Some(r#"{"hookApiVersion":2}"#)),
+        (
+            "output_too_large",
+            Some("head -c 65537 /dev/zero | tr '\\0' x\n"),
+        ),
+        ("spawn_failed", None),
+    ];
+    for (kind, body) in cases {
+        for mode in [HookMode::Mandatory, HookMode::Optional] {
+            let root = temp_dir(&format!("failure-{kind}-{}", mode.as_str()));
+            let mut hook = match body {
+                Some(body) => {
+                    let body = if body.starts_with('{') {
+                        json_response(body)
+                    } else {
+                        body.to_string()
+                    };
+                    sh_hook(
+                        &format!("{kind}_{}", mode.as_str()),
+                        &script(&root, kind, &body),
+                    )
+                }
+                None => {
+                    let mut hook = hook(
+                        &format!("{kind}_{}", mode.as_str()),
+                        0,
+                        &[HookEvent::BeforeTool],
+                        true,
+                    );
+                    hook.command = "/nonexistent/damaian-hook".to_string();
+                    hook
+                }
+            };
+            hook.mode = mode;
+            if kind == "timeout" {
+                hook.timeout_ms = Some(300);
+            }
+            let config = config_for(&root, vec![hook]);
+            let outcome = dispatch(&dispatcher_for(&config), HookEvent::BeforeTool, &root);
+
+            let expected = match mode {
+                HookMode::Mandatory => Verdict::Deny,
+                HookMode::Optional => Verdict::Warn,
+            };
+            assert_eq!(outcome.verdict, expected, "{kind} {mode:?}");
+            let invoked = events_of(&config.data_dir, "hook_invoked");
+            assert_eq!(invoked.len(), 1, "{kind} {mode:?}");
+            assert_eq!(invoked[0]["failureKind"], kind, "{kind} {mode:?}");
+            assert_eq!(invoked[0]["outcome"], "failed", "{kind}");
+            if mode == HookMode::Mandatory {
+                assert_eq!(outcome.reasons.len(), 1, "{kind}");
+                assert_eq!(
+                    outcome.reasons[0].1,
+                    format!("hook `{kind}_mandatory` failed: {kind}"),
+                    "{kind}"
+                );
+                assert!(outcome.warnings.is_empty(), "{kind}");
+            } else {
+                assert!(outcome.reasons.is_empty(), "{kind}");
+                assert!(
+                    outcome
+                        .warnings
+                        .iter()
+                        .any(|warning| warning.contains(kind)),
+                    "{kind}: {:?}",
+                    outcome.warnings
+                );
+                assert!(
+                    outcome.findings.iter().any(|finding| {
+                        finding.source() == FindingSource::Hook
+                            && finding.severity() == Severity::Warning
+                    }),
+                    "{kind}: no warning finding"
+                );
+            }
+
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+}
+
+#[test]
+fn a_hook_with_no_mode_fails_closed() {
+    let root = temp_dir("default-mode");
+    let mut hook = sh_hook("defaulted", &script(&root, "defaulted", "exit 1\n"));
+    hook.mode = HookMode::default();
+    assert_eq!(hook.mode, HookMode::Mandatory);
+    let config = config_for(&root, vec![hook]);
+    let outcome = dispatch(&dispatcher_for(&config), HookEvent::BeforeTool, &root);
+    assert_eq!(outcome.verdict, Verdict::Deny);
+    assert_eq!(
+        outcome.reasons[0].1,
+        "hook `defaulted` failed: non_zero_exit"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_unknown_verdict_is_audited_as_a_widening_attempt_and_denies() {
+    let root = temp_dir("widening");
+    let hook = sh_hook(
+        "approver",
+        &script(
+            &root,
+            "approve",
+            &json_response(
+                r#"{"hookApiVersion":1,"verdict":"approve","grant":"GRANT_VALUE_TEXT","reason":"SECRET_REASON_TEXT"}"#,
+            ),
+        ),
+    );
+    let config = config_for(&root, vec![hook]);
+    let outcome = dispatch(&dispatcher_for(&config), HookEvent::BeforeTool, &root);
+
+    assert_eq!(outcome.verdict, Verdict::Deny);
+    assert_eq!(outcome.reasons[0].1, "hook `approver` failed: malformed");
+    let widening = events_of(&config.data_dir, "hook_widening_attempt");
+    assert_eq!(widening.len(), 2, "{widening:?}");
+    let field = widening
+        .iter()
+        .find(|event| event.get("field").is_some())
+        .expect("the unknown field was not audited");
+    assert_eq!(field["field"], "grant");
+    assert!(field.get("verdict").is_none(), "{field:?}");
+    let verdict = widening
+        .iter()
+        .find(|event| event.get("verdict").is_some())
+        .expect("the unknown verdict was not audited");
+    assert_eq!(verdict["verdict"], "approve");
+    assert!(verdict.get("field").is_none(), "{verdict:?}");
+    let invoked = events_of(&config.data_dir, "hook_invoked");
+    assert_eq!(invoked.len(), 1);
+    assert_eq!(invoked[0]["failureKind"], "malformed");
+
+    // Attempts are audited by name, never by the value the hook put there.
+    let audit = fs::read_to_string(config.data_dir.join("audit/events.jsonl")).unwrap();
+    for value in ["SECRET_REASON_TEXT", "GRANT_VALUE_TEXT"] {
+        assert!(
+            !audit.contains(value),
+            "{value} reached the audit log: {audit}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hook_output_is_redacted_before_the_outcome_and_the_audit() {
+    let root = temp_dir("redaction");
+    let body = r#"key=AKIAIOSFODNN7EXAMPLE
+echo "$key" >&2
+cat <<JSON
+{"hookApiVersion":1,"verdict":"deny","reason":"reason $key","findings":[{"severity":"error","summary":"summary $key","details":"details $key"}],"context":["context $key"]}
+JSON
+"#;
+    let hook = sh_hook("leaky", &script(&root, "leaky", body));
+    let mut hook = hook;
+    hook.events = vec![HookEvent::BeforeContext];
+    let config = config_for(&root, vec![hook]);
+    let outcome = dispatch(&dispatcher_for(&config), HookEvent::BeforeContext, &root);
+
+    const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+    assert_eq!(outcome.verdict, Verdict::Deny);
+    for text in outcome
+        .reasons
+        .iter()
+        .map(|(_, reason)| reason.clone())
+        .chain(outcome.warnings.iter().cloned())
+        .chain(outcome.context.iter().map(|(_, context)| context.clone()))
+    {
+        assert!(!text.contains(KEY), "a string kept the secret: {text}");
+    }
+    for finding in &outcome.findings {
+        assert!(!finding.summary().contains(KEY), "{}", finding.summary());
+        assert!(
+            !finding.details().unwrap_or_default().contains(KEY),
+            "{:?}",
+            finding.details()
+        );
+    }
+    assert!(!outcome.reasons[0].1.is_empty());
+    let audit = fs::read_to_string(config.data_dir.join("audit/events.jsonl")).unwrap();
+    assert!(
+        !audit.contains(KEY),
+        "the audit log kept the secret: {audit}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_repository_hook_runs_only_after_review_at_its_hash() {
+    let root = temp_dir("review-gate");
+    let check = script(
+        &root,
+        "check",
+        &format!(
+            "echo approved >> runs.log\n{}",
+            json_response(r#"{"hookApiVersion":1,"verdict":"allow"}"#)
+        ),
+    );
+    let mut hook = sh_hook("repo_check", &check);
+    hook.source = HookSource::Repository;
+    hook.events = vec![HookEvent::BeforeTool];
+    let mut config = config_for(&root, vec![hook.clone()]);
+    let runs = root.join("runs.log");
+
+    // Pending: not run, not audited.
+    assert_eq!(
+        dispatch(&dispatcher_for(&config), HookEvent::BeforeTool, &root).verdict,
+        Verdict::Allow
+    );
+    assert!(!runs.exists(), "a pending hook ran");
+    assert!(events_of(&config.data_dir, "hook_invoked").is_empty());
+
+    // Approved at this hash: it runs.
+    let hash = hook_definition_hash(&hook, &root).unwrap();
+    config.hook_reviews_by_repository.insert(
+        repository_id_for_root(&root),
+        BTreeMap::from([(hook.id.clone(), HookReview::Approved { hash })]),
+    );
+    assert_eq!(
+        dispatch(&dispatcher_for(&config), HookEvent::BeforeTool, &root).verdict,
+        Verdict::Allow
+    );
+    assert_eq!(fs::read_to_string(&runs).unwrap(), "approved\n");
+
+    // The script changed after review: it must not run, and its mandatory
+    // classification turns the change into a denial.
+    write(
+        &check,
+        &format!(
+            "echo changed >> runs.log\n{}",
+            json_response(r#"{"hookApiVersion":1,"verdict":"allow"}"#)
+        ),
+    );
+    let outcome = dispatch(&dispatcher_for(&config), HookEvent::BeforeTool, &root);
+    assert_eq!(outcome.verdict, Verdict::Deny);
+    assert!(
+        outcome.reasons[0].1.contains("changed_since_review"),
+        "{:?}",
+        outcome.reasons
+    );
+    assert_eq!(
+        fs::read_to_string(&runs).unwrap(),
+        "approved\n",
+        "the changed script ran"
+    );
+    let invoked = events_of(&config.data_dir, "hook_invoked");
+    assert_eq!(invoked.len(), 2);
+    assert_eq!(invoked[1]["failureKind"], "changed_since_review");
+
+    // Declined: not run, not audited, whichever definition is on disk.
+    config.hook_reviews_by_repository.insert(
+        repository_id_for_root(&root),
+        BTreeMap::from([(hook.id.clone(), HookReview::Declined)]),
+    );
+    assert_eq!(
+        dispatch(&dispatcher_for(&config), HookEvent::BeforeTool, &root).verdict,
+        Verdict::Allow
+    );
+    assert_eq!(fs::read_to_string(&runs).unwrap(), "approved\n");
+    assert_eq!(events_of(&config.data_dir, "hook_invoked").len(), 2);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn every_invocation_writes_one_hook_invoked_event() {
+    let root = temp_dir("audit-invocation");
+    let allow = sh_hook(
+        "quiet",
+        &script(
+            &root,
+            "quiet",
+            &json_response(r#"{"hookApiVersion":1,"verdict":"allow"}"#),
+        ),
+    );
+    let config = config_for(&root, vec![allow]);
+    dispatch(&dispatcher_for(&config), HookEvent::BeforeTool, &root);
+    let invoked = events_of(&config.data_dir, "hook_invoked");
+    assert_eq!(invoked.len(), 1);
+    let event = &invoked[0];
+    assert_eq!(event["hookId"], "quiet");
+    assert_eq!(event["event"], "before_tool");
+    assert_eq!(event["sessionId"], "session_1");
+    assert_eq!(event["taskId"], "task_1");
+    assert_eq!(event["classification"], "mandatory");
+    assert_eq!(event["source"], "user");
+    assert_eq!(event["verdict"], "allow");
+    assert_eq!(event["outcome"], "ok");
+    assert!(event.get("failureKind").is_none(), "{event}");
+    assert!(event.get("reason").is_none(), "{event}");
+    assert!(event["durationMs"].as_str().unwrap().parse::<u64>().is_ok());
+    let _ = fs::remove_dir_all(&root);
+
+    // A denial records its reason, and an optional classification shows in
+    // the same event.
+    let root = temp_dir("audit-denial");
+    let mut deny = sh_hook(
+        "refuser",
+        &script(
+            &root,
+            "refuser",
+            &json_response(r#"{"hookApiVersion":1,"verdict":"deny","reason":"not here"}"#),
+        ),
+    );
+    deny.mode = HookMode::Optional;
+    let config = config_for(&root, vec![deny]);
+    dispatch(&dispatcher_for(&config), HookEvent::BeforeTool, &root);
+    let invoked = events_of(&config.data_dir, "hook_invoked");
+    assert_eq!(invoked.len(), 1);
+    assert_eq!(invoked[0]["classification"], "optional");
+    assert_eq!(invoked[0]["verdict"], "deny");
+    assert_eq!(invoked[0]["outcome"], "ok");
+    assert_eq!(invoked[0]["reason"], "not here");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_dispatch_with_no_hooks_spawns_nothing_and_writes_no_audit() {
+    let root = temp_dir("no-hooks");
+    let data_dir = root.join(".damaian-data");
+    let engine = WorkspaceEngine::new(config_for(&root, Vec::new()));
+    let outcome = engine.hooks.dispatch(
+        HookEvent::BeforeTool,
+        event_parts(),
+        &root,
+        &HookContext::root(),
+    );
+    assert_eq!(outcome.verdict, Verdict::Allow);
+    assert!(outcome.findings.is_empty());
+    assert!(
+        !data_dir.join("audit").exists(),
+        "an empty dispatch audited"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_hook_for_another_event_and_an_excluded_hook_do_not_run() {
+    let root = temp_dir("not-this-event");
+    let marker = |id: &str| {
+        let body = format!(
+            "echo ran >> {id}.log\n{}",
+            json_response(r#"{"hookApiVersion":1,"verdict":"allow"}"#)
+        );
+        sh_hook(id, &script(&root, id, &body))
+    };
+    let mut patch_hook = marker("patch_only");
+    patch_hook.events = vec![HookEvent::BeforePatchApply];
+    let tool_hook = marker("tool_hook");
+    let config = config_for(&root, vec![patch_hook, tool_hook]);
+
+    dispatch(&dispatcher_for(&config), HookEvent::BeforeTool, &root);
+    assert!(!root.join("patch_only.log").exists());
+    assert!(root.join("tool_hook.log").exists());
+    assert_eq!(events_of(&config.data_dir, "hook_invoked").len(), 1);
+
+    fs::remove_file(root.join("tool_hook.log")).unwrap();
+    let dispatcher = dispatcher_for(&config);
+    let ctx = HookContext {
+        depth: 0,
+        excluded: BTreeSet::from(["tool_hook".to_string()]),
+    };
+    let outcome = dispatcher.dispatch(HookEvent::BeforeTool, event_parts(), &root, &ctx);
+    assert_eq!(outcome.verdict, Verdict::Allow);
+    assert!(!root.join("tool_hook.log").exists(), "an excluded hook ran");
+    assert_eq!(events_of(&config.data_dir, "hook_invoked").len(), 1);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn context_is_kept_only_at_the_events_that_use_it() {
+    let root = temp_dir("context-events");
+    let mut hook = sh_hook(
+        "contextual",
+        &script(
+            &root,
+            "contextual",
+            &json_response(r#"{"hookApiVersion":1,"context":["a note"]}"#),
+        ),
+    );
+    hook.events = vec![HookEvent::BeforeContext, HookEvent::BeforeTool];
+    let config = config_for(&root, vec![hook]);
+    let dispatcher = dispatcher_for(&config);
+
+    let before_context = dispatch(&dispatcher, HookEvent::BeforeContext, &root);
+    assert_eq!(
+        before_context.context,
+        [("contextual".to_string(), "a note".to_string())]
+    );
+    assert!(before_context.warnings.is_empty());
+
+    let before_tool = dispatch(&dispatcher, HookEvent::BeforeTool, &root);
+    assert!(before_tool.context.is_empty(), "context was not honoured");
+    assert_eq!(before_tool.warnings.len(), 1, "{:?}", before_tool.warnings);
+    assert!(before_tool.warnings[0].contains("context"));
+    assert!(
+        before_tool
+            .findings
+            .iter()
+            .any(|finding| finding.source() == FindingSource::Hook
+                && finding.severity() == Severity::Warning)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_warn_is_a_warning_finding_and_request_approval_keeps_its_reason() {
+    let root = temp_dir("warn-request");
+    let warn = sh_hook(
+        "warned",
+        &script(
+            &root,
+            "warned",
+            &json_response(r#"{"hookApiVersion":1,"verdict":"warn","reason":"careful"}"#),
+        ),
+    );
+    let config = config_for(&root, vec![warn]);
+    let outcome = dispatch(&dispatcher_for(&config), HookEvent::BeforeTool, &root);
+    assert_eq!(outcome.verdict, Verdict::Warn);
+    assert_eq!(outcome.deciding_hook.as_deref(), Some("warned"));
+    assert_eq!(outcome.warnings, ["careful"]);
+    assert!(outcome.reasons.is_empty());
+    assert!(
+        outcome
+            .findings
+            .iter()
+            .any(|finding| finding.source() == FindingSource::Hook
+                && finding.severity() == Severity::Warning
+                && finding.summary() == "careful"
+                && finding.origin_ref() == Some("hook:warned"))
+    );
+    let _ = fs::remove_dir_all(&root);
+
+    let root = temp_dir("request-approval");
+    let request = sh_hook(
+        "asks",
+        &script(
+            &root,
+            "asks",
+            &json_response(
+                r#"{"hookApiVersion":1,"verdict":"request_approval","reason":"ask me"}"#,
+            ),
+        ),
+    );
+    let config = config_for(&root, vec![request]);
+    let outcome = dispatch(&dispatcher_for(&config), HookEvent::BeforeTool, &root);
+    assert_eq!(outcome.verdict, Verdict::RequestApproval);
+    assert_eq!(outcome.deciding_hook.as_deref(), Some("asks"));
+    assert_eq!(
+        outcome.reasons,
+        [("asks".to_string(), "ask me".to_string())]
+    );
+    assert!(outcome.warnings.is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_hook_finding_keeps_a_path_only_when_it_stays_in_the_repository() {
+    let root = temp_dir("finding-path");
+    let hook = sh_hook(
+        "paths",
+        &script(
+            &root,
+            "paths",
+            &json_response(
+                r#"{"hookApiVersion":1,"findings":[
+                    {"severity":"warning","summary":"inside","path":"src/lib.rs","line":3},
+                    {"severity":"warning","summary":"outside","path":"../outside.rs","line":1},
+                    {"severity":"warning","summary":"absolute","path":"/etc/passwd","line":2}
+                ]}"#,
+            ),
+        ),
+    );
+    let config = config_for(&root, vec![hook]);
+    let outcome = dispatch(&dispatcher_for(&config), HookEvent::BeforeTool, &root);
+    let paths: Vec<Option<String>> = outcome
+        .findings
+        .iter()
+        .map(|finding| finding.range().map(|range| range.path.clone()))
+        .collect();
+    assert_eq!(
+        paths,
+        [Some("src/lib.rs".to_string()), None, None],
+        "{:?}",
+        outcome.findings
+    );
+    assert!(
+        outcome
+            .findings
+            .iter()
+            .all(|finding| finding.source() == FindingSource::Hook
+                && finding.origin_ref() == Some("hook:paths"))
+    );
+
     let _ = fs::remove_dir_all(&root);
 }

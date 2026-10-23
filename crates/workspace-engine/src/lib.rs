@@ -103,7 +103,10 @@ pub use git_service::{
     WorktreeListing, WorktreeListingEntry, parse_github_remote,
 };
 pub use hash::repository_id_for_root;
-pub use hooks::{HookEnvelope, HookFailureKind, HookFinding, HookResponse};
+pub use hooks::{
+    HookActivation, HookContext, HookDispatcher, HookEnvelope, HookEnvelopeParts, HookFailureKind,
+    HookFinding, HookOutcome, HookResponse, RequestedCommand, activation, hook_definition_hash,
+};
 pub use index_cache::IndexCache;
 pub use indexer::{ProjectIndexer, RepositoryIndex, SearchResult};
 pub use language::{Declaration, SymbolKind, extract_declarations};

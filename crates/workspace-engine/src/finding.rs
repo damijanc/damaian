@@ -44,6 +44,8 @@ pub enum FindingSource {
     /// A failed scenario step, such as a click that timed out
     /// (`context.md` §12.1).
     BrowserScenario,
+    /// A finding, warning or refusal an external hook returned (spec 32).
+    Hook,
 }
 
 impl FindingSource {
@@ -60,6 +62,7 @@ impl FindingSource {
             Self::LanguageServer => "language_server",
             Self::Command => "command",
             Self::BrowserScenario => "browser_scenario",
+            Self::Hook => "hook",
         }
     }
 }
@@ -658,6 +661,7 @@ mod tests {
             LanguageServer,
             Command,
             BrowserScenario,
+            Hook,
         ] {
             assert_eq!(
                 serde_json::to_value(source).unwrap(),
