@@ -87,7 +87,7 @@ reports the disagreement.
 
 - **In progress:** #25 symbols (Tasks 1–7 of 11), #32 hooks (1–3 of 10), #49
   prompt cache (accounting slice done; the reuse slice is blocked on #55 or
-  #26), #50 clarification (1–3 of 8), #59 exploration allowance (1 of 6), #60
+  #26), #50 clarification (1–3 of 8), #59 exploration allowance (2 of 6), #60
   worktree reads (1–5 of 6; Task 6 in progress), #61 continue the stopped turn
   (1–5 of 7), #62 approval reasons (1–2 of 7), #63 exploratory failures (1–5 of
   6), #64 read-only boundary (requirements 1–8 implemented; close-out open).

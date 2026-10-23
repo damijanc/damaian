@@ -1,9 +1,12 @@
 # Feature Spec: Exploration Round Allowance
 
-Status: In progress. Task 1 of 6 done 2026-10-18 (the `agent_max_exploration_rounds`
-config key); see [`tasks.md`](tasks.md). Specified on 2026-10-17 from a session that ran out of tool
+Status: In progress. Tasks 1–2 of 6 done (2026-10-18, 2026-10-23) — the
+`agent_max_exploration_rounds` config key, then round classification and the two
+counters; see [`tasks.md`](tasks.md). Specified on 2026-10-17 from a session that ran out of tool
 rounds on a reporting-only request; the evidence is in
-[`context.md`](context.md) §1. Planned on 2026-10-18.
+[`context.md`](context.md) §1. Planned on 2026-10-18; §2, §5.2 and §5.5
+re-planned on 2026-10-23 against spec 61's round-budget pause, which landed
+first (`tasks.md` C8–C10).
 Order: 59 of 59
 Plan: none. Like [#47](../47_agent_working_capability/proposal.md), this spec is
 evidence-driven rather than a roadmap graduation — an exception to the rule in
@@ -51,16 +54,28 @@ and bound what it *reads* separately and more generously.
 
 - `agent_max_tool_rounds` (default 8) is clamped to
   `ABSOLUTE_TOOL_ROUND_CAP` (16) by `default_tool_round_limit`
-  ([chat.rs:530](../../../crates/workspace-engine/src/chat.rs)). Web debug
-  mode uses `agent_web_debug_max_tool_rounds` (12), and *Continue debugging*
-  uses the cap itself (`tool_round_limit`, `chat.rs:542`).
-- The turn loop counts every model call that returns tool calls as one round.
-  At `round >= max_rounds` it sets `force_final`, makes one more call with
-  tools dropped, and stops with `StopReason::ToolBudget` if the model still asks
-  for a tool (`chat.rs:2072`, `chat.rs:2340`).
+  ([chat.rs:575](../../../crates/workspace-engine/src/chat.rs)). Web debug
+  mode uses `agent_web_debug_max_tool_rounds` (12) (`tool_round_limit`,
+  `chat.rs:587`). The old *Continue debugging* option is gone: spec 61
+  replaced it with the round-budget pause below.
+- The turn loop counts every model call that returns tool calls as one
+  `round`, and `run_agentic_turn` takes that `round` as a parameter, so every
+  resumed turn — after a command approval, a plan review or a round-budget
+  pause — continues it from `PendingChatTurn.round`. The limit is
+  `max_rounds = (tool_round_limit + round_budget_extension).min(ABSOLUTE_TURN_ROUND_CAP)`
+  (`chat.rs:2296`), and `force_final` is `round >= max_rounds`.
+- At `force_final` with no token ceiling (or with one, once
+  `round >= ABSOLUTE_TOOL_ROUND_CAP`), spec 61 **pauses** before the forced
+  final call (`pause_for_round_budget`, `chat.rs:3826`): the pending turn
+  stores a `RoundBudgetPause { rounds_used, rounds_granted }`, and the user
+  chooses *Continue* — `resume_round_budget` grants another
+  `default_tool_round_limit` rounds through `round_budget_extension`, up to
+  `ABSOLUTE_TURN_ROUND_CAP` (64) — or *Answer now*, which makes the forced
+  final call and stops with `StopReason::ToolBudget` if the model still asks
+  for a tool (`chat.rs:1522`, `chat.rs:2588`).
 - With `agent_max_task_tokens` set, spec 47 requirement 6 continues past the
-  cap in further segments, bounded by the token ceiling and by
-  `round < ABSOLUTE_TOOL_ROUND_CAP` (`chat.rs:2350`).
+  segment instead of pausing, bounded by the token ceiling and by
+  `round < ABSOLUTE_TOOL_ROUND_CAP` (`chat.rs:2597`).
 - `action_effect` ([chat.rs:4465](../../../crates/workspace-engine/src/chat.rs))
   already classifies every tool. `ReadFile`, `ListDirectory`, `SearchContent`,
   `SearchCodebase`, `ReadGitStatus` and `ReadGitDiff` — all now carrying spec
@@ -164,20 +179,40 @@ model that keeps asking.
 ### 5.2 Two counters, one loop
 
 The loop's single `round` counter becomes two: `action_rounds` and
-`exploration_rounds`. A third, `model_calls`, keeps the role `round` has for
-anything that is genuinely per call — spec 57's pause-and-steer boundary and
-the round markers in the audit log. (`TurnPhase`'s `round` becomes the action
-count; see §5.5.)
+`exploration_rounds`. Every existing use of `round` already means the action
+count, so `round` simply becomes `action_rounds` there: the budget checks,
+`TurnPhase.round`, the `toolRound`/`round` audit fields,
+`PendingChatTurn.round` and `RoundBudgetPause.rounds_used`. No third counter
+is needed — nothing in the loop is keyed by the raw number of model calls, and
+spec 57's pause-and-steer check runs at the top of every iteration without
+reading a round number.
 
-- `force_final` becomes `action_rounds >= max_action_rounds`, where
-  `max_action_rounds` is today's `max_rounds` (including spec 47's
-  `round_budget_extension`).
-- Spec 47's continuation condition `round < ABSOLUTE_TOOL_ROUND_CAP` becomes
-  `action_rounds < ABSOLUTE_TOOL_ROUND_CAP`. Continuation extends the action
-  budget only; the exploration allowance is per turn and never extended.
-- *Continue debugging* (`options.continue_debugging`) keeps raising the action
-  limit to the cap. It does not change the exploration allowance, which is
-  already fresh for the new turn.
+- **Charging.** A round classified exploration (§5.1) adds one to
+  `exploration_rounds`; every other round — including a round whose calls all
+  failed to decode, and the round #47's token-ceiling continuation adds — adds
+  one to `action_rounds`.
+- **The budget.** `max_action_rounds` is today's `max_rounds`:
+  `(tool_round_limit(web_debug_mode) + round_budget_extension).min(ABSOLUTE_TURN_ROUND_CAP)`.
+  `force_final` becomes `action_rounds >= max_action_rounds`. Exploration
+  rounds never set `force_final`.
+- **Spec 61's pause** triggers on the action budget only: the pause condition
+  and #47's token-ceiling guard compare `action_rounds` with
+  `ABSOLUTE_TOOL_ROUND_CAP`, `RoundBudgetPause.rounds_used` and `at_hard_cap`
+  are action counts, and *Continue* grants action rounds through
+  `round_budget_extension` exactly as it does now. Exhausting the exploration
+  allowance never pauses a turn (requirement 3).
+- **The allowance is per turn and never extended.** A round-budget *Continue*
+  resumes the same turn, as does every other pause, so `exploration_rounds`
+  is carried across it: `PendingChatTurn` gains `exploration_rounds: u32`
+  (`#[serde(default)]`, so pending turns written before this spec load with
+  0), every site that saves a pending turn records it, and every resume
+  passes it back into `run_agentic_turn` beside `round`. Neither *Continue*
+  nor a token-ceiling continuation resets or raises it. Without this, each
+  approval or *Continue* would hand the turn a fresh allowance and the bound
+  in requirement 5 would not hold.
+- **The total bound.** A turn makes at most `ABSOLUTE_TURN_ROUND_CAP` (64)
+  action rounds and `ABSOLUTE_EXPLORATION_ROUND_CAP` (32) exploration rounds,
+  plus the forced final call — 97 model calls, whatever the configuration.
 - Web debug mode keeps its action limit, `agent_web_debug_max_tool_rounds`, and
   has the same exploration allowance as any other turn.
 
@@ -278,15 +313,15 @@ one uncaught repeat after a resume.
   bar stay correct without change. The progress label adds the reads when there
   are any: `round 3/8 · 12 reads`. Spec 57's progress file carries the two new
   fields additively; older readers ignore them.
-- **When stopped.** `tool_budget_exhausted_response` names both counts and does
-  not mention debugging, for example: "This turn used its 8 action rounds (and
-  24 read-only rounds) and the model still wanted another tool. Nothing was
-  lost: continue to give it more action rounds, or narrow the request." The
-  wording is settled when the task is planned; the constraints are that it
-  names both numbers and assumes nothing about the kind of task.
-- **The button** under a stopped turn becomes *Continue* (`app.js:6978`). It
-  does what *Continue debugging* does today. The internal option name
-  `continue_debugging` may stay; it is not user-visible.
+- **When stopped.** Since spec 61 a turn at its action budget pauses rather
+  than stops, with "Used N of M tool rounds." (`round_budget_pause_response`)
+  and *Continue — N more* / *Answer now* buttons, so the button this section
+  once asked for already exists. Both messages that report a budget name both
+  counts and assume nothing about the kind of task: the pause message (for
+  example "Used 8 of 8 action rounds and 24 read-only rounds."), and
+  `tool_budget_exhausted_response`, still reached through *Answer now* and the
+  token-ceiling path, which drops "Continue debugging". The exact wording is
+  settled in Task 4.
 
 ### 5.6 Recording
 
@@ -331,8 +366,11 @@ needs no change unless that has changed by then.
 
 - A turn whose rounds are all read-only and non-repeating completes past eight
   rounds with the defaults (`long_discovery`).
-- A turn that mixes reads and commands is stopped by the action budget at the
-  same point it is today, counting only its action rounds.
+- A turn that mixes reads and commands reaches the action budget — spec 61's
+  pause, or #47's continuation under a token ceiling — at the same point it
+  does today, counting only its action rounds.
+- A round-budget *Continue*, or any other resumed pause, carries the
+  exploration count over rather than restoring the allowance.
 - A round containing one command and three reads is charged as one action round
   and no exploration round.
 - A repeated identical read is charged as an action round (`read_loop` stops

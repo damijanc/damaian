@@ -2,14 +2,14 @@
 
 **Implements:** [`proposal.md`](proposal.md) · background in [`context.md`](context.md)
 **Started:** 2026-10-18
-**Status:** In progress. Task 1 done 2026-10-18; tasks 2–6 remain.
+**Status:** In progress. Task 1 done 2026-10-18, Task 2 done 2026-10-23; tasks 3–6 remain.
 
 ## Progress
 
 | Task | State | Notes |
 |---|---|---|
 | 1 · The `agent_max_exploration_rounds` config key | Done 2026-10-18 | **Landed:** the `Config` field `agent_max_exploration_rounds: u32` (default 24) and the `ConfigOverlay` field `Option<u32>`, the exhaustive destructure, a `u32` restrict-only apply block via a new `restrict_only_u32` helper (C3), the dedicated `parse_exploration_round_count` parser (accepts `0..=32`, clamps above 32 to 32 — C2), `config_show`/`to_policy_text` for both `Config` and `ConfigOverlay`, `=> Capability` in `classify_overlay_fields!`, the carried profile key (`split_profile_keys` destructure + `carried` overlay + `equals_base_limit`), and the `effective_policy` label "Read-only rounds per turn". **Tests:** 4 new in `tests/foundation.rs` (`exploration_round_allowance_accepts_zero_where_the_action_budget_refuses_it`, `…_clamps_values_above_its_ceiling_to_32`, `…_defaults_to_24`, `…_round_trips_through_config_show_and_the_overlay_serializer`), 1 new in `tests/repository_config_trust.rs` (`repository_config_may_lower_the_exploration_allowance_but_not_raise_it`, including the audit assertion), 1 new in `tests/permission_profiles.rs` (`agent_max_exploration_rounds_is_a_capability_key_with_a_human_name`), plus a `weakening_cases` entry so `every_capability_key_resists_weakening_from_repository_scope` and the profile-carry/import tests hold. `cargo nextest run -p workspace-engine --test permission_profiles --test repository_config_trust --test foundation`: 275 passed, 1 skipped. Scoped `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `scripts/quality-gate.sh fmt node lint typos deny` clean. **Falsified:** classified `Preference` → `agent_max_exploration_rounds_is_a_capability_key_with_a_human_name` fails; applied as a Free preference → `repository_config_may_lower_the_exploration_allowance_but_not_raise_it` fails (32 applied instead of refused); parse refused 0 → `…_accepts_zero_…` fails; clamp removed → `…_clamps_values_above_its_ceiling_to_32` fails. All reverted. **Deviations:** none of design; the ceiling constant is not yet defined — the parser clamps to the literal 32 with a comment naming `ABSOLUTE_EXPLORATION_ROUND_CAP`, which Task 2 defines beside `ABSOLUTE_TOOL_ROUND_CAP` in `chat.rs` (the `parse_round_count` precedent also hardcodes 16 rather than referencing the constant). |
-| 2 · Round classification and two counters | Not started | |
+| 2 · Round classification and two counters | Done 2026-10-23 | **Landed:** in `chat.rs`, `run_agentic_turn`'s `round` is renamed `action_rounds` and a `mut exploration_rounds: u32` parameter sits beside it (C8: no `model_calls`); the loop classifies each round **before dispatch** as exploration when every decoded call is `ActionEffect::ReadOnly`, `undecodable_calls.is_empty()`, and `exploration_rounds < max_exploration_rounds` (repeat detection stubbed to "never a repeat", Task 3), charging the end-of-loop increment to the chosen counter while the undecodable-only path and #47's continuation increment `action_rounds`; `force_final` is `action_rounds >= max_rounds`, the pause condition and continuation guard compare `action_rounds` with `ABSOLUTE_TOOL_ROUND_CAP`, and `pause_for_round_budget`'s `rounds_used`/`at_hard_cap` and both audit round markers (`toolRound`, `turn_continued`'s `round`) are action counts; `ABSOLUTE_EXPLORATION_ROUND_CAP = 32` beside the other caps plus `default_exploration_round_limit` (`.min(32)`); `PendingChatTurn.exploration_rounds` (`#[serde(default)]`) is set at all six pending-turn sites and passed back as a new `run_agentic_turn` parameter at all five resume sites, so *Continue* and every approval carry it; the `action_effect` doc comment names the budget decision as a consumer (C1). **Tests:** 9 new in `tests/exploration_rounds.rs` (ten reads complete past the action budget; eight mixed rounds pause at `rounds_used == 8`; one command + three reads = one action round; zero allowance reproduces the action budget; a spent allowance charges reads as action and does not pause; the allowance survives *Continue*; it survives a command approval; a pending turn without `exploration_rounds` loads; `TurnPhase.round` stays at 1 for an all-read turn). `cargo nextest run -p workspace-engine --test exploration_rounds --test round_budget --test token_ceiling --test crash_recovery --test foundation`: 233 passed, 2 skipped. Scoped `cargo clippy -p workspace-engine --all-targets --locked -- -D warnings` clean; `scripts/quality-gate.sh fmt node lint typos` clean. **Deviation:** `foundation.rs::tool_round_exhaustion_pauses_when_model_still_requests_tools` reaches its first round with `read_git_status`, which spec 59 correctly classifies as exploration, so one round no longer reaches the action cap; its subject is spec 61's action-budget pause, so it now pins `agent_max_exploration_rounds = 0` (requirement 6 / the "same rounds, stop reason and audit sequence" acceptance criterion) and its assertions are unchanged. **Falsified:** charging every round to `action_rounds` → `ten_read_only_rounds_complete_past_the_action_budget` fails; `force_final = action_rounds + exploration_rounds >= max_rounds` → same test fails; `default_exploration_round_limit` permitting 1 at config 0 → `zero_exploration_allowance_reproduces_the_action_budget` fails (9 calls vs 8); resuming with `0` → both `the_allowance_survives_*` tests fail. All reverted. |
 | 3 · Repeat detection | Not started | |
 | 4 · What the user sees | Not started | |
 | 5 · Audit, eval harness and the two scenarios | Not started | |
@@ -32,13 +32,20 @@ Every task's requirements implicitly include this section.
   spec 60's Task 4 lands. Adding a `ToolAction` variant already forces a
   decision in that match; that decision is now also the budget decision, and
   the doc comment on `action_effect` must say so.
-- **Do not run alongside spec 61 Tasks 1–3** (the `round_budget` pause, its
-  resume path and `ABSOLUTE_TURN_ROUND_CAP`). Spec 61 is being implemented on
-  another branch and rewrites the same round-limit code in `chat.rs` — the
-  `force_final`/forced-final path and the `ABSOLUTE_TOOL_ROUND_CAP` constant
-  that this spec also edits. If a task finds spec 61's changes present, stop
-  and say so rather than reconciling them. `docs/specs/README.md` "Parallel
-  work" already rules out #61 and #62 beside #59.
+- **Spec 61 Tasks 1–5 have landed on `main`** (the `round_budget` pause,
+  `resume_round_budget` with *Continue* / *Answer now*,
+  `ABSOLUTE_TURN_ROUND_CAP`, crash recovery and the pause row in the UI), and
+  this plan was re-checked against them on 2026-10-23 (C8–C10). Build on that
+  code; do not undo or route around it. Spec 61's remaining Tasks 6–7 (an eval
+  scenario and docs) do not edit `chat.rs`, but Task 6 edits the eval
+  harness's `runner.rs`, which this spec's Task 5 also edits, so those two
+  must not run at the same time. `docs/specs/README.md` "Parallel work" still
+  rules out #62 beside #59.
+- **The existing round-budget tests pass unchanged.** `round_budget.rs`,
+  `token_ceiling.rs` and the `foundation.rs` budget tests walk the budget with
+  command rounds (`ls src`, `pwd`), which are action rounds, so this spec must
+  not change their outcome. If one fails, treat it as a classification bug,
+  not a test to update.
 - **`chat.rs` is shared.** Spec 60 edits the tool definitions, `parse_tool_call`
   and read-only dispatch; spec 63 edits `record_command_findings` and the
   `run_command` description. Keep this spec's `chat.rs` edits to the round loop,
@@ -80,9 +87,12 @@ Each one names the task that owns it.
 | C2 | §5.4 says the key is clamped "as `agent_max_tool_rounds` is" | `parse_round_count` (`config.rs:4368`) *refuses* 0 and anything over 16, but this key must *accept* 0 (requirement 6) and clamp over 32 to the ceiling (requirement 5) | A dedicated parser accepting `0..=32`, clamping larger values to `ABSOLUTE_EXPLORATION_ROUND_CAP`, plus a runtime `default_exploration_round_limit`. §5.4 updated. **Task 1** |
 | C3 | §5.4 says "in the same loop as `agent_max_turn_messages` and `max_read_lines` (`config.rs:1570`)" | That loop's `restrict_only_limit` is `usize`-typed (`config.rs:4423`); the new key is `u32` | A `u32` restrict-only apply block (a small `restrict_only_u32` helper or a dedicated block, as `agent_max_task_tokens` has via `restrict_only_ceiling`). §5.4 updated. **Task 1** |
 | C4 | §5.6 says the audit records gain fields "beside `roundLimit`" on "forced-final, continued and exhausted paths" | The round fields are `toolRound`/`toolRoundLimit` in `model_request_prepared` (`chat.rs:2108`) and `round`/`roundLimit` in `turn_continued` (`chat.rs:2358`); there is no separate forced-final or exhausted audit event | Name the two records precisely; exhaustion is visible through `model_request_prepared` at `toolRound == toolRoundLimit` plus the stop reason. §5.6 updated. **Task 5** |
-| C5 | §5.2 lists "the progress phase's position in the turn" as a `model_calls` role | §5.5 says `TurnPhase.round`/`max_rounds` "now mean action rounds" | §5.5 wins: `TurnPhase.round` = action rounds; `model_calls` feeds spec 57's pause/steer boundary and the audit round markers only. §5.2 updated. **Tasks 2, 4** |
+| C5 | §5.2 lists "the progress phase's position in the turn" as a `model_calls` role | §5.5 says `TurnPhase.round`/`max_rounds` "now mean action rounds" | §5.5 wins: `TurnPhase.round` = action rounds; `model_calls` feeds spec 57's pause/steer boundary and the audit round markers only. §5.2 updated; `model_calls` itself dropped by C8. **Tasks 2, 4** |
 | C6 | §2's `chat.rs` line references (523, 535, 2053, 2324, 2334, 4380, 5238, 162) | Drifted after spec 60/63/64 merged into `chat.rs` (now 530, 542, 2072, 2340, 2350, 4465, 5443, 168) | Re-checked and corrected on 2026-10-18; will drift again when spec 61 lands. Not a design change. **all** |
 | C7 | §5.3's canonical form named only a repository-relative path, a line range and search arguments | Spec 60 gave five read tools a `worktree` argument and added `read_git_diff`'s `paths`/`stat`/`base`, `list_worktrees` and `read_git_log`; keyed by path alone, `README.md` in a worktree repeats `README.md` in the main checkout, and a `read_git_status` after a command repeats the one before it | §5.3 now keys every call by its checkout, gives a canonical row per read tool, and clears the seen-call set after a round that writes. Found reviewing #65 on 2026-10-19, whose elision notice prints this form. **Task 3** |
+| C8 | §5.2 assumed the round loop of 2026-10-18: *Continue debugging* (`options.continue_debugging`) raising the limit to `ABSOLUTE_TOOL_ROUND_CAP` in a new turn, a forced final call at the budget, and a third `model_calls` counter for spec 57's steer boundary and the audit markers | Spec 61 Tasks 1–5 removed `continue_debugging`; the budget now pauses (`pause_for_round_budget`) and *Continue* resumes the **same** turn with `round_budget_extension` raised, up to `ABSOLUTE_TURN_ROUND_CAP` (64). `round` is a parameter of `run_agentic_turn`, persisted in `PendingChatTurn.round` across every pause. Nothing reads a per-call count | §2 and §5.2 rewritten 2026-10-23: `round` becomes `action_rounds` everywhere it is used; no `model_calls`; the pause and both caps compare action rounds; `PendingChatTurn` gains `exploration_rounds` (`#[serde(default)]`), carried through every pause and resume so neither *Continue* nor an approval refreshes the allowance. **Task 2** |
+| C9 | §5.5 asked for the stop button to become *Continue* and `tool_budget_exhausted_response` to name both counts | Spec 61 already shows *Continue — N more* / *Answer now* beside "Used N of M tool rounds." (`round_budget_pause_response`); `tool_budget_exhausted_response` is now reached only through *Answer now* and the token-ceiling path, and still says "Continue debugging" | §5.5 updated: no button change; both messages name both counts and drop "debugging". **Task 4** |
+| C10 | §5.6 and §5.7 assumed a budget stop ends the turn `ToolBudgetExhausted` and that the only round audit records are `model_request_prepared` and `turn_continued` | With no token ceiling the turn now pauses at the budget (the deterministic harness has no ceiling), and spec 61 added `round_budget_paused` and `turn_budget_extended` records | Not settled here. Task 5 decides, when it starts, whether `round_budget_paused` also carries `explorationRounds`, and whether `long_discovery` with the allowance at 0 and `read_loop` assert the pause or answer *Answer now* — spec 61 Task 6's `RoundBudgetDecision` scenario option, if it has landed by then — and updates §5.6, §5.7 and §6 to match. **Task 5** |
 
 ## File Structure
 
@@ -158,50 +168,89 @@ beside #61 Tasks 1–3 (Global Constraints) or another spec's `chat.rs` task
 
 ## Task 2: Round classification and two counters
 
-**Requirements:** 1, 2, 3, 6. **Proposal:** §5.1, §5.2. **Corrections:** C1, C5.
-**Files:** `chat.rs`, `tests/exploration_rounds.rs` (new).
+**Requirements:** 1, 2, 3, 5, 6. **Proposal:** §5.1, §5.2. **Corrections:** C1,
+C5, C8. **Files:** `chat.rs`, `tests/exploration_rounds.rs` (new).
 
-- [ ] **Step 1: Write the failing tests** in `tests/exploration_rounds.rs`,
-      each through `MockModelAdapter`:
-  - a turn of ten read-only rounds (`read_file`/`list_directory`/`search_content`
-    over a fixture) completes (`TaskStatus::Complete`) past the eight-round
-    action budget;
-  - a turn mixing reads and a command stops at the action budget
-    (`TaskStatus::ToolBudgetExhausted`), counting only its action rounds;
+Re-planned on 2026-10-23 against spec 61's round loop (C8). Read §5.2 as
+rewritten, `run_agentic_turn`, `pause_for_round_budget`,
+`resume_round_budget` and `PendingChatTurn` before starting. `TurnPhase`'s new
+fields and every message wording stay in Task 4.
+
+- [x] **Step 1: Write the failing tests** in `tests/exploration_rounds.rs`,
+      each through `MockModelAdapter` with native tool calls
+      (`new_sequence_with_tool_calls`), no token ceiling unless stated, over
+      a fixture repository (the `round_budget.rs` helpers are the pattern).
+      For action rounds use a command the policy runs without approval
+      (`ls src`, as `round_budget.rs`'s `read_only_round` does), so a test
+      walks the budget without stopping for a command approval:
+  - a turn of ten read-only rounds (`read_file`/`list_directory`/`search_content`)
+    then an answer completes (`TaskStatus::Complete`, no
+    `round_budget_proposal`) past the eight-round action budget;
+  - a turn of eight command rounds with reads between them pauses at the
+    action budget (`round_budget_proposal` with `rounds_used == 8`), counting
+    only its action rounds;
   - a round containing one command and three reads charges one action round and
-    no exploration round;
-  - `agent_max_exploration_rounds = 0` reproduces today's behaviour (a read-only
-    turn stops after `agent_max_tool_rounds` rounds);
-  - once the allowance is spent, further read-only rounds are charged as action
-    rounds and the turn is not stopped at that moment;
-  - `TurnPhase` carries `exploration_round` and `max_exploration_rounds`, and
-    `round`/`max_rounds` are the action counts (C5).
-- [ ] **Step 2: Run them and confirm they fail.**
-- [ ] **Step 3: Split the counter.** In `run_agentic_turn`, replace the single
-      `round` with `action_rounds`, `exploration_rounds` and `model_calls` per
-      §5.2. `ABSOLUTE_EXPLORATION_ROUND_CAP = 32` beside
-      `ABSOLUTE_TOOL_ROUND_CAP`, and `default_exploration_round_limit` clamps
-      `0..=32`.
-- [ ] **Step 4: Classify before dispatch** (§5.1). After the calls decode and
+    no exploration round (visible as the pause's `rounds_used`, or the phase
+    events' `round`);
+  - `agent_max_exploration_rounds = 0` reproduces today's behaviour: a
+    read-only turn pauses with `rounds_used == agent_max_tool_rounds`;
+  - once the allowance is spent (set it to, say, 2), further read-only rounds
+    are charged as action rounds and the turn is not paused at that moment,
+    only when the action budget is reached;
+  - **the allowance survives a resume:** a turn that spends its allowance,
+    then pauses at the action budget and is resumed with
+    `resume_round_budget(.., RoundBudgetDecision::Continue, ..)`, charges its
+    next read-only round as an action round; and a turn resumed after a
+    command approval likewise keeps its exploration count;
+  - a pending turn file written without `exploration_rounds` still loads (the
+    field defaults to 0);
+  - `TurnPhase.round`/`max_rounds` in the progress events are action counts:
+    an all-read turn's phases never show `round` above 0 (C5).
+- [x] **Step 2: Run them and confirm they fail.**
+- [x] **Step 3: Split the counter.** In `run_agentic_turn`, `round` becomes
+      `action_rounds` in every use (§5.2: the budget checks, `sink.phase`,
+      the `toolRound`/`round` audit fields, the pending turn's `round`,
+      `RoundBudgetPause.rounds_used`), and a new `exploration_rounds` counter
+      sits beside it. No `model_calls`. Add `ABSOLUTE_EXPLORATION_ROUND_CAP = 32`
+      beside `ABSOLUTE_TOOL_ROUND_CAP` and `ABSOLUTE_TURN_ROUND_CAP`, with
+      their style of doc comment, and `default_exploration_round_limit`
+      clamping the config value to `0..=32`. Point Task 1's literal 32 in
+      `parse_exploration_round_count` at the constant if it is visible there;
+      otherwise leave the comment.
+- [x] **Step 4: Persist it.** `PendingChatTurn` gains
+      `exploration_rounds: u32` with `#[serde(default)]`; every site that
+      builds a `PendingChatTurn` sets it from the loop, and every resume
+      (`resume_round_budget` both arms, command/MCP/web-diagnostic/plan/
+      fallback resumes — wherever `pending.round` is passed into
+      `run_agentic_turn`) passes it back, as a new parameter beside `round`.
+- [x] **Step 5: Classify before dispatch** (§5.1). After the calls decode and
       before any dispatches, a round is exploration when every decoded call is
-      `ActionEffect::ReadOnly`, none is a repeat (§5.3 — stubbed empty in this
-      task), and `exploration_rounds < max_exploration_rounds`; action
-      otherwise. An undecodable call makes the round action.
-- [ ] **Step 5: Re-point the budget.** `force_final` becomes
-      `action_rounds >= max_action_rounds` (where `max_action_rounds` is
-      today's `max_rounds`); continuation's guard becomes
-      `action_rounds < ABSOLUTE_TOOL_ROUND_CAP`; *Continue debugging* still
-      raises the action limit to the cap and never touches the exploration
-      allowance; web-debug mode keeps its action limit.
-- [ ] **Step 6: Update the `action_effect` doc comment** so the budget decision
+      `ActionEffect::ReadOnly`, there is no undecodable call in the round,
+      none is a repeat (§5.3 — stubbed to "never a repeat" in this task), and
+      `exploration_rounds < max_exploration_rounds`; action otherwise. The
+      round's increment at the end of the loop body goes to the counter
+      classification chose; the undecodable-only path and #47's continuation
+      increment `action_rounds`.
+- [x] **Step 6: Re-point the budget** (§5.2). `force_final` is
+      `action_rounds >= max_action_rounds`, where `max_action_rounds` is the
+      existing `max_rounds` expression; the pause condition and #47's
+      continuation guard compare `action_rounds` with
+      `ABSOLUTE_TOOL_ROUND_CAP`; `pause_for_round_budget`'s `rounds_used` and
+      `at_hard_cap` use `action_rounds`; `resume_round_budget`'s *Continue*
+      grants action rounds only and never resets `exploration_rounds`;
+      web-debug mode keeps its action limit.
+- [x] **Step 7: Update the `action_effect` doc comment** so the budget decision
       is documented as one of its consumers (C1).
-- [ ] **Step 7: Falsify** — charge an all-read round to the action budget, let
-      exploration rounds count toward the action cap, and let
-      `agent_max_exploration_rounds = 0` still allow exploration. Confirm a
-      named test fails for each, and revert.
-- [ ] **Step 8: Scoped checks.** `cargo nextest run -p workspace-engine --test
-      exploration_rounds --test foundation --test token_ceiling`, scoped clippy
-      for `workspace-engine`, and the fast checks.
+- [x] **Step 8: Falsify** — charge an all-read round to the action budget, let
+      exploration rounds count toward the action cap, let
+      `agent_max_exploration_rounds = 0` still allow exploration, and reset
+      `exploration_rounds` to 0 on resume. Confirm a named test fails for
+      each, and revert.
+- [x] **Step 9: Scoped checks.** `cargo nextest run -p workspace-engine --test
+      exploration_rounds --test round_budget --test token_ceiling --test
+      crash_recovery --test foundation`, scoped clippy for `workspace-engine`,
+      and the fast checks. `round_budget`, `token_ceiling` and
+      `crash_recovery` must pass without edits (Global Constraints).
 
 ## Task 3: Repeat detection
 
@@ -241,7 +290,7 @@ beside #61 Tasks 1–3 (Global Constraints) or another spec's `chat.rs` task
 
 ## Task 4: What the user sees
 
-**Requirement:** 8. **Proposal:** §5.5. **Corrections:** C5.
+**Requirement:** 8. **Proposal:** §5.5. **Corrections:** C5, C9.
 **Files:** `chat.rs`, `desktop-shell/src/lib.rs`,
 `desktop-shell/src/workers.rs`, `desktop-shell/static/app.js`,
 `tests/exploration_rounds.rs`.
@@ -249,8 +298,8 @@ beside #61 Tasks 1–3 (Global Constraints) or another spec's `chat.rs` task
 - [ ] **Step 1: Write the failing tests.** `TurnPhase` gains
       `exploration_round` and `max_exploration_rounds`; the SSE `phase` payload
       (`lib.rs:3533`) and the worker progress file (`workers.rs:1097`) carry
-      them additively; the stop message names both counts and does not mention
-      debugging; the button text is *Continue*.
+      them additively; the pause message and the stop message name both counts
+      and do not mention debugging (C9).
 - [ ] **Step 2: Run them and confirm they fail.**
 - [ ] **Step 3: `TurnPhase` and its emitters.** Add the two fields to
       `TurnPhase`, `TurnPhase::new`, `sink.phase` and every `TurnPhase::new`
@@ -259,13 +308,15 @@ beside #61 Tasks 1–3 (Global Constraints) or another spec's `chat.rs` task
 - [ ] **Step 4: The label.** `app.js:4172` appends `· {n} reads` when the
       exploration count is non-zero, keeping `round N/M` (now action rounds)
       unchanged.
-- [ ] **Step 5: The stop message and button.** `tool_budget_exhausted_response`
-      names both counts and assumes nothing about the task; the button at
-      `app.js:6978` becomes *Continue* (the `continue_debugging` option name
-      may stay).
+- [ ] **Step 5: The messages** (C9). `round_budget_pause_response` and
+      `tool_budget_exhausted_response` name both counts and assume nothing
+      about the task; the latter drops "Continue debugging". Spec 61's pause
+      row already offers *Continue*; no button changes. Check that the pause
+      row in `app.js` (`createRoundBudgetOffer`) still reads correctly with
+      the longer message.
 - [ ] **Step 6: Falsify** — drop the reads from the label, leave the stop
-      message mentioning "debugging", and keep the button text. Confirm a named
-      test fails for each, and revert.
+      message mentioning "debugging", and drop the read-only count from the
+      pause message. Confirm a named test fails for each, and revert.
 - [ ] **Step 7: Scoped checks.** `node --check crates/desktop-shell/static/app.js`,
       `npm run lint:web`, scoped clippy for `workspace-engine` and
       `desktop-shell`, `cargo nextest run -p workspace-engine --test
@@ -274,7 +325,7 @@ beside #61 Tasks 1–3 (Global Constraints) or another spec's `chat.rs` task
 ## Task 5: Audit, eval harness and the two scenarios
 
 **Requirement:** 9, and the acceptance rows in §6. **Proposal:** §5.6, §5.7.
-**Corrections:** C4. **Files:** `chat.rs`, `eval-harness/src/trace.rs`,
+**Corrections:** C4, C10. **Files:** `chat.rs`, `eval-harness/src/trace.rs`,
 `record.rs`, `runner.rs`, `scenarios/long_discovery.toml`, `read_loop.toml`,
 fixtures.
 
