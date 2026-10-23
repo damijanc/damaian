@@ -1,7 +1,7 @@
 # Feature Spec: Exploratory Command Failures Are Not Findings
 
-Status: In progress (started 2026-10-17; Tasks 1–5 of 6 done — see
-[`tasks.md`](tasks.md)). Specified on 2026-10-17 from the session behind
+Status: Done 2026-10-23. Tasks 1–6 of 6 done — see
+[`tasks.md`](tasks.md). Specified on 2026-10-17 from the session behind
 [#59](../59_exploration_round_allowance/proposal.md)–[#62](../62_approval_prompts_name_the_reason/proposal.md),
 a reporting-only request that left two open **error** findings behind: an
 unquoted glob that zsh refused, and an `ls -d` of a directory that did not
