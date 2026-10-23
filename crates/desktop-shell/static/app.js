@@ -1695,6 +1695,9 @@ function applyRepositoryState(value, persist = true) {
   // Refresh the roots cache so chips and patch files can qualify by root. A
   // failure here is not fatal: the UI simply shows unqualified names.
   void refreshRepositoryRoots(projectPath).catch(() => {});
+  if (!$("settings-shell").hidden) {
+    void refreshLanguageServers(projectPath).catch(() => {});
+  }
   // Switching repositories restarts the shell in the new working folder.
   if (terminalOpen) {
     void restartTerminal().catch((error) => toast(error.message));
@@ -1912,6 +1915,7 @@ function setSettingsPage(page) {
     : "providers";
   if (target === "mcp") renderMcpConfigSelect();
   if (target === "checkpoints") void renderCheckpointList();
+  if (target === "general") void refreshLanguageServers().catch(() => {});
   document.querySelectorAll(".settings-nav-item").forEach((button) => {
     button.classList.toggle("active", button.dataset.settingsPage === target);
   });
@@ -8206,10 +8210,21 @@ function exportFilenameFromDisposition(disposition) {
   return match ? match[1] : null;
 }
 
+function closeSessionSearch() {
+  $("session-search-panel").hidden = true;
+  $("session-search-btn").setAttribute("aria-expanded", "false");
+}
+
+function closeSymbolSearch() {
+  $("symbol-search-panel").hidden = true;
+  $("symbol-search-btn").setAttribute("aria-expanded", "false");
+}
+
 function toggleSessionSearch() {
   const panel = $("session-search-panel");
   const button = $("session-search-btn");
   const open = panel.hidden;
+  closeSymbolSearch();
   panel.hidden = !open;
   button.setAttribute("aria-expanded", String(open));
   if (open) {
@@ -8277,12 +8292,294 @@ function renderSessionSearchResults(payload) {
 }
 
 async function openSearchHit(hit) {
-  $("session-search-panel").hidden = true;
-  $("session-search-btn").setAttribute("aria-expanded", "false");
+  closeSessionSearch();
   await switchProject(repo(), { preferredSessionId: hit.sessionId, reloadSelected: false });
   await loadSession(hit.sessionId);
   const target = document.querySelector(`.message[data-seq="${hit.seq}"]`);
   if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// Symbol search (spec 25 Task 10). A result is reference information, so the
+// row stays quiet and its path:line is the clickable part. A heuristic symbol
+// carries the "likely" marker in the payload's `provenance`; nothing here
+// infers it.
+function toggleSymbolSearch() {
+  const panel = $("symbol-search-panel");
+  const button = $("symbol-search-btn");
+  const open = panel.hidden;
+  closeSessionSearch();
+  panel.hidden = !open;
+  button.setAttribute("aria-expanded", String(open));
+  if (open) {
+    $("symbol-search-input").value = "";
+    $("symbol-search-results").innerHTML = "";
+    setSymbolSearchStatus("");
+    $("symbol-search-input").focus();
+  }
+}
+
+function setSymbolSearchStatus(message) {
+  const status = $("symbol-search-status");
+  status.textContent = message || "";
+  status.hidden = !message;
+}
+
+async function runSymbolSearch(query) {
+  const results = $("symbol-search-results");
+  if (!query.trim()) {
+    results.innerHTML = "";
+    setSymbolSearchStatus("");
+    return;
+  }
+  const repoPath = repo();
+  if (!repoPath) {
+    results.innerHTML = "";
+    setSymbolSearchStatus("Select a repository first");
+    return;
+  }
+  try {
+    const payload = await api(
+      `/api/symbols?repo=${encodeURIComponent(repoPath)}&q=${encodeURIComponent(query.trim())}`,
+    );
+    renderSymbolSearchResults(payload);
+  } catch (error) {
+    results.innerHTML = "";
+    setSymbolSearchStatus(error.message);
+  }
+}
+
+function symbolKindLabel(kind) {
+  return String(kind || "symbol").replace(/_/g, " ");
+}
+
+function renderSymbolSearchResults(payload) {
+  const results = $("symbol-search-results");
+  results.innerHTML = "";
+  const matches = payload.matches || [];
+  if (!matches.length) {
+    setSymbolSearchStatus("No matching symbols");
+    return;
+  }
+  setSymbolSearchStatus(matches.length === 1 ? "1 symbol" : `${matches.length} symbols`);
+  matches.forEach((match) => {
+    results.append(symbolResultRow(match));
+  });
+}
+
+function symbolResultRow(match) {
+  const symbol = match.symbol || {};
+  const row = document.createElement("div");
+  row.className = "symbol-search-hit";
+  row.dataset.provenance = symbol.provenance || "";
+
+  const header = document.createElement("div");
+  header.className = "symbol-search-hit-header";
+  const name = document.createElement("strong");
+  name.className = "symbol-search-hit-name";
+  name.textContent = symbol.name || "";
+  const kind = document.createElement("span");
+  kind.className = "symbol-kind-chip";
+  kind.textContent = symbolKindLabel(symbol.kind);
+  header.append(name, kind);
+  if (symbol.provenance === "heuristic") {
+    const likely = document.createElement("span");
+    likely.className = "symbol-provenance";
+    likely.textContent = "likely";
+    likely.title = "Derived from source text rather than a language server; may be inaccurate.";
+    header.append(likely);
+  }
+
+  const meta = document.createElement("div");
+  meta.className = "symbol-search-hit-meta";
+  meta.append(symbolPathButton(symbol));
+  if (symbol.rootPath) {
+    const root = document.createElement("span");
+    root.className = "symbol-root";
+    root.textContent = `· ${symbol.rootPath}`;
+    meta.append(root);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "inline-actions";
+  const find = document.createElement("button");
+  find.type = "button";
+  find.className = "btn-sm symbol-find-references";
+  find.textContent = "Find references";
+  actions.append(find);
+
+  const references = document.createElement("div");
+  references.className = "symbol-references";
+  references.hidden = true;
+  find.addEventListener("click", () => void loadSymbolReferences(find, references, symbol));
+
+  row.append(header, meta, actions, references);
+  return row;
+}
+
+function symbolPathButton(symbol) {
+  const path = document.createElement("button");
+  path.type = "button";
+  path.className = "symbol-path";
+  path.textContent = `${symbol.path}:${symbol.line}`;
+  path.title = `Open ${symbol.path}:${symbol.line} in Visual Studio Code`;
+  path.addEventListener("click", async () => {
+    try {
+      const fields = { repo: requireRepo(), path: symbol.path, line: symbol.line };
+      if (symbol.column) fields.col = symbol.column;
+      const payload = await api("/api/open-vscode-file", form(fields));
+      toast(`Opened ${payload.path}`);
+    } catch (error) {
+      toast(error.message);
+    }
+  });
+  return path;
+}
+
+async function loadSymbolReferences(button, container, symbol) {
+  button.disabled = true;
+  container.hidden = false;
+  container.textContent = "Looking up references…";
+  try {
+    const payload = await api(
+      `/api/symbol-references?repo=${encodeURIComponent(requireRepo())}&path=${encodeURIComponent(
+        symbol.path,
+      )}&line=${symbol.line}&name=${encodeURIComponent(symbol.name)}`,
+    );
+    renderSymbolReferences(container, payload);
+  } catch (error) {
+    container.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderSymbolReferences(container, payload) {
+  container.innerHTML = "";
+  if (!payload.available) {
+    container.textContent = unavailableReferencesMessage(payload);
+    return;
+  }
+  const relations = payload.relations || [];
+  if (!relations.length) {
+    container.textContent = "No references found.";
+    return;
+  }
+  relations.forEach((relation) => {
+    const target = relation.to || {};
+    const row = document.createElement("div");
+    row.className = "symbol-reference-row";
+    if (target.type === "symbol") {
+      row.append(symbolPathButton(target));
+      const name = document.createElement("span");
+      name.className = "symbol-reference-name";
+      name.textContent = target.name || "";
+      row.append(name);
+    } else if (target.type === "file") {
+      const path = document.createElement("code");
+      path.textContent = target.path || "";
+      row.append(path);
+    } else {
+      const external = document.createElement("span");
+      external.textContent = target.specifier || "unknown target";
+      row.append(external);
+    }
+    container.append(row);
+  });
+}
+
+function unavailableReferencesMessage(payload) {
+  const reason = String(payload.reason || "");
+  const language = String(payload.language || "");
+  if (/^no language server for /i.test(reason)) {
+    return language ? `No language server for ${language}` : "No language server for this language";
+  }
+  if (reason) return reason;
+  return language ? `No language server for ${language}` : "No language server is configured";
+}
+
+// Settings › Language servers. Every configured language is listed, whether a
+// lookup has started it or not; a hub entry replaces the idle row once it
+// exists, so an unavailable or crashed server keeps its reason.
+const languageServerStateLabels = {
+  idle: "not started",
+  starting: "starting",
+  ready: "running",
+  unavailable: "unavailable",
+  crashed: "crashed",
+};
+
+async function refreshLanguageServers(repoPath = repo()) {
+  const list = $("language-server-list");
+  const status = $("language-servers-status");
+  list.innerHTML = "";
+  if (!repoPath) {
+    status.textContent = "No repository selected.";
+    return;
+  }
+  try {
+    const payload = await api(`/api/language-servers?repo=${encodeURIComponent(repoPath)}`);
+    renderLanguageServers(payload);
+  } catch (error) {
+    status.textContent = error.message;
+  }
+}
+
+function renderLanguageServers(payload) {
+  const list = $("language-server-list");
+  const status = $("language-servers-status");
+  list.innerHTML = "";
+  const servers = payload.servers || [];
+  if (!servers.length) {
+    status.textContent =
+      "No language server is configured. Symbol results are heuristic and marked likely.";
+    return;
+  }
+  status.textContent = servers.length === 1 ? "1 configured" : `${servers.length} configured`;
+  servers.forEach((server) => {
+    list.append(languageServerRow(server));
+  });
+}
+
+function languageServerRow(server) {
+  const state = server.state || "idle";
+  const row = document.createElement("div");
+  row.className = "language-server-row";
+  row.dataset.state = state;
+
+  const heading = document.createElement("div");
+  heading.className = "language-server-heading";
+  const language = document.createElement("strong");
+  language.className = "language-server-language";
+  language.textContent = server.language || "";
+  const label = document.createElement("span");
+  label.className = "language-server-state";
+  label.textContent = languageServerStateLabels[state] || state;
+  if (state === "ready" && server.pid) label.textContent = `running — pid ${server.pid}`;
+  heading.append(language, label);
+
+  const command = document.createElement("code");
+  command.className = "language-server-command";
+  command.textContent = server.command || "";
+
+  row.append(heading, command);
+  const reason = languageServerReason(server);
+  if (reason) {
+    const detail = document.createElement("p");
+    detail.className = "language-server-reason";
+    detail.textContent = reason;
+    row.append(detail);
+  }
+  return row;
+}
+
+function languageServerReason(server) {
+  if (server.state === "unavailable") return server.reason || "The server could not start.";
+  if (server.state === "crashed") {
+    return Number(server.restarts) > 0
+      ? "Crashed again after its one restart; it stays down until this repository's server entry expires."
+      : "Crashed; the next symbol lookup will restart it once.";
+  }
+  return "";
 }
 
 function diffStats(diff) {
@@ -9846,8 +10143,15 @@ document.addEventListener("click", (event) => {
     !searchPanel.contains(event.target) &&
     !$("session-search-btn").contains(event.target)
   ) {
-    searchPanel.hidden = true;
-    $("session-search-btn").setAttribute("aria-expanded", "false");
+    closeSessionSearch();
+  }
+  const symbolPanel = $("symbol-search-panel");
+  if (
+    !symbolPanel.hidden &&
+    !symbolPanel.contains(event.target) &&
+    !$("symbol-search-btn").contains(event.target)
+  ) {
+    closeSymbolSearch();
   }
 });
 
@@ -9972,10 +10276,19 @@ $("session-search-input").addEventListener("input", (event) => {
 });
 
 $("session-search-input").addEventListener("keydown", (event) => {
-  if (event.key === "Escape") {
-    $("session-search-panel").hidden = true;
-    $("session-search-btn").setAttribute("aria-expanded", "false");
-  }
+  if (event.key === "Escape") closeSessionSearch();
+});
+
+$("symbol-search-btn").addEventListener("click", () => {
+  toggleSymbolSearch();
+});
+
+$("symbol-search-input").addEventListener("input", (event) => {
+  void runSymbolSearch(event.target.value);
+});
+
+$("symbol-search-input").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeSymbolSearch();
 });
 
 $("terminal-close-btn").addEventListener("click", () => {

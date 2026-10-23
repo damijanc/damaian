@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -12,16 +12,17 @@ use workspace_engine::{
     AgentFallbackProposal, AgentPlanProposal, AgentRoundBudgetProposal,
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult, Config,
     CostEstimate, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExportFormat,
-    GeneratedSecretWarning, McpClient, McpServerConfig, McpTokenResolver, McpTransport,
-    ModelAdapter, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep,
-    ProcessRegistry, ProfileId, ProposedFilePatch, ResumeDecisionOptions, RoundBudgetDecision,
-    SearchOptions, Session, SessionMode, StepStatus, TaskPlan, TaskUsage, TokenUsage, TurnPhase,
-    TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
-    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
-    allow_always_eligible, command_approval_prompt, custom_profile_ids, ensure_data_dir_schema,
-    export_profile, import_profile, normalize_mcp_server_id, normalize_model_provider,
-    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
-    profile_import_base, review_profile_import, review_profile_rejections, select_profile,
+    GeneratedSecretWarning, LanguageServerStatus, McpClient, McpServerConfig, McpTokenResolver,
+    McpTransport, ModelAdapter, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns,
+    PlanRevisionStep, ProcessRegistry, ProfileId, ProposedFilePatch, ResumeDecisionOptions,
+    RoundBudgetDecision, SearchOptions, Session, SessionMode, StepStatus, SymbolRef, TaskPlan,
+    TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind,
+    WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
+    WorkspaceEngine, allow_always_eligible, command_approval_prompt, custom_profile_ids,
+    ensure_data_dir_schema, export_profile, import_profile, normalize_mcp_server_id,
+    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
+    parse_mcp_transport, patch_diff_text, profile_import_base, repository_id_for_root,
+    review_profile_import, review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -358,6 +359,13 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/reject-command") => handle_reject_command(stream, &request),
         ("GET", "/api/repository-map") => handle_repository_map(stream, &request),
         ("POST", "/api/repository-roots") => handle_repository_roots(stream, &request),
+        // Spec 25 Task 10: symbol search, on-demand references, and the state
+        // of each configured language server. Each is its own function for the
+        // reason the findings routes are (spec 22 Task 10): the engine they
+        // build belongs to that frame, not to `handle_connection`'s.
+        ("GET", "/api/symbols") => handle_symbols(stream, &request),
+        ("GET", "/api/symbol-references") => handle_symbol_references(stream, &request),
+        ("GET", "/api/language-servers") => handle_language_servers(stream, &request),
         ("GET", "/api/command-proposal") => handle_command_proposal(stream, &request),
         ("GET", "/api/repository-config-review") => {
             handle_repository_config_review(stream, &request)
@@ -4171,6 +4179,125 @@ fn handle_repository_roots(stream: &mut TcpStream, request: &Request) -> Result<
     write_response(stream, request, 200, "application/json", &body)
 }
 
+/// How many symbol matches `/api/symbols` returns. A search box wants a short
+/// list; the CLI takes an explicit limit for anything larger.
+const SYMBOL_SEARCH_LIMIT: usize = 50;
+
+/// `GET /api/symbols?repo=&q=`: the repository's symbol lookup, each match
+/// carrying its `Symbol`, match quality and `provenance`. A heuristic match is
+/// labelled as one by the payload, so the UI never has to infer it.
+fn handle_symbols(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = required_param(request, "repo")?;
+    let query = required_param(request, "q")?;
+    let engine = engine_for_repo(&repo)?;
+    let root = symbol_repository(&engine, &repo)?;
+    let matches = engine
+        .find_symbols(&root, &query, SYMBOL_SEARCH_LIMIT)
+        .map_err(|error| error.to_string())?;
+    let body = format!(
+        "{{\"matches\":{}}}",
+        workspace_engine::symbol_matches_json(&matches)
+    );
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// `GET /api/symbol-references?repo=&path=&line=&name=`: Task 9's on-demand
+/// answer, unchanged, for the UI. `available: false` is a normal answer: the
+/// heuristic tier does not guess references.
+fn handle_symbol_references(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = required_param(request, "repo")?;
+    let path = required_param(request, "path")?;
+    let line = required_param(request, "line")?
+        .parse::<u32>()
+        .ok()
+        .filter(|line| *line > 0)
+        .ok_or_else(|| "line must be a positive integer".to_string())?;
+    let name = required_param(request, "name")?;
+    let engine = engine_for_repo(&repo)?;
+    let root = symbol_repository(&engine, &repo)?;
+    // The path arrives from the browser, so it goes through the same policy
+    // every other browser-supplied path does before a server sees it.
+    let target = engine
+        .path_policy
+        .resolve_existing(&root, &path, false)
+        .map_err(|error| error.to_string())?;
+    engine
+        .path_policy
+        .assert_not_restricted(&target.relative_path, false)
+        .map_err(|error| error.to_string())?;
+    let symbol = SymbolRef {
+        path: target.relative_path,
+        name,
+        line,
+    };
+    let references = engine
+        .symbol_references(&root, &symbol)
+        .map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &workspace_engine::symbol_references_json(&references),
+    )
+}
+
+/// `GET /api/language-servers?repo=`: every language the user configured, plus
+/// the hub's live state once a lookup has started one. Settings can therefore
+/// show a configured server before anything has spawned it.
+fn handle_language_servers(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = required_param(request, "repo")?;
+    let engine = engine_for_repo(&repo)?;
+    let root = symbol_repository(&engine, &repo)?;
+    let statuses = engine
+        .language_servers()
+        .status(&repository_id_for_root(&root));
+    let body = language_servers_json(&engine.config.language_servers, statuses);
+    write_response(stream, request, 200, "application/json", &body)
+}
+
+/// The JSON `/api/language-servers` serves. A configured server that no lookup
+/// has started yet is `idle`; a hub entry's own state replaces that once it
+/// exists, so an unavailable or crashed server keeps its reason.
+fn language_servers_json(
+    configured: &BTreeMap<String, String>,
+    statuses: Vec<LanguageServerStatus>,
+) -> String {
+    let mut servers: BTreeMap<String, serde_json::Value> = configured
+        .iter()
+        .map(|(language, command)| {
+            (
+                language.clone(),
+                serde_json::json!({
+                    "language": language,
+                    "command": command,
+                    "state": "idle",
+                    "pid": serde_json::Value::Null,
+                }),
+            )
+        })
+        .collect();
+    for status in statuses {
+        // Strings, numbers and unit variants: none of this can fail.
+        let value = serde_json::to_value(&status).expect("a language server status serialises");
+        servers.insert(status.language.clone(), value);
+    }
+    let servers: Vec<serde_json::Value> = servers.into_values().collect();
+    serde_json::to_string(&serde_json::json!({ "servers": servers }))
+        .expect("a language server list serialises")
+}
+
+/// A symbol endpoint's repository root, canonical and inside `allowed_roots`.
+/// Indexing does not consult `allowed_roots` either, so without this check the
+/// endpoints would read any directory they are named.
+fn symbol_repository(engine: &WorkspaceEngine, repo: &str) -> Result<PathBuf, String> {
+    let root = validate_working_folder(repo)?;
+    engine
+        .path_policy
+        .canonical_root(&root)
+        .map_err(|error| error.to_string())
+}
+
 /// Where a root override for `repo` is written, once `repo` passes the path
 /// policy. Indexing does not consult `allowed_roots`, so without this check
 /// the endpoint would write into any directory it is named.
@@ -4546,16 +4673,17 @@ mod tests {
         checkpoint_restore_json, default_engine, desktop_settings_config_path,
         effective_policy_for_repo, engine_for_repo, forget_model_api_key,
         generated_secret_warnings_json, handle_connection, index_html, json_error,
-        json_optional_string, keychain, mcp_browser_arguments, parse_form, parse_path_list,
-        percent_decode, plan_json, plan_proposal_json, relay_turn_events, remember_model_api_key,
-        render_markdown_with_optional_file_links, repository_config_review_json,
-        repository_config_write_target, require_api_token, run_server, run_terminal_command,
-        save_config_file, spawn_with_shell_stack, sweep_orphaned_processes, task_states_json,
-        task_usage_json, terminal_cwd_for_repo, turn_progress_event, validate_context_files,
+        json_optional_string, keychain, language_servers_json, mcp_browser_arguments, parse_form,
+        parse_path_list, percent_decode, plan_json, plan_proposal_json, relay_turn_events,
+        remember_model_api_key, render_markdown_with_optional_file_links,
+        repository_config_review_json, repository_config_write_target, require_api_token,
+        run_server, run_terminal_command, save_config_file, spawn_with_shell_stack,
+        sweep_orphaned_processes, symbol_repository, task_states_json, task_usage_json,
+        terminal_cwd_for_repo, turn_progress_event, validate_context_files,
         validate_working_folder, validate_workspace_path, verify_data_dir_schema_at,
         web_diagnostic_json, web_diagnostic_reveal_target, write_basic_response, write_sse_event,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -4565,9 +4693,10 @@ mod tests {
     use workspace_engine::CheckpointRestoreResult;
     use workspace_engine::{
         AgentPlanProposal, CancelToken, Config, Evidence, GeneratedSecretWarning,
-        LanguageServerHub, LanguageServerLaunch, MockModelAdapter, PlanStep, SecretScanner,
-        SessionMode, StepStatus, TaskPlan, TaskUsage, ToolCall, TurnProgress, TurnSink,
-        UsageSource, WebDiagnosticRecord, WebDiagnosticReport, WorkspaceEngine,
+        LanguageServerHub, LanguageServerLaunch, LanguageServerState, LanguageServerStatus,
+        MockModelAdapter, PlanStep, SecretScanner, SessionMode, StepStatus, TaskPlan, TaskUsage,
+        ToolCall, TurnProgress, TurnSink, UsageSource, WebDiagnosticRecord, WebDiagnosticReport,
+        WorkspaceEngine,
         finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange},
     };
 
@@ -6080,6 +6209,21 @@ mod tests {
         repo
     }
 
+    /// A Rust declaration at the repository root and one under an npm root, so
+    /// the symbol endpoints have both a provenance and a `rootPath` to report.
+    fn symbol_fixture(name: &str) -> PathBuf {
+        isolated_data_dir();
+        let repo = repository_map_fixture(name);
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/upload.rs"), "pub fn upload_retry() {}\n").unwrap();
+        fs::write(
+            repo.join("packages/api/src/retry.ts"),
+            "export function uploadRetry() {}\n",
+        )
+        .unwrap();
+        repo
+    }
+
     fn find_root<'a>(payload: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
         payload["map"]["roots"]
             .as_array()?
@@ -6248,6 +6392,186 @@ mod tests {
             "{refused:?}"
         );
         assert!(!outside.join(".damaian").exists());
+    }
+
+    #[test]
+    fn symbols_endpoint_serves_matches_with_provenance_and_their_root() {
+        let repo = symbol_fixture("symbols-shape");
+        let (port, token) = serve_for_test();
+        let url = format!(
+            "/api/symbols?repo={}&q=upload_retry",
+            percent_encode_for_test(&repo.to_string_lossy())
+        );
+        let response = get_for_test(port, &token, &url);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        let payload = json_of(&response);
+        let matches = payload["matches"].as_array().expect("matches");
+        assert_eq!(matches.len(), 1, "{payload}");
+        assert_eq!(matches[0]["quality"], "exact");
+        let symbol = &matches[0]["symbol"];
+        assert_eq!(symbol["name"], "upload_retry");
+        assert_eq!(symbol["kind"], "function");
+        assert_eq!(symbol["path"], "src/upload.rs");
+        assert_eq!(symbol["line"], 1);
+        assert_eq!(symbol["rootPath"], "");
+        assert_eq!(symbol["provenance"], "heuristic");
+
+        // The root is the payload's, not something the UI infers.
+        let rooted = format!(
+            "/api/symbols?repo={}&q=uploadRetry",
+            percent_encode_for_test(&repo.to_string_lossy())
+        );
+        let response = get_for_test(port, &token, &rooted);
+        let payload = json_of(&response);
+        assert_eq!(
+            payload["matches"][0]["symbol"]["rootPath"], "packages/api",
+            "{payload}"
+        );
+    }
+
+    #[test]
+    fn symbol_references_endpoint_answers_without_a_language_server() {
+        let repo = symbol_fixture("symbols-references");
+        let (port, token) = serve_for_test();
+        let url = format!(
+            "/api/symbol-references?repo={}&path=src%2Fupload.rs&line=1&name=upload_retry",
+            percent_encode_for_test(&repo.to_string_lossy())
+        );
+        let response = get_for_test(port, &token, &url);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        let payload = json_of(&response);
+        assert_eq!(payload["kind"], "references");
+        assert_eq!(payload["symbol"]["path"], "src/upload.rs");
+        assert_eq!(payload["symbol"]["line"], 1);
+        assert_eq!(payload["symbol"]["name"], "upload_retry");
+        assert_eq!(payload["language"], "rust");
+        assert_eq!(payload["available"], false);
+        assert!(
+            payload["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("no language server for rust")),
+            "{payload}"
+        );
+        assert_eq!(payload["relations"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn symbol_endpoints_refuse_a_repository_that_is_not_a_directory() {
+        let (port, token) = serve_for_test();
+        let not_a_repository = temp_path("symbols-foreign");
+        fs::write(&not_a_repository, "not a directory").unwrap();
+        let repo = percent_encode_for_test(&not_a_repository.to_string_lossy());
+
+        for path in [
+            format!("/api/symbols?repo={repo}&q=upload_retry"),
+            format!("/api/symbol-references?repo={repo}&path=x.rs&line=1&name=x"),
+            format!("/api/language-servers?repo={repo}"),
+        ] {
+            let response = get_for_test(port, &token, &path);
+            assert!(response.starts_with("HTTP/1.1 500"), "{path}: {response}");
+        }
+        fs::remove_file(not_a_repository).unwrap();
+    }
+
+    #[test]
+    fn symbol_repository_stays_inside_the_allowed_roots() {
+        let allowed = temp_path("symbols-allowed");
+        let inside = allowed.join("repo");
+        let outside = temp_path("symbols-outside");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let engine = WorkspaceEngine::new(Config {
+            data_dir: allowed.join(".damaian-data"),
+            allowed_roots: vec![allowed.clone()],
+            enable_index_watcher: false,
+            ..Config::default()
+        });
+
+        assert_eq!(
+            symbol_repository(&engine, &inside.to_string_lossy()).unwrap(),
+            fs::canonicalize(&inside).unwrap()
+        );
+        let refused = symbol_repository(&engine, &outside.to_string_lossy());
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.contains("not allowed")),
+            "{refused:?}"
+        );
+        fs::remove_dir_all(allowed).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn language_servers_endpoint_serves_the_hub_shape() {
+        let repo = symbol_fixture("symbols-servers");
+        let (port, token) = serve_for_test();
+        let url = format!(
+            "/api/language-servers?repo={}",
+            percent_encode_for_test(&repo.to_string_lossy())
+        );
+        let response = get_for_test(port, &token, &url);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        // Nothing is configured in this test's user config, so the list is
+        // empty rather than absent.
+        assert_eq!(json_of(&response)["servers"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn language_servers_json_lists_configured_servers_before_they_start() {
+        let mut configured = BTreeMap::new();
+        configured.insert("rust".to_string(), "rust-analyzer".to_string());
+        configured.insert(
+            "python".to_string(),
+            "pyright-langserver --stdio".to_string(),
+        );
+        let statuses = vec![
+            LanguageServerStatus {
+                language: "rust".to_string(),
+                command: "rust-analyzer".to_string(),
+                state: LanguageServerState::Crashed { restarts: 1 },
+                pid: None,
+            },
+            LanguageServerStatus {
+                language: "python".to_string(),
+                command: "pyright-langserver --stdio".to_string(),
+                state: LanguageServerState::Unavailable {
+                    reason: "spawn failed: No such file or directory".to_string(),
+                },
+                pid: None,
+            },
+        ];
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&language_servers_json(&configured, statuses)).unwrap();
+        let servers = payload["servers"].as_array().expect("servers");
+        assert_eq!(servers.len(), 2, "{payload}");
+        assert_eq!(servers[0]["language"], "python");
+        assert_eq!(servers[0]["state"], "unavailable");
+        assert_eq!(
+            servers[0]["reason"],
+            "spawn failed: No such file or directory"
+        );
+        assert_eq!(servers[1]["language"], "rust");
+        assert_eq!(servers[1]["state"], "crashed");
+        assert_eq!(servers[1]["restarts"], 1);
+        assert!(servers[1]["reason"].is_null(), "{payload}");
+    }
+
+    #[test]
+    fn a_configured_language_server_is_idle_until_a_lookup_starts_it() {
+        let mut configured = BTreeMap::new();
+        configured.insert("go".to_string(), "gopls".to_string());
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&language_servers_json(&configured, Vec::new())).unwrap();
+        let server = &payload["servers"][0];
+        assert_eq!(server["language"], "go");
+        assert_eq!(server["command"], "gopls");
+        assert_eq!(server["state"], "idle");
+        assert!(server["pid"].is_null());
     }
 
     #[test]

@@ -92,6 +92,17 @@
             </div>
             <div class="thread-actions">
               <button
+                id="symbol-search-btn"
+                class="topbar-button symbol-search-button"
+                type="button"
+                aria-label="Search symbols"
+                aria-haspopup="dialog"
+                aria-expanded="false"
+                title="Search symbols"
+              >
+                <span class="symbol-icon" aria-hidden="true"></span>
+              </button>
+              <button
                 id="terminal-toggle-btn"
                 class="topbar-button terminal-button"
                 type="button"
@@ -125,6 +136,23 @@
             aria-label="Search sessions"
           />
           <div id="session-search-results" class="session-search-results"></div>
+        </div>
+
+        <div
+          id="symbol-search-panel"
+          class="session-search-panel symbol-search-panel"
+          role="dialog"
+          aria-label="Symbol search"
+          hidden
+        >
+          <input
+            id="symbol-search-input"
+            type="search"
+            placeholder="Search symbols"
+            aria-label="Search symbols"
+          />
+          <p id="symbol-search-status" class="symbol-search-status" hidden></p>
+          <div id="symbol-search-results" class="session-search-results symbol-search-results"></div>
         </div>
 
         <section id="chat-log" class="chat-log" aria-live="polite"></section>
@@ -445,6 +473,17 @@
             <div id="repository-roots-list" class="repository-roots-list"></div>
             <div id="repository-root-detail" class="repository-root-detail" hidden></div>
             <div id="repository-roots-excluded" class="repository-roots-excluded" hidden></div>
+          </section>
+          <section class="settings-section" id="language-servers-section">
+            <h3>Language servers</h3>
+            <p class="settings-page-hint">
+              Add <code>language_server.&lt;language&gt;=&lt;command&gt;</code> to your user
+              configuration to get exact symbol locations. A repository cannot set this key. A
+              server starts on the first symbol lookup and stops after ten idle minutes or when
+              Damaian quits.
+            </p>
+            <p id="language-servers-status" class="settings-page-hint"></p>
+            <div id="language-server-list" class="language-server-list"></div>
           </section>
           <section class="settings-section">
             <h3>Effective policy</h3>

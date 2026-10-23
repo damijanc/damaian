@@ -803,6 +803,25 @@ button:disabled {
   content: "";
 }
 
+.symbol-search-button {
+  width: 30px;
+  padding: 0;
+}
+
+/* The symbol lookup is repo-wide, so its trigger is the drawn pair of braces
+   rather than a second magnifier beside "Search sessions". */
+.symbol-icon {
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: -1px;
+  line-height: 1;
+}
+
+.symbol-icon::before {
+  content: "{}";
+}
+
 /* Its trigger sits in the sidebar header, so the panel opens at the
    conversation's left edge, beside the sidebar, rather than under the header's
    right-hand actions. */
@@ -865,6 +884,119 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.symbol-search-panel {
+  width: min(560px, calc(100% - 32px));
+}
+
+.symbol-search-status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* A symbol result is a quiet reference row, not a button: the clickable part
+   is its path, which opens the file at the declaration. */
+.symbol-search-hit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 8px;
+}
+
+.symbol-search-hit:hover,
+.symbol-search-hit:focus-within {
+  background: var(--surface-soft);
+}
+
+.symbol-search-hit-header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.symbol-search-hit-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.symbol-kind-chip {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 1px 6px;
+}
+
+.symbol-provenance {
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+  color: var(--warn);
+  cursor: help;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  padding: 1px 5px;
+  text-transform: uppercase;
+}
+
+.symbol-search-hit-meta {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.symbol-path {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  padding: 0;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.symbol-path:hover {
+  opacity: 0.8;
+}
+
+.symbol-root {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+.symbol-references {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-top: 1px solid var(--line);
+  padding-top: 6px;
+  font-size: 12px;
+}
+
+.symbol-references[hidden] {
+  display: none;
+}
+
+.symbol-reference-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.symbol-reference-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 .chat-log {
@@ -4602,6 +4734,69 @@ body.worker-view #chat-model-menu {
 
 .repository-roots-excluded[hidden] {
   display: none;
+}
+
+/* Language servers (spec 25 Task 10). One row per configured language, with a
+   state word rather than a colour alone: `unavailable` and `crashed` carry the
+   reason the heuristic tier is doing the work. */
+.language-server-list {
+  display: grid;
+  gap: 8px;
+}
+
+.language-server-row {
+  display: grid;
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 10px 14px;
+}
+
+.language-server-row[data-state="unavailable"],
+.language-server-row[data-state="crashed"] {
+  border-color: var(--danger);
+}
+
+.language-server-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.language-server-language {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.language-server-state {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.language-server-row[data-state="ready"] .language-server-state {
+  color: var(--ok);
+}
+
+.language-server-row[data-state="unavailable"] .language-server-state,
+.language-server-row[data-state="crashed"] .language-server-state {
+  color: var(--danger);
+}
+
+.language-server-command {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.language-server-reason {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12px;
 }
 
 /* "Runs in `packages/api`" on a command approval card. */
