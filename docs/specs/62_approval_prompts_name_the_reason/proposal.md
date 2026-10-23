@@ -1,7 +1,8 @@
 # Feature Spec: Approval Prompts Name the Reason
 
 Status: In progress. Tasks 1 (`ApprovalCause` and structured causes) and 2
-(`Setting` and profile-block causes) landed 2026-10-18. Specified on 2026-10-17
+(`Setting` and profile-block causes) landed 2026-10-18; Task 3 (prompt and
+model-facing wording) landed 2026-10-23. Specified on 2026-10-17
 from the session behind
 [#59](../59_exploration_round_allowance/proposal.md)–[#61](../61_continue_the_stopped_turn/proposal.md),
 in which the user answered 40 approval prompts that all gave the same reason,
@@ -48,8 +49,10 @@ believes auto-run commands are sandboxed will trust them more than they should.
 > boundary and its classifier, and its reason strings are what §5.1's
 > `ApprovalCause` replaces. The `tasks.md` Corrections table records where the
 > code now differs from this section; the bullets below are the corrected view.
+> Task 3 has since rewritten the wording and removed the strings named here;
+> the line references point at the current source for that pre-Task-3 state.
 
-- `command_proposal_response` (`chat.rs:5310`) returns one of two fixed
+- `command_proposal_response` (`chat.rs:6249`) returns one of two fixed
   sentences, both claiming "sandbox mode", whatever the proposal says.
 - `CommandProposal` (`validation.rs:18`) carries the model's stated `reason`
   (set from the tool call in `propose_command_at`), plus `risk`,
@@ -89,13 +92,14 @@ believes auto-run commands are sandboxed will trust them more than they should.
   `classify_at` runs: `CommandPolicy` is built from `Config` alone
   (`workspace_engine.rs:78`), so §5.1's `Setting.source` needs that attribution
   threaded in.
-- The tool description for `run_command` (`chat.rs:4747`) and the system prompt
-  and command envelope paragraphs (`chat.rs:4247`, `4255`) tell the model that
+- The tool description for `run_command` (`chat.rs:5641`) and the system prompt
+  and command envelope paragraphs (`chat.rs:5099`, `5110`) tell the model that
   Damaian "runs sandbox-safe read-only commands automatically". Three more
   "sandbox" strings are not in those paragraphs: the auto-run path passes the
-  literal `"sandbox"` as `approved_by` (`chat.rs:2756`), the model-facing
-  context separator is `--- sandbox_command_result ---` (`chat.rs:4300`), and
-  the audit turn status includes `complete_with_sandbox_command` (`chat.rs:3411`).
+  literal `"sandbox"` as `approved_by` (`chat.rs:3140`), the model-facing
+  context separator is `--- sandbox_command_result ---` (`chat.rs:5159`), and
+  the audit turn status includes `complete_with_sandbox_command` (now
+  `complete_with_command`, `chat.rs:3825`).
 
 ## 3. Requirements
 
@@ -178,8 +182,7 @@ default and may say so.
 
 `command_proposal_response` becomes, for example:
 
-> Damaian asks before running this: it uses `&&` and `|`, and shell control
-> always asks.
+> Asks first: uses `&&`, `|` — Damaian never runs shell control without asking
 > `cd .claude/worktrees/spec25-task8 && git --no-pager diff -- … | head -220`
 
 The card's header line shows the first cause's plain words next to the risk
@@ -194,18 +197,20 @@ approval, as today.
 The `run_command` description and the command envelope paragraphs replace
 "sandbox-safe" with what is true: Damaian runs a short list of read-only commands
 without asking and asks the user for everything else, including any command that
-uses shell control. Naming shell control there is deliberate: a model that knows
+uses shell control. Plan and Review carry the same sentence but say that
+everything else is refused outright in that mode, because those modes raise no
+approval card. Naming shell control there is deliberate: a model that knows
 `a && b | c` always asks may prefer two tool calls, or #60's tools, over one
 compound command.
 
 The test that asserts the read-only prompt omits the auto-run sentence is
-`ask_mode_system_prompt_has_no_command_envelope` (`chat.rs:6414`), not "around
+`ask_mode_system_prompt_has_no_command_envelope` (`chat.rs:7421`), not "around
 line 6178". It is updated with the new wording, not removed, and
-`code_mode_system_prompt_is_byte_identical_to_todays` (`chat.rs:6406`) pins the
+`code_mode_system_prompt_is_byte_identical_to_todays` (`chat.rs:7413`) pins the
 Code system prompt against a `TODAYS_CODE_SYSTEM_PROMPT` constant — that constant
 and the `CODE_PARAGRAPH_BEFORE_SPEC_50` / `READ_ONLY_PARAGRAPH_BEFORE_SPEC_50`
-fixtures (`chat.rs:6665`) change in the same commit or the byte-identical test
-breaks.
+fixtures (`chat.rs:7775`, `7776`) change in the same commit or the byte-identical
+test breaks.
 
 ### 5.4 Recording
 

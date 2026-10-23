@@ -647,13 +647,13 @@ fn use_color(no_color_flag: bool) -> bool {
 }
 
 fn default_engine() -> workspace_engine::Result<WorkspaceEngine> {
-    Ok(WorkspaceEngine::new(Config::load_for_repository(None)?))
+    let (config, report) = Config::load_for_repository_reporting(None)?;
+    Ok(WorkspaceEngine::new_with_report(config, &report))
 }
 
 fn engine_for_repo(repo: &str) -> workspace_engine::Result<WorkspaceEngine> {
-    Ok(WorkspaceEngine::new(Config::load_for_repository(Some(
-        Path::new(repo),
-    ))?))
+    let (config, report) = Config::load_for_repository_reporting(Some(Path::new(repo)))?;
+    Ok(WorkspaceEngine::new_with_report(config, &report))
 }
 
 /// What this repository's config asked for and did not get, and any

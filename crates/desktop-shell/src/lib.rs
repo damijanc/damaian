@@ -14,14 +14,15 @@ use workspace_engine::{
     CostEstimate, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExportFormat,
     GeneratedSecretWarning, McpClient, McpServerConfig, McpTokenResolver, McpTransport,
     ModelAdapter, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep,
-    ProcessRegistry, ProfileId, ProposedFilePatch, ResumeDecisionOptions, RoundBudgetDecision,
-    SearchOptions, Session, SessionMode, StepStatus, TaskPlan, TaskUsage, TokenUsage, TurnPhase,
-    TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord,
-    WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine,
-    allow_always_eligible, command_approval_prompt, custom_profile_ids, ensure_data_dir_schema,
-    export_profile, import_profile, normalize_mcp_server_id, normalize_model_provider,
-    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
-    profile_import_base, review_profile_import, review_profile_rejections, select_profile,
+    ProcessRegistry, ProfileId, ProposedFilePatch, RepositoryConfigReport, ResumeDecisionOptions,
+    RoundBudgetDecision, SearchOptions, Session, SessionMode, StepStatus, TaskPlan, TaskUsage,
+    TokenUsage, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall, WebDiagnosticKind,
+    WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner, WebDiagnosticsRunnerHandle,
+    WorkspaceEngine, allow_always_eligible, command_approval_prompt, custom_profile_ids,
+    ensure_data_dir_schema, export_profile, import_profile, normalize_mcp_server_id,
+    normalize_model_provider, normalize_model_reasoning_level, parse_hunk_selection,
+    parse_mcp_transport, patch_diff_text, profile_import_base, review_profile_import,
+    review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -1216,7 +1217,8 @@ fn handle_propose_edit(stream: &mut TcpStream, request: &Request) -> Result<(), 
         .get("session_id")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let engine = WorkspaceEngine::new(config_for_repo_with_model_options(&repo, &form)?);
+    let (config, report) = config_for_repo_with_model_options(&repo, &form)?;
+    let engine = WorkspaceEngine::new_with_report(config, &report);
     let context_files = form
         .get("context_files")
         .map(|value| validate_context_files(&engine, &repo, value))
@@ -1624,7 +1626,7 @@ fn run_resume_command_request(
     let repo = required_form(form, "repo")?;
     let proposal_id = required_form(form, "proposal_id")?;
     let approved = form.get("approved").map(String::as_str) == Some("true");
-    let engine = chat_engine(config_for_repo(&repo)?);
+    let engine = chat_engine(config_and_report_for_repo(&repo)?);
 
     if !engine
         .chat_orchestrator
@@ -1693,7 +1695,7 @@ fn run_resume_plan_request(
         Some(raw) => Some(parse_plan_revision(raw)?),
         None => None,
     };
-    let engine = chat_engine(config_for_repo(&repo)?);
+    let engine = chat_engine(config_and_report_for_repo(&repo)?);
 
     let mut adapter = chat_model_adapter(&engine.config, || {
         resolve_model_api_key(&engine.config.model_api_key_env)
@@ -1744,7 +1746,8 @@ fn run_resume_fallback_request(
         cancel,
         events,
         &|provider| {
-            let mut engine = WorkspaceEngine::new(config_for_repo_with_provider(&repo, provider)?);
+            let (config, report) = config_for_repo_with_provider(&repo, provider)?;
+            let mut engine = WorkspaceEngine::new_with_report(config, &report);
             configure_chat_integrations(&mut engine);
             Ok(engine)
         },
@@ -1839,7 +1842,7 @@ fn run_resume_round_budget_request(
         cancel,
         events,
         &|| {
-            let engine = chat_engine(config_for_repo(&repo)?);
+            let engine = chat_engine(config_and_report_for_repo(&repo)?);
             Ok(engine)
         },
         &mut |config| {
@@ -2037,8 +2040,9 @@ fn run_chat_request_with(
 /// The engine a chat turn runs on. The shell's turns and a worker's both build
 /// it here (spec 57 §5.2, "same turn"), so neither host can configure a turn
 /// the other would not.
-fn chat_engine(config: Config) -> WorkspaceEngine {
-    let mut engine = WorkspaceEngine::new(config);
+fn chat_engine(config_and_report: (Config, RepositoryConfigReport)) -> WorkspaceEngine {
+    let (config, report) = config_and_report;
+    let mut engine = WorkspaceEngine::new_with_report(config, &report);
     configure_chat_integrations(&mut engine);
     engine
 }
@@ -2125,8 +2129,9 @@ fn resume_decision_options(form: &HashMap<String, String>) -> ResumeDecisionOpti
 }
 
 fn default_engine() -> Result<WorkspaceEngine, String> {
-    let config = Config::load_for_repository(None).map_err(|error| error.to_string())?;
-    Ok(WorkspaceEngine::new(config))
+    let (config, report) =
+        Config::load_for_repository_reporting(None).map_err(|error| error.to_string())?;
+    Ok(WorkspaceEngine::new_with_report(config, &report))
 }
 
 fn desktop_settings_config_path(scope: Option<&str>) -> Result<PathBuf, String> {
@@ -2756,7 +2761,7 @@ fn forget_model_api_key(account: &str) {
 }
 
 fn model_key_status_json(repo: &str, provider: Option<&str>) -> Result<String, String> {
-    let config = config_for_repo_with_provider(repo, provider)?;
+    let (config, _) = config_for_repo_with_provider(repo, provider)?;
     let reference = config.model_api_key_env;
     if let Some(account) = keychain::account_from_reference(&reference) {
         let status = match keychain::password_exists(account) {
@@ -3219,34 +3224,44 @@ fn resolve_repository_allowlist_migration(repo: &str, keep: &[String]) -> Result
 }
 
 fn engine_for_repo(repo: &str) -> Result<WorkspaceEngine, String> {
-    let config = config_for_repo(repo)?;
-    Ok(WorkspaceEngine::new(config))
+    let (config, report) = config_and_report_for_repo(repo)?;
+    Ok(WorkspaceEngine::new_with_report(config, &report))
 }
 
 fn config_for_repo_with_model_options(
     repo: &str,
     form: &HashMap<String, String>,
-) -> Result<Config, String> {
-    let mut config = config_for_repo(repo)?;
+) -> Result<(Config, RepositoryConfigReport), String> {
+    let (mut config, report) = config_and_report_for_repo(repo)?;
     apply_model_form_options(&mut config, form)?;
-    Ok(config)
+    Ok((config, report))
 }
 
 fn config_for_repo(repo: &str) -> Result<Config, String> {
+    config_and_report_for_repo(repo).map(|(config, _)| config)
+}
+
+/// The loaded config and the report that says which scope set each key. Chat
+/// and command-approval paths build their engine with the report so an
+/// approval raised by a setting can name who set it (spec 62 Task 3).
+fn config_and_report_for_repo(repo: &str) -> Result<(Config, RepositoryConfigReport), String> {
     let repo_path = if repo.is_empty() {
         None
     } else {
         Some(Path::new(repo))
     };
-    Config::load_for_repository(repo_path).map_err(|error| error.to_string())
+    Config::load_for_repository_reporting(repo_path).map_err(|error| error.to_string())
 }
 
-fn config_for_repo_with_provider(repo: &str, provider: Option<&str>) -> Result<Config, String> {
-    let mut config = config_for_repo(repo)?;
+fn config_for_repo_with_provider(
+    repo: &str,
+    provider: Option<&str>,
+) -> Result<(Config, RepositoryConfigReport), String> {
+    let (mut config, report) = config_and_report_for_repo(repo)?;
     if let Some(provider) = provider.map(str::trim).filter(|value| !value.is_empty()) {
         switch_model_provider(&mut config, provider)?;
     }
-    Ok(config)
+    Ok((config, report))
 }
 
 /// Makes `provider` the active one, in memory only.

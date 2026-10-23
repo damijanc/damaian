@@ -669,7 +669,7 @@ Useful reads:
   the fastest way to confirm what the model actually saw, how many action and
   read-only rounds a turn took, and where its budget stood.
 - `model_response_completed.status` distinguishes `complete`,
-  `complete_with_sandbox_command`, `command_approval_required`, and
+  `complete_with_command`, `command_approval_required`, and
   `patch_proposal_ready`. A turn that "did nothing" usually ended `complete`
   when you expected `patch_proposal_ready`.
 - `command_proposed` carries `risk` and `requiresApproval` — check here before
