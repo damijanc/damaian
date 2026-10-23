@@ -49,6 +49,29 @@ Damaian classifies every command before it runs, and the classification, not the
 - **Asks first:** everything else, including anything that writes, installs, reaches the network or uses shell control syntax. `git diff` and `git show` ask too, because they print file contents a command line cannot bound or keep restricted paths out of; the agent's `read_git_diff` tool does both. Every Docker command asks, `docker ps` included, because the daemon is privileged.
 - **Blocked:** commands matching `command_blocklist` or a destructive pattern are refused and cannot be approved from the UI.
 
+The read-only boundary is a tokenizer, not a prefix match. A command runs
+without asking only when a shell tokenizer splits it into words with no
+expansion — no `$`, no backtick, no unquoted `*`, `?`, `[`, `{` or `~` — every
+program and option is from the closed list above, and every path argument
+resolves inside the repository and clear of `restricted_patterns`. What is
+checked is exactly what the login shell will run; anything the shell would
+rewrite after classification asks for approval. A path outside the repository,
+behind a symlink, or inside a restricted directory such as `secrets/` asks, and
+so does a restricted working directory.
+
+Two things the boundary deliberately does not cover:
+
+- **Allowlisted commands.** *Allow Always* records one exact command string the
+  user approved, and it keeps running without these checks. The allowlist is a
+  user decision about a specific command, not a claim that the command is
+  read-only; whether it should be held to the boundary is a separate question,
+  not this one.
+- **`ls` listing restricted names.** A path argument is checked, but `ls` does
+  not police the names it lists the way `list_directory` does. `ls secrets/`
+  asks, because the path is restricted; `ls` of an admitted directory still
+  lists a restricted entry nested inside it by name. The `list_directory` tool
+  is the answer for a listing that must hide restricted names.
+
 `require_approval_for_all_commands` makes every command ask. *Allow Always* records one exact command for one checkout in user config (see the trust boundary below) and is not offered for blocked commands or commands with shell control syntax. A working mode or permission profile can only narrow what runs. Output of every command is redacted before the model or the UI sees it, and each command runs under `command_timeout_secs` and is registered in the process registry. A command left running by a crash is found by the sweep at the next launch and killed by its recorded pid, only while its recorded start time still matches, and never by name.
 
 ## File Access

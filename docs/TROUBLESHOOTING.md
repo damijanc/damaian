@@ -47,6 +47,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | Applying a patch fails with a conflict | [Patch apply fails with a conflict](#patch-apply-fails-with-a-conflict) |
 | An `edit_file` proposal is refused | [An `edit_file` proposal is refused](#an-edit_file-proposal-is-refused) |
 | `Refused: …` from a mode, a profile or the command policy | [The assistant was refused](#the-assistant-was-refused-the-session-mode-the-permission-profile-or-the-command-policy) |
+| A command that used to run unasked now asks | [A command that used to run unasked now asks](#a-command-that-used-to-run-unasked-now-asks) |
 | A setting will not stick, or a repository config key has no effect | [Configuration layers](#configuration-layers), [Why a rule is in force](#why-a-rule-is-in-force) |
 | A permission profile key has no effect | [A permission profile key had no effect](#a-permission-profile-key-had-no-effect) |
 | A file read or search result was cut short | [A file read or search result was truncated](#a-file-read-or-search-result-was-truncated) |
@@ -1686,6 +1687,31 @@ model quotes the reason back. Two refusals are expected, not bugs:
 
 Neither refusal writes anything to disk. A refused edit goes back to the model
 as a tool result, so it can retry within the same turn.
+
+### A command that used to run unasked now asks
+
+Damaian used to admit a command as read-only when its text merely *started with*
+`pwd`, `ls`, `git status`, `git diff`, `git log` or `git show`. That prefix
+match let through commands that were not read-only at all, so it was replaced by
+a tokenizer and a closed option list. Three kinds of command that used to run
+without asking now ask, and each is deliberate:
+
+- **`git diff`, `git show` and `git log -p`.** They print file contents, which a
+  command line cannot bound or keep restricted paths out of. The assistant reads
+  changes and commit content through `read_git_diff` and `read_git_log`, which do
+  both, so nothing is lost — the shell form just asks now.
+- **An option outside the admitted list.** `git diff --output=README.md` and
+  `git log --output=x` used to write files unasked, and `git log
+  --since=yesterday` used to run. Any option not in the admitted list asks.
+- **A command that expands to something else, or reads outside the repository.**
+  `ls $HOME/.ssh`, `ls ~`, `ls *` and `git diff --no-index $HOME/x README.md`
+  used to slip past the prefix match. `$`, `~` and unquoted globs now ask,
+  because the shell would run something other than what was checked.
+
+If a command that looks harmless asks, check it against the admitted table in
+the user guide's [Command Approval](USER_GUIDE.md#command-approval); the reason
+under **Why this command** names the argument or the expansion that refused it.
+This is the boundary working, not a regression.
 
 ### The assistant was refused: the session mode, the permission profile, or the command policy?
 

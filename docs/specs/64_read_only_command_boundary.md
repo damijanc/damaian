@@ -1,10 +1,10 @@
 # Feature Spec: The Read-Only Command Boundary
 
-Status: In progress. Started 2026-10-17: requirements 1–4 and 8 (the
-tightening) and requirements 6–7 (pipelines) were implemented on 2026-10-17/18,
-and requirement 5 shipped on 2026-10-18 once #60's `read_git_diff` and
-`read_git_log` landed, so every requirement is now implemented; the §5.7
-documentation remains before the spec is Done. Specified on 2026-10-17. It began as "let read-only
+Status: Done 2026-10-23. Requirements 1–4 and 8 (the tightening) and
+requirements 6–7 (pipelines) were implemented on 2026-10-17/18, requirement 5
+shipped on 2026-10-18 once #60's `read_git_diff` and `read_git_log` landed, and
+the §5.7 documentation (user guide, security, troubleshooting) was written to
+close the spec. Specified on 2026-10-17. It began as "let read-only
 pipelines run without approval", from the session behind
 [#59](59_exploration_round_allowance/proposal.md)–[#63](63_exploratory_command_failures/proposal.md).
 Reading the policy to design that found the existing read-only list already

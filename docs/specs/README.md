@@ -79,7 +79,7 @@ directory was renamed from `ROADMAP` to `PLAN` because it was never a roadmap:
 
 ## What to build next, and what may run in parallel
 
-### Current state (2026-10-22)
+### Current state (2026-10-23)
 
 A summary of each spec's own `Status:`, `tasks.md` and `Depends on:` lines on
 this date. Where it disagrees with them, they win; `npm run specs:check`
@@ -90,7 +90,7 @@ reports the disagreement.
   #26), #50 clarification (1–3 of 8), #59 exploration allowance (1 of 6), #60
   worktree reads (1–5 of 6; Task 6 in progress), #61 continue the stopped turn
   (1–5 of 7), #62 approval reasons (1–2 of 7), #63 exploratory failures (1–5 of
-  6), #64 read-only boundary (requirements 1–8 implemented; close-out open).
+  6).
 - **Ready, not started:** #23 verification loop; #65 exploration memory (its
   requirement 8 waits for #59).
 - **Blocked:** #26 on #25; #27, #33, #51, #54 and #55 on #26; #28 on #26 and
@@ -348,11 +348,12 @@ waited for #60's `read_git_diff` and shipped on 2026-10-18. #64's requirements
 1–4 closed auto-run holes (`git diff --output=<file>` wrote, `$HOME/…` escaped
 the repository, `git show HEAD:.env` read a restricted file) on 2026-10-17, the
 day they were found, and its read-only pipelines (requirements 6–7) followed on
-2026-10-18. #59, #60, #61, #62, #63 and #64 are all in progress. #61 and #62
+2026-10-18. #59, #60, #61, #62 and #63 are all in progress; #64 is done
+(2026-10-23). #61 and #62
 edit `chat.rs` and pair with neither #59 nor #60; #63 keeps its
 logic in `command_purpose.rs` and `validation.rs` and touches
-`command_policy.rs` only to make `is_validation_command` visible, so it may run
-beside #64; either may pair with #61. #63's Task 4 rewrites the same
+`command_policy.rs` only to make `is_validation_command` visible, so it could
+run beside #64, which is now done; #63 may pair with #61. #63's Task 4 rewrites the same
 model-facing command text as #62 and must not run beside it.
 [#65](65_exploration_memory_within_a_turn.md), added on 2026-10-18 from a
 review of #59–#64 and revised on 2026-10-19, is ready: #20, #34 and #47 are
@@ -473,7 +474,7 @@ is ready.
 | 61 | [61_continue_the_stopped_turn/proposal.md](61_continue_the_stopped_turn/proposal.md) | **In progress; split into a folder and planned 2026-10-18, Tasks 1–5 done 2026-10-18.** Specified 2026-10-17: *Continue debugging* starts a new turn that sees only the last eight messages, so a reporting request was lost after one stop and three continuations drifted into debugging a worktree. At the round limit the turn now pauses as a `round_budget` approval, persisted like any `PendingChatTurn`, and *Continue* resumes the same task with every message and plan step, or *Answer now* makes the forced final call. Pausing before the forced call saves the call that was being thrown away. Hard-bounded by `ABSOLUTE_TURN_ROUND_CAP`; completes #47 requirement 6 for users without a token ceiling. |
 | 62 | [62_approval_prompts_name_the_reason/](62_approval_prompts_name_the_reason/proposal.md) | **In progress** (started 2026-10-18). Tasks 1–2 of 7 done: `command_policy.rs` gains the closed `ApprovalCause` enum and `CommandClassification.causes`, and `reasons` is rendered from it, so every classifier branch and escalation names its cause as a value — including the `Network`/`HighRisk` split and `Blocklisted`/`Destructive`; the `Setting`/`ProfileBlocked` causes name the `require_approval_for_*` key (with its user/repository/profile source, threaded from the `RepositoryConfigReport`) and the `command_access` block respectively. See `tasks.md` for the remaining tasks. Specified 2026-10-17: every approval said "because it cannot run in sandbox mode", and there is no sandbox. The classifier returns structured `ApprovalCause`s, the prompt's first line names the deciding one (which shell control, which keyword, which setting and who set it), the model's own reason is shown beside it, and "sandbox" leaves every user- and model-facing string. Changes no approval decision. |
 | 63 | [63_exploratory_command_failures/](63_exploratory_command_failures/proposal.md) | **In progress** (started 2026-10-17). Tasks 1–5 of 6 done. Commands get a purpose (check, exploration, other) that never influences approval; a failed exploration command records no finding and blocks no plan step, while checks and unknown commands behave as today. Prompted by a zsh glob error and an `ls` of a missing directory becoming open **error** findings; the model is now told its shell and zsh's glob rule. |
-| 64 | [64_read_only_command_boundary.md](64_read_only_command_boundary.md) | **In progress** (started 2026-10-17): every requirement is implemented (requirement 5 shipped 2026-10-18 once #60 landed); the §5.7 documentation (user guide, security, troubleshooting) remains before Done. Found the read-only list is not read-only (`git diff --output=<file>` writes) and replaces the prefix match with a tokenizer, per-program option lists and `PathPolicy` checks on every path argument. It then admits `cd <dir> &&` and `&&`/`|` pipelines of admitted commands into stdin-only filters. |
+| 64 | [64_read_only_command_boundary.md](64_read_only_command_boundary.md) | **Done 2026-10-23.** Found the read-only list is not read-only (`git diff --output=<file>` writes) and replaces the prefix match with a tokenizer, per-program option lists and `PathPolicy` checks on every path argument. It then admits `cd <dir> &&` and `&&`/`|` pipelines of admitted commands into stdin-only filters, and the §5.7 documentation (user guide, security, troubleshooting) was written to close it. |
 | 65 | [65_exploration_memory_within_a_turn.md](65_exploration_memory_within_a_turn.md) | **Not started — the next priority after #59.** Specified 2026-10-18, revised 2026-10-19. `bounded_messages` sends only the last ~7 rounds, so in a long turn most of what the agent read is gone before it answers. Adds a `turn_notes` tool whose bounded text (default 8,000 characters, restrict-only) is pinned after the seed, never elided, and carried into the next turn of the session. Requirement 8, the budget interaction, waits for #59. |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order

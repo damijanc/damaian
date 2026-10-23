@@ -782,7 +782,53 @@ characters.
 
 When the assistant needs a local command result, it asks Damaian to run the command. Read-only commands Damaian recognises, such as `pwd`, `ls`, `git status`, and `git log`, run without asking, in the selected working folder. They are not sandboxed: they run directly on your machine, which is why only commands Damaian classifies as read-only qualify. Simple pipelines made only of such commands, filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, or `grep`, also run without asking. Damaian redacts the output and sends it back to the model so it can finish answering.
 
-`git diff` and `git show` ask first, because they print file contents a command line cannot bound or keep restricted paths out of. The assistant reads changes through its own diff tool instead, which does both.
+### What runs without asking
+
+A command runs without asking only when Damaian can prove it is read-only. A
+shell tokenizer splits it into words with no expansion — no `$`, no backtick, no
+unquoted `*`, `?`, `[`, `{` or `~` — so what was checked is exactly what the
+shell will run. Each program then takes only a closed list of options, and every
+path argument is checked against the repository. Anything outside that shape
+asks for approval.
+
+| Program | Admitted form |
+|---|---|
+| `pwd` | alone |
+| `ls` | `-a`, `-l`, `-1`, `-d`, `-h`, `-R`, and paths, alone or combined; `-R` only with a path that is not the repository root |
+| `git status` | `--short`/`-s`, `--porcelain`, `--porcelain=v1`, `--branch`/`-b`, `--untracked-files=no` |
+| `git log` | `--oneline`, `-n N` (or `-nN`, `-N`), `--max-count=N`, `--stat`, `--name-only`, `--name-status`, `--format=…`, `--pretty` or `--pretty=…`, `--decorate`, `--graph`, revisions and paths — but not `-p`, `--patch` or `-u` |
+| `git diff`, `git show` | not admitted — they print file contents a command line cannot bound or keep restricted paths out of; the assistant reads them through the `read_git_diff` tool instead |
+| `git` (global) | `--no-pager` only |
+
+Every path in an admitted command is resolved against the repository and
+`restricted_patterns`: a path outside the repository, behind a symlink, or
+inside a restricted directory such as `secrets/` asks for approval, and so does
+a command whose working directory is restricted. `ls -R` also needs a path that
+is not the repository root, so a recursive listing cannot walk into restricted
+directories unasked. A restricted entry inside a directory you named is still
+listed by name — `ls` is not policed per entry the way the `list_directory` tool
+is.
+
+### Read-only pipelines
+
+A pipeline runs without asking when it is built only from those commands and a
+small set of filters, joined by `&&` and `|`. It may begin with `cd <dir> &&`,
+where `<dir>` is inside the repository, not restricted, and exists. Each command
+before a `|` must itself be an admitted command from the table, checked against
+the directory it will run in. Each command after a `|` must be a filter that
+reads only its input, with no file argument:
+
+- `head -n N`, `tail -n N`
+- `wc` with `-l`, `-w` or `-c`
+- `sort` with `-r`, `-n` or `-u`
+- `uniq` with `-c`
+- `cut` with `-d` and `-f`
+- `grep` with `-i`, `-v`, `-n`, `-c`, `-E` or `-F` and one pattern
+
+So `git log --oneline | grep -i fix | wc -l` and
+`cd crates && git status --short | head -n 3` run without asking. `git status;
+rm x`, `git log > out.txt` and `ls | xargs cat` do not: `;`, `>` and a filter
+with a file argument are outside the admitted shape.
 
 Every other command appears as an approval card in the conversation. Review the command, risk, and working directory (the reason is under **Why this command**), then select **Approve** or **Reject**. Destructive commands blocked by policy cannot be approved from the UI.
 
