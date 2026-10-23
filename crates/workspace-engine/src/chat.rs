@@ -45,7 +45,7 @@ use crate::web_diagnostics::{
 };
 use crate::worktree_access::resolve_worktree;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2200,6 +2200,10 @@ impl ChatOrchestrator {
         // The per-turn read allowance (spec 59 §5.2). It is fixed for the turn
         // and never extended by a continuation, so it is computed once here.
         let max_exploration_rounds = self.default_exploration_round_limit();
+        // The turn's already-dispatched read calls (spec 59 §5.3), keyed by the
+        // canonical form below. It lives for one turn: a resumed turn starts
+        // with an empty set, and a round that writes clears it.
+        let mut seen_read_calls: HashSet<Vec<String>> = HashSet::new();
         let (final_run, response, proposals, stop_reason) = loop {
             // Spec 57 §5.4, in its order: a pause holds here, before the
             // cancel check, so a stop that arrives while paused ends the turn
@@ -2723,16 +2727,33 @@ impl ChatOrchestrator {
             }
 
             // §5.1: a round is exploration when every decoded call is a read,
-            // nothing in it failed to decode, none is a repeat (repeat detection
-            // lands in a later task, so today nothing is a repeat), and the
+            // nothing in it failed to decode, none is a repeat (§5.3), and the
             // allowance has room. Classification uses `action_effect` and
             // nothing else, so a new `ToolAction` variant's effect is also its
             // budget decision.
+            //
+            // The canonical keys are computed once here and remembered for the
+            // dispatch below, so a call is not resolved twice and a batch and a
+            // sequential round agree on what counts as the same call.
+            let read_call_keys: Vec<Option<Vec<String>>> = calls_this_round
+                .iter()
+                .map(|(_, action)| self.read_call_key(repository_root, action))
+                .collect();
+            let repeats_a_seen_call = {
+                // A duplicate inside this round is a repeat too: two identical
+                // calls in one round make it an action round.
+                let mut this_round = HashSet::new();
+                read_call_keys
+                    .iter()
+                    .flatten()
+                    .any(|key| seen_read_calls.contains(key) || !this_round.insert(key))
+            };
             let round_is_exploration = !calls_this_round.is_empty()
                 && undecodable_calls.is_empty()
                 && calls_this_round
                     .iter()
                     .all(|(_, action)| matches!(action_effect(action), ActionEffect::ReadOnly))
+                && !repeats_a_seen_call
                 && exploration_rounds < max_exploration_rounds;
 
             // Every decoded call runs, in the order the model made them. A
@@ -2764,6 +2785,10 @@ impl ChatOrchestrator {
                 None
             };
             let mut terminal: Option<(ModelRun, String, TurnProposals, StopReason)> = None;
+            // Whether this round ran something that changes what a read
+            // reports, so the seen-call set is cleared once the round completes
+            // (spec 59 §5.3).
+            let mut wrote_this_round = false;
             // Index in `messages` of this round's one assistant message, once
             // its first call has run. Later calls join it (spec 03 §7): a
             // response is one assistant turn, whatever number of calls it made.
@@ -2924,6 +2949,18 @@ impl ChatOrchestrator {
                     .err(),
                     _ => None,
                 };
+                // Captured before the dispatch match consumes `tool_action`.
+                // A denied call never dispatched, so it is not a seen call;
+                // a read that failed on its own (a missing file, a refused
+                // path) did, and still counts.
+                let dispatched_read_key =
+                    if permission.is_allowed() && action_is_batchable_read_only(&tool_action) {
+                        read_call_keys[index].clone()
+                    } else {
+                        None
+                    };
+                let writes_this_call = permission.is_allowed()
+                    && matches!(action_effect(&tool_action), ActionEffect::WritesRepository);
                 let (assistant_summary, tool_result_text, action_outcome) = if !permission
                     .is_allowed()
                 {
@@ -3517,6 +3554,16 @@ impl ChatOrchestrator {
                         .finish_action(action_marker, "cancelled")?;
                     break;
                 }
+                // §5.3: a dispatched read joins the turn's seen-call set, so an
+                // identical call in a later round is a repeat. A write marks the
+                // round to clear the set once it completes: checking Git state
+                // again after changing it is verification, not a loop.
+                if let Some(key) = dispatched_read_key {
+                    seen_read_calls.insert(key);
+                }
+                if writes_this_call {
+                    wrote_this_round = true;
+                }
                 // Accrued before the marker is consumed, since the marker id is
                 // what ties this evidence back to the action in the log. Evidence
                 // belongs to whichever step is open; with no plan there is nothing
@@ -3638,10 +3685,18 @@ impl ChatOrchestrator {
                 messages.push(ModelMessage::user(note.clone()));
             }
 
+            // §5.3: a write changes the state Git and file reads report, so
+            // checking it again in a later round is the ordinary verify step.
+            // A terminal round breaks above and never reaches here; every
+            // resume starts with an empty set anyway.
+            if wrote_this_round {
+                seen_read_calls.clear();
+            }
+
             // §5.2: the round is charged to whichever budget classification
             // chose. `round_is_exploration` already required every decoded call
-            // to be a read, no undecodable call, and room in the allowance, so
-            // this is the whole charging rule.
+            // to be a read, no undecodable call, no repeat, and room in the
+            // allowance, so this is the whole charging rule.
             if round_is_exploration {
                 exploration_rounds += 1;
             } else {
@@ -4117,6 +4172,191 @@ impl ChatOrchestrator {
             classification.as_ref(),
             read_only_hint,
         )
+    }
+
+    /// The canonical identity of a read-only call for repeat detection
+    /// (spec 59 §5.3). `None` means the tool has no row in the proposal's table
+    /// and is therefore never a repeat — the err-toward-exploration direction
+    /// §5.3 requires, so a new read tool cannot silently start being policed
+    /// before its arguments are considered.
+    fn read_call_key(&self, repository_root: &Path, action: &ToolAction) -> Option<Vec<String>> {
+        match action {
+            ToolAction::ReadFile {
+                path,
+                range,
+                worktree,
+            } => {
+                let (checkout, root) =
+                    self.read_call_checkout(repository_root, worktree.as_deref());
+                let mut key = vec![
+                    "read_file".to_string(),
+                    checkout,
+                    self.read_call_path(&root, path),
+                ];
+                match range {
+                    Some(range) => key.extend([
+                        "range".to_string(),
+                        range.start.to_string(),
+                        range.end.to_string(),
+                    ]),
+                    None => key.push("no-range".to_string()),
+                }
+                Some(key)
+            }
+            ToolAction::ListDirectory {
+                dir,
+                depth,
+                worktree,
+            } => {
+                let (checkout, root) =
+                    self.read_call_checkout(repository_root, worktree.as_deref());
+                // An omitted `dir` is the checkout root, so it keys the same as
+                // an explicit `.` (§5.3).
+                let mut key = vec![
+                    "list_directory".to_string(),
+                    checkout,
+                    self.read_call_path(&root, dir.as_deref().unwrap_or(".")),
+                ];
+                match depth {
+                    Some(depth) => key.extend(["depth".to_string(), depth.to_string()]),
+                    None => key.push("no-depth".to_string()),
+                }
+                Some(key)
+            }
+            ToolAction::SearchContent {
+                pattern,
+                path_glob,
+                max_matches,
+                worktree,
+            } => {
+                let (checkout, root) =
+                    self.read_call_checkout(repository_root, worktree.as_deref());
+                let mut key = vec!["search_content".to_string(), checkout, pattern.clone()];
+                match path_glob {
+                    Some(glob) => {
+                        key.extend(["glob".to_string(), self.read_call_path(&root, glob)]);
+                    }
+                    None => key.push("no-glob".to_string()),
+                }
+                match max_matches {
+                    Some(cap) => key.extend(["max".to_string(), cap.to_string()]),
+                    None => key.push("no-max".to_string()),
+                }
+                Some(key)
+            }
+            ToolAction::SearchCodebase {
+                query,
+                semantic,
+                limit,
+            } => Some(vec![
+                "search_codebase".to_string(),
+                query.clone(),
+                semantic.to_string(),
+                limit.to_string(),
+            ]),
+            ToolAction::ReadGitStatus { worktree } => {
+                let (checkout, _) = self.read_call_checkout(repository_root, worktree.as_deref());
+                Some(vec!["read_git_status".to_string(), checkout])
+            }
+            ToolAction::ReadGitDiff {
+                staged,
+                worktree,
+                paths,
+                stat,
+                base,
+            } => {
+                let (checkout, root) =
+                    self.read_call_checkout(repository_root, worktree.as_deref());
+                // Path order does not change the diff, so the key sorts the
+                // resolved paths; every other argument changes what it returns.
+                let mut paths: Vec<String> = paths
+                    .iter()
+                    .map(|path| self.read_call_path(&root, path))
+                    .collect();
+                paths.sort();
+                let mut key = vec![
+                    "read_git_diff".to_string(),
+                    checkout,
+                    format!("staged:{staged}"),
+                    format!("stat:{stat}"),
+                ];
+                match base {
+                    Some(base) => key.extend(["base".to_string(), base.clone()]),
+                    None => key.push("no-base".to_string()),
+                }
+                key.push("paths".to_string());
+                key.extend(paths);
+                Some(key)
+            }
+            ToolAction::ListWorktrees { base } => {
+                let mut key = vec!["list_worktrees".to_string()];
+                match base {
+                    Some(base) => key.extend(["base".to_string(), base.clone()]),
+                    None => key.push("no-base".to_string()),
+                }
+                Some(key)
+            }
+            ToolAction::ReadGitLog {
+                worktree,
+                base,
+                max_count,
+            } => {
+                let (checkout, _) = self.read_call_checkout(repository_root, worktree.as_deref());
+                let mut key = vec!["read_git_log".to_string(), checkout];
+                match base {
+                    Some(base) => key.extend(["base".to_string(), base.clone()]),
+                    None => key.push("no-base".to_string()),
+                }
+                match max_count {
+                    Some(count) => key.extend(["max".to_string(), count.to_string()]),
+                    None => key.push("no-max".to_string()),
+                }
+                Some(key)
+            }
+            _ => None,
+        }
+    }
+
+    /// The checkout a read call names, as spec 60's resolver canonicalizes it,
+    /// together with the root its paths are resolved against. `None` is the
+    /// session's checkout. A refused `worktree` is kept as given, so a model
+    /// retrying the same refused argument is still caught (§5.3).
+    fn read_call_checkout(
+        &self,
+        repository_root: &Path,
+        worktree: Option<&str>,
+    ) -> (String, PathBuf) {
+        match worktree {
+            None => (
+                "checkout:session".to_string(),
+                repository_root.to_path_buf(),
+            ),
+            Some(requested) => {
+                match resolve_worktree(&self.git, &self.path_policy, repository_root, requested) {
+                    Ok(worktree) => match worktree.canonical {
+                        Some(canonical) => (format!("checkout:{}", canonical.display()), canonical),
+                        None => (
+                            format!("checkout-as-given:{requested}"),
+                            repository_root.to_path_buf(),
+                        ),
+                    },
+                    Err(_) => (
+                        format!("checkout-as-given:{requested}"),
+                        repository_root.to_path_buf(),
+                    ),
+                }
+            }
+        }
+    }
+
+    /// A read path as `PathPolicy` resolves it relative to its checkout. A path
+    /// the policy refuses is kept as given: a retry of the same refused path is
+    /// still the same call.
+    fn read_call_path(&self, checkout: &Path, requested: &str) -> String {
+        self.path_policy
+            .resolve_existing(checkout, requested, false)
+            .map(|resolved| resolved.relative_path)
+            .unwrap_or_else(|_| requested.to_string())
     }
 
     /// Dispatch one of the read-only tools. Shared by the sequential path (a

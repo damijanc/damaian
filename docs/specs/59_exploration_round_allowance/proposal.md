@@ -1,8 +1,8 @@
 # Feature Spec: Exploration Round Allowance
 
-Status: In progress. Tasks 1–2 of 6 done (2026-10-18, 2026-10-23) — the
+Status: In progress. Tasks 1–3 of 6 done (2026-10-18, 2026-10-23) — the
 `agent_max_exploration_rounds` config key, then round classification and the two
-counters; see [`tasks.md`](tasks.md). Specified on 2026-10-17 from a session that ran out of tool
+counters, then repeat detection; see [`tasks.md`](tasks.md). Specified on 2026-10-17 from a session that ran out of tool
 rounds on a reporting-only request; the evidence is in
 [`context.md`](context.md) §1. Planned on 2026-10-18; §2, §5.2 and §5.5
 re-planned on 2026-10-23 against spec 61's round-budget pause, which landed
