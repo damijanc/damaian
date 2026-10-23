@@ -1029,6 +1029,25 @@ or a whole check that failed in a way Damaian could not take apart. Findings
 come from the checks the assistant runs during a conversation and from its
 browser diagnostics. They belong to the session.
 
+Every command the assistant runs has a **purpose**, and the purpose decides
+whether a failure becomes a finding.
+
+- **Check** commands produce findings. A check is a detected project
+  validation (`cargo test`, `npm run lint`), a command the command policy
+  knows as a validation, or one whose output a finding parser reads
+  (`cargo build`, `cargo check`, `cargo clippy`, Biome).
+- **Exploration** commands do not. These are the assistant looking around:
+  searches (`grep`, `rg`, `find`), listings (`ls`, `pwd`, `du`, `stat`,
+  `file`), text reads (`cat`, `head`, `tail`, `wc`, `sed -n`, `awk`, `sort`,
+  `uniq`, `cut`, `echo`, `true`), and git reads (`status`, `diff`, `log`,
+  `show`, `rev-list`, `rev-parse`, `branch --list`, `worktree list`,
+  `ls-files`, `grep`), including pipelines and `&&`/`||`/`;` chains of those,
+  with a leading `cd <dir>` ignored. A search that matched nothing or a path
+  that does not exist is an answer, not a problem in your code, so its output
+  still reaches the assistant and no finding is recorded.
+- **Other** commands, including any command Damaian does not recognise,
+  produce findings as a check does.
+
 ### Fix N errors, and the findings list
 
 When the session has open findings, the [repo bar](#the-repo-bar) above the

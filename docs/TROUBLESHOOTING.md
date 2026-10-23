@@ -869,10 +869,11 @@ Known quirks:
 
 ### Findings
 
-A check the assistant runs inside a turn (a sandbox command, or one you
+A command the assistant runs inside a turn (a sandbox command, or one you
 approved) and every browser diagnostic turn their failures into findings,
-which the **Findings** panel shows. A command run from outside a conversation
-(`/api/run-command` with no session) records none.
+which the **Findings** panel shows — except an exploration command (see below).
+A command run from outside a conversation (`/api/run-command` with no session)
+records none.
 
 **Parsed structurally:**
 
@@ -890,6 +891,23 @@ whose parser found no error in output that failed. **How to tell:** source
 and nothing else is. Its summary names the command and its first output line,
 and its details are the last 40 lines of stderr then stdout. A cancelled check
 gets no generic finding, because it never reached a verdict.
+
+**A failed command recorded no finding.** Its purpose was **exploration** — a
+search, a listing, a text read, or a git read, including pipelines of those.
+`grep` exits 1 when nothing matches and `ls -d` exits 1 for a path that does
+not exist; Damaian treats either as the answer the assistant asked for, keeps
+the output in the tool result, and files no finding. The list of commands that
+count as exploration is in [USER_GUIDE.md](USER_GUIDE.md#findings). The
+purpose is decided once, when the command is proposed, and stored: `purpose`
+on the `command_executed` and `stored_command_executed` audit events, the
+`PURPOSE` field of the stored proposal and `summary.dcmd`, and the plan's
+`CommandExit` evidence. A `check` or `other` command still records findings,
+and a record written before purposes existed reads as `other`, so it keeps
+the old behaviour. To see what one execution was recorded as:
+
+```bash
+jq -c 'select(.eventType=="command_executed") | {command, exitCode, purpose}' "$DATA_DIR/audit/events.jsonl"
+```
 
 **Where full output lives.** A finding's `details` is a bounded excerpt (at
 most 4096 bytes, redacted). For a command, `originRef` is the execution id,
