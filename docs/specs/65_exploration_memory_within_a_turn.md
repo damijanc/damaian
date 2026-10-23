@@ -19,8 +19,8 @@ Depends on: [#47](47_agent_working_capability/proposal.md) (the read tools,
 built; [#34](34_repository_config_trust_boundary.md) (scope classes for the new
 key) — built. Requirement 8 also depends on
 [#59](59_exploration_round_allowance/proposal.md) (the exploration allowance
-and its repeat rule) — in progress, Task 1 of 6 done; everything else in this
-spec can be built without it. Everything else named below is a
+and its repeat rule) — built 2026-10-23; everything else in this spec can be
+built without it. Everything else named below is a
 cross-reference, not a prerequisite.
 Related implementation specs:
 [`55_conversation_compaction.md`](55_conversation_compaction.md) (summarises a

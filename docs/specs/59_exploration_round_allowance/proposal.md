@@ -1,14 +1,14 @@
 # Feature Spec: Exploration Round Allowance
 
-Status: In progress. Tasks 1–5 of 6 done (2026-10-18 to 2026-10-23) — the
+Status: Done 2026-10-23. Tasks 1–6 of 6 done (2026-10-18 to 2026-10-23) — the
 `agent_max_exploration_rounds` config key, then round classification and the two
 counters, then repeat detection, then the progress fields and both budget
-messages, then the audit fields and the two eval scenarios; see
-[`tasks.md`](tasks.md). Specified on 2026-10-17 from a session that ran out of tool
-rounds on a reporting-only request; the evidence is in
-[`context.md`](context.md) §1. Planned on 2026-10-18; §2, §5.2 and §5.5
-re-planned on 2026-10-23 against spec 61's round-budget pause, which landed
-first (`tasks.md` C8–C10).
+messages, then the audit fields and the two eval scenarios, then the docs, the
+live re-run and close-out; see [`tasks.md`](tasks.md). Specified on 2026-10-17
+from a session that ran out of tool rounds on a reporting-only request; the
+evidence is in [`context.md`](context.md) §1. Planned on 2026-10-18; §2, §5.2
+and §5.5 re-planned on 2026-10-23 against spec 61's round-budget pause, which
+landed first (`tasks.md` C8–C10).
 Order: 59 of 59
 Plan: none. Like [#47](../47_agent_working_capability/proposal.md), this spec is
 evidence-driven rather than a roadmap graduation — an exception to the rule in
@@ -430,4 +430,37 @@ needs no change unless that has changed by then.
 
 ## 7. Implementation Notes
 
-None yet.
+The per-task record is in [`tasks.md`](tasks.md), including each deliberate
+deviation, the falsification that checked the load-bearing tests, and the
+scoped check results.
+
+- Classification reads `action_effect` and nothing else, so spec 60's read
+  tools — including `list_worktrees` and `read_git_log`, which landed with its
+  Task 4 — became exploration rounds without a tool-name list.
+- The allowance is per turn. `PendingChatTurn.exploration_rounds`
+  (`#[serde(default)]`) carries it across every pause, so *Continue*, a
+  command approval and a plan review all keep the count instead of refreshing
+  it.
+- Repeat detection keys each read by its checkout and canonical arguments, and
+  a round that dispatches a write clears the seen-call set. Two rounds of the
+  live re-run below were charged as action rounds for repeating a read, not
+  because they ran anything.
+- Live re-run (Task 6, 2026-10-23). The motivating prompt, verbatim, against
+  `deepseek-v4-flash` on this repository with native tools on and default
+  budgets: it completed in 13 model calls with **ten read-only rounds and two
+  action rounds**, no round-budget pause and no approval stop. Usage:
+  1,132,515 input tokens (927,232 served from cache, 82%), 8,937 output. The
+  24-round allowance was ample; the repeated reads that became action rounds
+  are the intended bound working. The turn was driven in-process because
+  `damaian ask` cannot resume an approval or a pause; that temporary driver was
+  removed after the run.
+- Task 6's docs also corrected the pre-existing claim that
+  `agent_max_tool_rounds` was the only bound with no token ceiling set; the
+  read-only allowance is a second one.
+- Out of scope, observed during the live run: one line of `audit/events.jsonl`
+  held two concatenated JSON objects (two `git_log_read` records with the same
+  timestamp, from reads dispatched together), so the file was not one event per
+  line at that point. It does not affect this spec's result, but the audit
+  log's line framing deserves its own look.
+- The full seven-check gate is left to CI; the scoped checks that ran locally
+  are recorded in `tasks.md`.

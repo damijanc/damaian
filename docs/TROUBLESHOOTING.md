@@ -664,9 +664,10 @@ Event types grouped by what they tell you:
 
 Useful reads:
 
-- `model_request_prepared` carries `contextFiles`, `tokenEstimate`, and
-  `toolRound` — the fastest way to confirm what the model actually saw, and how
-  many tool rounds a turn took.
+- `model_request_prepared` carries `contextFiles`, `tokenEstimate`,
+  `toolRound`/`toolRoundLimit` and `explorationRounds`/`explorationLimit` —
+  the fastest way to confirm what the model actually saw, how many action and
+  read-only rounds a turn took, and where its budget stood.
 - `model_response_completed.status` distinguishes `complete`,
   `complete_with_sandbox_command`, `command_approval_required`, and
   `patch_proposal_ready`. A turn that "did nothing" usually ended `complete`
@@ -988,36 +989,47 @@ themselves.
 ### A turn stopped early: which budget ran out
 
 What happens at `agent_max_tool_rounds` (default 8) depends on whether a token
-ceiling is set ([spec 61](specs/61_continue_the_stopped_turn/proposal.md)):
+ceiling is set ([spec 61](specs/61_continue_the_stopped_turn/proposal.md)).
+That budget counts **action rounds**. A round in which every call was a read —
+`read_file`, `list_directory`, `search_content`, `search_codebase`,
+`read_git_status`, `read_git_diff`, `list_worktrees` or `read_git_log` — and no
+call repeats an earlier one is a **read-only round**, charged to
+`agent_max_exploration_rounds` (default 24, ceiling 32) instead
+([spec 59](specs/59_exploration_round_allowance/proposal.md)). Spending that
+allowance never pauses a turn; later reads are action rounds.
+`agent_max_exploration_rounds=0` restores the behaviour where every round is
+charged to `agent_max_tool_rounds`.
 
-- **No `agent_max_task_tokens` (the default).** When the turn reaches its round
-  budget and the model still wants a tool, the turn **pauses** instead of
-  stopping. The task goes to `waiting_for_approval` on a
+- **No `agent_max_task_tokens` (the default).** When the turn reaches its
+  action-round budget and the model still wants a tool, the turn **pauses**
+  instead of stopping. The task goes to `waiting_for_approval` on a
   `chat/pending/roundbudget_<id>.json` proposal with
-  `PendingApprovalRef.kind = "round_budget"`, and the conversation says how
-  many of the turn's rounds it used. **Continue — N more** grants the same turn
-  another `agent_max_tool_rounds` and replays its saved messages, tool results
-  and plan; **Answer now** makes one final call with tools dropped. A turn
-  never runs past 64 rounds in all: at that cap only Answer now is offered.
+  `PendingApprovalRef.kind = "round_budget"`, and the conversation names how
+  many action rounds it used and how many read-only rounds it had used.
+  **Continue — N more** grants the same turn another
+  `agent_max_tool_rounds` and replays its saved messages, tool results and
+  plan; **Answer now** makes one final call with tools dropped. A turn never
+  runs past 64 action rounds in all: at that cap only Answer now is offered.
 - **With `agent_max_task_tokens` set.** The turn continues on its own,
   another `agent_max_tool_rounds` at a time, and records `turn_continued` each
-  time, until the token ceiling stops it or it reaches 16 rounds. At 16 rounds
-  it pauses as above.
+  time, until the token ceiling stops it or it reaches 16 action rounds. At 16
+  rounds it pauses as above.
 
 Two terminal statuses look alike in the UI and mean different things:
 
 - `tool_budget_exhausted` — written only after **Answer now**, when the final
   call still asked for a tool instead of answering. The UI shows **Tool budget
   exhausted** with **Ask again**, which starts a new turn from the stopped
-  task's request.
+  task's request, and the reply names both the action and read-only counts.
 - `token_budget_exhausted` — the turn reached `agent_max_task_tokens`, which is
   **per turn**, not per session. Nothing is wrong; it cost more than the cap
   allows.
 
 A paused turn is in the audit log as `round_budget_paused` (`proposalId`,
-`roundsUsed`, `roundsTotal`). The answer is `round_budget_decision` with
-`decision` `continue` or `answer_now`, and a Continue also writes
-`turn_budget_extended` with the rounds granted and the running total:
+`roundsUsed`, `roundsTotal`, `explorationRounds`, `explorationLimit`). The
+answer is `round_budget_decision` with `decision` `continue` or `answer_now`,
+and a Continue also writes `turn_budget_extended` with the rounds granted and
+the running total:
 
 ```bash
 jq -c 'select(.eventType|test("^(round_budget_|turn_budget_extended|turn_continued)"))' "$DATA_DIR/audit/events.jsonl"
