@@ -1,7 +1,9 @@
 # Feature Spec: Symbol and Relationship Index
 
-Status: In progress. Tasks 1–10 of 11 done (started 2026-10-13); see
-[`tasks.md`](tasks.md). Split into a folder and planned on 2026-10-09, re-checked
+Status: Done 2026-10-23 (started 2026-10-13). Tasks 1–11 of 11 done; see
+[`tasks.md`](tasks.md). §7 records the acceptance evidence, the measurements,
+the three `chat.rs` pieces that remain deferred, and where the eager definition
+pass starts (closed by the Task 11 follow-up). Split into a folder and planned on 2026-10-09, re-checked
 against `main` on 2026-10-12. Design unchanged from the original flat spec. Corrections where it no
 longer matches the code are in [`context.md`](context.md), not inlined here,
 the way specs 22, 24 and 31 kept theirs. The most important ones:
@@ -443,14 +445,142 @@ category with its own budget, so symbol results do not crowd out file content.
 
 ## 7. Implementation Notes
 
-To be completed during implementation. Record:
+Written in Task 11 (2026-10-23). The per-task record is
+[`tasks.md`](tasks.md)'s progress table; the decisions that replaced parts of
+§5 are in [`context.md`](context.md).
 
-- Which language servers were tested, and the measured `documentSymbol` latency
-  per file on a medium repository — this is the number that decides whether
-  eager definition indexing is viable as specified.
-- Heuristic symbol accuracy per language against the fixtures, before and after
-  the §5.3 improvements. If comment-skipping and `impl` handling do not move
-  Rust accuracy materially, say so — it changes whether a real parser is worth a
-  later work package.
-- Symbol index size on disk relative to the vector index, for the same
-  repository.
+### 7.1 Acceptance criteria and the tests that prove them
+
+Engine tests are in `crates/workspace-engine/tests/symbol_index.rs` unless
+another file is named. The pure LSP protocol tests are in `lsp.rs`'s
+`#[cfg(test)]` module; shell tests are in the `tests` module of
+`crates/desktop-shell/src/lib.rs`.
+
+| §6 criterion | Proved by | State |
+|---|---|---|
+| Searching for a symbol returns its definition with an exact file and line, in both tiers | Heuristic: `a_lookup_returns_the_definition_at_its_exact_path_and_line`, `the_engine_finds_symbols_from_the_stored_index`, shell `symbols_endpoint_serves_matches_with_provenance_and_their_root`. Language server: `a_server_that_covers_one_file_supersedes_it_and_heuristics_elsewhere_survive`, and the app path `a_symbol_search_starts_the_pass_without_waiting_and_the_next_read_sees_it` | Met. `/api/symbols` calls `WorkspaceEngine::symbol_search`, which reads the current snapshot and starts the eager pass; the first response is heuristic and the next read sees the server's definition (§7.4) |
+| Symbol kind is recorded, and a Rust method inside an `impl` block is `Method` with its container | `rust_declarations_match_the_fixture` (the fixture's `impl` methods are expected as `Method` with their type), `typescript_declarations_match_the_fixture` … `php_declarations_match_the_fixture`, `heuristic_accuracy_per_language` | Met |
+| A declaration inside a comment or a string literal is not indexed — asserted by fixture | All eight `*_declarations_match_the_fixture` tests; each fixture contains comment, block-comment and string declarations that its expected table omits | Met |
+| Every symbol and relationship carries `Provenance`, and a heuristic item is labelled in the UI **and** in rendered model context | `with_no_language_server_every_symbol_and_relation_is_heuristic` (types and every built item); `a_prompt_naming_a_symbol_gets_one_hedged_symbols_item_after_the_map` (the rendered context string contains `heuristic — may be inaccurate`); `a_language_server_symbol_is_rendered_without_the_hedge`. The UI's `likely` marker and its hover text were verified by hand against the running shell in Task 10 | Met. The UI half has **no automated test**: the web UI has no JS test harness, the same limit spec 24 recorded for its chips |
+| An unresolvable import is `External` with its raw specifier, never a file edge | `relative_imports_resolve_to_indexed_files_and_the_rest_stay_external` | Met |
+| A relative import resolves to a repository file where one exists | `relative_imports_resolve_to_indexed_files_and_the_rest_stay_external` | Met |
+| Killing a language server mid-task degrades to heuristics without failing the task, and the task completes | `a_server_that_exits_halfway_stops_the_pass_and_nothing_else` (a mock-model turn started during the pass completes), `a_server_that_crashes_twice_is_restarted_once_and_then_left_down`, `a_server_that_never_answers_costs_one_timeout_per_file_and_never_delays_a_reader` | Met |
+| With no language server configured, extraction works and every item is `Heuristic` | `with_no_language_server_every_symbol_and_relation_is_heuristic`; `with_no_language_server_configured_nothing_is_launched_or_recorded` | Met |
+| A server that indexes part of the repository does not make heuristic symbols elsewhere disappear | `a_server_that_covers_one_file_supersedes_it_and_heuristics_elsewhere_survive`, `the_same_name_in_another_file_is_not_superseded` | Met |
+| A repeatedly crashing server is not restarted in a loop | `a_server_that_crashes_twice_is_restarted_once_and_then_left_down` | Met |
+| No server process outlives the session that started it, and a PID whose start time no longer matches is not killed | `a_running_server_has_one_registry_entry_until_shutdown_all`, `an_idle_server_is_stopped_and_its_entry_removed`, `a_language_server_entry_whose_start_time_does_not_match_is_not_killed` | Met with `context.md` §3's restatement: sessions have no close event, so a server lives for the Damaian process or ten idle minutes, and the shell calls `shutdown_all` on exit. The Tauri app's own exit path does not call it; EOF on stdin usually ends a server, and the next launch's sweep covers the rest (§7.4) |
+| LSP diagnostics appear as `Finding`s with `source: language_server` and a range, and do not block a plan step | `diagnostics_are_recorded_once_with_one_based_ranges_and_a_clearing_set_removes_nothing`, `a_diagnostic_on_a_restricted_file_or_outside_the_repository_is_never_recorded`, `a_language_server_error_leaves_the_active_plan_step_unchanged`, shell `get_findings_returns_a_language_server_diagnostic`, and the app path `a_symbol_search_lets_a_configured_server_publish_a_finding` | Met. The pass sends `didOpen` before `documentSymbol`, the hub routes the diagnostic, and `GET /api/findings` records it through `record_language_server_findings` with no task (§7.4) |
+| References are resolved on demand and a cached set is discarded when a file's hash changes | `references_are_language_server_relations`, `a_second_reference_call_is_served_from_the_cache`, `editing_a_referencing_file_discards_the_cache_and_asks_again`, `implementations_are_language_server_relations`, `without_a_language_server_references_are_unavailable_and_not_guessed` | Met |
+| A corrupt or version-mismatched index rebuilds cleanly and reports it | `a_garbage_index_file_is_rebuilt_as_corrupt_and_audited`, `an_index_from_another_schema_version_is_rebuilt_as_a_mismatch`, `an_index_of_another_repository_is_rebuilt_as_corrupt` | Met |
+| Symbol accuracy fixtures pass for each supported language | `rust_declarations_match_the_fixture`, `typescript_declarations_match_the_fixture`, `javascript_declarations_match_the_fixture`, `python_declarations_match_the_fixture`, `go_declarations_match_the_fixture`, `java_declarations_match_the_fixture`, `kotlin_declarations_match_the_fixture`, `php_declarations_match_the_fixture` | Met |
+| Every quality-gate command passes, and the spec 18 baseline shows no regression | The Task 11 scoped runs recorded in `tasks.md`; the full seven-command gate is CI's job under `AGENTS.md` | **Pending CI.** Scoped checks and the deterministic eval tier pass locally: 19/19 scenarios, 268,808 estimated tokens against Task 8's 268,839 and the 101,963 baseline of 2026-09-18, whose staleness Task 8 documented |
+
+### 7.2 Recording questions
+
+**Language servers tested: none.** Checked again on 2026-10-23:
+`~/.cargo/bin/rust-analyzer` is still the rustup proxy and answers "Unknown
+binary 'rust-analyzer' in official toolchain"; `typescript-language-server`,
+`pyright-langserver` and `gopls` are not on `PATH`. Installing one is the user's
+decision (`context.md` §13), so **`documentSymbol` latency is not measured**, and
+neither is the full pass's wall time or a warm launch against a cold one. The
+engine is tested against the re-executed fake server only. Whether eager
+definition indexing is viable on a medium repository is therefore **unresolved**
+by this spec.
+
+**Heuristic accuracy, by name** (progress row 1). Precision is 1.00 in every
+language after Task 1 because comment and string skipping removed the false
+positives; extra names are 0 everywhere except Rust's one pinned
+`macro_rules!` body. Rust recall moved materially, 0.50 → 1.00, through
+visibility and qualifier stripping, the added keywords and `impl` tracking. The
+other languages' recall did not move; their misses are prefix gaps (modifiers,
+`async def`, TS `type`/`enum`, Go receivers, class methods), not parsing
+problems.
+
+| Language | Found before | Extra before | P / R before | Found after | Extra after | P / R after |
+|---|---|---|---|---|---|---|
+| Rust | 11/22 | 5 | 0.69 / 0.50 | 22/22 | 1 | 0.96 / 1.00 |
+| TypeScript | 8/12 | 5 | 0.62 / 0.67 | 8/12 | 0 | 1.00 / 0.67 |
+| JavaScript | 8/10 | 5 | 0.62 / 0.80 | 8/10 | 0 | 1.00 / 0.80 |
+| Python | 4/6 | 3 | 0.57 / 0.67 | 4/6 | 0 | 1.00 / 0.67 |
+| Go | 4/7 | 2 | 0.67 / 0.57 | 4/7 | 0 | 1.00 / 0.57 |
+| Java | 1/4 | 2 | 0.33 / 0.25 | 1/4 | 0 | 1.00 / 0.25 |
+| Kotlin | 3/5 | 2 | 0.60 / 0.60 | 3/5 | 0 | 1.00 / 0.60 |
+| PHP | 3/4 | 2 | 0.60 / 0.75 | 3/4 | 0 | 1.00 / 0.75 |
+
+**Symbol index size.** Task 3 measured this repository on 2026-10-15 in a
+release build: 309 indexed files, 4,743 symbols, 851 relations; the stored JSON
+is **1,632,054 bytes**, `Built` takes 3.3–4.2 ms and `Reused` 7.9–8.1 ms. Reuse
+is slower than a build because parsing 1.6 MB costs more than re-deriving the
+heuristics, which confirms `context.md` §4.3: persistence earns its keep for
+language-server results, not for heuristic ones. **The vector index's size for
+the same repository is not measured**: semantic search is off by default and
+nothing builds a vector index unless it runs, so no comparable file exists in
+this checkout's isolated data directory.
+
+### 7.3 The three `chat.rs` pieces, not met for the agent
+
+The three `chat.rs` pieces named in `context.md` §12 are **not met for the
+agent**, because #25 must not edit `chat.rs` or `build_model_prompt`:
+
+1. **An agent-facing symbol tool.** The user can search symbols and ask for
+   references through the shell and the CLI; the agent can see definitions in
+   the `symbols` context item but cannot request references or implementations.
+   Requirement 2's references are therefore met for the user, not for the agent.
+2. **Diagnostics attributed to the active task.** They are recorded with no task
+   id, which §5.9 allows when no task is active, but they are never tied to one.
+3. **Symbols in `search_codebase`'s result text.** Not needed by any acceptance
+   criterion; `find_symbols` satisfies the search criterion.
+
+One follow-up `chat.rs` task adds items 1–3, sequenced against whichever
+`chat.rs` spec is in flight. It is not started.
+
+### 7.4 Where the eager pass starts
+
+Closed on 2026-10-23 by the Task 11 follow-up. `WorkspaceEngine::symbol_search`
+is the production entry point: it reads `find_symbols`'s snapshot,
+then calls `start_definition_pass_with` with the process-wide hub and the
+`symbol-search` session id. `handle_symbols` uses it, so the **first
+`GET /api/symbols` for a repository starts the pass**. §8 of `context.md`
+requires the pass to run on the hub's thread and never be awaited by a reader;
+Task 6's note named repository open or the first symbol request. The first
+symbol request is the least surprising of those:
+
+- opening a repository, or running a turn, does not spawn a language server;
+  the user asks for symbol data first;
+- the request answers from the snapshot it already read, so the first search
+  returns at once (heuristic until the pass lands) and the next read sees the
+  server's definitions;
+- `PassClaim` still allows one pass per repository at a time, and a second
+  search while one runs returns its snapshot without starting another;
+- no `language_server.<language>` means `start_definition_pass_with` returns
+  `None` before claiming or spawning anything;
+- the caller is reached only after `symbol_repository` has canonicalised the
+  root and checked `allowed_roots`, and the pass keeps its own restrictions:
+  restricted files are skipped, repository config cannot name a server, and a
+  failure to start is swallowed because it only costs the next read its
+  improvement.
+
+The pass sends `didOpen` before `documentSymbol`, which is where a server
+publishes diagnostics. `GET /api/findings` then records them through
+`record_language_server_findings`, so the findings path needs no second
+change.
+
+**Tests.** Four engine tests use the production entry point, not
+`start_definition_pass`:
+`a_symbol_search_starts_the_pass_without_waiting_and_the_next_read_sees_it`
+asserts the first snapshot is heuristic, returns quickly, and the next read is
+`LanguageServer`;
+`a_symbol_search_lets_a_configured_server_publish_a_finding` asserts the
+diagnostic reaches the session as a `language_server` finding with a range and
+no task;
+`a_second_symbol_search_while_a_pass_runs_starts_no_second_pass` asserts the
+claim holds through the caller; and
+`a_symbol_search_with_no_server_configured_starts_no_pass` asserts no process
+or registry entry. They are engine-level because the production caller
+is in the engine; `handle_symbols` is the shell's one-line use of it.
+**Falsified:** removing the `start_definition_pass_with` call makes both
+app-path tests time out after 20 s waiting for a covered file, then passes again
+when restored.
+
+The Tauri app's exit path still does not call `shutdown_all`; that remains
+recorded in Task 5's row and is out of scope here.

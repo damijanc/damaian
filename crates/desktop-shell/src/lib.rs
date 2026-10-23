@@ -4192,7 +4192,7 @@ fn handle_symbols(stream: &mut TcpStream, request: &Request) -> Result<(), Strin
     let engine = engine_for_repo(&repo)?;
     let root = symbol_repository(&engine, &repo)?;
     let matches = engine
-        .find_symbols(&root, &query, SYMBOL_SEARCH_LIMIT)
+        .symbol_search(&root, &query, SYMBOL_SEARCH_LIMIT)
         .map_err(|error| error.to_string())?;
     let body = format!(
         "{{\"matches\":{}}}",

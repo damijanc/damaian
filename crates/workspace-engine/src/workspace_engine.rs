@@ -237,6 +237,41 @@ impl WorkspaceEngine {
         Ok(index.find(query, limit))
     }
 
+    /// The shell's symbol search: [`Self::find_symbols`] over the current
+    /// snapshot, then an eager definition pass in the background so a
+    /// configured language server can improve the *next* read. The matches
+    /// returned are the snapshot from before the pass starts, and starting it
+    /// returns at once, so neither this request nor a turn waits on a server.
+    /// No `language_server.<language>` means the pass is not started at all.
+    pub fn symbol_search(
+        &self,
+        repository_root: impl AsRef<Path>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SymbolMatch>> {
+        self.symbol_search_with(LanguageServerHub::global(), repository_root, query, limit)
+    }
+
+    /// [`Self::symbol_search`] against `hub`, for tests that must not use the
+    /// global hub.
+    pub fn symbol_search_with<H>(
+        &self,
+        hub: H,
+        repository_root: impl AsRef<Path>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SymbolMatch>>
+    where
+        H: Deref<Target = LanguageServerHub> + Send + 'static,
+    {
+        let root = repository_root.as_ref().to_path_buf();
+        let matches = self.find_symbols(&root, query, limit)?;
+        // A pass that cannot start costs only the next read its improvement;
+        // it must never turn a successful search into an error.
+        let _ = self.start_definition_pass_with(hub, &root, SYMBOL_SEARCH_SESSION);
+        Ok(matches)
+    }
+
     /// The language server's references for `symbol`, fetched on demand
     /// (proposal §5.5). See [`Self::symbol_references_with`].
     pub fn symbol_references(
@@ -587,6 +622,11 @@ impl WorkspaceEngine {
 /// started. There is no turn or session in hand; the registry keeps it for
 /// the audit trail (`context.md` §3).
 const SYMBOL_LOOKUP_SESSION: &str = "symbol-lookup";
+
+/// The session id recorded for the eager pass a symbol search starts. Like
+/// [`SYMBOL_LOOKUP_SESSION`], it exists for the registry's audit trail; the
+/// pass belongs to the process, not to a conversation.
+const SYMBOL_SEARCH_SESSION: &str = "symbol-search";
 
 /// The name to give one `references` or `implementation` location. A
 /// declaration in the index at that place names itself; a reference site has

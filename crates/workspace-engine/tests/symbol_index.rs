@@ -2382,6 +2382,191 @@ fn a_server_that_never_answers_costs_one_timeout_per_file_and_never_delays_a_rea
     hub.shutdown_all();
 }
 
+// ---- The shell's symbol search starts the eager pass ----
+
+/// The app's first need for the index is the first symbol search. That call
+/// must return the snapshot it read and start the pass behind it, never wait
+/// for it; the next read sees what the server added.
+#[test]
+fn a_symbol_search_starts_the_pass_without_waiting_and_the_next_read_sees_it() {
+    let fixture = ServerFixture::with_files(
+        "search-starts-pass",
+        &[
+            ("src/upload.rs", "pub fn upload_retry() {}\n"),
+            ("src/other.rs", "pub fn other() {}\n"),
+        ],
+    );
+    fixture.answer_symbols(serde_json::json!({
+        "src/upload.rs": [reported("upload_retry", LSP_FUNCTION, 1)]
+    }));
+    let engine = fixture.engine("normal");
+    let hub = Arc::new(LanguageServerHub::with_limits(limits(
+        START_TIMEOUT,
+        Duration::from_secs(600),
+    )));
+    let root = fixture.repo.root.clone();
+
+    let started = Instant::now();
+    let searched = engine
+        .symbol_search_with(Arc::clone(&hub), &root, "upload_retry", 50)
+        .expect("a search never fails on a server's account");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the search waited on the pass: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(searched.len(), 1);
+    assert_eq!(
+        searched[0].symbol.provenance,
+        Provenance::Heuristic,
+        "the response is the pre-pass snapshot, not the server's later answer"
+    );
+
+    wait_until("the pass to cover src/upload.rs", START_TIMEOUT, || {
+        covered_files(&fixture.repo)
+            .iter()
+            .any(|path| path == "src/upload.rs")
+    });
+    assert_eq!(
+        found(&engine, &root, "upload_retry"),
+        [("src/upload.rs".to_string(), 1, Provenance::LanguageServer)],
+        "the next read sees the server's symbol"
+    );
+    let mut asked = fixture.symbol_requests();
+    asked.sort();
+    assert_eq!(
+        asked,
+        ["src/other.rs", "src/upload.rs"],
+        "the pass walked the indexed Rust files"
+    );
+    hub.shutdown_all();
+}
+
+/// The pass's `didOpen` is what makes a server publish. With the search as
+/// the caller, a diagnostic reaches the same recording path
+/// `GET /api/findings` uses, with no task and a range.
+#[test]
+fn a_symbol_search_lets_a_configured_server_publish_a_finding() {
+    let fixture = ServerFixture::with_files("search-diagnostics", &[("src/x.rs", X_RS)]);
+    fixture.publish_on_open(serde_json::json!({
+        "src/x.rs": [{ "uri": "src/x.rs", "diagnostics": x_rs_diagnostics() }],
+    }));
+    let engine = fixture.engine("normal");
+    let session_id = new_session(&engine, &fixture.repo.root);
+    let hub = Arc::new(LanguageServerHub::with_limits(limits(
+        START_TIMEOUT,
+        Duration::from_secs(600),
+    )));
+    let root = fixture.repo.root.clone();
+
+    engine
+        .symbol_search_with(Arc::clone(&hub), &root, "x", 50)
+        .expect("a search never fails on a server's account");
+    wait_until("the pass to open src/x.rs", START_TIMEOUT, || {
+        covered_files(&fixture.repo)
+            .iter()
+            .any(|path| path == "src/x.rs")
+    });
+
+    let recorded = engine
+        .record_language_server_findings_with(&hub, &session_id, &root)
+        .expect("diagnostics are recorded");
+    assert_eq!(recorded, 2, "the error and the warning");
+    let findings = engine
+        .session_store
+        .read_findings(&session_id, &root)
+        .unwrap();
+    assert_eq!(findings.len(), 2, "{findings:?}");
+    let error = &findings[0];
+    assert_eq!(error.source(), FindingSource::LanguageServer);
+    assert_eq!(error.task_id(), None, "no task: context.md §10");
+    assert_eq!(error.summary(), "mismatched types");
+    assert_eq!(
+        error.range(),
+        Some(&SourceRange {
+            path: "src/x.rs".to_string(),
+            start_line: 2,
+            start_column: Some(5),
+            end_line: Some(2),
+            end_column: Some(10),
+        })
+    );
+    assert_eq!(
+        engine
+            .record_language_server_findings_with(&hub, &session_id, &root)
+            .unwrap(),
+        0,
+        "a second call records nothing new"
+    );
+    hub.shutdown_all();
+}
+
+/// `PassClaim` keeps one pass per repository: a second search while a pass
+/// runs returns its snapshot and starts nothing.
+#[test]
+fn a_second_symbol_search_while_a_pass_runs_starts_no_second_pass() {
+    let fixture = ServerFixture::with_files(
+        "search-one-pass",
+        &[
+            ("src/a.rs", "pub fn a() {}\n"),
+            ("src/b.rs", "pub fn b() {}\n"),
+        ],
+    );
+    let engine = fixture.engine("delay_500");
+    let hub = Arc::new(LanguageServerHub::with_limits(limits(
+        START_TIMEOUT,
+        Duration::from_secs(600),
+    )));
+    let root = fixture.repo.root.clone();
+
+    engine
+        .symbol_search_with(Arc::clone(&hub), &root, "a", 50)
+        .unwrap();
+    wait_until("the fake server to start", START_TIMEOUT, || {
+        fixture.spawns() >= 1
+    });
+    engine
+        .symbol_search_with(Arc::clone(&hub), &root, "b", 50)
+        .unwrap();
+    wait_until("the pass to cover both files", START_TIMEOUT, || {
+        covered_files(&fixture.repo).len() == 2
+    });
+
+    assert_eq!(fixture.spawns(), 1, "a second pass was started");
+    assert_eq!(
+        fixture.symbol_requests().len(),
+        2,
+        "a second pass asked the server again"
+    );
+    hub.shutdown_all();
+}
+
+/// A search with no `language_server.<language>` returns the heuristic
+/// snapshot and starts nothing: no process, no registry entry, no pass.
+#[test]
+fn a_symbol_search_with_no_server_configured_starts_no_pass() {
+    let fixture = ServerFixture::new("search-no-server");
+    let engine = WorkspaceEngine::new(fixture.repo.config());
+    let hub = Arc::new(LanguageServerHub::with_limits(limits(
+        START_TIMEOUT,
+        Duration::from_secs(600),
+    )));
+    let root = fixture.repo.root.clone();
+
+    let matches = engine
+        .symbol_search_with(Arc::clone(&hub), &root, "alpha", 50)
+        .unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].symbol.provenance, Provenance::Heuristic);
+    assert_eq!(fixture.spawns(), 0);
+    assert!(fixture.registry_entries().is_empty());
+    assert!(
+        hub.status(&workspace_engine::repository_id_for_root(&root))
+            .is_empty()
+    );
+    hub.shutdown_all();
+}
+
 // ---- Task 7: diagnostics as findings ----
 
 /// An error and a warning on `src/x.rs`, as the fake server publishes them:

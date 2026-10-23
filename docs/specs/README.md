@@ -85,22 +85,22 @@ A summary of each spec's own `Status:`, `tasks.md` and `Depends on:` lines on
 this date. Where it disagrees with them, they win; `npm run specs:check`
 reports the disagreement.
 
-- **In progress:** #25 symbols (Tasks 1–8 of 11), #32 hooks (1–4 of 10), #49
-  prompt cache (accounting slice done; the reuse slice is blocked on #55 or
-  #26), #50 clarification (1–3 of 8), #59 exploration allowance (4 of 6), #62
-  approval reasons (1–2 of 7).
-- **Ready, not started:** #23 verification loop; #65 exploration memory (its
-  requirement 8 waits for #59).
-- **Blocked:** #26 on #25; #27, #33, #51, #54 and #55 on #26; #28 on #26 and
-  #27; #29 on #28; #30 on #28 and #29; #35 on #23; #36 on #35; #37 on #33, #35
-  and #36; #52 on #33; #39 on #38; #40 on #38 and #39.
+- **In progress:** #32 hooks (1–4 of 10), #49 prompt cache (accounting slice
+  done; the reuse slice is blocked on #55 or #26), #50 clarification (1–3 of 8),
+  #59 exploration allowance (4 of 6), #62 approval reasons (1–2 of 7).
+- **Ready, not started:** #23 verification loop; #26 context assembly (its
+  last dependency, #25, is built); #65 exploration memory (its requirement 8
+  waits for #59).
+- **Blocked:** #27, #33, #51, #54 and #55 on #26; #28 on #26 and #27; #29 on
+  #28; #30 on #28 and #29; #35 on #23; #36 on #35; #37 on #33, #35 and #36;
+  #52 on #33; #39 on #38; #40 on #38 and #39.
 - **Deferred:** #38 (stage 1 is due for re-evaluation now that #57 is done).
 - **Pairing:** two specs may run together only if at most one of them edits
   `chat.rs`, and #26, #55 and #49's reuse slice never run together — see
   [Parallel work](#parallel-work).
 - **Open decision:** the priority table below predates #59–#65 and does not
   rank them; the text after it calls #65 "the priority after #59". Where
-  #59–#65 rank against #25 → #26 is the owner's call.
+  #59–#65 rank against #26 is the owner's call.
 
 ### History
 
@@ -128,8 +128,8 @@ linear:
 
 ```
 #20 working modes (done) ──> #22 findings (done) ──> #23 verification, #32 hooks, #35 commit prep
-                        │                       └──> #24 repo map (done) ──> #25 symbols
-                        │                                               └──> #26 context assembly (also needs #25)
+                        │                       └──> #24 repo map (done) ──> #25 symbols (done)
+                        │                                               └──> #26 context assembly (ready)
                         ├──> #31 profiles (done) ──> #52 MCP server mode
                         ├──> #33 MCP mgmt  ──┘   (#33 also needs #26 and #31)
                         └──> #50 clarification, #51 fetch (#51 also needs #26)
@@ -298,13 +298,22 @@ condition is now met rather than a dependency: #38's stage 1 was to be
 re-evaluated once #57 shipped (#38's Deferral section). That re-evaluation is
 a decision for the user, and #38 stays deferred until it is made.
 
-**#25 and #26 are the keystones now that #24 has landed.** #25 is the last
-thing in front of #26, and the whole tail waits on #26. Preferring a spec that
-unblocks nothing over one of these costs more than it looks like it does.
+Re-derived on 2026-10-23, when [#25](25_symbol_and_relationship_index/proposal.md)
+was finished. One `Depends on:` line named #25 not built: #26. **One is
+promoted:** [#26](26_context_assembly.md), whose other dependencies (#21, #22
+and #24) were already built. #26 leaves the blocked set and joins the ready
+set, which is now #23, #26 and #65. #25 leaves the in-progress set. A Task 11
+follow-up closed the one wiring gap its close-out found: the first symbol search
+now starts the eager definition pass, so language-server definitions and
+diagnostics are reachable in the app.
+
+**#26 is the keystone now that #24 and #25 have landed.** The whole tail waits
+on #26, and nothing else in front of it is unbuilt. Preferring a spec that
+unblocks nothing over it costs more than it looks like it does.
 
 | | Build | Why here |
 |---|---|---|
-| 1 | **#25 → #26** | The keystone now that #24 is done: #25 is in progress, and #26, which waits only on #25, is the real unlock |
+| 1 | **#26 context assembly** | The keystone now that #24 and #25 are done: #26 waits on nothing, and it is the real unlock for #27, #33, #49's reuse slice, #51, #54 and #55 |
 | 2 | #23 verification | Ready now that #22 is done; the last thing in front of #35. Its loop lives in `chat.rs`, so check the parallel rule below before pairing it |
 | 3 | #32 hooks | In progress (Tasks 1–4 of 10 done); unblocks nothing, but it is the one Must-tier Phase 4 package that could start |
 | 4 | #55 compaction | Also unblocks #49's reuse slice, which is why that slice waits |
@@ -317,7 +326,7 @@ unblocks nothing over one of these costs more than it looks like it does.
 (2026-10-12): it closed the half of #48 that had shipped as only a negative
 guarantee.
 [#50](50_model_initiated_clarification/proposal.md) is in progress (Tasks 1–3 of 8 done) and unblocks nothing,
-which is why it sits off the table rather than above #25.
+which is why it sits off the table rather than above #26.
 [#57](57_worker_sessions/proposal.md), added on 2026-10-03, sits off the table
 for the same reason: every dependency (#17, #20, #46) is built and nothing
 depends on it. It is done (2026-10-16).
@@ -333,7 +342,8 @@ unblocks it.
 off the table like #50 and #57: every dependency (#21, #34, #47) is built and
 nothing depends on it, so it joins the ready set beside #23. It rewrites the
 round loop's counting in `chat.rs`, so it does not pair with #23 or with #32's
-`chat.rs` tasks; it does pair with #25, which never edits `chat.rs`.
+`chat.rs` tasks; it did pair with #25, which never edited `chat.rs`, and #25 is
+now done, so that pairing no longer constrains anything.
 [#60](60_worktree_aware_read_tools/proposal.md), added the same day, is ready
 for the same reason (#20, #34 and #47 are built) and also unblocks nothing. It
 adds tool arguments and dispatch in `chat.rs` and rewrites `git_service.rs`'s
@@ -429,8 +439,8 @@ is ready.
 | 22 | [22_findings_model_and_panel/](22_findings_model_and_panel/proposal.md) | **Done 2026-10-04.** Roadmap Phase 2 WP6. One `Finding` type shared by compiler, test, lint, browser and (later) review sources, with parsers that degrade to one honest generic finding rather than losing a failure, persisted in #17's session log. A session panel filters, opens, dismisses, or sends a selected subset to the agent as a scoped repair. It also closed #21's deferred `Evidence::Findings`. |
 | 23 | [23_verification_loop/](23_verification_loop/proposal.md) | **Not started; split into a folder and planned 2026-10-09.** See `tasks.md` for the ten-task breakdown. [`context.md`](23_verification_loop/context.md) found that a patch is applied after the turn that proposed it has ended, so the loop is a continuation the apply path triggers rather than a step inside a turn. It also found that detection gives a Cargo root `cargo test` and nothing else, so checks are selected by the root that owns each changed file, not by a file-category table. Roadmap Phase 2 WP3. Sequences apply → discover checks → run → find → repair → rerun → report, driven by the orchestrator rather than the model, so a completion report distinguishes verified from assumed. Consumes #21, #22 and #24. |
 | 24 | [24_repository_map_and_monorepo_boundaries/](24_repository_map_and_monorepo_boundaries/proposal.md) | **Done 2026-10-09.** Roadmap Phase 3 WP2, built in nine tasks. A deterministic map of project roots, persisted per repository and rebuilt on an input fingerprint, rendered into model context under `repository_map_max_tokens` (default 800, lower-only from a repository). A command discovered in, or requested for, `packages/api` runs there. Allow Always in a sub-root writes a root-qualified grant, and a plain allowlist entry applies at the repository root only. Containment is always checked against the repository root. Roots are corrected through `project_roots_added`/`project_roots_removed` in repository config, from Settings or `damaian repo-root`. Reuses `detect_project_commands`' manifest list per root rather than inventing a second one. `context.md` records where the code contradicted the design. Not built: frameworks and per-root permission restrictions (`proposal.md` §7.1). |
-| 25 | [25_symbol_and_relationship_index/](25_symbol_and_relationship_index/proposal.md) | **In progress: Tasks 1–10 of 11 done (started 2026-10-13). Split into a folder and planned 2026-10-09, re-checked against `main` 2026-10-12.** See `tasks.md` for the eleven-task breakdown. [`context.md`](25_symbol_and_relationship_index/context.md) records where the code contradicted the design: spec 46's registry is built, LSP framing is not MCP's, sessions have no close event, and restricted files are indexed. It also records the three pieces that need `chat.rs` and are deferred (§12): an agent-facing symbol tool, task attribution for diagnostics, and symbols in `search_codebase` output. Roadmap Phase 3 WP3. A rescope, not greenfield: `FileRecord.symbols`/`imports` already exist as prefix heuristics. Adds locations, kinds, relationships, and a `Provenance` label separating language-server fact from heuristic guess. Satisfies Phase 2's deferred LSP dependency. |
-| 26 | [26_context_assembly.md](26_context_assembly.md) | **Not started.** Roadmap Phase 3 WP4. Replaces the single first-come-first-served budget with per-category allocation, range deduplication, and a manifest recording what was excluded and why. Adds line ranges to `ContextItem`, without which two of its requirements are unexpressible. |
+| 25 | [25_symbol_and_relationship_index/](25_symbol_and_relationship_index/proposal.md) | **Done 2026-10-23 (started 2026-10-13).** Split into a folder and planned 2026-10-09, re-checked against `main` 2026-10-12, built in eleven tasks. [`context.md`](25_symbol_and_relationship_index/context.md) records where the code contradicted the design: spec 46's registry is built, LSP framing is not MCP's, sessions have no close event, and restricted files are indexed. The three pieces that need `chat.rs` remain deferred (§12): an agent-facing symbol tool, task attribution for diagnostics, and symbols in `search_codebase` output. Roadmap Phase 3 WP3. A rescope, not greenfield: `FileRecord.symbols`/`imports` already existed as prefix heuristics. Adds locations, kinds, relationships, a `symbols` context item, on-demand references, and a `Provenance` label separating language-server fact from heuristic guess. Satisfies Phase 2's deferred LSP dependency. A Task 11 follow-up wired the eager definition pass to the first symbol search, so language-server definitions and diagnostics are reachable in the app; the Tauri app's exit path still relies on EOF and the next launch's sweep, as Task 5 recorded. |
+| 26 | [26_context_assembly.md](26_context_assembly.md) | **Not started.** Roadmap Phase 3 WP4. Its last dependency, #25, is built (2026-10-23), so it is now the keystone. Replaces the single first-come-first-served budget with per-category allocation, range deduplication, and a manifest recording what was excluded and why. Adds line ranges to `ContextItem`, without which two of its requirements are unexpressible. |
 | 27 | [27_context_inspector.md](27_context_inspector.md) | **Not started.** Roadmap Phase 3 WP5. Renders #26's manifest pre- and post-send, and adds pins and path restrictions. Makes "the user can see what context the agent uses" true; Phase 3b's memory arrives as one more category in this view. |
 | 28 | [28_memory_model_and_storage.md](28_memory_model_and_storage.md) | **Not started.** Roadmap Phase 3b WP1. The memory record and store, with a `project_key` resolved from the repository's root commit — because `repository_id` is a path hash and cannot give the sharing property the roadmap asks for. Memory refuses secrets rather than redacting them. |
 | 29 | [29_memory_creation_and_consent.md](29_memory_creation_and_consent.md) | **Not started.** Roadmap Phase 3b WP2. The consent gate: `MemoryProposal` and `MemoryEntry` are separate types with one conversion requiring a user confirmation, so unconfirmed persistence is unrepresentable. Instruction-shaped candidates from untrusted origins get no proposal at all. |

@@ -54,6 +54,8 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | A file is missing from the model's context | [A file the model should see is missing from context](#a-file-the-model-should-see-is-missing-from-context) |
 | A `worktree` argument is refused | [A `worktree` argument is refused](#a-worktree-argument-is-refused) |
 | A project root is missing or wrong, or a command ran in the wrong directory | [Repository roots and the repository map](#repository-roots-and-the-repository-map) |
+| Symbol search shows only `likely` results, or a configured language server will not start | [Symbol search shows only likely results, or a language server will not start](#symbol-search-shows-only-likely-results-or-a-language-server-will-not-start) |
+| A language-server diagnostic never appears | [Symbol search shows only likely results, or a language server will not start](#symbol-search-shows-only-likely-results-or-a-language-server-will-not-start) |
 | Findings are missing, stale, or cannot be opened | [Findings](#findings) |
 | A browser diagnostic looks wrong | [Browser diagnostics](#browser-diagnostics) |
 | Command output looks cut short | [Command output](#command-output) |
@@ -183,6 +185,7 @@ isolated tree — that is the intended way to test without touching real data.
 | `processes/<pid>-<start-time-us>.json` | One live child process this instance spawned, written **before** the child is returned to its caller and unlinked on clean exit | `ProcessRegistry::register` ([process_registry.rs](../crates/workspace-engine/src/process_registry.rs)) |
 | `web-diagnostics/<session-id>/<task-id>/run-<ms>/` | Browser diagnostic screenshots, copied out of the browser server's own output. Images are **not** secret-scanned; they show whatever the page showed | `materialize_browser_artifacts` ([desktop-shell/src/lib.rs](../crates/desktop-shell/src/lib.rs)) |
 | `repository-map/<repo-id>.json` | The repository map: roots, their evidence and commands, and excluded paths. Derived, safe to delete | `RepositoryMapStore` ([repository_map.rs](../crates/workspace-engine/src/repository_map.rs)) |
+| `symbol-index/<repo-id>.json` | The symbol index: declarations, relations, per-file hashes and the on-demand reference cache. Derived, safe to delete | `SymbolIndexStore` ([symbol_index.rs](../crates/workspace-engine/src/symbol_index.rs)) |
 | `vector-index/<repo-id>.bin` | Semantic-search embeddings cache | `vector_index_path` ([vector_index.rs](../crates/workspace-engine/src/vector_index.rs)) |
 | `models/all-MiniLM-L6-v2/` | Downloaded embedding model (semantic search only) | `EmbeddingModel::load` ([embeddings.rs](../crates/workspace-engine/src/embeddings.rs)) |
 
@@ -512,6 +515,74 @@ default is 800, `0` turns it off, and a repository may only lower it. When the
 map is cut to fit, its last line starts `Abridged to fit:` and says what was
 dropped. If the map cannot be stored, for example because the data directory
 is read-only, it is left out of the request and the turn goes on.
+
+### Symbol search shows only likely results, or a language server will not start
+
+**Check the index first.** The symbol index is stored per repository:
+
+```text
+$DATA_DIR/symbol-index/<repository_id>.json
+```
+
+`<repository_id>` is the same `repo_…` id as `command_allowlist.<repository_id>`
+and `repository-map/`. The file is derived from the in-memory index. **To force a
+rebuild, delete it**; the next symbol search builds it again. A missing file is
+built silently. A stale, corrupt, version-mismatched or foreign file is rebuilt
+and audited as `symbol_index_rebuilt` with `repositoryId`, `reason` (`corrupt`,
+`schemaMismatch` with `foundSchemaVersion`, or `stale`), `fileCount`,
+`totalFiles` and `durationMs`. A first build and a reuse write nothing.
+
+```bash
+jq -c 'select(.eventType=="symbol_index_rebuilt")' "$DATA_DIR/audit/events.jsonl"
+```
+
+**Read it without the UI.** Each command takes a scratch `DAMAIAN_DATA_DIR` so
+they do not touch your real state:
+
+```bash
+DAMAIAN_DATA_DIR=/tmp/damaian-debug cargo run -p damaian-cli -- symbols /path/to/repo upload_retry
+DAMAIAN_DATA_DIR=/tmp/damaian-debug cargo run -p damaian-cli -- symbols /path/to/repo upload_retry --json | jq '.matches[] | {name: .symbol.name, path: .symbol.path, line: .symbol.line}'
+DAMAIAN_DATA_DIR=/tmp/damaian-debug cargo run -p damaian-cli -- symbol-references /path/to/repo src/upload.rs:42 upload_retry
+```
+
+`symbols` prints `name  kind  path:line  root  provenance` and says whether the
+index was built, reused or rebuilt. `symbol-references` prints either the
+unavailable reason, or each `path:line  name  kind  provenance`. Neither prints a
+heuristic result without `provenance`.
+
+**A configured server shows `idle`, `unavailable` or `crashed`.**
+Settings › General › Language servers lists every configured language;
+`GET /api/language-servers?repo=…` returns the same. `idle` means configured but
+not started. `ready` carries the PID. `unavailable` carries the reason: the spawn
+failed, or `initialize` failed or timed out. `crashed` carries `restarts`; after
+the one restart it stays down until the entry expires or Damaian restarts.
+
+- **The command is not found.** A GUI app does not inherit your shell's `PATH`.
+  Use an absolute path in `language_server.<language>`, and test that exact
+  command from Terminal with the repository as the working directory. Damaian's
+  spawn sends the server's stderr to `/dev/null`, so the app keeps no server
+  log; run the command yourself to see its errors.
+- **The key has no effect.** It must be in user config, not
+  `.damaian/config.conf`: a repository's value is ignored and audited as
+  `repository_config_key_rejected`. A typo in the language name, or an empty
+  command, is a parse error naming the key. A permission profile cannot carry
+  it.
+- **Which processes are ours.** A running server has one
+  `processes/<pid>-<start-time-us>.json` entry with
+  `"kind":"language_server"`. On a sweep, an entry whose recorded start time no
+  longer matches is refused rather than killed, and the refusal is audited as
+  `orphan_process_kill_refused` with `"kind":"language_server"`. Damaian never
+  kills a process by name, so your editor's own `rust-analyzer` is not at risk.
+
+**Why results stay `likely`.** The first symbol search for a repository starts
+the background pass, but answers from the snapshot it read, so that response is
+heuristic. A later search after the pass finishes shows the server's
+definitions. If results are still `likely`, check the reason in Settings ›
+General › Language servers: `idle` means no search has started the server yet,
+and `unavailable`/`crashed` carry why. A configured server can also leave a file
+heuristic when it reports nothing for it, when the file is restricted, or when
+its language has no configured server. Diagnostics appear after a search has let
+the server open files, on the next findings refresh.
 
 ## Logs
 
@@ -1482,6 +1553,8 @@ cargo run -p damaian-cli -- git-status /path/to/repo
 cargo run -p damaian-cli -- classify-command "rm -rf build"
 cargo run -p damaian-cli -- propose-command /path/to/repo "npm test"
 cargo run -p damaian-cli -- repo-map /path/to/repo --json
+cargo run -p damaian-cli -- symbols /path/to/repo upload_retry
+cargo run -p damaian-cli -- symbol-references /path/to/repo src/upload.rs:42 upload_retry
 cargo run -p damaian-cli -- propose-validations /path/to/repo
 DAMAIAN_MOCK_MODEL_RESPONSE="Mock answer" cargo run -p damaian-cli -- ask /path/to/repo "What does auth do?"
 cargo run -p damaian-cli -- propose-edit /path/to/repo "Make the change"
