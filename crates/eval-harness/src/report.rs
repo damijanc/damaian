@@ -100,11 +100,38 @@ pub fn to_text(report: &Report) -> String {
         }
     }
 
+    // Spec 62 §5.5. Only runs that asked for approval: a proposal the policy
+    // ran without asking has no cause, and grouping one under a "none" bucket
+    // would describe proposals rather than prompts.
+    let prompted: Vec<&RunRecord> = report
+        .records
+        .iter()
+        .filter(|record| !record.approvals_by_cause.is_empty())
+        .collect();
+    if !prompted.is_empty() {
+        out.push_str("\nApproval prompts by first cause\n");
+        for record in prompted {
+            let grouped = record
+                .approvals_by_cause
+                .iter()
+                .map(|(cause, count)| format!("{cause} {count}"))
+                .collect::<Vec<_>>()
+                .join("  ");
+            out.push_str(&format!("  {:<32} {grouped}\n", record.scenario));
+        }
+    }
+
     out.push_str("\nMetrics\n");
     for metric in &report.metrics.metrics {
         let rendered = match &metric.value {
             MetricValue::Number { value } => format!("{value:.3}"),
             MetricValue::Count { value } => value.to_string(),
+            // Spec 62 §5.5: `cause count`, in the map's stable order.
+            MetricValue::Groups { counts } => counts
+                .iter()
+                .map(|(group, count)| format!("{group} {count}"))
+                .collect::<Vec<_>>()
+                .join("  "),
             MetricValue::Human {
                 value,
                 sample_size,

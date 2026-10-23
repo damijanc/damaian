@@ -1,10 +1,11 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use eval_harness::assertions;
 use eval_harness::metrics::{MetricSet, MetricValue};
 use eval_harness::record::{
-    AssertionOutcome, CacheUsage, FindingsByPurpose, PurposeTally, RecordedPlan, RecordedRecovery,
-    RecordedToolCall, RunRecord, Tokens,
+    AssertionOutcome, CacheUsage, FindingsByPurpose, PurposeTally, RecordedApproval, RecordedPlan,
+    RecordedRecovery, RecordedToolCall, RunRecord, Tokens,
 };
 use eval_harness::report;
 use eval_harness::scenario::{self, Tier};
@@ -1166,8 +1167,8 @@ fn a_blocked_scenario_is_still_skipped_and_says_why() {
 }
 
 /// Guards the count in spec 18 §6, now that spec 17 has landed: every scenario
-/// runs and none is blocked. Twenty-one since spec 59 added `long_discovery` and
-/// `read_loop`.
+/// runs and none is blocked. Twenty-two: spec 59 added `long_discovery` and
+/// `read_loop`, and spec 62 added `approval_causes`.
 #[test]
 fn every_scenario_runs_and_none_is_blocked() {
     let all = scenario::load_all().expect("scenarios should load");
@@ -1182,7 +1183,7 @@ fn every_scenario_runs_and_none_is_blocked() {
         Vec::<&str>::new(),
         "no scenario is deferred any more"
     );
-    assert_eq!(all.len(), 21, "twenty-one scenarios should run");
+    assert_eq!(all.len(), 22, "twenty-two scenarios should run");
 }
 
 #[test]
@@ -1469,8 +1470,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
     assert_eq!(
         built.records.len(),
-        21,
-        "all twenty-one scenario files should be accounted for"
+        22,
+        "all twenty-two scenario files should be accounted for"
     );
     assert_eq!(
         built
@@ -2373,4 +2374,162 @@ fn the_exploration_findings_assertion_fails_when_nothing_explored() {
     let results = assertions::evaluate(&run, &asserts, Tier::Deterministic, &[]);
     let result = outcome(&results, "exploration_findings");
     assert!(!result.passed, "{} / {}", result.expected, result.actual);
+}
+
+// ---------------------------------------------------------------------------
+// Approval prompts by first cause. Spec 62 §5.5.
+// ---------------------------------------------------------------------------
+
+/// The evidence §5.5 asks for: each stored proposal carries the cause the
+/// classifier decided on, and the run groups its prompts by the *first* one.
+///
+/// `approval_causes` produces two prompts with different causes. The second
+/// proposal has two causes (`unknown,outside_repository`), so taking the last
+/// one instead of the first would make it disagree with the prompt the user
+/// actually saw.
+#[test]
+fn a_run_records_each_approval_prompt_by_its_first_cause() {
+    let (run, results) = run_and_evaluate("approval_causes");
+    assert_all_passed("approval_causes", &results);
+
+    let requested: Vec<&RecordedApproval> = run
+        .record
+        .approvals
+        .iter()
+        .filter(|approval| approval.decision == "requested")
+        .collect();
+    assert_eq!(
+        requested.len(),
+        2,
+        "the scenario produces two prompts, got {:?}",
+        run.record.approvals
+    );
+    assert_eq!(
+        requested[0].cause.as_deref(),
+        Some("shell_control"),
+        "a compound command names shell control first"
+    );
+    assert_eq!(
+        requested[1].cause.as_deref(),
+        Some("unknown"),
+        "the first of `unknown,outside_repository`, which is what the prompt led with"
+    );
+
+    assert_eq!(
+        run.record.approvals_by_cause,
+        BTreeMap::from([("shell_control".to_string(), 1), ("unknown".to_string(), 1),]),
+        "the run groups its prompts by the deciding cause"
+    );
+}
+
+/// A proposal that ran without asking is not an approval prompt and must not
+/// be counted as one. `planned_task`'s `ls src` is admitted read-only, so its
+/// `command_proposal_stored` event carries no causes at all; grouping it under
+/// a "none" bucket would make the report measure proposals rather than prompts.
+#[test]
+fn a_proposal_that_needed_no_approval_is_not_counted_as_a_prompt() {
+    let (run, results) = run_and_evaluate("planned_task");
+    assert_all_passed("planned_task", &results);
+
+    let requested: Vec<&RecordedApproval> = run
+        .record
+        .approvals
+        .iter()
+        .filter(|approval| approval.decision == "requested")
+        .collect();
+    assert!(
+        !requested.is_empty(),
+        "the run stored a proposal for the command it ran"
+    );
+    assert!(
+        requested.iter().all(|approval| approval.cause.is_none()),
+        "an auto-run proposal has no cause, got {requested:?}"
+    );
+    assert!(
+        run.record.approvals_by_cause.is_empty(),
+        "nothing was asked, so nothing is grouped: {:?}",
+        run.record.approvals_by_cause
+    );
+
+    let grouped = run.record.approvals_by_cause.clone();
+    let built = report::build(vec![run.record]);
+    assert!(
+        !report::to_text(&built).contains("\nApproval prompts by first cause\n"),
+        "a run that never prompted has no grouping section, got {grouped:?}"
+    );
+    match &built
+        .metrics
+        .get("approval_prompts_by_cause")
+        .expect("metric")
+        .value
+    {
+        MetricValue::NotApplicable { phase } => assert_eq!(phase, "no-approval-prompts"),
+        other => panic!("a run with no prompts must report no data, got {other:?}"),
+    }
+}
+
+/// The per-run line the text report prints, and the metric built from the same
+/// grouping. Both carry the cause *name* and the count, because one total would
+/// lose exactly the fact §5.5 exists to show: which cause dominates.
+#[test]
+fn the_report_groups_approval_prompts_by_their_first_cause() {
+    let (run, results) = run_and_evaluate("approval_causes");
+    assert_all_passed("approval_causes", &results);
+
+    let built = report::build(vec![run.record]);
+    let text = report::to_text(&built);
+
+    assert!(
+        text.contains("\nApproval prompts by first cause\n"),
+        "the report has a grouping section:\n{text}"
+    );
+    let section = text
+        .split_once("\nApproval prompts by first cause\n")
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("no grouping section:\n{text}"));
+    let line = section
+        .lines()
+        .find(|line| line.trim_start().starts_with("approval_causes"))
+        .unwrap_or_else(|| panic!("no per-run grouping line:\n{text}"));
+    assert!(
+        line.contains("shell_control 1") && line.contains("unknown 1"),
+        "the line must name each cause and its count: {line}"
+    );
+
+    match &built
+        .metrics
+        .get("approval_prompts_by_cause")
+        .expect("metric")
+        .value
+    {
+        MetricValue::Groups { counts } => {
+            assert_eq!(counts.get("shell_control"), Some(&1));
+            assert_eq!(counts.get("unknown"), Some(&1));
+        }
+        other => panic!("expected the grouped metric, got {other:?}"),
+    }
+}
+
+/// The metric must sum across runs rather than let one run overwrite another —
+/// a constant, or a last-run-wins figure, would satisfy a single-run test while
+/// measuring nothing about a suite.
+#[test]
+fn the_approval_cause_metric_sums_across_runs() {
+    let mut first = RunRecord::new("a", "4", "deterministic", "mock", "mock");
+    first.final_status = "awaiting_approval".to_string();
+    first.approvals_by_cause =
+        BTreeMap::from([("shell_control".to_string(), 2), ("unknown".to_string(), 1)]);
+    let mut second = RunRecord::new("b", "4", "deterministic", "mock", "mock");
+    second.final_status = "awaiting_approval".to_string();
+    second.approvals_by_cause = BTreeMap::from([("shell_control".to_string(), 1)]);
+
+    let set = MetricSet::compute(&[first, second]);
+
+    match &set.get("approval_prompts_by_cause").expect("metric").value {
+        MetricValue::Groups { counts } => {
+            assert_eq!(counts.get("shell_control"), Some(&3));
+            assert_eq!(counts.get("unknown"), Some(&1));
+        }
+        other => panic!("expected the grouped metric, got {other:?}"),
+    }
 }

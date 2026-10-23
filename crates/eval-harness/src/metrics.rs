@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 use crate::record::{CacheUsage, RecordedPlan, RunRecord};
@@ -10,6 +12,13 @@ pub enum MetricValue {
     },
     Count {
         value: u64,
+    },
+    /// Counts grouped by the value being measured — spec 62 §5.5's prompts by
+    /// first cause. A single total would lose the grouping, which is the
+    /// measurement: a session where nearly every prompt is `shell_control`
+    /// reads very differently from one spread across causes.
+    Groups {
+        counts: BTreeMap<String, u64>,
     },
     /// §5.6: manual repair rate and patch acceptance rate need a human decision
     /// as their input. A machine-generated value for either would be a fiction
@@ -52,11 +61,11 @@ impl MetricSet {
     /// requirement 5 guards against.
     ///
     /// The next four are spec 21's plan rows, then spec 49's
-    /// `cache_hit_rate`, and the last is spec 63's `exploration_findings`.
-    /// They live here rather than in a metric set of their
-    /// own because requirement 5 is about *the* report — a measure kept
-    /// somewhere else is a measure a baseline diff does not cover.
-    pub const KEYS: [&'static str; 22] = [
+    /// `cache_hit_rate`, spec 63's `exploration_findings`, and spec 62's
+    /// `approval_prompts_by_cause`. They live here rather than in a metric set
+    /// of their own because requirement 5 is about *the* report — a measure
+    /// kept somewhere else is a measure a baseline diff does not cover.
+    pub const KEYS: [&'static str; 23] = [
         "task_completion_rate",
         "check_pass_rate",
         "approval_policy_violations",
@@ -79,6 +88,7 @@ impl MetricSet {
         "plan_steps_blocked",
         "cache_hit_rate",
         "exploration_findings",
+        "approval_prompts_by_cause",
     ];
 
     pub fn get(&self, key: &str) -> Option<&Metric> {
@@ -446,6 +456,32 @@ impl MetricSet {
                 explored as usize,
                 "no-exploration-commands",
             ),
+        );
+
+        // Spec 62 §5.5: prompts grouped by the cause that made them ask. Summed
+        // across runs by cause rather than per run, so the report answers "what
+        // asks most often" over the whole tier. A run that never prompted
+        // contributes nothing; with no prompts anywhere the honest answer is no
+        // data, because zero over nothing says nothing about which causes
+        // dominate.
+        let mut prompts_by_cause: BTreeMap<String, u64> = BTreeMap::new();
+        for record in &runnable {
+            for (cause, count) in &record.approvals_by_cause {
+                *prompts_by_cause.entry(cause.clone()).or_default() += count;
+            }
+        }
+        push(
+            "approval_prompts_by_cause",
+            "Approval prompts by first cause",
+            if prompts_by_cause.is_empty() {
+                MetricValue::NotApplicable {
+                    phase: "no-approval-prompts".to_string(),
+                }
+            } else {
+                MetricValue::Groups {
+                    counts: prompts_by_cause,
+                }
+            },
         );
 
         MetricSet { metrics }

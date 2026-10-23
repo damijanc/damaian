@@ -4,7 +4,8 @@ Status: In progress. Tasks 1 (`ApprovalCause` and structured causes) and 2
 (`Setting` and profile-block causes) landed 2026-10-18; Task 3 (prompt and
 model-facing wording) landed 2026-10-23; Task 4 (the card names the cause and
 the model's reason) landed 2026-10-23; Task 5 (recording causes in the proposal
-and audit record) landed 2026-10-23. Specified on 2026-10-17
+and audit record) landed 2026-10-23; Task 6 (the eval harness groups prompts by
+first cause) landed 2026-10-23. Specified on 2026-10-17
 from the session behind
 [#59](../59_exploration_round_allowance/proposal.md)–[#61](../61_continue_the_stopped_turn/proposal.md),
 in which the user answered 40 approval prompts that all gave the same reason,

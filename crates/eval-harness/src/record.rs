@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use workspace_engine::SecretScanner;
 
@@ -29,6 +31,15 @@ pub struct RecordedToolCall {
 pub struct RecordedApproval {
     pub kind: String,
     pub decision: String,
+    /// The first cause the classifier recorded for the proposal, by the name
+    /// the audit log carries (`shell_control`, `network`, …), read from the
+    /// `command_proposal_stored` event's `causes` field (spec 62 §5.4).
+    ///
+    /// `None` for a decision event, which follows a proposal rather than
+    /// opening one, and for a proposal that needed no approval at all: its
+    /// `causes` list is empty because there is no reason to name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,6 +167,14 @@ pub struct RunRecord {
     pub duration_ms: u128,
     pub tool_calls: Vec<RecordedToolCall>,
     pub approvals: Vec<RecordedApproval>,
+    /// Spec 62 §5.5: the run's approval prompts grouped by their first
+    /// (deciding) cause, name to count. Derived from `approvals` by
+    /// [`Self::group_approvals_by_cause`] rather than accumulated beside them,
+    /// so the grouping cannot disagree with the list it summarises.
+    ///
+    /// A `BTreeMap` so the report and a baseline diff list causes in a stable
+    /// order rather than one that depends on which prompt came first.
+    pub approvals_by_cause: BTreeMap<String, u64>,
     /// Paths only. File contents never enter a record (proposal §5.5).
     pub files_changed: Vec<String>,
     pub checks: Vec<RecordedCheck>,
@@ -244,6 +263,7 @@ impl RunRecord {
             duration_ms: 0,
             tool_calls: Vec::new(),
             approvals: Vec::new(),
+            approvals_by_cause: BTreeMap::new(),
             files_changed: Vec::new(),
             checks: Vec::new(),
             final_status: "not_run".to_string(),
@@ -267,6 +287,24 @@ impl RunRecord {
             native_tools: false,
             cache: None,
             findings_by_purpose: FindingsByPurpose::default(),
+        }
+    }
+
+    /// Groups the run's approval prompts by their first cause (spec 62 §5.5).
+    ///
+    /// Only a `requested` entry that carries a cause is a prompt: a decision
+    /// follows one, and a proposal that ran without asking has no cause to
+    /// group. One function over `approvals` keeps the count and the list from
+    /// drifting.
+    pub fn group_approvals_by_cause(&mut self) {
+        self.approvals_by_cause.clear();
+        for approval in &self.approvals {
+            if approval.decision != "requested" {
+                continue;
+            }
+            if let Some(cause) = &approval.cause {
+                *self.approvals_by_cause.entry(cause.clone()).or_default() += 1;
+            }
         }
     }
 

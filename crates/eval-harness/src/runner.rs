@@ -487,10 +487,15 @@ fn drive(
     }
     run_record.files_changed = files_changed;
 
-    for _ in 0..trace.count("command_proposal_stored") {
+    // Spec 62 §5.5: the prompt's deciding cause is the first name in the
+    // event's `causes` field, which `validation.rs::store_proposal` writes in
+    // classifier order. Empty for a proposal that ran without asking, so
+    // `None` there rather than a made-up cause.
+    for event in trace.of_type("command_proposal_stored") {
         run_record.approvals.push(RecordedApproval {
             kind: "command".to_string(),
             decision: "requested".to_string(),
+            cause: first_cause(event),
         });
     }
     for (event_type, decision) in [
@@ -502,9 +507,11 @@ fn drive(
             run_record.approvals.push(RecordedApproval {
                 kind: "command".to_string(),
                 decision: decision.to_string(),
+                cause: None,
             });
         }
     }
+    run_record.group_approvals_by_cause();
 
     // Checks are the commands the engine actually ran, with their exit status.
     // `command_executed` carries both `command` and `exitCode`
@@ -773,6 +780,20 @@ fn count_tasks(engine: &WorkspaceEngine) -> Result<u64> {
         count += engine.session_store.read_task_statuses(&session.id)?.len() as u64;
     }
     Ok(count)
+}
+
+/// The first cause name on a `command_proposal_stored` event, or `None` when
+/// the proposal needed no approval (spec 62 §5.4–5.5).
+///
+/// The event joins the names with commas and always carries the field, empty
+/// for a command that runs without asking, so an empty string means "no cause"
+/// rather than a cause with a blank name.
+fn first_cause(event: &trace::Event) -> Option<String> {
+    event
+        .field("causes")?
+        .split(',')
+        .find(|cause| !cause.is_empty())
+        .map(str::to_string)
 }
 
 /// Turns scenario turns into the three parallel vectors `MockModelAdapter` wants.
