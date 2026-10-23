@@ -195,7 +195,7 @@ spent a round, and an approval, per worktree to get them. With `n` worktrees it
 spawns `1 + 3n` git processes (the list, then `status`, `rev-parse --short HEAD`
 and `rev-list --left-right --count` per worktree), capped at 20 worktrees with
 the rest counted. On this machine a spawn is usually milliseconds and
-occasionally ~280 ms (`docs/TROUBLESHOOTING.md`, "The quality gate is slow
+occasionally ~280 ms (`docs/DEVELOPMENT.md`, "The quality gate is slow
 locally"), so the cap also bounds the worst case.
 
 Tool descriptions say plainly what the session lacked: worktrees exist,

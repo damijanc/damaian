@@ -14,45 +14,62 @@ API keys under your control.
 
 ## What you can do
 
-- **Chat with your codebase.** Ask questions and get streamed answers. Each turn
-  lists the repository files it read, and any file it mentions opens in your
-  editor in one click.
-- **Review edits before they land.** File-change requests come back as a diff
-  preview. Apply or reject changes per file — or per individual hunk — and
-  Damaian checks file hashes so it never overwrites work you changed after the
-  preview.
-- **Undo a whole turn.** Every turn leaves a checkpoint covering both the files
-  it changed and your position in the conversation, so a wrong direction is one
-  Rewind away rather than a manual unpick. Checkpoints are session recovery, not
-  version control, and no substitute for a commit.
-- **Stay in control of the terminal.** When the assistant needs a local fact, it
-  can run read-only commands (like `git status` or `git log`) on its own.
-  Anything that writes, installs, or reaches the network waits for your approval
-  in the conversation, showing the full command before you decide. Approve once,
-  or allow that command for the project. Docker commands, including read-only
-  ones such as `docker ps`, always ask.
-- **Stop a run that is going wrong.** Long turns report what they are doing and
-  how long they have been doing it, and stop on `Escape` or the Stop button.
-- **Give the assistant project rules.** `AGENTS.md` files are read as scoped
-  repository instructions, including nested ones for subdirectories.
-- **Extend it with MCP servers.** Connect local (stdio) or remote (HTTP) Model
-  Context Protocol servers in Settings, with per-server approval requirements.
-- **Organize work by project.** A Projects sidebar groups chat sessions by
-  folder, and your project list and last-used folder are remembered between
-  launches.
-- **Find an old session, and take one with you.** Search the text of every
-  session in the current folder, jump straight to the matching message, and
-  export a whole conversation as Markdown. Exports are secret-redacted and say
-  at the top how many secrets were removed, so what you share is not what the
-  session stored.
-- **Hand off to your editor.** Open the current folder in Visual Studio Code or
-  Finder from the conversation header's ⋮ menu, or open the built-in terminal
-  panel beside it.
-- **Keep secrets safe.** Detected credentials are redacted from context, command
-  output, and diffs, and your model API key is stored in the macOS Keychain.
-- **Update in place.** When a newer signed release is available, the update
-  button at the bottom of the sidebar installs it after you confirm; restart
-  Damaian to finish.
+### Understand your code
+
+- **Ask about your repository.** Streamed answers list the files they read;
+  `AGENTS.md` files, nested ones included, act as scoped project rules.
+- **Work across a monorepo.** Each project is a *root* whose commands run in its
+  own directory; adjust roots in **Settings › General**.
+- **See what a web page does.** With a browser MCP server, the assistant reports
+  a page's errors, console problems and failed requests. Remote pages ask first.
+
+### Change it safely
+
+- **Review edits before they land.** Apply a diff per file or per hunk; a file
+  you changed after the preview is blocked, not overwritten.
+- **Follow the plan.** Approve a multi-step plan before anything changes, then
+  see each step end **Confirmed**, **Completed, unverified**, **Blocked** or
+  **Skipped**, with the evidence behind it.
+- **Fix what a check found.** Errors from compilers, tests, lint and the browser
+  become findings: **Fix N errors** repairs them all, **Fix selected** some.
+
+### Stay in control
+
+- **Working modes.** **Ask**, **Plan**, **Code** or **Review** sets what the
+  assistant can do in a session.
+- **Permission profiles.** Pick one per repository, from **Read-only** to **Full
+  repository development**. A profile only ever narrows.
+- **Command approval.** Read-only commands run on their own; everything else
+  shows the full command and waits for you. Docker commands always ask.
+- **Long turns.** **Stop** (or `Escape`) ends a turn; one that runs out of tool
+  rounds pauses on **Continue — N more** or **Answer now**.
+- **Cost.** Each reply shows tokens, model calls, prompt-cache hit rate and a
+  cost at your own rates; `agent_max_task_tokens` caps one turn.
+- **Provider fallback.** If your provider refuses a turn, Damaian can offer a
+  second configured one for that turn only, and only if you accept.
+- **Secrets.** Credentials are redacted from context, command output and diffs;
+  your API key stays in the macOS Keychain.
+
+### Organize your work
+
+- **Projects and sessions** are grouped by folder in the sidebar; search every
+  session's text, or export one as secret-redacted Markdown.
+- **The repo bar** above the prompt shows branch, change count and a **Fix**
+  action when a check found errors.
+- **Worker sessions** (opt-in) run handed-off tasks in their own Git worktree,
+  tracked on each project's **Workers** board.
+- **Hand-offs:** open the folder in VS Code, Finder or the built-in terminal;
+  connect MCP servers; script it with the `damaian` CLI, built from source (see
+  [Development](docs/DEVELOPMENT.md#cli)).
+- **Updates** install in place from the sidebar after you confirm.
+
+### Recover from mistakes
+
+- **Rewind** any turn's file changes, conversation, or both, from its
+  checkpoint. Checkpoints are session recovery, not a substitute for a commit.
+- **After a crash**, the session says what was interrupted and offers
+  **Resume**, **Inspect**, **Mark failed** or **Abandon**. It never re-runs an
+  action whose outcome is unknown.
 
 ## Requirements
 
@@ -76,8 +93,10 @@ No Node.js runtime is required to run the packaged app.
 
 1. Open Damaian and select `+` beside **Projects** to pick a local Git
    repository.
-2. Open **Settings** (`⌘,`), add your model provider details, and use the
-   **Model API Key** controls to store your key in the Keychain.
+2. Open **Settings** (`⌘,`), add your model provider details, turn on
+   **Native tool-calling** for the provider, and use the **Model API Key**
+   controls to store your key in the Keychain. Without native tool-calling the
+   assistant can answer questions but cannot propose file changes.
 3. Ask a question about the repository in the conversation, or request a change
    such as "add a test for the config parser" and review the diff preview.
 

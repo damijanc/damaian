@@ -4,110 +4,272 @@ Damaian is a local-first AI coding assistant for macOS. It indexes a local Git r
 
 This build is a developer preview. Release builds are Developer ID signed and notarized, and update themselves from GitHub Releases. The feature set is still moving, and configuration and stored data may change shape between releases.
 
-## First Run
+## Quick start
 
-1. Open `Damaian.app`.
-2. Select `+` beside `Projects`.
-3. Pick the local Git repository or working folder you want Damaian to inspect.
-4. Use the conversation header's ⋮ menu, **Open in › VS Code**, when you want to open the same folder in Visual Studio Code, or the terminal icon beside it to open the bottom terminal panel.
+1. Install Damaian and open `Damaian.app`. See [macOS Installation](MACOS_INSTALLATION.md#install).
+2. Open Settings with `⌘,`. It opens on **Providers**.
+3. Under **Popular providers**, select **+ Connect** beside your provider, or select **New** beside **Configured providers** for any other OpenAI-compatible endpoint. Check **Base URL** and **Models** in **Provider details**.
+4. Paste your key into **API Key**. While **API Key Reference** starts with `keychain:` (Damaian fills one in), the key is stored in macOS Keychain and only the reference is written to your config.
+5. Turn on **Native tool-calling**, then select **Save Provider**. Without native tool-calling the assistant can answer questions but cannot propose file changes ([why](#native-tool-calling)).
+6. Close Settings. In the model picker below the prompt, choose your provider under **Provider** ([Choosing the model and effort](#choosing-the-model-and-effort)).
+7. Select **+** beside **Projects** and pick the Git repository you want to work on.
+8. Ask a question in the prompt box and press `Enter`. To change code, ask for the change, review the patch preview in the conversation, and select **Apply N** ([File Changes](#file-changes)).
+
+## Contents
+
+**Setup**
+
+- [Quick start](#quick-start)
+- [Updates](#updates)
+- [Settings](#settings)
+- [Model Providers and API Keys](#model-providers-and-api-keys)
+- [Output and Context Limits](#output-and-context-limits)
+
+**Daily use**
+
+- [Working Folder](#working-folder)
+- [Terminal](#terminal)
+- [Chat](#chat)
+- [File Changes](#file-changes)
+- [Rewind](#rewind)
+- [The Plan Panel](#the-plan-panel)
+- [Search and Export](#search-and-export)
+- [After a Crash](#after-a-crash)
+
+**Control**
+
+- [Working Modes](#working-modes)
+- [Permission Profiles](#permission-profiles)
+- [Command Approval](#command-approval)
+- [Repository Roots](#repository-roots)
+
+**Advanced**
+
+- [Worker Sessions](#worker-sessions)
+- [MCP Servers](#mcp-servers)
+- [Browser Diagnostics](#browser-diagnostics)
+- [Findings](#findings)
+- [Provider Limits and Retries](#provider-limits-and-retries)
+- [Capping What One Turn May Spend](#capping-what-one-turn-may-spend)
+- [What a Turn Cost](#what-a-turn-cost)
+
+**Reference**
+
+- [Local Data](#local-data)
+- [The Command-Line Tool](#the-command-line-tool)
+- [Safety Model](#safety-model)
+- [Troubleshooting](#troubleshooting)
 
 ## Updates
 
-Damaian checks for updates when the desktop app starts, and on demand from **Damaian › Check for Updates...**. If a newer GitHub Release is available, the button at the bottom of the sidebar changes to `Update <version>`. Select it and confirm **Install** to download and install the signed update, then quit and reopen Damaian to finish.
+Damaian checks for updates when the desktop app starts, and on demand from **Damaian › Check for Updates...**. If a newer GitHub Release is available, the button at the bottom of the sidebar changes to **Update &lt;version&gt;**. Select it and confirm **Install** to download and install the signed update, then quit and reopen Damaian to finish.
 
 The first installed version must already include the updater. If you installed an older developer-preview DMG before automatic updates were added, download and install one newer DMG manually once.
+
+## Settings
+
+Open Settings with `⌘,` or **Damaian › Settings...**; Escape or **×** closes it. It opens on **Providers**, and its other pages are **General**, **Shortcuts**, **Checkpoints**, **MCP Servers** and **Models**. Your user configuration is under **General › User configuration**: edit it and select **Save**, or select **Load** to re-read the file from disk.
+
+These are your user-scope settings, and they are kept in one file:
+
+```text
+~/Library/Application Support/DamaianClient/config/user.conf
+```
+
+Editing that file by hand does the same thing as editing it in Settings, which is how you configure Damaian for the [command-line tool](#the-command-line-tool), which has no Settings window. Note the `config/` directory in the middle of that path, and the `.conf` name: a file dropped next to it as `config.conf` is not user config and is read by nothing.
+
+Configuration uses one `key=value` entry per line. Edit values directly and select **Save**. Delete a line and save to remove that user-level override.
+
+`model_api_key_env` is a reference field. The app rejects raw API keys in this field; use the **Model API Key** controls to store the secret in Keychain (see [Model Providers and API Keys](#model-providers-and-api-keys)).
+
+Common keys:
+
+| Key | Default | What it does | Can a repository change it? |
+|---|---|---|---|
+| `restricted_patterns` | `.env` files, `*.pem`, `*.key`, SSH private keys, `secrets/` and `credentials/` directories, and similar | Files Damaian never reads or sends, separated by `\|` | Adds to yours; cannot remove any |
+| `ignore_patterns` | Built-in list | Files Damaian does not index | Adds to yours; cannot remove any |
+| `audit_enabled` | `true` | Turns the local audit log on or off | No |
+| `model_provider` | `openai` | The provider used when the model picker has no choice of its own | No |
+| `model_name` | `gpt-4.1` | Model identifier | No |
+| `model_base_url` | `https://api.openai.com` | OpenAI-compatible API base URL | No |
+| `model_api_key_env` | `OPENAI_API_KEY` | API key reference: `keychain:model-api-key` for the desktop Keychain flow, or an environment variable name for [CLI and development](#environment-variables-cli-and-development-only) | No |
+| `model_reasoning_level` | `default` | Reasoning effort: `default`, `minimal`, `low`, `medium` or `high` | No |
+| `model_provider.<id>.supports_native_tools` | off | Use the provider's native tool-calling API ([Native tool-calling](#native-tool-calling)) | No |
+| `model_provider.<id>.max_output_tokens` | Per model | Largest reply the model may generate, in tokens ([Output and Context Limits](#output-and-context-limits)) | No |
+| `model_provider.<id>.context_token_budget` | Per model | How much repository content is sent with each request, in tokens | No |
+| `enable_semantic_search` | `false` | Embedding-based retrieval ([Semantic search](#semantic-search)) | Yes |
+| `enable_worker_sessions` | `false` | [Worker Sessions](#worker-sessions) | No |
+| `agent_max_tool_rounds` | `8` | Tool rounds before a turn pauses ([While a turn runs](#while-a-turn-runs-and-how-it-ended)) | Yes |
+| `agent_max_task_tokens` | none | Token cap per turn ([Capping What One Turn May Spend](#capping-what-one-turn-may-spend)) | Lower only |
+| `command_timeout_secs` | `600` | Deadline for a command Damaian runs | Lower only |
+| `require_approval_for_file_edits` | `true` | Ask before changing files | Turn on only |
+| `require_approval_for_all_commands` | `false` | Ask before every command, read-only ones included | Turn on only |
+| `checkpoint_retention_days` | `90` | How long [checkpoints](#rewind) are kept | No |
+| `audit_retention_days` | `90` | How long audit records are kept | Yes |
+| `repository_map_max_tokens` | `800` | Size of the [repository map](#the-map-the-assistant-sees) | Lower only |
+
+Repository-scoped settings are not edited from Settings. Put repository defaults in `.damaian/config.conf` inside the selected repository. Repository settings are included in the [effective policy view](#reading-the-effective-policy-view).
+
+Because that file arrives with a clone, a repository can only make Damaian *more* careful, never less:
+
+- `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, every `language_server.<language>` key, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
+- `restricted_patterns`, `ignore_patterns`, and `command_blocklist` are added to yours rather than replacing them.
+- The `require_approval_for_*` flags can be turned on by a repository, not off. MCP and individual MCP servers can be turned off, not on.
+- `command_allowlist` is never taken from repository config; *Allow Always* writes to your own config instead. See [Allow Always](#allow-always).
+- Budgets and preferences — `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, `agent_max_tool_rounds`, and the root overrides `project_roots_added` and `project_roots_removed` ([Repository Roots](#repository-roots)) — apply as written.
+- The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — and the repository map's `repository_map_max_tokens` (800) can be lowered by a repository but never raised. The same holds for `command_timeout_secs`, `agent_max_task_tokens`, `agent_max_turn_messages`, and `agent_max_exploration_rounds`. They bound how much of your repository a single tool call, or the map, puts into a model request, so raising one would widen what leaves your machine. A repository that tries is told to you like any other rejected key.
+
+### Semantic search
+
+`enable_semantic_search` is off by default. Off, Damaian finds relevant files for a request, and answers the assistant's `search_codebase` tool, by keyword and term overlap. On, it also uses an embedding model for that search, which can find files that use different words for the same idea.
+
+Turning it on downloads the embedding model on first use, into `models/all-MiniLM-L6-v2/` inside the [data directory](#local-data), so the first search afterwards is slower. If it seems to do nothing, see [Troubleshooting](TROUBLESHOOTING.md#semantic-search-does-nothing).
+
+## Model Providers and API Keys
+
+Damaian uses OpenAI-compatible chat APIs. Configure providers under **Settings › Providers**, but do not paste the API key into the configuration file.
+
+### Adding a provider
+
+The **Providers** page lists your **Configured providers**, then **Popular providers** (OpenAI, DeepSeek, OpenAI compatible and Ollama) that you have not configured yet. **+ Connect** on a popular provider, or **New**, fills the **Provider details** form below:
+
+- **Name** and **ID** identify the provider. Built-in providers keep their ID.
+- **Base URL** is the OpenAI-compatible API address.
+- **API Key Reference** and **API Key**: when the reference starts with `keychain:`, a key pasted into **API Key** is stored in macOS Keychain under that account when you save. Only the reference is written to your config. A key cannot be saved against any other kind of reference.
+- **Models** lists the model ids to offer, one per line.
+- **Native tool-calling** ([below](#native-tool-calling)).
+- **Max output tokens** and **Context budget** ([Output and Context Limits](#output-and-context-limits)).
+
+Select **Save Provider** to write it to your user config, or **Remove** to delete it. **Settings › Models** lists each configured provider's models, with **Configure** to open it here. Saving a provider does not make it the one chat uses: pick it in the composer's [model picker](#choosing-the-model-and-effort), or set `model_provider`.
+
+### The Model API Key panel
+
+The **Model API Key** panel at the bottom of **Providers** stores the key named by `model_api_key_env`:
+
+1. Enter a Keychain account name in **Keychain Account**, such as `model-api-key`.
+2. Paste the API key into **API Key**.
+3. Select **Save Key**.
+
+Damaian stores the secret in macOS Keychain and writes only this reference to config:
+
+```text
+model_api_key_env=keychain:model-api-key
+```
+
+Damaian keeps a process-local in-memory copy after a successful Keychain save or read. You may be asked by macOS the first time the app accesses the key after launch, but repeated chat, edit, or command-assisted answers in the same app run should not require another password prompt.
+
+Use **Remove Key** to delete the stored secret from Keychain. Saving a new key with the same account replaces the previous value.
+
+If the [effective policy view](#reading-the-effective-policy-view) still shows a different `model_api_key_env` after saving the key, a repository or admin config is overriding the user setting. Remove or update that override before retrying chat.
+
+### Native tool-calling
+
+Turn on **Native tool-calling** for the provider in **Provider details** (or set `model_provider.<id>.supports_native_tools=true`). Built-in providers leave it off, and without it the assistant can answer questions but cannot propose file changes, make plans, or use [MCP](#mcp-servers) or any other tools.
+
+### Configuration examples
+
+Every example below is user-scope configuration: enter it in Settings, or write it to [`config/user.conf`](#settings) directly. From a source checkout, the [command-line tool](#the-command-line-tool) writes that file for you and prints the path it used:
+
+```sh
+cargo run -p damaian-cli -- config-set user model_provider deepseek
+```
+
+Naming a built-in provider fills in most of the setup. `model_provider=deepseek` or `model_provider=openai` sets the base URL, the default model, and the key variable for that provider; set the other keys only to override one of those. You still need to turn on [Native tool-calling](#native-tool-calling).
+
+Example DeepSeek configuration:
+
+```text
+model_provider=deepseek
+model_name=deepseek-v4-flash
+model_base_url=https://api.deepseek.com
+model_api_key_env=keychain:model-api-key
+```
+
+The same pattern applies to OpenAI or any OpenAI-compatible provider.
+
+If an older configuration still names `deepseek-chat` or `deepseek-reasoner`, update it. Those were compatibility aliases that DeepSeek retired on 24 July 2026; the current models are `deepseek-v4-flash` and `deepseek-v4-pro`.
+
+### Environment variables (CLI and development only)
+
+Keychain is the way to give the desktop app a key. An app opened from Finder or the Dock does not see variables exported in your shell, so an environment-variable reference only works for the command-line tool and for a development build started from a shell.
+
+In that mode, `model_api_key_env` is the name of an environment variable that contains the key. It is not the key itself:
+
+```text
+model_provider=deepseek
+model_name=deepseek-v4-flash
+model_base_url=https://api.deepseek.com
+model_api_key_env=DEEPSEEK_API_KEY
+```
+
+Then set the variable in the shell that runs the command-line tool or the development build (see [DEVELOPMENT.md](DEVELOPMENT.md)):
+
+```sh
+export DEEPSEEK_API_KEY="your-deepseek-api-key"
+```
+
+To check that the settings were picked up before spending anything, print the merged configuration. This makes no model call:
+
+```sh
+cargo run -p damaian-cli -- config-show | grep '^model'
+```
+
+If `model_api_key_env` names a variable you did not choose, the configuration was not read at all and the built-in default is standing. That is a wrong path or a wrong filename, not a wrong key.
+
+## Output and Context Limits
+
+Two settings control how many tokens each request may use. They are independent: one bounds what the model writes, the other bounds what it reads. Both live in Settings under **Providers**, in the **Provider details** panel, and both apply per provider.
+
+- **Max output tokens** caps the reply the model generates in a single response. Set too low, a large multi-file patch is cut off mid-way. Damaian detects this, tells the model its call was truncated, and asks it to retry with fewer files per patch, so the request recovers instead of failing silently.
+- **Context budget** caps how much repository content Damaian packs into each request. Raising it lets the assistant see more of a large repository, which can improve answers. This content is re-sent and re-billed on every turn, so a higher budget increases cost and latency on all requests, not just large ones.
+
+Leave a field blank to use the built-in default for the selected model. The defaults are:
+
+- `deepseek-v4-flash` and `deepseek-v4-pro`: 65536 output tokens, 64000 context budget.
+- `deepseek-chat` and `deepseek-reasoner` (retired aliases): 8192 output tokens, 16000 context budget.
+- Other DeepSeek models: 8192 output tokens, 16000 context budget.
+- All other models: no output cap is sent, and the context budget is 16000.
+
+The built-in context budgets are deliberately well below what these models technically accept. DeepSeek's V4 models allow up to 384000 output tokens and a 1M-token context window, but requesting the maximum on every turn is rarely worth the cost. Raise the values if your repository or your patches need more.
+
+A value entered in the panel always wins over the built-in default. To give a V4 model its full output range:
+
+```text
+model_provider.deepseek.max_output_tokens=384000
+```
+
+Setting a value higher than the model actually allows causes the provider to reject the request outright, so prefer the built-in defaults unless you know the model's real limit.
 
 ## Working Folder
 
 Damaian uses the selected working folder as the root for indexing, file reads, patch previews, Git status, and repository-scoped settings.
 
-Use `+` beside `Projects` to open the native macOS folder picker. The selected folder appears under `Projects` by folder name. Expand a project to see its sessions grouped underneath it. Use the `+` beside a project folder to start a new session for that project.
+Use **+** beside **Projects** to open the native macOS folder picker. The selected folder appears under **Projects** by folder name. Expand a project to see its sessions grouped underneath it. Use the **+** beside a project folder to start a new session for that project.
 
 Select a project folder in the sidebar to switch the active working folder.
 
 Damaian remembers the project list and the last selected working folder in local app storage. The last folder is restored when the app restarts. Launch-time defaults such as `DAMAIAN_REPO` are used only when no previous selection has been saved.
 
-The conversation header holds only the session title, the terminal toggle and a ⋮ menu. The ⋮ menu's **Open in** submenu opens the selected working folder in **VS Code**, reveals it in **Finder**, or opens the **Terminal** panel there. Below it are **Rename session**, **Export as Markdown** and, last, **Delete session**, which asks for confirmation. Damaian keeps AI orchestration, context assembly, patch preview, settings, and audit logging in the app; normal code navigation and IDE work happen outside Damaian in Visual Studio Code.
+Damaian keeps AI orchestration, context assembly, patch preview, settings, and audit logging in the app; normal code navigation and IDE work happen outside Damaian in Visual Studio Code.
+
+### Project and session menus
+
+**A project's ⋮ menu** in the sidebar offers **Open in › VS Code** or **Open in › Finder**, **Rename** and **Delete**, plus **New worker** when [Worker Sessions](#worker-sessions) are on. **Rename** changes only the name shown in the sidebar; an empty name goes back to the folder name. **Delete** asks first, then removes the project from the list only. Nothing on disk is deleted, and you can add the folder again later.
+
+**A session's ⋮ menu**, shown on the open session and when you hover over or tab to a row, has **Rename**, **Export as Markdown** and **Delete** (which asks for confirmation). Double-clicking a session also renames it. Select an existing session to reload its conversation.
+
+**The conversation header** holds only the session title, the terminal toggle and a ⋮ menu. The ⋮ menu's **Open in** submenu opens the selected working folder in **VS Code**, reveals it in **Finder**, or opens the **Terminal** panel there. Below it are **Rename session**, **Export as Markdown** and, last, **Delete session**, which asks for confirmation: the same actions as the open session's own menu.
 
 ### The repo bar
 
 A strip directly above the prompt shows where the next turn will work:
 
-- **The folder button** names the working folder. It opens a menu: **Show in Finder**, **Open repository on GitHub**, **Copy path**, **Change folder…** (the same folder picker as the `+` beside `Projects`) and **Open in terminal**. **Open repository on GitHub** appears only when the folder's `origin` remote is on github.com. Damaian rebuilds the address as `https://github.com/<owner>/<repo>` from the remote rather than opening the remote's text as it stands, because a cloned repository controls that text.
+- **The folder button** names the working folder. It opens a menu: **Show in Finder**, **Open repository on GitHub**, **Copy path**, **Change folder…** (the same folder picker as the **+** beside **Projects**) and **Open in terminal**. **Open repository on GitHub** appears only when the folder's `origin` remote is on github.com. Damaian rebuilds the address as `https://github.com/<owner>/<repo>` from the remote rather than opening the remote's text as it stands, because a cloned repository controls that text.
 - **The branch** follows it in grey. On a detached HEAD it shows the short commit hash instead.
 - **The change count**, `+N −M` on the right, is the working tree's lines added and removed against the last commit, with new untracked text files counted as added lines. It is hidden when there is nothing to count. It is information only; clicking it does nothing yet.
 - **A contextual action** may appear at the far right. Today that is **Fix N errors** or **Fix N warnings** ([Findings](#fix-n-errors-and-the-findings-list)).
 
 In a folder that is not a Git repository, the bar shows the folder button alone, and its menu still works. The bar refreshes when you open a session, after every turn, after you apply or roll back a patch, after a rewind, and when you return to the window (at most once every five seconds). It never polls on a timer.
-
-## Repository Roots
-
-A repository can hold several projects: a Cargo workspace and its member crates, or `packages/api` (Node) beside `packages/web`. Damaian calls each one a *root*. Each root has its own languages, manifests, entry points, test directories, `AGENTS.md` files and commands. A root's commands run in that root's directory, so `npm test` found in `packages/api` runs in `packages/api`, where its `package.json` is.
-
-### How roots are found
-
-A directory is a root when it contains one of the manifests Damaian already knows how to run: `package.json`, `pyproject.toml`, `pytest.ini`, `pom.xml`, `build.gradle`, `go.mod` or `Cargo.toml`. The working folder itself is always a root, even with no manifest, so every repository has at least one. Nested roots are all kept: a Cargo workspace root is right for `cargo test --workspace`, and each member is right for its own `cargo test`.
-
-Some directories are never roots:
-
-- anything `.gitignore`d or matched by `ignore_patterns`, because Damaian never indexes it;
-- `node_modules`, `vendor`, `target`, `dist`, `build`, `.venv` and `venv`, wherever they appear, even if you have removed them from `ignore_patterns`;
-- anything more than six directories deep. Damaian records a manifest found there rather than ignoring it silently (see [Troubleshooting](TROUBLESHOOTING.md#repository-roots-and-the-repository-map)).
-
-When a directory holds more than one manifest, the root names the first in the list above as its evidence. A repository root with both `package.json` and `Cargo.toml` therefore reads "because `package.json` exists".
-
-A root's commands come from its manifest: `npm run <name>` for each of the scripts `test`, `lint`, `typecheck`, `build` and `format` in `package.json` (plus `npm test` when there is a `test` script), and one fixed command for each other manifest, such as `cargo test` for `Cargo.toml`. Only those exact script names count: a script called `lint:web` or `check` is not offered.
-
-### Seeing and correcting roots
-
-`Settings` › `General` has a **Repository roots** section for the selected working folder. Each row shows the root's path (`.` is the working folder itself), its languages, how many commands it has, and whether it was `detected`, `added by you` or `removed by you`. Select a row to see why it is a root ("Treated as a root because `packages/api/package.json` exists."), its instruction files, and each command with the directory it runs in.
-
-- `Add a root` makes a directory a root although it has no manifest. It must be a directory inside the repository that holds at least one indexed file, and not under a vendor directory or a `restricted_patterns` match.
-- `Remove root` stops treating a detected directory as a project. Its files then belong to the nearest enclosing root, and it proposes no commands. It stays in the list, marked `removed by you`, so the decision is visible.
-- `Undo` clears your override for that directory.
-
-The working folder itself cannot be removed.
-
-Add, remove and undo write `project_roots_added` and `project_roots_removed` to `.damaian/config.conf` **inside the repository**. That file is in your working tree, so `git status` shows it, and you can commit it to share the correction or leave it uncommitted. Damaian asks before it writes. If that file already has a line Damaian cannot parse, the write is refused with the error, so a hand-edited file is never rewritten. You can also edit the two keys by hand, as `|`-separated lists:
-
-```text
-project_roots_added=tools/scripts
-project_roots_removed=examples/legacy|examples/old
-```
-
-An entry Damaian cannot apply (a path that does not exist, a file, `..`, the working folder in `project_roots_removed`, a path in both lists) is not applied, and the section lists it under "Overrides Damaian did not apply". Overrides survive every rescan.
-
-The same keys are accepted in your user config (`config/user.conf`). There they apply to every repository you open. Nothing in Damaian writes them there.
-
-From the CLI, `damaian repo-root <repo> add|remove|clear <path>` makes the same edit, and `damaian repo-map <repo>` prints the roots.
-
-### Where a command runs
-
-A command the assistant asks for runs in the working folder unless it asks for a directory inside the repository, normally one of the roots on the map. When it does, the approval card reads **Runs in `packages/api`**. No line means the command runs in the working folder itself. A root changes only the directory. It never changes whether a command needs your approval, and never lets a command reach a path outside the repository: `cat ../web/src/index.ts` from `packages/api` is still inside the repository, and a directory outside it, behind a symlink, or under `restricted_patterns` is refused before anything is proposed.
-
-Error locations a command prints (`src/x.ts:3:5`) are matched to files relative to the directory it ran in first, then its parent directories up to the working folder. So findings from a command in `packages/api` point at `packages/api/src/x.ts`, and `cargo` output from a member crate, which prints workspace-relative paths, still resolves.
-
-Elsewhere the UI names the root when a file is not in the working folder's own root: a pinned file chip reads `index.ts · packages/api`, and each file in a patch preview is tagged with its root. A turn that touches two packages shows both.
-
-### `Allow Always` in a root
-
-`Allow Always` on a command that runs in a root other than the working folder records the grant for that root only. For `npm test` in `packages/api`, your config gets:
-
-```text
-command_allowlist.<repository_id>=cd packages/api && npm test
-```
-
-That entry lets `npm test` run unprompted in `packages/api` and nowhere else. `npm test` in `packages/web` may do something quite different, so it still asks. The entry cannot be matched by typing it as a command, because a command containing `&&` is never allowlisted.
-
-The reverse also holds. A plain `command_allowlist` entry, whether from `Allow Always` at the working folder or one you wrote yourself at user or admin scope, applies **only at the repository root**. Your machine-wide `command_allowlist=npm test` does not let `npm test` run unprompted in `packages/api`. That case did not exist before roots, because every command ran at the repository root, so nothing that ran unprompted before now asks.
-
-### The map the assistant sees
-
-Each request includes a compact *repository map*: every root with its languages and commands and, when there is room, its manifests, entry points, test directories, major directories and instruction files. The map tells the assistant where things are without searching. It sits after `AGENTS.md` instructions and before retrieved files, so under a tight context budget it can displace retrieved files but never instructions. It is secret-scanned like every other context item.
-
-The map is limited by `repository_map_max_tokens`, 800 by default. When a repository's map is larger, Damaian drops detail in a fixed order: entry points and test directories (largest root first), then major directories, then generated and vendor paths, which become a count, and finally whole roots. Whenever anything is left out, the map ends with a line saying what, such as "3 of 7 roots shown". Set the key to `0` to leave the map out of requests entirely. The roots, the `Settings` section and the CLI work either way.
-
-A repository's `.damaian/config.conf` can lower `repository_map_max_tokens` or set it to `0`, but cannot raise it above yours, because the map is repository content sent to the model on every request.
 
 ## Terminal
 
@@ -123,7 +285,7 @@ Press `Enter` to send a chat message. Press `Shift+Enter` to insert a new line.
 
 Questions stream read-only answers. Code and file change requests, such as `create a test file` or `update the README`, generate an inline patch preview in the conversation. With Worker sessions on, a request to plan, split or hand off work stays in the conversation instead (see [Worker Sessions](#worker-sessions)).
 
-To pin specific repository files into the next chat request, select **+** at the bottom left of the prompt and then **Add file**, or drag files onto the window. Pinned files appear as chips above the prompt and are included before automatic retrieval. Select `×` on a chip to remove that file.
+To pin specific repository files into the next chat request, select **+** at the bottom left of the prompt and then **Add file**, or drag files onto the window. Pinned files appear as chips above the prompt and are included before automatic retrieval. Select **×** on a chip to remove that file.
 
 If you name a file in your prompt, such as `USER_GUIDE.md` or `docs/USER_GUIDE.md`, Damaian attempts to include that file in the model context. A filename without a directory must uniquely match one file in the selected repository.
 
@@ -133,37 +295,34 @@ under their directory, and more specific nested instructions override broader
 ones. These instructions are sent for chat answers and edit proposals, but they
 do not override your request or Damaian's safety policy.
 
-If the assistant needs a local command result to answer a question, it can ask Damaian to run commands. Read-only commands Damaian recognises, such as `pwd`, `ls`, `git status`, and `git log`, run without asking, in the selected working folder. They are not sandboxed: they run directly on your machine, which is why only commands Damaian classifies as read-only qualify. Simple pipelines made only of such commands, filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, or `grep`, also run without asking. Damaian redacts the output and sends it back to the model so it can finish answering.
-
-`git diff` and `git show` ask first, because they print file contents a command line cannot bound or keep restricted paths out of. The assistant reads changes through its own diff tool instead, which does both.
-
-Every other command appears as an approval card in the conversation. Review the command, risk, and working directory (the reason is under **Why this command**), then select **Approve** or **Reject**. Destructive commands blocked by policy cannot be approved from the UI.
-
-Docker commands, including `docker ps`, `docker compose ...`, and `docker-compose ...`, always ask for approval. They can inspect or change a privileged local daemon, use the network, start background services, mount host paths, expose ports, and mutate images or volumes, so Damaian never treats them as read-only.
-
-**Always allow in this project**, in the approval card's ⋯ menu, runs the command and records it in your own config as `command_allowlist.<repository_id>`, so that command stops asking. The rest of this guide, and the policy view, call this grant *Allow Always*. The allowance covers the exact command only: allowing `npm run test:unit` does not allow `npm run test:unit --watch`, and allowing `git push` does not allow `git push --force`. It applies to that working folder alone, and not to another clone of the same project at a different path. Remove an entry by editing the `command_allowlist.<repository_id>` line in `~/Library/Application Support/DamaianClient/config/user.conf`.
-
-The decision is stored in your config rather than in the repository because Damaian could not otherwise tell a command you allowed from one that arrived with the clone. A `command_allowlist` in a repository's `.damaian/config.conf` is never honoured; if a repository you open already has one, Damaian shows the exact commands once and asks which to keep.
-
-`Allow Always` is not offered for commands blocked by policy, for commands containing shell control syntax such as `|`, `&&`, or `>`, or when `require_approval_for_all_commands` is set — in each of those cases an allowlist entry would have no effect, so the app does not offer to write one.
-
-Sessions are shown under their project folder in the sidebar. Select an existing session to reload its conversation. Each session has a ⋮ menu, shown on the open session and when you hover over or tab to a row, with **Rename**, **Export as Markdown** and **Delete** (which asks for confirmation). Double-clicking a session also renames it. The header's ⋮ menu offers the same three actions for the open session.
-
-### While a turn runs, and how it ended
-
-Progress is shown inside the reply, not in the header. While a turn runs, a line in the assistant's message shows what it is doing ("Waiting for model", a tool's own label, "Streaming", "round 2/8", or "Generating patch" for a file-change request), how long it has been running, and **Stop** when that kind of turn can be stopped. A chat message you send can be stopped. A turn that resumes after you approve a command, a plan or a fallback offer, and a patch being generated, show the line without Stop. When a turn finishes normally, the line disappears.
-
-A turn that reaches its tool-round limit (`agent_max_tool_rounds`, 8 by default) while the assistant still wants a tool does not stop: it pauses and says "Used N of M tool rounds." Select **Continue — N more** to give the same turn another set of rounds, or **Answer now** to have the assistant answer with what it has, without tools. A turn can be continued up to 64 rounds in total; at that cap only **Answer now** is offered. The pause is saved, so it is still waiting after a restart.
-
-A turn that ends any other way leaves a mark on its message: **Stopped by you**, **Tool budget exhausted** (after **Answer now**; select **Ask again** to start a new turn on the same request), **Token budget exhausted**, **Stopped before finishing**, or the error itself when the request failed. The stop and budget marks are still there when you reopen the session. **Stopped before finishing** and a failure's error are shown only in the window where the turn ran; after a reload, a stopped turn reads **Stopped by you** and a failed one has no mark.
+If the assistant needs a local command result to answer a question, it can ask Damaian to run commands. Read-only ones run without asking; everything else asks you first. See [Command Approval](#command-approval).
 
 If the app cannot reach its own background service, a red banner above the conversation says **Desktop API unavailable**. It stays until a request succeeds again.
 
 Context file buttons open the referenced file in Visual Studio Code.
 
+### Choosing the model and effort
+
+Below the prompt, after the **+** button and the [mode](#working-modes) pill, two buttons show the model and the reasoning effort the next turn will use. Either one opens the same menu:
+
+- **Provider** lists your configured providers.
+- **Model** lists that provider's models, with a **Custom model** field and **Apply** for a model id that is not listed.
+- **Effort** offers **Default**, **Minimal**, **Low**, **Medium** and **Extra High**.
+- **Reset to default** goes back to the provider, model and effort in your configuration (`model_provider`, `model_name` and `model_reasoning_level`).
+
+The choice is remembered in the app for each working folder and sent with each request. It is not written to your config file.
+
+### While a turn runs, and how it ended
+
+Progress is shown inside the reply, not in the header. While a turn runs, a line in the assistant's message shows what it is doing ("Waiting for model", a tool's own label, "Streaming", "round 2/8", or "Generating patch" for a file-change request), how long it has been running, and **Stop** when that kind of turn can be stopped. A chat message you send can be stopped. A turn that resumes after you approve a command, a plan or a fallback offer, and a patch being generated, show the line without Stop. When a turn finishes normally, the line disappears.
+
+A turn that reaches its tool-round limit (`agent_max_tool_rounds`, 8 by default) while the assistant still wants a tool does not stop: it pauses and says "Used N of M tool rounds." Select **Continue — N more** to give the same turn another set of rounds, or **Answer now** to have the assistant answer with what it has, without tools. A turn can be continued up to 64 rounds in total; at that cap only **Answer now** is offered. The pause is saved, so it is still waiting after a restart. With a token cap set, the turn continues on its own instead of pausing (see [Capping What One Turn May Spend](#capping-what-one-turn-may-spend)).
+
+A turn that ends any other way leaves a mark on its message: **Stopped by you**, **Tool budget exhausted** (after **Answer now**; select **Ask again** to start a new turn on the same request), **Token budget exhausted**, **Stopped before finishing**, or the error itself when the request failed. The stop and budget marks are still there when you reopen the session. **Stopped before finishing** and a failure's error are shown only in the window where the turn ran; after a reload, a stopped turn reads **Stopped by you** and a failed one has no mark.
+
 ### Agent tools for reading and navigating
 
-With native tool-calling enabled, Damaian offers the assistant tools that need
+With [native tool-calling](#native-tool-calling) enabled, Damaian offers the assistant tools that need
 no approval and never change anything: `read_file` (with an optional line
 range), `list_directory`, `search_content`, `search_codebase`,
 `read_git_status`, `read_git_diff`, `list_worktrees`, and `read_git_log`. They
@@ -195,15 +354,151 @@ patterns, the read and search caps, and secret redaction. Git reads in a
 worktree or the main checkout exclude restricted paths and are bounded the same
 way.
 
-A command Damaian runs is stoppable and has a deadline: its output is streamed
-to the turn while it runs, Stop ends it, and `command_timeout_secs` (600 by
-default) kills it if it runs too long. A repository may shorten that deadline,
-never lengthen it. When one model message asks for several read-only tools, they
-run together and their results are reported in the order the model asked for
-them. With a token ceiling set (`agent_max_task_tokens`), a turn that reaches
-its tool-round limit continues on its own instead of pausing, and the messages it
-sends are bounded by `agent_max_turn_messages` so a long turn does not grow
-without limit.
+When one model message asks for several read-only tools, they run together and
+their results are reported in the order the model asked for them.
+
+## File Changes
+
+Use the conversation box to request file changes.
+
+1. Enter a request such as `create a test file for the config parser`.
+2. Review the inline patch preview returned by the assistant.
+3. Keep checked only the files you want to act on. Each file's hunks have their own checkboxes, so you can also leave out part of a file.
+4. Select **Apply N** to write the checked changes, or **Reject** to record the checked files as rejected without changing the workspace.
+
+Damaian checks file hashes before applying a stored patch. If a target file changed after preview, that file is blocked instead of overwriting newer local work.
+
+### Hardcoded secret warnings
+
+Damaian scans generated content for credentials before writing it. If a selected file is flagged, nothing is written: the preview shows which file tripped the check and what was detected, and you choose.
+
+Detection is not perfect. Setup instructions and placeholder values can resemble credentials, so review the diff before deciding. Select **Apply Anyway** to accept the change as written, or **Cancel** to leave the workspace untouched. The decision applies to that one apply and is not remembered; each apply asks again, and the override is recorded in the audit log.
+
+From the CLI, `damaian apply-patch` prints the same findings and re-runs with `--allow-generated-secrets` to accept them.
+
+After files are applied, Damaian prints a concise Git status summary in the conversation.
+
+## Rewind
+
+Damaian takes a checkpoint before every turn, so a turn that went the wrong way can be undone in one action. Each of your messages in the conversation carries a **Rewind** control, which offers three choices:
+
+- **Files and conversation** — puts back the files Damaian changed in that turn and moves the conversation to just before your message.
+- **Files only** — restores the files and leaves the conversation as it is.
+- **Conversation only** — moves the conversation back and leaves your files alone.
+
+What a checkpoint covers is what Damaian itself changed in that turn: files from patches you applied, and files an approved command created, modified, or deleted. Files you edited yourself are not covered.
+
+Some things are deliberately left out, and the dialog says so before you confirm:
+
+- Paths excluded by policy — `.env` and anything else matching `restricted_patterns` — are never snapshotted and never restored.
+- Files an approved command changed are not covered when the repository is not a Git checkout, or when its working tree is larger than `checkpoint_census_max_paths`.
+- Effects that are not files — a pushed commit, a network call, a database write, container state — cannot be undone by a rewind.
+
+If a file changed after the turn ran, the rewind stops and restores nothing. That is deliberate: Damaian cannot tell your later edit from the agent's change, so it reports the conflict and leaves everything alone rather than overwriting work it does not understand. Resolve the file by hand, or rewind the conversation only.
+
+A rewind never rewrites history you can audit. The conversation moves back by appending a marker, so the full session log — including the messages that left the conversation — is still there.
+
+**Checkpoints are session recovery, not version control.** They cover Damaian's own changes to one repository, they expire (`checkpoint_retention_days`, 90 days by default), and they are no substitute for a commit. Commit anything you would be unhappy to lose.
+
+### The Checkpoints page
+
+**Settings › Checkpoints** lists the open repository's checkpoints, one per turn, newest first. Each row shows the turn's summary, when it was taken, how many files it holds, the session it belongs to, and whether you have already rewound to it. A row also says when the checkpoint does not cover command effects, or how many paths policy excluded. **Rewind** on a row opens the same rewind dialog as the control on a message.
+
+## The Plan Panel
+
+When a request needs more than one piece of work, the assistant writes a plan
+before starting and a panel appears under its answer showing every step and
+what became of it.
+
+Short requests get no plan. A question answered by reading one file is a single
+step, and gets no panel.
+
+Exactly one step runs at a time. If the panel ever shows two as running, it
+says so in red: that is a fault in Damaian, not something you caused.
+
+### What each step says
+
+Every finished step carries one of four outcomes:
+
+- **Confirmed** — the step finished and something Damaian watched confirms it: a
+  command that exited cleanly, or a patch that was applied.
+- **Completed, unverified** — the step finished, and nothing observable stands
+  behind it. "Understand the retry logic" is a real step with nothing to
+  measure. Damaian says so rather than implying a confirmation it does not
+  have.
+- **Blocked** — a check or other command the step ran did not succeed. The
+  steps after it stay pending: continuing would build on work that did not
+  happen. A look-around command that fails, such as a `grep` with no match or an
+  `ls` of a missing path, is kept as evidence but does not block the step.
+- **Skipped** — the step was not needed.
+
+The one-line summary at the top of the panel **never says "complete" while any
+step is blocked or still open**. A plan where four steps passed and one failed
+is not a plan that worked.
+
+Open **What confirms this** on any step to see the evidence itself — the command
+and its exit code, or the files a patch wrote. This is what Damaian observed,
+never what the model said about its own work. A step whose command exited 3 is
+blocked no matter how confidently the reply describes it as done.
+
+The panel survives a reload, so you can reopen an old session and still see
+what a turn came to.
+
+### Reviewing a plan before it runs
+
+Before the first step that changes anything, Damaian stops and shows you the
+plan. Nothing has happened yet at that point — no file written, no command run.
+You can:
+
+- **Reorder** steps with the arrows.
+- **Retitle** a step by typing in its box.
+- **Delete** a step with **×**.
+- **Approve** the plan as it stands, or **Decline** it.
+
+A plan whose steps only read things — listing files, searching, reading source
+— is never put up for approval, because there is nothing to undo.
+
+A step that has already run is shown but has no controls. Its result is tied to
+the state of your repository, and deleting it would leave a plan whose history
+no longer describes what actually happened. If you want a genuinely different
+plan mid-task, stop the task and start another — [Rewind](#rewind) can take the
+repository back first.
+
+Approving is remembered for that task, so you are asked once, not before every
+edit. A [rewind](#rewind) past the point where you approved takes the approval
+with it: you are asked again, because you have moved the conversation back to
+before you saw the plan.
+
+## Search and Export
+
+The search icon in the sidebar, beside the **+** next to **Projects**, opens a search box that finds text across the sessions of the current working folder; Escape, the button again, or a click elsewhere closes it. Type and matches appear live, each with the session title and a short snippet. Choosing one opens that session and scrolls to the matching message. Search is a plain text search — it is not code search and it is not semantic — and it only searches the current folder's sessions, because a session from another folder can contain that folder's file contents. Search only ever reads the session log; it never changes a session.
+
+**Export as Markdown**, in a session's ⋮ menu ([Project and session menus](#project-and-session-menus)), saves the conversation as Markdown. Exports contain the title, the time range, the conversation in order, what each task came to, the plan steps and their evidence, and token and cost totals.
+
+**Exports are redacted.** A session stores exactly what was said, so that a rewind can restore it faithfully; that same fidelity is why the stored log is not safe to copy out as-is. Every export runs the secret scanner over the conversation and states at the top how many secrets it removed. The number is not silently applied: if a transcript says it removed three secrets, three secrets were replaced with `[REDACTED_…]` and are not in the file. Searching finds a secret-shaped string without showing it — the snippet is redacted too.
+
+An export is a one-way record. It cannot be imported back, and it never leaves your machine on its own: the file is saved wherever your browser's save dialog puts it, and no request is made to anywhere but Damaian itself.
+
+## After a Crash
+
+If Damaian stops while a turn is in flight — a crash, a force quit, a machine that lost power — the turn is not lost silently. When you reopen the session, a card at the top of the conversation says what was actually happening: "A patch application was in progress and its outcome is unknown", "Reading a file was interrupted before it finished". It never just says the session was interrupted, because what was in flight is what decides what can safely be done about it.
+
+Each card offers up to four choices:
+
+- **Resume** or **Continue** — sends your original request again as a new turn, carrying over the plan the interrupted turn had made so the steps it already finished are not redone. Offered only when Damaian can account for everything that was in flight.
+- **Inspect** — expands to show your request, the action that never finished, the files it may have touched, and the checkpoint taken before the turn, so you can rewind if you want to.
+- **Mark failed** — closes the turn out and records that its outcome was unknown.
+- **Abandon** — closes the turn without retrying it.
+
+If the turn had already spent anything, the card says so — including the model call that was in flight when Damaian stopped, which the provider billed even though its answer was lost. That figure is an estimate and is marked as one. A turn with nothing recorded shows no figure at all rather than a zero, which would read as a crash that was free.
+
+Neither **Mark failed** nor **Abandon** changes or undoes anything on disk. They settle what the *turn* is, not what happened to your files. Putting files back is **Rewind**, which is what the checkpoint link in **Inspect** opens.
+
+**Damaian will not retry an action on its own.** Where a turn was reading files or waiting on the model, there is nothing outside Damaian that could have half-happened, so the turn is marked ready to pick up again and the card tells you it was — but it still waits for you to press **Continue**, because resuming means paying for another model call and you should be the one to decide that.
+
+Where something was running that could have changed the world — a command, a patch being written to disk, a call out to an MCP server — **Resume** is not offered at all, and the card says why. There is no way to find out whether a command finished, whether the patch wrote three files or ten, or whether the remote call went through. Damaian will not run it again and hope, and it will not do so even if you ask: the refusal is in the engine, not in a button that could be worked around. Look at what actually happened with **Inspect**, put files back with **Rewind** if you need to, and then mark the turn failed or abandon it.
+
+If a turn was waiting for your approval when Damaian stopped, that approval comes back: the command, the patch, or the plan is re-presented exactly as it was, and nothing runs until you approve it. A command approved this way runs on its own — the conversation that proposed it ended with the crash, so its output is not fed back to the model. A plan is the exception: the turn that asked you to review it was saved, so approving the plan continues that turn from where it stopped. Occasionally an approval cannot be restored, because an older version of Damaian recorded that a turn was waiting without recording what it was waiting for. That turn is closed with the reason stated rather than shown as a rebuilt approval card: approving a command Damaian is guessing at would be worse than losing the turn. Your stored patches and commands are untouched either way.
 
 ## Working Modes
 
@@ -214,7 +509,8 @@ do in that session. The four modes:
 - **Plan** — reads, runs read-only commands, and produces a plan. It cannot
   change a file.
 - **Code** — the full set: file changes, commands and validation, each on the
-  approval terms described above. This is the default.
+  approval terms described in [Command Approval](#command-approval) and
+  [File Changes](#file-changes). This is the default.
 - **Review** — reads, runs read-only commands and browser diagnostics, and
   reports findings. It cannot change a file or make a plan.
 
@@ -241,17 +537,16 @@ nothing happens. In Plan and Review, a command that would need your approval is
 refused outright rather than shown as an approval card, because approving it
 would let you click your way out of the mode you chose.
 
-**An allowlisted command is still refused in Ask, Plan and Review.** `Allow
-Always` means "stop asking me about this exact command", not "this command is
-read-only". An allowlisted `npm run build` runs without a prompt in Code and is
-refused in the other three modes. Plan and Review decide what counts as
-read-only from the command itself, never from your allowlist.
+**An allowlisted command is still refused in Ask, Plan and Review.** An
+allowlisted `npm run build` ([Allow Always](#allow-always)) runs without a
+prompt in Code and is refused in the other three modes. Plan and Review decide
+what counts as read-only from the command itself, never from your allowlist.
 
 MCP tools are read-only only when their server says so. Most servers don't mark
 their tools at all, and an unmarked tool counts as able to change things, so it
 is only offered in Code.
 
-**Switching modes.** The mode is the pill below the prompt, after the `+`
+**Switching modes.** The mode is the pill below the prompt, after the **+**
 attach button and before the model, labelled with the current mode (**Code**,
 for example). Click it, or tab to it and press Enter, and pick a mode; the
 current one is marked **Current**. It takes effect from the next turn. If the
@@ -277,10 +572,6 @@ When something is refused, the conversation says which mode blocked it and which
 would allow it, for example: "Refused: Ask mode does not allow this. Switch to
 Code mode to allow it."
 
-Sessions created before modes existed continue in Code mode, which is what they
-could already do, so none of them lost anything. Change one with the same
-control.
-
 Known limit: the CLI's `propose-edit` runs outside any session, so no mode
 applies to it. The repository's permission profile still does: under Read-only
 it is refused before the model is asked anything.
@@ -293,7 +584,7 @@ you allow in this checkout. You choose one per repository:
 
 | Profile | File edits | Commands | Browser diagnostics | MCP tools | Also |
 |---|---|---|---|---|---|
-| **Full repository development** | as configured | as configured | yes | yes | Narrows nothing. The default, and what every repository had before profiles existed |
+| **Full repository development** | as configured | as configured | yes | yes | Narrows nothing. The default |
 | **Safe local development** | always need your approval | `local` only | yes | yes | |
 | **Offline private** | as configured | `local` only | no | none (MCP off) | Audit and checkpoint retention lowered to 7 days |
 | **Read-only** | no | none | no | read-only tools only | |
@@ -301,10 +592,10 @@ you allow in this checkout. You choose one per repository:
 
 "As configured" means the profile leaves that key to your own settings.
 
-**Choosing one.** In `Settings` › `General`, open a repository, then pick from
-`Permission profile for this repository`. The choice is stored in your user
+**Choosing one.** In **Settings › General**, open a repository, then pick from
+**Permission profile for this repository**. The choice is stored in your user
 config as `permission_profile.<repository_id>=<profile>`, keyed by the working
-folder the way `Allow Always` is, so it does not carry over to another clone. A
+folder the way *Allow Always* is, so it does not carry over to another clone. A
 repository cannot choose its own profile in either direction. From the CLI:
 
 ```bash
@@ -340,8 +631,8 @@ either, because Read-only does not.
 
 The refusal says which one refused, because the fix is different:
 
-- A mode refusal: "Refused: Ask mode does not allow this. Switch to Code mode to
-  allow it."
+- A mode refusal names the mode and the mode that would allow it (see
+  [Working Modes](#working-modes)).
 - A profile refusal: "Refused: the permission profile does not allow this
   (allow_file_edits=false). Switching mode will not allow it."
 
@@ -378,7 +669,7 @@ local provider (see [Model Providers and API Keys](#model-providers-and-api-keys
 
 ### Reading the effective policy view
 
-`Settings` › `General` › `Effective policy` shows the policy in force for the
+**Settings › General › Effective policy** shows the policy in force for the
 open repository. Open a repository first; without one the picker is disabled
 and the table shows the global policy.
 
@@ -440,7 +731,7 @@ damaian config-show --sources /path/to/repo
 
 ### Exporting and importing profiles
 
-`Settings` › `General` › `Permission profile files`.
+**Settings › General › Permission profile files**.
 
 **Export** writes the selected profile as a short config file, starting with a
 `# Damaian permission profile: <id>` comment. It contains only the keys a
@@ -448,8 +739,8 @@ profile may carry, so it never contains `model_api_key_env`, an MCP server's
 `auth_token_env`, or any other credential reference, and it is safe to paste
 into an issue.
 
-**Import** treats the file as untrusted. Paste it, name it, and press `Review
-import`. Nothing is written yet. The review lists:
+**Import** treats the file as untrusted. Paste it, name it, and press **Review
+import**. Nothing is written yet. The review lists:
 
 - **Will write** — the keys the profile will carry.
 - **Not written, a profile cannot set these** — keys such as `shell`, `model_*`
@@ -460,9 +751,9 @@ import`. Nothing is written yet. The review lists:
   they keep the profile's narrowing.
 
 There is nothing to approve in the third list: no profile can widen anything,
-so an imported one cannot either. Then press `Import` or `Cancel`. A name that
+so an imported one cannot either. Then press **Import** or **Cancel**. A name that
 is a built-in, or that an existing custom profile already uses, is refused
-unless you tick `Replace a custom profile with this name`.
+unless you tick **Replace a custom profile with this name**.
 
 **An import never selects the profile.** It adds it to the picker; choosing it
 is a separate step, so importing a file cannot change what any repository runs
@@ -487,127 +778,113 @@ Imported profiles live in `config/profiles/<name>.conf` inside the data
 directory. Custom names are lowercase letters, digits and `_`, up to 40
 characters.
 
-## Provider Limits and Retries
+## Command Approval
 
-A model provider can refuse a call — rate limiting ("you are going too fast"), a
-transient overload, or an exhausted quota or balance. When the refusal is
-transient, Damaian retries automatically: the progress indicator says how long
-it is waiting (for example "Provider refused — retrying in 12s"), and you can
-stop the turn at any point during that wait. Retrying gives up after a bounded
-number of attempts and at most 90 seconds of total waiting.
+When the assistant needs a local command result, it asks Damaian to run the command. Read-only commands Damaian recognises, such as `pwd`, `ls`, `git status`, and `git log`, run without asking, in the selected working folder. They are not sandboxed: they run directly on your machine, which is why only commands Damaian classifies as read-only qualify. Simple pipelines made only of such commands, filtered through `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, or `grep`, also run without asking. Damaian redacts the output and sends it back to the model so it can finish answering.
 
-If the provider still refuses, the turn ends with a message that names the
-reason and carries the provider's own words — which is where you learn what to
-top up. The task keeps its plan, so you can resume the same work once the
-provider recovers or after you fix your account.
+`git diff` and `git show` ask first, because they print file contents a command line cannot bound or keep restricted paths out of. The assistant reads changes through its own diff tool instead, which does both.
 
-Damaian never switches to a different provider on its own. If you have a second
-provider configured with its own API key, a refused turn instead pauses on an
-offer that names both providers: **Answer this turn with …?** Choose:
+Every other command appears as an approval card in the conversation. Review the command, risk, and working directory (the reason is under **Why this command**), then select **Approve** or **Reject**. Destructive commands blocked by policy cannot be approved from the UI.
 
-- **Keep it failed** — the default, and the focused button. The turn fails
-  exactly as it would have without the offer.
-- **Answer with …** — the same request is sent to the other provider, the turn
-  continues there, and its plan carries over unchanged. A note in the
-  conversation ("Switched to … for this turn after … refused it") marks where
-  the other model took over, and it stays there after a reload.
+Docker commands, including `docker ps`, `docker compose ...`, and `docker-compose ...`, always ask for approval. They can inspect or change a privileged local daemon, use the network, start background services, mount host paths, expose ports, and mutate images or volumes, so Damaian never treats them as read-only.
 
-The offer is for that one turn only. There is no "always" option, nothing is
-written to your configuration, and your next turn starts on your configured
-provider again — if it refuses too, you are asked again. If the other provider
-also refuses, the turn fails; you are not offered a third choice. If Damaian
-stops while the offer is open, it is shown again under **Still waiting for
-you** when you return.
+A command Damaian runs is stoppable and has a deadline: its output is streamed
+to the turn while it runs, **Stop** ends it, and `command_timeout_secs` (600 by
+default) kills it if it runs too long. A repository may shorten that deadline,
+never lengthen it.
 
-Only the desktop app makes this offer. For a quota or balance refusal, the other
-provider must use a different API key, since two providers reading one key are
-the same account.
+Which commands may run at all also depends on the session's [working mode](#working-modes) and the repository's [permission profile](#permission-profiles). A command can run in a directory inside the repository rather than the working folder; see [Where a command runs](#where-a-command-runs).
 
-## File Changes
+### Allow Always
 
-Use the conversation box to request file changes.
+**Always allow in this project**, in the approval card's ⋯ menu, runs the command and records it in your own config as `command_allowlist.<repository_id>`, so that command stops asking. The rest of this guide, and the policy view, call this grant *Allow Always*. It means "stop asking me about this exact command", not "this command is read-only".
 
-1. Enter a request such as `create a test file for the config parser`.
-2. Review the inline patch preview returned by the assistant.
-3. Keep checked only the files you want to act on. Each file's hunks have their own checkboxes, so you can also leave out part of a file.
-4. Select **Apply N** to write the checked changes, or **Reject** to record the checked files as rejected without changing the workspace.
+The allowance covers the exact command only: allowing `npm run test:unit` does not allow `npm run test:unit --watch`, and allowing `git push` does not allow `git push --force`. It applies to that working folder alone, and not to another clone of the same project at a different path. In a root other than the working folder it applies to that root only ([`Allow Always` in a root](#allow-always-in-a-root)). Remove an entry by editing the `command_allowlist.<repository_id>` line in `~/Library/Application Support/DamaianClient/config/user.conf`.
 
-Damaian checks file hashes before applying a stored patch. If a target file changed after preview, that file is blocked instead of overwriting newer local work.
+The decision is stored in your config rather than in the repository because Damaian could not otherwise tell a command you allowed from one that arrived with the clone. A `command_allowlist` in a repository's `.damaian/config.conf` is never honoured; if a repository you open already has one, Damaian shows the exact commands once and asks which to keep.
 
-### Hardcoded secret warnings
+*Allow Always* is not offered for commands blocked by policy, for commands containing shell control syntax such as `|`, `&&`, or `>`, when `require_approval_for_all_commands` is set, or on a [worker's](#worker-sessions) command card. In the first three cases an allowlist entry would have no effect, so the app does not offer to write one. An allowlisted command is still refused in Ask, Plan and Review modes ([Working Modes](#working-modes)).
 
-Damaian scans generated content for credentials before writing it. If a selected file is flagged, nothing is written: the preview shows which file tripped the check and what was detected, and you choose.
+## Repository Roots
 
-Detection is not perfect. Setup instructions and placeholder values can resemble credentials, so review the diff before deciding. Select `Apply Anyway` to accept the change as written, or `Cancel` to leave the workspace untouched. The decision applies to that one apply and is not remembered; each apply asks again, and the override is recorded in the audit log.
+A repository can hold several projects: a Cargo workspace and its member crates, or `packages/api` (Node) beside `packages/web`. Damaian calls each one a *root*. Each root has its own languages, manifests, entry points, test directories, `AGENTS.md` files and commands. A root's commands run in that root's directory, so `npm test` found in `packages/api` runs in `packages/api`, where its `package.json` is.
 
-From the CLI, `damaian apply-patch` prints the same findings and re-runs with `--allow-generated-secrets` to accept them.
+### How roots are found
 
-After files are applied, Damaian prints a concise Git status summary in the conversation.
+A directory is a root when it contains one of the manifests Damaian already knows how to run: `package.json`, `pyproject.toml`, `pytest.ini`, `pom.xml`, `build.gradle`, `go.mod` or `Cargo.toml`. The working folder itself is always a root, even with no manifest, so every repository has at least one. Nested roots are all kept: a Cargo workspace root is right for `cargo test --workspace`, and each member is right for its own `cargo test`.
 
-## Rewind
+Some directories are never roots:
 
-Damaian takes a checkpoint before every turn, so a turn that went the wrong way can be undone in one action. Each of your messages in the conversation carries a `Rewind` control, which offers three choices:
+- anything `.gitignore`d or matched by `ignore_patterns`, because Damaian never indexes it;
+- `node_modules`, `vendor`, `target`, `dist`, `build`, `.venv` and `venv`, wherever they appear, even if you have removed them from `ignore_patterns`;
+- anything more than six directories deep. Damaian records a manifest found there rather than ignoring it silently (see [Troubleshooting](TROUBLESHOOTING.md#repository-roots-and-the-repository-map)).
 
-- **Files and conversation** — puts back the files Damaian changed in that turn and moves the conversation to just before your message.
-- **Files only** — restores the files and leaves the conversation as it is.
-- **Conversation only** — moves the conversation back and leaves your files alone.
+When a directory holds more than one manifest, the root names the first in the list above as its evidence. A repository root with both `package.json` and `Cargo.toml` therefore reads "because `package.json` exists".
 
-What a checkpoint covers is what Damaian itself changed in that turn: files from patches you applied, and files an approved command created, modified, or deleted. Files you edited yourself are not covered.
+A root's commands come from its manifest: `npm run <name>` for each of the scripts `test`, `lint`, `typecheck`, `build` and `format` in `package.json` (plus `npm test` when there is a `test` script), and one fixed command for each other manifest, such as `cargo test` for `Cargo.toml`. Only those exact script names count: a script called `lint:web` or `check` is not offered.
 
-Some things are deliberately left out, and the dialog says so before you confirm:
+### Seeing and correcting roots
 
-- Paths excluded by policy — `.env` and anything else matching `restricted_patterns` — are never snapshotted and never restored.
-- Files an approved command changed are not covered when the repository is not a Git checkout, or when its working tree is larger than `checkpoint_census_max_paths`.
-- Effects that are not files — a pushed commit, a network call, a database write, container state — cannot be undone by a rewind.
+**Settings › General** has a **Repository roots** section for the selected working folder. Each row shows the root's path (`.` is the working folder itself), its languages, how many commands it has, and whether it was "detected", "added by you" or "removed by you". Select a row to see why it is a root ("Treated as a root because `packages/api/package.json` exists."), its instruction files, and each command with the directory it runs in.
 
-If a file changed after the turn ran, the rewind stops and restores nothing. That is deliberate: Damaian cannot tell your later edit from the agent's change, so it reports the conflict and leaves everything alone rather than overwriting work it does not understand. Resolve the file by hand, or rewind the conversation only.
+- **Add a root** makes a directory a root although it has no manifest. It must be a directory inside the repository that holds at least one indexed file, and not under a vendor directory or a `restricted_patterns` match.
+- **Remove root** stops treating a detected directory as a project. Its files then belong to the nearest enclosing root, and it proposes no commands. It stays in the list, marked "removed by you", so the decision is visible.
+- **Undo** clears your override for that directory.
 
-A rewind never rewrites history you can audit. The conversation moves back by appending a marker, so the full session log — including the messages that left the conversation — is still there.
+The working folder itself cannot be removed.
 
-**Checkpoints are session recovery, not version control.** They cover Damaian's own changes to one repository, they expire (`checkpoint_retention_days`, 90 days by default), and they are no substitute for a commit. Commit anything you would be unhappy to lose.
+Add, remove and undo write `project_roots_added` and `project_roots_removed` to `.damaian/config.conf` **inside the repository**. That file is in your working tree, so `git status` shows it, and you can commit it to share the correction or leave it uncommitted. Damaian asks before it writes. If that file already has a line Damaian cannot parse, the write is refused with the error, so a hand-edited file is never rewritten. You can also edit the two keys by hand, as `|`-separated lists:
 
-## Search and Export
+```text
+project_roots_added=tools/scripts
+project_roots_removed=examples/legacy|examples/old
+```
 
-The search icon in the sidebar, beside the `+` next to `Projects`, opens a search box that finds text across the sessions of the current working folder; Escape, the button again, or a click elsewhere closes it. Type and matches appear live, each with the session title and a short snippet. Choosing one opens that session and scrolls to the matching message. Search is a plain text search — it is not code search and it is not semantic — and it only searches the current folder's sessions, because a session from another folder can contain that folder's file contents. Search only ever reads the session log; it never changes a session.
+An entry Damaian cannot apply (a path that does not exist, a file, `..`, the working folder in `project_roots_removed`, a path in both lists) is not applied, and the section lists it under "Overrides Damaian did not apply". Overrides survive every rescan.
 
-**Export as Markdown**, in a session's ⋮ menu in the sidebar or in the conversation header's ⋮ menu for the open session, saves the conversation as Markdown. Exports contain the title, the time range, the conversation in order, what each task came to, the plan steps and their evidence, and token and cost totals.
+The same keys are accepted in your user config (`config/user.conf`). There they apply to every repository you open. Nothing in Damaian writes them there.
 
-**Exports are redacted.** A session stores exactly what was said, so that a rewind can restore it faithfully; that same fidelity is why the stored log is not safe to copy out as-is. Every export runs the secret scanner over the conversation and states at the top how many secrets it removed. The number is not silently applied: if a transcript says it removed three secrets, three secrets were replaced with `[REDACTED_…]` and are not in the file. Searching finds a secret-shaped string without showing it — the snippet is redacted too.
+From the CLI, `damaian repo-root <repo> add|remove|clear <path>` makes the same edit, and `damaian repo-map <repo>` prints the roots.
 
-An export is a one-way record. It cannot be imported back, and it never leaves your machine on its own: the file is saved wherever your browser's save dialog puts it, and no request is made to anywhere but Damaian itself.
+### Where a command runs
 
-## After a Crash
+A command the assistant asks for runs in the working folder unless it asks for a directory inside the repository, normally one of the roots on the map. When it does, the approval card reads **Runs in `packages/api`**. No line means the command runs in the working folder itself. A root changes only the directory. It never changes whether a command needs your approval, and never lets a command reach a path outside the repository: `cat ../web/src/index.ts` from `packages/api` is still inside the repository, and a directory outside it, behind a symlink, or under `restricted_patterns` is refused before anything is proposed.
 
-If Damaian stops while a turn is in flight — a crash, a force quit, a machine that lost power — the turn is not lost silently. When you reopen the session, a card at the top of the conversation says what was actually happening: "A patch application was in progress and its outcome is unknown", "Reading a file was interrupted before it finished". It never just says the session was interrupted, because what was in flight is what decides what can safely be done about it.
+Error locations a command prints (`src/x.ts:3:5`) are matched to files relative to the directory it ran in first, then its parent directories up to the working folder. So findings from a command in `packages/api` point at `packages/api/src/x.ts`, and `cargo` output from a member crate, which prints workspace-relative paths, still resolves.
 
-Each card offers up to four choices:
+Elsewhere the UI names the root when a file is not in the working folder's own root: a pinned file chip reads `index.ts · packages/api`, and each file in a patch preview is tagged with its root. A turn that touches two packages shows both.
 
-- **Resume** or **Continue** — sends your original request again as a new turn, carrying over the plan the interrupted turn had made so the steps it already finished are not redone. Offered only when Damaian can account for everything that was in flight.
-- **Inspect** — expands to show your request, the action that never finished, the files it may have touched, and the checkpoint taken before the turn, so you can rewind if you want to.
-- **Mark failed** — closes the turn out and records that its outcome was unknown.
-- **Abandon** — closes the turn without retrying it.
+### `Allow Always` in a root
 
-If the turn had already spent anything, the card says so — including the model call that was in flight when Damaian stopped, which the provider billed even though its answer was lost. That figure is an estimate and is marked as one. A turn with nothing recorded shows no figure at all rather than a zero, which would read as a crash that was free.
+[*Allow Always*](#allow-always) on a command that runs in a root other than the working folder records the grant for that root only. For `npm test` in `packages/api`, your config gets:
 
-Neither `Mark failed` nor `Abandon` changes or undoes anything on disk. They settle what the *turn* is, not what happened to your files. Putting files back is `Rewind`, which is what the checkpoint link in `Inspect` opens.
+```text
+command_allowlist.<repository_id>=cd packages/api && npm test
+```
 
-**Damaian will not retry an action on its own.** Where a turn was reading files or waiting on the model, there is nothing outside Damaian that could have half-happened, so the turn is marked ready to pick up again and the card tells you it was — but it still waits for you to press `Continue`, because resuming means paying for another model call and you should be the one to decide that.
+That entry lets `npm test` run unprompted in `packages/api` and nowhere else. `npm test` in `packages/web` may do something quite different, so it still asks. The entry cannot be matched by typing it as a command, because a command containing `&&` is never allowlisted.
 
-Where something was running that could have changed the world — a command, a patch being written to disk, a call out to an MCP server — `Resume` is not offered at all, and the card says why. There is no way to find out whether a command finished, whether the patch wrote three files or ten, or whether the remote call went through. Damaian will not run it again and hope, and it will not do so even if you ask: the refusal is in the engine, not in a button that could be worked around. Look at what actually happened with `Inspect`, put files back with `Rewind` if you need to, and then mark the turn failed or abandon it.
+The reverse also holds. A plain `command_allowlist` entry, whether from *Allow Always* at the working folder or one you wrote yourself at user or admin scope, applies **only at the repository root**. Your machine-wide `command_allowlist=npm test` does not let `npm test` run unprompted in `packages/api`.
 
-If a turn was waiting for your approval when Damaian stopped, that approval comes back: the command, the patch, or the plan is re-presented exactly as it was, and nothing runs until you approve it. A command approved this way runs on its own — the conversation that proposed it ended with the crash, so its output is not fed back to the model. A plan is the exception: the turn that asked you to review it was saved, so approving the plan continues that turn from where it stopped. Occasionally an approval cannot be restored, because an older version of Damaian recorded that a turn was waiting without recording what it was waiting for. That turn is closed with the reason stated rather than shown as a rebuilt approval card: approving a command Damaian is guessing at would be worse than losing the turn. Your stored patches and commands are untouched either way.
+### The map the assistant sees
+
+Each request includes a compact *repository map*: every root with its languages and commands and, when there is room, its manifests, entry points, test directories, major directories and instruction files. The map tells the assistant where things are without searching. It sits after `AGENTS.md` instructions and before retrieved files, so under a tight context budget it can displace retrieved files but never instructions. It is secret-scanned like every other context item.
+
+The map is limited by `repository_map_max_tokens`, 800 by default. When a repository's map is larger, Damaian drops detail in a fixed order: entry points and test directories (largest root first), then major directories, then generated and vendor paths, which become a count, and finally whole roots. Whenever anything is left out, the map ends with a line saying what, such as "3 of 7 roots shown". Set the key to `0` to leave the map out of requests entirely. The roots, the Settings section and the CLI work either way.
+
+A repository's `.damaian/config.conf` can lower `repository_map_max_tokens` or set it to `0`, but cannot raise it above yours, because the map is repository content sent to the model on every request.
 
 ## Worker Sessions
 
 A **worker** is a session that runs on its own: it gets a prompt, works in a new Git worktree of its own, and is hosted by a separate Damaian process, so you can keep talking to the session that started it. Workers are for handing off self-contained tasks, several at once if they can run in parallel.
 
-**Turning them on.** Workers are off by default. Turn on **Worker sessions** at the top of `Settings` → General. A repository cannot turn them on for you. While they are on, every session that is not itself a worker is told how to write a handoff: a prompt in a fenced block whose opening line is ```` ```worker-prompt ````. A request that asks to plan, split or hand off work (it says *split*, *plan*, *tasks*, *hand off*, *parallel*, *worker* or *session*) then always goes to the conversation, even when it also asks for an edit, rather than to a one-shot patch preview, which could only answer with a diff. Off, nothing of this section is visible and nothing is added to what the model is sent.
+**Turning them on.** Workers are off by default. Turn on **Worker sessions** at the top of **Settings › General**. A repository cannot turn them on for you. While they are on, every session that is not itself a worker is told how to write a handoff: a prompt in a fenced block whose opening line is ```` ```worker-prompt ````. A request that asks to plan, split or hand off work (it says *split*, *plan*, *tasks*, *hand off*, *parallel*, *worker* or *session*) then always goes to the conversation, even when it also asks for an edit, rather than to a one-shot patch preview, which could only answer with a diff. Off, nothing of this section is visible and nothing is added to what the model is sent.
 
 **Starting a worker.** A `worker-prompt` block in an assistant's answer gets a **Start worker** button once the answer has finished. No other block gets one. Clicking it opens the New worker dialog with the block's text, which you can still edit. Confirm with **Start worker**. The session holding the block becomes the worker's parent: the block then shows "Started *‹title›* →", and the conversation gets a one-line "Spawned worker" link. **New worker** on a project's ⋮ menu or on the Workers board opens the same dialog empty, for a worker with no parent. A worker cannot start workers of its own.
 
 **Uncommitted changes.** A worker starts from your last commit, so it cannot see work you have not committed — often the very task file you planned it from. If your tree has uncommitted changes, the dialog says how many and names the files the prompt mentions first. Choose **Include uncommitted changes** (selected by default), which copies your tracked edits and untracked files into the worker's tree, or **Start from last commit**. Your own tree is not changed either way.
 
-**What a worker creates.** A branch `damaian/<name>` and a worktree at `<repository>/.damaian/worktrees/<name>`, the name taken from the prompt's first line. Damaian adds `.damaian/worktrees/` to `.git/info/exclude` once, so worktrees never show as untracked files. `.gitignore` is never edited. Clicking *Start worker* is your approval of those Git commands. They are recorded in the audit log and in the worker's session.
+**What a worker creates.** A branch `damaian/<name>` and a worktree at `<repository>/.damaian/worktrees/<name>`, the name taken from the prompt's first line. Damaian adds `.damaian/worktrees/` to `.git/info/exclude` once, so worktrees never show as untracked files. `.gitignore` is never edited. Clicking **Start worker** is your approval of those Git commands. They are recorded in the audit log and in the worker's session.
 
 **The Workers board.** **Workers** at the top of each project in the sidebar opens the board, and its badge counts the workers that need you. Workers are also listed in the sidebar under their parent, with a status dot. The board groups workers under *Needs you* (waiting for approval, or paused), *Running* and *Finished*, newest first. Each row shows the planner it came from, its rounds, what it is doing and how long it has run. Finished rows show files changed and commits ahead of where the worker started. Each row has one action — **Review** for an approval, **Pause** while running, **Open** otherwise — and a ⋯ menu with **Stop**, **Reveal worktree in Finder**, **Remove worktree** and **Dismiss from board**. Dismissing only hides the row. The session stays in the sidebar.
 
@@ -621,219 +898,27 @@ A **worker** is a session that runs on its own: it gets a prompt, works in a new
 
 **Nothing outlives Damaian.** When Damaian quits, crashes or is force-quit, every worker exits within seconds and takes every command it started with it. Deleting a session stops its workers, and a worker's own session too. Their worktrees, branches and session logs are kept.
 
-**Removing a worktree.** *Remove worktree* on a finished worker's ⋯ menu removes `.damaian/worktrees/<name>`, after a confirmation. If the worktree has uncommitted changes, a second confirmation names them. **The branch is never deleted**: merging or deleting it is yours, through ordinary Git or by asking a session to.
+**Removing a worktree.** **Remove worktree** on a finished worker's ⋯ menu removes `.damaian/worktrees/<name>`, after a confirmation. If the worktree has uncommitted changes, a second confirmation names them. **The branch is never deleted**: merging or deleting it is yours, through ordinary Git or by asking a session to.
 
 **Turning workers off** hides every entry point, the board and the controls. Workers that are already running keep running until they finish their turn or Damaian quits. To pause, steer or stop one, turn the setting on again.
 
-## Settings
+## MCP Servers
 
-Open Settings with `⌘,` or **Damaian › Settings...**; Escape or `×` closes it. It opens on **Providers**, and its other pages are General, Shortcuts, Checkpoints, MCP Servers and Models. Your user configuration is under **General › User configuration**: edit it and select **Save**, or select **Load** to re-read the file from disk.
+**Settings › MCP Servers** connects Model Context Protocol servers. Their tools are offered to the assistant alongside the built-in ones. MCP tools need [native tool-calling](#native-tool-calling) on the provider.
 
-These are your user-scope settings, and they are kept in one file:
+Select **New** beside **Configured servers**, then fill in **Server details**: a **Name** and an **ID**, and a **Transport**:
 
-```text
-~/Library/Application Support/DamaianClient/config/user.conf
-```
+- **Local (stdio)** starts a program on your machine. **Command** is the executable, or a full command line if you leave **Arguments** empty; quote paths that contain spaces. **Arguments** takes one argument per line, and **Environment** one `NAME=value` per line.
+- **Remote (HTTP)** connects to a **URL**. For a server that needs a token, set **Auth Token Reference** to a `keychain:` reference and paste the token into **Auth Token**: it is stored in macOS Keychain when you save, and only the reference is written to your config.
 
-Editing that file by hand does the same thing as editing it in `Settings`, which is how you configure Damaian for the CLI, which has no Settings window. Note the `config/` directory in the middle of that path, and the `.conf` name: a file dropped next to it as `config.conf` is not user config and is read by nothing.
+Two checkboxes follow. **Enabled — offer this server's tools to the assistant** turns the server on, and **Require approval before each tool call** makes every call wait for your approval. Both start ticked for a new server. **Test Connection** connects with the form as it stands and reports how many tools the server offers, or the error. **Save Server** writes it to your user config, as `mcp_server.<id>.*` keys, and **Remove** deletes it.
 
-Configuration uses one `key=value` entry per line. Edit values directly and select `Save`. Delete a line and save to remove that user-level override.
-
-`model_api_key_env` is a reference field. The app rejects raw API keys in this field; use the `Model API Key` controls to store the secret in Keychain.
-
-Common keys:
-
-- `restricted_patterns`: File patterns Damaian should avoid reading, separated by `|`.
-- `audit_enabled`: Set to `true` or `false`.
-- `model_base_url`: OpenAI-compatible API base URL.
-- `model_name`: Model identifier.
-- `model_api_key_env`: API key reference. Use `keychain:model-api-key` for the desktop Keychain flow, or an environment variable name for CLI/dev workflows.
-- `model_provider.<id>.max_output_tokens`: Largest reply the model may generate, in tokens. Omit to use the built-in default for the selected model. See [Output and Context Limits](#output-and-context-limits).
-- `model_provider.<id>.context_token_budget`: How much repository content is sent with each request, in tokens. Omit to use the built-in default for the selected model.
-- `model_provider.<id>.supports_native_tools`: Set to `true` to use the provider's native tool-calling API. Required for MCP tools, patch proposals, and other agentic actions.
-
-Repository-scoped settings are not edited from Settings. Put repository defaults in `.damaian/config.conf` inside the selected repository. Repository settings are included in `Effective Policy`.
-
-Because that file arrives with a clone, a repository can only make Damaian *more* careful, never less:
-
-- `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, every `language_server.<language>` key, and every `model_*` key are ignored in repository config. Damaian tells you once, per repository, when a repository tried to set one, and records it in the audit log.
-- `restricted_patterns`, `ignore_patterns`, and `command_blocklist` are added to yours rather than replacing them.
-- The `require_approval_for_*` flags can be turned on by a repository, not off. MCP and individual MCP servers can be turned off, not on.
-- `command_allowlist` is never taken from repository config; `Allow Always` writes to your own config instead. See [Chat](#chat).
-- Budgets and preferences — `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, `agent_max_tool_rounds`, and the root overrides `project_roots_added` and `project_roots_removed` ([Repository Roots](#repository-roots)) — apply as written.
-- The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — and the repository map's `repository_map_max_tokens` (800) can be lowered by a repository but never raised. The same holds for `command_timeout_secs`, `agent_max_task_tokens`, `agent_max_turn_messages`, and `agent_max_exploration_rounds`. They bound how much of your repository a single tool call, or the map, puts into a model request, so raising one would widen what leaves your machine. A repository that tries is told to you like any other rejected key.
-
-## Model Providers and API Keys
-
-Damaian uses OpenAI-compatible chat APIs. Configure the provider URL and model in Settings, but do not paste the API key into the configuration file.
-
-In the desktop app, use the `Model API Key` controls in Settings:
-
-1. Enter a Keychain account name, such as `model-api-key`.
-2. Paste the API key into `API Key`.
-3. Select `Save Key`.
-
-Damaian stores the secret in macOS Keychain and writes only this reference to config:
-
-```text
-model_api_key_env=keychain:model-api-key
-```
-
-Damaian keeps a process-local in-memory copy after a successful Keychain save or read. You may be asked by macOS the first time the app accesses the key after launch, but repeated chat, edit, or command-assisted answers in the same app run should not require another password prompt.
-
-Use `Remove Key` to delete the stored secret from Keychain. Saving a new key with the same account replaces the previous value.
-
-If `Effective Policy` still shows a different `model_api_key_env` after saving the key, a repository or admin config is overriding the user setting. Remove or update that override before retrying chat.
-
-Environment variables remain supported for CLI and development workflows. In that mode, `model_api_key_env` is the name of an environment variable that contains the key. It is not the key itself.
-
-Every example below is user-scope configuration: enter it in `Settings`, or write it to [`config/user.conf`](#settings) directly. From a shell, the CLI writes that file for you and prints the path it used:
-
-```sh
-cargo run -p damaian-cli -- config-set user model_provider deepseek
-```
-
-Naming a built-in provider fills in most of the setup. `model_provider=deepseek` or `model_provider=openai` sets the base URL, the default model, and the key variable for that provider; set the other keys only to override one of those. You also need to turn on **Native tool-calling** for the provider (Settings › Providers › Provider details, or `model_provider.<id>.supports_native_tools=true`). Built-in providers leave it off, and without it the assistant can answer questions but cannot propose file changes, make plans, or use MCP or any other tools.
-
-Example DeepSeek configuration:
-
-```text
-model_provider=deepseek
-model_name=deepseek-v4-flash
-model_base_url=https://api.deepseek.com
-model_api_key_env=keychain:model-api-key
-```
-
-For environment-variable based development, use:
-
-```text
-model_provider=deepseek
-model_name=deepseek-v4-flash
-model_base_url=https://api.deepseek.com
-model_api_key_env=DEEPSEEK_API_KEY
-```
-
-Then launch the app from a shell where that environment variable is set:
-
-```sh
-export DEEPSEEK_API_KEY="your-deepseek-api-key"
-npm run desktop:dev
-```
-
-Or set it for one launch:
-
-```sh
-DEEPSEEK_API_KEY="your-deepseek-api-key" npm run desktop:dev
-```
-
-The same pattern applies to OpenAI or any OpenAI-compatible provider.
-
-To check that the settings were picked up before spending anything, print the merged configuration. This makes no model call:
-
-```sh
-cargo run -p damaian-cli -- config-show | grep '^model'
-```
-
-If `model_api_key_env` names a variable you did not choose, the configuration was not read at all and the built-in default is standing. That is a wrong path or a wrong filename, not a wrong key.
-
-If an older configuration still names `deepseek-chat` or `deepseek-reasoner`, update it. Those were compatibility aliases that DeepSeek retired on 24 July 2026; the current models are `deepseek-v4-flash` and `deepseek-v4-pro`.
-
-## Output and Context Limits
-
-Two settings control how many tokens each request may use. They are independent: one bounds what the model writes, the other bounds what it reads. Both live in `Settings` under `Providers`, in the `Provider details` panel, and both apply per provider.
-
-- `Max output tokens` caps the reply the model generates in a single response. Set too low, a large multi-file patch is cut off mid-way. Damaian detects this, tells the model its call was truncated, and asks it to retry with fewer files per patch, so the request recovers instead of failing silently.
-- `Context budget` caps how much repository content Damaian packs into each request. Raising it lets the assistant see more of a large repository, which can improve answers. This content is re-sent and re-billed on every turn, so a higher budget increases cost and latency on all requests, not just large ones.
-
-Leave a field blank to use the built-in default for the selected model. The defaults are:
-
-- `deepseek-v4-flash` and `deepseek-v4-pro`: 65536 output tokens, 64000 context budget.
-- `deepseek-chat` and `deepseek-reasoner` (retired aliases): 8192 output tokens, 16000 context budget.
-- Other DeepSeek models: 8192 output tokens, 16000 context budget.
-- All other models: no output cap is sent, and the context budget is 16000.
-
-The built-in context budgets are deliberately well below what these models technically accept. DeepSeek's V4 models allow up to 384000 output tokens and a 1M-token context window, but requesting the maximum on every turn is rarely worth the cost. Raise the values if your repository or your patches need more.
-
-A value entered in the panel always wins over the built-in default. To give a V4 model its full output range:
-
-```text
-model_provider.deepseek.max_output_tokens=384000
-```
-
-Setting a value higher than the model actually allows causes the provider to reject the request outright, so prefer the built-in defaults unless you know the model's real limit.
-
-## The Plan Panel
-
-When a request needs more than one piece of work, the assistant writes a plan
-before starting and a panel appears under its answer showing every step and
-what became of it.
-
-Short requests get no plan. A question answered by reading one file is a single
-step, and a panel for it would be ceremony you learn to scroll past — which
-would cost the panel its meaning on the turn where it matters.
-
-Exactly one step runs at a time. If the panel ever shows two as running, it
-says so in red: that is a fault, not a feature, and hiding it by drawing only
-the first would conceal the bug.
-
-### What each step says
-
-Every finished step carries one of four outcomes:
-
-- **Confirmed** — the step finished and something Damaian watched confirms it: a
-  command that exited cleanly, or a patch that was applied.
-- **Completed, unverified** — the step finished, and nothing observable stands
-  behind it. "Understand the retry logic" is a real step with nothing to
-  measure. Damaian says so rather than implying a confirmation it does not
-  have.
-- **Blocked** — a check or other command the step ran did not succeed. The
-  steps after it stay pending: continuing would build on work that did not
-  happen. A look-around command that fails, such as a `grep` with no match or an
-  `ls` of a missing path, is kept as evidence but does not block the step.
-- **Skipped** — the step was not needed.
-
-The one-line summary at the top of the panel **never says "complete" while any
-step is blocked or still open**. A plan where four steps passed and one failed
-is not a plan that worked.
-
-Open *What confirms this* on any step to see the evidence itself — the command
-and its exit code, or the files a patch wrote. This is what Damaian observed,
-never what the model said about its own work. A step whose command exited 3 is
-blocked no matter how confidently the reply describes it as done.
-
-The panel survives a reload, so you can reopen an old session and still see
-what a turn came to.
-
-### Reviewing a plan before it runs
-
-Before the first step that changes anything, Damaian stops and shows you the
-plan. Nothing has happened yet at that point — no file written, no command run.
-You can:
-
-- **Reorder** steps with the arrows.
-- **Retitle** a step by typing in its box.
-- **Delete** a step with `×`.
-- **Approve** the plan as it stands, or **Decline** it.
-
-A plan whose steps only read things — listing files, searching, reading source
-— is never put up for approval. There is nothing to undo, and a prompt for
-every lookup is a prompt you stop reading.
-
-A step that has already run is shown but has no controls. Its result is tied to
-the state of your repository, and deleting it would leave a plan whose history
-no longer describes what actually happened. If you want a genuinely different
-plan mid-task, stop the task and start another — [Rewind](#rewind) can take the
-repository back first.
-
-Approving is remembered for that task, so you are asked once, not before every
-edit. A [rewind](#rewind) past the point where you approved takes the approval
-with it: you are asked again, because you have moved the conversation back to
-before you saw the plan.
+Which MCP tools a session may call also depends on its [working mode](#working-modes) and the repository's [permission profile](#permission-profiles): a tool its server does not mark read-only is offered only in Code mode. A repository can turn MCP or a server off, never on.
 
 ## Browser Diagnostics
 
 When a browser MCP server is configured, such as a Playwright server under
-**Settings → MCP Servers**, the assistant can look at a web page the way you see it.
+[**Settings › MCP Servers**](#mcp-servers), the assistant can look at a web page the way you see it.
 It can open a URL and report what the page did, or run a short scenario:
 fill a field, click a button, wait, take a screenshot. This is how it finds
 problems that `curl` cannot see, such as a script that throws on load and
@@ -882,7 +967,7 @@ errors does not.
 
 What the assistant reads is the same summary as the header, as text.
 Everything in it has been through the secret scanner first. Screenshots are
-for you. Phase 1 does not send images to the model.
+for you; they are not sent to the model.
 
 Cards survive a reload and a restart. A browser server that is not
 Playwright-shaped still works, but its card has no problem lists: only the
@@ -926,8 +1011,7 @@ what is shown:
 - **Severity:** Errors (the default), Errors and warnings, or All severities.
 - **Status:** Open (the default), Open and stale, or All statuses.
 
-The default is open errors, because a list that opens on forty warnings is a
-list you close. "Showing 2 of 5" tells you how much the filters hide.
+"Showing 2 of 5" tells you how much the filters hide.
 
 Each row shows the summary, the location when the tool reported one, and a
 collapsed **Details** with the tool's own excerpt. Click the location to open
@@ -983,6 +1067,42 @@ Where a finding's full output lives, and how to read findings from the
 session log, is in
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md#findings).
 
+## Provider Limits and Retries
+
+A model provider can refuse a call — rate limiting ("you are going too fast"), a
+transient overload, or an exhausted quota or balance. When the refusal is
+transient, Damaian retries automatically: the progress indicator says how long
+it is waiting (for example "Provider refused — retrying in 12s"), and you can
+stop the turn at any point during that wait. Retrying gives up after a bounded
+number of attempts and at most 90 seconds of total waiting.
+
+If the provider still refuses, the turn ends with a message that names the
+reason and carries the provider's own words — which is where you learn what to
+top up. The task keeps its plan, so you can resume the same work once the
+provider recovers or after you fix your account.
+
+Damaian never switches to a different provider on its own. If you have a second
+provider configured with its own API key, a refused turn instead pauses on an
+offer that names both providers: **Answer this turn with …?** Choose:
+
+- **Keep it failed** — the default, and the focused button. The turn fails
+  exactly as it would have without the offer.
+- **Answer with …** — the same request is sent to the other provider, the turn
+  continues there, and its plan carries over unchanged. A note in the
+  conversation ("Switched to … for this turn after … refused it") marks where
+  the other model took over, and it stays there after a reload.
+
+The offer is for that one turn only. There is no "always" option, nothing is
+written to your configuration, and your next turn starts on your configured
+provider again — if it refuses too, you are asked again. If the other provider
+also refuses, the turn fails; you are not offered a third choice. If Damaian
+stops while the offer is open, it is shown again under **Still waiting for
+you** when you return.
+
+Only the desktop app makes this offer. For a quota or balance refusal, the other
+provider must use a different API key, since two providers reading one key are
+the same account.
+
 ## Capping What One Turn May Spend
 
 `agent_max_task_tokens` stops a turn once it has spent that many tokens, rather
@@ -1003,6 +1123,11 @@ There is no default: without this setting, nothing caps a turn's tokens and
 `agent_max_tool_rounds` remains the only bound. The minimum accepted value is
 1000 — below that, a turn would stop before it could do anything.
 
+With the cap set, a turn that reaches its tool-round limit continues on its own
+instead of pausing for **Continue** ([While a turn runs](#while-a-turn-runs-and-how-it-ended)),
+and the messages it sends are bounded by `agent_max_turn_messages` so a long
+turn does not grow without limit.
+
 When a turn stops this way you see **Token budget exhausted** under the answer,
 and the reply names what was finished and what was left. Nothing is lost:
 raise the cap and ask again, and the turn picks the plan up where it stopped,
@@ -1014,8 +1139,7 @@ out of money.
 
 A repository's own `.damaian/config.conf` may only tighten this cap: it can
 lower one you set, or introduce one where you had none, but it can never raise
-or remove yours. A repository you cloned cannot widen what an agent may spend
-on your machine.
+or remove yours.
 
 ## What a Turn Cost
 
@@ -1145,6 +1269,10 @@ Repository-scoped config remains separate and lives at `.damaian/config.conf` in
 
 Two parts of that directory hold copies of your files exactly as they were, credentials included, because their job is to put a file back byte for byte: `checkpoints/` (session checkpoints) and `rollback/` (patch rollback). They never leave your machine, and they are not safe to attach to a bug report. Session logs hold your prompts and file content, so the same applies to them.
 
+## The Command-Line Tool
+
+This guide mentions `damaian` commands, such as `damaian config-show` or `damaian profile-set`. The command-line tool is not included in `Damaian.app`. It is built from a source checkout of Damaian, where you run it as `cargo run -p damaian-cli -- <command>`; see [DEVELOPMENT.md](DEVELOPMENT.md#cli). It reads and writes the same [user config](#settings) and [data directory](#local-data) as the app.
+
 ## Safety Model
 
 Damaian keeps the local app in control of important effects:
@@ -1153,20 +1281,20 @@ Damaian keeps the local app in control of important effects:
 - The model does not write files directly.
 - File edits are previewed before application.
 - Assistant commands run without approval only when Damaian classifies them as read-only. They are not sandboxed.
-- Every other command requires your approval before it runs, unless you allowed that exact command always for that repository.
+- Every other command requires your approval before it runs, unless you [allowed that exact command always](#allow-always) for that repository.
 - Restricted files and detected secrets are redacted or blocked by policy.
 - A [permission profile](#permission-profiles) per repository can narrow all of this further, and never widen it.
 - Important actions are recorded in a local audit trail.
 
 ## Troubleshooting
 
-If the app shows `Repository is required`, select `+` beside `Projects` and pick a working folder.
+If the app shows "Repository is required", select **+** beside **Projects** and pick a working folder.
 
-If model calls fail, open Settings and confirm the `Model API Key` status is `Saved`, or confirm that `model_api_key_env` names an environment variable and that the variable is set before launching the app.
+If model calls fail, open Settings and confirm the **Model API Key** status is **Saved**, or, for the command-line tool or a development build, confirm that `model_api_key_env` names an environment variable and that the variable is set before launching ([Environment variables](#environment-variables-cli-and-development-only)).
 
-If the assistant announces a file change, such as `Let me create all the necessary files:`, but no patch appears, its reply was cut off at the model's output limit. Ask it to create fewer files at a time, or raise `Max output tokens` in `Provider details`. See [Output and Context Limits](#output-and-context-limits).
+If the assistant announces a file change, such as `Let me create all the necessary files:`, but no patch appears, its reply was cut off at the model's output limit. Ask it to create fewer files at a time, or raise **Max output tokens** in **Provider details**. See [Output and Context Limits](#output-and-context-limits).
 
-If the assistant answers questions but never proposes file changes or uses MCP tools, enable `Native tool-calling` for the provider in `Provider details`. Patch proposals and MCP tools require it.
+If the assistant answers questions but never proposes file changes or uses MCP tools, turn on [Native tool-calling](#native-tool-calling) for the provider.
 
 If macOS warns that the app is from an unidentified developer, see [macOS Installation](./MACOS_INSTALLATION.md#install). A release build should never show that warning.
 

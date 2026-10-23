@@ -1,12 +1,105 @@
 # Troubleshooting
 
-How to diagnose a misbehaving Damaian build: where state is written, what is
-logged and what is not, and how to reproduce a failure outside the UI.
+This is the full reference for diagnosing problems with Damaian, for users and
+developers alike: where state is written, what is logged and what is not, what
+each failure means, and how to reproduce one outside the UI. The
+[User Guide](USER_GUIDE.md) explains how to use the app; building, testing and
+releasing it, including a slow local quality gate, are in
+[Development](DEVELOPMENT.md); repository conventions for contributors and
+coding agents are in [AGENTS.md](../AGENTS.md).
 
-Written for both humans and coding agents. For end-user symptoms and fixes see
-the [User Guide](USER_GUIDE.md#troubleshooting); for build and release mechanics
-see [Development](DEVELOPMENT.md); for repository conventions and traps see
-[AGENTS.md](../AGENTS.md).
+## Contents
+
+- [Symptom index](#symptom-index)
+- [Conventions](#conventions)
+- [Triage order](#triage-order)
+- [Process model](#process-model)
+- [Where state lives](#where-state-lives)
+- [Logs](#logs)
+- [Turns, recovery and workers](#turns-recovery-and-workers)
+- [Inspecting configuration](#inspecting-configuration)
+- [Reproducing outside the UI](#reproducing-outside-the-ui)
+- [Common failures](#common-failures)
+- [Resetting state](#resetting-state)
+- [What to collect for a bug report](#what-to-collect-for-a-bug-report)
+
+## Symptom index
+
+| Symptom | Section |
+|---------|---------|
+| The app refuses to start: port 4765 is in use | [Port 4765](#port-4765) |
+| The data directory is refused at startup | [The data directory is refused at startup](#the-data-directory-is-refused-at-startup) |
+| macOS blocks the first launch | [The packaged app will not launch](#the-packaged-app-will-not-launch) |
+| Something works from Terminal but not from the app (a key, a command, an MCP server) | [The app does not see your shell's environment](#the-app-does-not-see-your-shells-environment) |
+| Model calls fail | [Model calls fail](#model-calls-fail) |
+| The provider refused a call (rate limit, quota, auth) | [Provider refusal classifications](#provider-refusal-classifications) |
+| A refusal offered no switch to another provider | [A refusal offered no switch to my other provider](#a-refusal-offered-no-switch-to-my-other-provider) |
+| A turn stopped early, or asks *Answer now* / *Continue* | [A turn stopped early](#a-turn-stopped-early-which-budget-ran-out) |
+| A crash-recovery card, or a task marked unknown outcome | [After a crash: what recovery decided](#after-a-crash-what-recovery-decided) |
+| Processes left over after a crash | [After a crash: what was still running](#after-a-crash-what-was-still-running) |
+| A worker won't start | [A worker will not start](#a-worker-will-not-start) |
+| A worker shows *Interrupted* or *Ended* | [A worker shows Interrupted, or Ended](#a-worker-shows-interrupted-or-ended) |
+| The worker board stops updating | [The board or the control strip stops updating](#the-board-or-the-control-strip-stops-updating) |
+| No *Start worker* button on handoff prompts | [An answer has handoff prompts but no Start worker](#an-answer-has-handoff-prompts-but-no-start-worker) |
+| Worktrees left over after a crash | [Leftover worktrees after a crash](#leftover-worktrees-after-a-crash) |
+| Rewind did not restore a file, or reports a conflict | [Checkpoints and rewind](#checkpoints-and-rewind) |
+| The assistant replies but never proposes a patch | [The assistant replies but never proposes a patch](#the-assistant-replies-but-never-proposes-a-patch) |
+| Applying a patch fails with a conflict | [Patch apply fails with a conflict](#patch-apply-fails-with-a-conflict) |
+| An `edit_file` proposal is refused | [An `edit_file` proposal is refused](#an-edit_file-proposal-is-refused) |
+| `Refused: …` from a mode, a profile or the command policy | [The assistant was refused](#the-assistant-was-refused-the-session-mode-the-permission-profile-or-the-command-policy) |
+| A setting will not stick, or a repository config key has no effect | [Configuration layers](#configuration-layers), [Why a rule is in force](#why-a-rule-is-in-force) |
+| A permission profile key has no effect | [A permission profile key had no effect](#a-permission-profile-key-had-no-effect) |
+| A file read or search result was cut short | [A file read or search result was truncated](#a-file-read-or-search-result-was-truncated) |
+| A file is missing from the model's context | [A file the model should see is missing from context](#a-file-the-model-should-see-is-missing-from-context) |
+| A `worktree` argument is refused | [A `worktree` argument is refused](#a-worktree-argument-is-refused) |
+| A project root is missing or wrong, or a command ran in the wrong directory | [Repository roots and the repository map](#repository-roots-and-the-repository-map) |
+| Findings are missing, stale, or cannot be opened | [Findings](#findings) |
+| A browser diagnostic looks wrong | [Browser diagnostics](#browser-diagnostics) |
+| Command output looks cut short | [Command output](#command-output) |
+| MCP server not working | [MCP server not working](#mcp-server-not-working) |
+| A Docker command fails | [Docker command problems](#docker-command-problems) |
+| Semantic search does nothing | [Semantic search does nothing](#semantic-search-does-nothing) |
+| The terminal panel fails to start | [Terminal panel problems](#terminal-panel-problems) |
+| Token figures always read "estimated", or are missing | [Token figures are always "estimated"](#token-figures-are-always-estimated), [A turn shows no token line at all](#a-turn-shows-no-token-line-at-all) |
+| Cache hit rate reads "not reported", or seems low | [Cache hit rate](#cache-hit-rate-reads-not-reported-or-seems-low) |
+| The app forgot my projects | [Web UI state (localStorage)](#web-ui-state-localstorage) |
+| `curl` against `/api/*` is refused | [The API token blocks curl](#the-api-token-blocks-curl) |
+| A `Desktop API unavailable` banner | [Debugging the web UI](#debugging-the-web-ui) |
+| The quality gate is slow locally (contributors) | [Development](DEVELOPMENT.md#the-quality-gate-is-slow-locally) |
+
+## Conventions
+
+The recipes below use these shell variables. Set the ones a recipe needs
+first:
+
+```bash
+# The data directory: $DAMAIAN_DATA_DIR if you set it, otherwise the default.
+DATA_DIR="${DAMAIAN_DATA_DIR:-$HOME/Library/Application Support/DamaianClient}"
+
+# One conversation's session log; this picks the most recently written one.
+SESSION_FILE=$(ls -t "$DATA_DIR"/sessions/*.jsonl | grep -v '\.progress\.jsonl$' | head -1)
+
+# The repository you are working in. CLI examples write it as /path/to/repo.
+REPO=/path/to/repo
+```
+
+- `REPO_ID` — the repository's id, the directory name under
+  `$DATA_DIR/checkpoints/` and `$DATA_DIR/repository-map/` and the
+  `repositoryId` field on audit events. `ls "$DATA_DIR/checkpoints"` lists the
+  repositories that have checkpoints.
+- `CHECKPOINT_ID` — one checkpoint, named by the files under
+  `$DATA_DIR/checkpoints/$REPO_ID/manifests/` and by the `checkpointId` field on
+  `checkpoint_created` audit events.
+- `TOKEN` — the API token for `curl`. Only the manual-inspection server accepts
+  one from outside the app, and its token is fixed:
+  `TOKEN=damaian-ui-inspection-token` (see
+  [The API token blocks curl](#the-api-token-blocks-curl)).
+
+Audit events are flat objects, and **every field value is a string**, numbers
+and booleans included (`AuditLog::record` in
+[audit.rs](../crates/workspace-engine/src/audit.rs)). Compare with
+`"true"`, not `true`, and convert with `tonumber` before arithmetic, as the
+timeline recipe in [Audit log](#audit-log) does with `timestampMs`.
 
 ## Triage order
 
@@ -14,7 +107,7 @@ Work top to bottom. Each step is cheap and rules out a whole class of causes.
 
 1. **Reproduce with the process attached to a terminal.** The app has no log
    file — see [Logs](#logs). If you cannot see stderr, you are guessing.
-2. **Read the audit log tail.** `~/Library/Application Support/DamaianClient/audit/events.jsonl`
+2. **Read the audit log tail.** `$DATA_DIR/audit/events.jsonl`
    records every consequential action with a timestamp. It tells you how far the
    turn got before it failed.
 3. **Read the session log** for the affected conversation. It holds the actual
@@ -262,7 +355,8 @@ That prints the secret, so prefer checking existence only. The UI's
 `/api/model-key-status` and the Settings `Model API Key` field report `Saved`
 without revealing the value. If `model_api_key_env` names an environment
 variable instead, the variable must be set **in the environment the app was
-launched from** — a GUI launch from Finder does not inherit your shell profile.
+launched from**; see
+[The app does not see your shell's environment](#the-app-does-not-see-your-shells-environment).
 
 #### What is not safe to share
 
@@ -308,6 +402,115 @@ directory:
 A "the app forgot my projects" report is almost always this store, not
 `user.conf`. It is also why a fresh `DAMAIAN_DATA_DIR` still shows the old
 project list.
+
+### Repository roots and the repository map
+
+The map of a repository's project roots
+([User Guide](USER_GUIDE.md#repository-roots)) is stored per repository:
+
+```text
+$DATA_DIR/repository-map/<repository_id>.json
+```
+
+`<repository_id>` is the same `repo_…` id as `command_allowlist.<repository_id>`.
+The map is derived from the in-memory index plus config. The stored file is
+reused only while its `fingerprint` still matches the inputs: the indexed
+paths, the content of every manifest and `AGENTS.md`, the root overrides, the
+command allowlist and blocklist, and the excluded paths. Anything else
+rebuilds it: a changed manifest, a new grant, an unreadable file, or another
+schema version. **To force a rebuild, delete the file.** It is built again on
+the next request or map read. A deleted file is rebuilt silently. A stale,
+corrupt or version-mismatched one is rebuilt with an audit event.
+
+Read it without the UI. `--json` prints `{"load":{…},"map":{…}}`, the same
+shape the Settings section reads from `/api/repository-map`:
+
+```bash
+DAMAIAN_DATA_DIR=/tmp/damaian-debug cargo run -p damaian-cli -- repo-map /path/to/repo
+DAMAIAN_DATA_DIR=/tmp/damaian-debug cargo run -p damaian-cli -- repo-map /path/to/repo --json | jq '.map.roots[] | {path, detectedBy, userOverride}'
+```
+
+The first line of the summary says what happened: `map reused (inputs
+unchanged)`, `map built (none stored)`, or `map rebuilt: …` with the reason.
+In the JSON, `load.outcome` is `reused`, `built` or `rebuilt`, and a rebuild
+carries `reason` (`corrupt`, `schemaMismatch` with `foundSchemaVersion`, or
+`stale`).
+
+**Reading `detectedBy`.** Each root says why it is one:
+
+| `detectedBy.kind` | Meaning |
+|---|---|
+| `repositoryRoot` | The working folder, which is always a root, holding none of the known manifests |
+| `manifest` | `detectedBy.path` names the manifest that made it a root. With several in one directory, the first of `package.json`, `pyproject.toml`, `pytest.ini`, `pom.xml`, `build.gradle`, `go.mod`, `Cargo.toml` is named, so a root with `package.json` and `Cargo.toml` reads `package.json` |
+| `userOverride` | Added by `project_roots_added`, with no manifest of its own |
+
+`userOverride` on a root (`added` or `removed`) records a correction. A
+removed root keeps its manifest evidence. Its lists are empty, it proposes no
+commands, and it is not shown to the model. Its files belong to the nearest
+enclosing root.
+
+**Reading `excluded`.** Only three kinds of path are listed. Other ignored
+paths were never candidates and are not listed:
+
+| `reason` | Meaning |
+|---|---|
+| `vendor` | A `node_modules`, `vendor`, `target`, `dist`, `build`, `.venv` or `venv` directory. Never a root, even when indexed |
+| `belowDepthCeiling` | A manifest directory more than 6 segments deep (`packages/api` is 2). Not a root. If it should be one, add it: added roots are not held to the ceiling |
+| `invalidOverride` | A `project_roots_added` or `project_roots_removed` entry that was not applied. Possible causes: it is not a directory holding an indexed file; it is absolute or contains `..`; it is under a vendor directory or a `restricted_patterns` match; it is in both lists; it removes the repository root; or it removes a directory that is not a root. Fix or delete the entry |
+
+**A root is missing.** Check, in order:
+
+1. Does the directory hold one of the seven manifests? A `setup.py` alone is not one.
+2. Is it `.gitignore`d, under an `ignore_patterns` match, or under a vendor directory?
+3. Is it listed in `excluded`?
+4. Has an override removed it? The override can come from the repository's own
+   `.damaian/config.conf`, which may be committed, or from your
+   `config/user.conf`, where the keys apply to every repository.
+   `config-show` prints both lists.
+
+The index is in memory and updated by the file watcher. A manifest created a
+moment ago may need the watcher to catch up, or a restart.
+
+**A directory is wrongly a root.** The usual cause is a stray manifest in an
+example or a fixture. Remove it in Settings › General › Repository roots, or
+from the CLI:
+
+```bash
+cargo run -p damaian-cli -- repo-root /path/to/repo remove examples/demo
+```
+
+`add` and `clear` work the same way. All three write
+`<repo>/.damaian/config.conf`, which `git status` then shows. If that file
+already has a line the parser rejects, the write is refused with the parse
+error and the file is left alone.
+
+**A root has no commands, or not the expected ones.** Commands come only from
+the `package.json` scripts named exactly `test`, `lint`, `typecheck`, `build`
+or `format`, and from one fixed command per other manifest. A script named
+`lint:web` is not picked up. A Cargo workspace root and each member all show
+`cargo test`, each in its own directory.
+
+**A command ran in the wrong directory.** The approval card's **Runs in**
+line shows where a command runs. So do `workingDirectory` and `repositoryRoot`
+in the stored proposal (`commands/pending/<id>.dcmd`, or
+`/api/command-proposal`). A proposal written before roots existed has no
+`REPOSITORY_ROOT` line and is read as running at the repository root.
+
+**The audit event.** A rebuild of a stored map writes
+`repository_map_rebuilt` with `repositoryId`, `reason` (`corrupt`,
+`schemaMismatch` or `stale`) and, for a mismatch, `foundSchemaVersion`. A
+first build and a reuse write nothing.
+
+```bash
+jq -c 'select(.eventType=="repository_map_rebuilt")' "$DATA_DIR/audit/events.jsonl"
+```
+
+**What the model saw.** The map reaches the model as one context item of
+kind `repository_map`. It is limited by `repository_map_max_tokens`: the
+default is 800, `0` turns it off, and a repository may only lower it. When the
+map is cut to fit, its last line starts `Abridged to fit:` and says what was
+dropped. If the map cannot be stored, for example because the data directory
+is read-only, it is left out of the request and the turn goes on.
 
 ## Logs
 
@@ -400,7 +603,7 @@ A repository-sourced config key that was refused appears as
 which is repository-controlled text:
 
 ```bash
-jq -r 'select(.eventType=="repository_config_key_rejected") | "\(.repositoryId) \(.key) \(.class)"' ~/Library/Application\ Support/DamaianClient/audit/events.jsonl
+jq -r 'select(.eventType=="repository_config_key_rejected") | "\(.repositoryId) \(.key) \(.class)"' "$DATA_DIR/audit/events.jsonl"
 ```
 
 Permission profiles leave three events, none of which carries a refused or
@@ -416,28 +619,27 @@ imported value:
   and key names of what was not carried and what would loosen.
 
 ```bash
-jq -c 'select(.eventType|startswith("permission_profile"))' ~/Library/Application\ Support/DamaianClient/audit/events.jsonl
+jq -c 'select(.eventType|startswith("permission_profile"))' "$DATA_DIR/audit/events.jsonl"
 ```
 
-A command or browser diagnostic the profile refused when you approved it is
-recorded as `stored_command_rejected` with `rejectedBy: "profile_policy"`, or
-with `decision: "refused_by_profile"` (see
-[the refusal section](#the-assistant-was-refused-the-session-mode-the-permission-profile-or-the-command-policy)).
+How a command or browser diagnostic refused by the session mode or the profile
+is recorded is in
+[The assistant was refused](#the-assistant-was-refused-the-session-mode-the-permission-profile-or-the-command-policy).
 
 ```bash
-tail -20 ~/Library/Application\ Support/DamaianClient/audit/events.jsonl | jq .
+tail -20 "$DATA_DIR/audit/events.jsonl" | jq .
 ```
 
 Last 50 events as a readable timeline:
 
 ```bash
-jq -r '"\(.timestampMs|tonumber/1000|strftime("%H:%M:%S")) \(.eventType) \(.status // .exitCode // .files // "")"' ~/Library/Application\ Support/DamaianClient/audit/events.jsonl | tail -50
+jq -r '"\(.timestampMs|tonumber/1000|strftime("%H:%M:%S")) \(.eventType) \(.status // .exitCode // .files // "")"' "$DATA_DIR/audit/events.jsonl" | tail -50
 ```
 
 Which event types have ever fired, and how often:
 
 ```bash
-jq -r .eventType ~/Library/Application\ Support/DamaianClient/audit/events.jsonl | sort | uniq -c | sort -rn
+jq -r .eventType "$DATA_DIR/audit/events.jsonl" | sort | uniq -c | sort -rn
 ```
 
 Event types grouped by what they tell you:
@@ -509,7 +711,7 @@ sessions need no rewrite.
 Find the most recently touched session:
 
 ```bash
-ls -t ~/Library/Application\ Support/DamaianClient/sessions/*.jsonl | head -1
+ls -t "$DATA_DIR"/sessions/*.jsonl | grep -v '\.progress\.jsonl$' | head -1
 ```
 
 Replay a conversation:
@@ -691,7 +893,7 @@ gets no generic finding, because it never reached a verdict.
 **Where full output lives.** A finding's `details` is a bounded excerpt (at
 most 4096 bytes, redacted). For a command, `originRef` is the execution id,
 and the stored output is
-`<data dir>/commands/output/<originRef>/stdout.log` and `stderr.log`. That is
+`$DATA_DIR/commands/output/<originRef>/stdout.log` and `stderr.log`. That is
 the runner's tail-truncated, redacted output, the most Damaian keeps. For a
 browser finding, `originRef` is the `web_diagnostic_recorded` record's `id`.
 
@@ -732,114 +934,36 @@ crate) or a `..` path is dropped. A browser console location maps to a file
 only for a loopback URL whose path matches exactly one repository file outside
 `node_modules`. Percent-encoded paths are not decoded and never match.
 
-### Repository roots and the repository map
+### Command output
 
-The map of a repository's project roots
-([User Guide](USER_GUIDE.md#repository-roots)) is stored per repository:
+Approved command executions store their full output on disk
+(`CommandStore::save_execution` in
+[validation.rs](../crates/workspace-engine/src/validation.rs)):
 
 ```text
-<data dir>/repository-map/<repository_id>.json
+commands/output/<execution-id>/stdout.log
+commands/output/<execution-id>/stderr.log
+commands/output/<execution-id>/summary.dcmd
 ```
 
-`<repository_id>` is the same `repo_…` id as `command_allowlist.<repository_id>`.
-The map is derived from the in-memory index plus config. The stored file is
-reused only while its `fingerprint` still matches the inputs: the indexed
-paths, the content of every manifest and `AGENTS.md`, the root overrides, the
-command allowlist and blocklist, and the excluded paths. Anything else
-rebuilds it: a changed manifest, a new grant, an unreadable file, or another
-schema version. **To force a rebuild, delete the file.** It is built again on
-the next request or map read. A deleted file is rebuilt silently. A stale,
-corrupt or version-mismatched one is rebuilt with an audit event.
+Both streams are secret-redacted and truncated to `max_command_output_bytes`
+before being stored, so a suspiciously short log may be a truncation, not an
+early exit. Check `exitCode` on the matching `command_executed` audit event.
 
-Read it without the UI. `--json` prints `{"load":{…},"map":{…}}`, the same
-shape the Settings section reads from `/api/repository-map`:
+A command that was killed rather than exited reports `exitCode: -1` on that
+audit event and a `TERMINATION` of `timed_out` or `cancelled` on its
+`summary.dcmd`. It is killed when it passes `command_timeout_secs` (default
+600) or when the turn is stopped; `command_timeout_secs` is restrict-only, so a
+repository may lower that deadline but not raise it. While it runs, its output
+is streamed to the interface as it arrives and redacted a line at a time; the
+stored log above is still the authoritative whole-output redaction, so treat a
+missing secret in the live view as expected rather than as proof.
 
-```bash
-DAMAIAN_DATA_DIR=/tmp/damaian-debug cargo run -p damaian-cli -- repo-map /path/to/repo
-DAMAIAN_DATA_DIR=/tmp/damaian-debug cargo run -p damaian-cli -- repo-map /path/to/repo --json | jq '.map.roots[] | {path, detectedBy, userOverride}'
-```
+## Turns, recovery and workers
 
-The first line of the summary says what happened: `map reused (inputs
-unchanged)`, `map built (none stored)`, or `map rebuilt: …` with the reason.
-In the JSON, `load.outcome` is `reused`, `built` or `rebuilt`, and a rebuild
-carries `reason` (`corrupt`, `schemaMismatch` with `foundSchemaVersion`, or
-`stale`).
-
-**Reading `detectedBy`.** Each root says why it is one:
-
-| `detectedBy.kind` | Meaning |
-|---|---|
-| `repositoryRoot` | The working folder, which is always a root, holding none of the known manifests |
-| `manifest` | `detectedBy.path` names the manifest that made it a root. With several in one directory, the first of `package.json`, `pyproject.toml`, `pytest.ini`, `pom.xml`, `build.gradle`, `go.mod`, `Cargo.toml` is named, so a root with `package.json` and `Cargo.toml` reads `package.json` |
-| `userOverride` | Added by `project_roots_added`, with no manifest of its own |
-
-`userOverride` on a root (`added` or `removed`) records a correction. A
-removed root keeps its manifest evidence. Its lists are empty, it proposes no
-commands, and it is not shown to the model. Its files belong to the nearest
-enclosing root.
-
-**Reading `excluded`.** Only three kinds of path are listed. Other ignored
-paths were never candidates and are not listed:
-
-| `reason` | Meaning |
-|---|---|
-| `vendor` | A `node_modules`, `vendor`, `target`, `dist`, `build`, `.venv` or `venv` directory. Never a root, even when indexed |
-| `belowDepthCeiling` | A manifest directory more than 6 segments deep (`packages/api` is 2). Not a root. If it should be one, add it: added roots are not held to the ceiling |
-| `invalidOverride` | A `project_roots_added` or `project_roots_removed` entry that was not applied. Possible causes: it is not a directory holding an indexed file; it is absolute or contains `..`; it is under a vendor directory or a `restricted_patterns` match; it is in both lists; it removes the repository root; or it removes a directory that is not a root. Fix or delete the entry |
-
-**A root is missing.** Check, in order:
-
-1. Does the directory hold one of the seven manifests? A `setup.py` alone is not one.
-2. Is it `.gitignore`d, under an `ignore_patterns` match, or under a vendor directory?
-3. Is it listed in `excluded`?
-4. Has an override removed it? The override can come from the repository's own
-   `.damaian/config.conf`, which may be committed, or from your
-   `config/user.conf`, where the keys apply to every repository.
-   `config-show` prints both lists.
-
-The index is in memory and updated by the file watcher. A manifest created a
-moment ago may need the watcher to catch up, or a restart.
-
-**A directory is wrongly a root.** The usual cause is a stray manifest in an
-example or a fixture. Remove it in Settings › General › Repository roots, or
-from the CLI:
-
-```bash
-cargo run -p damaian-cli -- repo-root /path/to/repo remove examples/demo
-```
-
-`add` and `clear` work the same way. All three write
-`<repo>/.damaian/config.conf`, which `git status` then shows. If that file
-already has a line the parser rejects, the write is refused with the parse
-error and the file is left alone.
-
-**A root has no commands, or not the expected ones.** Commands come only from
-the `package.json` scripts named exactly `test`, `lint`, `typecheck`, `build`
-or `format`, and from one fixed command per other manifest. A script named
-`lint:web` is not picked up. A Cargo workspace root and each member all show
-`cargo test`, each in its own directory.
-
-**A command ran in the wrong directory.** The approval card's **Runs in**
-line shows where a command runs. So do `workingDirectory` and `repositoryRoot`
-in the stored proposal (`commands/pending/<id>.dcmd`, or
-`/api/command-proposal`). A proposal written before roots existed has no
-`REPOSITORY_ROOT` line and is read as running at the repository root.
-
-**The audit event.** A rebuild of a stored map writes
-`repository_map_rebuilt` with `repositoryId`, `reason` (`corrupt`,
-`schemaMismatch` or `stale`) and, for a mismatch, `foundSchemaVersion`. A
-first build and a reuse write nothing.
-
-```bash
-jq -c 'select(.eventType=="repository_map_rebuilt")' ~/Library/Application\ Support/DamaianClient/audit/events.jsonl
-```
-
-**What the model saw.** The map reaches the model as one context item of
-kind `repository_map`. It is limited by `repository_map_max_tokens`: the
-default is 800, `0` turns it off, and a repository may only lower it. When the
-map is cut to fit, its last line starts `Abridged to fit:` and says what was
-dropped. If the map cannot be stored, for example because the data directory
-is read-only, it is left out of the request and the turn goes on.
+How to read what a turn, a crash, a worker or a rewind left behind. Each
+section names the log events it relies on; [Logs](#logs) describes the logs
+themselves.
 
 ### A turn stopped early: which budget ran out
 
@@ -875,7 +999,7 @@ A paused turn is in the audit log as `round_budget_paused` (`proposalId`,
 `turn_budget_extended` with the rounds granted and the running total:
 
 ```bash
-jq -c 'select(.eventType|test("^(round_budget_|turn_budget_extended|turn_continued)"))' ~/Library/Application\ Support/DamaianClient/audit/events.jsonl
+jq -c 'select(.eventType|test("^(round_budget_|turn_budget_extended|turn_continued)"))' "$DATA_DIR/audit/events.jsonl"
 ```
 
 A pause survives a restart: crash recovery reattaches the `roundbudget_`
@@ -957,7 +1081,7 @@ scope, because the probe itself can have effects.
 Recovery decisions are in the **audit log**, not the session log:
 
 ```bash
-jq -r 'select(.eventType|startswith("task_recover")) | "\(.eventType) \(.taskId) \(.classification // "") \(.decision // "") \(.outcome // "") \(.reason // "")"' ~/Library/Application\ Support/DamaianClient/audit/events.jsonl
+jq -r 'select(.eventType|startswith("task_recover")) | "\(.eventType) \(.taskId) \(.classification // "") \(.decision // "") \(.outcome // "") \(.reason // "")"' "$DATA_DIR/audit/events.jsonl"
 ```
 
 `task_recovered` carries the classification and the evidence it was made on
@@ -977,13 +1101,11 @@ decision cannot be made on a claim the webview supplied.
 The running app's API cannot be reached from curl (see
 [The API token blocks curl](#the-api-token-blocks-curl)), so read a real
 session's verdict from the two audit events above. To watch the sweep's JSON,
-use the manual-inspection server, which is seeded with three tasks left
-mid-flight and prints a fixed token:
+start the manual-inspection server described there, which is seeded with three
+tasks left mid-flight, and in another terminal:
 
 ```bash
-cargo test -p desktop-shell --lib -- --ignored --nocapture serves_the_ui
-# in another terminal, with the apiToken it printed:
-curl -s -H "x-damaian-api-token: damaian-ui-inspection-token" http://127.0.0.1:4899/api/recovery | jq
+curl -s -H "x-damaian-api-token: $TOKEN" http://127.0.0.1:4899/api/recovery | jq
 ```
 
 A task that was resumed shows as `preparing_context` afterwards. That is
@@ -1094,7 +1216,7 @@ manual-inspection server, against its own seeded repository and data
 directory, the same route is:
 
 ```bash
-curl -s -H "x-damaian-api-token: damaian-ui-inspection-token" \
+curl -s -H "x-damaian-api-token: $TOKEN" \
   "http://127.0.0.1:4899/api/workers?repo=$(jq -rn --arg r "$REPO" '$r|@uri')" \
   | jq -r '.workers[] | "\(.group) \(.state) \(.taskStatus // "-") \(.sessionId) \(.branch)"'
 ```
@@ -1207,7 +1329,7 @@ for workers (`chat_model_adapter`), and like the CLI it answers from
 `DAMAIAN_MOCK_MODEL_RESPONSE` when that variable is set. A shell started from a
 terminal with it set therefore answers every turn, its own and its workers',
 from the variable, without calling the provider. The app started from Finder
-does not inherit a terminal's variables.
+does not ([why](#the-app-does-not-see-your-shells-environment)).
 
 ### Checkpoints and rewind
 
@@ -1246,31 +1368,6 @@ manifests, deletes their refs, and lets `git gc` collect the content, but never
 drops the newest checkpoint of the session you are in. None of the three keys
 can be set by repository config.
 
-### Command output
-
-Approved command executions store their full output on disk
-(`CommandStore::save_execution` in
-[validation.rs](../crates/workspace-engine/src/validation.rs)):
-
-```text
-commands/output/<execution-id>/stdout.log
-commands/output/<execution-id>/stderr.log
-commands/output/<execution-id>/summary.dcmd
-```
-
-Both streams are secret-redacted and truncated to `max_command_output_bytes`
-before being stored, so a suspiciously short log may be a truncation, not an
-early exit. Check `exitCode` on the matching `command_executed` audit event.
-
-A command that was killed rather than exited reports `exitCode: -1` on that
-audit event and a `TERMINATION` of `timed_out` or `cancelled` on its
-`summary.dcmd`. It is killed when it passes `command_timeout_secs` (default
-600) or when the turn is stopped; `command_timeout_secs` is restrict-only, so a
-repository may lower that deadline but not raise it. While it runs, its output
-is streamed to the interface as it arrives and redacted a line at a time; the
-stored log above is still the authoritative whole-output redaction, so treat a
-missing secret in the live view as expected rather than as proof.
-
 ## Inspecting configuration
 
 Effective config for a repository, with all three overlays applied:
@@ -1301,9 +1398,9 @@ cargo run -p damaian-cli -- config-set user model_name deepseek-v4-flash
 To check overlay precedence, print the raw files rather than the merged view:
 
 ```bash
-cat ~/Library/Application\ Support/DamaianClient/config/user.conf
-cat /path/to/repo/.damaian/config.conf
-cat ~/Library/Application\ Support/DamaianClient/config/admin.conf
+cat "$DATA_DIR/config/user.conf"
+cat "$REPO/.damaian/config.conf"
+cat "$DATA_DIR/config/admin.conf"
 ```
 
 Relevant environment variables:
@@ -1344,7 +1441,8 @@ token, with the repository and data paths:
 cargo test -p desktop-shell --lib -- --ignored --nocapture serves_the_ui
 ```
 
-It runs until you stop it. Pass that token as `x-damaian-api-token`, or in the
+It runs until you stop it. Pass that token as `x-damaian-api-token` (the
+recipes call it `$TOKEN`; see [Conventions](#conventions)), or in the
 browser console set `apiToken` to it and call `setRepository` with the printed
 repository path. It shows only its own seeded state, never the user's.
 
@@ -1385,7 +1483,8 @@ source maps, so line numbers in console errors are the real ones.
 
 In `npm run desktop:dev`, right-click the window and choose **Inspect Element**
 to open the WebKit inspector. Or point a browser at
-`http://127.0.0.1:4900/` for a standalone shell — the page loads and static
+`http://127.0.0.1:4900/` for a standalone shell
+([Capturing stdout and stderr](#capturing-stdout-and-stderr)) — the page loads and static
 assets work, but every `/api/*` call fails with `Desktop API bootstrap is
 available in the desktop app`, because the Tauri IPC that supplies the token
 does not exist in a plain browser. That message is expected outside the app,
@@ -1418,11 +1517,9 @@ lsof -nP -iTCP:4765 -sTCP:LISTEN
 ```
 
 If that PID is a Damaian shell, the user's app is probably already running. Do
-not take the port and do not kill by name. Run your own instance elsewhere:
-
-```bash
-DAMAIAN_DATA_DIR=/tmp/damaian-debug cargo run -p desktop-shell -- --port 4900 --repo /path/to/repo
-```
+not take the port and do not kill by name. Run your own instance on another
+port with its own data directory, using the standalone shell command in
+[Capturing stdout and stderr](#capturing-stdout-and-stderr).
 
 ### The data directory is refused at startup
 
@@ -1445,15 +1542,34 @@ supports it, or point `DAMAIAN_DATA_DIR` somewhere else. Do not delete the
 directory or edit the marker to get past it: the refusal exists because an
 older build writing over a newer layout loses sessions.
 
+### The app does not see your shell's environment
+
+A macOS app opened from Finder, the Dock or Launchpad does not read your shell
+profile, so it does not get the variables or the `PATH` your Terminal has. That
+one fact is behind several symptoms:
+
+- `model_api_key_env` names an environment variable that is set in your shell
+  and missing in the app, so [model calls fail](#model-calls-fail). A
+  `keychain:` reference avoids this.
+- An MCP stdio server's `command`, or `docker`, resolves in Terminal and not in
+  the app. Use an absolute path to the executable.
+- A variable such as `DAMAIAN_MOCK_MODEL_RESPONSE` or `DAMAIAN_DATA_DIR`
+  changes the behaviour of a shell started from a terminal and not of the app
+  started from Finder.
+
+To see what the app does with your shell's environment, launch it from a
+terminal instead, as described in
+[Capturing stdout and stderr](#capturing-stdout-and-stderr).
+
 ### Model calls fail
 
 Check in this order:
 
-1. `GET /api/model-key-status`, or the Settings `Model API Key` field — is it
-   `Saved`?
+1. Is the key `Saved`? [Secrets](#secrets) shows how to check without
+   printing it.
 2. If `model_api_key_env` names an environment variable rather than a
-   `keychain:` reference, is that variable set in the launching environment? A
-   Finder launch does not read your shell profile.
+   `keychain:` reference, is that variable set in the launching environment?
+   See [The app does not see your shell's environment](#the-app-does-not-see-your-shells-environment).
 3. `config-show` — is `model_base_url` the provider you think it is? A repo or
    admin overlay may be redirecting it.
 4. The audit log — a `model_request_prepared` with no matching
@@ -1509,7 +1625,7 @@ turn that could pause.
 To see what happened to an offer:
 
 ```bash
-grep -h '"provider_fallback' ~/Library/Application\ Support/DamaianClient/audit/events.jsonl | jq -c .
+grep -h '"provider_fallback' "$DATA_DIR/audit/events.jsonl" | jq -c .
 ```
 
 - `provider_fallback_offered`: the turn paused. Carries `proposalId`,
@@ -1690,7 +1806,8 @@ test button in MCP settings. Then check:
   underlying error.
 
 For stdio servers the `command` must be resolvable in the app's environment,
-which for a GUI launch is not your shell's `PATH` — prefer an absolute path.
+which for a GUI launch is not your shell's `PATH` — prefer an absolute path
+([why](#the-app-does-not-see-your-shells-environment)).
 
 ### Docker command problems
 
@@ -1700,9 +1817,9 @@ from the CLI to inspect policy decisions without a model call.
 
 If an approved Docker command fails:
 
-- `docker` may be missing from the GUI app environment. A Finder-launched macOS
-  app does not necessarily inherit your Terminal `PATH`; use an absolute Docker
-  executable path or launch Damaian from a shell in development.
+- `docker` may be missing from the app's `PATH`; use an absolute Docker
+  executable path, or launch Damaian from a terminal
+  ([why](#the-app-does-not-see-your-shells-environment)).
 - Docker Desktop or the Docker daemon may not be running or reachable.
 - `docker compose` requires the Compose plugin. If the machine uses the legacy
   binary, try `docker-compose`.
@@ -1773,7 +1890,7 @@ turn was free". Only new turns have figures. Check the session log for
 `task_usage_recorded`:
 
 ```bash
-grep -c task_usage_recorded ~/Library/Application\ Support/DamaianClient/sessions/<session>.jsonl
+grep -c task_usage_recorded "$SESSION_FILE"
 ```
 
 ### Cache hit rate reads "not reported", or seems low
@@ -1815,87 +1932,6 @@ by a manually triggered preview run, which is ad-hoc signed. That is expected,
 not a bug; the workaround is in [Development](DEVELOPMENT.md#build-a-macos-dmg). Do
 not try to "fix" it in code.
 
-### The quality gate is slow locally
-
-CI runs the whole gate in a few minutes. On this project's development Mac the
-same runs have ranged from that to well over an hour, on the same code, minutes
-apart. A fresh worktree's cold `target/` is not the cause: on 2026-10-14 a
-clippy run into an empty target directory took 45s, and
-`cargo nextest run --workspace` 33s. When a gate step runs past
-about ten minutes, stop waiting and find out why.
-
-**Measure it with `scripts/quality-gate.sh`.** It runs the same seven checks
-(or the ones named, e.g. `scripts/quality-gate.sh clippy nextest`), times each
-step, and samples load, swap, power source, concurrent cargo processes and the
-top CPU consumers every 30 seconds into
-`$CARGO_TARGET_DIR/gate-logs/<timestamp>/` (`target/` when unset). It warns
-on stderr once a step passes `GATE_SLOW_SECS` (default 600). Read the
-summary's `cpu/wall` column first: well above 1 means the step was compiling
-on several cores, well below 1 means it was mostly *waiting*, and no build
-cache or linker change will help a waiting step.
-
-**A waiting test step is most likely endpoint security software stalling
-process launches.** The tests that dominate a slow run are the ones that start
-many processes — the checkpoint store's `git` calls, the eval-harness
-scenarios, the mode-refusal tests that run commands and MCP servers. On
-2026-10-15 a full `nextest` took 457s–690s at `cpu/wall` 0.1, and the
-hundred-turn checkpoint test alone took 196s and then 49s a few minutes later.
-Timing every `git` call that test made showed two clusters: the median call
-took 14 ms, but about 9% took a fixed ~280 ms each and accounted for 68% of all
-`git` time. A plain launch of `/usr/bin/true` took 2 ms and of `git` 8 ms
-when measured in isolation. That shape — most launches fast, a share held for a
-fixed interval, worse at some moments than others, absent on CI — is what an
-agent that inspects every launch before letting it run produces. The Mac in
-question runs two, installed by its administrators: Sophos (`SophosAntiVirus`,
-`SophosCBR`) and SentinelOne (`sentineld`). Which of them is responsible has
-not been isolated; that needs their admin consoles.
-
-Check for the signature with `scripts/time-git-calls.sh`, which runs a command
-with every `git` call timed and prints the distribution:
-
-```bash
-scripts/time-git-calls.sh cargo nextest run -p workspace-engine --test checkpoints --locked \
-  -E 'test(a_hundred_turn_session_stays_within_its_documented_storage_bound)'
-```
-
-A healthy machine shows p99 within a few times p50 and no `>=150 ms` cluster.
-The remedy is outside this repository: ask the administrators for scanning
-exclusions covering the repositories (`~/development`), `~/.cargo`,
-`~/.rustup`, the `git` binary (`/opt/homebrew/bin/git`), the per-user temp
-directory the tests create repositories in (`$TMPDIR`, under `/var/folders`),
-and the target directories. Re-run the check afterwards; the slow cluster should
-be gone. Do not try to fix this in code — a test that is slow only on one
-machine is not a code defect.
-
-**Ruled out, with measurements, on 2026-10-14 and 2026-10-15:**
-
-- **The Developer Tools exemption** (System Settings → Privacy & Security →
-  Developer Tools). Gatekeeper's `syspolicyd` was often busy during slow runs,
-  but back-to-back runs launched from exempt Terminal.app and from an exempt
-  Claude Code process were equally slow (690s and 457s). One fast run after
-  adding an exemption was coincidence. If you try it anyway, note that the
-  exemption follows the *responsible* process, which is not always the parent
-  you see — `sudo launchctl procinfo $$ | grep -i responsible` names it.
-- **`git` itself and raw file I/O.** A checkpoint-style turn (five `git` calls)
-  cost about 55 ms in `$TMPDIR`, in a scratch directory and under
-  `~/development` alike.
-- **Parallel contention.** The hundred-turn test was as slow running alone as
-  inside the full suite.
-
-**Other causes to rule out, in the sampler log:**
-
-- **Concurrent builds.** The cargo/rustc process count covers every worktree.
-  Two gates at once compete for the same eight cores, and runs sharing one
-  target directory serialise on its lock (`Blocking waiting for file lock`).
-  Give each worktree its own `CARGO_TARGET_DIR`; never kill another session's
-  build to free the machine.
-- **Swap.** `vm.swapusage` close to its total while `rustc` processes are large
-  means the build is paging.
-- **Battery.** A run on battery or in Low Power Mode is slower by design.
-
-If none of these shows up, `sample <pid> 5` on the slowest process names the
-call it is blocked in; record what you find before changing anything.
-
 ## Resetting state
 
 Ordered least to most destructive. **Look at what you are deleting first** —
@@ -1906,15 +1942,15 @@ Clear the in-memory repository index: restart the app.
 Clear semantic-search caches (regenerated on demand):
 
 ```bash
-rm -rf ~/Library/Application\ Support/DamaianClient/vector-index
+rm -rf "$DATA_DIR/vector-index"
 ```
 
 Clear stale pending state — proposals the user never resolved:
 
 ```bash
-ls ~/Library/Application\ Support/DamaianClient/patches/pending
-ls ~/Library/Application\ Support/DamaianClient/commands/pending
-ls ~/Library/Application\ Support/DamaianClient/chat/pending
+ls "$DATA_DIR/patches/pending"
+ls "$DATA_DIR/commands/pending"
+ls "$DATA_DIR/chat/pending"
 ```
 
 Reset UI state only, keeping config and history — clear localStorage from the
@@ -1939,8 +1975,8 @@ them:
    [Process model](#process-model) is involved.
 3. stderr from a terminal-attached run, captured as described in
    [Logs](#logs).
-4. The audit timeline around the failure — the `jq` timeline command above,
-   trimmed to the relevant window.
+4. The audit timeline around the failure — the `jq` timeline command in
+   [Audit log](#audit-log), trimmed to the relevant window.
 5. The affected session file, or the `message_appended` extract. **Review it
    before sharing:** it contains prompts and file content from the user's
    repository.

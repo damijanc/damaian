@@ -79,6 +79,33 @@ directory was renamed from `ROADMAP` to `PLAN` because it was never a roadmap:
 
 ## What to build next, and what may run in parallel
 
+### Current state (2026-10-22)
+
+A summary of each spec's own `Status:`, `tasks.md` and `Depends on:` lines on
+this date. Where it disagrees with them, they win; `npm run specs:check`
+reports the disagreement.
+
+- **In progress:** #25 symbols (Tasks 1–7 of 11), #32 hooks (1–3 of 10), #49
+  prompt cache (accounting slice done; the reuse slice is blocked on #55 or
+  #26), #50 clarification (1–3 of 8), #59 exploration allowance (1 of 6), #60
+  worktree reads (1–5 of 6; Task 6 in progress), #61 continue the stopped turn
+  (1–5 of 7), #62 approval reasons (1–2 of 7), #63 exploratory failures (1–5 of
+  6), #64 read-only boundary (requirements 1–8 implemented; close-out open).
+- **Ready, not started:** #23 verification loop; #65 exploration memory (its
+  requirement 8 waits for #59).
+- **Blocked:** #26 on #25; #27, #33, #51, #54 and #55 on #26; #28 on #26 and
+  #27; #29 on #28; #30 on #28 and #29; #35 on #23; #36 on #35; #37 on #33, #35
+  and #36; #52 on #33; #39 on #38; #40 on #38 and #39.
+- **Deferred:** #38 (stage 1 is due for re-evaluation now that #57 is done).
+- **Pairing:** two specs may run together only if at most one of them edits
+  `chat.rs`, and #26, #55 and #49's reuse slice never run together — see
+  [Parallel work](#parallel-work).
+- **Open decision:** the priority table below predates #59–#65 and does not
+  rank them; the text after it calls #65 "the priority after #59". Where
+  #59–#65 rank against #25 → #26 is the owner's call.
+
+### History
+
 Derived on 2026-09-19 from the `Depends on:` line of every unstarted spec (see
 [Every spec names its prerequisites](#every-spec-names-its-prerequisites)),
 which is the source of truth — this section is a reading of those lines, not a

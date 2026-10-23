@@ -66,7 +66,7 @@ sample() {
         echo "!!   cpu/wall well below 1 means waiting: check for stalled launches with"
         echo "!!   scripts/time-git-calls.sh (see the doc below)"
         echo "!!   sample <pid of the slowest process> 5   (where is it blocked?)"
-        echo "!! See docs/TROUBLESHOOTING.md, 'The quality gate is slow locally'."
+        echo "!! See docs/DEVELOPMENT.md, 'The quality gate is slow locally'."
       } >&2
     fi
     sleep 30
