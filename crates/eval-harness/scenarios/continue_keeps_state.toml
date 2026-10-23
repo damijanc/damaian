@@ -1,0 +1,121 @@
+name = "continue_keeps_state"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "List the source files, then describe what the upload client does."
+round_budget_decision = "continue"
+
+# Spec 61 §5.8: a turn that runs out of rounds pauses, the harness answers
+# *Continue*, and the resumed turn keeps everything the stopped one had.
+#
+# Every round before the pause is a `run_command` of `ls src`, which the policy
+# classifies Low risk and runs without asking (`command_policy.rs`), so the
+# round budget is reached without a command approval stopping the turn first.
+#
+# Commands are deliberate rather than read tools (spec 59): a round in which
+# every call is `ActionEffect::ReadOnly` will be charged to the exploration
+# allowance instead of the action budget, so a script built from `read_file` or
+# `list_directory` would stop reaching the round budget once that spec lands.
+# A command round is an action round in both worlds.
+#
+# Eight rounds reach the default `agent_max_tool_rounds` (8). The turn pauses
+# before making its ninth model call, so responses nine through twelve are only
+# consumed after *Continue*. The ninth asks for the same call again — the pause
+# happened before it dispatched — and the last response answers.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+# The ninth response: the first one the resumed turn consumes.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = "The upload client reads a payload, rejects an empty one, and reports the error."
+
+[assert]
+# Requirement 2: one continuation, on the same task. `task_count` is the number
+# of tasks in the run's store, so a Continue that started a new turn would read
+# 2 — the failure the old *Continue debugging* button produced.
+continuations = 1
+task_count = 1
+final_task_status = "complete"
+
+# The ninth request — the first after *Continue* — replays the saved messages,
+# so it still carries the user's original request and the first turn's tool
+# results. `Command: ls src` appears only in a command tool result; the fixture
+# has no other source for it. Checked against the model request rather than the
+# session log, because the claim is about what the resumed turn *sent*.
+continuation_request_contains = ["List the source files", "Command: ls src", "upload.rs"]
+
+# Eight rounds before the pause, three resumed tool rounds, and the closing
+# answer: twelve model calls. No call is made between reaching the limit and
+# the choice, so a run that spent one there would read 13.
+model_calls_at_most = 12
+tool_calls_at_least = 11
+deterministic_only = [
+  "continuations",
+  "task_count",
+  "final_task_status",
+  "continuation_request_contains",
+  "model_calls_at_most",
+  "tool_calls_at_least",
+]

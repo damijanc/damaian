@@ -1,0 +1,88 @@
+name = "answer_now_ends_the_turn"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "List the source files, then describe what the upload client does."
+round_budget_decision = "answer_now"
+
+# Spec 61 §5.8's second case: the same pause, answered with *Answer now*. The
+# forced final call drops tools; the scripted response still asks for one, so
+# the turn ends `ToolBudgetExhausted` — the terminal outcome this case asserts.
+#
+# The eight rounds are command rounds for the reason `continue_keeps_state.toml`
+# records: a command is an action round under spec 59 too, so the script reaches
+# the round budget before and after that spec.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+# The ninth response, consumed only by the Answer-now forced call. It asks for a
+# tool even though the forced call offered none, which is what ends the turn.
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "run_command", arguments = { command = "ls src", reason = "List the source files" } },
+]
+
+[assert]
+# Answer now is not a continuation: no `turn_budget_extended` is recorded.
+continuations = 0
+task_count = 1
+final_task_status = "tool_budget_exhausted"
+
+# Eight rounds plus exactly one forced final call. A second call on resume, or
+# a call made before the choice, would exceed nine.
+model_calls_at_most = 9
+# The forced call dispatches nothing: the eight command rounds are the whole
+# side-effect set.
+tool_calls_at_least = 8
+deterministic_only = [
+  "continuations",
+  "task_count",
+  "final_task_status",
+  "model_calls_at_most",
+  "tool_calls_at_least",
+]

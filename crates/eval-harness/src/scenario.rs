@@ -61,6 +61,23 @@ pub struct Asserts {
     pub command_executed: Option<bool>,
     pub patch_applied: Option<bool>,
     pub model_calls_at_most: Option<u64>,
+    /// How many round-budget continuations the run granted (spec 61 §5.4).
+    /// Zero is a real answer — a turn answered with *Answer now* never
+    /// continues — so this is an exact count, not an upper bound.
+    pub continuations: Option<u64>,
+    /// How many tasks the run's store holds. A continued turn is the same task,
+    /// so this reads 1; a turn that started over reads more.
+    pub task_count: Option<u64>,
+    /// The task's terminal state, as `TaskStatus::as_str`, rather than
+    /// `finalStatus`. A paused turn's run is `completed` while its task still
+    /// waits for a human, so the two answer different questions.
+    pub final_task_status: Option<String>,
+    /// Strings the first model request after a round-budget continuation must
+    /// contain. This is the §5.8 claim that the resumed turn replayed the
+    /// user's request and the earlier tool results, checked against the request
+    /// itself rather than the log it was rebuilt from. Script-derived, so it is
+    /// `deterministic_only`.
+    pub continuation_request_contains: Option<Vec<String>>,
     /// That the run dispatched at least this many tool calls, which proves a
     /// batch ran every call the model made in one message. Script-derived, so a
     /// scenario using it lists it in `deterministic_only`.
@@ -86,6 +103,18 @@ pub struct Asserts {
     pub deterministic_only: Vec<String>,
 }
 
+/// How a scenario answers a round-budget pause (spec 61 §5.8).
+///
+/// Kept separate from the engine's `RoundBudgetDecision` because this is the
+/// scenario file's wire vocabulary (`continue` / `answer_now`), and the loader
+/// is the boundary where a file becomes a validated run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundBudgetDecision {
+    Continue,
+    AnswerNow,
+}
+
 #[derive(Debug, Clone)]
 pub struct Scenario {
     pub name: String,
@@ -103,6 +132,10 @@ pub struct Scenario {
     /// it stops on a command proposal, so the approved and denied paths are
     /// exercised end to end rather than stopping at the proposal.
     pub approval_decision: Option<bool>,
+    /// When set, the runner answers a round-budget pause with this decision and
+    /// keeps driving, so a continued turn's state and a forced final call are
+    /// exercised end to end (spec 61 §5.8).
+    pub round_budget_decision: Option<RoundBudgetDecision>,
     /// When set, the runner leaves the turn's task mid-action — an
     /// `action_started` with no `action_finished` — then reopens the store and
     /// classifies, which is what a restart does. See [`CrashMidAction`].
@@ -127,6 +160,8 @@ struct RawScenario {
     modify_after_proposal: Option<ModifyAfterProposal>,
     #[serde(default)]
     approval_decision: Option<bool>,
+    #[serde(default)]
+    round_budget_decision: Option<RoundBudgetDecision>,
     #[serde(default)]
     crash_mid_action: Option<CrashMidAction>,
     #[serde(default, rename = "turn")]
@@ -247,6 +282,7 @@ pub fn load(path: &Path) -> Result<Scenario> {
             .modify_after_proposal
             .map(|change| (change.path, change.content)),
         approval_decision: raw.approval_decision,
+        round_budget_decision: raw.round_budget_decision,
         crash_mid_action: raw.crash_mid_action,
         turns,
         asserts: raw.asserts,
