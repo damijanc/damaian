@@ -3,7 +3,8 @@
 Status: In progress. Tasks 1 (`ApprovalCause` and structured causes) and 2
 (`Setting` and profile-block causes) landed 2026-10-18; Task 3 (prompt and
 model-facing wording) landed 2026-10-23; Task 4 (the card names the cause and
-the model's reason) landed 2026-10-23. Specified on 2026-10-17
+the model's reason) landed 2026-10-23; Task 5 (recording causes in the proposal
+and audit record) landed 2026-10-23. Specified on 2026-10-17
 from the session behind
 [#59](../59_exploration_round_allowance/proposal.md)–[#61](../61_continue_the_stopped_turn/proposal.md),
 in which the user answered 40 approval prompts that all gave the same reason,
@@ -220,11 +221,15 @@ test breaks.
 The audit record for a command proposal — the `command_proposal_stored` event
 written in `validation.rs`'s `store_proposal`, which today carries
 `risk`/`requiresApproval`/`blocked` only — gains `causes`, the enum variant
-names in order (`shell_control,unknown`). Because the stored proposal
-(`serialize_proposal`) round-trips to disk and is reloaded for reattach and
-*Allow Always*, `CommandProposal` gains a `causes` field written and read with
-it, so the audit value and the reloaded proposal cannot drift. The session log's
-assistant message carries the plain words already, so no new event is needed.
+names in order (`unknown,outside_repository` for a command the policy does not
+recognise that also names a path outside the repository). Because the stored
+proposal (`serialize_proposal`) round-trips to disk and is reloaded for reattach
+and *Allow Always*, `CommandProposal` gains a `causes` field written and read
+with it, so the audit value and the reloaded proposal cannot drift. The field
+stores the causes themselves, not only their names: the audit names a cause,
+and the proposal keeps enough to render it. An older proposal without the field
+reads with no causes. The session log's assistant message carries the plain
+words already, so no new event is needed.
 
 ### 5.5 Measuring
 

@@ -6282,8 +6282,9 @@ fn agent_command_proposal(config: &Config, proposal: &CommandProposal) -> AgentC
         requires_approval: proposal.requires_approval,
         blocked: proposal.blocked,
         // `reasons` is rendered from the classification's causes, so the first
-        // entry is the deciding cause's plain words. Task 5 adds the causes to
-        // the stored proposal; until then this is the one source for the words.
+        // entry is the deciding cause's plain words. Kept as the rendered string
+        // rather than read from `causes` so a proposal stored before spec 62
+        // (which has reasons but no causes) still shows its cause on reattach.
         cause: proposal.reasons.first().cloned().unwrap_or_default(),
         reason: proposal.reason.clone(),
         allow_always: allow_always_eligible(config, &proposal.command, proposal.blocked),
@@ -9166,6 +9167,7 @@ mod approval_prompt_wording_tests {
             expected_effects: String::new(),
             may_use_network: false,
             reasons: causes.iter().map(ApprovalCause::plain_words).collect(),
+            causes,
             created_at_ms: 0,
             status: "pending".to_string(),
             purpose: CommandPurpose::Other,

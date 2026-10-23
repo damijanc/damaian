@@ -31,7 +31,11 @@ impl CommandRisk {
 /// display string (spec 62 §5.1). The set is closed: a new variant is a design
 /// decision. `Setting` and `ProfileBlocked` are wired by Task 2; Task 1 lands
 /// the classifier-branch and path-escalation causes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` exist so a stored proposal round-trips the values
+/// themselves, not only [`Self::as_str`]'s names (spec 62 Task 5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApprovalCause {
     Blocklisted { rule: String },
     Destructive { pattern: String },
@@ -47,6 +51,25 @@ pub enum ApprovalCause {
 }
 
 impl ApprovalCause {
+    /// The variant name, as it appears in the audit record (`shell_control`,
+    /// `outside_repository`, …). The audit carries names only, so no command
+    /// text or path from a cause reaches it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Blocklisted { .. } => "blocklisted",
+            Self::Destructive { .. } => "destructive",
+            Self::ShellControl { .. } => "shell_control",
+            Self::Docker => "docker",
+            Self::HighRisk { .. } => "high_risk",
+            Self::Network { .. } => "network",
+            Self::Unknown { .. } => "unknown",
+            Self::RestrictedPath { .. } => "restricted_path",
+            Self::OutsideRepository { .. } => "outside_repository",
+            Self::Setting { .. } => "setting",
+            Self::ProfileBlocked { .. } => "profile_blocked",
+        }
+    }
+
     /// The first line of an approval prompt, in plain words (spec 62 §5.1).
     pub fn plain_words(&self) -> String {
         match self {

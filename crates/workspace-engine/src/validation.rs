@@ -1,8 +1,8 @@
 use crate::audit::AuditLog;
 use crate::cancel::CancelToken;
 use crate::command_policy::{
-    CommandClassification, CommandPolicy, CommandRisk, allow_always_eligible, relative_location,
-    root_qualified_allowlist_entry,
+    ApprovalCause, CommandClassification, CommandPolicy, CommandRisk, allow_always_eligible,
+    relative_location, root_qualified_allowlist_entry,
 };
 use crate::command_purpose::{CommandPurpose, command_purpose};
 use crate::command_runner::{CommandExecution, CommandRunOptions, CommandRunner};
@@ -29,6 +29,10 @@ pub struct CommandProposal {
     pub expected_effects: String,
     pub may_use_network: bool,
     pub reasons: Vec<String>,
+    /// Why the policy asked or blocked, as values in the classifier's order
+    /// (spec 62 §5.4). Stored with the proposal so reattach and *Allow Always*
+    /// read the same causes the audit record names.
+    pub causes: Vec<ApprovalCause>,
     pub created_at_ms: u128,
     pub status: String,
     /// What the command is for (spec 63 §5.1), decided from the
@@ -97,7 +101,7 @@ impl CommandStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, serialize_proposal(proposal))?;
+        fs::write(&path, serialize_proposal(proposal)?)?;
         Ok(path)
     }
 
@@ -145,7 +149,7 @@ impl CommandStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut content = serialize_proposal(&proposal);
+        let mut content = serialize_proposal(&proposal)?;
         write_field(&mut content, "REJECTED_BY", rejected_by);
         write_field(&mut content, "REJECTED_AT_MS", &now_millis().to_string());
         fs::write(&path, content)?;
@@ -280,6 +284,18 @@ impl ValidationOrchestrator {
                 ("risk", proposal.risk.as_str().to_string()),
                 ("requiresApproval", proposal.requires_approval.to_string()),
                 ("blocked", proposal.blocked.to_string()),
+                // Names only, in classifier order, and empty for a command that
+                // ran without a cause (spec 62 §5.4). `AuditLog::record` runs
+                // every value through the secret scanner like the fields above.
+                (
+                    "causes",
+                    proposal
+                        .causes
+                        .iter()
+                        .map(ApprovalCause::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
             ],
         )?;
         Ok(proposal)
@@ -496,6 +512,7 @@ fn proposal_from_classification(
         expected_effects: classification.expected_effects,
         may_use_network: classification.may_use_network,
         reasons: classification.reasons,
+        causes: classification.causes,
         created_at_ms: now_millis(),
         status: "pending".to_string(),
         purpose,
@@ -516,7 +533,7 @@ pub fn command_approval_prompt(proposal: &CommandProposal) -> String {
     )
 }
 
-fn serialize_proposal(proposal: &CommandProposal) -> String {
+fn serialize_proposal(proposal: &CommandProposal) -> Result<String> {
     let mut output = String::new();
     output.push_str("DAMAIAN_COMMAND_PROPOSAL_V1\n");
     write_field(&mut output, "ID", &proposal.id);
@@ -553,8 +570,18 @@ fn serialize_proposal(proposal: &CommandProposal) -> String {
     // After it, optional the same way: proposals stored before spec 63 have
     // no purpose and read as `Other`, which keeps their old treatment.
     write_field(&mut output, "PURPOSE", proposal.purpose.as_str());
+    // Last, optional the same way: proposals stored before spec 62 have no
+    // causes and read back with an empty list. The value is JSON so every
+    // cause keeps its fields, not only its name.
+    write_field(
+        &mut output,
+        "CAUSES",
+        &serde_json::to_string(&proposal.causes).map_err(|error| {
+            ClientError::InvalidInput(format!("Could not store approval causes: {error}"))
+        })?,
+    );
     output.push_str("END_COMMAND_PROPOSAL\n");
-    output
+    Ok(output)
 }
 
 fn deserialize_proposal(raw: &str) -> Result<CommandProposal> {
@@ -590,6 +617,12 @@ fn deserialize_proposal(raw: &str) -> Result<CommandProposal> {
     } else {
         CommandPurpose::Other
     };
+    let causes = if cursor.next_field_is("CAUSES") {
+        serde_json::from_str(&cursor.read_field("CAUSES")?)
+            .map_err(|_| ClientError::InvalidInput("Invalid command proposal causes".to_string()))?
+    } else {
+        Vec::new()
+    };
     Ok(CommandProposal {
         id,
         command,
@@ -602,6 +635,7 @@ fn deserialize_proposal(raw: &str) -> Result<CommandProposal> {
         expected_effects,
         may_use_network,
         reasons,
+        causes,
         created_at_ms,
         status,
         purpose,
