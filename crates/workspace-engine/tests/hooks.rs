@@ -1196,27 +1196,40 @@ fn a_hook_past_its_deadline_is_killed_with_its_group_and_unregistered() {
         ),
     );
 
-    let run = run(
-        &hook,
-        &runner_envelope(&root, json!({})),
-        &root,
-        &data_dir,
-        Duration::from_millis(300),
-    );
-
-    assert_eq!(run.failure, Some(HookFailureKind::Timeout));
-    assert!(
-        run.duration < Duration::from_secs(1),
-        "the deadline was not enforced: {:?}",
-        run.duration
-    );
-    assert_eq!(registry_entries(&data_dir), 0);
-    let recorded = fs::read_to_string(&pids).expect("the hook recorded its pids");
-    let pids: Vec<i32> = recorded
-        .split_whitespace()
-        .map(|pid| pid.parse().unwrap())
-        .collect();
-    assert_eq!(pids.len(), 2);
+    // A hook can take longer than 300 ms just to start on this Mac (XProtect
+    // holding a freshly linked test binary's children: `main`'s copy of this
+    // test took 0.5-2 s per hook run). A deadline that expires before the
+    // script records its pids proves nothing about the group kill, so that
+    // run is repeated with a longer deadline. Each run is still bounded by
+    // its own deadline.
+    let mut recorded = None;
+    for deadline in [300, 1_000, 3_000].map(Duration::from_millis) {
+        let _ = fs::remove_file(&pids);
+        let run = run(
+            &hook,
+            &runner_envelope(&root, json!({})),
+            &root,
+            &data_dir,
+            deadline,
+        );
+        assert_eq!(run.failure, Some(HookFailureKind::Timeout));
+        assert!(
+            run.duration < deadline + Duration::from_millis(700),
+            "the {deadline:?} deadline was not enforced: {:?}",
+            run.duration
+        );
+        assert_eq!(registry_entries(&data_dir), 0);
+        let written: Vec<i32> = fs::read_to_string(&pids)
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        if written.len() == 2 {
+            recorded = Some(written);
+            break;
+        }
+    }
+    let pids = recorded.expect("the hook never started within 3 s");
     assert!(!is_alive(pids[0]), "the hook was reaped");
     // The orphaned `sleep` is reaped by launchd, which may take a moment.
     let settle = Instant::now() + Duration::from_secs(1);
@@ -1255,12 +1268,14 @@ fn output_over_the_ceiling_fails_and_reading_stops() {
         &envelope,
         &root,
         &data_dir,
-        Duration::from_secs(10),
+        Duration::from_secs(30),
     );
     assert_eq!(run_endless.failure, Some(HookFailureKind::OutputTooLarge));
     assert!(run_endless.stdout.len() <= MAX_HOOK_STDOUT_BYTES + 1);
+    // Far below the deadline, with room for a slow start (see the timeout
+    // test).
     assert!(
-        run_endless.duration < Duration::from_secs(2),
+        run_endless.duration < Duration::from_secs(10),
         "reading did not stop at the ceiling: {:?}",
         run_endless.duration
     );
