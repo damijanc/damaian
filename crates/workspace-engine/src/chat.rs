@@ -45,7 +45,7 @@ use crate::web_diagnostics::{
 };
 use crate::worktree_access::resolve_worktree;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -592,6 +592,16 @@ impl ChatOrchestrator {
         }
     }
 
+    /// The per-turn exploration allowance, clamped to
+    /// [`ABSOLUTE_EXPLORATION_ROUND_CAP`]. Unlike `agent_max_tool_rounds`, zero
+    /// is a valid value ("no exploration allowance", spec 59 requirement 6), so
+    /// this clamps from zero rather than from one.
+    fn default_exploration_round_limit(&self) -> u32 {
+        self.config
+            .agent_max_exploration_rounds
+            .min(ABSOLUTE_EXPLORATION_ROUND_CAP)
+    }
+
     /// Builds the per-turn MCP runtime from the active server config, resolving
     /// each HTTP server's auth token up front. Returns an inert runtime when no
     /// servers are active (the common case), so there's zero overhead and no
@@ -900,6 +910,7 @@ impl ChatOrchestrator {
             task,
             context.files,
             messages,
+            0,
             0,
             model_adapter,
             sink,
@@ -1236,6 +1247,7 @@ impl ChatOrchestrator {
             pending.context_files,
             messages,
             pending.round + 1,
+            pending.exploration_rounds,
             model_adapter,
             sink,
             pending.turn_options,
@@ -1361,6 +1373,7 @@ impl ChatOrchestrator {
             pending.context_files,
             messages,
             pending.round + 1,
+            pending.exploration_rounds,
             model_adapter,
             sink,
             pending.turn_options,
@@ -1501,6 +1514,7 @@ impl ChatOrchestrator {
             pending.context_files,
             pending.messages,
             pending.round,
+            pending.exploration_rounds,
             model_adapter,
             sink,
             turn_options,
@@ -1603,6 +1617,7 @@ impl ChatOrchestrator {
                     pending.context_files,
                     messages,
                     pending.round,
+                    pending.exploration_rounds,
                     model_adapter,
                     sink,
                     turn_options,
@@ -1636,6 +1651,7 @@ impl ChatOrchestrator {
                     pending.context_files,
                     pending.messages,
                     pending.round,
+                    pending.exploration_rounds,
                     model_adapter,
                     sink,
                     turn_options,
@@ -1939,7 +1955,8 @@ impl ChatOrchestrator {
         mut task: Task,
         context_files: Vec<String>,
         mut messages: Vec<ModelMessage>,
-        mut round: u32,
+        mut action_rounds: u32,
+        mut exploration_rounds: u32,
         model_adapter: &mut dyn ModelAdapter,
         sink: &mut TurnSink<'_>,
         turn_options: ChatTurnOptions,
@@ -2180,6 +2197,13 @@ impl ChatOrchestrator {
         // `rounds_granted`. Bounded by the absolute round cap so a provider
         // that reports no usage cannot loop forever.
         let mut round_budget_extension: u32 = turn_options.round_budget_extension;
+        // The per-turn read allowance (spec 59 §5.2). It is fixed for the turn
+        // and never extended by a continuation, so it is computed once here.
+        let max_exploration_rounds = self.default_exploration_round_limit();
+        // The turn's already-dispatched read calls (spec 59 §5.3), keyed by the
+        // canonical form below. It lives for one turn: a resumed turn starts
+        // with an empty set, and a round that writes clears it.
+        let mut seen_read_calls: HashSet<Vec<String>> = HashSet::new();
         let (final_run, response, proposals, stop_reason) = loop {
             // Spec 57 §5.4, in its order: a pause holds here, before the
             // cancel check, so a stop that arrives while paused ends the turn
@@ -2295,7 +2319,7 @@ impl ChatOrchestrator {
 
             let max_rounds = (self.tool_round_limit(web_debug_mode) + round_budget_extension)
                 .min(ABSOLUTE_TURN_ROUND_CAP);
-            let force_final = round >= max_rounds;
+            let force_final = action_rounds >= max_rounds;
             // Spec 61 §5.1: at the round budget, with no token ceiling to
             // continue under, pause before the forced final call instead of
             // spending it on text nobody sees. The forced call is made only
@@ -2304,7 +2328,8 @@ impl ChatOrchestrator {
             // reached, so the forced call proceeds on that path.
             if force_final
                 && !turn_options.round_budget_answer_now
-                && (self.config.agent_max_task_tokens.is_none() || round >= ABSOLUTE_TOOL_ROUND_CAP)
+                && (self.config.agent_max_task_tokens.is_none()
+                    || action_rounds >= ABSOLUTE_TOOL_ROUND_CAP)
             {
                 return self.pause_for_round_budget(
                     repository_root,
@@ -2312,7 +2337,8 @@ impl ChatOrchestrator {
                     task,
                     context_files,
                     messages,
-                    round,
+                    action_rounds,
+                    exploration_rounds,
                     max_rounds,
                     round_budget_extension,
                     turn_options,
@@ -2353,12 +2379,12 @@ impl ChatOrchestrator {
                     ("repositoryId", session.repository_id.clone()),
                     ("contextFiles", context_files.join(",")),
                     ("tokenEstimate", token_estimate.to_string()),
-                    ("toolRound", round.to_string()),
+                    ("toolRound", action_rounds.to_string()),
                     ("toolRoundLimit", max_rounds.to_string()),
                 ],
             )?;
 
-            sink.phase(PhaseKind::Model, "", round, max_rounds);
+            sink.phase(PhaseKind::Model, "", action_rounds, max_rounds);
             // `sideEffecting: false` — §4 treats a cut stream as a lost call:
             // the task resumes by making a new one, and spec 19 reports the cost
             // of the lost one rather than hiding it. So a marker left dangling
@@ -2396,7 +2422,7 @@ impl ChatOrchestrator {
                     on_progress(TurnProgress::Phase(TurnPhase::new(
                         PhaseKind::Model,
                         format!("Provider refused — retrying in {seconds}s"),
-                        round,
+                        action_rounds,
                         max_rounds,
                     )));
                 };
@@ -2501,7 +2527,8 @@ impl ChatOrchestrator {
                             task,
                             context_files,
                             messages,
-                            round,
+                            action_rounds,
+                            exploration_rounds,
                             turn_options,
                             offer,
                         );
@@ -2592,10 +2619,11 @@ impl ChatOrchestrator {
                     // so the turn takes another round segment and records that
                     // it did rather than stopping dead. With no ceiling there is
                     // no bound to continue under, so today's `ToolBudget` stop
-                    // stands. `round < ABSOLUTE_TOOL_ROUND_CAP` is the safety
-                    // net for a provider whose usage never reaches the ceiling.
+                    // stands. `action_rounds < ABSOLUTE_TOOL_ROUND_CAP` is the
+                    // safety net for a provider whose usage never reaches the
+                    // ceiling.
                     if self.config.agent_max_task_tokens.is_some()
-                        && round < ABSOLUTE_TOOL_ROUND_CAP
+                        && action_rounds < ABSOLUTE_TOOL_ROUND_CAP
                     {
                         self.audit_log.record(
                             "turn_continued",
@@ -2603,7 +2631,7 @@ impl ChatOrchestrator {
                                 ("actor", "system".to_string()),
                                 ("sessionId", session.id.clone()),
                                 ("taskId", task.id.clone()),
-                                ("round", round.to_string()),
+                                ("round", action_rounds.to_string()),
                                 ("roundLimit", max_rounds.to_string()),
                             ],
                         )?;
@@ -2616,7 +2644,9 @@ impl ChatOrchestrator {
                                 .to_string(),
                         ));
                         round_budget_extension += self.default_tool_round_limit();
-                        round += 1;
+                        // The forced-final call spent a round but dispatched
+                        // nothing, so it belongs to the action budget (§5.2).
+                        action_rounds += 1;
                         continue;
                     }
                     let response = tool_budget_exhausted_response(max_rounds);
@@ -2690,9 +2720,41 @@ impl ChatOrchestrator {
                     .with_reasoning_content(model_run.reasoning_content.clone()),
                 );
                 messages.push(ModelMessage::user(note.clone()));
-                round += 1;
+                // A round whose only calls failed to decode is not known to be
+                // reads, so it is an action round (§5.1).
+                action_rounds += 1;
                 continue;
             }
+
+            // §5.1: a round is exploration when every decoded call is a read,
+            // nothing in it failed to decode, none is a repeat (§5.3), and the
+            // allowance has room. Classification uses `action_effect` and
+            // nothing else, so a new `ToolAction` variant's effect is also its
+            // budget decision.
+            //
+            // The canonical keys are computed once here and remembered for the
+            // dispatch below, so a call is not resolved twice and a batch and a
+            // sequential round agree on what counts as the same call.
+            let read_call_keys: Vec<Option<Vec<String>>> = calls_this_round
+                .iter()
+                .map(|(_, action)| self.read_call_key(repository_root, action))
+                .collect();
+            let repeats_a_seen_call = {
+                // A duplicate inside this round is a repeat too: two identical
+                // calls in one round make it an action round.
+                let mut this_round = HashSet::new();
+                read_call_keys
+                    .iter()
+                    .flatten()
+                    .any(|key| seen_read_calls.contains(key) || !this_round.insert(key))
+            };
+            let round_is_exploration = !calls_this_round.is_empty()
+                && undecodable_calls.is_empty()
+                && calls_this_round
+                    .iter()
+                    .all(|(_, action)| matches!(action_effect(action), ActionEffect::ReadOnly))
+                && !repeats_a_seen_call
+                && exploration_rounds < max_exploration_rounds;
 
             // Every decoded call runs, in the order the model made them. A
             // terminal arm (a command needing approval, a patch ready for
@@ -2723,6 +2785,10 @@ impl ChatOrchestrator {
                 None
             };
             let mut terminal: Option<(ModelRun, String, TurnProposals, StopReason)> = None;
+            // Whether this round ran something that changes what a read
+            // reports, so the seen-call set is cleared once the round completes
+            // (spec 59 §5.3).
+            let mut wrote_this_round = false;
             // Index in `messages` of this round's one assistant message, once
             // its first call has run. Later calls join it (spec 03 §7): a
             // response is one assistant turn, whatever number of calls it made.
@@ -2778,7 +2844,8 @@ impl ChatOrchestrator {
                         task: task.clone(),
                         repository_root: repository_root.to_string_lossy().to_string(),
                         context_files: context_files.clone(),
-                        round,
+                        round: action_rounds,
+                        exploration_rounds,
                         messages: messages.clone(),
                         // The deferred call is deliberately dropped rather than
                         // stored: it was never dispatched, and the resumed turn
@@ -2831,7 +2898,7 @@ impl ChatOrchestrator {
                 sink.phase(
                     PhaseKind::Tool,
                     tool_action_label(&tool_action),
-                    round,
+                    action_rounds,
                     max_rounds,
                 );
 
@@ -2882,6 +2949,18 @@ impl ChatOrchestrator {
                     .err(),
                     _ => None,
                 };
+                // Captured before the dispatch match consumes `tool_action`.
+                // A denied call never dispatched, so it is not a seen call;
+                // a read that failed on its own (a missing file, a refused
+                // path) did, and still counts.
+                let dispatched_read_key =
+                    if permission.is_allowed() && action_is_batchable_read_only(&tool_action) {
+                        read_call_keys[index].clone()
+                    } else {
+                        None
+                    };
+                let writes_this_call = permission.is_allowed()
+                    && matches!(action_effect(&tool_action), ActionEffect::WritesRepository);
                 let (assistant_summary, tool_result_text, action_outcome) = if !permission
                     .is_allowed()
                 {
@@ -2943,7 +3022,8 @@ impl ChatOrchestrator {
                                     task: task.clone(),
                                     repository_root: repository_root.to_string_lossy().to_string(),
                                     context_files: context_files.clone(),
-                                    round,
+                                    round: action_rounds,
+                                    exploration_rounds,
                                     messages: messages.clone(),
                                     matched_tool_call: matched_tool_call.clone(),
                                     last_content: redacted.clone(),
@@ -2995,7 +3075,7 @@ impl ChatOrchestrator {
                                 on_progress(TurnProgress::Phase(TurnPhase::new(
                                     PhaseKind::Output,
                                     line,
-                                    round,
+                                    action_rounds,
                                     max_rounds,
                                 )));
                             };
@@ -3275,7 +3355,8 @@ impl ChatOrchestrator {
                                     task: task.clone(),
                                     repository_root: repository_root.to_string_lossy().to_string(),
                                     context_files: context_files.clone(),
-                                    round,
+                                    round: action_rounds,
+                                    exploration_rounds,
                                     messages: messages.clone(),
                                     matched_tool_call: matched_tool_call.clone(),
                                     last_content: redacted.clone(),
@@ -3384,7 +3465,8 @@ impl ChatOrchestrator {
                                     task: task.clone(),
                                     repository_root: repository_root.to_string_lossy().to_string(),
                                     context_files: context_files.clone(),
-                                    round,
+                                    round: action_rounds,
+                                    exploration_rounds,
                                     messages: messages.clone(),
                                     matched_tool_call: matched_tool_call.clone(),
                                     last_content: redacted.clone(),
@@ -3471,6 +3553,16 @@ impl ChatOrchestrator {
                     self.session_store
                         .finish_action(action_marker, "cancelled")?;
                     break;
+                }
+                // §5.3: a dispatched read joins the turn's seen-call set, so an
+                // identical call in a later round is a repeat. A write marks the
+                // round to clear the set once it completes: checking Git state
+                // again after changing it is verification, not a loop.
+                if let Some(key) = dispatched_read_key {
+                    seen_read_calls.insert(key);
+                }
+                if writes_this_call {
+                    wrote_this_round = true;
                 }
                 // Accrued before the marker is consumed, since the marker id is
                 // what ties this evidence back to the action in the log. Evidence
@@ -3593,7 +3685,23 @@ impl ChatOrchestrator {
                 messages.push(ModelMessage::user(note.clone()));
             }
 
-            round += 1;
+            // §5.3: a write changes the state Git and file reads report, so
+            // checking it again in a later round is the ordinary verify step.
+            // A terminal round breaks above and never reaches here; every
+            // resume starts with an empty set anyway.
+            if wrote_this_round {
+                seen_read_calls.clear();
+            }
+
+            // §5.2: the round is charged to whichever budget classification
+            // chose. `round_is_exploration` already required every decoded call
+            // to be a read, no undecodable call, no repeat, and room in the
+            // allowance, so this is the whole charging rule.
+            if round_is_exploration {
+                exploration_rounds += 1;
+            } else {
+                action_rounds += 1;
+            }
         };
 
         self.session_store
@@ -3658,7 +3766,7 @@ impl ChatOrchestrator {
                         "tool_budget_exhausted".to_string()
                     } else if stop_reason == StopReason::TokenBudget {
                         "token_budget_exhausted".to_string()
-                    } else if round > 0 {
+                    } else if action_rounds > 0 {
                         "complete_with_sandbox_command".to_string()
                     } else {
                         "complete".to_string()
@@ -3720,7 +3828,8 @@ impl ChatOrchestrator {
         task: Task,
         context_files: Vec<String>,
         messages: Vec<ModelMessage>,
-        round: u32,
+        action_rounds: u32,
+        exploration_rounds: u32,
         turn_options: ChatTurnOptions,
         offer: PendingProviderFallback,
     ) -> Result<ChatTurnResult> {
@@ -3732,7 +3841,8 @@ impl ChatOrchestrator {
             task: task.clone(),
             repository_root: repository_root.to_string_lossy().to_string(),
             context_files: context_files.clone(),
-            round,
+            round: action_rounds,
+            exploration_rounds,
             // The request as the provider refused it: approving re-issues this
             // round, so nothing is appended for a call that never answered.
             messages,
@@ -3830,17 +3940,18 @@ impl ChatOrchestrator {
         task: Task,
         context_files: Vec<String>,
         messages: Vec<ModelMessage>,
-        round: u32,
+        action_rounds: u32,
+        exploration_rounds: u32,
         max_rounds: u32,
         rounds_granted: u32,
         turn_options: ChatTurnOptions,
     ) -> Result<ChatTurnResult> {
         let proposal_id = create_id("roundbudget");
-        let response = round_budget_pause_response(round, max_rounds);
+        let response = round_budget_pause_response(action_rounds, max_rounds);
         // The turn has spent its last segment: only *Answer now* is left.
-        let at_hard_cap = round >= ABSOLUTE_TURN_ROUND_CAP;
+        let at_hard_cap = action_rounds >= ABSOLUTE_TURN_ROUND_CAP;
         let pause = RoundBudgetPause {
-            rounds_used: round,
+            rounds_used: action_rounds,
             rounds_granted,
         };
         self.pending_commands.save(&PendingChatTurn {
@@ -3849,7 +3960,8 @@ impl ChatOrchestrator {
             task: task.clone(),
             repository_root: repository_root.to_string_lossy().to_string(),
             context_files: context_files.clone(),
-            round,
+            round: action_rounds,
+            exploration_rounds,
             // The conversation so far, unchanged: nothing was dispatched, so
             // resuming replays it and the model simply asks for its tool again.
             messages,
@@ -3886,7 +3998,7 @@ impl ChatOrchestrator {
                 ("sessionId", session.id.clone()),
                 ("taskId", task.id.clone()),
                 ("proposalId", proposal_id.clone()),
-                ("roundsUsed", round.to_string()),
+                ("roundsUsed", action_rounds.to_string()),
                 ("roundsTotal", max_rounds.to_string()),
                 ("roundsGranted", rounds_granted.to_string()),
             ],
@@ -3919,7 +4031,7 @@ impl ChatOrchestrator {
             fallback_proposal: None,
             round_budget_proposal: Some(AgentRoundBudgetProposal {
                 id: proposal_id,
-                rounds_used: round,
+                rounds_used: action_rounds,
                 rounds_total: max_rounds,
                 rounds_granted,
                 rounds_more: self.default_tool_round_limit(),
@@ -4060,6 +4172,191 @@ impl ChatOrchestrator {
             classification.as_ref(),
             read_only_hint,
         )
+    }
+
+    /// The canonical identity of a read-only call for repeat detection
+    /// (spec 59 §5.3). `None` means the tool has no row in the proposal's table
+    /// and is therefore never a repeat — the err-toward-exploration direction
+    /// §5.3 requires, so a new read tool cannot silently start being policed
+    /// before its arguments are considered.
+    fn read_call_key(&self, repository_root: &Path, action: &ToolAction) -> Option<Vec<String>> {
+        match action {
+            ToolAction::ReadFile {
+                path,
+                range,
+                worktree,
+            } => {
+                let (checkout, root) =
+                    self.read_call_checkout(repository_root, worktree.as_deref());
+                let mut key = vec![
+                    "read_file".to_string(),
+                    checkout,
+                    self.read_call_path(&root, path),
+                ];
+                match range {
+                    Some(range) => key.extend([
+                        "range".to_string(),
+                        range.start.to_string(),
+                        range.end.to_string(),
+                    ]),
+                    None => key.push("no-range".to_string()),
+                }
+                Some(key)
+            }
+            ToolAction::ListDirectory {
+                dir,
+                depth,
+                worktree,
+            } => {
+                let (checkout, root) =
+                    self.read_call_checkout(repository_root, worktree.as_deref());
+                // An omitted `dir` is the checkout root, so it keys the same as
+                // an explicit `.` (§5.3).
+                let mut key = vec![
+                    "list_directory".to_string(),
+                    checkout,
+                    self.read_call_path(&root, dir.as_deref().unwrap_or(".")),
+                ];
+                match depth {
+                    Some(depth) => key.extend(["depth".to_string(), depth.to_string()]),
+                    None => key.push("no-depth".to_string()),
+                }
+                Some(key)
+            }
+            ToolAction::SearchContent {
+                pattern,
+                path_glob,
+                max_matches,
+                worktree,
+            } => {
+                let (checkout, root) =
+                    self.read_call_checkout(repository_root, worktree.as_deref());
+                let mut key = vec!["search_content".to_string(), checkout, pattern.clone()];
+                match path_glob {
+                    Some(glob) => {
+                        key.extend(["glob".to_string(), self.read_call_path(&root, glob)]);
+                    }
+                    None => key.push("no-glob".to_string()),
+                }
+                match max_matches {
+                    Some(cap) => key.extend(["max".to_string(), cap.to_string()]),
+                    None => key.push("no-max".to_string()),
+                }
+                Some(key)
+            }
+            ToolAction::SearchCodebase {
+                query,
+                semantic,
+                limit,
+            } => Some(vec![
+                "search_codebase".to_string(),
+                query.clone(),
+                semantic.to_string(),
+                limit.to_string(),
+            ]),
+            ToolAction::ReadGitStatus { worktree } => {
+                let (checkout, _) = self.read_call_checkout(repository_root, worktree.as_deref());
+                Some(vec!["read_git_status".to_string(), checkout])
+            }
+            ToolAction::ReadGitDiff {
+                staged,
+                worktree,
+                paths,
+                stat,
+                base,
+            } => {
+                let (checkout, root) =
+                    self.read_call_checkout(repository_root, worktree.as_deref());
+                // Path order does not change the diff, so the key sorts the
+                // resolved paths; every other argument changes what it returns.
+                let mut paths: Vec<String> = paths
+                    .iter()
+                    .map(|path| self.read_call_path(&root, path))
+                    .collect();
+                paths.sort();
+                let mut key = vec![
+                    "read_git_diff".to_string(),
+                    checkout,
+                    format!("staged:{staged}"),
+                    format!("stat:{stat}"),
+                ];
+                match base {
+                    Some(base) => key.extend(["base".to_string(), base.clone()]),
+                    None => key.push("no-base".to_string()),
+                }
+                key.push("paths".to_string());
+                key.extend(paths);
+                Some(key)
+            }
+            ToolAction::ListWorktrees { base } => {
+                let mut key = vec!["list_worktrees".to_string()];
+                match base {
+                    Some(base) => key.extend(["base".to_string(), base.clone()]),
+                    None => key.push("no-base".to_string()),
+                }
+                Some(key)
+            }
+            ToolAction::ReadGitLog {
+                worktree,
+                base,
+                max_count,
+            } => {
+                let (checkout, _) = self.read_call_checkout(repository_root, worktree.as_deref());
+                let mut key = vec!["read_git_log".to_string(), checkout];
+                match base {
+                    Some(base) => key.extend(["base".to_string(), base.clone()]),
+                    None => key.push("no-base".to_string()),
+                }
+                match max_count {
+                    Some(count) => key.extend(["max".to_string(), count.to_string()]),
+                    None => key.push("no-max".to_string()),
+                }
+                Some(key)
+            }
+            _ => None,
+        }
+    }
+
+    /// The checkout a read call names, as spec 60's resolver canonicalizes it,
+    /// together with the root its paths are resolved against. `None` is the
+    /// session's checkout. A refused `worktree` is kept as given, so a model
+    /// retrying the same refused argument is still caught (§5.3).
+    fn read_call_checkout(
+        &self,
+        repository_root: &Path,
+        worktree: Option<&str>,
+    ) -> (String, PathBuf) {
+        match worktree {
+            None => (
+                "checkout:session".to_string(),
+                repository_root.to_path_buf(),
+            ),
+            Some(requested) => {
+                match resolve_worktree(&self.git, &self.path_policy, repository_root, requested) {
+                    Ok(worktree) => match worktree.canonical {
+                        Some(canonical) => (format!("checkout:{}", canonical.display()), canonical),
+                        None => (
+                            format!("checkout-as-given:{requested}"),
+                            repository_root.to_path_buf(),
+                        ),
+                    },
+                    Err(_) => (
+                        format!("checkout-as-given:{requested}"),
+                        repository_root.to_path_buf(),
+                    ),
+                }
+            }
+        }
+    }
+
+    /// A read path as `PathPolicy` resolves it relative to its checkout. A path
+    /// the policy refuses is kept as given: a retry of the same refused path is
+    /// still the same call.
+    fn read_call_path(&self, checkout: &Path, requested: &str) -> String {
+        self.path_policy
+            .resolve_existing(checkout, requested, false)
+            .map(|resolved| resolved.relative_path)
+            .unwrap_or_else(|_| requested.to_string())
     }
 
     /// Dispatch one of the read-only tools. Shared by the sequential path (a
@@ -4399,7 +4696,16 @@ struct PendingChatTurn {
     task: Task,
     repository_root: String,
     context_files: Vec<String>,
+    /// The action rounds the turn has used. Every pause and resume carries
+    /// this, so the action budget continues where it stopped (spec 61 §5.2).
     round: u32,
+    /// The exploration (read-only) rounds the turn has used. A pause resumes
+    /// the same turn, so this is carried with it rather than restarted: an
+    /// approval or *Continue* must not refresh the allowance (spec 59 §5.2).
+    /// `#[serde(default)]` keeps pending turns written before this field
+    /// existed loadable, with no exploration rounds spent.
+    #[serde(default)]
+    exploration_rounds: u32,
     messages: Vec<ModelMessage>,
     matched_tool_call: Option<ToolCall>,
     last_content: String,
@@ -4623,6 +4929,13 @@ impl PendingCommandStore {
 /// requires explicit UI work so an agent cannot silently spend a whole session
 /// on repeated tool calls.
 const ABSOLUTE_TOOL_ROUND_CAP: u32 = 16;
+
+/// Absolute upper bound for the per-turn exploration allowance (spec 59 §5.4).
+/// A turn may read all it needs, but not without a bound: with no token ceiling
+/// set this allowance is the only thing beyond the action budget that a model
+/// can spend, so raising it past the constant requires explicit work, not
+/// configuration (requirement 5).
+const ABSOLUTE_EXPLORATION_ROUND_CAP: u32 = 32;
 
 /// Absolute bound on the rounds of one turn across all round-budget
 /// continuations (spec 61 §5.3): the initial eight-round segment plus seven
@@ -4940,9 +5253,12 @@ pub(crate) enum ToolAction {
 /// The one place that question is answered. Spec 17's recovery reads the
 /// [`ActionEffect::WritesRepository`] answer through [`tool_action_marker`]'s
 /// boolean; requirement 8's batching reads [`ActionEffect::ReadOnly`] through
-/// [`action_is_batchable_read_only`]. Both come off one exhaustive match, so a
-/// new tool cannot become batchable or side-effecting by omission, and there is
-/// no second list to keep in sync with spec 17.
+/// [`action_is_batchable_read_only`]; and spec 59's round classification (§5.1)
+/// reads it to decide whether a round is charged to the exploration allowance
+/// or the action budget. A tool's effect is therefore also its budget decision,
+/// so adding a variant forces that decision here. All come off one exhaustive
+/// match, so a new tool cannot become batchable, side-effecting or exploration
+/// by omission, and there is no second list to keep in sync with spec 17.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActionEffect {
     /// Reads repository or session state and returns it. No write, no turn

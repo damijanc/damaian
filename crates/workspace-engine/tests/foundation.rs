@@ -3394,6 +3394,12 @@ fn tool_round_exhaustion_pauses_when_model_still_requests_tools() {
     write_fixture(&repo, "README.md", "# Tool budget\n");
     let mut config = test_config(&repo);
     config.agent_max_tool_rounds = 1;
+    // This scenario reaches the action cap with a `read_git_status` round,
+    // which spec 59 classifies as exploration. Pin the allowance to zero so it
+    // keeps exercising the action budget it was written against, exactly as
+    // before spec 59 (requirement 6 / the "same rounds, stop reason and audit
+    // sequence" acceptance criterion).
+    config.agent_max_exploration_rounds = 0;
     config.model_providers.push(native_tool_provider());
     let engine = WorkspaceEngine::new(config);
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
