@@ -678,6 +678,75 @@ fn the_worktree_survey_scenario_surveys_worktrees_without_approval() {
     );
 }
 
+/// Spec 61 §5.8's first case, end to end: the turn pauses at eight rounds, the
+/// harness answers *Continue*, and the resumed turn finishes the same task with
+/// the earlier request and tool results still in front of it.
+///
+/// The `[assert]` block carries the claims the report needs. This test reads the
+/// record fields directly as well, so a scenario that silently stopped
+/// asserting one of them would still fail here.
+#[test]
+fn the_continue_keeps_state_scenario_resumes_the_same_task() {
+    let (run, results) = run_and_evaluate("continue_keeps_state");
+    assert_all_passed("continue_keeps_state", &results);
+
+    assert_eq!(
+        run.record.continuations, 1,
+        "one *Continue* is recorded, from the `turn_budget_extended` audit"
+    );
+    assert_eq!(
+        run.record.task_count, 1,
+        "the continued turn is the same task; a new turn would read 2"
+    );
+    assert_eq!(run.record.final_task_status, "complete");
+    assert_eq!(
+        run.record.model_calls, 12,
+        "eight rounds before the pause, three resumed rounds, and the answer"
+    );
+
+    // The ninth request — the first after the choice — replayed the first
+    // turn's messages. `Command: ls src` comes only from a command tool result.
+    let resumed = run
+        .continuation_request
+        .as_deref()
+        .expect("a continuation must record the request that followed it");
+    assert!(
+        resumed.contains("List the source files"),
+        "the resumed request lost the user's original request"
+    );
+    assert!(
+        resumed.contains("Command: ls src") && resumed.contains("upload.rs"),
+        "the resumed request lost the first turn's tool results"
+    );
+}
+
+/// Spec 61 §5.8's second case: *Answer now* makes exactly one forced final call
+/// with tools dropped, and the turn ends at the terminal outcome that call
+/// produces.
+#[test]
+fn the_answer_now_scenario_makes_one_forced_final_call() {
+    let (run, results) = run_and_evaluate("answer_now_ends_the_turn");
+    assert_all_passed("answer_now_ends_the_turn", &results);
+
+    assert_eq!(
+        run.record.continuations, 0,
+        "Answer now grants no rounds, so no continuation is recorded"
+    );
+    assert_eq!(run.record.task_count, 1);
+    assert_eq!(
+        run.record.final_task_status, "tool_budget_exhausted",
+        "the forced call still asked for a tool, which ends the turn"
+    );
+    assert_eq!(
+        run.record.model_calls, 9,
+        "eight rounds plus exactly one forced final call"
+    );
+    assert_eq!(
+        run.record.tool_rounds, 8,
+        "the forced call dispatched no tool"
+    );
+}
+
 /// Requirement 9, asserted the way §5.5 says: by grepping every artifact the
 /// run produced, the harness's own record and the audit log included.
 ///
@@ -931,7 +1000,8 @@ fn a_blocked_scenario_is_still_skipped_and_says_why() {
 }
 
 /// Guards the count in spec 18 §6, now that spec 17 has landed: every scenario
-/// runs and none is blocked. Seventeen since spec 60 added `worktree_survey`.
+/// runs and none is blocked. Nineteen since spec 61 added
+/// `continue_keeps_state` and `answer_now_ends_the_turn`.
 #[test]
 fn every_scenario_runs_and_none_is_blocked() {
     let all = scenario::load_all().expect("scenarios should load");
@@ -946,7 +1016,7 @@ fn every_scenario_runs_and_none_is_blocked() {
         Vec::<&str>::new(),
         "no scenario is deferred any more"
     );
-    assert_eq!(all.len(), 17, "seventeen scenarios should run");
+    assert_eq!(all.len(), 19, "nineteen scenarios should run");
 }
 
 #[test]
@@ -1233,8 +1303,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
     assert_eq!(
         built.records.len(),
-        17,
-        "all seventeen scenario files should be accounted for"
+        19,
+        "all nineteen scenario files should be accounted for"
     );
     assert_eq!(
         built

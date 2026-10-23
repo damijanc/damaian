@@ -244,6 +244,70 @@ pub fn evaluate(
             );
         }
 
+        // Spec 61 §5.4: continuations are counted per run. An exact count, not
+        // a bound, because *Answer now* is expected to record zero.
+        if let Some(expected) = asserts.continuations {
+            let actual = run.record.continuations;
+            push(
+                "continuations",
+                actual == expected,
+                expected.to_string(),
+                actual.to_string(),
+            );
+        }
+
+        // Spec 61 §5.8: a continued turn is the same task, so the store holds
+        // one. Counted across every session, not just the finished one, so a
+        // new turn started beside it is visible.
+        if let Some(expected) = asserts.task_count {
+            let actual = run.record.task_count;
+            push(
+                "task_count",
+                actual == expected,
+                expected.to_string(),
+                actual.to_string(),
+            );
+        }
+
+        if let Some(expected) = &asserts.final_task_status {
+            let actual = &run.record.final_task_status;
+            push(
+                "final_task_status",
+                actual == expected,
+                expected.clone(),
+                actual.clone(),
+            );
+        }
+
+        // §5.8's replay claim, read from the request the mock adapter recorded
+        // rather than from the session log the request was rebuilt from.
+        if let Some(wanted) = &asserts.continuation_request_contains {
+            match &run.continuation_request {
+                Some(request) => {
+                    let missing: Vec<&String> = wanted
+                        .iter()
+                        .filter(|needle| !request.contains(needle.as_str()))
+                        .collect();
+                    push(
+                        "continuation_request_contains",
+                        missing.is_empty(),
+                        format!("{wanted:?}"),
+                        if missing.is_empty() {
+                            "all present".to_string()
+                        } else {
+                            format!("missing from the resumed request: {missing:?}")
+                        },
+                    );
+                }
+                None => push(
+                    "continuation_request_contains",
+                    false,
+                    format!("{wanted:?}"),
+                    "no continuation request was recorded".to_string(),
+                ),
+            }
+        }
+
         if let Some(limit) = asserts.tool_calls_at_least {
             let count = run.record.tool_calls.len() as u64;
             push(

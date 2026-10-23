@@ -169,6 +169,20 @@ pub struct RunRecord {
     pub not_applicable: Option<String>,
     pub tool_rounds: u64,
     pub model_calls: u64,
+    /// How many round-budget continuations the run granted, read from the
+    /// `turn_budget_extended` audit records (spec 61 §5.4). Counted here rather
+    /// than in `metrics.rs` because §5.4 asks for it per run, and because the
+    /// record is what a reader diffs against a baseline.
+    pub continuations: u64,
+    /// Tasks in the run's store. A continued turn is the same task, so this
+    /// reads 1; a path that started a new turn (the old *Continue debugging*
+    /// behaviour) reads 2.
+    pub task_count: u64,
+    /// The task's terminal state (`complete`, `tool_budget_exhausted`, …), read
+    /// from the task record rather than inferred from `finalStatus`. The two
+    /// differ for a wasted round budget: the run *completed* by pausing, while
+    /// the task still waits for a human.
+    pub final_task_status: String,
     /// Commands the engine executed despite a human declining them, counted by
     /// matching `proposalId` across `stored_command_rejected` and
     /// `stored_command_executed`. Computed by the runner rather than by
@@ -238,6 +252,9 @@ impl RunRecord {
             not_applicable: None,
             tool_rounds: 0,
             model_calls: 0,
+            continuations: 0,
+            task_count: 0,
+            final_task_status: String::new(),
             approval_policy_violations: 0,
             recovery: None,
             plan: None,

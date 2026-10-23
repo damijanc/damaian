@@ -3,16 +3,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::{
     AgentCommandProposal, AgentPatchProposal, CancelToken, ClientError, Config, CurlModelTransport,
-    MockModelAdapter, ModelAdapter, ModelProviderConfig, OpenAICompatibleAdapter, ProcessRegistry,
-    Result, SecretScanner, SessionStore, Task, TaskStatus, ToolCall, TurnProgress, TurnSink,
-    UsageSource, WorkspaceEngine, classify_session, resume,
+    MockModelAdapter, ModelAdapter, ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter,
+    ProcessRegistry, Result, RoundBudgetDecision, SecretScanner, SessionStore, Task, TaskStatus,
+    ToolCall, TurnProgress, TurnSink, UsageSource, WorkspaceEngine, classify_session, resume,
 };
 
 use crate::fixture::{self, Materialized};
 use crate::record::{
     CacheUsage, RecordedApproval, RecordedCheck, RecordedPlan, RecordedRecovery, RunRecord, Tokens,
 };
-use crate::scenario::{CrashMidAction, Scenario, Tier};
+use crate::scenario::{
+    CrashMidAction, RoundBudgetDecision as ScenarioRoundBudgetDecision, Scenario, Tier,
+};
 use crate::trace::{self, Trace};
 
 #[derive(Debug)]
@@ -28,6 +30,12 @@ pub struct Run {
     /// resulting apply was refused. `None` means either no apply was attempted
     /// or it succeeded.
     pub apply_error: Option<String>,
+    /// The message contents of the first model request made after a
+    /// `turn_budget_extended`, joined for substring assertions. Only the
+    /// deterministic tier can supply it: the mock adapter records its requests,
+    /// a live provider does not (and the scenario's script does not describe a
+    /// live request). `None` means the run did not continue a turn.
+    pub continuation_request: Option<String>,
     pub trace: Trace,
 }
 
@@ -83,7 +91,7 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(responses, tool_calls)
         .with_truncated(truncated);
 
-    drive(
+    let mut run = drive(
         scenario,
         &materialized,
         &engine,
@@ -92,7 +100,35 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
         "deterministic",
         "mock",
         "mock",
-    )
+    )?;
+    // The adapter is the only place the tier can see what a request actually
+    // contained, and the resume happens inside `drive`. Read it here, after the
+    // run, and locate the first post-continuation request from the trace: the
+    // `turn_budget_extended` record is written before the resumed loop makes
+    // its next call, so the calls before it are the pre-pause ones.
+    run.continuation_request = continuation_request(&run.trace, &adapter.requests);
+    Ok(run)
+}
+
+/// The request that followed the first `turn_budget_extended`, flattened to the
+/// message contents it sent. `None` when the run granted no continuation.
+fn continuation_request(trace: &Trace, requests: &[ModelRequest]) -> Option<String> {
+    let extended_at = trace
+        .events
+        .iter()
+        .position(|event| event.event_type == "turn_budget_extended")?;
+    let index = trace.events[..extended_at]
+        .iter()
+        .filter(|event| event.event_type == "model_request_prepared")
+        .count();
+    requests.get(index).map(|request| {
+        request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
 }
 
 /// The live tier: the same scenario files against a real provider, **ignoring
@@ -227,6 +263,7 @@ fn skip_if_blocked(scenario: &Scenario) -> Option<Run> {
         command_proposal: None,
         patch_proposal: None,
         apply_error: None,
+        continuation_request: None,
         trace: Trace::default(),
     })
 }
@@ -304,6 +341,38 @@ fn drive(
         ));
     }
 
+    // Spec 61 §5.8: a scenario that answers a round-budget pause resumes it with
+    // the decision it names, so the continued turn (or the forced final call)
+    // is exercised end to end. The pause is on the original outcome, which is
+    // why the proposal is read before the resume can supersede it.
+    if let Some(decision) = scenario.round_budget_decision
+        && let Some(proposal) = outcome
+            .as_ref()
+            .ok()
+            .and_then(|result| result.round_budget_proposal.as_ref())
+    {
+        let cancel = CancelToken::new();
+        let mut on_resume_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_resume_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        let decision = match decision {
+            ScenarioRoundBudgetDecision::Continue => RoundBudgetDecision::Continue,
+            ScenarioRoundBudgetDecision::AnswerNow => RoundBudgetDecision::AnswerNow,
+        };
+        resumed = Some(engine.chat_orchestrator.resume_round_budget(
+            &proposal.id,
+            decision,
+            "eval-harness",
+            adapter,
+            &mut sink,
+        ));
+    }
+
     // The resumed turn is the one that finished, so it supersedes the original.
     let outcome = resumed.unwrap_or(outcome);
     if let Ok(result) = &outcome
@@ -356,11 +425,21 @@ fn drive(
     };
 
     let trace = Trace::read(&materialized.data_dir)?;
+    // Read before the status match consumes `outcome`. `finalStatus` says what
+    // the run did; this says what the task ended as, and the two differ on a
+    // pause (`completed` vs `waiting_for_approval`).
+    let final_task_status = outcome
+        .as_ref()
+        .ok()
+        .map(|result| result.task.status.as_str().to_string())
+        .unwrap_or_default();
     let mut run_record =
         RunRecord::new(&scenario.name, &materialized.version, tier, provider, model);
     run_record.recovery = recovery;
     run_record.started_at_ms = started_at_ms;
     run_record.duration_ms = duration_ms;
+    run_record.continuations = trace.count("turn_budget_extended");
+    run_record.task_count = count_tasks(engine)?;
     // Read from the engine both tiers actually ran with, so the record cannot
     // claim a capability set the run did not have.
     run_record.native_tools = engine.config.supports_native_tools();
@@ -530,6 +609,7 @@ fn drive(
         ),
     };
     run_record.final_status = final_status;
+    run_record.final_task_status = final_task_status;
     // Spec 19's per-task accounting is the one definition of what a task
     // spent, and `ChatTurnResult.usage` is that figure read back from the
     // session log. The harness reports it rather than counting model calls
@@ -566,6 +646,9 @@ fn drive(
         command_proposal,
         patch_proposal,
         apply_error,
+        // Filled by `run` after the deterministic adapter's requests are
+        // available; the live tier has no request record to read.
+        continuation_request: None,
         trace,
     })
 }
@@ -655,6 +738,20 @@ fn interrupt_and_recover(
         auto_resume_permitted: task.auto_resume_permitted,
         resume_refused,
     })
+}
+
+/// Every task the run's store holds, across every session.
+///
+/// A continued turn reuses its session and task, so this reads 1. A path that
+/// started a new turn — the old *Continue debugging* behaviour, or a resume
+/// entry point that created a task — reads more, which is the fact spec 61's
+/// `no second task` assertion needs.
+fn count_tasks(engine: &WorkspaceEngine) -> Result<u64> {
+    let mut count = 0;
+    for session in engine.session_store.list_sessions(None)? {
+        count += engine.session_store.read_task_statuses(&session.id)?.len() as u64;
+    }
+    Ok(count)
 }
 
 /// Turns scenario turns into the three parallel vectors `MockModelAdapter` wants.
