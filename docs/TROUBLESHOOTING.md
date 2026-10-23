@@ -725,7 +725,8 @@ Follow task state, which is how you spot a turn that died mid-flight — a task
 whose last status is not `complete`, `failed`, `cancelled`,
 `tool_budget_exhausted` or `token_budget_exhausted` never finished. The
 exception is `waiting_for_approval`: a task paused on a proposal (a command, a
-plan review, a provider fallback, or a `roundbudget_…` round-budget pause, see
+plan review, a provider fallback, or a `round_budget` pause whose file is
+`chat/pending/roundbudget_…`, see
 [A turn stopped early](#a-turn-stopped-early-which-budget-ran-out)) is waiting
 for you, not dead:
 
@@ -992,11 +993,12 @@ ceiling is set ([spec 61](specs/61_continue_the_stopped_turn/proposal.md)):
 - **No `agent_max_task_tokens` (the default).** When the turn reaches its round
   budget and the model still wants a tool, the turn **pauses** instead of
   stopping. The task goes to `waiting_for_approval` on a
-  `chat/pending/roundbudget_<id>.json` proposal, and the conversation shows
-  `Used N of M tool rounds.` with **Answer now** and **Continue — N more**.
-  Continue grants the same turn another `agent_max_tool_rounds` rounds; Answer
-  now makes one final call with tools dropped. A turn never runs past 64 rounds
-  in all: at that cap only Answer now is offered.
+  `chat/pending/roundbudget_<id>.json` proposal with
+  `PendingApprovalRef.kind = "round_budget"`, and the conversation says how
+  many of the turn's rounds it used. **Continue — N more** grants the same turn
+  another `agent_max_tool_rounds` and replays its saved messages, tool results
+  and plan; **Answer now** makes one final call with tools dropped. A turn
+  never runs past 64 rounds in all: at that cap only Answer now is offered.
 - **With `agent_max_task_tokens` set.** The turn continues on its own,
   another `agent_max_tool_rounds` at a time, and records `turn_continued` each
   time, until the token ceiling stops it or it reaches 16 rounds. At 16 rounds
@@ -1007,7 +1009,7 @@ Two terminal statuses look alike in the UI and mean different things:
 - `tool_budget_exhausted` — written only after **Answer now**, when the final
   call still asked for a tool instead of answering. The UI shows **Tool budget
   exhausted** with **Ask again**, which starts a new turn from the stopped
-  task's own request.
+  task's request.
 - `token_budget_exhausted` — the turn reached `agent_max_task_tokens`, which is
   **per turn**, not per session. Nothing is wrong; it cost more than the cap
   allows.
@@ -1033,11 +1035,14 @@ jq -r 'select(.eventType=="task_status_updated") | .payload.task.status // .payl
 ```
 
 A stop is recoverable without losing work. After a token stop, raise the cap
-and ask again; after a tool-budget stop, press **Ask again**. The next turn
-reads the stopped task's plan, carries it forward as `plan_resumed`, and keeps
-the evidence the earlier steps had already gathered. The same carry happens
-when crash recovery's `Continue` supersedes an interrupted task. Confirm the
-carry happened:
+and ask again; after a tool-budget stop, press **Ask again**. That button sends
+only the stopped task's id, and the engine builds the new turn from the task's
+own `user_prompt` as `Continue this earlier request: <that request>` — the
+client never supplies the text, and a fixed "continue debugging" prompt is not
+sent. The next turn reads the stopped task's plan, carries it forward as
+`plan_resumed`, and keeps the evidence the earlier steps had already gathered.
+The same carry happens when crash recovery's `Continue` supersedes an
+interrupted task. Confirm the carry happened:
 
 ```bash
 jq -r 'select(.eventType=="plan_resumed") | "\(.payload.taskId) resumed from \(.payload.resumedFrom)"' "$SESSION_FILE"

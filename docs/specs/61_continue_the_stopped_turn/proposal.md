@@ -1,7 +1,10 @@
 # Feature Spec: Continue the Stopped Turn
 
-Status: In progress. Specified on 2026-10-17 from the session behind
-[#59](../59_exploration_round_allowance/proposal.md) and
+Status: Done 2026-10-23 (started 2026-10-18). The pause, *Continue* and *Answer
+now*, the hard cap, crash recovery and worker answering, the UI row, the *Ask
+again* path and the `continue_keeps_state` scenario are built; plan and
+progress in [`tasks.md`](tasks.md). Specified on 2026-10-17 from the session
+behind [#59](../59_exploration_round_allowance/proposal.md) and
 [#60](../60_worktree_aware_read_tools/proposal.md): three presses of *Continue
 debugging* produced three new turns that had lost the user's request, drifted
 into debugging a worktree, and still never answered.
@@ -277,4 +280,23 @@ the two buttons do), `docs/TROUBLESHOOTING.md` (a task waiting on
 
 ## 7. Implementation Notes
 
-None yet.
+The per-task record is in [`tasks.md`](tasks.md), including each deliberate
+deviation and the falsification that checked the load-bearing tests.
+
+- The pause runs before the forced final call, so a turn with no token ceiling
+  never spends that call until the user chooses *Answer now*. §5.1's ordering
+  is what makes "no model call between the limit and the choice" hold.
+- `RoundBudgetPause`, `AgentRoundBudgetProposal`, `RoundBudgetDecision` and
+  `resume_round_budget` are public because `ChatTurnResult`, `recovery.rs` and
+  the worker read them. `ChatTurnOptions` carries the `round_budget_extension`
+  seed and the `round_budget_answer_now` bypass; both are `#[serde(default)]`,
+  so existing callers are unchanged.
+- `ABSOLUTE_TURN_ROUND_CAP` is 64 and measured in total rounds, not in
+  `rounds_granted` (which tops out at 56 after seven continuations of eight).
+- The offer is `createRoundBudgetOffer` in `app.js`. A reattached pause reads
+  only `rounds_used` and `rounds_granted` from `PausedTurns`, so its hard-cap
+  check repeats the 64-round constant and it omits the figures it does not
+  know.
+- Task 7 wrote §5.9's documentation in `docs/USER_GUIDE.md` and
+  `docs/TROUBLESHOOTING.md`; the workspace clippy and test suite are left to
+  CI.

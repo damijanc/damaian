@@ -87,8 +87,8 @@ reports the disagreement.
 
 - **In progress:** #25 symbols (Tasks 1–7 of 11), #32 hooks (1–3 of 10), #49
   prompt cache (accounting slice done; the reuse slice is blocked on #55 or
-  #26), #50 clarification (1–3 of 8), #59 exploration allowance (3 of 6), #61
-  continue the stopped turn (1–6 of 7), #62 approval reasons (1–2 of 7).
+  #26), #50 clarification (1–3 of 8), #59 exploration allowance (3 of 6), #62
+  approval reasons (1–2 of 7).
 - **Ready, not started:** #23 verification loop; #65 exploration memory (its
   requirement 8 waits for #59).
 - **Blocked:** #26 on #25; #27, #33, #51, #54 and #55 on #26; #28 on #26 and
@@ -346,8 +346,8 @@ waited for #60's `read_git_diff` and shipped on 2026-10-18. #64's requirements
 1–4 closed auto-run holes (`git diff --output=<file>` wrote, `$HOME/…` escaped
 the repository, `git show HEAD:.env` read a restricted file) on 2026-10-17, the
 day they were found, and its read-only pipelines (requirements 6–7) followed on
-2026-10-18. #59, #61 and #62 are in progress; #60, #63 and #64 are done
-(2026-10-23). #61 and #62 edit `chat.rs` and do not pair with #59, and #62
+2026-10-18. #59 and #62 are in progress; #60, #61, #63 and #64 are done
+(2026-10-23). #59 and #62 both edit `chat.rs` and do not pair, and #62
 rewrites the model-facing command text that #63 updated in its Task 4.
 [#65](65_exploration_memory_within_a_turn.md), added on 2026-10-18 from a
 review of #59–#64 and revised on 2026-10-19, is ready: #20, #34 and #47 are
@@ -355,13 +355,13 @@ built. Only its requirement 8 (how notes count against the round budget) waits
 for #59. **It is the priority after #59.** Investigating a large project is
 the prerequisite for everything else Damaian does — an agent that cannot learn
 a codebase cannot fix, design or implement in it — and #65 is what makes that
-investigation stick: #59 gives a turn the rounds, #61 (Tasks 1–5 on main) keeps
-a stopped turn alive, and #65 keeps what those rounds found in view once the
-request window drops them, and carries it into the next turn. Nothing formally
-depends on it, but new feature work should not jump ahead of it. It edits
-`bounded_messages`, `build_model_prompt` and the turn loop in `chat.rs`, so it
-does not pair with #59, #60, #61 or #62; build it straight after #59, and let
-#59's Task 3 add the per-turn call list both specs use.
+investigation stick: #59 gives a turn the rounds, #61 keeps a stopped turn
+alive, and #65 keeps what those rounds found in view once the request window
+drops them, and carries it into the next turn. Nothing formally depends on it,
+but new feature work should not jump ahead of it. It edits `bounded_messages`,
+`build_model_prompt` and the turn loop in `chat.rs`, so it does not pair with
+#59 or #62; build it straight after #59, and let #59's Task 3 add the per-turn
+call list both specs use.
 
 ### Parallel work
 
@@ -465,7 +465,7 @@ is ready.
 | 58 | [58_header_repo_bar_and_menus/](58_header_repo_bar_and_menus/proposal.md) | **Done (2026-10-14).** Every acceptance criterion walked in the running app; the full seven-check gate passed in CI. Usability rework of the desktop shell: every "more actions" control becomes one vertical ⋮ menu, the header keeps only title, terminal and ⋮, and a repo bar above the prompt shows folder, branch, `+N −M` and contextual actions such as *Fix N errors*. `githubUrl` is reconstructed from a parsed `origin`, never opened raw, because the remote is repository-controlled. |
 | 59 | [59_exploration_round_allowance/](59_exploration_round_allowance/proposal.md) | **In progress** (Tasks 1–3 of 6 done 2026-10-18 to 2026-10-23: the config key, round classification and repeat detection; see `tasks.md`). Specified 2026-10-17 from a reporting-only session that hit *Tool budget exhausted* after eight rounds, five of them read-only. Exception to the graduation rule, like #47, whose read tools made the agent read in more, smaller rounds. A round in which every call is `ActionEffect::ReadOnly` is charged to a separate, clamped allowance (`agent_max_exploration_rounds`, default 24, ceiling 32) instead of `agent_max_tool_rounds`; a round with any command, edit or question, or a read that repeats an earlier one, is charged as today. Reads are not exempted outright because the round cap is the only runaway bound when no token ceiling is set (#21 §5.4). The key is restrict-only, `0` restores today's behaviour, and the stop message and *Continue* button stop assuming the turn was debugging. |
 | 60 | [60_worktree_aware_read_tools/](60_worktree_aware_read_tools/proposal.md) | **Done 2026-10-23** (started 2026-10-17; the live re-run of the motivating prompt made no approval stop, see its §7). Adds `list_worktrees`, `read_git_log` and a `worktree` argument on the five existing read tools, because 35 of 40 approval prompts in one session were read-only shell commands in `.claude/worktrees/`. Only worktrees git itself has registered for this repository are reachable, so a symlink a clone ships there is refused. No command-policy change. |
-| 61 | [61_continue_the_stopped_turn/proposal.md](61_continue_the_stopped_turn/proposal.md) | **In progress; split into a folder and planned 2026-10-18, Tasks 1–5 done 2026-10-18, Task 6 done 2026-10-23.** Specified 2026-10-17: *Continue debugging* starts a new turn that sees only the last eight messages, so a reporting request was lost after one stop and three continuations drifted into debugging a worktree. At the round limit the turn now pauses as a `round_budget` approval, persisted like any `PendingChatTurn`, and *Continue* resumes the same task with every message and plan step, or *Answer now* makes the forced final call. Pausing before the forced call saves the call that was being thrown away. Hard-bounded by `ABSOLUTE_TURN_ROUND_CAP`; completes #47 requirement 6 for users without a token ceiling. |
+| 61 | [61_continue_the_stopped_turn/proposal.md](61_continue_the_stopped_turn/proposal.md) | **Done 2026-10-23** (started 2026-10-18; Tasks 1–7, the last on 2026-10-23; §6's criteria walked against the tree on 2026-10-23). Specified 2026-10-17: *Continue debugging* starts a new turn that sees only the last eight messages, so a reporting request was lost after one stop and three continuations drifted into debugging a worktree. At the round limit the turn now pauses as a `round_budget` approval, persisted like any `PendingChatTurn`, and *Continue* resumes the same task with every message and plan step, or *Answer now* makes the forced final call. Pausing before the forced call saves the call that was being thrown away. Hard-bounded by `ABSOLUTE_TURN_ROUND_CAP`; completes #47 requirement 6 for users without a token ceiling. The `continue_keeps_state` scenario proves the resumed request still carries the original prompt and the earlier tool results. |
 | 62 | [62_approval_prompts_name_the_reason/](62_approval_prompts_name_the_reason/proposal.md) | **In progress** (started 2026-10-18). Tasks 1–2 of 7 done: `command_policy.rs` gains the closed `ApprovalCause` enum and `CommandClassification.causes`, and `reasons` is rendered from it, so every classifier branch and escalation names its cause as a value — including the `Network`/`HighRisk` split and `Blocklisted`/`Destructive`; the `Setting`/`ProfileBlocked` causes name the `require_approval_for_*` key (with its user/repository/profile source, threaded from the `RepositoryConfigReport`) and the `command_access` block respectively. See `tasks.md` for the remaining tasks. Specified 2026-10-17: every approval said "because it cannot run in sandbox mode", and there is no sandbox. The classifier returns structured `ApprovalCause`s, the prompt's first line names the deciding one (which shell control, which keyword, which setting and who set it), the model's own reason is shown beside it, and "sandbox" leaves every user- and model-facing string. Changes no approval decision. |
 | 63 | [63_exploratory_command_failures/](63_exploratory_command_failures/proposal.md) | **Done 2026-10-23.** Tasks 1–5 built 2026-10-17/18; Task 6 walked the §6 criteria and documented the purpose split. Commands get a purpose (check, exploration, other) that never influences approval; a failed exploration command records no finding and blocks no plan step, while checks and unknown commands behave as today. Prompted by a zsh glob error and an `ls` of a missing directory becoming open **error** findings; the model is now told its shell and zsh's glob rule. |
 | 64 | [64_read_only_command_boundary.md](64_read_only_command_boundary.md) | **Done 2026-10-23.** Found the read-only list is not read-only (`git diff --output=<file>` writes) and replaces the prefix match with a tokenizer, per-program option lists and `PathPolicy` checks on every path argument. It then admits `cd <dir> &&` and `&&`/`|` pipelines of admitted commands into stdin-only filters, and the §5.7 documentation (user guide, security, troubleshooting) was written to close it. |
