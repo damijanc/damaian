@@ -33,6 +33,12 @@
 //! its place, the hedge on a heuristic and none on a language-server symbol,
 //! its ceiling and the line that says how many were shown, and that a
 //! failure leaves it out of a turn that goes on.
+//!
+//! Task 9 pins references and implementations fetched on demand from the same
+//! fake server: `LanguageServer` relations with 1-based lines, an answer
+//! cached until a referencing file changes and then asked for again, and an
+//! empty `available: false` result when no server is configured or it times
+//! out, with no heuristic fallback.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -51,7 +57,8 @@ use workspace_engine::{
     Provenance, RebuildReason, RegisteredProcess, RelationKind, RelationTarget, RepositoryIndex,
     RepositoryKeyClass, RepositoryMap, RepositoryTrustStore, SYMBOL_INDEX_SCHEMA_VERSION,
     SecretScanner, SweepScope, Symbol, SymbolIndex, SymbolIndexStore, SymbolKind, SymbolLoad,
-    WorkspaceEngine, extract_declarations, merge, read_message, run_definition_pass, write_message,
+    SymbolRef, WorkspaceEngine, extract_declarations, merge, read_message, run_definition_pass,
+    write_message,
 };
 use workspace_engine::{Evidence, FileDiagnostics, PlanStep, StepStatus, TaskPhase, TaskPlan};
 
@@ -1315,6 +1322,7 @@ const FAKE_LOG: &str = "DAMAIAN_FAKE_LSP_LOG";
 const FAKE_REGISTRY: &str = "DAMAIAN_FAKE_LSP_REGISTRY";
 const FAKE_SYMBOLS: &str = "DAMAIAN_FAKE_LSP_SYMBOLS";
 const FAKE_DIAGNOSTICS: &str = "DAMAIAN_FAKE_LSP_DIAGNOSTICS";
+const FAKE_LOCATIONS: &str = "DAMAIAN_FAKE_LSP_LOCATIONS";
 
 /// A temp repository with a data directory, a fake server log, and the
 /// config that names the fake server for Rust.
@@ -1339,12 +1347,13 @@ impl ServerFixture {
         let binary = std::env::current_exe().expect("test binary path");
         format!(
             "/bin/sh -c \"export {FAKE_MODE}={mode} {FAKE_LOG}='{}' {FAKE_REGISTRY}='{}' \
-             {FAKE_SYMBOLS}='{}' {FAKE_DIAGNOSTICS}='{}'; \
+             {FAKE_SYMBOLS}='{}' {FAKE_DIAGNOSTICS}='{}' {FAKE_LOCATIONS}='{}'; \
              exec \\\"\\$0\\\" --ignored --exact fake_language_server_helper 3>&1 1>/dev/null\" '{}'",
             self.log.display(),
             self.repo.data_dir.join("processes").display(),
             self.symbols_file().display(),
             self.diagnostics_file().display(),
+            self.locations_file().display(),
             binary.display(),
         )
     }
@@ -1370,6 +1379,30 @@ impl ServerFixture {
     /// Read on every `didOpen`, so a test can change it between opens.
     fn publish_on_open(&self, notifications: serde_json::Value) {
         fs::write(self.diagnostics_file(), notifications.to_string()).unwrap();
+    }
+
+    /// Where the fake server reads its `references` and `implementation`
+    /// answers from: `{ "references": [{ "path", "line" }], "implementation":
+    /// [...] }`, with 0-based lines. A missing key answers `[]`.
+    fn locations_file(&self) -> PathBuf {
+        self.repo.data_dir.join("fake-locations.json")
+    }
+
+    fn answer_locations(&self, locations: serde_json::Value) {
+        fs::write(self.locations_file(), locations.to_string()).unwrap();
+    }
+
+    /// The `textDocument/references` requests the fake servers saw.
+    fn reference_requests(&self) -> Vec<String> {
+        self.requested("request textDocument/references ")
+            .into_iter()
+            .map(|line| {
+                line.split(" includeDeclaration=")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
     }
 
     /// An engine whose config names the fake server in `mode` for Rust.
@@ -2729,6 +2762,11 @@ fn fake_language_server_helper() {
         .ok()
         .and_then(|path| fs::read(path).ok())
         .map(|bytes| serde_json::from_slice(&bytes).unwrap());
+    let locations: Option<serde_json::Map<String, serde_json::Value>> =
+        std::env::var(FAKE_LOCATIONS)
+            .ok()
+            .and_then(|path| fs::read(path).ok())
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap());
     let log = |line: &str| {
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -2756,6 +2794,38 @@ fn fake_language_server_helper() {
     let mut root_uri = String::new();
     let mut send = |message: serde_json::Value| write_message(&mut output, &message).unwrap();
     let reply = |id: &serde_json::Value, result: serde_json::Value| serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+    /// `[{"path","line","character"}]` under `key` as `Location`s against
+    /// `root_uri`, or `[]`.
+    fn location_result(
+        locations: &Option<serde_json::Map<String, serde_json::Value>>,
+        key: &str,
+        root_uri: &str,
+    ) -> serde_json::Value {
+        let Some(items) = locations
+            .as_ref()
+            .and_then(|map| map.get(key))
+            .and_then(serde_json::Value::as_array)
+        else {
+            return serde_json::json!([]);
+        };
+        serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| {
+                    let path = item["path"].as_str().unwrap_or_default();
+                    let line = item["line"].as_u64().unwrap_or(0);
+                    let character = item["character"].as_u64().unwrap_or(0);
+                    serde_json::json!({
+                        "uri": format!("{root_uri}/{path}"),
+                        "range": {
+                            "start": { "line": line, "character": character },
+                            "end": { "line": line, "character": character },
+                        },
+                    })
+                })
+                .collect(),
+        )
+    }
     loop {
         let Ok(Some(message)) = read_message(&mut input) else {
             std::process::exit(0);
@@ -2812,6 +2882,47 @@ fn fake_language_server_helper() {
                     None => serde_json::json!([]),
                 };
                 send(reply(&id, result));
+                answered += 1;
+                if exit_after.is_some_and(|limit| answered >= limit) {
+                    std::process::exit(0);
+                }
+            }
+            ("textDocument/references", Some(id)) => {
+                let uri = message["params"]["textDocument"]["uri"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let include_declaration = message["params"]["context"]["includeDeclaration"]
+                    .as_bool()
+                    .unwrap_or(true);
+                log(&format!(
+                    "request textDocument/references {uri} includeDeclaration={include_declaration}"
+                ));
+                if flags.contains(&"no_references") {
+                    continue;
+                }
+                send(reply(
+                    &id,
+                    location_result(&locations, "references", &root_uri),
+                ));
+                answered += 1;
+                if exit_after.is_some_and(|limit| answered >= limit) {
+                    std::process::exit(0);
+                }
+            }
+            ("textDocument/implementation", Some(id)) => {
+                let uri = message["params"]["textDocument"]["uri"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                log(&format!("request textDocument/implementation {uri}"));
+                if flags.contains(&"no_implementation") {
+                    continue;
+                }
+                send(reply(
+                    &id,
+                    location_result(&locations, "implementation", &root_uri),
+                ));
                 answered += 1;
                 if exit_after.is_some_and(|limit| answered >= limit) {
                     std::process::exit(0);
@@ -3111,4 +3222,202 @@ fn prose_words_match_exactly_and_only_code_shaped_words_as_a_prefix() {
         vec![("uploadFile".to_string(), MatchQuality::Prefix)]
     );
     assert!(names("").is_empty());
+}
+
+// ---- Task 9: references and implementations on demand ----
+
+fn queried(path: &str, name: &str, line: u32) -> SymbolRef {
+    SymbolRef {
+        path: path.to_string(),
+        name: name.to_string(),
+        line,
+    }
+}
+
+/// `src/lib.rs` declares `alpha`; the two other files are where the fake
+/// server says it is used.
+fn reference_fixture(name: &str) -> ServerFixture {
+    ServerFixture::with_files(
+        name,
+        &[
+            ("src/lib.rs", "pub fn alpha() {}\n\npub fn beta() {}\n"),
+            ("src/other.rs", "pub fn gamma() {}\n"),
+            ("src/third.rs", "pub fn delta() {}\n"),
+        ],
+    )
+}
+
+fn target(relation: &workspace_engine::Relation) -> (&str, &str, u32) {
+    let RelationTarget::Symbol(target) = &relation.to else {
+        panic!("a reference points at a symbol: {relation:?}");
+    };
+    (&target.path, &target.name, target.line)
+}
+
+#[test]
+fn references_are_language_server_relations() {
+    let fixture = reference_fixture("references");
+    fixture.answer_locations(serde_json::json!({
+        "references": [
+            { "path": "src/other.rs", "line": 0 },
+            { "path": "src/third.rs", "line": 2 },
+        ],
+    }));
+    let engine = fixture.engine("normal");
+    let hub = LanguageServerHub::with_limits(limits(START_TIMEOUT, Duration::from_secs(600)));
+    let symbol = queried("src/lib.rs", "alpha", 1);
+
+    let result = engine
+        .symbol_references_with(&hub, &fixture.repo.root, &symbol)
+        .expect("the lookup itself succeeds");
+    assert!(result.available, "{result:?}");
+    assert_eq!(result.reason, None, "{result:?}");
+    assert_eq!(result.kind, RelationKind::References);
+    assert_eq!(result.symbol, symbol);
+    assert_eq!(result.language.as_deref(), Some("rust"));
+    assert_eq!(result.relations.len(), 2, "{result:?}");
+    for relation in &result.relations {
+        assert_eq!(relation.kind, RelationKind::References);
+        assert_eq!(relation.provenance, Provenance::LanguageServer);
+        assert_eq!(relation.from, symbol);
+    }
+    let targets: Vec<(&str, &str, u32)> = result.relations.iter().map(target).collect();
+    // The locations are 0-based in LSP, so they are 1-based here.
+    assert_eq!(
+        targets,
+        [("src/other.rs", "alpha", 1), ("src/third.rs", "alpha", 3)]
+    );
+    assert_eq!(fixture.reference_requests(), ["src/lib.rs"]);
+    // `includeDeclaration` is false: the declaration itself is not requested.
+    assert!(
+        fixture
+            .log_lines()
+            .iter()
+            .any(|line| line.ends_with("includeDeclaration=false")),
+        "{:?}",
+        fixture.log_lines()
+    );
+}
+
+#[test]
+fn a_second_reference_call_is_served_from_the_cache() {
+    let fixture = reference_fixture("references-cache");
+    fixture.answer_locations(serde_json::json!({
+        "references": [{ "path": "src/other.rs", "line": 0 }],
+    }));
+    let engine = fixture.engine("normal");
+    let hub = LanguageServerHub::with_limits(limits(START_TIMEOUT, Duration::from_secs(600)));
+    let symbol = queried("src/lib.rs", "alpha", 1);
+
+    let first = engine
+        .symbol_references_with(&hub, &fixture.repo.root, &symbol)
+        .unwrap();
+    assert_eq!(fixture.reference_requests().len(), 1);
+
+    let second = engine
+        .symbol_references_with(&hub, &fixture.repo.root, &symbol)
+        .unwrap();
+    assert!(second.available, "{second:?}");
+    assert_eq!(second.relations, first.relations);
+    assert_eq!(
+        fixture.reference_requests().len(),
+        1,
+        "the fake server was asked again instead of the cache being used"
+    );
+}
+
+#[test]
+fn editing_a_referencing_file_discards_the_cache_and_asks_again() {
+    let fixture = reference_fixture("references-edit");
+    fixture.answer_locations(serde_json::json!({
+        "references": [{ "path": "src/other.rs", "line": 0 }],
+    }));
+    let engine = fixture.engine("normal");
+    let hub = LanguageServerHub::with_limits(limits(START_TIMEOUT, Duration::from_secs(600)));
+    let symbol = queried("src/lib.rs", "alpha", 1);
+
+    engine
+        .symbol_references_with(&hub, &fixture.repo.root, &symbol)
+        .unwrap();
+    assert_eq!(fixture.reference_requests().len(), 1);
+
+    // `src/other.rs` is a referencing file, not the defining one: a cache
+    // checked against `src/lib.rs` alone would still be served.
+    fixture
+        .repo
+        .write("src/other.rs", "pub fn gamma() {}\n\npub fn calls() {}\n");
+    let second = engine
+        .symbol_references_with(&hub, &fixture.repo.root, &symbol)
+        .unwrap();
+    assert!(second.available, "{second:?}");
+    assert_eq!(
+        fixture.reference_requests().len(),
+        2,
+        "the stale cached set was returned"
+    );
+}
+
+#[test]
+fn without_a_language_server_references_are_unavailable_and_not_guessed() {
+    let repo = Repo::new("references-none", &[("src/lib.rs", "pub fn alpha() {}\n")]);
+    let engine = WorkspaceEngine::new(repo.config());
+    let result = engine
+        .symbol_references(&repo.root, &queried("src/lib.rs", "alpha", 1))
+        .unwrap();
+
+    assert!(!result.available, "{result:?}");
+    assert!(result.relations.is_empty(), "{result:?}");
+    assert_eq!(result.language.as_deref(), Some("rust"));
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no language server")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_timed_out_reference_request_is_unavailable_with_the_reason() {
+    let fixture = reference_fixture("references-timeout");
+    fixture.answer_locations(serde_json::json!({
+        "references": [{ "path": "src/other.rs", "line": 0 }],
+    }));
+    let engine = fixture.engine("no_references");
+    let hub =
+        LanguageServerHub::with_limits(limits(Duration::from_secs(1), Duration::from_secs(600)));
+
+    let result = engine
+        .symbol_references_with(&hub, &fixture.repo.root, &queried("src/lib.rs", "alpha", 1))
+        .unwrap();
+    assert!(!result.available, "{result:?}");
+    assert!(result.relations.is_empty(), "{result:?}");
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("textDocument/references")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn implementations_are_language_server_relations() {
+    let fixture = reference_fixture("implementations");
+    fixture.answer_locations(serde_json::json!({
+        "implementation": [{ "path": "src/other.rs", "line": 0 }],
+    }));
+    let engine = fixture.engine("normal");
+    let hub = LanguageServerHub::with_limits(limits(START_TIMEOUT, Duration::from_secs(600)));
+
+    let result = engine
+        .symbol_implementations_with(&hub, &fixture.repo.root, &queried("src/lib.rs", "alpha", 1))
+        .unwrap();
+    assert!(result.available, "{result:?}");
+    assert_eq!(result.relations.len(), 1, "{result:?}");
+    let relation = &result.relations[0];
+    assert_eq!(relation.kind, RelationKind::Implements);
+    assert_eq!(relation.provenance, Provenance::LanguageServer);
+    // The target is a declaration the index knows, so it is named.
+    assert_eq!(target(relation), ("src/other.rs", "gamma", 1));
 }

@@ -5,11 +5,12 @@ use workspace_engine::{
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, CommandProposal, CommandRisk, Config, ConfigOverlay,
     ConfigScope, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExclusionReason, MapLoad,
     MockModelAdapter, OpenAICompatibleAdapter, ProcessRegistry, ProfileId, ReadWindow,
-    RebuildReason, RepositoryMap, RootEvidence, RootOverride, RootOverrideEdit, SearchResult,
-    SymbolLoad, SymbolMatch, WorkspaceEngine, command_approval_prompt, edit_root_overrides,
-    ensure_data_dir_schema, export_profile, import_profile, parse_hunk_selection, patch_diff_text,
-    patch_hunk_summary, profile_import_base, render_markdown_to_ansi, review_profile_import,
-    review_profile_rejections, select_profile, symbol_matches_json,
+    RebuildReason, RelationTarget, RepositoryMap, RootEvidence, RootOverride, RootOverrideEdit,
+    SearchResult, SymbolLoad, SymbolMatch, SymbolRef, SymbolReferences, WorkspaceEngine,
+    command_approval_prompt, edit_root_overrides, ensure_data_dir_schema, export_profile,
+    import_profile, parse_hunk_selection, patch_diff_text, patch_hunk_summary, profile_import_base,
+    render_markdown_to_ansi, review_profile_import, review_profile_rejections, select_profile,
+    symbol_matches_json, symbol_references_json,
 };
 
 fn usage() -> &'static str {
@@ -24,6 +25,7 @@ fn usage() -> &'static str {
   damaian detect-commands <repo>
   damaian repo-map <repo> [--json]
   damaian symbols <repo> <query> [--json]
+  damaian symbol-references <repo> <path>:<line> <name> [--json]
   damaian classify-command <command>
   damaian config-show [--sources] [repo]
   damaian config-review <repo>
@@ -319,6 +321,25 @@ fn run() -> workspace_engine::Result<()> {
                 );
             } else {
                 print!("{}", symbol_matches_text(&matches, &load));
+            }
+        }
+        "symbol-references" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let location = require_arg(&args, 2, "<path>:<line>")?;
+            let name = require_arg(&args, 3, "<name>")?;
+            let json = args.iter().skip(4).any(|arg| arg == "--json");
+            let (path, line) = parse_symbol_location(location)?;
+            let symbol = SymbolRef {
+                path,
+                name: name.to_string(),
+                line,
+            };
+            let engine = engine_for_repo(repo)?;
+            let result = engine.symbol_references(repo, &symbol)?;
+            if json {
+                println!("{}", symbol_references_json(&result));
+            } else {
+                print!("{}", symbol_references_text(&result));
             }
         }
         "propose-validations" => {
@@ -981,6 +1002,79 @@ fn symbol_matches_text(matches: &[SymbolMatch], load: &SymbolLoad) -> String {
             symbol.path,
             symbol.line,
             symbol.provenance.as_str()
+        ));
+    }
+    output
+}
+
+/// `<path>:<line>` for `damaian symbol-references`. The last colon separates
+/// the line, so a path may contain one.
+fn parse_symbol_location(location: &str) -> workspace_engine::Result<(String, u32)> {
+    let (path, line) = location.rsplit_once(':').ok_or_else(|| {
+        workspace_engine::ClientError::InvalidInput(format!(
+            "Expected <path>:<line>, not {location}"
+        ))
+    })?;
+    if path.is_empty() {
+        return Err(workspace_engine::ClientError::InvalidInput(format!(
+            "{location} has no path"
+        )));
+    }
+    let line = line.parse::<u32>().map_err(|_| {
+        workspace_engine::ClientError::InvalidInput(format!(
+            "{location} does not end in a line number"
+        ))
+    })?;
+    if line == 0 {
+        return Err(workspace_engine::ClientError::InvalidInput(format!(
+            "{location} has line 0; lines are 1-based"
+        )));
+    }
+    Ok((path.to_string(), line))
+}
+
+/// One line per relation, after a line saying whether a language server
+/// answered. Provenance is always printed: a language-server answer is the
+/// only kind this command reports, and it says so (spec 25 §5.7).
+fn symbol_references_text(result: &SymbolReferences) -> String {
+    let location = format!("{}:{}", result.symbol.path, result.symbol.line);
+    let mut output = if result.available {
+        format!(
+            "{} for {} at {location}\n",
+            result.kind.as_str(),
+            result.symbol.name
+        )
+    } else {
+        format!(
+            "{} for {} at {location} unavailable: {}\n",
+            result.kind.as_str(),
+            result.symbol.name,
+            result
+                .reason
+                .as_deref()
+                .unwrap_or("no language server answered")
+        )
+    };
+    if result.available && result.relations.is_empty() {
+        output.push_str("none\n");
+    }
+    for relation in &result.relations {
+        let (path, name, line) = match &relation.to {
+            RelationTarget::Symbol(target) => {
+                (target.path.as_str(), target.name.as_str(), target.line)
+            }
+            RelationTarget::File { path } => (path.as_str(), "", 0),
+            RelationTarget::External { specifier } => (specifier.as_str(), "", 0),
+        };
+        let name = if name.is_empty() {
+            result.symbol.name.as_str()
+        } else {
+            name
+        };
+        output.push_str(&format!(
+            "{path}:{line}  {name}  {}  {}\n",
+            relation.kind.as_str(),
+            relation.provenance.as_str()
         ));
     }
     output
