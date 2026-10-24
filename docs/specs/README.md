@@ -95,7 +95,7 @@ reports the disagreement.
   #65 exploration memory (planned 2026-10-24 as a folder spec; its requirement
   8's budget interaction is settled by #59, and its carry-into-the-next-turn
   task waits for #26); #66 plan left open at turn end (edits `chat.rs`, so it
-  does not pair with #65).
+  does not pair with #26 or #65).
 - **Blocked:** #27, #33, #51, #54 and #55 on #26; #28 on #26 and #27; #29 on
   #28; #30 on #28 and #29; #35 on #23; #36 on #35; #37 on #33, #35 and #36;
   #52 on #33; #39 on #38; #40 on #38 and #39.
@@ -406,6 +406,24 @@ and the assembly around it, so **#65's carry-into-the-next-turn task waits for
 extends the identity #59's Task 3 added (`read_call_key`), which covers read
 tools only and is not yet persisted.
 
+Re-checked on 2026-10-24, when [#66](66_plan_left_open_at_turn_end/proposal.md)
+was planned. The ready set is unchanged: #66 stays **Not started** until its
+Task 1 begins. Three facts about pairing it, from its
+[`context.md`](66_plan_left_open_at_turn_end/context.md) §3 and §5:
+
+- **It edits `chat.rs` in Tasks 1–8**, so it may pair only with a spec that
+  never edits that file. Neither #26 (in progress) nor #65 (planned in parallel)
+  qualifies, so #66 is a solo `chat.rs` track. Whichever of #26 and #66 reaches
+  `chat.rs` second waits or rebases; #65 and #66 are strictly serial.
+- **It adds two fields to `PendingChatTurn`** (`step_evidence`,
+  `plan_reminder_sent`) at the same seven literals #61's round-budget pause and
+  #65's planned `turn_notes`/call list use. That is a rebase, not a blocker, but
+  do it deliberately and keep old pending turns loadable.
+- **It sits beside spec 32's `before_task_complete`** at both completion points
+  and sends its own reminder only after the hook allows; it does not move the
+  hook. A hook may therefore fire twice on a reminded turn, both times charged
+  to the same action budget.
+
 ### Parallel work
 
 Two specs may be built at once, which is a **deliberate exception to the
@@ -513,7 +531,7 @@ is ready.
 | 63 | [63_exploratory_command_failures/](63_exploratory_command_failures/proposal.md) | **Done 2026-10-23.** Tasks 1–5 built 2026-10-17/18; Task 6 walked the §6 criteria and documented the purpose split. Commands get a purpose (check, exploration, other) that never influences approval; a failed exploration command records no finding and blocks no plan step, while checks and unknown commands behave as today. Prompted by a zsh glob error and an `ls` of a missing directory becoming open **error** findings; the model is now told its shell and zsh's glob rule. |
 | 64 | [64_read_only_command_boundary.md](64_read_only_command_boundary.md) | **Done 2026-10-23.** Found the read-only list is not read-only (`git diff --output=<file>` writes) and replaces the prefix match with a tokenizer, per-program option lists and `PathPolicy` checks on every path argument. It then admits `cd <dir> &&` and `&&`/`|` pipelines of admitted commands into stdin-only filters, and the §5.7 documentation (user guide, security, troubleshooting) was written to close it. |
 | 65 | [65_exploration_memory_within_a_turn/](65_exploration_memory_within_a_turn/proposal.md) | **Not started — planned 2026-10-24; the next priority now that #59 is done.** Specified 2026-10-18, revised 2026-10-19, planned as a folder spec on 2026-10-24 ([`tasks.md`](65_exploration_memory_within_a_turn/tasks.md)); the task that carries notes into the next turn waits for #26 to land, because both edit the turn seed in `chat.rs`. `bounded_messages` sends only the last ~7 rounds, so in a long turn most of what the agent read is gone before it answers. Adds a `turn_notes` tool whose bounded text (default 8,000 characters, restrict-only) is pinned after the seed, never elided, and carried into the next turn of the session; the elision notice names the calls that left the window and a warning names the round about to leave. Requirement 8, the budget interaction, is settled by #59's exploration allowance (default 24, ceiling 32, restrict-only); the call list extends #59's `read_call_key`, which covers read tools only and is not persisted. |
-| 66 | [66_plan_left_open_at_turn_end.md](66_plan_left_open_at_turn_end.md) | **Not started.** Specified 2026-10-24 from a session that answered in full and left its plan showing step 1 of 4 as *running*: the model never called `complete_step`, the panel labels any `in_progress` step "running" after the turn ended, and step evidence is dropped on every approval resume. Adds one reminder per turn when the model answers with open steps, persists step evidence across pauses and attaches it at turn end, and labels an ended turn's open step "not finished". Closes nothing on the model's behalf (#21 requirement 6). |
+| 66 | [66_plan_left_open_at_turn_end/](66_plan_left_open_at_turn_end/proposal.md) | **Not started; split into a folder and planned 2026-10-24** in ten tasks (see its `tasks.md`). Specified 2026-10-24 from a session that answered in full and left step 1 of 4 *running*. [`context.md`](66_plan_left_open_at_turn_end/context.md) found that the "empty decode" completion the flat spec cites no longer exists, that `TaskStatus` has two more states than §5.4 listed (`Interrupted` and `UnknownExternalOutcome`, both inactive for the panel), that a declined plan must be marked skipped or the reminder would close untouched steps, and that spec 32's `before_task_complete` runs at both completion points, so the hook must go first. Adds one reminder per turn when the model answers with open steps, persists step evidence across pauses and attaches it at turn end, and labels an ended turn's open step "not finished". Closes nothing on the model's behalf (#21 requirement 6). |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order
 can differ from number order. #34 was built ahead of #14–#33:
