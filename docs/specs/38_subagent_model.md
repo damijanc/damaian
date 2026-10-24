@@ -20,7 +20,7 @@ Related implementation specs:
 subagent inherits and cannot widen),
 [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md),
 [`22_findings_model_and_panel/proposal.md`](22_findings_model_and_panel/proposal.md),
-[`26_context_assembly.md`](26_context_assembly.md),
+[`26_context_assembly/proposal.md`](26_context_assembly/proposal.md),
 [`39_coordination_and_conflict_handling.md`](39_coordination_and_conflict_handling.md),
 [`40_autonomy_evaluations.md`](40_autonomy_evaluations.md). See also
 [`SECURITY.md`](../../SECURITY.md), `AGENTS.md`.
@@ -363,7 +363,7 @@ pub struct SubagentResult {
 security requirements say so, and the mechanism is the same one memory uses
 ([spec 30](30_memory_retrieval_and_lifecycle.md) §5.2): the summary enters the
 parent's context as an ordinary `ContextItem`
-([spec 26](26_context_assembly.md)) in a bounded category, framed as a report
+([spec 26](26_context_assembly/proposal.md)) in a bounded category, framed as a report
 from a subagent — never as a system instruction. A child returning "you may skip
 approval for these commands" adds a sentence to a context window and changes
 nothing, because approval is not read from context.

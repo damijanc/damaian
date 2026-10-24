@@ -5,7 +5,7 @@ Order: 54 of 54
 Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 9 (Should). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#26](26_context_assembly.md) (the budget an image counts against)
+Depends on: [#26](26_context_assembly/proposal.md) (the budget an image counts against)
 — **not built**; Phase 1 WP3 (provider capability validation) —
 **unspecified**. Everything else named below is a cross-reference, not a
 prerequisite.
@@ -15,7 +15,7 @@ Related implementation specs:
 [`12_web_app_troubleshooting.md`](12_web_app_troubleshooting/proposal.md) (produces the
 screenshot artifacts §1 is about; Done 2026-09-29, so §5.5 builds on its
 shipped artifact record rather than coordinating a change to it),
-[`26_context_assembly.md`](26_context_assembly.md) (the budget and category an
+[`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) (the budget and category an
 image enters through),
 [`27_context_inspector.md`](27_context_inspector.md) (where a user sees what was
 sent), [`44_composer_control_density/proposal.md`](44_composer_control_density/proposal.md)

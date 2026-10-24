@@ -21,7 +21,7 @@ Related implementation specs:
 (owns `TokenUsage`, the measured/estimated distinction and `estimated_cost`;
 this spec extends it additively and changes none of its rules),
 [`18_local_evaluation_harness/proposal.md`](../18_local_evaluation_harness/proposal.md)
-(gains one metric), [`26_context_assembly.md`](../26_context_assembly.md) (owns
+(gains one metric), [`26_context_assembly/proposal.md`](../26_context_assembly/proposal.md) (owns
 the ordering this spec depends on),
 [`55_conversation_compaction.md`](../55_conversation_compaction.md) (owns the
 eight-message window §5.8 is blocked on, and recorded the ordering problem

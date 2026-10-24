@@ -5,14 +5,14 @@ Order: 28 of 30
 Plan: `docs/PLAN/03b_phase_3b_persistent_memory.md`, Phase 3b, Work
 Package 1 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#26](26_context_assembly.md) (context assembly) — **not built**;
+Depends on: [#26](26_context_assembly/proposal.md) (context assembly) — **not built**;
 [#27](27_context_inspector.md) (the inspector memory appears in) — **not
 built**. Everything else named below is a cross-reference, not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
 and secret policy), section 7.10 (secret detection). Related implementation
 specs: [`11_agents_md_support.md`](11_agents_md_support.md) (the inspectable,
 user-owned model memory should imitate),
-[`26_context_assembly.md`](26_context_assembly.md) and
+[`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) and
 [`27_context_inspector.md`](27_context_inspector.md) (memory is delivered and
 inspected through these, never around them),
 [`29_memory_creation_and_consent.md`](29_memory_creation_and_consent.md),
@@ -332,7 +332,7 @@ and the second is the one that actually covers the undetectable case:
 3. **Redaction on the way out.** Memory reaches the model only as a
    `ContextItem` ([spec 30](30_memory_retrieval_and_lifecycle.md) §5.1), and
    context assembly redacts every item before measuring or storing it
-   ([spec 26](26_context_assembly.md) §5.6). So a credential that somehow got
+   ([spec 26](26_context_assembly/proposal.md) §5.6). So a credential that somehow got
    stored — written before a scanner pattern existed, say — is still redacted
    before it is sent anywhere.
 

@@ -12,7 +12,7 @@ Related spec sections: `ai_coding_assistant_specification.md` section 7.3 (path
 and secret policy), section 7.9 (context assembly). Related implementation
 specs: [`11_agents_md_support.md`](11_agents_md_support.md),
 [`20_working_modes/proposal.md`](20_working_modes/proposal.md),
-[`26_context_assembly.md`](26_context_assembly.md) (the only delivery path),
+[`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) (the only delivery path),
 [`27_context_inspector.md`](27_context_inspector.md) (where recall is visible
 and removable), [`28_memory_model_and_storage.md`](28_memory_model_and_storage.md),
 [`29_memory_creation_and_consent.md`](29_memory_creation_and_consent.md).
@@ -55,7 +55,7 @@ mechanisms below are what make the slow failure detectable.
   store; [spec 29](29_memory_creation_and_consent.md) the creation gate. This
   spec is the read side.
 - **Context assembly is category-budgeted with a manifest.**
-  [Spec 26](26_context_assembly.md) §5.1 defines `ContextCategory` as an ordered
+  [Spec 26](26_context_assembly/proposal.md) §5.1 defines `ContextCategory` as an ordered
   enum, per-category budgets (§5.2), and a `ContextManifest` recording included
   and excluded items with reasons (§5.5). It has **no memory category yet** —
   adding one is this spec's integration point.
@@ -128,7 +128,7 @@ mechanisms below are what make the slow failure detectable.
 Requirement 2, stated as a constraint on the code rather than a principle:
 **there is no memory-to-model path except a `ContextItem`.**
 
-[Spec 26](26_context_assembly.md) §5.1's `ContextCategory` gains one variant,
+[Spec 26](26_context_assembly/proposal.md) §5.1's `ContextCategory` gains one variant,
 placed last:
 
 ```rust
@@ -149,7 +149,7 @@ pub enum ContextCategory {
 ```
 
 Last in declaration order means last in the derived `Ord`, which
-[spec 26](26_context_assembly.md) uses as priority — so memory is the first
+[spec 26](26_context_assembly/proposal.md) uses as priority — so memory is the first
 category truncated when the budget is contested, and it can never displace
 instructions, plan state, or file content. Requirement 5 of
 [spec 29](29_memory_creation_and_consent.md) ("memory is the lowest-priority

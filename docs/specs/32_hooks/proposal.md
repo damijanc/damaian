@@ -198,7 +198,7 @@ hook granting permission, which is precisely the widening requirement 6 forbids.
 which puts hook output in the same panel as compiler and test output and makes it
 navigable and repairable. `context` additions are bounded strings that enter
 context assembly as ordinary `ContextItem`s in a dedicated category
-([spec 26](../26_context_assembly.md)) — not a privileged channel, subject to the
+([spec 26](../26_context_assembly/proposal.md)) — not a privileged channel, subject to the
 same budget and the same visibility in the inspector
 ([spec 27](../27_context_inspector.md)).
 

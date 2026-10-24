@@ -341,7 +341,7 @@ satisfied in neither:
   `upload_retry (function, src/upload.rs:42, heuristic — may be inaccurate)`.
   This is the part most likely to be skipped, and it is the part that matters:
   an agent told a relationship is certain will act on it, and a wrong `Implements`
-  edge sends it to rewrite the wrong type. [Spec 26](../26_context_assembly.md)
+  edge sends it to rewrite the wrong type. [Spec 26](../26_context_assembly/proposal.md)
   carries the label through as provenance on the context item.
 
 ### 5.8 Process lifetime
@@ -406,7 +406,7 @@ A symbol lookup path: exact name match, then prefix, then fuzzy, returning
 acceptance criterion — a symbol search returns a definition with an exact file
 and line — is satisfied by this path, in both tiers.
 
-Symbol hits also feed [spec 26](../26_context_assembly.md) as a distinct context
+Symbol hits also feed [spec 26](../26_context_assembly/proposal.md) as a distinct context
 category with its own budget, so symbol results do not crowd out file content.
 
 ## 6. Acceptance Criteria

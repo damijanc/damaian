@@ -168,7 +168,7 @@ Dependencies are a topological order, not a solver: a child runs when its named
 dependencies have reached a terminal state. A cycle is refused at declaration.
 
 `max_concurrent` defaults low — a small number, configurable — because each agent
-carries its own assembled context ([spec 26](26_context_assembly.md)) and its own
+carries its own assembled context ([spec 26](26_context_assembly/proposal.md)) and its own
 model calls, so concurrency multiplies both memory and spend. The default exists
 to make the cost visible rather than to maximise throughput, and
 [spec 40](40_autonomy_evaluations.md) measures whether raising it helps.

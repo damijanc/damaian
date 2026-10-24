@@ -5,7 +5,7 @@ Order: 27 of 27
 Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 5 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
-Depends on: [#26](26_context_assembly.md) (the context manifest it renders) —
+Depends on: [#26](26_context_assembly/proposal.md) (the context manifest it renders) —
 **not built**. Everything else named below is a cross-reference, not a
 prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.1 (chat
@@ -15,7 +15,7 @@ assembly). Related implementation specs:
 (navigation to referenced content),
 [`11_agents_md_support.md`](11_agents_md_support.md),
 [`20_working_modes/proposal.md`](20_working_modes/proposal.md) (session-scoped state pattern),
-[`26_context_assembly.md`](26_context_assembly.md) (produces the manifest this
+[`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) (produces the manifest this
 renders — this spec is unusable without it).
 
 ## 1. Motivation
@@ -24,7 +24,7 @@ renders — this spec is unusable without it).
 claims, and it is currently false. There is no view of assembled context, before
 or after a call.
 
-[Spec 26](26_context_assembly.md) produces the data — a manifest of what was
+[Spec 26](26_context_assembly/proposal.md) produces the data — a manifest of what was
 included, what was excluded, and why. This work package makes it visible and
 gives the user control over the optional parts. Shipping the assembly pipeline
 without the inspector ships the mechanism without the accountability: better
@@ -55,7 +55,7 @@ retrieval heuristics cannot make at all.
   is unrecorded, so a pre-send view built on today's structure could show only
   what happened to fit.
 - **`ContextItem` has no line range** (`context_manager.rs:22-29`), so content is
-  whole-file. [Spec 26](26_context_assembly.md) §5.1 adds ranges and categories;
+  whole-file. [Spec 26](26_context_assembly/proposal.md) §5.1 adds ranges and categories;
   this spec depends on that.
 - **Per-session state has an established pattern.**
   `SessionStore::allow_browser_diagnostics_for_session` /
@@ -83,7 +83,7 @@ retrieval heuristics cannot make at all.
 ## 4. Non-goals
 
 - Changing what assembly selects. The inspector shows and constrains; the
-  selection logic is [spec 26](26_context_assembly.md).
+  selection logic is [spec 26](26_context_assembly/proposal.md).
 - Editing context content. A user may include or exclude an item, and pin a
   range — not rewrite what a file says on the way to the model.
 - Showing raw provider payloads or message JSON. The view is categories, paths,
@@ -127,7 +127,7 @@ sending, not that they must.
 
 ### 5.2 What the view shows
 
-Rendered from `ContextManifest` ([spec 26](26_context_assembly.md) §5.5), which
+Rendered from `ContextManifest` ([spec 26](26_context_assembly/proposal.md) §5.5), which
 already carries every field requirement 1 asks for:
 
 ```text
@@ -156,7 +156,7 @@ Three things this rendering makes visible that nothing does today:
 - **The excluded list**, which is the half users actually need. "Why didn't it
   read `upload.rs`?" is answerable.
 - **The limit's source** — declared, observed, or default
-  ([spec 26](26_context_assembly.md) §5.7) — so conservative context is
+  ([spec 26](26_context_assembly/proposal.md) §5.7) — so conservative context is
   attributable rather than mysterious.
 - **Heuristic counts**, carrying [spec 25](25_symbol_and_relationship_index/proposal.md)'s
   provenance through to the surface. "12 symbols (4 heuristic)" tells the user
@@ -218,7 +218,7 @@ excluded list with the reason rather than silently dropped from the pin list.
 ### 5.5 What cannot be removed
 
 Requirement 3 is enforced by the type, not by the UI.
-[Spec 26](26_context_assembly.md) §5.1 defines `ContextCategory::Required` as the
+[Spec 26](26_context_assembly/proposal.md) §5.1 defines `ContextCategory::Required` as the
 first variant, holding safety instructions and the user's own message. The
 inspector renders `Required` items as locked, and the removal path rejects a
 `Required` item — so a UI bug, or a future caller, cannot remove one.

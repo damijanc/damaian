@@ -6,7 +6,7 @@ Plan: `docs/PLAN/04_phase_4_customization_and_extensibility.md`, Phase 4,
 Work Package 4 (Must). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#20](20_working_modes/proposal.md) (modes) — built;
-[#26](26_context_assembly.md) (the context budget schemas count against) —
+[#26](26_context_assembly/proposal.md) (the context budget schemas count against) —
 **not built**; [#31](31_permission_profiles/proposal.md) (the profile a server cannot
 widen) — built. Everything else named below is a cross-reference, not a
 prerequisite.
@@ -18,7 +18,7 @@ adapter, tool calling), section 7.6 (tool and action orchestrator), section 7.8
 [`17_durable_task_state_and_crash_recovery/proposal.md`](17_durable_task_state_and_crash_recovery/proposal.md)
 (the PID registry MCP servers are the primary client of),
 [`20_working_modes/proposal.md`](20_working_modes/proposal.md) (mode filters MCP tools),
-[`26_context_assembly.md`](26_context_assembly.md) (the context budget this
+[`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) (the context budget this
 protects), [`31_permission_profiles/proposal.md`](31_permission_profiles/proposal.md) (the profile
 that governs external writes).
 
@@ -32,7 +32,7 @@ per-tool control, no deferral, and no bound: a server exposing forty tools
 contributes forty JSON schemas to every request in the session, whether the task
 needs them or not.
 
-That is a direct conflict with [spec 26](26_context_assembly.md), which allocates
+That is a direct conflict with [spec 26](26_context_assembly/proposal.md), which allocates
 context by category and accounts for every token. Tool schemas are not part of
 that accounting — they arrive in the request's `tools` array rather than as
 context items — so an unmanaged MCP configuration silently consumes the window

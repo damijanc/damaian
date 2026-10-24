@@ -18,7 +18,7 @@ Related implementation specs:
 [`../41_ui_density_and_action_hierarchy/proposal.md`](../41_ui_density_and_action_hierarchy/proposal.md)
 (the scale and disclosure pattern this builds on; §2 of that spec names the
 context strip as this spec's opening item),
-[`../26_context_assembly.md`](../26_context_assembly.md) and
+[`../26_context_assembly/proposal.md`](../26_context_assembly/proposal.md) and
 [`../27_context_inspector.md`](../27_context_inspector.md) (the eventual
 first-class context view; this spec is presentation only and does not
 anticipate it).

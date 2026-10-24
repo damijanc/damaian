@@ -6,7 +6,7 @@ Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work
 Package 8 (Should). That directory is local-only and not committed, so the
 reference is a name rather than a link; this spec is self-contained.
 Depends on: [#20](20_working_modes/proposal.md) (the mode that gates the tool) —
-built; [#26](26_context_assembly.md) (the category and budget fetched content
+built; [#26](26_context_assembly/proposal.md) (the category and budget fetched content
 enters) — **not built**. Everything else named below is a cross-reference, not
 a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.10
@@ -15,7 +15,7 @@ Related implementation specs:
 [`12_web_app_troubleshooting.md`](12_web_app_troubleshooting/proposal.md) (browser
 diagnostics for the user's own local app — a different capability with a
 different trust model, see §4),
-[`26_context_assembly.md`](26_context_assembly.md) (the category and budget this
+[`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) (the category and budget this
 content enters through),
 [`27_context_inspector.md`](27_context_inspector.md) (where a user sees and
 removes it),
@@ -142,7 +142,7 @@ property this spec needs and MCP cannot give:
 - **Provenance has to survive into context.** Requirement 3 needs the content
   labelled at the point it is produced. An MCP tool result is a string.
 - **Accounting.** [Spec 19](19_token_and_cost_accounting/proposal.md) and
-  [spec 26](26_context_assembly.md) budget what enters a request. Content
+  [spec 26](26_context_assembly/proposal.md) budget what enters a request. Content
   arriving through a generic tool result is outside both.
 
 A user who adds an MCP fetch server still gets spec 33's treatment. This spec
@@ -243,7 +243,7 @@ treatment of memory rather than inventing a second approach:
 
 - It enters as a `ContextItem` with a distinct kind and an explicit provenance
   label naming the URL and the fetch time, in the **lowest-priority category**
-  of [spec 26](26_context_assembly.md)'s allocation — so a crowded context drops
+  of [spec 26](26_context_assembly/proposal.md)'s allocation — so a crowded context drops
   a fetched page before it drops repository code.
 - It is delimited and labelled in the request as retrieved external content,
   never merged into the system prompt, never presented as instructions, and
@@ -287,7 +287,7 @@ whole spec exists to prevent.
 
 ### 5.6 Budget
 
-Fetched content counts against [spec 26](26_context_assembly.md)'s context
+Fetched content counts against [spec 26](26_context_assembly/proposal.md)'s context
 budget in its own category, and the tool call counts a round against
 [spec 21](21_task_plan_progress_and_budget/proposal.md)'s ceiling. A per-turn cap
 on fetches bounds the worst case — a model that fetches twelve pages has lost

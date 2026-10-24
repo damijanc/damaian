@@ -314,7 +314,7 @@ A language-server item carries no hedge. It is bounded by
 `symbol_context_max_tokens`, a lower-wins capability key with the same merge
 as `repository_map_max_tokens` (spec 24 `context.md` §7). Its default is
 **1,600**, which is spec 26's planned 10% share
-(`context_budget.symbols=0.10`, `26_context_assembly.md:186`) of the
+(`context_budget.symbols=0.10`, `../26_context_assembly/proposal.md` §5.2) of the
 16,000-token default budget. `0` turns it off. Spec 26 absorbs the item as its
 planned `ContextCategory::Symbols`.
 

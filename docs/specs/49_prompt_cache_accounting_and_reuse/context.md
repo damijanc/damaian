@@ -83,7 +83,7 @@ cache sits behind two volatile sections.
 
 **This was already recorded by [#55](../55_conversation_compaction.md) §2**,
 which found it while surveying the same function and explicitly assigned
-resolving it to this spec or [#26](../26_context_assembly.md). Two specs
+resolving it to this spec or [#26](../26_context_assembly/proposal.md). Two specs
 arriving at it independently is worth noting: it is a real property of the code,
 not an artifact of one reading.
 

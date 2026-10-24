@@ -7159,7 +7159,7 @@ it as hung on a timer, and record its wall-clock time.
   Flip #22 to "built" in each dependent's header:
   - `23_verification_loop/proposal.md`, around line 10;
   - `24_repository_map_and_monorepo_boundaries.md`, around line 9;
-  - `26_context_assembly.md`, around line 9;
+  - `../26_context_assembly/proposal.md`, around line 9;
   - `32_hooks.md`, around lines 8–9. Change only the #22 clause; #31's status
     is spec 31's to update;
   - `35_commit_preparation.md`, around line 9.

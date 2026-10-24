@@ -34,7 +34,7 @@ and [`34_repository_config_trust_boundary.md`](../34_repository_config_trust_bou
 (own the budget this defers to),
 [`24_repository_map_and_monorepo_boundaries/`](../24_repository_map_and_monorepo_boundaries/proposal.md),
 [`25_symbol_and_relationship_index/`](../25_symbol_and_relationship_index/proposal.md) and
-[`26_context_assembly.md`](../26_context_assembly.md) (the durable versions of the
+[`26_context_assembly/proposal.md`](../26_context_assembly/proposal.md) (the durable versions of the
 navigation and ranged-read floor this establishes).
 
 ## 1. Motivation
@@ -78,7 +78,7 @@ diagnostics runner is attached, plus discovered MCP tools.
 | Command execution | `Command::output()` — blocking, no timeout, no streaming (`command_runner.rs:89`). Output truncated at `max_command_output_bytes`, default 1 MiB | The `AGENTS.md` quality gate is seven commands; `cargo clippy --workspace --all-targets` alone runs for minutes with no incremental output. Spec 08's stop is checked *between* rounds (`chat.rs`, `sink.cancel.is_cancelled()`), so it cannot interrupt a running build |
 
 Two of these gaps have durable successors already specified — ranged context
-belongs to [#26](../26_context_assembly.md), which adds line ranges to
+belongs to [#26](../26_context_assembly/proposal.md), which adds line ranges to
 `ContextItem`, and structural navigation to [#24](../24_repository_map_and_monorepo_boundaries/proposal.md)
 and [#25](../25_symbol_and_relationship_index/proposal.md). **This spec is the cheap
 deterministic floor beneath them, not a substitute.** It is specified first
@@ -121,7 +121,7 @@ because those three cannot be built by an agent that lacks it.
   a constraint on the design, not an invitation to revisit them.
 - Replacing [#24](../24_repository_map_and_monorepo_boundaries/proposal.md),
   [#25](../25_symbol_and_relationship_index/proposal.md) or
-  [#26](../26_context_assembly.md). Those stay as specified.
+  [#26](../26_context_assembly/proposal.md). Those stay as specified.
 - Removing the tool-round cap. Requirement 6 replaces a fixed count with a
   bounded budget; an unbounded turn is not the goal, and the enforced ceiling
   belongs to [#21](../21_task_plan_progress_and_budget/proposal.md).
@@ -265,7 +265,7 @@ for cost figures: a number presented without its caveat is worse than no number.
   could have left a side effect. A tool that cannot is a tool safe to batch. A
   second declaration would be a second thing to keep in sync, and this one
   cannot drift because spec 17's recovery already depends on it being right.
-- **A ranged read and [#26](../26_context_assembly.md)'s `ContextItem` ranges
+- **A ranged read and [#26](../26_context_assembly/proposal.md)'s `ContextItem` ranges
   are the same representation.** A ranged read is what produces one. #26 adopts
   the range type this slice introduces rather than defining a second.
 

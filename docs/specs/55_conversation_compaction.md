@@ -6,7 +6,7 @@ Plan: `docs/PLAN/03_phase_3_code_understanding.md`, Phase 3, Work Package 6
 (Must, and in this phase's minimum releasable slice). That directory is
 local-only and not committed, so the reference is a name rather than a link;
 this spec is self-contained.
-Depends on: [#26](26_context_assembly.md) (the budget the recency window is
+Depends on: [#26](26_context_assembly/proposal.md) (the budget the recency window is
 sized from) — **not built**. Everything else named below is a cross-reference,
 not a prerequisite.
 Related spec sections: `ai_coding_assistant_specification.md` section 7.1 (chat
@@ -21,7 +21,7 @@ safe to do at all, and owns the rewind that must survive it),
 (accounts for the summarisation call),
 [`21_task_plan_progress_and_budget/proposal.md`](21_task_plan_progress_and_budget/proposal.md)
 (owns the plan state §5.2 reads, and the per-turn ceiling §5.5 must not make
-worse), [`26_context_assembly.md`](26_context_assembly.md) (owns the budget this
+worse), [`26_context_assembly/proposal.md`](26_context_assembly/proposal.md) (owns the budget this
 is measured against),
 [`27_context_inspector.md`](27_context_inspector.md) (where a summary is seen),
 [`30_memory_retrieval_and_lifecycle.md`](30_memory_retrieval_and_lifecycle.md)
@@ -96,7 +96,7 @@ central loop.
   §5.3 needs. That spec assumes the sections are separately orderable; today they
   are concatenated in one string. Recorded here because this spec touches that
   string and is the natural place to notice it — resolving it belongs to spec 49
-  or [spec 26](26_context_assembly.md), not here.
+  or [spec 26](26_context_assembly/proposal.md), not here.
 - **Messages are stored faithfully and unredacted.**
   `SessionStore::append_message` writes `content` verbatim;
   [spec 16](16_session_checkpoints_and_rewind.md) settled that deliberately, so a
@@ -155,7 +155,7 @@ central loop.
 - **Deleting or rewriting stored messages.** Requirement 2, and the append-only
   rule from spec 17.
 - **Compacting repository context.** It is rebuilt per turn under
-  [spec 26](26_context_assembly.md)'s budget and does not accumulate.
+  [spec 26](26_context_assembly/proposal.md)'s budget and does not accumulate.
 - **Fixing the prompt-section ordering** described in §2. Named, not solved.
 - **Summarising with the main model as a quality feature.** Which model
   summarises is the delivery plan's model-routing
@@ -175,7 +175,7 @@ conversation of short messages keeps more turns than one of long ones. Message
 count was never the quantity that mattered; it was only the quantity that was
 easy.
 
-[Spec 26](26_context_assembly.md) is `Not started`, so the budget it will own
+[Spec 26](26_context_assembly/proposal.md) is `Not started`, so the budget it will own
 does not exist yet, and this spec must not wait for it. Until it lands, the
 window is sized as a share of the existing `Config::context_token_budget`, which
 is already resolved per provider and per model today. When spec 26 lands, the
