@@ -596,6 +596,89 @@ async function reviewRepositoryConfig(repoPath) {
       toast(error.message);
     }
   }
+  // Spec 32: a repository-defined hook stays inactive until the user approves
+  // the exact definition shown here. Declining is the default action, and a
+  // dismissal asks again next time rather than recording either decision.
+  const hooks = Array.isArray(review.hooks) ? review.hooks : [];
+  for (const hook of hooks) {
+    const decision = await showHookReviewDialog(path, hook);
+    if (decision === null) {
+      reviewedRepositoryConfigs.delete(path);
+      break;
+    }
+    try {
+      await api(
+        "/api/hook-review",
+        form({ repo: path, hook: hook.id, decision, hash: hook.hash || "" }),
+      );
+      toast(decision === "approve" ? `Approved hook ${hook.id}` : `Declined hook ${hook.id}`);
+    } catch (error) {
+      reviewedRepositoryConfigs.delete(path);
+      toast(error.message);
+      break;
+    }
+  }
+}
+
+// One pending repository hook, with its full command line in the consent
+// surface (UI style guide §1: consent content is never truncated). Every
+// hook-supplied string is text, never markup.
+function showHookReviewDialog(repoPath, hook) {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement("div");
+    backdrop.className = "app-dialog-backdrop";
+    backdrop.innerHTML = `
+      <div class="app-dialog app-dialog-wide app-dialog-hook-review" role="dialog" aria-modal="true">
+        <p class="app-dialog-title"></p>
+        <p class="app-dialog-message"></p>
+        <p class="hook-review-label">Command</p>
+        <pre class="hook-review-command"></pre>
+        <p class="hook-review-meta"></p>
+        <div class="app-dialog-actions">
+          <button type="button" class="app-dialog-btn app-dialog-decline">Decline</button>
+          <button type="button" class="app-dialog-btn app-dialog-approve">Approve</button>
+        </div>
+      </div>
+    `;
+    const changed = hook.activation === "changed_since_review";
+    backdrop.querySelector(".app-dialog-title").textContent = changed
+      ? "A hook this repository defines has changed"
+      : "This repository defines a hook";
+    backdrop.querySelector(".app-dialog-message").textContent = changed
+      ? `${projectName(repoPath)} ships a different definition of the hook "${hook.id}" from the one you approved. It is not running until you review the new definition. If it changes again, it stops again.`
+      : `${projectName(repoPath)} ships a hook named "${hook.id}". Damaian will run it only after you approve this exact definition. If it changes later, it stops running until you review it again.`;
+    const command = hook.command + ((hook.args || []).length ? ` ${hook.args.join(" ")}` : "");
+    backdrop.querySelector(".hook-review-command").textContent = command;
+    const failure = hook.mode === "mandatory" ? "blocks" : "warns";
+    backdrop.querySelector(".hook-review-meta").textContent = `Events: ${(hook.events || []).join(
+      ", ",
+    )} · If it fails: ${failure}`;
+
+    document.body.append(backdrop);
+
+    const cleanup = (result) => {
+      document.removeEventListener("keydown", onKeydown, true);
+      backdrop.remove();
+      resolve(result);
+    };
+    const onKeydown = (event) => {
+      if (event.key === "Escape") cleanup(null);
+    };
+    document.addEventListener("keydown", onKeydown, true);
+    backdrop.querySelector(".app-dialog-approve").addEventListener("click", () => {
+      if (!hook.hash) {
+        toast("This hook's definition could not be read, so it cannot be approved");
+        return;
+      }
+      cleanup("approve");
+    });
+    backdrop
+      .querySelector(".app-dialog-decline")
+      .addEventListener("click", () => cleanup("decline"));
+    // Decline is the default: it takes focus, and Approve is never the filled
+    // or pre-selected choice (UI style guide §4, §5).
+    backdrop.querySelector(".app-dialog-decline").focus();
+  });
 }
 
 // Resolves to the commands to keep (possibly empty), or `null` if the user
@@ -1905,13 +1988,20 @@ async function installAppUpdate() {
 }
 
 function setSettingsPage(page) {
-  const target = ["general", "shortcuts", "checkpoints", "mcp", "providers", "models"].includes(
-    page,
-  )
+  const target = [
+    "general",
+    "shortcuts",
+    "checkpoints",
+    "mcp",
+    "hooks",
+    "providers",
+    "models",
+  ].includes(page)
     ? page
     : "providers";
   if (target === "mcp") renderMcpConfigSelect();
   if (target === "checkpoints") void renderCheckpointList();
+  if (target === "hooks") void renderSettingsHooks();
   document.querySelectorAll(".settings-nav-item").forEach((button) => {
     button.classList.toggle("active", button.dataset.settingsPage === target);
   });
@@ -3641,6 +3731,188 @@ function renderMcpServerList() {
     row.append(copy, configureButton);
     container.append(row);
   });
+}
+
+const HOOK_ACTIVATION_LABELS = {
+  active: "active",
+  pending_review: "pending review",
+  declined: "declined",
+  changed_since_review: "changed since review",
+  disabled: "disabled",
+};
+
+// Spec 32 Task 9: every configured hook, whether it can run, what it runs, and
+// its fail direction. A repository hook is switched by review, never by the
+// toggle: the repository owns its definition and the user owns the decision.
+async function renderSettingsHooks() {
+  const container = $("hook-list");
+  if (!container) return;
+  const repoPath = repo();
+  const empty = (text) => {
+    container.replaceChildren();
+    const row = document.createElement("div");
+    row.className = "provider-empty-row";
+    row.textContent = text;
+    container.append(row);
+  };
+  if (!repoPath) {
+    empty("Open a folder to see the hooks that apply to it.");
+    return;
+  }
+  let payload;
+  try {
+    payload = await api(`/api/hooks?repo=${encodeURIComponent(repoPath)}`);
+  } catch (error) {
+    empty(`Hooks could not be loaded: ${error.message}`);
+    return;
+  }
+  if (repo() !== repoPath) return;
+  const hooks = Array.isArray(payload.hooks) ? payload.hooks : [];
+  if (!hooks.length) {
+    empty(
+      "No hooks are configured. Add hook.<id>.command and hook.<id>.events to your user configuration, or to this repository's .damaian/config.conf.",
+    );
+    return;
+  }
+  container.replaceChildren(...hooks.map((hook) => hookSettingEntry(repoPath, hook)));
+}
+
+function hookSettingEntry(repoPath, hook) {
+  const entry = document.createElement("div");
+  entry.className = "hook-entry";
+
+  const row = document.createElement("div");
+  row.className = "settings-row";
+  const copy = document.createElement("div");
+  copy.className = "hook-row-copy";
+
+  const title = document.createElement("strong");
+  title.textContent = hook.id;
+  const meta = document.createElement("p");
+  const failure = hook.mode === "mandatory" ? "If it fails: blocks" : "If it fails: warns";
+  const activation = HOOK_ACTIVATION_LABELS[hook.activation] || hook.activation;
+  meta.textContent = `${hook.source} · ${(hook.events || []).join(", ")} · ${failure} · ${activation}`;
+  const command = document.createElement("p");
+  command.className = "hook-command";
+  command.textContent = hook.command + ((hook.args || []).length ? ` ${hook.args.join(" ")}` : "");
+  copy.append(title, meta, command);
+
+  const actions = document.createElement("div");
+  actions.className = "provider-row-actions hook-row-actions";
+
+  if (hook.source === "user") {
+    const toggle = document.createElement("label");
+    toggle.className = "field-checkbox hook-toggle";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = hook.enabled === true;
+    box.setAttribute("aria-label", `Enable hook ${hook.id}`);
+    box.addEventListener("change", async () => {
+      box.disabled = true;
+      try {
+        await api(
+          "/api/hook-enabled",
+          form({ repo: repoPath, hook: hook.id, enabled: box.checked ? "true" : "false" }),
+        );
+        toast(`${box.checked ? "Enabled" : "Disabled"} hook ${hook.id}`);
+        await renderSettingsHooks();
+      } catch (error) {
+        box.checked = !box.checked;
+        box.disabled = false;
+        toast(error.message);
+      }
+    });
+    const label = document.createElement("span");
+    label.textContent = "Enabled";
+    toggle.append(box, label);
+    actions.append(toggle);
+  }
+
+  if (
+    hook.source === "repository" &&
+    ["pending_review", "changed_since_review", "declined"].includes(hook.activation)
+  ) {
+    const approve = document.createElement("button");
+    approve.type = "button";
+    approve.className = "btn-sm";
+    approve.textContent = "Approve";
+    approve.disabled = !hook.hash;
+    approve.addEventListener("click", () => decideHook(repoPath, hook, "approve"));
+    actions.append(approve);
+    // A declined hook is already declined; offering Decline again would be a
+    // second, meaningless decision. Approve lets the user reconsider.
+    if (hook.activation !== "declined") {
+      const decline = document.createElement("button");
+      decline.type = "button";
+      decline.className = "btn-sm btn-quiet";
+      decline.textContent = "Decline";
+      decline.addEventListener("click", () => decideHook(repoPath, hook, "decline"));
+      actions.append(decline);
+    }
+  }
+
+  let testResult = null;
+  if ((hook.events || []).length) {
+    const eventSelect = document.createElement("select");
+    eventSelect.className = "mode-select hook-event-select";
+    eventSelect.setAttribute("aria-label", `Event to test for hook ${hook.id}`);
+    hook.events.forEach((event) => {
+      const option = document.createElement("option");
+      option.value = event;
+      option.textContent = event;
+      eventSelect.append(option);
+    });
+    const test = document.createElement("button");
+    test.type = "button";
+    test.className = "btn-sm btn-quiet";
+    test.textContent = "Test";
+    actions.append(eventSelect, test);
+
+    testResult = document.createElement("pre");
+    testResult.className = "hook-test-result";
+    testResult.hidden = true;
+    test.addEventListener("click", () =>
+      testHook(repoPath, hook, eventSelect.value, test, testResult),
+    );
+  }
+
+  row.append(copy, actions);
+  entry.append(row);
+  if (testResult) entry.append(testResult);
+  return entry;
+}
+
+async function decideHook(repoPath, hook, decision) {
+  try {
+    await api(
+      "/api/hook-review",
+      form({ repo: repoPath, hook: hook.id, decision, hash: hook.hash || "" }),
+    );
+    toast(`${decision === "approve" ? "Approved" : "Declined"} hook ${hook.id}`);
+    await renderSettingsHooks();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function testHook(repoPath, hook, event, button, result) {
+  button.disabled = true;
+  result.hidden = false;
+  result.dataset.state = "";
+  result.textContent = "Running…";
+  try {
+    const run = await api("/api/hook-test", form({ repo: repoPath, hook: hook.id, event }));
+    const lines = [`${event}: ${run.verdict}`];
+    if (run.failure) lines.push(`failed: ${run.failure}`);
+    if (run.stderr) lines.push(run.stderr.trimEnd());
+    result.textContent = lines.join("\n");
+    result.dataset.state = run.failure ? "error" : run.verdict === "allow" ? "ok" : "warn";
+  } catch (error) {
+    result.textContent = `${event}: ${error.message}`;
+    result.dataset.state = "error";
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function upsertMcpConfig(content, server) {
@@ -7620,6 +7892,7 @@ const FINDING_SOURCE_LABELS = {
   browser_scenario: "Browser scenario",
   code_review: "Code review",
   language_server: "Language server",
+  hook: "Hook",
   command: "Unparsed checks",
 };
 
@@ -9219,6 +9492,9 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
   const state = {
     patchId: payload.patchId,
     initialFileCount: (payload.files || []).length,
+    // Warnings a hook returned on an apply (spec 32 Task 9). They are not a
+    // reason to roll back, so they stay beside the applied files.
+    hookWarnings: [],
     files: (payload.files || []).map((file) => {
       const stats = diffStats(file.diff);
       return {
@@ -9473,6 +9749,22 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
     });
 
     const hasPending = state.files.some((file) => file.state === "pending");
+    if (state.hookWarnings.length) {
+      const notice = document.createElement("div");
+      notice.className = "patch-hook-warnings";
+      const heading = document.createElement("strong");
+      heading.textContent =
+        state.hookWarnings.length === 1
+          ? "A hook reported on this apply"
+          : "Hooks reported on this apply";
+      notice.append(heading);
+      state.hookWarnings.forEach((warning) => {
+        const line = document.createElement("p");
+        line.textContent = warning;
+        notice.append(line);
+      });
+      list.append(notice);
+    }
     applyButton.disabled = !hasPending;
     rejectButton.disabled = !hasPending;
     $("chat-log").scrollTop = $("chat-log").scrollHeight;
@@ -9506,6 +9798,7 @@ function createPatchPreview(payload, patchRepo, { onResolved = null } = {}) {
         return;
       }
 
+      state.hookWarnings = Array.isArray(result.hookWarnings) ? result.hookWarnings : [];
       const applied = result.appliedFiles || [];
       markFiles(applied, "applied");
       await reportResolvedIfSettled();

@@ -8,21 +8,24 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use workspace_engine::finding::{FindingStatus, RepairRequest};
+use workspace_engine::hooks::{
+    HookReviewDecision, list_hooks, review_hook, set_hook_enabled, test_run,
+};
 use workspace_engine::{
     AgentFallbackProposal, AgentPlanProposal, AgentQuestionProposal, AgentRoundBudgetProposal,
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, ChatMessage, ChatTurnOptions, ChatTurnResult, Config,
     CostEstimate, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExportFormat,
-    GeneratedSecretWarning, McpClient, McpServerConfig, McpTokenResolver, McpTransport,
-    ModelAdapter, ModelRequest, ModelRun, OpenAICompatibleAdapter, PausedTurns, PlanRevisionStep,
-    ProcessRegistry, ProfileId, ProposedFilePatch, QuestionState, RepositoryConfigReport,
-    ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session, SessionMode, StepStatus,
-    TaskPlan, TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink, WebDiagnosticCall,
-    WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport, WebDiagnosticsRunner,
-    WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible, command_approval_prompt,
-    custom_profile_ids, ensure_data_dir_schema, export_profile, import_profile,
-    normalize_mcp_server_id, normalize_model_provider, normalize_model_reasoning_level,
-    parse_hunk_selection, parse_mcp_transport, patch_diff_text, profile_import_base,
-    review_profile_import, review_profile_rejections, select_profile,
+    GeneratedSecretWarning, HookActivation, HookEvent, McpClient, McpServerConfig,
+    McpTokenResolver, McpTransport, ModelAdapter, ModelRequest, ModelRun, OpenAICompatibleAdapter,
+    PausedTurns, PlanRevisionStep, ProcessRegistry, ProfileId, ProposedFilePatch, QuestionState,
+    RepositoryConfigReport, ResumeDecisionOptions, RoundBudgetDecision, SearchOptions, Session,
+    SessionMode, StepStatus, TaskPlan, TaskUsage, TokenUsage, TurnPhase, TurnProgress, TurnSink,
+    WebDiagnosticCall, WebDiagnosticKind, WebDiagnosticRecord, WebDiagnosticReport,
+    WebDiagnosticsRunner, WebDiagnosticsRunnerHandle, WorkspaceEngine, allow_always_eligible,
+    command_approval_prompt, custom_profile_ids, ensure_data_dir_schema, export_profile,
+    import_profile, normalize_mcp_server_id, normalize_model_provider,
+    normalize_model_reasoning_level, parse_hunk_selection, parse_mcp_transport, patch_diff_text,
+    profile_import_base, review_profile_import, review_profile_rejections, select_profile,
 };
 
 mod keychain;
@@ -367,6 +370,13 @@ fn handle_connection(stream: &mut TcpStream, options: &ShellOptions) -> Result<(
         ("POST", "/api/repository-config-allowlist") => {
             handle_repository_config_allowlist(stream, &request)
         }
+        // Spec 32 Task 9: the hooks the user can see, review, switch and test.
+        // None of these takes a config path: user config is the only file they
+        // can write, and its location comes from the data directory.
+        ("GET", "/api/hooks") => handle_hooks(stream, &request),
+        ("POST", "/api/hook-review") => handle_hook_review(stream, &request),
+        ("POST", "/api/hook-enabled") => handle_hook_enabled(stream, &request),
+        ("POST", "/api/hook-test") => handle_hook_test(stream, &request),
         ("POST", "/api/config-set") => handle_config_set(stream, &request),
         ("POST", "/api/config-file") => handle_post_config_file(stream, &request),
         ("POST", "/api/model-key") => handle_model_key(stream, &request),
@@ -867,6 +877,122 @@ fn handle_repository_config_allowlist(
         200,
         "application/json",
         &resolve_repository_allowlist_migration(&repo, &keep)?,
+    )
+}
+
+/// Every configured hook for `repo`, with its activation, so Settings can list
+/// and act on them. `repo` is the only input: there is no path parameter that
+/// could name a config file.
+fn hooks_json(repo: &str) -> Result<String, String> {
+    if repo.trim().is_empty() {
+        return Ok("{\"repositoryPath\":\"\",\"hooks\":[]}".to_string());
+    }
+    let config = config_for_repo(repo)?;
+    let hooks = list_hooks(&config, Path::new(repo));
+    serde_json::to_string(&serde_json::json!({
+        "repositoryPath": repo,
+        "hooks": hooks,
+    }))
+    .map_err(|error| error.to_string())
+}
+
+fn handle_hooks(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let repo = request.param("repo").unwrap_or_default();
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &hooks_json(&repo)?,
+    )
+}
+
+fn handle_hook_review(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let hook = required_form(&form, "hook")?;
+    let decision = match required_form(&form, "decision")?.as_str() {
+        "approve" => HookReviewDecision::Approve {
+            hash: required_form(&form, "hash")?,
+        },
+        "decline" => HookReviewDecision::Decline,
+        other => {
+            return Err(format!(
+                "A hook review decision is approve or decline, not {other}"
+            ));
+        }
+    };
+    let config = config_for_repo(&repo)?;
+    let path = review_hook(&config, Path::new(&repo), &hook, decision)
+        .map_err(|error| error.to_string())?;
+    // Re-read so the response carries the review that was just written.
+    let config = config_for_repo(&repo)?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &serde_json::to_string(&serde_json::json!({
+            "path": path.to_string_lossy(),
+            "hooks": list_hooks(&config, Path::new(&repo)),
+        }))
+        .map_err(|error| error.to_string())?,
+    )
+}
+
+fn handle_hook_enabled(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let hook = required_form(&form, "hook")?;
+    let enabled = match required_form(&form, "enabled")?.as_str() {
+        "true" | "1" => true,
+        "false" | "0" => false,
+        other => return Err(format!("A hook toggle is true or false, not {other}")),
+    };
+    let config = config_for_repo(&repo)?;
+    let path = set_hook_enabled(&config, &hook, enabled).map_err(|error| error.to_string())?;
+    let config = config_for_repo(&repo)?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &serde_json::to_string(&serde_json::json!({
+            "path": path.to_string_lossy(),
+            "hooks": list_hooks(&config, Path::new(&repo)),
+        }))
+        .map_err(|error| error.to_string())?,
+    )
+}
+
+fn handle_hook_test(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
+    let form = parse_form(&request.body);
+    let repo = required_form(&form, "repo")?;
+    let hook_id = required_form(&form, "hook")?;
+    let event_name = required_form(&form, "event")?;
+    let event =
+        HookEvent::parse(&event_name).ok_or_else(|| format!("Unknown hook event: {event_name}"))?;
+    let config = config_for_repo(&repo)?;
+    let hook = config
+        .hook(&hook_id)
+        .cloned()
+        .ok_or_else(|| format!("Hook `{hook_id}` is not configured"))?;
+    let run =
+        test_run(&config, &hook, event, Path::new(&repo)).map_err(|error| error.to_string())?;
+    write_response(
+        stream,
+        request,
+        200,
+        "application/json",
+        &serde_json::to_string(&serde_json::json!({
+            "id": hook_id,
+            "event": event.as_str(),
+            "verdict": run.verdict.as_str(),
+            "failure": run.failure.map(|kind| kind.as_str()),
+            "stderr": run.stderr,
+            "durationMs": run.duration_ms,
+        }))
+        .map_err(|error| error.to_string())?,
     )
 }
 
@@ -3261,10 +3387,22 @@ fn update_config_overlay(
 /// repository, so an unremarkable repository answers with empty lists.
 fn repository_config_review_json(repo: &str) -> Result<String, String> {
     if repo.trim().is_empty() {
-        return Ok("{\"rejectedKeys\":[],\"allowlistEntries\":[]}".to_string());
+        return Ok("{\"rejectedKeys\":[],\"allowlistEntries\":[],\"hooks\":[]}".to_string());
     }
     let (config, report) = Config::load_for_repository_reporting(Some(Path::new(repo)))
         .map_err(|error| error.to_string())?;
+    // A repository hook that is waiting on the user, or whose definition has
+    // changed since they approved it, is an itemised review entry: the notice
+    // shows the full command line, its events and its fail direction.
+    let hooks: Vec<_> = list_hooks(&config, Path::new(repo))
+        .into_iter()
+        .filter(|hook| {
+            matches!(
+                hook.activation,
+                HookActivation::PendingReview | HookActivation::ChangedSinceReview
+            )
+        })
+        .collect();
     let engine = WorkspaceEngine::new(config);
     let notice = engine
         .repository_trust
@@ -3286,31 +3424,25 @@ fn repository_config_review_json(repo: &str) -> Result<String, String> {
                 .rejected
                 .iter()
                 .map(|rejected| {
-                    format!(
-                        "{{\"key\":\"{}\",\"class\":\"{}\"}}",
-                        escape_json(&rejected.key),
-                        rejected.class.as_str()
-                    )
+                    serde_json::json!({
+                        "key": rejected.key,
+                        "class": rejected.class.as_str(),
+                    })
                 })
                 .collect::<Vec<_>>()
-                .join(",")
         })
         .unwrap_or_default();
     let entries = migration
         .as_ref()
-        .map(|migration| {
-            migration
-                .entries
-                .iter()
-                .map(|entry| format!("\"{}\"", escape_json(entry)))
-                .collect::<Vec<_>>()
-                .join(",")
-        })
+        .map(|migration| migration.entries.clone())
         .unwrap_or_default();
-    Ok(format!(
-        "{{\"repositoryPath\":\"{}\",\"rejectedKeys\":[{rejected}],\"allowlistEntries\":[{entries}]}}",
-        escape_json(repo)
-    ))
+    serde_json::to_string(&serde_json::json!({
+        "repositoryPath": repo,
+        "rejectedKeys": rejected,
+        "allowlistEntries": entries,
+        "hooks": hooks,
+    }))
+    .map_err(|error| error.to_string())
 }
 
 fn resolve_repository_allowlist_migration(repo: &str, keep: &[String]) -> Result<String, String> {
@@ -8031,7 +8163,7 @@ mod tests {
     fn repository_config_review_is_empty_without_a_repository() {
         assert_eq!(
             repository_config_review_json("  ").unwrap(),
-            "{\"rejectedKeys\":[],\"allowlistEntries\":[]}"
+            "{\"rejectedKeys\":[],\"allowlistEntries\":[],\"hooks\":[]}"
         );
     }
 
@@ -11132,6 +11264,235 @@ exec /bin/cat > /dev/null
                 StopOutcome::Terminated
             );
         }
+    }
+    /// Spec 32 Task 9 over real HTTP: list, review, toggle and test a hook.
+    ///
+    /// The review writes user config only — the endpoint has no path parameter,
+    /// and a `path` field naming the repository's own `.damaian/config.conf` is
+    /// ignored. A pending repository hook cannot be tested before it is
+    /// reviewed, and a stale approval hash is refused rather than adopting a
+    /// definition the user never saw. The test run reports redacted stderr.
+    #[test]
+    fn hook_routes_list_review_toggle_and_test_over_http() {
+        let repo = std::env::temp_dir().join(format!(
+            "damaian-hook-routes-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(repo.join(".damaian")).unwrap();
+        fs::create_dir_all(repo.join("scripts")).unwrap();
+        let lint_script = repo.join("scripts").join("lint-hook.sh");
+        let lint_marker = repo.join("lint-ran");
+        fs::write(
+            &lint_script,
+            format!(
+                "#!/bin/sh\ntouch {}\necho '{{\"hookApiVersion\":1,\"verdict\":\"allow\"}}'\n",
+                lint_marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let repository_config = Config::repository_config_path(&repo);
+        fs::write(
+            &repository_config,
+            "hook.lint.command=/bin/sh\n\
+             hook.lint.args=./scripts/lint-hook.sh\n\
+             hook.lint.events=before_tool\n\
+             hook.lint.mode=optional\n",
+        )
+        .unwrap();
+        let repository_before = fs::read_to_string(&repository_config).unwrap();
+
+        let data_dir = isolated_data_dir();
+        let user_config = data_dir.join("config").join("user.conf");
+        fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+        let noter_script = data_dir.join("noter.sh");
+        fs::write(
+            &noter_script,
+            "cat > /dev/null\n\
+             echo '{\"hookApiVersion\":1,\"verdict\":\"warn\",\"reason\":\"heads up\"}'\n\
+             echo 'aws key AKIAIOSFODNN7EXAMPLE' >&2\n",
+        )
+        .unwrap();
+        fs::write(
+            &user_config,
+            format!(
+                "hook.noter.command=/bin/sh\nhook.noter.args={}\nhook.noter.events=before_tool\n",
+                noter_script.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let repo_arg = repo.to_string_lossy().to_string();
+        let (port, token) = serve_for_test();
+        let hooks_path = format!("/api/hooks?repo={}", percent_encode_for_test(&repo_arg));
+
+        // Both are listed; the repository hook is pending until reviewed.
+        let listed = get_for_test(port, &token, &hooks_path);
+        assert!(listed.starts_with("HTTP/1.1 200"), "{listed}");
+        let listed = json_of(&listed);
+        let rows = listed["hooks"].as_array().expect("a hooks list");
+        assert_eq!(rows.len(), 2, "{listed}");
+        let lint = rows.iter().find(|row| row["id"] == "lint").unwrap();
+        assert_eq!(lint["activation"], "pending_review");
+        assert_eq!(lint["source"], "repository");
+        assert_eq!(lint["mode"], "optional");
+        assert_eq!(lint["command"], "/bin/sh");
+        assert_eq!(lint["events"][0], "before_tool");
+        let hash = lint["hash"]
+            .as_str()
+            .expect("a definition hash")
+            .to_string();
+        let noter = rows.iter().find(|row| row["id"] == "noter").unwrap();
+        assert_eq!(noter["activation"], "active");
+        assert_eq!(noter["source"], "user");
+
+        // A pending repository hook is not executed by a test run.
+        let refused = post_fields_for_test(
+            port,
+            &token,
+            "/api/hook-test",
+            &[
+                ("repo", repo_arg.as_str()),
+                ("hook", "lint"),
+                ("event", "before_tool"),
+            ],
+        );
+        assert!(refused.starts_with("HTTP/1.1 500"), "{refused}");
+        assert!(refused.contains("review"), "{refused}");
+        assert!(!lint_marker.exists(), "an unreviewed hook ran");
+
+        // A stale hash is refused, and nothing is written.
+        let stale = post_fields_for_test(
+            port,
+            &token,
+            "/api/hook-review",
+            &[
+                ("repo", repo_arg.as_str()),
+                ("hook", "lint"),
+                ("decision", "approve"),
+                ("hash", "sha256:deadbeef"),
+            ],
+        );
+        assert!(stale.starts_with("HTTP/1.1 500"), "{stale}");
+        assert!(
+            !fs::read_to_string(&user_config)
+                .unwrap()
+                .contains("hook_review."),
+            "a refused review wrote user config"
+        );
+
+        // The real review: a `path` field naming the repository's own config is
+        // ignored, because the endpoint has no such parameter.
+        let reviewed = post_fields_for_test(
+            port,
+            &token,
+            "/api/hook-review",
+            &[
+                ("repo", repo_arg.as_str()),
+                ("hook", "lint"),
+                ("decision", "approve"),
+                ("hash", hash.as_str()),
+                ("path", repository_config.to_str().unwrap()),
+            ],
+        );
+        assert!(reviewed.starts_with("HTTP/1.1 200"), "{reviewed}");
+        let reviewed = json_of(&reviewed);
+        let lint = reviewed["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "lint")
+            .unwrap();
+        assert_eq!(lint["activation"], "active", "{reviewed}");
+        assert_eq!(
+            fs::read_to_string(&repository_config).unwrap(),
+            repository_before,
+            "the endpoint wrote the repository's own config"
+        );
+        let user = fs::read_to_string(&user_config).unwrap();
+        assert!(user.contains("hook_review."), "{user}");
+        assert!(user.contains(&hash), "{user}");
+
+        // A user hook can be switched off, and the definition survives.
+        let disabled = post_fields_for_test(
+            port,
+            &token,
+            "/api/hook-enabled",
+            &[
+                ("repo", repo_arg.as_str()),
+                ("hook", "noter"),
+                ("enabled", "false"),
+            ],
+        );
+        assert!(disabled.starts_with("HTTP/1.1 200"), "{disabled}");
+        let disabled = json_of(&disabled);
+        let noter = disabled["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "noter")
+            .unwrap();
+        assert_eq!(noter["activation"], "disabled", "{disabled}");
+        assert_eq!(noter["enabled"], false);
+
+        // A repository's hook is not the user's to switch off.
+        let refused_toggle = post_fields_for_test(
+            port,
+            &token,
+            "/api/hook-enabled",
+            &[
+                ("repo", repo_arg.as_str()),
+                ("hook", "lint"),
+                ("enabled", "false"),
+            ],
+        );
+        assert!(
+            refused_toggle.starts_with("HTTP/1.1 500"),
+            "{refused_toggle}"
+        );
+        assert_eq!(
+            fs::read_to_string(&repository_config).unwrap(),
+            repository_before
+        );
+
+        // A test run reports the verdict and redacted stderr.
+        let tested = post_fields_for_test(
+            port,
+            &token,
+            "/api/hook-test",
+            &[
+                ("repo", repo_arg.as_str()),
+                ("hook", "noter"),
+                ("event", "before_tool"),
+            ],
+        );
+        assert!(tested.starts_with("HTTP/1.1 200"), "{tested}");
+        let tested = json_of(&tested);
+        assert_eq!(tested["verdict"], "warn", "{tested}");
+        assert!(tested["failure"].is_null(), "{tested}");
+        let stderr = tested["stderr"].as_str().expect("stderr");
+        assert!(stderr.contains("[REDACTED_AWS_ACCESS_KEY"), "{stderr}");
+        assert!(!stderr.contains("AKIAIOSFODNN7EXAMPLE"), "{stderr}");
+
+        // The reviewed repository hook now runs, and the settings listing shows
+        // it active.
+        let ran = post_fields_for_test(
+            port,
+            &token,
+            "/api/hook-test",
+            &[
+                ("repo", repo_arg.as_str()),
+                ("hook", "lint"),
+                ("event", "before_tool"),
+            ],
+        );
+        assert!(ran.starts_with("HTTP/1.1 200"), "{ran}");
+        assert_eq!(json_of(&ran)["verdict"], "allow");
+        assert!(lint_marker.exists(), "the reviewed hook did not run");
+
+        let _ = fs::remove_dir_all(&repo);
     }
 }
 

@@ -29,10 +29,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use workspace_engine::finding::{FindingSource, Severity};
 use workspace_engine::hooks::{
     self, HOOK_API_VERSION, HookActivation, HookContext, HookDispatcher, HookEnvelope,
-    HookEnvelopeParts, HookFailureKind, HookOutcome, HookRun, MAX_HOOK_COMMANDS,
-    MAX_HOOK_CONTEXT_CHARS, MAX_HOOK_CONTEXT_ENTRIES, MAX_HOOK_DEPTH, MAX_HOOK_FINDINGS,
-    MAX_HOOK_REASON_CHARS, MAX_HOOK_STDERR_BYTES, MAX_HOOK_STDOUT_BYTES, ResponseError, Verdict,
-    WideningAttempt, activation, hook_definition_hash,
+    HookEnvelopeParts, HookFailureKind, HookOutcome, HookReviewDecision, HookRun,
+    MAX_HOOK_COMMANDS, MAX_HOOK_CONTEXT_CHARS, MAX_HOOK_CONTEXT_ENTRIES, MAX_HOOK_DEPTH,
+    MAX_HOOK_FINDINGS, MAX_HOOK_REASON_CHARS, MAX_HOOK_STDERR_BYTES, MAX_HOOK_STDOUT_BYTES,
+    ResponseError, Verdict, WideningAttempt, activation, hook_definition_hash,
 };
 use workspace_engine::{
     ApprovalCause, AuditLog, CancelToken, ChatTurnOptions, ChatTurnResult, CommandPolicy,
@@ -4973,4 +4973,488 @@ fn before_tool_overhead_is_measured() {
          per_call={per_call:?} (50 calls)"
     );
     let _ = fs::remove_dir_all(&hook_source);
+}
+
+// ---------------------------------------------------------------------------
+// Task 9: the helpers the shell and the CLI use — list, review, enable, test.
+// ---------------------------------------------------------------------------
+
+const REPOSITORY_LINT_SCRIPT: &str =
+    "#!/bin/sh\necho '{\"hookApiVersion\":1,\"verdict\":\"allow\"}'\n";
+
+/// A fixture whose config files stay on disk after loading, so a helper that
+/// writes user config can be inspected and the result loaded again.
+struct PersistentFixture {
+    root: PathBuf,
+    data_dir: PathBuf,
+    user_config: PathBuf,
+    repository_config: PathBuf,
+    admin_config: PathBuf,
+    config: Config,
+}
+
+impl PersistentFixture {
+    fn reload(&self) -> Config {
+        Config::load_scoped(
+            Config {
+                data_dir: self.data_dir.clone(),
+                enable_index_watcher: false,
+                ..Config::default()
+            },
+            Some(&self.user_config),
+            Some(&self.repository_config),
+            Some(&self.admin_config),
+            Some(&self.root),
+        )
+        .expect("the written config loads again")
+        .0
+    }
+
+    fn write_repository_lint(&self) -> PathBuf {
+        let script = self.root.join("scripts").join("lint-hook.sh");
+        write(&script, REPOSITORY_LINT_SCRIPT);
+        script
+    }
+}
+
+fn persistent(name: &str, user: &str, repository: &str) -> PersistentFixture {
+    let root = temp_dir(name);
+    let data_dir = root.join(".damaian-data");
+    let user_config = data_dir.join("config").join("user.conf");
+    let admin_config = data_dir.join("config").join("admin.conf");
+    let repository_config = Config::repository_config_path(&root);
+    write(&user_config, user);
+    write(&admin_config, "");
+    write(&repository_config, repository);
+    let config = Config::load_scoped(
+        Config {
+            data_dir: data_dir.clone(),
+            enable_index_watcher: false,
+            ..Config::default()
+        },
+        Some(&user_config),
+        Some(&repository_config),
+        Some(&admin_config),
+        Some(&root),
+    )
+    .expect("the fixture config loads")
+    .0;
+    PersistentFixture {
+        root,
+        data_dir,
+        user_config,
+        repository_config,
+        admin_config,
+        config,
+    }
+}
+
+const REPOSITORY_LINT_HOOK: &str = concat!(
+    "hook.lint.command=/bin/sh\n",
+    "hook.lint.args=./scripts/lint-hook.sh\n",
+    "hook.lint.events=before_tool|after_patch_apply\n",
+    "hook.lint.mode=optional\n",
+);
+
+#[test]
+fn list_hooks_reports_source_mode_events_and_activation() {
+    let fixture = persistent("listing", USER_GUARD, REPOSITORY_LINT_HOOK);
+    fixture.write_repository_lint();
+    let config = fixture.reload();
+
+    let listings = hooks::list_hooks(&config, &fixture.root);
+    let ids: Vec<&str> = listings.iter().map(|listing| listing.id.as_str()).collect();
+    assert_eq!(ids, ["guard", "lint"], "the list is stable by id");
+
+    let guard = listings
+        .iter()
+        .find(|listing| listing.id == "guard")
+        .unwrap();
+    assert_eq!(guard.source, "user");
+    assert_eq!(guard.command, "/usr/local/bin/guard");
+    assert!(guard.args.is_empty());
+    assert_eq!(guard.events, ["before_patch_apply", "before_tool"]);
+    assert_eq!(guard.mode, "mandatory");
+    assert_eq!(guard.order, 0);
+    assert!(guard.enabled);
+    assert_eq!(guard.activation, HookActivation::Active);
+    assert_eq!(guard.hash, None, "a user hook needs no review hash");
+
+    let lint = listings
+        .iter()
+        .find(|listing| listing.id == "lint")
+        .unwrap();
+    assert_eq!(lint.source, "repository");
+    assert_eq!(lint.command, "/bin/sh");
+    assert_eq!(lint.args, ["./scripts/lint-hook.sh"]);
+    assert_eq!(lint.events, ["before_tool", "after_patch_apply"]);
+    assert_eq!(lint.mode, "optional");
+    assert_eq!(lint.activation, HookActivation::PendingReview);
+    let hash = lint
+        .hash
+        .as_deref()
+        .expect("a repository hook has a definition hash");
+    assert_eq!(
+        hash,
+        hook_definition_hash(config.hook("lint").unwrap(), &fixture.root).unwrap()
+    );
+
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
+fn review_hook_writes_only_user_config_and_audits_the_decision() {
+    let fixture = persistent("review", USER_GUARD, REPOSITORY_LINT_HOOK);
+    let script = fixture.write_repository_lint();
+    let repository_before = fs::read_to_string(&fixture.repository_config).unwrap();
+    let hook = fixture.config.hook("lint").unwrap().clone();
+    let hash = hook_definition_hash(&hook, &fixture.root).unwrap();
+    let repository_id = repository_id_for_root(&fixture.root);
+
+    let path = hooks::review_hook(
+        &fixture.config,
+        &fixture.root,
+        "lint",
+        HookReviewDecision::Approve { hash: hash.clone() },
+    )
+    .expect("the review is written");
+
+    assert_eq!(path, fixture.user_config);
+    let user = fs::read_to_string(&fixture.user_config).unwrap();
+    assert!(
+        user.contains(&format!("hook_review.{repository_id}.lint={hash}")),
+        "{user}"
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.repository_config).unwrap(),
+        repository_before,
+        "a review must never touch the repository's own config"
+    );
+    let audit =
+        fs::read_to_string(fixture.data_dir.join("audit").join("events.jsonl")).unwrap_or_default();
+    assert!(audit.contains("\"hook_reviewed\""), "{audit}");
+    assert!(audit.contains("\"decision\":\"approved\""), "{audit}");
+    assert!(audit.contains(&hash), "{audit}");
+
+    // The review activates exactly this definition, and the script it names.
+    let reloaded = fixture.reload();
+    assert_eq!(
+        activation(
+            &reloaded,
+            reloaded.hook("lint").unwrap(),
+            &repository_id,
+            &fixture.root
+        ),
+        HookActivation::Active
+    );
+    assert!(script.exists());
+
+    // Declining replaces the approval and records the other decision.
+    hooks::review_hook(
+        &reloaded,
+        &fixture.root,
+        "lint",
+        HookReviewDecision::Decline,
+    )
+    .expect("the decline is written");
+    let reloaded = fixture.reload();
+    assert_eq!(
+        activation(
+            &reloaded,
+            reloaded.hook("lint").unwrap(),
+            &repository_id,
+            &fixture.root
+        ),
+        HookActivation::Declined
+    );
+    let user = fs::read_to_string(&fixture.user_config).unwrap();
+    assert!(
+        user.contains(&format!("hook_review.{repository_id}.lint=declined")),
+        "{user}"
+    );
+    let audit =
+        fs::read_to_string(fixture.data_dir.join("audit").join("events.jsonl")).unwrap_or_default();
+    assert!(audit.contains("\"decision\":\"declined\""), "{audit}");
+    assert_eq!(
+        fs::read_to_string(&fixture.repository_config).unwrap(),
+        repository_before,
+        "a decline must never touch the repository's own config"
+    );
+
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
+fn a_review_at_an_old_hash_does_not_activate_a_changed_hook() {
+    let fixture = persistent("review-stale", USER_GUARD, REPOSITORY_LINT_HOOK);
+    let script = fixture.write_repository_lint();
+    let repository_id = repository_id_for_root(&fixture.root);
+    let old_hash =
+        hook_definition_hash(fixture.config.hook("lint").unwrap(), &fixture.root).unwrap();
+    hooks::review_hook(
+        &fixture.config,
+        &fixture.root,
+        "lint",
+        HookReviewDecision::Approve {
+            hash: old_hash.clone(),
+        },
+    )
+    .expect("the first review is written");
+    let reloaded = fixture.reload();
+    assert_eq!(
+        activation(
+            &reloaded,
+            reloaded.hook("lint").unwrap(),
+            &repository_id,
+            &fixture.root
+        ),
+        HookActivation::Active
+    );
+
+    // The approved script changes after review. A second review at the old
+    // hash must not adopt the new definition.
+    write(&script, "#!/bin/sh\nexit 0\n");
+    let user_before = fs::read_to_string(&fixture.user_config).unwrap();
+    let error = hooks::review_hook(
+        &fixture.config,
+        &fixture.root,
+        "lint",
+        HookReviewDecision::Approve { hash: old_hash },
+    )
+    .expect_err("a review taken at an old hash is refused");
+    assert!(error.to_string().contains("changed since"), "{error}");
+    assert_eq!(
+        fs::read_to_string(&fixture.user_config).unwrap(),
+        user_before,
+        "a refused review wrote the user's config"
+    );
+
+    let reloaded = fixture.reload();
+    assert_eq!(
+        activation(
+            &reloaded,
+            reloaded.hook("lint").unwrap(),
+            &repository_id,
+            &fixture.root
+        ),
+        HookActivation::ChangedSinceReview
+    );
+
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
+fn only_a_user_hook_can_be_enabled_or_disabled_from_user_config() {
+    let fixture = persistent("enable", USER_GUARD, REPOSITORY_LINT_HOOK);
+    fixture.write_repository_lint();
+    let repository_before = fs::read_to_string(&fixture.repository_config).unwrap();
+
+    let path = hooks::set_hook_enabled(&fixture.config, "guard", false)
+        .expect("a user hook can be disabled");
+    assert_eq!(path, fixture.user_config);
+    let user = fs::read_to_string(&fixture.user_config).unwrap();
+    assert!(user.contains("hook.guard.enabled=false"), "{user}");
+    let reloaded = fixture.reload();
+    assert!(!reloaded.hook("guard").unwrap().enabled);
+    assert_eq!(
+        reloaded.hook("guard").unwrap().command,
+        "/usr/local/bin/guard",
+        "toggling a hook must not drop its definition"
+    );
+    assert!(!reloaded.hook("guard").unwrap().events.is_empty());
+
+    hooks::set_hook_enabled(&reloaded, "guard", true).expect("a user hook can be enabled");
+    let user = fs::read_to_string(&fixture.user_config).unwrap();
+    assert!(user.contains("hook.guard.enabled=true"), "{user}");
+
+    let error = hooks::set_hook_enabled(&fixture.config, "lint", false)
+        .expect_err("a repository's hook is not the user's to switch off");
+    assert!(error.to_string().contains("repository"), "{error}");
+    assert_eq!(
+        fs::read_to_string(&fixture.repository_config).unwrap(),
+        repository_before
+    );
+
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
+fn a_test_run_reports_the_verdict_the_failure_and_redacted_stderr() {
+    let fixture = persistent("test-run", "", "");
+    let script = script(
+        &fixture.root,
+        "noter",
+        "cat > /dev/null\n\
+         echo '{\"hookApiVersion\":1,\"verdict\":\"warn\",\"reason\":\"heads up\"}'\n\
+         echo 'aws key AKIAIOSFODNN7EXAMPLE' >&2\n",
+    );
+    let user = format!(
+        "hook.noter.command=/bin/sh\nhook.noter.args={}\nhook.noter.events=before_tool\n",
+        script.to_string_lossy()
+    );
+    write(&fixture.user_config, &user);
+    let config = fixture.reload();
+
+    let run = hooks::test_run(
+        &config,
+        config.hook("noter").unwrap(),
+        HookEvent::BeforeTool,
+        &fixture.root,
+    )
+    .expect("a user hook can be tested");
+
+    assert_eq!(run.verdict, Verdict::Warn);
+    assert_eq!(run.failure, None);
+    assert!(
+        run.stderr.contains("[REDACTED_AWS_ACCESS_KEY"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("AKIAIOSFODNN7EXAMPLE"),
+        "{}",
+        run.stderr
+    );
+
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
+fn a_failing_test_run_reports_the_failure_and_its_configured_fail_direction() {
+    let fixture = persistent("test-run-failure", "", "");
+    let broken_script = script(
+        &fixture.root,
+        "broken",
+        "cat > /dev/null\necho 'the check is broken' >&2\nexit 3\n",
+    );
+    let mandatory = format!(
+        "hook.broken.command=/bin/sh\nhook.broken.args={}\nhook.broken.events=before_tool\n",
+        broken_script.to_string_lossy()
+    );
+    write(&fixture.user_config, &mandatory);
+    let config = fixture.reload();
+    let run = hooks::test_run(
+        &config,
+        config.hook("broken").unwrap(),
+        HookEvent::BeforeTool,
+        &fixture.root,
+    )
+    .expect("a failing hook still answers with its failure");
+    assert_eq!(run.verdict, Verdict::Deny, "a mandatory failure blocks");
+    assert_eq!(run.failure, Some(HookFailureKind::NonZeroExit));
+    assert!(run.stderr.contains("the check is broken"), "{}", run.stderr);
+
+    let optional = format!(
+        "hook.broken.command=/bin/sh\nhook.broken.args={}\nhook.broken.events=before_tool\nhook.broken.mode=optional\n",
+        broken_script.to_string_lossy()
+    );
+    write(&fixture.user_config, &optional);
+    let config = fixture.reload();
+    let run = hooks::test_run(
+        &config,
+        config.hook("broken").unwrap(),
+        HookEvent::BeforeTool,
+        &fixture.root,
+    )
+    .expect("an optional failing hook still answers");
+    assert_eq!(run.verdict, Verdict::Warn, "an optional failure warns");
+    assert_eq!(run.failure, Some(HookFailureKind::NonZeroExit));
+
+    // A response outside the contract is a failure, not an answer: an unknown
+    // verdict is a widening attempt, and a newer contract version is not
+    // assumed benign (`context.md` §5).
+    let widening = script(
+        &fixture.root,
+        "widening",
+        "cat > /dev/null\necho '{\"hookApiVersion\":1,\"verdict\":\"approve\"}'\n",
+    );
+    write(
+        &fixture.user_config,
+        &format!(
+            "hook.broken.command=/bin/sh\nhook.broken.args={}\nhook.broken.events=before_tool\n",
+            widening.to_string_lossy()
+        ),
+    );
+    let config = fixture.reload();
+    let run = hooks::test_run(
+        &config,
+        config.hook("broken").unwrap(),
+        HookEvent::BeforeTool,
+        &fixture.root,
+    )
+    .expect("a widening response is still reported");
+    assert_eq!(run.failure, Some(HookFailureKind::Malformed));
+    assert_eq!(run.verdict, Verdict::Deny);
+
+    let version = script(
+        &fixture.root,
+        "version",
+        "cat > /dev/null\necho '{\"hookApiVersion\":2,\"verdict\":\"allow\"}'\n",
+    );
+    write(
+        &fixture.user_config,
+        &format!(
+            "hook.broken.command=/bin/sh\nhook.broken.args={}\nhook.broken.events=before_tool\n",
+            version.to_string_lossy()
+        ),
+    );
+    let config = fixture.reload();
+    let run = hooks::test_run(
+        &config,
+        config.hook("broken").unwrap(),
+        HookEvent::BeforeTool,
+        &fixture.root,
+    )
+    .expect("a version mismatch is still reported");
+    assert_eq!(run.failure, Some(HookFailureKind::VersionMismatch));
+    assert_eq!(run.verdict, Verdict::Deny);
+
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
+fn a_test_run_never_executes_a_repository_hook_before_it_is_reviewed() {
+    let fixture = persistent("test-run-pending", "", REPOSITORY_LINT_HOOK);
+    let marker = fixture.root.join("lint-ran");
+    let script = fixture.write_repository_lint();
+    write(
+        &script,
+        &format!(
+            "#!/bin/sh\ntouch {}\necho '{{\"hookApiVersion\":1,\"verdict\":\"allow\"}}'\n",
+            marker.to_string_lossy()
+        ),
+    );
+    let config = fixture.reload();
+
+    let error = hooks::test_run(
+        &config,
+        config.hook("lint").unwrap(),
+        HookEvent::BeforeTool,
+        &fixture.root,
+    )
+    .expect_err("an unreviewed repository hook must not run");
+    assert!(error.to_string().contains("review"), "{error}");
+    assert!(!marker.exists(), "a pending hook's executable ran");
+
+    // Once reviewed at this hash, the same hook can be tested.
+    let hash = hook_definition_hash(config.hook("lint").unwrap(), &fixture.root).unwrap();
+    hooks::review_hook(
+        &config,
+        &fixture.root,
+        "lint",
+        HookReviewDecision::Approve { hash },
+    )
+    .expect("the review is written");
+    let config = fixture.reload();
+    let run = hooks::test_run(
+        &config,
+        config.hook("lint").unwrap(),
+        HookEvent::BeforeTool,
+        &fixture.root,
+    )
+    .expect("a reviewed repository hook can be tested");
+    assert_eq!(run.verdict, Verdict::Allow);
+    assert!(marker.exists(), "the reviewed hook did not run");
+
+    let _ = fs::remove_dir_all(&fixture.root);
 }

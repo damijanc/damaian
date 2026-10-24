@@ -2342,6 +2342,29 @@ button:disabled {
   color: #909294;
 }
 
+.hook-icon::before {
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  top: 3px;
+  bottom: 5px;
+  border: 2px solid currentColor;
+  border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+  content: "";
+}
+
+.hook-icon::after {
+  position: absolute;
+  left: 50%;
+  bottom: 1px;
+  width: 2px;
+  height: 6px;
+  margin-left: -1px;
+  background: currentColor;
+  content: "";
+}
+
 .sliders-icon::before,
 .sliders-icon::after {
   position: absolute;
@@ -2612,6 +2635,121 @@ button:disabled {
   border-radius: 8px;
   font-size: 13px;
   padding: 7px 12px;
+}
+
+/* Hooks in Settings (spec 32 Task 9). */
+.hook-entry {
+  border-bottom: 1px solid var(--line);
+}
+
+.hook-entry:last-child {
+  border-bottom: 0;
+}
+
+.hook-entry .settings-row {
+  align-items: flex-start;
+  border-bottom: 0;
+}
+
+.hook-row-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.hook-command {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+
+.hook-row-actions {
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.hook-toggle {
+  white-space: nowrap;
+}
+
+.hook-event-select {
+  max-width: 180px;
+}
+
+.hook-test-result {
+  margin: 0;
+  border-top: 1px dashed var(--line);
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 10px 16px 12px;
+}
+
+.hook-test-result[data-state="ok"] {
+  color: var(--ok);
+}
+
+.hook-test-result[data-state="warn"] {
+  color: var(--warn);
+}
+
+.hook-test-result[data-state="error"] {
+  color: var(--danger);
+}
+
+.hook-test-result[hidden] {
+  display: none;
+}
+
+.hook-review-label {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.hook-review-command {
+  margin: 4px 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 8px 10px;
+}
+
+.hook-review-meta {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.patch-hook-warnings {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  padding: 10px 12px;
+}
+
+.patch-hook-warnings strong {
+  font-size: 13px;
+}
+
+.patch-hook-warnings p {
+  margin: 4px 0 0;
+  color: var(--ink);
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .settings-provider-editor {

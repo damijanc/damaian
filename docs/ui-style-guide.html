@@ -486,6 +486,30 @@
     </section>
 
     <section class="sg-section">
+      <h2>Hook review</h2>
+      <p class="sg-hint">
+        A repository-defined hook is a consent surface: the command line is shown in full, its
+        events and fail direction sit outside any disclosure, and <strong>Decline is the default
+        action</strong>. Approve is never filled or pre-selected. Dismissing records neither
+        decision, so the repository is asked about again next time.
+      </p>
+      <div class="app-dialog app-dialog-wide app-dialog-hook-review">
+        <p class="app-dialog-title">This repository defines a hook</p>
+        <p class="app-dialog-message">
+          app ships a hook named "no_migrations". Damaian will run it only after you approve this
+          exact definition. If it changes later, it stops running until you review it again.
+        </p>
+        <p class="hook-review-label">Command</p>
+        <pre class="hook-review-command">/bin/sh ./scripts/no-migrations.sh --strict</pre>
+        <p class="hook-review-meta">Events: before_patch_apply, before_tool · If it fails: blocks</p>
+        <div class="app-dialog-actions">
+          <button type="button" class="app-dialog-btn app-dialog-decline">Decline</button>
+          <button type="button" class="app-dialog-btn app-dialog-approve">Approve</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="sg-section">
       <h2>Question surface</h2>
       <p class="sg-hint">
         A question from the model, not an approval request. It shares no chrome with the command

@@ -1,15 +1,17 @@
 use std::env;
 use std::io::IsTerminal;
 use std::path::Path;
+use workspace_engine::hooks::{HookReviewDecision, list_hooks, review_hook, test_run};
 use workspace_engine::{
     CURRENT_DATA_SCHEMA_VERSION, CancelToken, CommandProposal, CommandRisk, Config, ConfigOverlay,
-    ConfigScope, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExclusionReason, MapLoad,
-    MockModelAdapter, OpenAICompatibleAdapter, ProcessRegistry, ProfileId, ReadWindow,
-    RebuildReason, RepositoryMap, RootEvidence, RootOverride, RootOverrideEdit, SearchResult,
-    SymbolLoad, SymbolMatch, WorkspaceEngine, command_approval_prompt, edit_root_overrides,
-    ensure_data_dir_schema, export_profile, import_profile, parse_hunk_selection, patch_diff_text,
-    patch_hunk_summary, profile_import_base, render_markdown_to_ansi, review_profile_import,
-    review_profile_rejections, select_profile, symbol_matches_json,
+    ConfigScope, CurlModelTransport, DataSchemaOutcome, EffectivePolicy, ExclusionReason,
+    HookEvent, MapLoad, MockModelAdapter, OpenAICompatibleAdapter, ProcessRegistry, ProfileId,
+    ReadWindow, RebuildReason, RepositoryMap, RootEvidence, RootOverride, RootOverrideEdit,
+    SearchResult, SymbolLoad, SymbolMatch, WorkspaceEngine, command_approval_prompt,
+    edit_root_overrides, ensure_data_dir_schema, export_profile, hook_definition_hash,
+    import_profile, parse_hunk_selection, patch_diff_text, patch_hunk_summary, profile_import_base,
+    render_markdown_to_ansi, review_profile_import, review_profile_rejections, select_profile,
+    symbol_matches_json,
 };
 
 fn usage() -> &'static str {
@@ -31,6 +33,9 @@ fn usage() -> &'static str {
   damaian config-set user <key> <value>
   damaian config-set repo <repo> <key> <value>
   damaian config-set admin <key> <value>
+  damaian hooks <repo>
+  damaian hook-review <repo> <id> approve|decline
+  damaian hook-run <repo> <id> <event>
   damaian profile-set <repo> <read_only|safe_local|full|offline_private|custom-name>
   damaian profile-export <profile> [file]
   damaian profile-import <custom-name> <file> [--repo <repo>] [--replace] [--review]
@@ -259,6 +264,22 @@ fn run() -> workspace_engine::Result<()> {
         "config-allowlist-keep" => {
             let repo = require_arg(&args, 1, "<repo>")?;
             print!("{}", keep_repository_allowlist(repo, &args[2..])?);
+        }
+        "hooks" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            print!("{}", hooks_listing(repo)?);
+        }
+        "hook-review" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let id = require_arg(&args, 2, "<id>")?;
+            let decision = require_arg(&args, 3, "approve|decline")?;
+            print!("{}", review_hook_command(repo, id, decision)?);
+        }
+        "hook-run" => {
+            let repo = require_arg(&args, 1, "<repo>")?;
+            let id = require_arg(&args, 2, "<id>")?;
+            let event = require_arg(&args, 3, "<event>")?;
+            print!("{}", run_hook_command(repo, id, event)?);
         }
         "config-set" => {
             set_config_value(&args)?;
@@ -701,6 +722,106 @@ fn repository_config_review(repo: &str) -> workspace_engine::Result<String> {
                 rejected.key,
                 rejected.class.as_str()
             ));
+        }
+    }
+    Ok(output)
+}
+
+/// Every configured hook, whether it can run yet, and the command it runs.
+/// Spec 32 Task 9; the shell's Settings page shows the same listing.
+fn hooks_listing(repo: &str) -> workspace_engine::Result<String> {
+    let config = Config::load_for_repository(Some(Path::new(repo)))?;
+    let listings = list_hooks(&config, Path::new(repo));
+    if listings.is_empty() {
+        return Ok("no hooks configured\n".to_string());
+    }
+    let mut output = String::new();
+    for hook in listings {
+        let failure = if hook.mode == "mandatory" {
+            "if it fails: blocks"
+        } else {
+            "if it fails: warns"
+        };
+        output.push_str(&format!(
+            "{}  {}  {} ({failure})  {}\n",
+            hook.id,
+            hook.source,
+            hook.mode,
+            hook.activation.as_str()
+        ));
+        let events = hook.events.join(", ");
+        output.push_str(&format!("  events: {events}\n"));
+        let mut command = hook.command;
+        if !hook.args.is_empty() {
+            command.push(' ');
+            command.push_str(&hook.args.join(" "));
+        }
+        output.push_str(&format!("  command: {command}\n"));
+        if let Some(hash) = hook.hash {
+            output.push_str(&format!("  review hash: {hash}\n"));
+        }
+    }
+    Ok(output)
+}
+
+/// `hook-review <repo> <id> approve|decline`. The review is written to user
+/// config, never to the repository's own `.damaian/config.conf`, and an
+/// approval records the definition hash that is current now.
+fn review_hook_command(
+    repo: &str,
+    hook_id: &str,
+    decision: &str,
+) -> workspace_engine::Result<String> {
+    let config = Config::load_for_repository(Some(Path::new(repo)))?;
+    let hook = config.hook(hook_id).cloned().ok_or_else(|| {
+        workspace_engine::ClientError::InvalidInput(format!("Hook `{hook_id}` is not configured"))
+    })?;
+    let decision = match decision {
+        "approve" => HookReviewDecision::Approve {
+            hash: hook_definition_hash(&hook, Path::new(repo))?,
+        },
+        "decline" => HookReviewDecision::Decline,
+        _ => {
+            return Err(workspace_engine::ClientError::InvalidInput(
+                "hook-review takes approve or decline".to_string(),
+            ));
+        }
+    };
+    let approved = matches!(decision, HookReviewDecision::Approve { .. });
+    let path = review_hook(&config, Path::new(repo), hook_id, decision)?;
+    Ok(format!(
+        "{} {}\nwrote {}\n",
+        hook_id,
+        if approved { "approved" } else { "declined" },
+        path.to_string_lossy()
+    ))
+}
+
+/// `hook-run <repo> <id> <event>`: one hook against a sample envelope, with
+/// its redacted stderr, for debugging a failing hook (proposal §5.11).
+fn run_hook_command(repo: &str, hook_id: &str, event: &str) -> workspace_engine::Result<String> {
+    let event = HookEvent::parse(event).ok_or_else(|| {
+        workspace_engine::ClientError::InvalidInput(format!("Unknown hook event: {event}"))
+    })?;
+    let config = Config::load_for_repository(Some(Path::new(repo)))?;
+    let hook = config.hook(hook_id).cloned().ok_or_else(|| {
+        workspace_engine::ClientError::InvalidInput(format!("Hook `{hook_id}` is not configured"))
+    })?;
+    let run = test_run(&config, &hook, event, Path::new(repo))?;
+    let mut output = format!(
+        "{hook_id} at {}: {}\nfailure: {}\nduration: {} ms\n",
+        event.as_str(),
+        run.verdict.as_str(),
+        run.failure.map_or("none", |kind| kind.as_str()),
+        run.duration_ms
+    );
+    if run.stderr.trim().is_empty() {
+        output.push_str("stderr: (empty)\n");
+    } else {
+        output.push_str("stderr:\n");
+        output.push_str(&run.stderr);
+        if !run.stderr.ends_with('\n') {
+            output.push('\n');
         }
     }
     Ok(output)

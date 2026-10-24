@@ -365,6 +365,22 @@ the UI, because the user is granting consent rather than navigating.
 - **Nothing is pre-selected toward approval.** Focus does not land on the
   primary action.
 
+### Hook review
+
+Spec 32 lets a repository ship a hook. It does not run until the user approves
+the exact definition, so this is a consent surface rather than a setting:
+
+- **The command line is shown in full**, wrapped, never scrolled or elided.
+- **Its events and fail direction sit outside any disclosure** — "Events:
+  before_patch_apply, before_tool · If it fails: blocks".
+- **Decline is the default action.** It takes focus; Approve is never
+  `.btn-primary` and is never pre-selected.
+- **Dismissing records no decision**, and the notice returns next time.
+- The id, command and arguments are repository-authored, so they enter the DOM
+  through `textContent`, never as markup.
+- An approval is taken at the definition's hash: if the definition changes, the
+  hook stops until it is reviewed again, and the prompt says so.
+
 ### Question surface
 
 Spec 50 lets the model ask one bounded question mid-turn. That surface is

@@ -27,7 +27,8 @@ use crate::cancel::CancelToken;
 use crate::chat::{CommandRequest, ToolAction};
 use crate::command_runner::CommandTermination;
 use crate::command_runner::kill_process_group;
-use crate::config::Config;
+use crate::config::{Config, ConfigOverlay};
+use crate::error::ClientError;
 use crate::finding::{
     Finding, FindingDraft, FindingSource, Severity, SourceRange, default_parsers,
     findings_from_execution,
@@ -900,6 +901,307 @@ fn repository_command_is_contained(hook: &HookConfig, repository_root: &Path) ->
     }
     let root = fs::canonicalize(repository_root).unwrap_or_else(|_| repository_root.to_path_buf());
     fs::canonicalize(root.join(command)).is_ok_and(|resolved| resolved.starts_with(&root))
+}
+
+/// One hook as the shell and the CLI show it: what it runs, when, how it fails
+/// and whether it is active right now (proposal §5.5, §5.8, `context.md` §7.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookListing {
+    pub id: String,
+    pub source: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub events: Vec<String>,
+    pub mode: String,
+    pub order: i64,
+    pub timeout_ms: Option<u64>,
+    pub enabled: bool,
+    pub activation: HookActivation,
+    /// The definition hash a repository hook would be approved at. `None` for
+    /// a user or admin hook, whose definition is already the user's.
+    pub hash: Option<String>,
+}
+
+/// Every configured hook, active or not, sorted by id. A repository hook is
+/// inactive until its current definition hash is reviewed (`context.md` §7.1).
+pub fn list_hooks(config: &Config, repository_root: &Path) -> Vec<HookListing> {
+    let repository_id = repository_id_for_root(repository_root);
+    let mut listings: Vec<HookListing> = config
+        .hooks
+        .iter()
+        .map(|hook| HookListing {
+            id: hook.id.clone(),
+            source: hook.source.as_str().to_string(),
+            command: hook.command.clone(),
+            args: hook.args.clone(),
+            events: hook
+                .events
+                .iter()
+                .map(|event| event.as_str().to_string())
+                .collect(),
+            mode: hook.mode.as_str().to_string(),
+            order: hook.order,
+            timeout_ms: hook.timeout_ms,
+            enabled: hook.enabled,
+            activation: activation(config, hook, &repository_id, repository_root),
+            hash: (hook.source == HookSource::Repository)
+                .then(|| hook_definition_hash(hook, repository_root).ok())
+                .flatten(),
+        })
+        .collect();
+    listings.sort_by(|a, b| a.id.cmp(&b.id));
+    listings
+}
+
+/// The user's decision about one repository-defined hook (`context.md` §7.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookReviewDecision {
+    /// Approve exactly the definition whose hash was shown to the user.
+    Approve {
+        hash: String,
+    },
+    Decline,
+}
+
+impl HookReviewDecision {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HookReviewDecision::Approve { .. } => "approved",
+            HookReviewDecision::Decline => "declined",
+        }
+    }
+}
+
+/// Records the user's review of a repository hook in **user** config, never in
+/// the repository's own `.damaian/config.conf`, and audits it (`context.md`
+/// §11).
+///
+/// An approval must carry the hash the user was shown. The current definition
+/// hash is recomputed here and must still equal it: a hook whose script or
+/// definition changed while the review was on screen is refused, so an old
+/// review can never adopt a definition the user did not see. Declining needs
+/// no hash.
+pub fn review_hook(
+    config: &Config,
+    repository_root: &Path,
+    hook_id: &str,
+    decision: HookReviewDecision,
+) -> crate::error::Result<PathBuf> {
+    let hook = config
+        .hook(hook_id)
+        .ok_or_else(|| ClientError::InvalidInput(format!("Hook `{hook_id}` is not configured")))?;
+    if hook.source != HookSource::Repository {
+        return Err(ClientError::InvalidInput(format!(
+            "Hook `{hook_id}` is configured in your own config, so it has no review"
+        )));
+    }
+    let repository_id = repository_id_for_root(repository_root);
+    let decision_label = decision.as_str();
+    let hash = match decision {
+        HookReviewDecision::Decline => None,
+        HookReviewDecision::Approve { hash } => {
+            let current = hook_definition_hash(hook, repository_root)?;
+            if current != hash {
+                return Err(ClientError::InvalidInput(format!(
+                    "Hook `{hook_id}` changed since it was shown to you; review its current \
+                     definition, then approve it again"
+                )));
+            }
+            Some(current)
+        }
+    };
+    let value = hash.clone().unwrap_or_else(|| "declined".to_string());
+
+    let path = config.user_config_path();
+    let mut overlay = ConfigOverlay::load_or_default(&path)?;
+    overlay.set(&format!("hook_review.{repository_id}.{hook_id}"), &value)?;
+    overlay.save(&path)?;
+
+    let audit = AuditLog::with_retention(
+        &config.data_dir,
+        config.audit_enabled,
+        config.audit_retention_days,
+        SecretScanner::new(config.secret_patterns.clone()),
+    );
+    let mut fields = vec![
+        ("repositoryId", repository_id),
+        ("hookId", hook_id.to_string()),
+        ("decision", decision_label.to_string()),
+    ];
+    if let Some(hash) = hash {
+        fields.push(("hash", hash));
+    }
+    audit.record("hook_reviewed", &fields)?;
+    Ok(path)
+}
+
+/// Switches one of the user's own hooks on or off in **user** config.
+///
+/// A repository-defined hook cannot be switched from here: its definition
+/// lives in the repository, and the user's only decision about it is the
+/// review (`context.md` §7.1). An admin-defined hook belongs to the
+/// administrator's file, which is applied last and would override a user
+/// toggle.
+pub fn set_hook_enabled(
+    config: &Config,
+    hook_id: &str,
+    enabled: bool,
+) -> crate::error::Result<PathBuf> {
+    let hook = config
+        .hook(hook_id)
+        .ok_or_else(|| ClientError::InvalidInput(format!("Hook `{hook_id}` is not configured")))?;
+    match hook.source {
+        HookSource::Repository => {
+            return Err(ClientError::InvalidInput(format!(
+                "Hook `{hook_id}` is defined by this repository; your config cannot switch it \
+                 on or off. Review it, or change the repository's own config"
+            )));
+        }
+        HookSource::Admin => {
+            return Err(ClientError::InvalidInput(format!(
+                "Hook `{hook_id}` is defined in the administrator's config and cannot be \
+                 switched from your own"
+            )));
+        }
+        HookSource::User => {}
+    }
+    let path = config.user_config_path();
+    let mut overlay = ConfigOverlay::load_or_default(&path)?;
+    overlay.set(
+        &format!("hook.{hook_id}.enabled"),
+        if enabled { "true" } else { "false" },
+    )?;
+    overlay.save(&path)?;
+    Ok(path)
+}
+
+/// The result of running one hook by hand (`context.md` §5, proposal §5.11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookTestRun {
+    /// What the hook answered, or the fail direction its `mode` gives a
+    /// failure: `deny` for a mandatory hook, `warn` for an optional one.
+    pub verdict: Verdict,
+    pub failure: Option<HookFailureKind>,
+    /// Already redacted, and the last 8 KiB only: for the user debugging the
+    /// hook, never for the model.
+    pub stderr: String,
+    pub duration_ms: u64,
+}
+
+/// Runs one hook against a sample envelope, the way the shell's Test button
+/// and `damaian hook-run` do (`context.md` §5, proposal §5.11).
+///
+/// This is the one hook, with no ordering and no resolution, so it reports what
+/// that hook itself would answer. It refuses a repository hook that is not
+/// active: running an unreviewed definition would execute a repository's
+/// executable before the user approved it, which is the review gate's whole
+/// purpose. A user's own disabled hook can still be tested, because its
+/// definition is already the user's.
+pub fn test_run(
+    config: &Config,
+    hook: &HookConfig,
+    event: HookEvent,
+    repository_root: &Path,
+) -> crate::error::Result<HookTestRun> {
+    let repository_id = repository_id_for_root(repository_root);
+    if hook.source == HookSource::Repository {
+        let now = activation(config, hook, &repository_id, repository_root);
+        if now != HookActivation::Active {
+            return Err(ClientError::InvalidInput(format!(
+                "Hook `{}` is {} for this repository; review its current definition before \
+                 testing it",
+                hook.id,
+                now.as_str()
+            )));
+        }
+    }
+
+    let envelope = HookEnvelope {
+        event,
+        hook_api_version: HOOK_API_VERSION,
+        session_id: None,
+        task_id: None,
+        mode: SessionMode::Code.as_str().to_string(),
+        profile: "full".to_string(),
+        repository_root: repository_root.to_path_buf(),
+        hook_depth: 0,
+        payload: sample_payload(event),
+    };
+    let scanner = SecretScanner::new(config.secret_patterns.clone());
+    let run = run_hook(
+        hook,
+        &envelope,
+        repository_root,
+        &config.data_dir,
+        "hook-test",
+        &scanner,
+        Duration::from_millis(hook.deadline_ms(event)),
+    );
+    let fail_direction = match hook.mode {
+        HookMode::Mandatory => Verdict::Deny,
+        HookMode::Optional => Verdict::Warn,
+    };
+    let mut failure = run.failure;
+    let verdict = if failure.is_none() {
+        match parse_response(&run.stdout) {
+            Ok(response) => response.verdict,
+            Err(ResponseError::Widening { .. }) => {
+                failure = Some(HookFailureKind::Malformed);
+                fail_direction
+            }
+            Err(error) => {
+                failure = Some(error.failure_kind());
+                fail_direction
+            }
+        }
+    } else {
+        fail_direction
+    };
+    Ok(HookTestRun {
+        verdict,
+        failure,
+        stderr: run.stderr,
+        duration_ms: run.duration.as_millis() as u64,
+    })
+}
+
+/// A representative payload for each event (`context.md` §6), so a test run
+/// exercises the hook with the shape it will see in a real turn.
+fn sample_payload(event: HookEvent) -> Value {
+    let file = json!({ "path": "src/lib.rs", "status": "modified" });
+    match event {
+        HookEvent::SessionStart | HookEvent::SessionEnd => json!({}),
+        HookEvent::BeforeContext => {
+            json!({ "flow": "chat", "explicitPaths": ["src/lib.rs"] })
+        }
+        HookEvent::BeforeTool => json!({ "tool": "read_file", "paths": ["src/lib.rs"] }),
+        HookEvent::AfterTool => json!({
+            "tool": "run_command",
+            "paths": [],
+            "command": "cargo test",
+            "outcome": "ok",
+            "exitCode": 0,
+            "termination": "exited",
+        }),
+        HookEvent::BeforePatchApply => {
+            json!({ "patchId": "patch_sample", "files": [file] })
+        }
+        HookEvent::AfterPatchApply => json!({
+            "patchId": "patch_sample",
+            "files": [file],
+            "appliedFiles": ["src/lib.rs"],
+        }),
+        HookEvent::AfterCheck => json!({
+            "command": "cargo test",
+            "exitCode": 0,
+            "termination": "exited",
+            "findingIds": [],
+        }),
+        HookEvent::BeforeTaskComplete => {
+            json!({ "rounds": 1, "filesChanged": ["src/lib.rs"] })
+        }
+    }
 }
 
 /// Where a dispatch sits in the recursion graph (`context.md` §9). Task 5
