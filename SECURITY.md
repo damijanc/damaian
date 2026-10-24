@@ -162,6 +162,7 @@ Prompts and the context Damaian assembles go to the model provider you configure
 
 - **Provider fallback.** When a provider refuses a turn and a second qualifying provider is configured, the desktop app offers to answer that one turn with it. The offer is refused unless you accept it, it never becomes permanent, and it covers only the turn it was offered for.
 - **Browser diagnostics on a remote URL.** Inspecting a local page (`localhost`, `127.0.0.1`, `[::1]`) runs without asking. Any page outside your machine asks every time and shows the origin it will reach; the per-session grant never covers a remote URL.
+- **A language server.** A configured `language_server.<language>` is a local program you named in your own config, started with the repository as its working directory. Damaian sends it the content of files it already has on disk, and scans everything it returns before storing or showing it. It is not a network endpoint, and a repository cannot name one (see [Repository Config Trust Boundary](#repository-config-trust-boundary)).
 
 The provider API key is stored in the macOS Keychain under the service `DamaianClient`, or read from an environment variable you name. Config holds only a reference to it (`keychain:<account>` or the variable's name), never the key itself.
 

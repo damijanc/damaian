@@ -1335,6 +1335,86 @@ error[E0308]: mismatched types
     </section>
 
     <section class="sg-section">
+      <h2>Symbol results</h2>
+      <p class="sg-hint">
+        The thread header's <code>{}</code> control opens symbol search. A result is reference
+        information: its <code>path:line</code> is the clickable part, the root appears only when it
+        is not the repository root, and a heuristic result carries the <em>likely</em> marker whose
+        hover text says it was derived from source text rather than a language server.
+      </p>
+      <div class="sg-card" style="display: grid; gap: 8px">
+        <div class="symbol-search-hit">
+          <div class="symbol-search-hit-header">
+            <strong class="symbol-search-hit-name">upload_retry</strong>
+            <span class="symbol-kind-chip">function</span>
+            <span
+              class="symbol-provenance"
+              title="Derived from source text rather than a language server; may be inaccurate."
+              >likely</span
+            >
+          </div>
+          <div class="symbol-search-hit-meta">
+            <button type="button" class="symbol-path">packages/api/src/upload.ts:42</button>
+            <span class="symbol-root">packages/api</span>
+          </div>
+          <div class="inline-actions">
+            <button type="button" class="btn-sm symbol-find-references">Find references</button>
+          </div>
+          <div class="symbol-references">
+            <div class="symbol-reference-row">
+              <button type="button" class="symbol-path">src/client.rs:88</button>
+              <span class="symbol-reference-name">send_with_retry</span>
+            </div>
+          </div>
+        </div>
+        <div class="symbol-search-hit">
+          <div class="symbol-search-hit-header">
+            <strong class="symbol-search-hit-name">UploadClient</strong>
+            <span class="symbol-kind-chip">struct</span>
+          </div>
+          <div class="symbol-search-hit-meta">
+            <button type="button" class="symbol-path">src/upload.rs:12</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="sg-section">
+      <h2>Language servers</h2>
+      <p class="sg-hint">
+        Settings › General. Every configured language is listed, whether a lookup has started it or
+        not. An unavailable server keeps the reason; a crashed one says whether its single restart
+        is still ahead of it.
+      </p>
+      <div class="sg-card" style="display: grid; gap: 8px">
+        <div class="language-server-row" data-state="ready">
+          <div class="language-server-heading">
+            <strong class="language-server-language">rust</strong>
+            <span class="language-server-state">running — pid 4242</span>
+          </div>
+          <code class="language-server-command">rust-analyzer</code>
+        </div>
+        <div class="language-server-row" data-state="unavailable">
+          <div class="language-server-heading">
+            <strong class="language-server-language">python</strong>
+            <span class="language-server-state">unavailable</span>
+          </div>
+          <code class="language-server-command">pyright-langserver --stdio</code>
+          <p class="language-server-reason">
+            spawn failed: No such file or directory (os error 2)
+          </p>
+        </div>
+        <div class="language-server-row" data-state="idle">
+          <div class="language-server-heading">
+            <strong class="language-server-language">go</strong>
+            <span class="language-server-state">not started</span>
+          </div>
+          <code class="language-server-command">gopls</code>
+        </div>
+      </div>
+    </section>
+
+    <section class="sg-section">
       <h2>Repository roots</h2>
       <p class="sg-hint">
         Settings › General. Each root is listed with its languages, command count and whether

@@ -14,8 +14,10 @@ use crate::hash::{file_hash, repository_id_for_root};
 use crate::hooks::{HookContext, HookDispatcher, HookEvent};
 use crate::index_cache::IndexCache;
 use crate::indexer::ProjectIndexer;
+use crate::language::detect_language;
 use crate::lsp::{
-    DefinitionPass, LanguageServerHub, LanguageServerLaunch, PassClaim, run_definition_pass,
+    DefinitionPass, LanguageServerHub, LanguageServerLaunch, PassClaim, Position, RepositoryUris,
+    run_definition_pass, symbol_refs_from_locations,
 };
 use crate::navigation::NavigationController;
 use crate::patch_engine::PatchEngine;
@@ -24,7 +26,10 @@ use crate::repository_map::{MapLoad, RepositoryMap, RepositoryMapStore};
 use crate::repository_trust::RepositoryTrustStore;
 use crate::secret_scanner::SecretScanner;
 use crate::session::SessionStore;
-use crate::symbol_index::{SymbolIndex, SymbolIndexStore, SymbolLoad, SymbolMatch};
+use crate::symbol_index::{
+    CachedRelationSet, Provenance, Relation, RelationKind, RelationTarget, SymbolIndex,
+    SymbolIndexStore, SymbolLoad, SymbolMatch, SymbolRef, SymbolReferences,
+};
 use crate::validation::{CommandStore, ValidationOrchestrator};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
@@ -284,6 +289,232 @@ impl WorkspaceEngine {
         Ok(index.find(query, limit))
     }
 
+    /// The shell's symbol search: [`Self::find_symbols`] over the current
+    /// snapshot, then an eager definition pass in the background so a
+    /// configured language server can improve the *next* read. The matches
+    /// returned are the snapshot from before the pass starts, and starting it
+    /// returns at once, so neither this request nor a turn waits on a server.
+    /// No `language_server.<language>` means the pass is not started at all.
+    pub fn symbol_search(
+        &self,
+        repository_root: impl AsRef<Path>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SymbolMatch>> {
+        self.symbol_search_with(LanguageServerHub::global(), repository_root, query, limit)
+    }
+
+    /// [`Self::symbol_search`] against `hub`, for tests that must not use the
+    /// global hub.
+    pub fn symbol_search_with<H>(
+        &self,
+        hub: H,
+        repository_root: impl AsRef<Path>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SymbolMatch>>
+    where
+        H: Deref<Target = LanguageServerHub> + Send + 'static,
+    {
+        let root = repository_root.as_ref().to_path_buf();
+        let matches = self.find_symbols(&root, query, limit)?;
+        // A pass that cannot start costs only the next read its improvement;
+        // it must never turn a successful search into an error.
+        let _ = self.start_definition_pass_with(hub, &root, SYMBOL_SEARCH_SESSION);
+        Ok(matches)
+    }
+
+    /// The language server's references for `symbol`, fetched on demand
+    /// (proposal §5.5). See [`Self::symbol_references_with`].
+    pub fn symbol_references(
+        &self,
+        repository_root: impl AsRef<Path>,
+        symbol: &SymbolRef,
+    ) -> Result<SymbolReferences> {
+        self.symbol_references_with(LanguageServerHub::global(), repository_root, symbol)
+    }
+
+    /// `textDocument/references` for `symbol`, with `includeDeclaration:
+    /// false`, answered by the language server configured for the symbol's
+    /// language. This is the one place a caller waits on a server, because the
+    /// user asked for this symbol directly; the wait is the hub's request
+    /// timeout. Without a configured server, or if it is unavailable or times
+    /// out, the result is empty and `available` is false: references are only
+    /// reported where they are reliable, never guessed from source text.
+    ///
+    /// The answer is cached under the content hash of the defining file and
+    /// every referencing file, and returned again only while all of them still
+    /// match; otherwise it is fetched again.
+    pub fn symbol_references_with<H>(
+        &self,
+        hub: H,
+        repository_root: impl AsRef<Path>,
+        symbol: &SymbolRef,
+    ) -> Result<SymbolReferences>
+    where
+        H: Deref<Target = LanguageServerHub>,
+    {
+        self.symbol_relations_with(hub, repository_root, symbol, RelationKind::References)
+    }
+
+    /// The language server's implementations for `symbol`, fetched on demand
+    /// like [`Self::symbol_references`].
+    pub fn symbol_implementations(
+        &self,
+        repository_root: impl AsRef<Path>,
+        symbol: &SymbolRef,
+    ) -> Result<SymbolReferences> {
+        self.symbol_implementations_with(LanguageServerHub::global(), repository_root, symbol)
+    }
+
+    /// `textDocument/implementation` for `symbol`, with the same availability
+    /// and cache rules as [`Self::symbol_references_with`].
+    pub fn symbol_implementations_with<H>(
+        &self,
+        hub: H,
+        repository_root: impl AsRef<Path>,
+        symbol: &SymbolRef,
+    ) -> Result<SymbolReferences>
+    where
+        H: Deref<Target = LanguageServerHub>,
+    {
+        self.symbol_relations_with(hub, repository_root, symbol, RelationKind::Implements)
+    }
+
+    fn symbol_relations_with(
+        &self,
+        hub: impl Deref<Target = LanguageServerHub>,
+        repository_root: impl AsRef<Path>,
+        symbol: &SymbolRef,
+        kind: RelationKind,
+    ) -> Result<SymbolReferences> {
+        let root = repository_root.as_ref();
+        let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let language = detect_language(&symbol.path);
+        let unavailable = |reason: String| SymbolReferences {
+            kind,
+            symbol: symbol.clone(),
+            language: Some(language.to_string()),
+            available: false,
+            reason: Some(reason),
+            relations: Vec::new(),
+        };
+        // A restricted file is never sent to a server (`context.md` §7).
+        if self.path_policy.is_restricted(&symbol.path, false) {
+            return Ok(unavailable(format!("{} is restricted", symbol.path)));
+        }
+        let Some(launch) = self.language_server_launch(&canonical, language, SYMBOL_LOOKUP_SESSION)
+        else {
+            return Ok(unavailable(format!("no language server for {language}")));
+        };
+        let store = SymbolIndexStore::new(&self.config.data_dir, self.audit_log.clone());
+        if let Some(relations) =
+            store.cached_relations(&launch.repository_id, &canonical, symbol, kind)?
+        {
+            return Ok(SymbolReferences {
+                kind,
+                symbol: symbol.clone(),
+                language: Some(launch.language.clone()),
+                available: true,
+                reason: None,
+                relations,
+            });
+        }
+
+        // The name's column, when the index has seen the declaration. A
+        // lookup is still worth making without it: the server has the file.
+        let index = self.symbol_index(&canonical).ok().map(|(index, _)| index);
+        let column = index
+            .as_ref()
+            .and_then(|index| {
+                index
+                    .symbols
+                    .iter()
+                    .find(|candidate| {
+                        candidate.path == symbol.path
+                            && candidate.name == symbol.name
+                            && candidate.line == symbol.line
+                    })
+                    .and_then(|candidate| candidate.column)
+            })
+            .unwrap_or(1);
+        let position = Position::from_one_based(symbol.line, column);
+        let response = match kind {
+            RelationKind::References => hub.request(&launch, |client, uris| {
+                client.references(&uris.uri_for(&symbol.path), position, false)
+            }),
+            RelationKind::Implements => hub.request(&launch, |client, uris| {
+                client.implementation(&uris.uri_for(&symbol.path), position)
+            }),
+            other => {
+                return Err(crate::error::ClientError::InvalidInput(format!(
+                    "{other:?} is not an on-demand relation kind"
+                )));
+            }
+        };
+        let value = match response {
+            Ok(value) => value,
+            Err(error) => return Ok(unavailable(error.to_string())),
+        };
+
+        let uris = RepositoryUris::new(&launch.root);
+        let mut targets = symbol_refs_from_locations(&value, &uris);
+        targets.retain(|target| !self.path_policy.is_restricted(&target.path, false));
+        for target in &mut targets {
+            target.name = target_name(index.as_ref(), target, symbol, kind);
+        }
+        let mut relations: Vec<Relation> = targets
+            .into_iter()
+            .map(|target| Relation {
+                kind,
+                from: symbol.clone(),
+                to: RelationTarget::Symbol(target),
+                provenance: Provenance::LanguageServer,
+            })
+            .collect();
+        relations.sort_by(|left, right| {
+            (&left.from, left.kind, &left.to).cmp(&(&right.from, right.kind, &right.to))
+        });
+        relations.dedup();
+
+        let mut hashes = BTreeMap::new();
+        let mut cacheable = true;
+        let referenced = relations.iter().filter_map(|relation| match &relation.to {
+            RelationTarget::Symbol(target) => Some(target.path.as_str()),
+            _ => None,
+        });
+        for path in std::iter::once(symbol.path.as_str()).chain(referenced) {
+            match file_hash(canonical.join(path)) {
+                Ok(hash) => {
+                    hashes.insert(path.to_string(), hash);
+                }
+                Err(_) => cacheable = false,
+            }
+        }
+        if cacheable {
+            // Caching is an optimisation; a write that fails only costs the
+            // next lookup another request.
+            let _ = store.cache_relations(
+                &launch.repository_id,
+                &canonical,
+                CachedRelationSet {
+                    kind,
+                    symbol: symbol.clone(),
+                    relations: relations.clone(),
+                    hashes,
+                },
+            );
+        }
+        Ok(SymbolReferences {
+            kind,
+            symbol: symbol.clone(),
+            language: Some(launch.language.clone()),
+            available: true,
+            reason: None,
+            relations,
+        })
+    }
+
     /// The process-wide language-server hub (spec 25 `context.md` §3).
     pub fn language_servers(&self) -> &'static LanguageServerHub {
         LanguageServerHub::global()
@@ -437,6 +668,41 @@ impl WorkspaceEngine {
             session_id,
         )
     }
+}
+
+/// The session id recorded for a server that a user's on-demand lookup
+/// started. There is no turn or session in hand; the registry keeps it for
+/// the audit trail (`context.md` §3).
+const SYMBOL_LOOKUP_SESSION: &str = "symbol-lookup";
+
+/// The session id recorded for the eager pass a symbol search starts. Like
+/// [`SYMBOL_LOOKUP_SESSION`], it exists for the registry's audit trail; the
+/// pass belongs to the process, not to a conversation.
+const SYMBOL_SEARCH_SESSION: &str = "symbol-search";
+
+/// The name to give one `references` or `implementation` location. A
+/// declaration in the index at that place names itself; a reference site has
+/// no declaration there, so it carries the queried symbol's name.
+fn target_name(
+    index: Option<&SymbolIndex>,
+    target: &SymbolRef,
+    queried: &SymbolRef,
+    kind: RelationKind,
+) -> String {
+    // A reference site names the symbol it refers to, whatever declaration
+    // happens to start on that line.
+    if kind == RelationKind::References {
+        return queried.name.clone();
+    }
+    if let Some(found) = index.and_then(|index| {
+        index
+            .symbols
+            .iter()
+            .find(|symbol| symbol.path == target.path && symbol.line == target.line)
+    }) {
+        return found.name.clone();
+    }
+    String::new()
 }
 
 /// A range's path, lines and columns.

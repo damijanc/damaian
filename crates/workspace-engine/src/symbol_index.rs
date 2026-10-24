@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditLog;
 use crate::error::{ClientError, Result};
+use crate::hash::file_hash;
 use crate::indexer::{FileRecord, RepositoryIndex};
 use crate::language::SymbolKind;
 use crate::path_policy::PathPolicy;
@@ -112,6 +113,19 @@ pub enum RelationKind {
     TestOf,
 }
 
+impl RelationKind {
+    /// The serde name, for surfaces that print rather than serialise.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Imports => "imports",
+            Self::References => "references",
+            Self::Implements => "implements",
+            Self::Extends => "extends",
+            Self::TestOf => "test_of",
+        }
+    }
+}
+
 /// One end of a relation. A file-level end, such as the importing file of an
 /// `Imports` edge, has an empty `name` and `line` 0.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -147,7 +161,7 @@ pub enum RelationTarget {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Relation {
     pub kind: RelationKind,
@@ -175,6 +189,42 @@ pub struct SymbolMatch {
     pub quality: MatchQuality,
 }
 
+/// A reference or implementation answer a language server gave for one symbol,
+/// with what it depended on. A cached set is used only while every file it
+/// names still has the content hash recorded here (proposal §5.5).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedRelationSet {
+    pub kind: RelationKind,
+    /// The symbol that was asked about.
+    pub symbol: SymbolRef,
+    pub relations: Vec<Relation>,
+    /// The defining file and every file a relation points at, with the
+    /// content hash each had when the server answered.
+    pub hashes: BTreeMap<String, String>,
+}
+
+/// One on-demand answer from a language server (proposal §5.5, Task 9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolReferences {
+    /// Which question was asked.
+    pub kind: RelationKind,
+    pub symbol: SymbolRef,
+    /// The language the symbol's file is in, when it was recognised. The shell
+    /// names it when no server is configured (Task 10).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Whether a language server answered. When it did, `relations` may still
+    /// be empty: the server said there are none. When it did not, nothing is
+    /// guessed (proposal §3: references "where reliable").
+    pub available: bool,
+    /// Why no server answered. Absent when `available`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub relations: Vec<Relation>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SymbolIndex {
@@ -187,6 +237,11 @@ pub struct SymbolIndex {
     pub symbols: Vec<Symbol>,
     /// Sorted, with no duplicates.
     pub relations: Vec<Relation>,
+    /// Reference and implementation answers a language server gave on demand,
+    /// kept across rebuilds while every file they name is unchanged. Absent in
+    /// an index written before Task 9, which reads as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relation_cache: Vec<CachedRelationSet>,
 }
 
 /// One source file and the hash of the content its symbols describe.
@@ -241,6 +296,10 @@ impl SymbolIndex {
             .collect();
         records.sort_by(|left, right| left.path.cmp(&right.path));
         let paths: BTreeSet<&str> = records.iter().map(|record| record.path.as_str()).collect();
+        let current_hashes: BTreeMap<&str, &str> = records
+            .iter()
+            .map(|record| (record.path.as_str(), record.content_hash.as_str()))
+            .collect();
 
         let stored_files: BTreeMap<&str, &SymbolFile> = stored
             .map(|stored| {
@@ -358,12 +417,27 @@ impl SymbolIndex {
                         .is_some_and(|file| file.language_server),
             })
             .collect();
+        // A cached answer is only good while every file it names is at the
+        // hash the server saw. A set naming a file no longer indexed is stale
+        // too: it is no longer the repository this index describes.
+        let mut relation_cache: Vec<CachedRelationSet> = stored
+            .iter()
+            .flat_map(|stored| &stored.relation_cache)
+            .filter(|set| {
+                set.hashes
+                    .iter()
+                    .all(|(path, hash)| current_hashes.get(path.as_str()) == Some(&hash.as_str()))
+            })
+            .cloned()
+            .collect();
+        relation_cache.sort();
         let index = Self {
             schema_version: SYMBOL_INDEX_SCHEMA_VERSION,
             repository_id: index.repository_id.clone(),
             files,
             symbols,
             relations,
+            relation_cache,
         };
         (index, extracted)
     }
@@ -591,6 +665,12 @@ pub fn symbol_matches_json(matches: &[SymbolMatch]) -> String {
     serde_json::to_string(matches).expect("symbol matches always serialise")
 }
 
+/// A reference or implementation answer as JSON, for front ends that do not
+/// depend on serde.
+pub fn symbol_references_json(references: &SymbolReferences) -> String {
+    serde_json::to_string(references).expect("a reference answer always serialises")
+}
+
 /// How [`SymbolIndexStore::load_or_build`] got its index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolLoad {
@@ -725,6 +805,85 @@ impl SymbolIndexStore {
         write_replacing(&index_path, &json)?;
         Ok(true)
     }
+
+    /// The stored answer for `symbol` and `kind`, if every file it depends on
+    /// still has the content hash the server saw. The files on disk are hashed,
+    /// not the stored index, so an index that has not caught up with an edit
+    /// cannot make a stale answer look current. A missing or unreadable index
+    /// has no answer; a stale set is not returned, and the next request
+    /// replaces it.
+    pub fn cached_relations(
+        &self,
+        repository_id: &str,
+        root: &Path,
+        symbol: &SymbolRef,
+        kind: RelationKind,
+    ) -> Result<Option<Vec<Relation>>> {
+        let path = Self::path(&self.data_dir, repository_id);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Ok(stored) = stored_index(&bytes, repository_id) else {
+            return Ok(None);
+        };
+        let Some(set) = stored
+            .relation_cache
+            .iter()
+            .find(|set| set.kind == kind && set.symbol == *symbol)
+        else {
+            return Ok(None);
+        };
+        if hashes_still_match(&set.hashes, root) {
+            Ok(Some(set.relations.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Stores `set`, replacing an earlier answer for the same symbol and kind.
+    /// Nothing is written when a file the answer depends on has changed since
+    /// it was fetched, or when the stored index is missing or unreadable:
+    /// either way the answer describes text the index no longer holds.
+    pub fn cache_relations(
+        &self,
+        repository_id: &str,
+        root: &Path,
+        set: CachedRelationSet,
+    ) -> Result<bool> {
+        let _writes = store_writes();
+        if !hashes_still_match(&set.hashes, root) {
+            return Ok(false);
+        }
+        let index_path = Self::path(&self.data_dir, repository_id);
+        let bytes = match fs::read(&index_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let Ok(mut stored) = stored_index(&bytes, repository_id) else {
+            return Ok(false);
+        };
+        let (kind, symbol) = (set.kind, set.symbol.clone());
+        stored
+            .relation_cache
+            .retain(|existing| !(existing.kind == kind && existing.symbol == symbol));
+        stored.relation_cache.push(set);
+        stored.relation_cache.sort();
+        let json = serde_json::to_vec_pretty(&stored).map_err(|error| {
+            ClientError::Io(format!("Failed to serialise the symbol index: {error}"))
+        })?;
+        write_replacing(&index_path, &json)?;
+        Ok(true)
+    }
+}
+
+/// Whether each named file is still at the hash recorded for it.
+fn hashes_still_match(hashes: &BTreeMap<String, String>, root: &Path) -> bool {
+    hashes
+        .iter()
+        .all(|(path, hash)| file_hash(root.join(path)).is_ok_and(|current| current == *hash))
 }
 
 /// One file's two tiers as one list (proposal §5.6, `context.md` §8). A

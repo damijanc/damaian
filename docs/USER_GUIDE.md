@@ -34,6 +34,7 @@ This build is a developer preview. Release builds are Developer ID signed and no
 - [Rewind](#rewind)
 - [The Plan Panel](#the-plan-panel)
 - [Search and Export](#search-and-export)
+- [Symbol Search and Language Servers](#symbol-search-and-language-servers)
 - [After a Crash](#after-a-crash)
 
 **Control**
@@ -109,6 +110,8 @@ Common keys:
 | `checkpoint_retention_days` | `90` | How long [checkpoints](#rewind) are kept | No |
 | `audit_retention_days` | `90` | How long audit records are kept | Yes |
 | `repository_map_max_tokens` | `800` | Size of the [repository map](#the-map-the-assistant-sees) | Lower only |
+| `symbol_context_max_tokens` | `1600` | Size of the symbol hints added when a prompt names one ([Symbol Search and Language Servers](#symbol-search-and-language-servers)) | Lower only |
+| `language_server.<language>` | none | Command for an optional language server ([Language servers](#language-servers)) | No |
 
 Repository-scoped settings are not edited from Settings. Put repository defaults in `.damaian/config.conf` inside the selected repository. Repository settings are included in the [effective policy view](#reading-the-effective-policy-view).
 
@@ -126,6 +129,29 @@ Because that file arrives with a clone, a repository can only make Damaian *more
 `enable_semantic_search` is off by default. Off, Damaian finds relevant files for a request, and answers the assistant's `search_codebase` tool, by keyword and term overlap. On, it also uses an embedding model for that search, which can find files that use different words for the same idea.
 
 Turning it on downloads the embedding model on first use, into `models/all-MiniLM-L6-v2/` inside the [data directory](#local-data), so the first search afterwards is slower. If it seems to do nothing, see [Troubleshooting](TROUBLESHOOTING.md#semantic-search-does-nothing).
+
+### Language servers
+
+A language server is optional. Configured, it adds exact symbol locations to later searches, answers **Find references** exactly, and publishes diagnostics into [Findings](#findings). Unconfigured, symbols come from Damaian's source-text matching and every result is marked `likely`.
+
+Add one line per language to your user config ([Settings](#settings)):
+
+```text
+language_server.rust=/absolute/path/to/rust-analyzer
+language_server.typescript=/absolute/path/to/typescript-language-server --stdio
+```
+
+The key accepts the languages Damaian indexes: `rust`, `typescript`, `javascript`, `python`, `go`, `java`, `kotlin` and `php`. Any other language, or an empty command, is a configuration error naming the key. The value is a command line, split the way an MCP server's command is. An app opened from Finder or the Dock may not see your shell's `PATH`, so use an absolute path: a bare name that works in Terminal can fail in the app.
+
+**A repository cannot set this key.** It names a program Damaian starts, so it has the same power as `shell`. A `language_server.<language>` line in `.damaian/config.conf` is ignored and recorded in the audit log as a rejected repository key; your own value stands. A permission profile cannot carry it either.
+
+**What is sent.** The server is a local program you named, started with the repository root as its working directory. Damaian sends it the content of files it indexes (`textDocument/didOpen`), the `documentSymbol`, `references`, `implementation` and `definition` requests, and the lifecycle messages. It sends no prompts, model traffic or credentials; the server reads the same repository from disk anyway. Everything coming back — symbol names, locations and diagnostic text — is secret-scanned before Damaian stores or shows it, and a restricted file is never sent to a server.
+
+**Lifetime.** A server starts on the first lookup that needs it and stops after ten idle minutes. At quit, a server sees its input close, which most servers treat as a request to exit, and the next launch's sweep removes anything left; the standalone shell also shuts its servers down explicitly. A server that crashes is restarted once; if it crashes again it stays down until its entry expires or Damaian restarts. A server that fails to start, or never answers `initialize`, is unavailable, and Damaian carries on with the heuristic symbols. Each server's PID and start time are recorded, and a process whose start time no longer matches is never killed. Nothing is ever killed by name, so your editor's own `rust-analyzer` is safe.
+
+**Settings › General › Language servers** lists every configured language: `idle` before it has started, `ready` with its PID while it runs, or `unavailable`/`crashed` with the reason. The same state is served at `GET /api/language-servers`.
+
+The first symbol search for a repository starts the pass in the background, and the search itself answers from the index as it was, so it returns at once. Once the pass finishes, later searches show the server's exact definitions, and diagnostics it published while opening those files appear in [Findings](#findings) on the next refresh. See [Troubleshooting](TROUBLESHOOTING.md#symbol-search-shows-only-likely-results-or-a-language-server-will-not-start) if results stay `likely` or a server will not start.
 
 ## Model Providers and API Keys
 
@@ -520,6 +546,20 @@ The search icon in the sidebar, beside the **+** next to **Projects**, opens a s
 **Exports are redacted.** A session stores exactly what was said, so that a rewind can restore it faithfully; that same fidelity is why the stored log is not safe to copy out as-is. Every export runs the secret scanner over the conversation and states at the top how many secrets it removed. The number is not silently applied: if a transcript says it removed three secrets, three secrets were replaced with `[REDACTED_…]` and are not in the file. Searching finds a secret-shaped string without showing it — the snippet is redacted too.
 
 An export is a one-way record. It cannot be imported back, and it never leaves your machine on its own: the file is saved wherever your browser's save dialog puts it, and no request is made to anywhere but Damaian itself.
+
+## Symbol Search and Language Servers
+
+The `{ }` button in the thread header, beside the terminal control, opens symbol search for the current folder. It searches declarations rather than text. Each result gives the symbol's name, its kind (function, method, struct, class, and so on) and an exact `path:line`. The `path:line` is clickable and opens the file in Visual Studio Code at that line and column, the same way a file reference in a reply does. A result in a project root other than the repository root shows that root after its path.
+
+Results put a language-server answer before a guess, then order exact names before prefix matches and prefix matches before fuzzy ones, and show at most 50. The index is local and built from source text, so search needs no setup, no network and no language server.
+
+**What `likely` means.** Every symbol and relationship carries a provenance. A result Damaian inferred by matching source text carries a `likely` marker; hover it to read "Derived from source text rather than a language server; may be inaccurate." A result a language server reported has no marker. A heuristic result's file and line are still real, and the link works: the marker says the *identification* is a guess, not that the location is missing. The assistant's context uses the same distinction, as `heuristic — may be inaccurate` (below).
+
+**Find references.** Each result offers **Find references**, which asks the language server configured for that file's language ([Language servers](#language-servers)). Without one, or if it is unavailable, slow or crashed, the panel says so and shows nothing: references are reported only where they are reliable, never guessed from source text. A successful answer lists each reference as a clickable `path:line`. The answer is cached until a file it names changes.
+
+**What the assistant sees.** When your prompt names an identifier the index knows, the turn gets a `symbols` context item after the repository map: one line per symbol with its kind, `path:line`, and the hedge for a heuristic entry. `symbol_context_max_tokens` caps the item at 1,600 estimated tokens by default; `0` turns it off, and a repository may lower it but not raise it. When the item is cut to fit, its last line says how many of the matching symbols were shown. If the index cannot be read, the item is left out and the turn continues.
+
+**The first search starts the background pass.** It answers from the index as it was, so that first response is the heuristic tier and returns immediately. Once the pass has run, later searches show the language server's definitions without the `likely` marker, and diagnostics the server published while opening the files appear in [Findings](#findings) on the next refresh. The full effect, the settings that show a server's state, and the audit event that reports a rebuild are in [Troubleshooting](TROUBLESHOOTING.md#symbol-search-shows-only-likely-results-or-a-language-server-will-not-start).
 
 ## After a Crash
 
@@ -1327,10 +1367,11 @@ result (see
 
 A **finding** is one problem a check reported: a compiler error at a file and
 line, a failing test, a lint rule, a browser console error or failed request, a
-hook's own finding or warning, or a whole check that failed in a way Damaian
-could not take apart. Findings come from the checks the assistant runs during a
-conversation, from its browser diagnostics, and from [hooks](#hooks). They
-belong to the session.
+hook's own finding or warning, a diagnostic a language server published, or a
+whole check that failed in a way Damaian could not take apart. Findings come
+from the checks the assistant runs during a conversation, from its browser
+diagnostics, from [hooks](#hooks), and from a configured
+[language server](#language-servers). They belong to the session.
 
 Every command the assistant runs has a **purpose**, and the purpose decides
 whether a failure becomes a finding.
@@ -1434,6 +1475,14 @@ recorded, never goes stale.
 - **A browser location opens a file only when exactly one file matches.** A
   bundled script, a file served from another origin, or a path that matches
   two files in your repository is shown without a location.
+- **A language-server diagnostic has no task.** It is recorded when the findings
+  panel refreshes, with the source **Language server** and its range, but with
+  no task id: it is never attached to a plan step and never blocks one by
+  itself. A diagnostic that a later edit republishes unchanged is recorded
+  again, and the earlier one turns [stale](#what-stale-means). Diagnostics
+  arrive after the first symbol search has let a configured server open the
+  files
+  ([details](TROUBLESHOOTING.md#symbol-search-shows-only-likely-results-or-a-language-server-will-not-start)).
 
 Where a finding's full output lives, and how to read findings from the
 session log, is in
@@ -1641,6 +1690,8 @@ Your own settings live inside that directory too, at `config/user.conf`, so `DAM
 Repository-scoped config remains separate and lives at `.damaian/config.conf` inside the selected repository.
 
 Two parts of that directory hold copies of your files exactly as they were, credentials included, because their job is to put a file back byte for byte: `checkpoints/` (session checkpoints) and `rollback/` (patch rollback). They never leave your machine, and they are not safe to attach to a bug report. Session logs hold your prompts and file content, so the same applies to them.
+
+`symbol-index/<repository_id>.json` holds the derived symbol index and cached reference answers. It is safe to delete, and Damaian rebuilds it on the next symbol search; [Troubleshooting](TROUBLESHOOTING.md#symbol-search-shows-only-likely-results-or-a-language-server-will-not-start) shows how to force that.
 
 ## The Command-Line Tool
 

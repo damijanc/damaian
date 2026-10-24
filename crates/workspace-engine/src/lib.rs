@@ -175,9 +175,10 @@ pub use session::{
 };
 pub use steering::TurnSteering;
 pub use symbol_index::{
-    HEURISTIC_HEDGE, MERGE_LINE_TOLERANCE, MatchQuality, Provenance, Relation, RelationKind,
-    RelationTarget, RenderedSymbols, SYMBOL_INDEX_SCHEMA_VERSION, Symbol, SymbolFile, SymbolIndex,
-    SymbolIndexStore, SymbolLoad, SymbolMatch, SymbolRef, merge, symbol_matches_json,
+    CachedRelationSet, HEURISTIC_HEDGE, MERGE_LINE_TOLERANCE, MatchQuality, Provenance, Relation,
+    RelationKind, RelationTarget, RenderedSymbols, SYMBOL_INDEX_SCHEMA_VERSION, Symbol, SymbolFile,
+    SymbolIndex, SymbolIndexStore, SymbolLoad, SymbolMatch, SymbolRef, SymbolReferences, merge,
+    symbol_matches_json, symbol_references_json,
 };
 pub use tree_walk::{WalkEvent, WalkFile, WalkSkip};
 pub use validation::{
