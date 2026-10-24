@@ -5149,7 +5149,7 @@ fn openrouter_builtin_provider_resolves_its_endpoint_key_and_models() {
     assert_eq!(config.model_provider, "openrouter");
     assert_eq!(config.model_base_url, "https://openrouter.ai/api/v1");
     assert_eq!(config.model_api_key_env, "OPENROUTER_API_KEY");
-    assert_eq!(config.model_name, "anthropic/claude-sonnet-4.5");
+    assert_eq!(config.model_name, "anthropic/claude-sonnet-5.5");
     assert!(config.supports_native_tools());
 
     let provider = config
@@ -5158,9 +5158,16 @@ fn openrouter_builtin_provider_resolves_its_endpoint_key_and_models() {
     assert_eq!(
         provider.models,
         vec![
-            "anthropic/claude-sonnet-4.5".to_string(),
-            "openai/gpt-4.1".to_string(),
-            "deepseek/deepseek-chat".to_string(),
+            "anthropic/claude-sonnet-5.5".to_string(),
+            "anthropic/claude-opus-5.5".to_string(),
+            "anthropic/claude-haiku-5.5".to_string(),
+            "openai/gpt-6.1-sol".to_string(),
+            "google/gemini-3.8-flash".to_string(),
+            "deepseek/deepseek-v4.1-flash".to_string(),
+            "x-ai/grok-4.7".to_string(),
+            "moonshotai/kimi-k3.1-pro".to_string(),
+            "z-ai/glm-5.3".to_string(),
+            "qwen/qwen3.8-max-prime".to_string(),
         ]
     );
     assert!(provider.provider_reports_usage);

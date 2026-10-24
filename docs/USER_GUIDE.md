@@ -215,7 +215,7 @@ model_base_url=https://api.deepseek.com
 model_api_key_env=keychain:model-api-key
 ```
 
-The same pattern applies to OpenAI, OpenRouter, or any OpenAI-compatible provider. OpenRouter defaults to `https://openrouter.ai/api/v1` with `anthropic/claude-sonnet-4.5`, `openai/gpt-4.1`, and `deepseek/deepseek-chat`; set `model_name` to use another model it serves.
+The same pattern applies to OpenAI, OpenRouter, or any OpenAI-compatible provider. OpenRouter defaults to `https://openrouter.ai/api/v1` with `anthropic/claude-sonnet-5.5` and a starter list of tool-capable models from Anthropic, OpenAI, Google, DeepSeek, xAI, Moonshot, Z.ai and Qwen. Any other model OpenRouter serves can be added under **Models** (one id per line) or selected with `model_name`.
 
 If an older configuration still names `deepseek-chat` or `deepseek-reasoner`, update it. Those were compatibility aliases that DeepSeek retired on 24 July 2026; the current models are `deepseek-v4-flash` and `deepseek-v4-pro`.
 

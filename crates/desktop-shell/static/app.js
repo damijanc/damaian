@@ -68,8 +68,19 @@ const builtInModelProviderPresets = {
     label: "OpenRouter",
     baseUrl: "https://openrouter.ai/api/v1",
     apiKeyEnv: "OPENROUTER_API_KEY",
-    defaultModel: "anthropic/claude-sonnet-4.5",
-    models: ["anthropic/claude-sonnet-4.5", "openai/gpt-4.1", "deepseek/deepseek-chat"],
+    defaultModel: "anthropic/claude-sonnet-5.5",
+    models: [
+      "anthropic/claude-sonnet-5.5",
+      "anthropic/claude-opus-5.5",
+      "anthropic/claude-haiku-5.5",
+      "openai/gpt-6.1-sol",
+      "google/gemini-3.8-flash",
+      "deepseek/deepseek-v4.1-flash",
+      "x-ai/grok-4.7",
+      "moonshotai/kimi-k3.1-pro",
+      "z-ai/glm-5.3",
+      "qwen/qwen3.8-max-prime",
+    ],
   },
   "openai-compatible": {
     label: "Custom",
@@ -3395,7 +3406,9 @@ function connectPopularProvider(preset) {
     $("provider-id-input").value = provider.id;
     $("provider-id-input").disabled = builtInProviderIdSet.has(provider.id);
     $("provider-base-url-input").value = provider.baseUrl || "";
-    $("provider-key-ref-input").value = provider.apiKeyEnv || `keychain:${provider.id}-api-key`;
+    // The built-in presets carry environment-variable names for the CLI, but a
+    // key pasted here can only be saved against a keychain: reference.
+    $("provider-key-ref-input").value = preset.apiKeyEnv || `keychain:${provider.id}-api-key`;
     $("provider-models-input").value = (provider.models || []).join("\n");
   }
   $("provider-label-input").focus();
