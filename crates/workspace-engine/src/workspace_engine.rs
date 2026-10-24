@@ -163,6 +163,7 @@ impl WorkspaceEngine {
             patch_engine.clone(),
             patch_store.clone(),
             checkpoint_store.clone(),
+            hooks.clone(),
         );
         let edit_orchestrator = EditOrchestrator::new(
             config.clone(),

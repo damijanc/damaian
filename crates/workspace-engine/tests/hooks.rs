@@ -35,11 +35,13 @@ use workspace_engine::hooks::{
     WideningAttempt, activation, hook_definition_hash,
 };
 use workspace_engine::{
-    AuditLog, CommandPolicy, CommandRunner, CommandStore, Config, ConfigOverlay, ConfigScope,
-    EffectivePolicy, HookConfig, HookEvent, HookMode, HookReview, HookSource, MAX_HOOK_TIMEOUT_MS,
-    MockModelAdapter, ProcessRegistry, RepositoryConfigReport, RepositoryKeyClass, SecretScanner,
-    Session, SessionMode, SessionStore, SourceKind, Task, ValidationOrchestrator, WorkspaceEngine,
-    repository_id_for_root, split_profile_keys,
+    AuditLog, CancelToken, ChatTurnOptions, ChatTurnResult, CommandPolicy, CommandRunner,
+    CommandStore, Config, ConfigOverlay, ConfigScope, EffectivePolicy, HookConfig, HookEvent,
+    HookMode, HookReview, HookSource, MAX_HOOK_TIMEOUT_MS, MockModelAdapter, ModelAdapter,
+    ModelProviderConfig, ProcessRegistry, RepositoryConfigReport, RepositoryKeyClass,
+    SecretScanner, Session, SessionMode, SessionStore, SourceKind, Task, TaskStatus, ToolCall,
+    TurnProgress, TurnSink, ValidationOrchestrator, WorkspaceEngine, repository_id_for_root,
+    split_profile_keys,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -3185,6 +3187,569 @@ fn with_no_hooks_a_patch_apply_is_todays_result() {
     assert_eq!(
         fs::read_to_string(root.join("src/a.txt")).unwrap(),
         "after\n"
+    );
+    assert!(events_of(&config.data_dir, "hook_invoked").is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ---- Task 7: chat.rs turn boundaries. `context.md` §3, §4, §10 ------------
+
+/// The active provider with native tools on, so a test can drive a pause with
+/// a tool call. `ask_user` exists only as a native call (spec 50).
+fn native_provider(id: &str) -> ModelProviderConfig {
+    ModelProviderConfig {
+        id: id.to_string(),
+        label: "Test".to_string(),
+        base_url: String::new(),
+        api_key_env: String::new(),
+        models: Vec::new(),
+        supports_native_tools: true,
+        max_output_tokens: None,
+        context_token_budget: None,
+        provider_reports_usage: true,
+        price_per_million_input_tokens: None,
+        price_per_million_output_tokens: None,
+        price_per_million_cached_input_tokens: None,
+        supports_explicit_cache_breakpoints: false,
+    }
+}
+
+/// One chat turn, through the same entry point the shell uses.
+fn chat_turn(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    session_id: Option<&str>,
+    adapter: &mut dyn ModelAdapter,
+    options: ChatTurnOptions,
+) -> workspace_engine::Result<ChatTurnResult> {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine.chat_orchestrator.ask_with_session_with_options(
+        repo,
+        "Do the task.",
+        &[],
+        session_id,
+        adapter,
+        &mut sink,
+        options,
+    )
+}
+
+fn policy_blocked(error: workspace_engine::ClientError) -> String {
+    match error {
+        workspace_engine::ClientError::PolicyBlocked(message) => message,
+        other => panic!("expected a policy block, got {other:?}"),
+    }
+}
+
+/// A hook that appends to a marker file and allows. Dispatch, not the verdict,
+/// is what the pause tests observe.
+fn marker_hook(root: &Path, id: &str, event: HookEvent) -> (HookConfig, PathBuf) {
+    let marker = root.join(format!("{id}-ran"));
+    let body = format!(
+        "echo invoked >> {}\necho '{{\"hookApiVersion\":1,\"verdict\":\"allow\"}}'\n",
+        marker.display()
+    );
+    let mut hook = sh_hook(id, &script(root, id, &body));
+    hook.events = vec![event];
+    (hook, marker)
+}
+
+fn hook_invocations(config: &Config, event: &str) -> usize {
+    events_of(&config.data_dir, "hook_invoked")
+        .into_iter()
+        .filter(|entry| entry["event"] == event)
+        .count()
+}
+
+/// `session_start` runs before the session exists, so a denial leaves no
+/// session behind and never reaches the model. `request_approval` has no
+/// approval step here and denies identically (`context.md` §4).
+#[test]
+fn a_denying_session_start_hook_creates_no_session() {
+    for verdict in ["deny", "request_approval"] {
+        let root = temp_dir(&format!("start-{verdict}"));
+        write(&root.join("README.md"), "# repo\n");
+        let hook = answering_hook(
+            &root,
+            "no_start",
+            &[HookEvent::SessionStart],
+            HookMode::Mandatory,
+            &format!(
+                r#"{{"hookApiVersion":1,"verdict":"{verdict}","reason":"not this repository"}}"#
+            ),
+        );
+        let (config, engine) = engine_for(&root, vec![hook]);
+        let mut adapter = MockModelAdapter::new("Done.");
+
+        let message = policy_blocked(
+            chat_turn(
+                &engine,
+                &root,
+                None,
+                &mut adapter,
+                ChatTurnOptions::default(),
+            )
+            .expect_err("a refusing session_start must refuse the turn"),
+        );
+
+        assert!(message.contains("no_start"), "{message}");
+        assert!(message.contains("not this repository"), "{message}");
+        assert_eq!(adapter.requests.len(), 0, "the model was called");
+        assert!(
+            engine
+                .session_store
+                .list_sessions(Some(&repository_id_for_root(&root)))
+                .unwrap()
+                .is_empty(),
+            "a refused session_start created a session"
+        );
+        assert!(
+            !config.data_dir.join("sessions").exists(),
+            "a refused session_start wrote a session log"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+/// `session_start` runs before any session or task exists, so its envelope
+/// carries neither; the payload is `{}` (`context.md` §6). Task 6's note
+/// directed `envelope_parts(None, None, {})`, which serialises the absent id
+/// as `null` rather than an empty string.
+#[test]
+fn a_session_start_envelope_carries_no_session_or_task() {
+    let root = temp_dir("start-envelope");
+    write(&root.join("README.md"), "# repo\n");
+    let envelope = root.join("start-envelope.json");
+    let body = format!(
+        "cat > {}\necho '{{\"hookApiVersion\":1,\"verdict\":\"allow\"}}'\n",
+        envelope.display()
+    );
+    let mut hook = sh_hook("start_envelope", &script(&root, "start_envelope", &body));
+    hook.events = vec![HookEvent::SessionStart];
+    let (_, engine) = engine_for(&root, vec![hook]);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    chat_turn(
+        &engine,
+        &root,
+        None,
+        &mut adapter,
+        ChatTurnOptions::default(),
+    )
+    .expect("an allowing session_start runs the turn");
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&envelope).unwrap()).unwrap();
+    assert_eq!(envelope["event"], "session_start");
+    assert!(envelope["sessionId"].is_null(), "{envelope}");
+    assert!(envelope["taskId"].is_null(), "{envelope}");
+    assert_eq!(envelope["payload"], serde_json::json!({}));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A denied `before_context` fails the task with the hook's kind and message,
+/// and the model is never asked (`context.md` §4).
+#[test]
+fn a_denying_before_context_hook_fails_the_task_without_calling_the_model() {
+    let root = temp_dir("chat-context-deny");
+    write(&root.join("README.md"), "# repo\n");
+    let hook = answering_hook(
+        &root,
+        "no_context",
+        &[HookEvent::BeforeContext],
+        HookMode::Mandatory,
+        r#"{"hookApiVersion":1,"verdict":"deny","reason":"this prompt breaks the rule"}"#,
+    );
+    let (_, engine) = engine_for(&root, vec![hook]);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let message = policy_blocked(
+        chat_turn(
+            &engine,
+            &root,
+            None,
+            &mut adapter,
+            ChatTurnOptions::default(),
+        )
+        .expect_err("a refusing before_context must end the turn"),
+    );
+
+    assert!(message.contains("no_context"), "{message}");
+    assert!(message.contains("this prompt breaks the rule"), "{message}");
+    assert_eq!(adapter.requests.len(), 0, "the model was called");
+    let sessions = engine
+        .session_store
+        .list_sessions(Some(&repository_id_for_root(&root)))
+        .unwrap();
+    let session = sessions.first().expect("the task is recorded");
+    let failure_kinds = engine
+        .session_store
+        .read_task_failure_kinds(&session.id)
+        .unwrap();
+    assert!(
+        failure_kinds.values().any(|kind| kind == "hook_denied"),
+        "{failure_kinds:?}"
+    );
+    let messages = engine.session_store.read_messages(&session.id).unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.role == "assistant" && message.content.contains("no_context")),
+        "{messages:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Context from either honoured event reaches the model prompt as an ordinary
+/// `hook_context` item (`context.md` §10), with `session_start`'s carried
+/// through to the same turn.
+#[test]
+fn context_from_session_start_and_before_context_reaches_the_model_prompt() {
+    let root = temp_dir("chat-hook-context");
+    write(&root.join("README.md"), "# repo\n");
+    let start = answering_hook(
+        &root,
+        "start_note",
+        &[HookEvent::SessionStart],
+        HookMode::Mandatory,
+        r#"{"hookApiVersion":1,"verdict":"allow","context":["a note from session_start"]}"#,
+    );
+    let before = answering_hook(
+        &root,
+        "context_note",
+        &[HookEvent::BeforeContext],
+        HookMode::Mandatory,
+        r#"{"hookApiVersion":1,"verdict":"allow","context":["a note from before_context"]}"#,
+    );
+    let (_, engine) = engine_for(&root, vec![start, before]);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    chat_turn(
+        &engine,
+        &root,
+        None,
+        &mut adapter,
+        ChatTurnOptions::default(),
+    )
+    .expect("an allowing context turn runs");
+
+    let prompt = &adapter.requests[0].messages[1].content;
+    assert!(
+        prompt.contains("--- hook_context: hook:start_note ---"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("a note from session_start"), "{prompt}");
+    assert!(
+        prompt.contains("--- hook_context: hook:context_note ---"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("a note from before_context"), "{prompt}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A command a `before_context` hook requests is an action: it runs under the
+/// session's mode and profile and is bracketed by a `hook_command` marker
+/// (`context.md` §9). The hook's verdict is unchanged.
+#[test]
+fn a_before_context_hooks_requested_command_runs_behind_a_marker() {
+    let root = temp_dir("chat-context-command");
+    write(&root.join("README.md"), "# repo\n");
+    let hook = answering_hook(
+        &root,
+        "check_first",
+        &[HookEvent::BeforeContext],
+        HookMode::Mandatory,
+        r#"{"hookApiVersion":1,"verdict":"allow","commands":["pwd"]}"#,
+    );
+    let mut config = config_for(&root, vec![hook]);
+    config.shell = "/usr/bin/true".to_string();
+    let engine = WorkspaceEngine::new(config.clone());
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let result = chat_turn(
+        &engine,
+        &root,
+        None,
+        &mut adapter,
+        ChatTurnOptions::default(),
+    )
+    .expect("the turn runs");
+
+    let markers = actions(&config, &result.session.id, "action_started")
+        .into_iter()
+        .filter(|event| event["payload"]["action"] == "hook_command")
+        .count();
+    assert_eq!(
+        markers, 1,
+        "a requested command opened no hook_command marker"
+    );
+    assert_eq!(
+        adapter.requests.len(),
+        1,
+        "the turn did not reach the model"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A `before_task_complete` denial is a correction, not a failure: the reason
+/// returns as a user-role note and the turn takes another round. A hook that
+/// denies once then allows leaves a complete task after two model calls
+/// (`context.md` §4).
+#[test]
+fn a_before_task_complete_hook_that_denies_once_then_allows_completes() {
+    let root = temp_dir("chat-complete-once");
+    write(&root.join("README.md"), "# repo\n");
+    let counter = root.join("complete-count");
+    let body = format!(
+        "count=$(cat {counter} 2>/dev/null || echo 0)\n\
+         count=$((count + 1))\n\
+         echo \"$count\" > {counter}\n\
+         if [ \"$count\" -eq 1 ]; then\n\
+           echo '{{\"hookApiVersion\":1,\"verdict\":\"deny\",\"reason\":\"run the formatter first\"}}'\n\
+         else\n\
+           echo '{{\"hookApiVersion\":1,\"verdict\":\"allow\"}}'\n\
+         fi\n",
+        counter = counter.display()
+    );
+    let mut hook = sh_hook("before_complete", &script(&root, "before_complete", &body));
+    hook.events = vec![HookEvent::BeforeTaskComplete];
+    let (config, engine) = engine_for(&root, vec![hook]);
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let result = chat_turn(
+        &engine,
+        &root,
+        None,
+        &mut adapter,
+        ChatTurnOptions::default(),
+    )
+    .expect("the turn runs");
+
+    assert_eq!(
+        adapter.requests.len(),
+        2,
+        "the denial did not re-enter the loop"
+    );
+    assert_eq!(
+        result.task.status,
+        TaskStatus::Complete,
+        "{:?}",
+        result.task
+    );
+    assert_eq!(hook_invocations(&config, "before_task_complete"), 2);
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    assert!(
+        messages.iter().any(|message| {
+            message.role == "user"
+                && message
+                    .content
+                    .contains("A hook did not let this task complete")
+                && message.content.contains("run the formatter first")
+        }),
+        "{messages:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The existing action budget bounds the re-entries. A hook that always denies
+/// reaches the round budget, which is a pause under spec 61 — not a loop and
+/// not a `ToolBudgetExhausted` end, because the loop pauses before spending
+/// its last forced call. The round budget is exactly `agent_max_tool_rounds`
+/// calls (`context.md` §4).
+#[test]
+fn a_before_task_complete_hook_that_always_denies_stops_at_the_round_budget() {
+    let root = temp_dir("chat-complete-always");
+    write(&root.join("README.md"), "# repo\n");
+    let mut hook = answering_hook(
+        &root,
+        "always_deny",
+        &[HookEvent::BeforeTaskComplete],
+        HookMode::Mandatory,
+        r#"{"hookApiVersion":1,"verdict":"deny","reason":"not yet"}"#,
+    );
+    hook.order = 0;
+    let mut config = config_for(&root, vec![hook]);
+    config.agent_max_tool_rounds = 2;
+    let engine = WorkspaceEngine::new(config.clone());
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let result = chat_turn(
+        &engine,
+        &root,
+        None,
+        &mut adapter,
+        ChatTurnOptions::default(),
+    )
+    .expect("a budget stop is a pause, not an error");
+
+    assert_eq!(
+        adapter.requests.len(),
+        2,
+        "the round budget did not stop it"
+    );
+    let pause = result
+        .round_budget_proposal
+        .as_ref()
+        .expect("the turn pauses at its round budget");
+    assert_eq!(pause.rounds_used, 2);
+    assert_eq!(pause.rounds_total, 2);
+    assert_eq!(result.task.status, TaskStatus::WaitingForApproval);
+    assert_eq!(
+        hook_invocations(&config, "before_task_complete"),
+        2,
+        "each completion was dispatched"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A pause is not a completion. A turn that stops for command approval must
+/// not dispatch `before_task_complete` (`context.md` §3, §4).
+#[test]
+fn a_command_approval_pause_does_not_dispatch_before_task_complete() {
+    let root = temp_dir("chat-command-pause");
+    write(&root.join("README.md"), "# repo\n");
+    let (hook, marker) = marker_hook(&root, "complete_probe", HookEvent::BeforeTaskComplete);
+    let mut config = config_for(&root, vec![hook]);
+    config
+        .model_providers
+        .push(native_provider(&config.model_provider.clone()));
+    let engine = WorkspaceEngine::new(config.clone());
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![ToolCall {
+            id: "call_1".to_string(),
+            name: "run_command".to_string(),
+            arguments_json: r#"{"command":"npm test","reason":"Run the tests"}"#.to_string(),
+        }]],
+    );
+
+    let result = chat_turn(
+        &engine,
+        &root,
+        None,
+        &mut adapter,
+        ChatTurnOptions::default(),
+    )
+    .expect("the turn pauses");
+
+    assert!(
+        result.command_proposal.is_some(),
+        "the fixture did not pause for approval"
+    );
+    assert!(
+        !marker.exists(),
+        "before_task_complete ran on a command-approval pause"
+    );
+    assert_eq!(hook_invocations(&config, "before_task_complete"), 0);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `ask_user` is the third kind of pause (spec 50): a question, not a
+/// completion, so `before_task_complete` does not see it either.
+#[test]
+fn a_question_pause_does_not_dispatch_before_task_complete() {
+    let root = temp_dir("chat-question-pause");
+    write(&root.join("README.md"), "# repo\n");
+    let (hook, marker) = marker_hook(&root, "complete_probe", HookEvent::BeforeTaskComplete);
+    let mut config = config_for(&root, vec![hook]);
+    config.agent_max_questions_per_turn = 3;
+    config
+        .model_providers
+        .push(native_provider(&config.model_provider.clone()));
+    let engine = WorkspaceEngine::new(config.clone());
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![ToolCall {
+            id: "call_ask".to_string(),
+            name: "ask_user".to_string(),
+            arguments_json: r#"{"question":"Which one?","options":["The CLI","The shell"]}"#
+                .to_string(),
+        }]],
+    );
+
+    let result = chat_turn(
+        &engine,
+        &root,
+        None,
+        &mut adapter,
+        ChatTurnOptions {
+            user_present: true,
+            ..ChatTurnOptions::default()
+        },
+    )
+    .expect("the turn pauses for the answer");
+
+    assert!(
+        result.question_proposal.is_some(),
+        "the fixture did not pause for a question"
+    );
+    assert!(
+        !marker.exists(),
+        "before_task_complete ran on a question pause"
+    );
+    assert_eq!(hook_invocations(&config, "before_task_complete"), 0);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Zero hooks means today's behaviour byte for byte: one model call, the same
+/// two messages, `Complete`, and nothing hook-related audited or recorded.
+#[test]
+fn with_no_hooks_a_chat_turn_is_todays_result() {
+    let root = temp_dir("chat-no-hooks");
+    write(&root.join("README.md"), "# repo\n");
+    let (config, engine) = engine_for(&root, Vec::new());
+    let mut adapter = MockModelAdapter::new("Done.");
+
+    let result = chat_turn(
+        &engine,
+        &root,
+        None,
+        &mut adapter,
+        ChatTurnOptions::default(),
+    )
+    .expect("the turn runs");
+
+    assert_eq!(result.response, "Done.");
+    assert_eq!(result.task.status, TaskStatus::Complete);
+    assert_eq!(adapter.requests.len(), 1);
+    let messages = engine
+        .session_store
+        .read_messages(&result.session.id)
+        .unwrap();
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|message| message.role.as_str())
+        .collect();
+    assert_eq!(roles, ["user", "assistant"]);
+    assert_eq!(messages[0].content, "Do the task.");
+    assert_eq!(messages[1].content, "Done.");
+    assert!(
+        engine
+            .session_store
+            .read_findings(&result.session.id, &root)
+            .unwrap()
+            .is_empty()
     );
     assert!(events_of(&config.data_dir, "hook_invoked").is_empty());
 

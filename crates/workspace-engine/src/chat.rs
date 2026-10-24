@@ -21,6 +21,7 @@ use crate::finding::{
 };
 use crate::git_service::{DiffOptions, GitService, GitStatus, WorktreeListing};
 use crate::hash::{create_id, now_millis};
+use crate::hooks::{HookContext, HookDispatcher, HookEvent, HookOutcome, Verdict};
 use crate::indexer::{ProjectIndexer, SearchResult};
 use crate::mcp::{McpRuntime, McpServerRuntime, parse_namespaced_tool_name};
 use crate::mode::{Permission, SessionMode, permits, refusal_message};
@@ -569,6 +570,7 @@ pub struct ChatOrchestrator {
     patch_engine: PatchEngine,
     patch_store: PatchStore,
     checkpoint_store: CheckpointStore,
+    hooks: HookDispatcher,
     mcp_token_resolver: Option<McpTokenResolver>,
     web_diagnostics_runner: Option<WebDiagnosticsRunnerHandle>,
 }
@@ -594,6 +596,7 @@ impl ChatOrchestrator {
         patch_engine: PatchEngine,
         patch_store: PatchStore,
         checkpoint_store: CheckpointStore,
+        hooks: HookDispatcher,
     ) -> Self {
         let pending_commands = PendingCommandStore::new(&config.data_dir);
         Self {
@@ -613,6 +616,7 @@ impl ChatOrchestrator {
             patch_engine,
             patch_store,
             checkpoint_store,
+            hooks,
             mcp_token_resolver: None,
             web_diagnostics_runner: None,
         }
@@ -865,6 +869,11 @@ impl ChatOrchestrator {
     ) -> Result<ChatTurnResult> {
         let repository_root = repository_root.as_ref();
         let index = crate::index_cache::IndexCache::get_or_build(&self.indexer, repository_root)?;
+        // Context a `session_start` or `before_context` hook returned, in the
+        // order the events ran (spec 32 `context.md` §10). It is ordinary
+        // context: `build_context_with_hooks` redacts it and charges it to the
+        // turn's budget like every other item.
+        let mut hook_context: Vec<(String, String)> = Vec::new();
         let (session, prior_messages) = if let Some(session_id) = session_id {
             let Some(session) = self.session_store.read_session(session_id)? else {
                 return Err(ClientError::InvalidInput(format!(
@@ -879,11 +888,31 @@ impl ChatOrchestrator {
             let messages = self.session_store.read_messages(&session.id)?;
             (session, messages)
         } else {
-            (
-                self.session_store
-                    .create_session(&index.repository_id, &session_title(prompt))?,
-                Vec::new(),
-            )
+            // Spec 32 `context.md` §3: the event runs before the session
+            // exists, so the envelope carries no session id and there is no
+            // task. `RequestApproval` has no approval step here, so it denies
+            // like `deny` does (§4). A denial creates nothing: no session, no
+            // task, and no model call.
+            let ctx = HookContext::root();
+            let parts = self.hooks.envelope_parts(None, None, serde_json::json!({}));
+            let outcome =
+                self.hooks
+                    .dispatch(HookEvent::SessionStart, parts, repository_root, &ctx);
+            if matches!(outcome.verdict, Verdict::Deny | Verdict::RequestApproval) {
+                return Err(ClientError::PolicyBlocked(hook_refusal(&outcome)));
+            }
+            let session_start_findings = outcome.findings;
+            hook_context.extend(outcome.context);
+            let session = self
+                .session_store
+                .create_session(&index.repository_id, &session_title(prompt))?;
+            // Warnings are findings too, and now there is a log to keep them
+            // in. Requested commands are not run: `session_start` has no task,
+            // and §9 refuses a command at an event with no task.
+            for finding in &session_start_findings {
+                let _ = self.session_store.record_finding(&session.id, finding);
+            }
+            (session, Vec::new())
         };
         // Captured before the turn's own events, so rewinding this checkpoint
         // takes the user's prompt with it rather than leaving a question the
@@ -940,7 +969,63 @@ impl ChatOrchestrator {
             self.default_exploration_round_limit(),
         );
 
-        let context = self.context_manager.build_context(
+        // Spec 32 `context.md` §3, §4: context is assembled once per turn, so
+        // this is the one place a hook's additions can become ordinary
+        // `hook_context` items. `RequestApproval` has no approval step here, so
+        // it denies like `deny` does. A refused turn never reaches the model.
+        let before_context = {
+            let ctx = HookContext::root();
+            let parts = self.hooks.envelope_parts(
+                Some(&session),
+                Some(&task.id),
+                serde_json::json!({"flow": "chat", "explicitPaths": explicit_paths}),
+            );
+            let mut outcome =
+                self.hooks
+                    .dispatch(HookEvent::BeforeContext, parts, repository_root, &ctx);
+            // Warnings are findings too, so this records both (`context.md`
+            // §10). A finding that could not be journalled does not decide the
+            // turn either way.
+            for finding in &outcome.findings {
+                let _ = self.session_store.record_finding(&session.id, finding);
+            }
+            if matches!(outcome.verdict, Verdict::Deny | Verdict::RequestApproval) {
+                let message = hook_refusal(&outcome);
+                self.session_store.append_message(
+                    &session.id,
+                    Some(&task.id),
+                    "assistant",
+                    &message,
+                )?;
+                let _ = self.session_store.update_task_status_with_kind(
+                    &task,
+                    TaskStatus::Failed,
+                    Some(&message),
+                    Some("hook_denied"),
+                );
+                return Err(ClientError::PolicyBlocked(message));
+            }
+            // A `before_context` hook's requested commands run under the
+            // session's mode and profile, like any other (`context.md` §9).
+            if !outcome.commands.is_empty() {
+                let mode = self.session_store.session_mode(&session.id);
+                let requested = self.hooks.run_requested_commands(
+                    &mut outcome,
+                    &session,
+                    Some(&task),
+                    mode,
+                    repository_root,
+                    &ctx,
+                );
+                for finding in &requested {
+                    let _ = self.session_store.record_finding(&session.id, finding);
+                }
+            }
+            outcome.context
+        };
+        hook_context.extend(before_context);
+
+        let context = self.context_manager.build_context_with_hooks(
             repository_root,
             &index.repository_id,
             &task.id,
@@ -948,6 +1033,7 @@ impl ChatOrchestrator {
             Some(&index),
             explicit_paths,
             self.config.context_token_budget(),
+            &hook_context,
         );
         let model_prompt = build_model_prompt(prompt, &context.items, &prior_messages, None);
         let mode = self.session_store.session_mode(&session.id);
@@ -2175,6 +2261,67 @@ impl ChatOrchestrator {
         self.session_store.resume_plan(task, &previous.id)
     }
 
+    /// Runs `before_task_complete` for a model answer that would end the turn
+    /// (spec 32 `context.md` §3, §4).
+    ///
+    /// `Some(note)` means a hook denied: the caller feeds the note back to the
+    /// model and continues the loop. `None` means the turn may complete. Only
+    /// a completion calls this — a pause, a budget stop and a cancel are not
+    /// completions, and a hook never sees them.
+    ///
+    /// `filesChanged` comes from the turn's checkpoint manifest: it is the
+    /// durable per-task record of the paths this turn accepted a patch or
+    /// changed through a command for. The session log carries findings and
+    /// messages, not a path list.
+    fn before_task_complete(
+        &self,
+        repository_root: &Path,
+        session: &Session,
+        task: &Task,
+        action_rounds: u32,
+    ) -> Result<Option<String>> {
+        // With nothing listening, this is today's completion path: no
+        // checkpoint read, no dispatch and no audit.
+        if crate::hooks::ordered(&self.config.hooks, HookEvent::BeforeTaskComplete).is_empty() {
+            return Ok(None);
+        }
+        let ctx = HookContext::root();
+        let files_changed = self
+            .checkpoint_store
+            .read_checkpoint_for_task(&session.repository_id, &task.id)
+            .ok()
+            .flatten()
+            .map(|manifest| {
+                manifest
+                    .files
+                    .into_iter()
+                    .map(|file| file.path)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let parts = self.hooks.envelope_parts(
+            Some(session),
+            Some(&task.id),
+            serde_json::json!({"rounds": action_rounds, "filesChanged": files_changed}),
+        );
+        let outcome =
+            self.hooks
+                .dispatch(HookEvent::BeforeTaskComplete, parts, repository_root, &ctx);
+        for finding in &outcome.findings {
+            let _ = self.session_store.record_finding(&session.id, finding);
+        }
+        if matches!(outcome.verdict, Verdict::Deny | Verdict::RequestApproval) {
+            let note = format!(
+                "A hook did not let this task complete: {}",
+                hook_refusal(&outcome)
+            );
+            self.session_store
+                .append_message(&session.id, Some(&task.id), "user", &note)?;
+            return Ok(Some(note));
+        }
+        Ok(None)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_agentic_turn(
         &self,
@@ -2906,6 +3053,30 @@ impl ChatOrchestrator {
                         StopReason::ToolBudget,
                     );
                 }
+                // Spec 32 `context.md` §4: a hook that denies a completion
+                // does not fail the turn — the reason goes back as a user-role
+                // note and the model gets another round. The action budget
+                // bounds the re-entries: a call that dispatched nothing is an
+                // action round, exactly as the forced-final call is (§5.2).
+                //
+                // *Answer now* is the user's own decision to end the turn at
+                // the round budget (spec 61 §5.2). The hook does not run
+                // there: §4's correction needs another round, and this path
+                // deliberately has none left — re-entering it would loop
+                // without a bound, because the pause that would stop it is
+                // skipped for exactly this turn.
+                if !turn_options.round_budget_answer_now
+                    && let Some(note) =
+                        self.before_task_complete(repository_root, &session, &task, action_rounds)?
+                {
+                    messages.push(
+                        ModelMessage::assistant(redacted.clone())
+                            .with_reasoning_content(model_run.reasoning_content.clone()),
+                    );
+                    messages.push(ModelMessage::user(note));
+                    action_rounds += 1;
+                    continue;
+                }
                 break (
                     model_run,
                     redacted,
@@ -2935,6 +3106,19 @@ impl ChatOrchestrator {
                 // instead so the model can retry within the remaining rounds —
                 // the same recovery the restricted-path patch arm uses.
                 let Some((undecodable, note)) = undecodable_calls.first() else {
+                    // The model answered with no tool call: a completion, so
+                    // `before_task_complete` sees it (spec 32 `context.md` §4).
+                    if let Some(note) =
+                        self.before_task_complete(repository_root, &session, &task, action_rounds)?
+                    {
+                        messages.push(
+                            ModelMessage::assistant(redacted.clone())
+                                .with_reasoning_content(model_run.reasoning_content.clone()),
+                        );
+                        messages.push(ModelMessage::user(note));
+                        action_rounds += 1;
+                        continue;
+                    }
                     break (
                         model_run,
                         redacted,
@@ -6774,6 +6958,22 @@ fn model_output_requests_tool(model_run: &ModelRun, content: &str) -> bool {
         || content.contains("DAMAIAN_COMMAND_V1")
         || content.contains("tool_calls")
         || content.contains("DSML")
+}
+
+/// The one sentence a hook denial reaches the user with, always naming the
+/// hook so it is distinguishable from a mode or profile refusal (spec 32
+/// `context.md` §10).
+fn hook_refusal(outcome: &HookOutcome) -> String {
+    let hook_id = outcome.deciding_hook.as_deref().unwrap_or("unknown");
+    match outcome
+        .reasons
+        .iter()
+        .find(|(id, _)| id == hook_id)
+        .map(|(_, reason)| reason.as_str())
+    {
+        Some(reason) => format!("Refused by hook `{hook_id}`: {reason}"),
+        None => format!("Refused by hook `{hook_id}`"),
+    }
 }
 
 /// Names the ceiling, what was actually spent, and what is left undone.
