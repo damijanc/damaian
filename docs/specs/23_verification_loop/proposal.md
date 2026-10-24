@@ -43,7 +43,7 @@ Damaian applies a change and stops.
 
 Every piece needed to check the change already exists — `patch_engine` applies
 it, `ValidationOrchestrator::propose_detected_validations`
-(`crates/workspace-engine/src/validation.rs:273`) knows what the project's checks
+(`crates/workspace-engine/src/validation.rs:349`) knows what the project's checks
 are, `CommandRunner` runs them, `web_diagnostics` can inspect a running page.
 Nothing sequences them. The agent finishes a patch, says what it did, and the
 question of whether it works is left to the user.
@@ -62,47 +62,50 @@ report — distinguishing what was verified from what was assumed.
 
 ## 2. Current State
 
-Checked against the code on 2026-10-09.
+Checked against the code on 2026-10-09; references re-checked on 2026-10-24.
 
 - **The pieces exist; the sequence does not.** `chat.rs` runs a tool-call loop,
   `patch_engine.rs` proposes and applies diffs, `validation.rs` proposes and runs
   commands, `web_diagnostics.rs` inspects a running app. Nothing chains them into
   a task that knows whether it succeeded.
 - **A patch is applied after its turn has ended.** `propose_patch` and
-  `edit_file` end the turn with a patch awaiting review (`chat.rs:2514-2531`).
+  `edit_file` end the turn with a patch awaiting review (`chat.rs:3858-3906`,
+  `chat.rs:4054-4109`).
   The user applies it later through `/api/apply-patch`
-  (`desktop-shell/src/lib.rs:1172`) and `EditOrchestrator::apply_stored_patch`
-  (`edit.rs:560`), which appends `Evidence::PatchApplied` to the plan's open
-  step through the log (`edit.rs:657-676`). No turn is running at that point
+  (`desktop-shell/src/lib.rs:358`) and `EditOrchestrator::apply_stored_patch`
+  (`edit.rs:666`), which appends `Evidence::PatchApplied` to the plan's open
+  step through the log (`edit.rs:801-812`). No turn is running at that point
   (`context.md` §1).
 - **Validation discovery already exists and should be reused.**
   `ValidationOrchestrator::propose_detected_validations(repository_root, &RepositoryMap)`
-  (`validation.rs:273`) maps each repository-map root's detected commands into
+  (`validation.rs:349`) maps each repository-map root's detected commands into
   `CommandProposal`s, one per detected check, each carrying the standard
   approval fields and its root's working directory
   ([spec 24](../24_repository_map_and_monorepo_boundaries/context.md) §9). It
   skips removed roots and classifies each command again where it will run.
-- **What detection finds is narrow.** `detect_in` (`command_policy.rs:308`)
-  yields `npm run <test|lint|typecheck|build|format>` for the scripts a
+- **What detection finds is narrow.** `detect_in` (`command_policy.rs:708`,
+  private) yields `npm run <test|lint|typecheck|build|format>` for the scripts a
   `package.json` names, plus `npm test` again as `test-shortcut`, and one
   command per other manifest: `pytest`, `mvn test`, `gradle test`,
   `go test ./...`, `cargo test`. A Cargo root has no build or clippy command,
   and a script named `lint:web` is not found (`context.md` §2).
 - **Running a check is approval-gated.** `ValidationOrchestrator::run_proposal`
-  (`validation.rs:301`) refuses a blocked proposal outright and returns
+  (`validation.rs:379`) refuses a blocked proposal outright and returns
   `ApprovalRequired` when `requires_approval` is true and `approved` is false.
 - **Check results are unstructured** — `CommandExecution` with `exit_code:
-  Option<i32>` (`command_runner.rs:25`), `stdout`, `stderr`. Full output is
-  persisted by `CommandStore::save_execution` (`validation.rs:104`) as
+  Option<i32>` (`command_runner.rs:26`), `stdout`, `stderr`. Full output is
+  persisted by `CommandStore::save_execution` (`validation.rs:113`) as
   `stdout.log`, `stderr.log`, and a summary.
 - **Repair bounds already exist.** `agent_tool_retry_limit` (default 2,
-  `crates/workspace-engine/src/config.rs:316`), `agent_max_tool_rounds`
-  (`config.rs:310`), and `agent_web_debug_max_tool_rounds` (`config.rs:313`).
-  All three are Preference keys a repository may set (`config.rs:2294-2296`).
+  `crates/workspace-engine/src/config.rs:329`), `agent_max_tool_rounds`
+  (`config.rs:317`), and `agent_web_debug_max_tool_rounds` (`config.rs:326`).
+  All three are Preference keys a repository may set (`config.rs:2836-2838`).
   The roadmap names these as the right hooks rather than new ones.
 - **The budget-stop shape exists**: `tool_budget_exhausted_response`
-  (`chat.rs:4759`) and `TaskStatus::ToolBudgetExhausted` (`session.rs:70`).
-  `TaskStatus::Failed` and `TaskStatus::Validating` exist too (`session.rs:55`).
+  (`chat.rs:7549`) and `TaskStatus::ToolBudgetExhausted` (`session.rs:73`).
+  `TaskStatus::Failed` and `TaskStatus::Validating` exist too (`session.rs:58`).
+  Spec 61 added a pause at the round budget beside that stop
+  (`context.md` §5).
 - **Persistent approval exists.** [Spec 10](../10_persistent_command_approval.md)
   added exact-command `Allow Always`, written to repository config — which matters
   here because a verification loop that prompts for `cargo test` on every task is
@@ -110,8 +113,10 @@ Checked against the code on 2026-10-09.
   is qualified with that root (`cd packages/api && npm test`).
 - **Hunk-level acceptance exists end to end**
   ([spec 04](../04_hunk_level_patch_apply.md)), including
-  `/api/reject-patch-files` and `/api/rollback-patch`. Each file of a stored
-  patch carries its own `status`.
+  `/api/reject-patch-files` and `/api/rollback-patch`. Each file of a proposed
+  patch carries a `status`, but it is the content's (`added`, `modified`,
+  `deleted`), not the user's decision; the apply path records what it wrote and
+  the reject path writes a separate rejected copy (`context.md` §1).
 
 ## 3. Requirements
 
@@ -167,8 +172,8 @@ a model that would rather declare success cannot skip it.
 
 A patch is applied after the turn that proposed it has ended (§2). So the
 apply path, not the turn, starts the loop. When a patch from a Code-mode task
-is settled, meaning no file of it is still pending and at least one was
-applied, the apply path records that verification is due. A continuation of
+is settled — every file of it applied or rejected, at least one applied — the
+apply path records that verification is due. A continuation of
 the task then runs it. That continuation is a turn Damaian starts, not one the
 user types, and the plan carries into it the way spec 21 carries a plan across
 a resume. A task with verification due cannot be reported complete until the
@@ -227,7 +232,7 @@ against.
 ### 5.3 Approval, and not defeating it
 
 Each check is a `CommandProposal` and goes through the existing gate
-(`validation.rs:301`). Three cases:
+(`validation.rs:379`). Three cases:
 
 - **Auto-runnable** — sandbox-safe read-only, or an exact match in
   `command_allowlist` from [spec 10](../10_persistent_command_approval.md)
@@ -266,13 +271,13 @@ page is not.
 
 On a failing check, its findings ([spec 22](../22_findings_model_and_panel/proposal.md)) are
 handed to the model with a repair request, bounded by `agent_tool_retry_limit`
-(`config.rs:316`):
+(`config.rs:329`):
 
 1. Findings for the failing check are given to the model — findings, not raw log
    output.
 2. The model proposes a patch. It goes through the normal preview and approval
    path; repair does not bypass `require_approval_for_file_edits`, and the
-   `base_hash` conflict check at `patch_engine.rs:329` still applies.
+   `base_hash` conflict check at `patch_engine.rs:334` still applies.
 3. The check reruns once that patch is applied and settled (§5.1).
 4. On pass, the step's evidence is the passing `CommandExit`. On fail, attempt
    count increments and the loop returns to 1 until the limit.
@@ -316,7 +321,7 @@ made outside Damaian (`context.md` §6).
 
 This is the same staleness idea as `FindingStatus::Stale` in
 [spec 22](../22_findings_model_and_panel/proposal.md) and the same hash comparison as
-`patch_engine.rs:329`, applied to check runs. Phase 2 WP7 builds the review UI
+`patch_engine.rs:334`, applied to check runs. Phase 2 WP7 builds the review UI
 around this; the data it needs is produced here.
 
 ### 5.7 The completion report
@@ -339,7 +344,7 @@ Construction rules, which are the requirement rather than the formatting:
 - **`Checks passed` is derived from `CommandExit` evidence with
   `exit_code == Some(0)`.** Not from the absence of a failure, not from
   `!is_error`, and never from `exit_code.unwrap_or(0)` — `exit_code: None`
-  (`command_runner.rs:25`) means a signalled or killed command, and it belongs in
+  (`command_runner.rs:26`) means a signalled or killed command, and it belongs in
   `Checks failed` with the reason.
 - **A check is identified by its command and its root**, so `cargo test` at the
   repository root and `cargo test` in `crates/engine` are two checks.
