@@ -121,9 +121,11 @@ identically.
 
 ### 5.2 One file per process
 
-`<data_dir>/processes/<pid>-<start_time_us>.json`, created with
-`create_new(true)` *before* `register` returns, and unlinked when the process
-exits cleanly:
+`<data_dir>/processes/<pid>-<start_time_us>.json`, written in full under a
+temporary name (`<owner_pid>-<owner_start_time_us>-<n>.tmp`) and hard-linked
+into place *before* `register` returns, and unlinked when the process exits
+cleanly. The hard link fails on an existing name, as `create_new(true)` did, and
+it means a reader sees a whole entry or none (§7, "Concurrent readers"):
 
 ```json
 {"pid":1063,"startTimeUs":1789393267792219,"pgid":1063,"kind":"command",
@@ -170,10 +172,14 @@ comparison §5.1 applies to the children.
 | Child alive, start time **differs** | **Refuse to kill**, unlink | `orphan_process_kill_refused` |
 | Child alive, start time matches | Kill, unlink | `orphan_process_killed` |
 
-An unparsable file is audited rather than ignored: a half-written entry means a
-crash landed between `create_new` and the write, which is evidence about the
+An unparsable file is audited rather than ignored: it is evidence about the
 crash being recovered from, and the same reasoning `recovery.rs` applies to a
-torn session-log tail.
+torn session-log tail. Since entries are linked into place whole, a crash
+inside `register` leaves a `.tmp` file instead of a torn `.json`; the launch
+sweep audits it under the same `process_registry_entry_unreadable` event and
+unlinks it, but only when the owner its name records is gone — a live owner's
+`.tmp` is a registration still in flight. An entry that vanishes between
+listing and reading was unlinked by its handle and is skipped, not audited.
 
 The refusal records both start times. Requirement 5 asks for refusals to be
 audited, and a refusal is only checkable after the fact if it says what it
@@ -383,6 +389,36 @@ auditing happens to be enabled on that machine.
 None of the three produces a warning, because all are `pub` and `dead_code` does
 not fire on public items. Worth knowing before reading a green clippy run as
 "nothing here is unused".
+
+### Concurrent readers, and a child that exits before it is registered
+
+Added 2026-10-24 after two flakes. Both were real defects, not test artefacts.
+
+- **A vanished entry read as unreadable.** `entries()` lists the directory and
+  then reads each file. A handle dropped on another thread in between (the
+  language-server idle reaper, in CI) made the read fail, and the failure was
+  reported as an unparsable entry. A not-found read is now skipped.
+- **A file created but not yet written read as torn.** `register` used to
+  `create_new` the final name and then write it, so a concurrent reader could
+  see it empty. For a second instance's launch sweep that is worse than a
+  flake: it audits the entry as unreadable and **unlinks a live instance's
+  record**, breaking requirement 6's spirit. `register` now writes a `.tmp`
+  file and hard-links it into place (§5.2, §5.4).
+- **A fast child failed its own spawn.** A command such as `ls` can exit
+  between `spawn` and `register`. Unreaped, it is a zombie, which
+  `proc_pidinfo` reports as having no identity, so `register` returned
+  `process … has no readable identity to record` and a command that had run
+  successfully failed. `register` now asks `waitid(…, WNOWAIT)` whether the
+  pid is our own exited, unreaped child; if so it records nothing and returns
+  an empty handle. `WNOWAIT` leaves the status for the `Child`'s owner to
+  reap, and nothing is lost: an unreaped pid cannot be reused, and an exited
+  child has nothing to sweep. Any other pid without an identity still fails,
+  so a bare number is never recorded.
+
+`a_reader_racing_registration_and_removal_never_sees_an_unreadable_entry`,
+`registering_a_child_that_already_exited_succeeds_and_records_nothing` and
+`a_temp_file_left_by_a_crashed_owner_is_audited_and_removed` reproduce each case;
+the first two failed before the change.
 
 ### Test mechanics
 

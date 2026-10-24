@@ -74,6 +74,33 @@ impl ProcessIdentity {
     }
 }
 
+/// Whether `pid` is a child of this process that has exited but not been
+/// reaped. `WNOWAIT` leaves the exit status in place, so whoever owns the
+/// `Child` still reaps it. A pid that is not our child is `ECHILD`: false.
+fn exited_unreaped(pid: u32) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a zeroed `siginfo_t` that `waitid` fills in; nothing
+    // else is borrowed.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    // With `WNOHANG`, a child that is still running also returns 0, with no
+    // pid filled in.
+    result == 0 && info.si_pid == pid as libc::pid_t
+}
+
+/// The name an entry is written under before it is linked into place. It
+/// carries the owner's identity rather than the child's, because the launch
+/// sweep needs to know whether the registration it finds is still in flight.
+fn temp_file_name(owner: ProcessIdentity, sequence: u64) -> String {
+    format!("{}-{}-{sequence}.tmp", owner.pid, owner.start_time_us)
+}
+
 /// What a registry entry describes, so an audited sweep says what it killed
 /// rather than only which number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,15 +217,29 @@ impl ProcessRegistry {
     /// construction: there is no window in which a child is running and
     /// unrecorded, and nothing has to be written at exit for the record to
     /// survive a `SIGKILL`.
+    ///
+    /// The entry is written to a temporary name and hard-linked into place, so
+    /// a reader sees a whole entry or none. A sweep from a second instance that
+    /// read a created-but-unwritten file would otherwise audit it as torn and
+    /// unlink a live instance's record.
     pub fn register(
         &self,
         kind: ProcessKind,
         session_id: &str,
         pid: u32,
     ) -> Result<RegistrationHandle> {
-        let identity = ProcessIdentity::of(pid).ok_or_else(|| {
-            ClientError::Io(format!("process {pid} has no readable identity to record"))
-        })?;
+        let identity = match ProcessIdentity::of(pid) {
+            Some(identity) => identity,
+            // A fast child can exit between `spawn` and here. Unreaped, its pid
+            // cannot be reused and there is nothing left to sweep, so there is
+            // nothing to record — and failing would fail a command that ran.
+            None if exited_unreaped(pid) => return Ok(RegistrationHandle::none()),
+            None => {
+                return Err(ClientError::Io(format!(
+                    "process {pid} has no readable identity to record"
+                )));
+            }
+        };
         // Read rather than assumed. Every spawn site puts the child in its own
         // group, so this should equal `pid`; where it does not, the sweep falls
         // back to killing the bare pid rather than a group we did not create.
@@ -217,18 +258,32 @@ impl ProcessRegistry {
         let path = self.dir.join(entry.file_name());
         let json =
             serde_json::to_string(&entry).map_err(|error| ClientError::Io(error.to_string()))?;
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)?;
-        file.write_all(json.as_bytes())?;
-        file.sync_all()?;
+        let temp = self.dir.join(temp_file_name(
+            self.owner,
+            TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        let written = (|| -> std::io::Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            // `hard_link` rather than `rename`: it fails on an existing name,
+            // as `create_new` did, where `rename` would replace another live
+            // registration of the same identity.
+            fs::hard_link(&temp, &path)
+        })();
+        let _ = fs::remove_file(&temp);
+        written?;
         Ok(RegistrationHandle { path: Some(path) })
     }
 
     /// Every entry file, paired with its parsed content. `None` means the file
-    /// did not parse — a write interrupted between `create_new` and
-    /// `write_all`, which the sweep audits rather than ignores.
+    /// did not parse. Entries are linked into place whole, so that is outside
+    /// interference rather than a race, and the sweep audits it rather than
+    /// ignoring it. A file removed between listing and reading is skipped: its
+    /// handle was dropped, which is a clean exit, not damage.
     pub fn entries(&self) -> Result<Vec<(PathBuf, Option<RegisteredProcess>)>> {
         read_entries(&self.dir)
     }
@@ -245,13 +300,46 @@ fn read_entries(dir: &Path) -> Result<Vec<(PathBuf, Option<RegisteredProcess>)>>
         if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
             continue;
         }
-        let parsed = fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<RegisteredProcess>(&text).ok());
+        let parsed = match fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str::<RegisteredProcess>(&text).ok(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => None,
+        };
         entries.push((path, parsed));
     }
     Ok(entries)
 }
+
+/// Registrations that never reached their final name, with the owner each
+/// name records. Only a crash mid-`register` leaves one behind for long.
+fn read_temp_files(dir: &Path) -> Result<Vec<(PathBuf, ProcessIdentity)>> {
+    let mut temps = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("tmp") {
+            continue;
+        }
+        let owner = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| {
+                let mut parts = stem.splitn(3, '-');
+                Some(ProcessIdentity {
+                    pid: parts.next()?.parse().ok()?,
+                    start_time_us: parts.next()?.parse().ok()?,
+                })
+            });
+        // A name we did not write is left alone rather than guessed at.
+        if let Some(owner) = owner {
+            temps.push((path, owner));
+        }
+    }
+    Ok(temps)
+}
+
+/// Makes each temporary name unique within this process; the owner's identity
+/// in the name makes it unique across processes.
+static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether a spec 57 worker for `session_id` is running: a
 /// [`ProcessKind::Worker`] entry for that session whose pid still has the
@@ -339,6 +427,25 @@ impl ProcessRegistry {
         kill: &mut dyn FnMut(&RegisteredProcess),
     ) -> Result<SweepReport> {
         let mut report = SweepReport::default();
+        // A temporary file is the torn entry of a crash inside `register`, so
+        // it gets the same audit. Only at launch, and only once its owner is
+        // gone: a live owner's file is a registration still in flight.
+        if scope == SweepScope::CrashedOwners {
+            for (path, owner) in read_temp_files(&self.dir)? {
+                if identity_of(owner.pid) == Some(owner) {
+                    continue;
+                }
+                audit.record(
+                    "process_registry_entry_unreadable",
+                    &[
+                        ("actor", "system".to_string()),
+                        ("path", path.display().to_string()),
+                    ],
+                )?;
+                let _ = fs::remove_file(&path);
+                report.decisions.push(SweepDecision::Unreadable);
+            }
+        }
         for (path, parsed) in self.entries()? {
             let Some(entry) = parsed else {
                 audit.record(
@@ -712,6 +819,105 @@ mod tests {
             entries[0].1.is_none(),
             "a torn write is evidence of the crash, not something to guess at"
         );
+    }
+
+    /// The CI flake behind this: a reader listed an entry, its handle was
+    /// dropped on another thread, and the vanished file was reported as
+    /// unreadable. Registering and dropping in a loop while reading also
+    /// catches a reader seeing a file that is created but not yet written.
+    #[test]
+    fn a_reader_racing_registration_and_removal_never_sees_an_unreadable_entry() {
+        let data_dir = scratch("race");
+        let registry = ProcessRegistry::open(&data_dir).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let registry = registry.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let handle = registry
+                        .register(ProcessKind::Command, "ses_1", std::process::id())
+                        .unwrap();
+                    drop(handle);
+                }
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut unreadable = Vec::new();
+        while std::time::Instant::now() < deadline {
+            for (path, entry) in registry.entries().unwrap() {
+                if entry.is_none() {
+                    unreadable.push(path);
+                }
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(
+            unreadable.is_empty(),
+            "{} reads saw a live instance's entry as unreadable, which a launch sweep would \
+             unlink; the first was {:?}",
+            unreadable.len(),
+            unreadable.first()
+        );
+    }
+
+    /// A child that exits before `register` reads it is an unreaped zombie,
+    /// which has no identity. It is no orphan risk — its pid cannot be reused
+    /// until its owner reaps it — so registering it must not fail the spawn.
+    #[test]
+    fn registering_a_child_that_already_exited_succeeds_and_records_nothing() {
+        let data_dir = scratch("exited-child");
+        let registry = ProcessRegistry::open(&data_dir).unwrap();
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("true should spawn");
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !exited_unreaped(pid) {
+            assert!(std::time::Instant::now() < deadline, "true never exited");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let handle = registry.register(ProcessKind::Command, "ses_1", pid);
+
+        assert!(handle.is_ok(), "{handle:?}");
+        assert!(registry.entries().unwrap().is_empty());
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "registering must leave the exit status for the owner to reap"
+        );
+    }
+
+    #[test]
+    fn a_temp_file_left_by_a_crashed_owner_is_audited_and_removed() {
+        let data_dir = scratch("stale-temp");
+        let registry = ProcessRegistry::open(&data_dir).unwrap();
+        let audit = audit_for(&data_dir);
+        let dir = registry.entries_dir_for_test();
+        let dead = dead_owner();
+        let stale = dir.join(temp_file_name(dead, 0));
+        let in_flight = dir.join(temp_file_name(registry.owner(), 0));
+        std::fs::write(&stale, "{\"pid\":1").unwrap();
+        std::fs::write(&in_flight, "{\"pid\":1").unwrap();
+
+        let (report, killed) =
+            sweep_recording(&registry, &audit, SweepScope::CrashedOwners, &|pid| {
+                (pid == registry.owner().pid).then(|| registry.owner())
+            });
+
+        assert!(killed.is_empty());
+        assert_eq!(report.decisions, vec![SweepDecision::Unreadable]);
+        assert!(
+            !stale.exists(),
+            "a crashed registration is evidence, then spent"
+        );
+        assert!(
+            in_flight.exists(),
+            "a live instance's registration in flight is not ours to remove"
+        );
+        let log = std::fs::read_to_string(data_dir.join("audit").join("events.jsonl")).unwrap();
+        assert!(log.contains("process_registry_entry_unreadable"));
     }
 
     #[test]
