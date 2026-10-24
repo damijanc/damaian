@@ -20,8 +20,8 @@ use workspace_engine::{
     ConfigOverlay, MAX_QUESTIONS_PER_TURN_CEILING, MockModelAdapter, ModelAdapter,
     ModelProviderConfig, OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN, PendingApprovalRef,
     PendingDecision, PendingQuestionRef, QUESTION_MAX_CHARS, RepositoryConfigReport,
-    RepositoryKeyClass, SessionMode, SessionStore, Task, TaskStatus, ToolCall, TurnProgress,
-    TurnSink, WorkspaceEngine, validate_answer,
+    RepositoryKeyClass, RoundBudgetDecision, SessionMode, SessionStore, Task, TaskStatus, ToolCall,
+    TurnProgress, TurnSink, WorkspaceEngine, validate_answer,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -777,6 +777,170 @@ fn tool_results(engine: &WorkspaceEngine, session_id: &str) -> Vec<String> {
         .collect()
 }
 
+/// The pending chat-turn files a repository's data directory holds.
+fn pending_turns(repo: &Path) -> usize {
+    fs::read_dir(repo.join(".damaian").join("chat").join("pending"))
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0)
+}
+
+fn resume_after_answer(
+    engine: &WorkspaceEngine,
+    question_id: &str,
+    answer: &str,
+    selected_option: Option<usize>,
+    adapter: &mut dyn ModelAdapter,
+) -> workspace_engine::Result<ChatTurnResult> {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine.chat_orchestrator.resume_after_answer(
+        question_id,
+        answer,
+        selected_option,
+        adapter,
+        &mut sink,
+    )
+}
+
+fn resume_after_command(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    approved: bool,
+    adapter: &mut dyn ModelAdapter,
+) -> workspace_engine::Result<ChatTurnResult> {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine.chat_orchestrator.resume_after_command_decision(
+        proposal_id,
+        approved,
+        "tester",
+        adapter,
+        &mut sink,
+    )
+}
+
+fn resume_after_plan(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> workspace_engine::Result<ChatTurnResult> {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine.chat_orchestrator.resume_after_plan_decision(
+        proposal_id,
+        true,
+        None,
+        "tester",
+        adapter,
+        &mut sink,
+    )
+}
+
+fn resume_after_fallback(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> workspace_engine::Result<ChatTurnResult> {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine.chat_orchestrator.resume_after_fallback_decision(
+        proposal_id,
+        true,
+        "tester",
+        adapter,
+        &mut sink,
+    )
+}
+
+fn resume_round_budget(
+    engine: &WorkspaceEngine,
+    proposal_id: &str,
+    adapter: &mut dyn ModelAdapter,
+) -> workspace_engine::Result<ChatTurnResult> {
+    let cancel = CancelToken::new();
+    let mut on_token = |_token: &str| {};
+    let mut on_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut on_progress,
+        cancel: &cancel,
+        steering: None,
+    };
+    engine.chat_orchestrator.resume_round_budget(
+        proposal_id,
+        RoundBudgetDecision::Continue,
+        "tester",
+        adapter,
+        &mut sink,
+    )
+}
+
+/// The model asks one question and the turn pauses on it.
+fn paused_on_question(
+    engine: &WorkspaceEngine,
+    repo: &Path,
+    arguments_json: &str,
+) -> ChatTurnResult {
+    let mut adapter = asks_then_answers(arguments_json);
+    let paused = turn(engine, repo, None, true, &mut adapter);
+    assert!(
+        paused.question_proposal.is_some(),
+        "the turn should have paused on the question"
+    );
+    paused
+}
+
+fn question_decision(
+    engine: &WorkspaceEngine,
+    session_id: &str,
+    task_id: &str,
+) -> Option<PendingQuestionRef> {
+    match engine
+        .session_store
+        .pending_decision_for(session_id, task_id)
+        .unwrap()
+    {
+        Some(PendingDecision::Question(question)) => Some(question),
+        _ => None,
+    }
+}
+
+fn ask_user_call_with(id: &str, arguments_json: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_string(),
+        name: "ask_user".to_string(),
+        arguments_json: arguments_json.to_string(),
+    }
+}
+
 #[test]
 fn ask_user_is_offered_when_a_user_is_present() {
     let repo = temp_repo("offered");
@@ -853,20 +1017,662 @@ fn an_unoffered_ask_user_call_is_refused_as_a_tool_result_and_the_turn_continues
     fs::remove_dir_all(repo).unwrap();
 }
 
-/// Until Task 4 builds the pause, an offered call is refused the same way, so
-/// nothing waits on an answer no route can deliver. Task 4 replaces this test.
-#[test]
-fn an_offered_ask_user_call_does_not_pause_yet() {
-    let repo = temp_repo("offered-no-pause");
-    let engine = engine_for(&repo, 2);
-    let mut adapter = asks_then_answers(CLI_OR_SHELL_CALL);
-    let result = turn(&engine, &repo, None, true, &mut adapter);
+// Task 4: the pause, the answer and the resume. A question is a tool call like
+// any other for the round budget — it consumes one action round — but it is
+// not an approval and no resume may cross kinds (`context.md` §2, §7).
 
-    let results = tool_results(&engine, &result.session.id);
-    assert_eq!(results.len(), 1, "{results:?}");
-    assert!(results[0].contains("No user can answer"), "{results:?}");
-    assert_eq!(result.task.status, TaskStatus::Complete);
-    assert!(result.command_proposal.is_none() && result.plan_proposal.is_none());
+#[test]
+fn a_question_is_answered_and_the_turn_continues() {
+    let repo = temp_repo("answered");
+    let engine = engine_for(&repo, 2);
+    let paused = paused_on_question(&engine, &repo, CLI_OR_SHELL_CALL);
+
+    let proposal = paused
+        .question_proposal
+        .clone()
+        .expect("the pause carries the question");
+    assert_eq!(proposal.question, "Did you mean the CLI or the shell?");
+    assert_eq!(proposal.options, vec!["The CLI", "The shell"]);
+    assert!(!proposal.allow_free_text);
+    assert!(proposal.question_id.starts_with("question_"));
+    assert_eq!(paused.task.status, TaskStatus::WaitingForApproval);
+    assert_eq!(
+        engine
+            .session_store
+            .pending_approval_for(&paused.session.id, &paused.task.id)
+            .unwrap(),
+        None,
+        "a waiting question must never read as a pending approval"
+    );
+    let question = question_decision(&engine, &paused.session.id, &paused.task.id)
+        .expect("the newest link is a question");
+    assert_eq!(question.question_id(), proposal.question_id);
+    assert_eq!(pending_turns(&repo), 1);
+
+    let mut resumed_adapter = MockModelAdapter::new("The CLI it is.");
+    let resumed = resume_after_answer(
+        &engine,
+        &proposal.question_id,
+        "The CLI",
+        Some(0),
+        &mut resumed_adapter,
+    )
+    .expect("the answer resumes the turn");
+
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+    assert_eq!(resumed.response, "The CLI it is.");
+    let last = resumed_adapter.requests[0]
+        .messages
+        .last()
+        .expect("the resumed request has messages");
+    assert_eq!(last.role, "tool");
+    assert!(
+        last.content
+            .contains("The user answered: \"The CLI\" (option 0: \"The CLI\")"),
+        "{}",
+        last.content
+    );
+    let state = engine
+        .session_store
+        .question_state(&resumed.session.id, &proposal.question_id)
+        .unwrap()
+        .expect("the question is recorded");
+    assert_eq!(state.answer, Some(("The CLI".to_string(), Some(0))));
+    assert_eq!(pending_turns(&repo), 0, "resuming consumes the pause");
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn an_answered_question_resumes_with_the_recorded_answer_and_is_not_asked_again() {
+    let repo = temp_repo("answered-before-resume");
+    let engine = engine_for(&repo, 2);
+    let paused = paused_on_question(&engine, &repo, CLI_OR_SHELL_CALL);
+    let question_id = paused
+        .question_proposal
+        .as_ref()
+        .unwrap()
+        .question_id
+        .clone();
+
+    // The state a crash between recording the answer and resuming leaves: the
+    // answer is in the log and the pause is still on disk.
+    engine
+        .session_store
+        .record_question_answered(&paused.session.id, &question_id, "The CLI", Some(0))
+        .unwrap();
+
+    let mut resumed_adapter = MockModelAdapter::new("Done.");
+    let resumed = resume_after_answer(
+        &engine,
+        &question_id,
+        "The shell",
+        Some(1),
+        &mut resumed_adapter,
+    )
+    .expect("an answered question still resumes");
+
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+    let last = resumed_adapter.requests[0]
+        .messages
+        .last()
+        .expect("the resumed request has messages");
+    assert!(last.content.contains("The CLI"), "{}", last.content);
+    assert!(
+        !last.content.contains("The shell"),
+        "the new answer must be ignored: {}",
+        last.content
+    );
+    assert_eq!(
+        engine
+            .session_store
+            .question_state(&resumed.session.id, &question_id)
+            .unwrap()
+            .unwrap()
+            .answer,
+        Some(("The CLI".to_string(), Some(0)))
+    );
+    assert_eq!(
+        engine
+            .session_store
+            .questions_asked_in_task(&resumed.session.id, &resumed.task.id)
+            .unwrap(),
+        1,
+        "the question is not asked again"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_free_text_answer_is_refused_when_not_allowed() {
+    let repo = temp_repo("free-text-refused");
+    let engine = engine_for(&repo, 2);
+    let paused = paused_on_question(&engine, &repo, CLI_OR_SHELL_CALL);
+    let question_id = paused
+        .question_proposal
+        .as_ref()
+        .unwrap()
+        .question_id
+        .clone();
+
+    let error = resume_after_answer(
+        &engine,
+        &question_id,
+        "Both, actually",
+        None,
+        &mut MockModelAdapter::new("unused"),
+    )
+    .expect_err("free text needs allowFreeText");
+    assert!(
+        error.to_string().contains("option"),
+        "the refusal should name the options: {error}"
+    );
+
+    // The pause was put back, so the question can still be answered.
+    assert_eq!(pending_turns(&repo), 1);
+    let state = engine
+        .session_store
+        .question_state(&paused.session.id, &question_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.answer, None, "a refused answer records nothing");
+
+    let mut resumed_adapter = MockModelAdapter::new("Understood.");
+    let resumed = resume_after_answer(
+        &engine,
+        &question_id,
+        "The shell",
+        Some(1),
+        &mut resumed_adapter,
+    )
+    .expect("the question is still resumable");
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_third_question_in_one_turn_is_refused_with_a_tool_error() {
+    let repo = temp_repo("third-question");
+    let engine = engine_for(&repo, 2);
+    let first = paused_on_question(&engine, &repo, CLI_OR_SHELL_CALL);
+    let first_id = first
+        .question_proposal
+        .as_ref()
+        .unwrap()
+        .question_id
+        .clone();
+
+    // The resumed turn asks its second question. The count comes from the log,
+    // so this only works if the resumed turn counts the one already asked.
+    let second_arguments = r#"{"question":"Which crate?","options":["engine","shell"]}"#;
+    let mut second_adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Continuing.".to_string()],
+        vec![
+            vec![ask_user_call_with("call_ask_2", second_arguments)],
+            Vec::new(),
+        ],
+    );
+    let second = resume_after_answer(&engine, &first_id, "The CLI", Some(0), &mut second_adapter)
+        .expect("the first answer resumes the turn");
+    let second_id = second
+        .question_proposal
+        .as_ref()
+        .expect("the second question is allowed")
+        .question_id
+        .clone();
+
+    // The third call is refused as a tool result and the model carries on.
+    let third_arguments = r#"{"question":"Or the desktop app?","options":["yes","no"]}"#;
+    let mut third_adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Done.".to_string()],
+        vec![
+            vec![ask_user_call_with("call_ask_3", third_arguments)],
+            Vec::new(),
+        ],
+    );
+    let resumed = resume_after_answer(&engine, &second_id, "engine", Some(0), &mut third_adapter)
+        .expect("the second answer resumes the turn");
+
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+    let results = tool_results(&engine, &resumed.session.id);
+    assert!(
+        results
+            .last()
+            .expect("three tool results")
+            .contains("already asked 2 of 2 questions"),
+        "{results:?}"
+    );
+    assert_eq!(
+        engine
+            .session_store
+            .questions_asked_in_task(&resumed.session.id, &resumed.task.id)
+            .unwrap(),
+        2,
+        "the refused third question is not recorded"
+    );
+    assert_eq!(pending_turns(&repo), 0);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn an_answer_never_authorises_a_command() {
+    let repo = temp_repo("answer-command");
+    let engine = engine_for(&repo, 2);
+    let paused = paused_on_question(&engine, &repo, CLI_OR_SHELL_CALL);
+    let question_id = paused
+        .question_proposal
+        .as_ref()
+        .unwrap()
+        .question_id
+        .clone();
+
+    let command = ToolCall {
+        id: "call_command".to_string(),
+        name: "run_command".to_string(),
+        arguments_json: r#"{"command":"touch should-not-run.txt","reason":"Write a marker file."}"#
+            .to_string(),
+    };
+    let mut resumed_adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Approval needed.".to_string()],
+        vec![vec![command], Vec::new()],
+    );
+    let resumed = resume_after_answer(
+        &engine,
+        &question_id,
+        "The CLI",
+        Some(0),
+        &mut resumed_adapter,
+    )
+    .expect("the turn resumes and then pauses on the command");
+
+    assert!(
+        resumed.command_proposal.is_some(),
+        "the command still needs its own approval"
+    );
+    assert_eq!(resumed.task.status, TaskStatus::WaitingForApproval);
+    match engine
+        .session_store
+        .pending_decision_for(&resumed.session.id, &resumed.task.id)
+        .unwrap()
+    {
+        Some(PendingDecision::Approval(approval)) => assert_eq!(approval.kind, "command"),
+        other => panic!("expected a command approval, got {other:?}"),
+    }
+    assert!(
+        !repo.join("should-not-run.txt").exists(),
+        "an answered question must not run the command"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn an_answer_never_authorises_a_patch() {
+    let repo = temp_repo("answer-patch");
+    let engine = engine_for(&repo, 2);
+    let paused = paused_on_question(&engine, &repo, CLI_OR_SHELL_CALL);
+    let question_id = paused
+        .question_proposal
+        .as_ref()
+        .unwrap()
+        .question_id
+        .clone();
+
+    let patch = ToolCall {
+        id: "call_patch".to_string(),
+        name: "propose_patch".to_string(),
+        arguments_json:
+            r##"{"summary":"Change the readme","files":[{"path":"README.md","content":"# Changed\n"}]}"##
+                .to_string(),
+    };
+    let mut resumed_adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Review needed.".to_string()],
+        vec![vec![patch], Vec::new()],
+    );
+    let resumed = resume_after_answer(
+        &engine,
+        &question_id,
+        "The CLI",
+        Some(0),
+        &mut resumed_adapter,
+    )
+    .expect("the turn resumes and then proposes the patch");
+
+    assert!(
+        resumed.patch_proposal.is_some(),
+        "the patch still waits for review"
+    );
+    assert_eq!(resumed.task.status, TaskStatus::WaitingForApproval);
+    assert_eq!(
+        fs::read_to_string(repo.join("README.md")).unwrap(),
+        "# Clarification test\n",
+        "an answered question must not apply the patch"
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_question_id_cannot_resume_a_command_a_plan_a_fallback_or_a_round_budget() {
+    let repo = temp_repo("cross-kind");
+    let engine = engine_for(&repo, 2);
+    let paused = paused_on_question(&engine, &repo, CLI_OR_SHELL_CALL);
+    let question_id = paused
+        .question_proposal
+        .as_ref()
+        .unwrap()
+        .question_id
+        .clone();
+
+    let command_error = resume_after_command(
+        &engine,
+        &question_id,
+        true,
+        &mut MockModelAdapter::new("unused"),
+    )
+    .expect_err("a question id must not approve a command");
+    assert!(
+        command_error.to_string().contains("resume_after_answer"),
+        "{command_error}"
+    );
+    let plan_error = resume_after_plan(&engine, &question_id, &mut MockModelAdapter::new("unused"))
+        .expect_err("a question id must not decide a plan");
+    assert!(
+        plan_error.to_string().contains("resume_after_answer"),
+        "{plan_error}"
+    );
+    let fallback_error =
+        resume_after_fallback(&engine, &question_id, &mut MockModelAdapter::new("unused"))
+            .expect_err("a question id must not decide a fallback offer");
+    assert!(
+        fallback_error.to_string().contains("resume_after_answer"),
+        "{fallback_error}"
+    );
+    let budget_error =
+        resume_round_budget(&engine, &question_id, &mut MockModelAdapter::new("unused"))
+            .expect_err("a question id must not decide a round-budget pause");
+    assert!(
+        budget_error.to_string().contains("resume_after_answer"),
+        "{budget_error}"
+    );
+
+    // Every refusal put the file back, so nothing ran and the question is
+    // still answerable.
+    assert_eq!(pending_turns(&repo), 1);
+    let mut resumed_adapter = MockModelAdapter::new("Done.");
+    let resumed = resume_after_answer(
+        &engine,
+        &question_id,
+        "The CLI",
+        Some(0),
+        &mut resumed_adapter,
+    )
+    .expect("the question is still resumable");
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_command_or_plan_id_cannot_be_answered() {
+    // A command pause.
+    let command_repo = temp_repo("answer-command-id");
+    let command_engine = engine_for(&command_repo, 2);
+    let command_call = ToolCall {
+        id: "call_command".to_string(),
+        name: "run_command".to_string(),
+        arguments_json: r#"{"command":"touch should-not-run.txt","reason":"Write a marker file."}"#
+            .to_string(),
+    };
+    let mut command_adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![command_call]],
+    );
+    let command_pause = turn(
+        &command_engine,
+        &command_repo,
+        None,
+        true,
+        &mut command_adapter,
+    );
+    let command_id = command_pause.command_proposal.as_ref().unwrap().id.clone();
+    let error = resume_after_answer(
+        &command_engine,
+        &command_id,
+        "The CLI",
+        Some(0),
+        &mut MockModelAdapter::new("unused"),
+    )
+    .expect_err("a command id must not be answered");
+    assert!(
+        error.to_string().contains("resume_after_command_decision"),
+        "{error}"
+    );
+    assert!(
+        command_engine
+            .chat_orchestrator
+            .has_pending_chat_command(&command_id)
+    );
+    let resumed = resume_after_command(
+        &command_engine,
+        &command_id,
+        false,
+        &mut MockModelAdapter::new("Declined."),
+    )
+    .expect("the command is still resumable");
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+    fs::remove_dir_all(command_repo).unwrap();
+
+    // A plan review pause.
+    let plan_repo = temp_repo("answer-plan-id");
+    let plan_engine = engine_for(&plan_repo, 2);
+    let plan_call = ToolCall {
+        id: "call_plan".to_string(),
+        name: "propose_plan".to_string(),
+        arguments_json: r#"{"steps":[{"title":"Look"},{"title":"Change"}]}"#.to_string(),
+    };
+    let patch_call = ToolCall {
+        id: "call_patch".to_string(),
+        name: "propose_patch".to_string(),
+        arguments_json:
+            r##"{"summary":"Change the readme","files":[{"path":"README.md","content":"# Changed\n"}]}"##
+                .to_string(),
+    };
+    let mut plan_adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), String::new()],
+        vec![vec![plan_call], vec![patch_call]],
+    );
+    let plan_pause = turn(&plan_engine, &plan_repo, None, true, &mut plan_adapter);
+    let plan_id = plan_pause.plan_proposal.as_ref().unwrap().id.clone();
+    let error = resume_after_answer(
+        &plan_engine,
+        &plan_id,
+        "The CLI",
+        Some(0),
+        &mut MockModelAdapter::new("unused"),
+    )
+    .expect_err("a plan id must not be answered");
+    assert!(
+        error.to_string().contains("resume_after_plan_decision"),
+        "{error}"
+    );
+    let resumed = resume_after_plan(
+        &plan_engine,
+        &plan_id,
+        &mut MockModelAdapter::new("Approved."),
+    )
+    .expect("the plan is still resumable");
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+    fs::remove_dir_all(plan_repo).unwrap();
+}
+
+#[test]
+fn a_question_id_is_not_a_pending_chat_command() {
+    let repo = temp_repo("pending-command");
+    let engine = engine_for(&repo, 2);
+    let paused = paused_on_question(&engine, &repo, CLI_OR_SHELL_CALL);
+    let question_id = paused
+        .question_proposal
+        .as_ref()
+        .unwrap()
+        .question_id
+        .clone();
+
+    assert!(
+        !engine
+            .chat_orchestrator
+            .has_pending_chat_command(&question_id),
+        "a question id must not route to the command resume"
+    );
+
+    // A real command pause still reads as one.
+    let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new()],
+        vec![vec![ToolCall {
+            id: "call_command".to_string(),
+            name: "run_command".to_string(),
+            arguments_json:
+                r#"{"command":"touch should-not-run.txt","reason":"Write a marker file."}"#
+                    .to_string(),
+        }]],
+    );
+    let command_pause = turn(&engine, &repo, Some(&paused.session.id), true, &mut adapter);
+    let command_id = command_pause.command_proposal.as_ref().unwrap().id.clone();
+    assert!(
+        engine
+            .chat_orchestrator
+            .has_pending_chat_command(&command_id)
+    );
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_configuration_change_still_needs_its_own_approval() {
+    // Through a command.
+    let command_repo = temp_repo("answer-config-command");
+    let command_engine = engine_for(&command_repo, 2);
+    fs::create_dir_all(command_repo.join(".damaian")).unwrap();
+    let config_path = command_repo.join(".damaian").join("config.conf");
+    fs::write(&config_path, "agent_max_tool_rounds=8\n").unwrap();
+    let paused = paused_on_question(&command_engine, &command_repo, CLI_OR_SHELL_CALL);
+    let question_id = paused
+        .question_proposal
+        .as_ref()
+        .unwrap()
+        .question_id
+        .clone();
+    let command = ToolCall {
+        id: "call_config".to_string(),
+        name: "run_command".to_string(),
+        arguments_json:
+            r#"{"command":"echo agent_max_tool_rounds=1 > .damaian/config.conf","reason":"Change the round budget."}"#
+                .to_string(),
+    };
+    let mut command_adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Approval needed.".to_string()],
+        vec![vec![command], Vec::new()],
+    );
+    let resumed = resume_after_answer(
+        &command_engine,
+        &question_id,
+        "The CLI",
+        Some(0),
+        &mut command_adapter,
+    )
+    .expect("the turn resumes and then pauses on the command");
+    assert!(resumed.command_proposal.is_some());
+    assert_eq!(
+        fs::read_to_string(&config_path).unwrap(),
+        "agent_max_tool_rounds=8\n",
+        "an answered question must not change configuration"
+    );
+    fs::remove_dir_all(command_repo).unwrap();
+
+    // Through a patch to the same file.
+    let patch_repo = temp_repo("answer-config-patch");
+    let patch_engine = engine_for(&patch_repo, 2);
+    fs::create_dir_all(patch_repo.join(".damaian")).unwrap();
+    let config_path = patch_repo.join(".damaian").join("config.conf");
+    fs::write(&config_path, "agent_max_tool_rounds=8\n").unwrap();
+    let paused = paused_on_question(&patch_engine, &patch_repo, CLI_OR_SHELL_CALL);
+    let question_id = paused
+        .question_proposal
+        .as_ref()
+        .unwrap()
+        .question_id
+        .clone();
+    let patch = ToolCall {
+        id: "call_config_patch".to_string(),
+        name: "propose_patch".to_string(),
+        arguments_json:
+            r#"{"summary":"Change the round budget","files":[{"path":".damaian/config.conf","content":"agent_max_tool_rounds=1\n"}]}"#
+                .to_string(),
+    };
+    let mut patch_adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Review needed.".to_string()],
+        vec![vec![patch], Vec::new()],
+    );
+    let resumed = resume_after_answer(
+        &patch_engine,
+        &question_id,
+        "The CLI",
+        Some(0),
+        &mut patch_adapter,
+    )
+    .expect("the turn resumes and then proposes the patch");
+    assert!(resumed.patch_proposal.is_some());
+    assert_eq!(
+        fs::read_to_string(&config_path).unwrap(),
+        "agent_max_tool_rounds=8\n",
+        "an answered question must not apply a configuration patch"
+    );
+    fs::remove_dir_all(patch_repo).unwrap();
+}
+
+#[test]
+fn a_secret_in_a_question_is_redacted_before_the_log_and_the_result() {
+    const SECRET: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+
+    let repo = temp_repo("secret-question");
+    let engine = engine_for(&repo, 2);
+    let arguments =
+        format!(r#"{{"question":"Should I use {SECRET} here?","options":["Yes","No"]}}"#);
+    let paused = paused_on_question(&engine, &repo, &arguments);
+    let proposal = paused.question_proposal.as_ref().unwrap();
+
+    assert!(!proposal.question.contains(SECRET), "{}", proposal.question);
+    assert!(
+        proposal.question.contains("[REDACTED_"),
+        "the question should say a secret was removed: {}",
+        proposal.question
+    );
+    let log = session_log(&repo.join(".damaian"), &paused.session.id);
+    assert!(!log.contains(SECRET), "the question reached the log raw");
+
+    let mut resumed_adapter = MockModelAdapter::new("Yes.");
+    let resumed = resume_after_answer(
+        &engine,
+        &proposal.question_id,
+        "Yes",
+        Some(0),
+        &mut resumed_adapter,
+    )
+    .expect("the answer resumes the turn");
+    assert_eq!(resumed.task.status, TaskStatus::Complete);
+    for request in &resumed_adapter.requests {
+        for message in &request.messages {
+            assert!(
+                !message.content.contains(SECRET),
+                "the secret reached the model: {}",
+                message.content
+            );
+        }
+    }
+
     fs::remove_dir_all(repo).unwrap();
 }
 
@@ -908,11 +1714,16 @@ fn an_ask_user_call_with_malformed_arguments_is_a_tool_error_not_a_drop() {
 }
 
 /// Spec 21 §5.5's gate holds back the first step that changes anything until
-/// the plan is reviewed. Asking changes nothing, so it must not raise a plan
-/// review: the turn has a plan, it is not yet approved, and the call goes
-/// through to its (for now, refusing) arm.
+/// the plan is reviewed. An answer authorises nothing, so asking must neither
+/// raise the gate nor satisfy it: the question pauses first, and the mutation
+/// after the answer still raises the plan review.
+///
+/// The plan's own wording says "in Plan mode", but `propose_patch` is refused
+/// outright in `SessionMode::Plan`, so no plan review can ever be raised there.
+/// The gate is reachable in Code mode, which is what this uses — the same turn
+/// shape as `asking_does_not_wait_for_plan_review` before Task 4.
 #[test]
-fn asking_does_not_wait_for_plan_review() {
+fn asking_a_question_does_not_satisfy_the_plan_gate() {
     let repo = temp_repo("plan-gate");
     let engine = engine_for(&repo, 2);
     let plan = ToolCall {
@@ -921,26 +1732,55 @@ fn asking_does_not_wait_for_plan_review() {
         arguments_json: r#"{"steps":[{"title":"Look"},{"title":"Change"}]}"#.to_string(),
     };
     let mut adapter = MockModelAdapter::new_sequence_with_tool_calls(
-        vec![
-            String::new(),
-            String::new(),
-            "Assuming the CLI.".to_string(),
-        ],
-        vec![
-            vec![plan],
-            vec![ask_user_call(CLI_OR_SHELL_CALL)],
-            Vec::new(),
-        ],
+        vec![String::new(), String::new()],
+        vec![vec![plan], vec![ask_user_call(CLI_OR_SHELL_CALL)]],
     );
-    let result = turn(&engine, &repo, None, true, &mut adapter);
+    let paused = turn(&engine, &repo, None, true, &mut adapter);
 
-    assert!(result.plan_proposal.is_none(), "{:?}", result.plan_proposal);
-    let results = tool_results(&engine, &result.session.id);
     assert!(
-        results
-            .iter()
-            .any(|text| text.contains("No user can answer")),
-        "{results:?}"
+        paused.plan_proposal.is_none(),
+        "asking changes nothing, so it must not raise the plan review: {:?}",
+        paused.plan_proposal
     );
+    let question_id = paused
+        .question_proposal
+        .as_ref()
+        .expect("the turn pauses on the question")
+        .question_id
+        .clone();
+    assert_eq!(paused.task.status, TaskStatus::WaitingForApproval);
+
+    let patch = ToolCall {
+        id: "call_patch".to_string(),
+        name: "propose_patch".to_string(),
+        arguments_json:
+            r##"{"summary":"Change the readme","files":[{"path":"README.md","content":"# Changed\n"}]}"##
+                .to_string(),
+    };
+    let mut resumed_adapter = MockModelAdapter::new_sequence_with_tool_calls(
+        vec![String::new(), "Waiting for review.".to_string()],
+        vec![vec![patch], Vec::new()],
+    );
+    let resumed = resume_after_answer(
+        &engine,
+        &question_id,
+        "The CLI",
+        Some(0),
+        &mut resumed_adapter,
+    )
+    .expect("the answer resumes the turn");
+
+    let plan_proposal = resumed
+        .plan_proposal
+        .as_ref()
+        .expect("the mutation still needs its plan reviewed");
+    assert_eq!(plan_proposal.deferred_action, "Preparing a patch");
+    assert!(resumed.patch_proposal.is_none());
+    assert_eq!(
+        fs::read_to_string(repo.join("README.md")).unwrap(),
+        "# Clarification test\n",
+        "the patch must not be applied before the plan is reviewed"
+    );
+
     fs::remove_dir_all(repo).unwrap();
 }

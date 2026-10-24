@@ -4,7 +4,8 @@ use crate::checkpoint::{
     CheckpointConversation, CheckpointRequest, CheckpointStore, CommandCensus, PendingApproval,
 };
 use crate::clarification::{
-    AskUserInput, OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN, QUESTION_MAX_CHARS,
+    AskUserInput, OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN, PendingQuestionRef,
+    QUESTION_MAX_CHARS, validate_answer,
 };
 use crate::command_policy::{CommandClassification, CommandRisk, allow_always_eligible};
 use crate::command_purpose::CommandPurpose;
@@ -369,6 +370,22 @@ pub struct AgentPlanProposal {
     pub deferred_action: String,
 }
 
+/// A question the model asked mid-turn, waiting for the user's answer
+/// (spec 50). Resumed through [`ChatOrchestrator::resume_after_answer`].
+///
+/// Carries no proposal id, because a question is not a proposal: the id
+/// addresses the paused turn, and answering it authorises nothing. The text is
+/// already redacted — the chat loop runs the secret scanner before it is stored
+/// (`context.md` §7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentQuestionProposal {
+    /// The id to hand back to [`ChatOrchestrator::resume_after_answer`].
+    pub question_id: String,
+    pub question: String,
+    pub options: Vec<String>,
+    pub allow_free_text: bool,
+}
+
 /// A one-shot offer to answer a refused turn with a different configured
 /// provider (spec 56). Declined by default: nothing switches until the user
 /// approves this one occurrence, and there is no "always".
@@ -451,6 +468,10 @@ pub struct ChatTurnResult {
     /// mutating step. Resumed through
     /// [`ChatOrchestrator::resume_after_plan_decision`].
     pub plan_proposal: Option<AgentPlanProposal>,
+    /// The model asked a question mid-turn and the turn is waiting for the
+    /// user's answer. Resumed through
+    /// [`ChatOrchestrator::resume_after_answer`] (spec 50).
+    pub question_proposal: Option<AgentQuestionProposal>,
     /// The provider refused and a different configured provider could answer.
     /// The turn is paused, not failed, until
     /// [`ChatOrchestrator::resume_after_fallback_decision`] decides.
@@ -489,6 +510,7 @@ struct TurnProposals {
     command: Option<AgentCommandProposal>,
     patch: Option<AgentPatchProposal>,
     plan: Option<AgentPlanProposal>,
+    question: Option<AgentQuestionProposal>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -989,33 +1011,14 @@ impl ChatOrchestrator {
         decision_options: ResumeDecisionOptions,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(proposal_id)?;
-        // A plan review shares the pending-turn file but not this path: there
-        // is no dispatched call to execute or decline, and falling through to
-        // the shell-command branch below would run `last_content` as a
-        // command. Refused loudly rather than guessed at — and the pending
-        // turn is put back, so the right resume can still find it.
-        if pending.plan_review.is_some() {
-            self.pending_commands.save(&pending)?;
-            return Err(ClientError::InvalidInput(format!(
-                "Proposal {proposal_id} is a plan review; resume it with resume_after_plan_decision"
-            )));
-        }
-        // Same reasoning for a fallback offer: nothing was dispatched, and
-        // `last_content` is empty rather than a command.
-        if pending.provider_fallback.is_some() {
-            self.pending_commands.save(&pending)?;
-            return Err(ClientError::InvalidInput(format!(
-                "Proposal {proposal_id} is a provider fallback offer; resume it with resume_after_fallback_decision"
-            )));
-        }
-        // Same reasoning for a round-budget pause (spec 61): nothing was
-        // dispatched, and `last_content` is empty rather than a command.
-        if pending.round_budget.is_some() {
-            self.pending_commands.save(&pending)?;
-            return Err(ClientError::InvalidInput(format!(
-                "Proposal {proposal_id} is a round-budget pause; resume it with resume_round_budget"
-            )));
-        }
+        // Every pause shares the pending-turn file, and each resume loads
+        // whatever file its id names. A plan review, a provider fallback, a
+        // round-budget pause and a question each have their own resume;
+        // falling through to the shell-command branch here would run
+        // `last_content` as a command or fail with a misleading error after
+        // deleting the pause. Refused loudly instead, with the file put back
+        // so the right resume can still find it (spec 50 `context.md` §2).
+        self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::Action)?;
         let repository_root = PathBuf::from(&pending.repository_root);
         let mut messages = pending.messages;
         // Layer 3's resume-path points (`context.md` §8): approving a paused
@@ -1323,11 +1326,10 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(proposal_id)?;
+        self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::PlanReview)?;
         let Some(review) = pending.plan_review.clone() else {
-            self.pending_commands.save(&pending)?;
-            return Err(ClientError::InvalidInput(format!(
-                "Proposal {proposal_id} is not a plan review"
-            )));
+            // `refuse_unless_paused_for` just proved the pause is a plan review.
+            unreachable!("a plan review pause must carry its review");
         };
         let repository_root = PathBuf::from(&pending.repository_root);
         let mut messages = pending.messages;
@@ -1421,6 +1423,158 @@ impl ChatOrchestrator {
         )
     }
 
+    /// Answers the question a turn paused on (spec 50 `context.md` §7).
+    ///
+    /// The answer goes back as a **tool result**, not a user message: the
+    /// paused call is replayed and its result is the user's answer, so the
+    /// model sees the exchange as a tool round and the question consumes one
+    /// action round, exactly as an uninterrupted `ask_user` would.
+    ///
+    /// An answer authorises nothing. This method only ever appends a tool
+    /// result; every side-effecting tool the model asks for next still passes
+    /// through its own approval or review.
+    pub fn resume_after_answer(
+        &self,
+        question_id: &str,
+        answer: &str,
+        selected_option: Option<usize>,
+        model_adapter: &mut dyn ModelAdapter,
+        sink: &mut TurnSink<'_>,
+    ) -> Result<ChatTurnResult> {
+        let pending = self.pending_commands.take(question_id)?;
+        self.refuse_unless_paused_for(question_id, &pending, PausedFor::Question)?;
+        let Some(question) = pending.question.clone() else {
+            // `refuse_unless_paused_for` just proved the pause is a question.
+            unreachable!("a question pause must carry its question id");
+        };
+        let Some(state) = self
+            .session_store
+            .question_state(&pending.session.id, &question.question_id)?
+        else {
+            // The question was rewound out of the active conversation, so
+            // there is nothing left to answer. Put the pause back rather than
+            // consume it.
+            self.pending_commands.save(&pending)?;
+            return Err(ClientError::InvalidInput(format!(
+                "Unknown question: {}",
+                question.question_id
+            )));
+        };
+
+        // The answer is user text, but it becomes a tool result that leaves
+        // the protected boundary, so it is redacted on the way in. The turn's
+        // own prompt is stored and sent as written; this path is stricter
+        // because the result is engine-authored text like any other tool
+        // result (spec 50 `context.md` §7).
+        let answer = self.scanner.redact(answer).text;
+
+        // An already-answered question is never asked again (requirement 4):
+        // the recorded answer wins and a new one is ignored, even if it would
+        // not have been valid. That is the state a crash between recording the
+        // answer and resuming the turn leaves behind.
+        let (answer, selected_option) = match state.answer.clone() {
+            Some(recorded) => recorded,
+            None => {
+                if let Err(error) = validate_answer(&state.input(), &answer, selected_option) {
+                    self.pending_commands.save(&pending)?;
+                    return Err(ClientError::InvalidInput(error));
+                }
+                match self.session_store.record_question_answered(
+                    &pending.session.id,
+                    &question.question_id,
+                    &answer,
+                    selected_option,
+                ) {
+                    Ok(updated) => updated.answer.unwrap_or((answer, selected_option)),
+                    Err(error) => {
+                        // Another route may have answered it between the read
+                        // and the write. Use what is recorded; otherwise the
+                        // pause is put back so the answer can be tried again.
+                        match self
+                            .session_store
+                            .question_state(&pending.session.id, &question.question_id)?
+                            .and_then(|state| state.answer)
+                        {
+                            Some(recorded) => recorded,
+                            None => {
+                                self.pending_commands.save(&pending)?;
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        let tool_result = answered_question_result(&answer, selected_option, &state.options);
+        self.session_store.append_message(
+            &pending.session.id,
+            Some(&pending.task.id),
+            "assistant",
+            &format!("Asked: \"{}\"", state.question),
+        )?;
+        self.session_store.append_message(
+            &pending.session.id,
+            Some(&pending.task.id),
+            "tool",
+            &tool_result,
+        )?;
+
+        let repository_root = PathBuf::from(&pending.repository_root);
+        let mut messages = pending.messages;
+        if let Some(call) = &pending.matched_tool_call {
+            // Same round shape as the command resume: the paused call joins
+            // the round's one assistant message when earlier calls ran, and
+            // its answer is the tool result that follows it.
+            let round_message = pending
+                .round_calls_fed_back
+                .then(|| {
+                    messages
+                        .iter()
+                        .rposition(|message| !message.tool_calls.is_empty())
+                })
+                .flatten();
+            match round_message {
+                Some(index) => messages[index].tool_calls.push(call.clone()),
+                None => messages.push(ModelMessage::assistant_with_tool_calls(
+                    pending.last_content.clone(),
+                    vec![call.clone()],
+                    pending.reasoning_content.clone(),
+                )),
+            }
+            messages.push(ModelMessage::tool(call.id.clone(), tool_result));
+        } else {
+            // `ask_user` exists only as a native call, so this is unreachable.
+            // It mirrors the command resume's text fallback rather than
+            // inventing a second rule.
+            messages.push(
+                ModelMessage::assistant(pending.last_content.clone())
+                    .with_reasoning_content(pending.reasoning_content.clone()),
+            );
+            messages.push(ModelMessage::user(tool_result));
+        }
+
+        self.note_pending_approvals(&pending.session, &pending.task, Vec::new());
+        let task = self.session_store.update_task_status(
+            &pending.task,
+            TaskStatus::PreparingContext,
+            None,
+        )?;
+
+        self.run_agentic_turn(
+            &repository_root,
+            pending.session,
+            task,
+            pending.context_files,
+            messages,
+            pending.round + 1,
+            pending.exploration_rounds,
+            model_adapter,
+            sink,
+            pending.turn_options,
+        )
+    }
+
     /// Decides a provider-fallback offer (spec 56).
     ///
     /// Declining — the default — fails the task exactly as an unoffered
@@ -1437,11 +1591,10 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(proposal_id)?;
+        self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::ProviderFallback)?;
         let Some(offer) = pending.provider_fallback.clone() else {
-            self.pending_commands.save(&pending)?;
-            return Err(ClientError::InvalidInput(format!(
-                "Proposal {proposal_id} is not a provider fallback offer"
-            )));
+            // `refuse_unless_paused_for` just proved the pause is a fallback.
+            unreachable!("a provider fallback pause must carry its offer");
         };
 
         if approved {
@@ -1583,11 +1736,10 @@ impl ChatOrchestrator {
         sink: &mut TurnSink<'_>,
     ) -> Result<ChatTurnResult> {
         let pending = self.pending_commands.take(proposal_id)?;
+        self.refuse_unless_paused_for(proposal_id, &pending, PausedFor::RoundBudget)?;
         let Some(pause) = pending.round_budget.clone() else {
-            self.pending_commands.save(&pending)?;
-            return Err(ClientError::InvalidInput(format!(
-                "Proposal {proposal_id} is not a round-budget pause"
-            )));
+            // `refuse_unless_paused_for` just proved the pause is a budget stop.
+            unreachable!("a round-budget pause must carry its rounds");
         };
         let repository_root = PathBuf::from(&pending.repository_root);
 
@@ -1920,8 +2072,43 @@ impl ChatOrchestrator {
     /// Whether `proposal_id` was raised by a chat turn (and so should be
     /// resumed via [`Self::resume_after_command_decision`]) as opposed to a
     /// standalone command proposal from outside the chat flow.
+    ///
+    /// A question shares the pending-turn file but not this path: a question
+    /// id reaching `/api/run-command` must not be treated as an approval. It
+    /// falls through to the standalone proposal path, where no command
+    /// proposal has that id and nothing runs (spec 50 `context.md` §2).
     pub fn has_pending_chat_command(&self, proposal_id: &str) -> bool {
-        self.pending_commands.has(proposal_id)
+        self.pending_commands.has(proposal_id) && !self.pending_commands.is_question(proposal_id)
+    }
+
+    /// Refuses a pause of the wrong kind and puts its file back, so the resume
+    /// that owns it can still find it.
+    ///
+    /// `expected` is named by each resume, so every entry point has to say
+    /// what it accepts; a new [`PausedFor`] variant fails to compile in
+    /// `paused_for` and in the descriptions below until it is classified
+    /// (spec 50 `context.md` §2).
+    fn refuse_unless_paused_for(
+        &self,
+        proposal_id: &str,
+        pending: &PendingChatTurn,
+        expected: PausedFor,
+    ) -> Result<()> {
+        let actual = paused_for(pending);
+        if actual == expected {
+            return Ok(());
+        }
+        self.pending_commands.save(pending)?;
+        if actual == PausedFor::Conflicting {
+            return Err(ClientError::InvalidInput(format!(
+                "Proposal {proposal_id} records more than one kind of pause and cannot be resumed"
+            )));
+        }
+        Err(ClientError::InvalidInput(format!(
+            "Proposal {proposal_id} is {}; resume it with {}",
+            actual.description(),
+            actual.resume_method()
+        )))
     }
 
     /// Runs the model in a loop, letting it request tools across multiple
@@ -2923,6 +3110,7 @@ impl ChatOrchestrator {
                         }),
                         provider_fallback: None,
                         round_budget: None,
+                        question: None,
                     })?;
                     self.note_pending_approvals(
                         &session,
@@ -3097,6 +3285,7 @@ impl ChatOrchestrator {
                                     plan_review: None,
                                     provider_fallback: None,
                                     round_budget: None,
+                                    question: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -3432,6 +3621,7 @@ impl ChatOrchestrator {
                                     plan_review: None,
                                     provider_fallback: None,
                                     round_budget: None,
+                                    question: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -3546,6 +3736,7 @@ impl ChatOrchestrator {
                                     plan_review: None,
                                     provider_fallback: None,
                                     round_budget: None,
+                                    question: None,
                                 })?;
                                 self.note_pending_approvals(
                                     &session,
@@ -3595,14 +3786,106 @@ impl ChatOrchestrator {
                                 };
                             (summary, content, outcome)
                         }
-                        // Nothing can deliver an answer until spec 50 Task 4 builds
-                        // the pause, so even an offered call is refused the same
-                        // way rather than waiting.
-                        ToolAction::AskUser(_) => (
-                            "Attempted to ask the user a question.".to_string(),
-                            NO_USER_CAN_ANSWER.to_string(),
-                            ActionOutcome::Failed,
-                        ),
+                        ToolAction::AskUser(input) => {
+                            // Requirement 5: the cap is read from the log, so a
+                            // resumed turn counts what it already asked and an
+                            // in-memory counter cannot reset it.
+                            let asked = self
+                                .session_store
+                                .questions_asked_in_task(&session.id, &task.id)?;
+                            let cap = self.config.agent_max_questions_per_turn as usize;
+                            if asked >= cap {
+                                (
+                                    "Attempted to ask the user a question.".to_string(),
+                                    format!(
+                                        "A question was not asked: this turn has already asked \
+                                         {asked} of {cap} questions. Proceed without asking more, \
+                                         and say in your answer what you assumed and why."
+                                    ),
+                                    ActionOutcome::Failed,
+                                )
+                            } else {
+                                // Requirement 7: the question is model-authored
+                                // and may be quoting repository content, so it
+                                // is redacted before it is stored, shown or
+                                // sent anywhere.
+                                let redacted_input = AskUserInput {
+                                    question: self.scanner.redact(&input.question).text,
+                                    options: input
+                                        .options
+                                        .iter()
+                                        .map(|option| self.scanner.redact(option).text)
+                                        .collect(),
+                                    allow_free_text: input.allow_free_text,
+                                };
+                                if let Err(error) = redacted_input.validate() {
+                                    // Redaction can lengthen a question enough
+                                    // to break a bound. That is still the
+                                    // model's to fix, not a reason to fail the
+                                    // turn.
+                                    (
+                                        "Attempted to ask the user a question.".to_string(),
+                                        format!("The question was not asked: {error}"),
+                                        ActionOutcome::Failed,
+                                    )
+                                } else {
+                                    let question = PendingQuestionRef::new();
+                                    self.session_store.record_question_asked(
+                                        &session.id,
+                                        &task.id,
+                                        &question,
+                                        &redacted_input,
+                                    )?;
+                                    self.pending_commands.save(&PendingChatTurn {
+                                        proposal_id: question.question_id().to_string(),
+                                        session: session.clone(),
+                                        task: task.clone(),
+                                        repository_root: repository_root
+                                            .to_string_lossy()
+                                            .to_string(),
+                                        context_files: context_files.clone(),
+                                        round: action_rounds,
+                                        exploration_rounds,
+                                        messages: messages.clone(),
+                                        matched_tool_call: matched_tool_call.clone(),
+                                        last_content: redacted.clone(),
+                                        turn_options,
+                                        reasoning_content: model_run.reasoning_content.clone(),
+                                        round_calls_fed_back: round_message.is_some(),
+                                        mcp_call: None,
+                                        web_diagnostic_call: None,
+                                        plan_review: None,
+                                        provider_fallback: None,
+                                        round_budget: None,
+                                        question: Some(PendingQuestion {
+                                            question_id: question.question_id().to_string(),
+                                        }),
+                                    })?;
+                                    // A clean stop for a human decision, not a
+                                    // crash: the marker says what it waits on.
+                                    self.session_store
+                                        .finish_action(action_marker, "awaiting_answer")?;
+                                    let response = QUESTION_PAUSED_RESPONSE.to_string();
+                                    let mut proposal_run = model_run;
+                                    proposal_run.content = response.clone();
+                                    terminal = Some((
+                                        proposal_run,
+                                        response,
+                                        TurnProposals {
+                                            question: Some(AgentQuestionProposal {
+                                                question_id: question.question_id().to_string(),
+                                                question: redacted_input.question,
+                                                options: redacted_input.options,
+                                                allow_free_text: redacted_input.allow_free_text,
+                                            }),
+                                            ..Default::default()
+                                        },
+                                        StopReason::Answered,
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
                         other => {
                             unreachable!("read-only action reached the sequential match: {other:?}")
                         }
@@ -3798,9 +4081,16 @@ impl ChatOrchestrator {
                         proposal_id: proposal.id.clone(),
                     })
             });
-        task = match &pending {
-            Some(pending) => self.session_store.await_approval(&task, pending)?,
-            None => {
+        let pending_question = proposals
+            .question
+            .as_ref()
+            .map(|proposal| PendingQuestionRef::recorded(proposal.question_id.clone()));
+        task = match (&pending, &pending_question) {
+            (Some(pending), None) => self.session_store.await_approval(&task, pending)?,
+            // A question link goes under its own status key through
+            // `await_answer`; never through `await_approval` (spec 50 §5.2).
+            (None, Some(question)) => self.session_store.await_answer(&task, question)?,
+            (None, None) => {
                 let final_status = match stop_reason {
                     StopReason::ToolBudget => TaskStatus::ToolBudgetExhausted,
                     StopReason::TokenBudget => TaskStatus::TokenBudgetExhausted,
@@ -3808,6 +4098,9 @@ impl ChatOrchestrator {
                 };
                 self.session_store
                     .update_task_status(&task, final_status, None)?
+            }
+            (Some(_), Some(_)) => {
+                unreachable!("a turn cannot pause for an approval and a question at once")
             }
         };
         self.audit_log.record(
@@ -3826,6 +4119,8 @@ impl ChatOrchestrator {
                         "patch_proposal_ready".to_string()
                     } else if proposals.plan.is_some() {
                         "plan_review_required".to_string()
+                    } else if proposals.question.is_some() {
+                        "question_pending".to_string()
                     } else if stop_reason == StopReason::ToolBudget {
                         "tool_budget_exhausted".to_string()
                     } else if stop_reason == StopReason::TokenBudget {
@@ -3839,11 +4134,12 @@ impl ChatOrchestrator {
             ],
         )?;
         // A turn waiting on a command decision is not over: it resumes through
-        // `resume_after_command_decision` and seals then. A plan review is the
-        // same shape — nothing has happened yet and the turn continues through
-        // `resume_after_plan_decision`. Anything else has left the repository
-        // in the state a rewind must compare against.
-        if proposals.command.is_none() && proposals.plan.is_none() {
+        // `resume_after_command_decision` and seals then. A plan review and a
+        // question are the same shape — nothing has happened yet and the turn
+        // continues through `resume_after_plan_decision` or
+        // `resume_after_answer`. Anything else has left the repository in the
+        // state a rewind must compare against.
+        if proposals.command.is_none() && proposals.plan.is_none() && proposals.question.is_none() {
             self.seal_turn_checkpoint(repository_root, &session, &task);
         }
         // From the log, not from a running total: the number the client shows
@@ -3870,6 +4166,7 @@ impl ChatOrchestrator {
             command_proposal: proposals.command,
             patch_proposal: proposals.patch,
             plan_proposal: proposals.plan,
+            question_proposal: proposals.question,
             fallback_proposal: None,
             round_budget_proposal: None,
             cancelled: false,
@@ -3920,6 +4217,7 @@ impl ChatOrchestrator {
             plan_review: None,
             provider_fallback: Some(offer.clone()),
             round_budget: None,
+            question: None,
         })?;
         self.note_pending_approvals(
             &session,
@@ -3973,6 +4271,7 @@ impl ChatOrchestrator {
             command_proposal: None,
             patch_proposal: None,
             plan_proposal: None,
+            question_proposal: None,
             fallback_proposal: Some(AgentFallbackProposal {
                 id: proposal_id,
                 refused_provider: offer.refused_provider,
@@ -4039,6 +4338,7 @@ impl ChatOrchestrator {
             plan_review: None,
             provider_fallback: None,
             round_budget: Some(pause),
+            question: None,
         })?;
         self.note_pending_approvals(
             &session,
@@ -4099,6 +4399,7 @@ impl ChatOrchestrator {
             command_proposal: None,
             patch_proposal: None,
             plan_proposal: None,
+            question_proposal: None,
             fallback_proposal: None,
             round_budget_proposal: Some(AgentRoundBudgetProposal {
                 id: proposal_id,
@@ -4180,6 +4481,7 @@ impl ChatOrchestrator {
             command_proposal: None,
             patch_proposal: None,
             plan_proposal: None,
+            question_proposal: None,
             fallback_proposal: None,
             round_budget_proposal: None,
             cancelled: true,
@@ -4757,6 +5059,75 @@ impl ChatOrchestrator {
     }
 }
 
+/// What a paused turn is waiting for. Every resume matches on this
+/// exhaustively and refuses the kinds it does not own (spec 50 `context.md`
+/// §2), because the pending-turn file is keyed only by an id and each resume
+/// loads whatever file its id names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PausedFor {
+    /// A command, patch or browser diagnostic that needs approval.
+    Action,
+    PlanReview,
+    ProviderFallback,
+    RoundBudget,
+    Question,
+    /// A file carrying more than one marker. No writer produces this, and
+    /// guessing which pause it means is exactly the mistake this type exists
+    /// to prevent, so every resume refuses it.
+    Conflicting,
+}
+
+impl PausedFor {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Action => "a command or patch approval",
+            Self::PlanReview => "a plan review",
+            Self::ProviderFallback => "a provider fallback offer",
+            Self::RoundBudget => "a round-budget pause",
+            Self::Question => "a question",
+            Self::Conflicting => "more than one kind of pause",
+        }
+    }
+
+    fn resume_method(self) -> &'static str {
+        match self {
+            Self::Action => "resume_after_command_decision",
+            Self::PlanReview => "resume_after_plan_decision",
+            Self::ProviderFallback => "resume_after_fallback_decision",
+            Self::RoundBudget => "resume_round_budget",
+            Self::Question => "resume_after_answer",
+            Self::Conflicting => "",
+        }
+    }
+}
+
+/// What a question pause is waiting for. The question's text and options live
+/// in the session log; this carries only the id that addresses them, so the
+/// pause cannot drift from what was asked (spec 50 `context.md` §2, §6).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingQuestion {
+    question_id: String,
+}
+
+/// The kind of pause a saved turn represents. Every writer sets at most one
+/// marker; the tuple match makes a new field on [`PendingChatTurn`] a compile
+/// error here, which is where each resume's decision starts.
+fn paused_for(pending: &PendingChatTurn) -> PausedFor {
+    match (
+        pending.plan_review.is_some(),
+        pending.provider_fallback.is_some(),
+        pending.round_budget.is_some(),
+        pending.question.is_some(),
+    ) {
+        (false, false, false, false) => PausedFor::Action,
+        (true, false, false, false) => PausedFor::PlanReview,
+        (false, true, false, false) => PausedFor::ProviderFallback,
+        (false, false, true, false) => PausedFor::RoundBudget,
+        (false, false, false, true) => PausedFor::Question,
+        _ => PausedFor::Conflicting,
+    }
+}
+
 /// Conversation state saved when a chat turn pauses on a command that needs
 /// human approval, so [`ChatOrchestrator::resume_after_command_decision`]
 /// can pick the turn back up once the user decides.
@@ -4825,6 +5196,13 @@ struct PendingChatTurn {
     /// pending turns written before the pause existed loadable.
     #[serde(default)]
     round_budget: Option<RoundBudgetPause>,
+    /// Present when the pause is a question the model asked (spec 50). As with
+    /// a plan review nothing was dispatched: the turn stopped to let a human
+    /// answer, and `round` is the round the question was asked in, because
+    /// that round has not been charged yet. `#[serde(default)]` keeps pending
+    /// turns written before the pause existed loadable.
+    #[serde(default)]
+    question: Option<PendingQuestion>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4969,6 +5347,21 @@ impl PendingCommandStore {
         self.path_for(proposal_id).exists()
     }
 
+    /// Whether the pending turn is a question pause. Parsed as loose JSON so a
+    /// file written by a version without the field still answers "no", and an
+    /// unreadable file is not mistaken for a question.
+    fn is_question(&self, proposal_id: &str) -> bool {
+        let Ok(content) = fs::read_to_string(self.path_for(proposal_id)) else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            return false;
+        };
+        value
+            .get("question")
+            .is_some_and(|question| !question.is_null())
+    }
+
     fn save(&self, pending: &PendingChatTurn) -> Result<()> {
         let path = self.path_for(&pending.proposal_id);
         if let Some(parent) = path.parent() {
@@ -5039,6 +5432,27 @@ fn system_prompt_for_session(
 
 /// The tool result for an `ask_user` call nobody can answer.
 const NO_USER_CAN_ANSWER: &str = "No user can answer a question in this context, so the question was not asked. Proceed under an explicitly stated assumption, and say in your answer what you assumed and why.";
+
+/// The assistant text a question pause leaves in the transcript. The question
+/// itself is its own `question_asked` event (`context.md` §6), so repeating it
+/// here would show the same text twice.
+const QUESTION_PAUSED_RESPONSE: &str = "I need an answer from you before continuing.";
+
+/// The answer as the model receives it, in `context.md` §7's fixed format. The
+/// option is named only when the user picked one; a free-text answer carries
+/// its text alone. The answer is already redacted by the caller.
+fn answered_question_result(
+    answer: &str,
+    selected_option: Option<usize>,
+    options: &[String],
+) -> String {
+    match selected_option.and_then(|index| options.get(index).map(|label| (index, label))) {
+        Some((index, label)) => {
+            format!("The user answered: \"{answer}\" (option {index}: \"{label}\")")
+        }
+        None => format!("The user answered: \"{answer}\""),
+    }
+}
 
 /// What a turn with nobody to ask is told instead of being offered `ask_user`
 /// (spec 50 `context.md` §4). Where a user is present the prompt carries no
