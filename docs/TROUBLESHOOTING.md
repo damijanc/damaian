@@ -897,7 +897,10 @@ gets no generic finding, because it never reached a verdict.
 search, a listing, a text read, or a git read, including pipelines of those.
 `grep` exits 1 when nothing matches and `ls -d` exits 1 for a path that does
 not exist; Damaian treats either as the answer the assistant asked for, keeps
-the output in the tool result, and files no finding. The list of commands that
+the output in the tool result, and files no finding. Until 2026-10-24 a loop
+(`for …; do …; done`) or a leading `set +e` made such a command **other**, so
+older sessions may still hold an **Unparsed checks** error that is only a
+failed look-around; dismiss it. The list of commands that
 count as exploration is in [USER_GUIDE.md](USER_GUIDE.md#findings). The
 purpose is decided once, when the command is proposed, and stored: `purpose`
 on the `command_executed` and `stored_command_executed` audit events, the

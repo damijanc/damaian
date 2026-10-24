@@ -1038,11 +1038,14 @@ whether a failure becomes a finding.
   (`cargo build`, `cargo check`, `cargo clippy`, Biome).
 - **Exploration** commands do not. These are the assistant looking around:
   searches (`grep`, `rg`, `find`), listings (`ls`, `pwd`, `du`, `stat`,
-  `file`), text reads (`cat`, `head`, `tail`, `wc`, `sed -n`, `awk`, `sort`,
-  `uniq`, `cut`, `echo`, `true`), and git reads (`status`, `diff`, `log`,
-  `show`, `rev-list`, `rev-parse`, `branch --list`, `worktree list`,
-  `ls-files`, `grep`), including pipelines and `&&`/`||`/`;` chains of those,
-  with a leading `cd <dir>` ignored. A search that matched nothing or a path
+  `file`), text reads (`cat`, `head`, `tail`, `wc`, `sed` without `-i`, `awk`,
+  `sort`, `uniq`, `cut`, `echo`, `true`, `read`), and git reads (`status`,
+  `diff`, `log`, `show`, `rev-list`, `rev-parse`, `branch --list`,
+  `worktree list`, `ls-files`, `grep`), including pipelines and `&&`/`||`/`;`
+  chains of those, with a leading `cd <dir>` or `set -e`/`set +e` ignored. A
+  `for`, `while` or `until` loop counts when every command it runs does, so a
+  loop that reads files is exploration and one that deletes them is not. A
+  command with `$(…)` or backticks never counts. A search that matched nothing or a path
   that does not exist is an answer, not a problem in your code, so its output
   still reaches the assistant and no finding is recorded.
 - **Other** commands, including any command Damaian does not recognise,

@@ -1,6 +1,7 @@
 # Feature Spec: Exploratory Command Failures Are Not Findings
 
-Status: Done 2026-10-23. Tasks 1–6 of 6 done — see
+Status: Done 2026-10-23; §5.1 amended 2026-10-24 (loops, `set`, `sed`, command
+substitution — see §7). Tasks 1–6 of 6 done — see
 [`tasks.md`](tasks.md). Specified on 2026-10-17 from the session behind
 [#59](../59_exploration_round_allowance/proposal.md)–[#62](../62_approval_prompts_name_the_reason/proposal.md),
 a reporting-only request that left two open **error** findings behind: an
@@ -127,14 +128,28 @@ the crate.
   `cargo clippy` counts as a check even though it is not on the validation list,
   because its output is something #22 already knows how to read.
 - **Exploration** when it is not a check and every simple command in it — split
-  on `&&`, `||`, `;` and `|`, with a leading `cd <dir>` ignored — starts with a
-  program from a closed list: `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `grep`,
-  `rg`, `find`, `sed -n`, `awk`, `sort`, `uniq`, `cut`, `du`, `stat`, `file`,
-  `echo`, `true`, and `git` with `status`, `diff`, `log`, `show`, `rev-list`,
-  `rev-parse`, `branch --list`, `worktree list`, `ls-files`, `grep`, optionally
-  after `-C <dir>`. Programs are matched by their exact first word, so
-  `./grep` and `FOO=1 grep` are `Other`. The split respects single and double
-  quotes and backslashes, and does not treat the `&` of `2>&1` as a separator.
+  on `&&`, `||`, `;`, `|` and newlines, with a leading `cd <dir>` ignored —
+  starts with a program from a closed list: `ls`, `pwd`, `cat`, `head`, `tail`,
+  `wc`, `grep`, `rg`, `find`, `sed` (any form without `-i` or `--in-place`),
+  `awk`, `sort`, `uniq`, `cut`, `du`, `stat`, `file`, `echo`, `true`, `read`,
+  and `git` with `status`, `diff`, `log`, `show`, `rev-list`, `rev-parse`,
+  `branch --list`, `worktree list`, `ls-files`, `grep`, optionally after
+  `-C <dir>`. Programs are matched by their exact first word, so `./grep` and
+  `FOO=1 grep` are `Other`. The split respects single and double quotes and
+  backslashes, and does not treat the `&` of `2>&1` as a separator.
+
+  Shell syntax that runs nothing by itself is looked through (amended
+  2026-10-24, §7): a `set` of options only (`set -e`, `set +e`,
+  `set -euo pipefail`; not `set --`); a `for` header, whose word list runs
+  nothing; and the `do` and `done` keywords. `while` and `until` are judged by
+  their condition, which is a command. So a loop is exploration exactly when
+  every command it runs would be on its own: `for f in …; do sed -n … "$f";
+  done` is, `for f in …; do rm "$f"; done` is not. A command that runs nothing
+  from the list — only `cd`, only `set` — is not exploration.
+
+  Any command substitution, `$(…)` or a backtick outside single quotes, makes
+  the whole command `Other`, because it runs a command the split cannot see:
+  `for f in $(cargo test …)` and `echo $(rm x)` alike.
 - **Other** otherwise.
 
 The list is generous on purpose, because requirement 6 makes it harmless: it
@@ -236,6 +251,10 @@ On Done: `docs/USER_GUIDE.md` (findings: which commands produce them), and
 - With `shell` set to zsh, the model-facing command description names zsh and
   the glob-quoting rule; with bash it names bash and omits the rule.
 - #23's checks still record and repair findings unchanged.
+- *(Amendment 2026-10-24.)* The two loops from the findings panel in §7's
+  amendment note are exploration; a loop whose body runs anything off the list
+  is `Other`, or `Check` when it runs a check; a command substitution anywhere
+  is `Other`.
 
 ## 7. Implementation Notes
 
@@ -271,3 +290,15 @@ the design above have been folded into §5.1.
   estimated tokens one call earlier (3 → 2), and `tests/token_ceiling.rs`
   pins `shell: "/bin/zsh"` so the count no longer depends on `$SHELL`. #62
   was still "Not started", so its wording was not a base.
+- **Amendment (2026-10-24): loops, `set` and `sed`.** A reporting session on
+  2026-10-24 left two open **error** findings that were its own failed
+  look-arounds: `for w in …; do echo "=== $w"; sed -n '1,6p' "…"*/proposal.md
+  2>/dev/null; done`, which zsh rejected with "no matches found", and
+  `set +e; for f in …; do …; done`. Both were `Other`, because `for`, `do`,
+  `done` and `set` were not on the list, so both were filed as findings and
+  offered for repair. §5.1 now looks through loop syntax and option-only `set`,
+  judges a loop by the commands it runs, makes any command substitution
+  `Other` (which also closes `echo $(rm x)` being exploration), accepts every
+  `sed` that does not edit in place, and adds `read` for `| while read f`. The
+  rules and their counter-cases are pinned in `command_purpose.rs`'s unit
+  tests. Findings already recorded are unchanged (§4); they can be dismissed.

@@ -68,9 +68,11 @@ pub fn command_purpose(command: &str, detected: bool) -> CommandPurpose {
 }
 
 /// Programs that only look, matched on the first word of a simple command.
+/// `read` is here for `… | while read f; do …; done`: it only fills a shell
+/// variable.
 const EXPLORATION_PROGRAMS: &[&str] = &[
     "ls", "pwd", "cat", "head", "tail", "wc", "grep", "rg", "find", "awk", "sort", "uniq", "cut",
-    "du", "stat", "file", "echo", "true",
+    "du", "stat", "file", "echo", "true", "read",
 ];
 
 /// `git` subcommands that only look. `branch` and `worktree` count only in
@@ -86,16 +88,36 @@ const EXPLORATION_GIT_SUBCOMMANDS: &[&str] = &[
     "grep",
 ];
 
-/// Every simple command is on the exploration list, ignoring a `cd <dir>`.
-/// A command that is only `cd` is not exploration.
+/// Every simple command is on the exploration list, ignoring a `cd <dir>`,
+/// a `set` of shell options, and loop syntax. A loop is judged by the
+/// commands it runs: `for`'s word list runs nothing, `while` and `until`
+/// run their condition, and `do` and `done` are keywords. A command that
+/// runs nothing on the list (only `cd`, only `set`) is not exploration.
+///
+/// Command substitution runs a command the split cannot see, so any `$(…)`
+/// or backtick outside single quotes makes the whole command `Other`.
 fn is_exploration(command: &str) -> bool {
+    if has_command_substitution(command) {
+        return false;
+    }
     let mut looked = false;
     for segment in simple_commands(command) {
-        let words: Vec<&str> = segment.split_whitespace().collect();
-        if words.is_empty() {
-            continue;
+        let mut words: Vec<&str> = segment.split_whitespace().collect();
+        match words.first() {
+            None | Some(&"done") => continue,
+            Some(&"for") => continue,
+            Some(&"do" | &"while" | &"until") => {
+                words.remove(0);
+                if words.is_empty() {
+                    continue;
+                }
+            }
+            _ => {}
         }
         if words[0] == "cd" && words.len() <= 2 {
+            continue;
+        }
+        if words[0] == "set" && is_option_set(&words[1..]) {
             continue;
         }
         if !is_exploration_command(&words) {
@@ -106,9 +128,58 @@ fn is_exploration(command: &str) -> bool {
     looked
 }
 
+/// `set -e`, `set +e`, `set -euo pipefail`: options only, no positional
+/// parameters. `--` starts positional parameters, so it does not count.
+fn is_option_set(arguments: &[&str]) -> bool {
+    let mut expects_name = false;
+    for argument in arguments {
+        if expects_name {
+            expects_name = false;
+            continue;
+        }
+        let is_flag = (argument.starts_with('-') || argument.starts_with('+'))
+            && argument.len() > 1
+            && *argument != "--";
+        if !is_flag {
+            return false;
+        }
+        expects_name = argument.ends_with('o');
+    }
+    !arguments.is_empty() && !expects_name
+}
+
+/// `$(` or a backtick outside single quotes, where the shell would run it.
+fn has_command_substitution(command: &str) -> bool {
+    let mut in_single = false;
+    let mut escaped = false;
+    let mut previous = None;
+    for character in command.chars() {
+        if escaped {
+            escaped = false;
+        } else if in_single {
+            in_single = character != '\'';
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '\'' {
+            in_single = true;
+        } else if character == '`' || (character == '(' && previous == Some('$')) {
+            return true;
+        }
+        previous = Some(character);
+    }
+    false
+}
+
 fn is_exploration_command(words: &[&str]) -> bool {
     match words[0] {
-        "sed" => words.get(1) == Some(&"-n"),
+        // Any form that prints rather than editing in place. A script word is
+        // quoted or starts with something other than `-`, so only option words
+        // are checked for `i`.
+        "sed" => !words[1..].iter().any(|word| {
+            *word == "--in-place"
+                || word.starts_with("--in-place=")
+                || (word.starts_with('-') && !word.starts_with("--") && word.contains('i'))
+        }),
         "git" => {
             // `git -C <dir> log` is how the agent reads another worktree.
             let rest = match words.get(1) {
@@ -248,6 +319,92 @@ mod tests {
             "grep -rn x . | xargs rm",
             "FOO=1 grep x .",
             "./grep x",
+        ] {
+            assert_eq!(purpose(command), CommandPurpose::Other, "{command}");
+        }
+    }
+
+    #[test]
+    fn the_loops_from_the_findings_panel_are_exploration() {
+        assert_eq!(
+            purpose(
+                r#"for w in spec25-task9 spec50-task4; do echo "=== $w"; sed -n '1,6p' ".claude/worktrees/$w/docs/specs/$w"*/proposal.md 2>/dev/null; done"#
+            ),
+            CommandPurpose::Exploration
+        );
+        assert_eq!(
+            purpose(
+                "set +e; for f in docs/specs/25_x/proposal.md docs/specs/32_hooks/proposal.md; do echo \"== $f\"; sed -n '3,8p' \"$f\"; done"
+            ),
+            CommandPurpose::Exploration
+        );
+    }
+
+    #[test]
+    fn a_loop_is_judged_by_the_commands_it_runs() {
+        for command in [
+            "for f in a b; do head -5 \"$f\"; done",
+            "for f in a b\ndo\n  wc -l \"$f\"\ndone | sort",
+            "while true; do ls; done",
+            "until git diff --quiet; do git status; done",
+            "find . -name '*.md' | while read f; do head -1 \"$f\"; done",
+            "set -e; ls",
+            "set -euo pipefail; git log --oneline -3",
+            "set +e\ngrep -rn x .",
+        ] {
+            assert_eq!(purpose(command), CommandPurpose::Exploration, "{command}");
+        }
+        for command in [
+            "for f in *.rs; do rustfmt \"$f\"; done",
+            "for f in a b; do rm \"$f\"; done",
+            "while read l; do rm \"$l\"; done",
+            "for f in a; do head \"$f\"; done; touch x",
+            "set -e; rm -rf build",
+            "set +e echo '== 59'; grep -rn x .",
+            "set -- a b; ls",
+            "for f in a; do done",
+            "set -e",
+        ] {
+            assert_eq!(purpose(command), CommandPurpose::Other, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_loop_that_runs_a_check_is_a_check() {
+        assert_eq!(
+            purpose("for t in a b; do cargo test \"$t\"; done"),
+            CommandPurpose::Check
+        );
+    }
+
+    #[test]
+    fn command_substitution_is_other_wherever_it_appears() {
+        for command in [
+            "for f in $(git ls-files); do head -1 \"$f\"; done",
+            "for f in `ls`; do head -1 \"$f\"; done",
+            "echo $(rm x)",
+            "echo \"$(touch y)\"",
+        ] {
+            assert_eq!(purpose(command), CommandPurpose::Other, "{command}");
+        }
+        // Single quotes make it literal text, so a search for it is still a search.
+        assert_eq!(purpose("grep -rn '$(foo)' ."), CommandPurpose::Exploration);
+    }
+
+    #[test]
+    fn sed_is_exploration_unless_it_edits_in_place() {
+        for command in [
+            "sed -e 's/a/b/' src/lib.rs | head",
+            "sed -E -n '/x/p' f",
+            "sed 's/a/b/' f",
+        ] {
+            assert_eq!(purpose(command), CommandPurpose::Exploration, "{command}");
+        }
+        for command in [
+            "sed -i 's/a/b/' f",
+            "sed -e 's/a/b/' -i f",
+            "sed -ni '/x/p' f",
+            "sed --in-place 's/a/b/' f",
         ] {
             assert_eq!(purpose(command), CommandPurpose::Other, "{command}");
         }
