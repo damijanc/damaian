@@ -700,14 +700,20 @@ fn handle_worker_route(stream: &mut TcpStream, request: &Request) -> Result<(), 
 fn handle_session_delete(stream: &mut TcpStream, request: &Request) -> Result<(), String> {
     let form = parse_form(&request.body);
     let session_id = required_form(&form, "session_id")?;
-    let engine = default_engine()?;
+    // A `session_end` hook runs in the repository, and a session stores only
+    // its repository id, so the caller says which checkout this session
+    // belongs to (spec 32 Task 6).
+    let repo = required_form(&form, "repo")?;
+    // Loaded for the repository, not with `default_engine`: a repository hook
+    // the user has reviewed should see `session_end` as a user hook does, and
+    // only a repository-scoped load carries it.
+    let engine = engine_for_repo(&repo)?;
     // Before the delete: the children are recorded in the log it removes.
     for worker in workers::workers_to_stop_for_deleted_session(&engine.session_store, &session_id) {
         workers::global().shutdown(&worker);
     }
     engine
-        .session_store
-        .delete_session(&session_id)
+        .delete_session(&session_id, &repo)
         .map_err(|error| error.to_string())?;
     write_response(
         stream,
@@ -1342,10 +1348,11 @@ fn handle_apply_patch(stream: &mut TcpStream, request: &Request) -> Result<(), S
         200,
         "application/json",
         &format!(
-            "{{\"patchId\":\"{}\",\"appliedFiles\":[{}],\"warningCount\":{}}}",
+            "{{\"patchId\":\"{}\",\"appliedFiles\":[{}],\"warningCount\":{},\"hookWarnings\":[{}]}}",
             escape_json(&result.patch_id),
             json_string_array(&result.applied_files),
-            result.warnings.len()
+            result.warnings.len(),
+            json_string_array(&result.hook_warnings)
         ),
     )
 }
@@ -5690,6 +5697,77 @@ mod tests {
             fs::read_to_string(repo.join("config.js")).unwrap(),
             "export const api_key = \"sk_live_9f8a7b6c5d4e3f2a1b0c\";\n"
         );
+
+        fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Spec 32 Task 6: a `before_patch_apply` hook's denial is the error text
+    /// the UI already shows, so its reason reaches the user, and a warning is
+    /// returned beside the applied files.
+    #[test]
+    fn apply_patch_endpoint_reports_hook_denials_and_warnings() {
+        let repo = std::env::temp_dir().join(format!(
+            "damaian-apply-hook-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(repo.join(".damaian")).unwrap();
+        fs::write(repo.join("notes.txt"), "one\n").unwrap();
+
+        let data_dir = isolated_data_dir().to_path_buf();
+        let script = data_dir.join("patch-hook.sh");
+        let deny = "cat <<'JSON'\n{\"hookApiVersion\":1,\"verdict\":\"deny\",\"reason\":\"migrations/ is applied by the release process\"}\nJSON\n";
+        fs::write(&script, deny).unwrap();
+        let user_config = data_dir.join("config").join("user.conf");
+        fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+        let hook_line = format!(
+            "hook.no_migrations.command=/bin/sh\nhook.no_migrations.args={}\nhook.no_migrations.events=before_patch_apply\n",
+            script.to_string_lossy()
+        );
+        fs::write(&user_config, &hook_line).unwrap();
+
+        let repo_arg = repo.to_string_lossy().to_string();
+        let engine = engine_for_repo(&repo_arg).expect("engine for test repo");
+        let patch = engine
+            .patch_engine
+            .create_patch(
+                &repo,
+                &[workspace_engine::ProposedChange {
+                    path: "notes.txt".to_string(),
+                    new_content: "two\n".to_string(),
+                    status: None,
+                    allow_restricted: false,
+                }],
+                None,
+                "hook apply",
+            )
+            .expect("create patch");
+        engine.patch_store.save(&patch).expect("store patch");
+
+        let (port, token) = serve_for_test();
+        let fields = [("repo", repo_arg.as_str()), ("patch_id", patch.id.as_str())];
+        let denied = post_fields_for_test(port, &token, "/api/apply-patch", &fields);
+        assert!(denied.starts_with("HTTP/1.1 500"), "{denied}");
+        assert!(denied.contains("no_migrations"), "{denied}");
+        assert!(denied.contains("release process"), "{denied}");
+        assert_eq!(
+            fs::read_to_string(repo.join("notes.txt")).unwrap(),
+            "one\n",
+            "a denied apply wrote the file"
+        );
+
+        let warn = "cat <<'JSON'\n{\"hookApiVersion\":1,\"verdict\":\"warn\",\"reason\":\"the patch was checked by the hook\"}\nJSON\n";
+        fs::write(&script, warn).unwrap();
+        let applied = post_fields_for_test(port, &token, "/api/apply-patch", &fields);
+        let _ = fs::remove_file(&user_config);
+        assert!(applied.starts_with("HTTP/1.1 200"), "{applied}");
+        assert!(
+            applied.contains("\"hookWarnings\":[\"the patch was checked by the hook\"]"),
+            "{applied}"
+        );
+        assert_eq!(fs::read_to_string(repo.join("notes.txt")).unwrap(), "two\n");
 
         fs::remove_dir_all(&repo).ok();
     }

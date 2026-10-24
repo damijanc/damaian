@@ -326,12 +326,12 @@ Spec 24's Task 9 found that a new per-request item shifts
 runs that file. If the count moves, it sets `symbol_context_max_tokens: 0` in
 `engine_with_ceiling`, as spec 24 did for the map.
 
-**Spec 32 edits the same function.** Its Task 6 (not started on 2026-10-12)
-adds `build_context_with_hooks`, which takes `hook_context` items, and makes
-`build_context` delegate to it (`32_hooks/tasks.md`, Task 6). Whichever lands
-second rebases. The `symbols` item belongs in the shared body, so both entry
-points get it. Its place stays after `repository_map` and before
-`retrieved_file`, wherever `hook_context` ends up.
+**Spec 32 edits the same function.** Its Task 6 landed on 2026-10-24 and added
+`build_context_with_hooks`, which takes `hook_context` items, and made
+`build_context` delegate to it (`32_hooks/tasks.md`, Task 6). The `symbols`
+item sits in the shared body, so both entry points get it, after
+`repository_map` and before `retrieved_file`, with `hook_context` between it
+and the retrieved files.
 
 ## 10. Diagnostics: recorded per session, with no task, and unable to block a step
 

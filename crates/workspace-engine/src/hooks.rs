@@ -1402,6 +1402,30 @@ impl HookDispatcher {
             .to_string()
     }
 
+    /// The envelope fields a call site supplies for an event it dispatches
+    /// itself (Tasks 6–8). `session` is `None` only where the event precedes
+    /// the session (`session_start`), which then runs as the default mode and
+    /// profile — the same values an envelope without a session has always
+    /// carried.
+    pub(crate) fn envelope_parts(
+        &self,
+        session: Option<&Session>,
+        task_id: Option<&str>,
+        payload: Value,
+    ) -> HookEnvelopeParts {
+        HookEnvelopeParts {
+            session_id: session.map(|session| session.id.clone()),
+            task_id: task_id.map(str::to_string),
+            mode: session
+                .map(|session| self.session_store.session_mode(&session.id))
+                .unwrap_or(SessionMode::Code)
+                .as_str()
+                .to_string(),
+            profile: session.map_or_else(|| "full".to_string(), |session| self.profile_id(session)),
+            payload,
+        }
+    }
+
     /// Proposes and runs one permitted command behind a `hook_command`
     /// marker, and turns its output into findings. `None` means it did not
     /// run; the reason is already a finding.

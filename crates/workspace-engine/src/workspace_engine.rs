@@ -6,12 +6,12 @@ use crate::command_runner::CommandRunner;
 use crate::config::{Config, RepositoryConfigReport};
 use crate::context_manager::{ContextManager, RepositoryMapSource, SymbolSource};
 use crate::edit::{EditOrchestrator, PatchStore};
-use crate::error::Result;
+use crate::error::{ClientError, Result};
 use crate::file_access::FileAccessController;
 use crate::finding::{Finding, FindingSource};
 use crate::git_service::{GitReadCaps, GitService};
 use crate::hash::{file_hash, repository_id_for_root};
-use crate::hooks::HookDispatcher;
+use crate::hooks::{HookContext, HookDispatcher, HookEvent};
 use crate::index_cache::IndexCache;
 use crate::indexer::ProjectIndexer;
 use crate::lsp::{
@@ -174,6 +174,7 @@ impl WorkspaceEngine {
             patch_engine.clone(),
             patch_store.clone(),
             checkpoint_store.clone(),
+            hooks.clone(),
         );
         Self {
             config,
@@ -197,6 +198,50 @@ impl WorkspaceEngine {
             validation_orchestrator,
             repository_trust,
         }
+    }
+
+    /// Ends a session (spec 32 `context.md` §3): `session_end` hooks first,
+    /// then the delete itself.
+    ///
+    /// The outcome is audit-only (§4). A hook cannot cancel a user's explicit
+    /// delete, because refusing it is not a narrowing anyone asked for; a
+    /// `deny` is recorded in the audit log and the session still goes.
+    ///
+    /// The repository root is an argument because a session stores only its
+    /// repository id, and a hook process needs a working directory and a
+    /// repository to run in. It must be the session's own repository: the
+    /// root comes from a caller (the shell takes it from the request form),
+    /// and running checkout B's hooks with checkout A's session in the
+    /// envelope would show one repository another repository's session.
+    pub fn delete_session(
+        &self,
+        session_id: &str,
+        repository_root: impl AsRef<Path>,
+    ) -> Result<()> {
+        let root = repository_root.as_ref();
+        if let Some(session) = self.session_store.read_session(session_id)? {
+            if repository_id_for_root(root) != session.repository_id {
+                return Err(ClientError::InvalidInput(format!(
+                    "Session {session_id} does not belong to repository {}",
+                    root.display()
+                )));
+            }
+            let ctx = HookContext::root();
+            let parts = self
+                .hooks
+                .envelope_parts(Some(&session), None, serde_json::json!({}));
+            let mut outcome = self
+                .hooks
+                .dispatch(HookEvent::SessionEnd, parts, root, &ctx);
+            // Nothing can be recorded against a log that is about to go, but a
+            // requested command at an event with no task is still refused and
+            // audited rather than dropped (`context.md` §9).
+            let mode = self.session_store.session_mode(&session.id);
+            let _ =
+                self.hooks
+                    .run_requested_commands(&mut outcome, &session, None, mode, root, &ctx);
+        }
+        self.session_store.delete_session(session_id)
     }
 
     /// The repository's map, from the cached index: the stored map when it

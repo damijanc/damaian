@@ -72,6 +72,11 @@ pub struct PatchApplyResult {
     /// evidence assert a file Damaian never wrote.
     pub applied: Vec<crate::plan::PatchedFile>,
     pub warnings: Vec<String>,
+    /// What the `before_patch_apply`/`after_patch_apply` hooks said that a
+    /// caller should show beside the result (spec 32 `context.md` §10).
+    /// Separate from `warnings`, which is the patch engine's own, so a caller
+    /// can tell a hook's advice from a patch problem.
+    pub hook_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -558,6 +563,9 @@ impl PatchEngine {
             applied_files,
             applied,
             warnings,
+            // The engine never runs hooks (spec 32 Task 6); the orchestrator
+            // that owns a dispatcher fills this in.
+            hook_warnings: Vec::new(),
         })
     }
 

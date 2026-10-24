@@ -8204,7 +8204,7 @@ async function renameSessionForProject(projectPath, session) {
 
 async function deleteSessionForProject(projectPath, session) {
   if (!(await confirmDialog("Delete this session?", ""))) return;
-  await api("/api/session-delete", form({ session_id: session.id }));
+  await api("/api/session-delete", form({ session_id: session.id, repo: projectPath }));
   const normalized = normalizeProjectPath(projectPath);
   if (normalized === repo() && currentSessionId === session.id) {
     localStorage.removeItem(lastSessionStorageKey(normalized));

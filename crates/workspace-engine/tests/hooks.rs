@@ -37,8 +37,8 @@ use workspace_engine::hooks::{
 use workspace_engine::{
     AuditLog, CommandPolicy, CommandRunner, CommandStore, Config, ConfigOverlay, ConfigScope,
     EffectivePolicy, HookConfig, HookEvent, HookMode, HookReview, HookSource, MAX_HOOK_TIMEOUT_MS,
-    ProcessRegistry, RepositoryConfigReport, RepositoryKeyClass, SecretScanner, Session,
-    SessionMode, SessionStore, SourceKind, Task, ValidationOrchestrator, WorkspaceEngine,
+    MockModelAdapter, ProcessRegistry, RepositoryConfigReport, RepositoryKeyClass, SecretScanner,
+    Session, SessionMode, SessionStore, SourceKind, Task, ValidationOrchestrator, WorkspaceEngine,
     repository_id_for_root, split_profile_keys,
 };
 
@@ -2610,6 +2610,583 @@ fn with_no_task_every_requested_command_is_refused() {
         events_of(&config.data_dir, "stored_command_executed").len(),
         0
     );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ---- Task 6: attachment outside chat.rs. `context.md` §3, §4, §10 ----------
+
+/// A hook answering with `body` on `events`, in `mode`.
+fn answering_hook(
+    root: &Path,
+    id: &str,
+    events: &[HookEvent],
+    mode: HookMode,
+    body: &str,
+) -> HookConfig {
+    let mut hook = sh_hook(id, &script(root, id, &json_response(body)));
+    hook.events = events.to_vec();
+    hook.mode = mode;
+    hook
+}
+
+/// An engine whose data directory and PID registry stay inside `root`, so a
+/// fixture never writes into the user's own state.
+fn engine_for(root: &Path, hooks: Vec<HookConfig>) -> (Config, WorkspaceEngine) {
+    let config = config_for(root, hooks);
+    (config.clone(), WorkspaceEngine::new(config))
+}
+
+/// Writes `before` at `path`, creates the patch that replaces it with `after`,
+/// attaches the patch to `session`/`task`, and stores it, so a test can apply a
+/// patch the way the shell does.
+fn stage_patch(
+    engine: &WorkspaceEngine,
+    root: &Path,
+    path: &str,
+    before: &str,
+    after: &str,
+    session: Option<(&Session, &Task)>,
+) -> workspace_engine::ProposedPatch {
+    write(&root.join(path), before);
+    let mut patch = engine
+        .patch_engine
+        .create_patch(
+            root,
+            &[workspace_engine::ProposedChange {
+                path: path.to_string(),
+                new_content: after.to_string(),
+                status: None,
+                allow_restricted: false,
+            }],
+            session.map(|(_, task)| task.id.as_str()),
+            "hook test",
+        )
+        .expect("the fixture patch is created");
+    patch.session_id = session
+        .map(|(session, _)| session.id.clone())
+        .unwrap_or_default();
+    patch.origin_session_id = String::new();
+    engine
+        .patch_store
+        .save(&patch)
+        .expect("the patch is stored");
+    patch
+}
+
+fn apply_markers(config: &Config, session_id: &str) -> Vec<serde_json::Value> {
+    actions(config, session_id, "action_started")
+        .into_iter()
+        .filter(|event| event["payload"]["action"] == "apply_patch")
+        .collect()
+}
+
+const EDIT_REPLY: &str = "DAMAIAN_EDIT_V1\nSUMMARY: Add a\nFILE: a.txt\nSTATUS: added\nCONTENT:\nhello\nEND_FILE\nEND_PATCH\n";
+
+/// Criterion 1, engine half: a denying `before_patch_apply` leaves the file
+/// alone, opens no marker, and its reason reaches the caller.
+#[test]
+fn a_before_patch_apply_deny_blocks_the_apply_and_names_the_hook() {
+    let root = temp_dir("apply-deny");
+    let hook = answering_hook(
+        &root,
+        "no_migrations",
+        &[HookEvent::BeforePatchApply],
+        HookMode::Mandatory,
+        r#"{"hookApiVersion":1,"verdict":"deny","reason":"migrations/ is applied by the release process"}"#,
+    );
+    let (config, engine) = engine_for(&root, vec![hook]);
+    let store = SessionStore::new(&config.data_dir);
+    let session = store
+        .create_session(&repository_id_for_root(&root), "apply")
+        .unwrap();
+    let task = store
+        .create_task(&session.id, "prompt", "provider", "model")
+        .unwrap();
+    let patch = stage_patch(
+        &engine,
+        &root,
+        "migrations/003.sql",
+        "SELECT 1;\n",
+        "SELECT 2;\n",
+        Some((&session, &task)),
+    );
+
+    let error = engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.id, None, None, "tester", false)
+        .expect_err("a denying hook must block the apply");
+
+    let message = match &error {
+        workspace_engine::ClientError::PolicyBlocked(message) => message,
+        other => panic!("expected a policy block, got {other:?}"),
+    };
+    assert!(message.contains("no_migrations"), "{message}");
+    assert!(message.contains("release process"), "{message}");
+    assert_eq!(
+        fs::read_to_string(root.join("migrations/003.sql")).unwrap(),
+        "SELECT 1;\n",
+        "a blocked apply wrote the file"
+    );
+    assert!(
+        apply_markers(&config, &session.id).is_empty(),
+        "a blocked apply opened a marker"
+    );
+    assert!(
+        events_of(&config.data_dir, "stored_patch_applied").is_empty(),
+        "a blocked apply was audited as applied"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A mandatory failure blocks and an optional one only warns (proposal §5.5),
+/// at the apply as everywhere else.
+#[test]
+fn a_timing_out_before_patch_apply_hook_blocks_or_warns_by_its_mode() {
+    for (mode, blocks) in [(HookMode::Mandatory, true), (HookMode::Optional, false)] {
+        let root = temp_dir(&format!("apply-timeout-{}", mode.as_str()));
+        let mut hook = sh_hook("slow", &script(&root, "slow", "sleep 30\n"));
+        hook.events = vec![HookEvent::BeforePatchApply];
+        hook.mode = mode;
+        // Well under the 10 s default, so the case is quick either way.
+        hook.timeout_ms = Some(200);
+        let (config, engine) = engine_for(&root, vec![hook]);
+        let store = SessionStore::new(&config.data_dir);
+        let session = store
+            .create_session(&repository_id_for_root(&root), "timeout")
+            .unwrap();
+        let task = store
+            .create_task(&session.id, "prompt", "provider", "model")
+            .unwrap();
+        let patch = stage_patch(
+            &engine,
+            &root,
+            "src/a.txt",
+            "before\n",
+            "after\n",
+            Some((&session, &task)),
+        );
+
+        let result = engine
+            .edit_orchestrator
+            .apply_stored_patch(&root, &patch.id, None, None, "tester", false);
+
+        if blocks {
+            let error = result.expect_err("a mandatory failure must block");
+            assert!(
+                matches!(&error, workspace_engine::ClientError::PolicyBlocked(message) if message.contains("slow") && message.contains("timeout")),
+                "{error:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("src/a.txt")).unwrap(),
+                "before\n"
+            );
+        } else {
+            let result = result.expect("an optional failure must let the apply proceed");
+            assert_eq!(result.applied_files, vec!["src/a.txt"]);
+            assert!(
+                result
+                    .hook_warnings
+                    .iter()
+                    .any(|warning| warning.contains("timeout")),
+                "{:?}",
+                result.hook_warnings
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("src/a.txt")).unwrap(),
+                "after\n"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+/// The action has happened: an `after_patch_apply` denial is an error finding
+/// and a warning, and nothing is rolled back (`context.md` §4).
+#[test]
+fn an_after_patch_apply_deny_keeps_the_content_and_records_an_error_finding() {
+    let root = temp_dir("apply-after-deny");
+    let hook = answering_hook(
+        &root,
+        "after_notes",
+        &[HookEvent::AfterPatchApply],
+        HookMode::Mandatory,
+        r#"{"hookApiVersion":1,"verdict":"deny","reason":"the release notes were not updated"}"#,
+    );
+    let (config, engine) = engine_for(&root, vec![hook]);
+    let store = SessionStore::new(&config.data_dir);
+    let session = store
+        .create_session(&repository_id_for_root(&root), "after")
+        .unwrap();
+    let task = store
+        .create_task(&session.id, "prompt", "provider", "model")
+        .unwrap();
+    let patch = stage_patch(
+        &engine,
+        &root,
+        "src/a.txt",
+        "before\n",
+        "after\n",
+        Some((&session, &task)),
+    );
+
+    let result = engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.id, None, None, "tester", false)
+        .expect("an after hook cannot undo the apply");
+
+    assert_eq!(
+        fs::read_to_string(root.join("src/a.txt")).unwrap(),
+        "after\n",
+        "an after deny rolled the patch back"
+    );
+    assert!(
+        result
+            .hook_warnings
+            .iter()
+            .any(|warning| warning.contains("release notes")),
+        "{:?}",
+        result.hook_warnings
+    );
+    let findings = store.read_findings(&session.id, &root).unwrap();
+    let error = findings
+        .iter()
+        .find(|finding| {
+            finding.source() == FindingSource::Hook && finding.severity() == Severity::Error
+        })
+        .unwrap_or_else(|| panic!("no error finding in {findings:?}"));
+    assert!(
+        error.summary().contains("release notes"),
+        "{}",
+        error.summary()
+    );
+    assert_eq!(error.origin_ref(), Some("hook:after_notes"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// An apply is always the user's own action, so `request_approval` is already
+/// satisfied: the apply proceeds and the reason is a warning on the result.
+#[test]
+fn request_approval_at_before_patch_apply_applies_with_a_warning() {
+    let root = temp_dir("apply-request-approval");
+    let hook = answering_hook(
+        &root,
+        "review_migration",
+        &[HookEvent::BeforePatchApply],
+        HookMode::Mandatory,
+        r#"{"hookApiVersion":1,"verdict":"request_approval","reason":"look at the migration by hand"}"#,
+    );
+    let (config, engine) = engine_for(&root, vec![hook]);
+    let store = SessionStore::new(&config.data_dir);
+    let session = store
+        .create_session(&repository_id_for_root(&root), "approve")
+        .unwrap();
+    let task = store
+        .create_task(&session.id, "prompt", "provider", "model")
+        .unwrap();
+    let patch = stage_patch(
+        &engine,
+        &root,
+        "migrations/003.sql",
+        "SELECT 1;\n",
+        "SELECT 2;\n",
+        Some((&session, &task)),
+    );
+
+    let result = engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.id, None, None, "tester", false)
+        .expect("request_approval does not block an apply");
+
+    assert_eq!(result.applied_files, vec!["migrations/003.sql"]);
+    assert!(
+        result.hook_warnings.iter().any(|warning| {
+            warning.contains("review_migration") && warning.contains("look at the migration")
+        }),
+        "{:?}",
+        result.hook_warnings
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `context.md` §9: a requested command at the apply runs through Task 5 with
+/// the patch's own task, not with no task.
+#[test]
+fn a_before_patch_apply_hooks_requested_command_runs_with_the_patch_task() {
+    let root = temp_dir("apply-requested-command");
+    let body = format!(
+        "echo ran >> command.log\n{}",
+        json_response(r#"{"hookApiVersion":1,"commands":["cargo test"]}"#)
+    );
+    let mut hook = sh_hook("asks", &script(&root, "asks", &body));
+    hook.events = vec![HookEvent::BeforePatchApply];
+    // No real login shell (Global Constraints), and `cargo test` allowlisted so
+    // it runs unasked in Code mode.
+    let mut config = config_for(&root, vec![hook]);
+    config.shell = "/usr/bin/true".to_string();
+    config.command_allowlist = vec![REQUESTED.to_string()];
+    let engine = WorkspaceEngine::new(config.clone());
+    let store = SessionStore::new(&config.data_dir);
+    let session = store
+        .create_session(&repository_id_for_root(&root), "commands")
+        .unwrap();
+    let task = store
+        .create_task(&session.id, "prompt", "provider", "model")
+        .unwrap();
+    let patch = stage_patch(
+        &engine,
+        &root,
+        "src/a.txt",
+        "before\n",
+        "after\n",
+        Some((&session, &task)),
+    );
+
+    engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.id, None, None, "tester", false)
+        .expect("the requested command must not block the apply");
+
+    assert_eq!(
+        pending_proposals(&config),
+        1,
+        "the command was not proposed"
+    );
+    assert_eq!(
+        events_of(&config.data_dir, "stored_command_executed").len(),
+        1
+    );
+    let started: Vec<_> = actions(&config, &session.id, "action_started")
+        .into_iter()
+        .filter(|event| event["payload"]["action"] == "hook_command")
+        .collect();
+    assert_eq!(started.len(), 1, "{started:?}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The edit flow's `before_context` additions are ordinary, redacted,
+/// budgeted `hook_context` items (`context.md` §10).
+#[test]
+fn a_before_context_hook_adds_a_redacted_hook_context_item_to_an_edit_plan() {
+    let root = temp_dir("edit-context");
+    let hook = answering_hook(
+        &root,
+        "noter",
+        &[HookEvent::BeforeContext],
+        HookMode::Mandatory,
+        r#"{"hookApiVersion":1,"context":["Hook note: api_key = sk_live_9f8a7b6c5d4e3f2a1b0c"]}"#,
+    );
+    let (_config, engine) = engine_for(&root, vec![hook]);
+    let mut adapter = MockModelAdapter::new(EDIT_REPLY);
+
+    engine
+        .edit_orchestrator
+        .propose_edit(&root, "Add a", &[], None, &mut adapter)
+        .expect("the proposal should be made");
+
+    let request = adapter.requests.first().expect("the model was called");
+    let prompt = &request.messages[1].content;
+    assert!(
+        prompt.contains("--- hook_context: hook:noter ---"),
+        "the hook's context was not a hook_context item: {prompt}"
+    );
+    assert!(prompt.contains("Hook note:"), "{prompt}");
+    assert!(
+        !prompt.contains("sk_live_9f8a7b6c5d4e3f2a1b0c"),
+        "the hook's context reached the model unredacted: {prompt}"
+    );
+
+    // Charged to the turn budget like any other item: under a tiny budget it is
+    // dropped rather than made privileged.
+    let plan = engine.context_manager.build_context_with_hooks(
+        &root,
+        &repository_id_for_root(&root),
+        "task",
+        "Add a",
+        None,
+        &[],
+        4,
+        &[("noter".to_string(), "x".repeat(400))],
+    );
+    assert!(
+        plan.items.iter().any(|item| item.kind == "user_prompt"),
+        "the budget was too small to compare anything: {:?}",
+        plan.items
+    );
+    assert!(
+        plan.items.iter().all(|item| item.kind != "hook_context"),
+        "{:?}",
+        plan.items
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `before_context` has no approval step, so `request_approval` denies
+/// (`context.md` §4); the reason reaches the caller and no model is called.
+#[test]
+fn a_before_context_deny_in_the_edit_flow_refuses_the_proposal() {
+    let root = temp_dir("edit-context-deny");
+    let hook = answering_hook(
+        &root,
+        "no_secrets",
+        &[HookEvent::BeforeContext],
+        HookMode::Mandatory,
+        r#"{"hookApiVersion":1,"verdict":"request_approval","reason":"never put secrets/ in a prompt"}"#,
+    );
+    let (config, engine) = engine_for(&root, vec![hook]);
+    let mut adapter = MockModelAdapter::new(EDIT_REPLY);
+
+    let error = engine
+        .edit_orchestrator
+        .propose_edit(&root, "Add a", &[], None, &mut adapter)
+        .expect_err("a before_context denial must refuse the proposal");
+
+    let message = match &error {
+        workspace_engine::ClientError::PolicyBlocked(message) => message,
+        other => panic!("expected a policy block, got {other:?}"),
+    };
+    assert!(message.contains("no_secrets"), "{message}");
+    assert!(message.contains("never put secrets/"), "{message}");
+    assert!(adapter.requests.is_empty(), "the model was called");
+    assert!(
+        !config.data_dir.join("patches").exists(),
+        "a refused proposal stored a patch"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `session_end` fires on deletion and only observes: a deny is audited and
+/// the session is still deleted (`context.md` §3, §4).
+#[test]
+fn session_end_runs_on_deletion_and_a_deny_does_not_stop_it() {
+    let root = temp_dir("session-end");
+    let body = format!(
+        "echo ran > session_end.log\n{}",
+        json_response(r#"{"hookApiVersion":1,"verdict":"deny","reason":"nothing to clean up"}"#)
+    );
+    let mut hook = sh_hook("at_end", &script(&root, "at_end", &body));
+    hook.events = vec![HookEvent::SessionEnd];
+    let (config, engine) = engine_for(&root, vec![hook]);
+    let store = SessionStore::new(&config.data_dir);
+    let session = store
+        .create_session(&repository_id_for_root(&root), "ending")
+        .unwrap();
+    let log = config
+        .data_dir
+        .join("sessions")
+        .join(format!("{}.jsonl", session.id));
+    assert!(log.exists(), "the fixture session was not created");
+
+    engine
+        .delete_session(&session.id, &root)
+        .expect("a deny must not cancel the delete");
+
+    assert!(!log.exists(), "the session was not deleted");
+    assert!(
+        root.join("session_end.log").exists(),
+        "the session_end hook did not run"
+    );
+    let invoked = events_of(&config.data_dir, "hook_invoked");
+    assert_eq!(invoked.len(), 1, "{invoked:?}");
+    assert_eq!(invoked[0]["event"], "session_end");
+    assert_eq!(invoked[0]["verdict"], "deny");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The root is a caller-supplied argument — the shell takes it from the
+/// request form — so it must be the session's own repository. Otherwise
+/// deleting A's session with `repo=B` would run B's `session_end` hooks with
+/// A's session in the envelope.
+#[test]
+fn deleting_a_session_with_another_repository_root_is_refused() {
+    let root = temp_dir("session-end-owner");
+    let other = temp_dir("session-end-other");
+    let body = format!(
+        "echo ran > session_end.log\n{}",
+        json_response(r#"{"hookApiVersion":1,"verdict":"allow"}"#)
+    );
+    let mut hook = sh_hook("at_end", &script(&root, "at_end", &body));
+    hook.events = vec![HookEvent::SessionEnd];
+    let (config, engine) = engine_for(&root, vec![hook]);
+    let store = SessionStore::new(&config.data_dir);
+    let session = store
+        .create_session(&repository_id_for_root(&root), "ending")
+        .unwrap();
+    let log = config
+        .data_dir
+        .join("sessions")
+        .join(format!("{}.jsonl", session.id));
+    assert!(log.exists(), "the fixture session was not created");
+
+    let error = engine
+        .delete_session(&session.id, &other)
+        .expect_err("a root that is not the session's repository must be refused");
+
+    assert!(
+        error.to_string().contains("does not belong"),
+        "the error should say why: {error}"
+    );
+    assert!(log.exists(), "a refused delete removed the session");
+    assert!(
+        !root.join("session_end.log").exists(),
+        "the session_end hook ran for another repository's root"
+    );
+    assert!(
+        !other.join("session_end.log").exists(),
+        "the session_end hook ran in the other repository"
+    );
+    assert!(
+        events_of(&config.data_dir, "hook_invoked").is_empty(),
+        "a refused delete dispatched a hook"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&other);
+}
+
+/// Zero hooks means today's behaviour (`Global Constraints`): the same apply,
+/// with no hook warnings and nothing audited.
+#[test]
+fn with_no_hooks_a_patch_apply_is_todays_result() {
+    let root = temp_dir("apply-no-hooks");
+    let (config, engine) = engine_for(&root, Vec::new());
+    let store = SessionStore::new(&config.data_dir);
+    let session = store
+        .create_session(&repository_id_for_root(&root), "plain")
+        .unwrap();
+    let task = store
+        .create_task(&session.id, "prompt", "provider", "model")
+        .unwrap();
+    let patch = stage_patch(
+        &engine,
+        &root,
+        "src/a.txt",
+        "before\n",
+        "after\n",
+        Some((&session, &task)),
+    );
+
+    let result = engine
+        .edit_orchestrator
+        .apply_stored_patch(&root, &patch.id, None, None, "tester", false)
+        .expect("a patch with no hooks applies");
+
+    assert_eq!(result.applied_files, vec!["src/a.txt"]);
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.hook_warnings, Vec::<String>::new());
+    assert_eq!(
+        fs::read_to_string(root.join("src/a.txt")).unwrap(),
+        "after\n"
+    );
+    assert!(events_of(&config.data_dir, "hook_invoked").is_empty());
 
     let _ = fs::remove_dir_all(&root);
 }
