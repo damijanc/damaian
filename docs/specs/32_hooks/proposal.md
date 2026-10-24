@@ -564,10 +564,12 @@ Recorded because each changes what a user or a later task should expect.
   `after_check_payload_carries_the_recorded_finding_ids`,
   `a_mandatory_failure_denies_and_an_optional_failure_warns` and
   `after_tool_runs_on_the_command_approval_resume` failed the same way, which
-  is consistent with the Task 9 observation. This is a pre-existing race in
-  spec 46/47's spawn-and-register path, outside spec 32's code and outside this
-  task's files; it is recorded here rather than papered over. The normal full
-  suite passed on rerun (1468/1468).
+  is consistent with the Task 9 observation. This was a pre-existing race in
+  spec 46/47's spawn-and-register path, outside spec 32's code. **Fixed on
+  2026-10-24 in spec 46:** `register` now returns an empty handle for its own
+  exited, unreaped child instead of failing, and links entries into place whole
+  (spec 46 proposal, "Concurrent readers, and a child that exits before it is
+  registered").
 - **Three eval-harness tests failed once in the same loaded background run**
   (`the_continue_keeps_state_scenario_resumes_the_same_task`,
   `the_answer_now_scenario_makes_one_forced_final_call` and
