@@ -92,7 +92,7 @@ treat all four as In progress until they land there. The entries below describe
 this branch line.
 
 - **In progress:** #25 symbols (Tasks 1–8 of 11 here; its close-out is on
-  `worktree-spec25-task9`), #32 hooks (1–4 of 10), #49 prompt cache (accounting
+  `worktree-spec25-task9`), #32 hooks (1–5 of 10), #49 prompt cache (accounting
   slice done; the reuse slice is blocked on #55 or #26).
 - **Ready, not started:** #23 verification loop; #65 exploration memory (its
   requirement 8's budget interaction is settled by #59, now done).
@@ -323,7 +323,7 @@ these costs more than it looks like it does.
 |---|---|---|
 | 1 | **#25 → #26** | The keystone now that #24 is done: #25 is Done on its branch (`worktree-spec25-task9`) and needs merging; #26, which waits only on #25, is the real unlock once it lands |
 | 2 | #23 verification | Ready now that #22 is done; the last thing in front of #35. Its loop lives in `chat.rs`, so check the parallel rule below before pairing it |
-| 3 | #32 hooks | In progress (Tasks 1–4 of 10 done); unblocks nothing, but it is the one Must-tier Phase 4 package that could start |
+| 3 | #32 hooks | In progress (Tasks 1–5 of 10 done); unblocks nothing, but it is the one Must-tier Phase 4 package that could start |
 | 4 | #55 compaction | Also unblocks #49's reuse slice, which is why that slice waits |
 | 5 | #27, #54, #51 | The fan-out once #26 has landed |
 | 6 | #28 → #29 → #30 | Memory, strictly serial |

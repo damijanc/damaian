@@ -80,7 +80,6 @@ impl WorkspaceEngine {
             config.audit_retention_days,
             scanner.clone(),
         );
-        let hooks = HookDispatcher::new(config.clone(), scanner.clone(), audit_log.clone());
         let path_policy = PathPolicy::new(&config);
         let file_access = FileAccessController::new(
             config.clone(),
@@ -140,6 +139,13 @@ impl WorkspaceEngine {
             command_runner.clone(),
             command_store.clone(),
             audit_log.clone(),
+        );
+        let hooks = HookDispatcher::new(
+            config.clone(),
+            scanner.clone(),
+            audit_log.clone(),
+            validation_orchestrator.clone(),
+            session_store.clone(),
         );
         let chat_orchestrator = ChatOrchestrator::new(
             config.clone(),

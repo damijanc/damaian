@@ -1,6 +1,6 @@
 # Feature Spec: Hooks
 
-Status: In progress (started 2026-10-07; Tasks 1–4 of 10 done, the last on 2026-10-23). Split into a folder and planned on 2026-10-07. Design
+Status: In progress (started 2026-10-07; Tasks 1–5 of 10 done, the last on 2026-10-24). Split into a folder and planned on 2026-10-07. Design
 unchanged from the original flat spec. Corrections where it no longer matches
 the code, and the decisions it leaves open, are in [`context.md`](context.md),
 not inlined here, the way specs 20, 22, 24 and 31 kept theirs. The most

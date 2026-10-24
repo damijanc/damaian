@@ -14,6 +14,11 @@
 //! stdin, the environment is cleared, a hook past its deadline or over the
 //! output ceiling is killed with its group and fails, and stderr comes back
 //! redacted and bounded.
+//!
+//! Task 5 pins requested commands and recursion (`context.md` §9): a hook's
+//! command runs only when policy would run it unasked, is bracketed by a
+//! `hook_command` marker, never re-enters the hook that asked for it, and is
+//! bounded by `MAX_HOOK_DEPTH` without the nested action being blocked.
 
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,15 +30,16 @@ use workspace_engine::finding::{FindingSource, Severity};
 use workspace_engine::hooks::{
     self, HOOK_API_VERSION, HookActivation, HookContext, HookDispatcher, HookEnvelope,
     HookEnvelopeParts, HookFailureKind, HookOutcome, HookRun, MAX_HOOK_COMMANDS,
-    MAX_HOOK_CONTEXT_CHARS, MAX_HOOK_CONTEXT_ENTRIES, MAX_HOOK_FINDINGS, MAX_HOOK_REASON_CHARS,
-    MAX_HOOK_STDERR_BYTES, MAX_HOOK_STDOUT_BYTES, ResponseError, Verdict, WideningAttempt,
-    activation, hook_definition_hash,
+    MAX_HOOK_CONTEXT_CHARS, MAX_HOOK_CONTEXT_ENTRIES, MAX_HOOK_DEPTH, MAX_HOOK_FINDINGS,
+    MAX_HOOK_REASON_CHARS, MAX_HOOK_STDERR_BYTES, MAX_HOOK_STDOUT_BYTES, ResponseError, Verdict,
+    WideningAttempt, activation, hook_definition_hash,
 };
 use workspace_engine::{
-    AuditLog, Config, ConfigOverlay, ConfigScope, EffectivePolicy, HookConfig, HookEvent, HookMode,
-    HookReview, HookSource, MAX_HOOK_TIMEOUT_MS, ProcessRegistry, RepositoryConfigReport,
-    RepositoryKeyClass, SecretScanner, SourceKind, WorkspaceEngine, repository_id_for_root,
-    split_profile_keys,
+    AuditLog, CommandPolicy, CommandRunner, CommandStore, Config, ConfigOverlay, ConfigScope,
+    EffectivePolicy, HookConfig, HookEvent, HookMode, HookReview, HookSource, MAX_HOOK_TIMEOUT_MS,
+    ProcessRegistry, RepositoryConfigReport, RepositoryKeyClass, SecretScanner, Session,
+    SessionMode, SessionStore, SourceKind, Task, ValidationOrchestrator, WorkspaceEngine,
+    repository_id_for_root, split_profile_keys,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1438,10 +1444,20 @@ fn config_for(root: &Path, hooks: Vec<HookConfig>) -> Config {
 
 fn dispatcher_for(config: &Config) -> HookDispatcher {
     let scanner = SecretScanner::new(Vec::new());
+    let audit = AuditLog::new(&config.data_dir, true, scanner.clone());
+    let policy = CommandPolicy::new(config.clone());
+    let validation = ValidationOrchestrator::new(
+        policy.clone(),
+        CommandRunner::new(config.clone(), policy, audit.clone(), scanner.clone()),
+        CommandStore::new(&config.data_dir),
+        audit.clone(),
+    );
     HookDispatcher::new(
         config.clone(),
-        scanner.clone(),
-        AuditLog::new(&config.data_dir, true, scanner),
+        scanner,
+        audit,
+        validation,
+        SessionStore::new(&config.data_dir),
     )
 }
 
@@ -2185,6 +2201,414 @@ fn a_hook_finding_keeps_a_path_only_when_it_stays_in_the_repository() {
             .iter()
             .all(|finding| finding.source() == FindingSource::Hook
                 && finding.origin_ref() == Some("hook:paths"))
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ---- Task 5: requested commands and recursion. `context.md` §9 -------------
+
+const REQUESTED: &str = "cargo test";
+
+/// A config whose commands run `/usr/bin/true` rather than a login shell,
+/// with `cargo test` allowlisted so it runs without approval in Code mode
+/// (Global Constraints: never spawn a real login shell).
+fn command_config(root: &Path, hooks: Vec<HookConfig>) -> Config {
+    let mut config = config_for(root, hooks);
+    config.shell = "/usr/bin/true".to_string();
+    config.command_allowlist = vec![REQUESTED.to_string()];
+    config
+}
+
+fn session_and_task(config: &Config, root: &Path) -> (Session, Task) {
+    let store = SessionStore::new(&config.data_dir);
+    let session = store
+        .create_session(&repository_id_for_root(root), "hooks")
+        .unwrap();
+    let task = store
+        .create_task(&session.id, "prompt", "provider", "model")
+        .unwrap();
+    (session, task)
+}
+
+/// A hook that appends its invocation to `<id>.log` (in the repository root,
+/// which is the hook's cwd) and asks for `command`.
+fn requesting_hook(root: &Path, id: &str, command: &str) -> HookConfig {
+    let body = format!(
+        "echo ran >> {id}.log\n{}",
+        json_response(&format!(
+            r#"{{"hookApiVersion":1,"commands":["{command}"]}}"#
+        ))
+    );
+    sh_hook(id, &script(root, id, &body))
+}
+
+fn run_requested(
+    dispatcher: &HookDispatcher,
+    outcome: &mut HookOutcome,
+    session: &Session,
+    task: Option<&Task>,
+    mode: SessionMode,
+    root: &Path,
+) -> Vec<workspace_engine::finding::Finding> {
+    dispatcher.run_requested_commands(outcome, session, task, mode, root, &HookContext::root())
+}
+
+fn session_events(config: &Config, session_id: &str) -> Vec<serde_json::Value> {
+    let path = config
+        .data_dir
+        .join("sessions")
+        .join(format!("{session_id}.jsonl"));
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn actions(config: &Config, session_id: &str, event_type: &str) -> Vec<serde_json::Value> {
+    session_events(config, session_id)
+        .into_iter()
+        .filter(|event| event["eventType"] == event_type)
+        .collect()
+}
+
+fn pending_proposals(config: &Config) -> usize {
+    let Ok(entries) = fs::read_dir(config.data_dir.join("commands").join("pending")) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "dcmd")
+        })
+        .count()
+}
+
+#[test]
+fn a_requested_command_runs_under_the_sessions_mode_and_is_bracketed_by_a_marker() {
+    let root = temp_dir("requested-runs");
+    let config = command_config(&root, vec![requesting_hook(&root, "asks", REQUESTED)]);
+    let dispatcher = dispatcher_for(&config);
+    let (session, task) = session_and_task(&config, &root);
+    let mut outcome = dispatch(&dispatcher, HookEvent::BeforeTool, &root);
+    assert_eq!(outcome.commands.len(), 1, "{:?}", outcome.commands);
+
+    let findings = run_requested(
+        &dispatcher,
+        &mut outcome,
+        &session,
+        Some(&task),
+        SessionMode::Code,
+        &root,
+    );
+
+    // Taking the commands does not change the hook's verdict (context.md §9).
+    assert_eq!(outcome.verdict, Verdict::Allow);
+    assert!(outcome.commands.is_empty(), "{:?}", outcome.commands);
+    assert!(findings.is_empty(), "{findings:?}");
+    assert_eq!(
+        pending_proposals(&config),
+        1,
+        "the command was not proposed"
+    );
+    assert_eq!(
+        events_of(&config.data_dir, "stored_command_executed").len(),
+        1
+    );
+    assert_eq!(events_of(&config.data_dir, "hook_command_refused").len(), 0);
+
+    let started: Vec<_> = actions(&config, &session.id, "action_started")
+        .into_iter()
+        .filter(|event| event["payload"]["action"] == "hook_command")
+        .collect();
+    let finished: Vec<_> = actions(&config, &session.id, "action_finished")
+        .into_iter()
+        .filter(|event| event["payload"]["action"] == "hook_command")
+        .collect();
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(finished.len(), 1, "{finished:?}");
+    assert_eq!(
+        started[0]["payload"]["markerId"],
+        finished[0]["payload"]["markerId"]
+    );
+    assert_eq!(finished[0]["payload"]["outcome"], "ok");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_requested_command_is_refused_in_ask_mode() {
+    let root = temp_dir("requested-ask");
+    let config = command_config(&root, vec![requesting_hook(&root, "asks", REQUESTED)]);
+    let dispatcher = dispatcher_for(&config);
+    let (session, task) = session_and_task(&config, &root);
+    let mut outcome = dispatch(&dispatcher, HookEvent::BeforeTool, &root);
+
+    let findings = run_requested(
+        &dispatcher,
+        &mut outcome,
+        &session,
+        Some(&task),
+        SessionMode::Ask,
+        &root,
+    );
+
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.source() == FindingSource::Hook
+                && finding.severity() == Severity::Warning
+                && finding.summary().contains("asks")),
+        "{findings:?}"
+    );
+    let refused = events_of(&config.data_dir, "hook_command_refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["hookId"], "asks");
+    assert_eq!(refused[0]["command"], REQUESTED);
+    assert_eq!(
+        pending_proposals(&config),
+        0,
+        "a refused command was stored"
+    );
+    assert!(
+        actions(&config, &session.id, "action_started")
+            .iter()
+            .all(|event| event["payload"]["action"] != "hook_command")
+    );
+    assert_eq!(
+        events_of(&config.data_dir, "stored_command_executed").len(),
+        0
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_requested_command_that_needs_approval_is_refused_without_a_card_or_proposal() {
+    let root = temp_dir("requested-approval");
+    let mut config = command_config(&root, vec![requesting_hook(&root, "asks", REQUESTED)]);
+    config.require_approval_for_all_commands = true;
+    let dispatcher = dispatcher_for(&config);
+    let (session, task) = session_and_task(&config, &root);
+    let mut outcome = dispatch(&dispatcher, HookEvent::BeforeTool, &root);
+
+    let findings = run_requested(
+        &dispatcher,
+        &mut outcome,
+        &session,
+        Some(&task),
+        SessionMode::Code,
+        &root,
+    );
+
+    assert!(!findings.is_empty(), "a refused command made no finding");
+    let refused = events_of(&config.data_dir, "hook_command_refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(
+        refused[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("approval")),
+        "{}",
+        refused[0]
+    );
+    // No card (a pending proposal) and no marker: a hook never asks.
+    assert_eq!(pending_proposals(&config), 0);
+    assert!(
+        actions(&config, &session.id, "action_started")
+            .iter()
+            .all(|event| event["payload"]["action"] != "hook_command")
+    );
+    assert_eq!(
+        events_of(&config.data_dir, "stored_command_executed").len(),
+        0
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_requested_command_does_not_reenter_the_hook_that_asked() {
+    let root = temp_dir("requested-no-reentry");
+    let config = command_config(&root, vec![requesting_hook(&root, "asks", REQUESTED)]);
+    let dispatcher = dispatcher_for(&config);
+    let (session, task) = session_and_task(&config, &root);
+    let mut outcome = dispatch(&dispatcher, HookEvent::BeforeTool, &root);
+
+    run_requested(
+        &dispatcher,
+        &mut outcome,
+        &session,
+        Some(&task),
+        SessionMode::Code,
+        &root,
+    );
+
+    let invocations = fs::read_to_string(root.join("asks.log")).unwrap();
+    assert_eq!(
+        invocations.lines().count(),
+        1,
+        "the hook saw its own command: {invocations}"
+    );
+    assert_eq!(events_of(&config.data_dir, "hook_invoked").len(), 1);
+    assert_eq!(
+        events_of(&config.data_dir, "stored_command_executed").len(),
+        1
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_hook_that_denies_a_requested_command_stops_it() {
+    let root = temp_dir("requested-denied");
+    let asks = requesting_hook(&root, "asks", REQUESTED);
+    // Denies only the nested dispatch, which is the one with depth 1.
+    let guard = sh_hook(
+        "guard",
+        &script(
+            &root,
+            "guard",
+            r#"input=$(cat)
+case "$input" in
+  *'"hookDepth":1'*)
+    printf '{"hookApiVersion":1,"verdict":"deny","reason":"not from a hook"}\n'
+    ;;
+  *)
+    printf '{"hookApiVersion":1}\n'
+    ;;
+esac
+"#,
+        ),
+    );
+    let config = command_config(&root, vec![asks, guard]);
+    let dispatcher = dispatcher_for(&config);
+    let (session, task) = session_and_task(&config, &root);
+    let mut outcome = dispatch(&dispatcher, HookEvent::BeforeTool, &root);
+    assert_eq!(outcome.commands.len(), 1, "{:?}", outcome.commands);
+
+    let findings = run_requested(
+        &dispatcher,
+        &mut outcome,
+        &session,
+        Some(&task),
+        SessionMode::Code,
+        &root,
+    );
+
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.summary().contains("guard")),
+        "{findings:?}"
+    );
+    assert_eq!(
+        events_of(&config.data_dir, "stored_command_executed").len(),
+        0
+    );
+    assert_eq!(pending_proposals(&config), 0);
+    assert_eq!(events_of(&config.data_dir, "hook_command_refused").len(), 1);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recursion_stops_at_the_depth_limit_and_the_nested_command_still_runs() {
+    let root = temp_dir("requested-recursion");
+    let alpha = requesting_hook(&root, "alpha", REQUESTED);
+    let beta = requesting_hook(&root, "beta", REQUESTED);
+    let config = command_config(&root, vec![alpha, beta]);
+    let dispatcher = dispatcher_for(&config);
+    let (session, task) = session_and_task(&config, &root);
+    let mut outcome = dispatch(&dispatcher, HookEvent::BeforeTool, &root);
+    assert_eq!(outcome.commands.len(), 2, "{:?}", outcome.commands);
+
+    let findings = run_requested(
+        &dispatcher,
+        &mut outcome,
+        &session,
+        Some(&task),
+        SessionMode::Code,
+        &root,
+    );
+
+    assert!(outcome.depth_exceeded, "the outer outcome was not marked");
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.summary().contains("depth")),
+        "{findings:?}"
+    );
+    let exceeded = events_of(&config.data_dir, "hook_depth_exceeded");
+    assert_eq!(exceeded.len(), 2, "{exceeded:?}");
+    for event in &exceeded {
+        assert!(
+            event["hookId"] == "alpha" || event["hookId"] == "beta",
+            "{event}"
+        );
+        assert_eq!(event["event"], "before_tool");
+        assert_eq!(event["depth"], (MAX_HOOK_DEPTH + 1).to_string());
+    }
+    // The nested action is not blocked (proposal §5.7): every command still
+    // ran, and every `hook_command` marker was finished.
+    let executed = events_of(&config.data_dir, "stored_command_executed");
+    assert_eq!(executed.len(), 6, "{executed:?}");
+    let started: Vec<_> = actions(&config, &session.id, "action_started")
+        .into_iter()
+        .filter(|event| event["payload"]["action"] == "hook_command")
+        .collect();
+    let finished: Vec<_> = actions(&config, &session.id, "action_finished")
+        .into_iter()
+        .filter(|event| event["payload"]["action"] == "hook_command")
+        .collect();
+    assert_eq!(started.len(), 6);
+    assert_eq!(finished.len(), 6);
+    // Each hook ran at the root, at depth 1 and at depth 2, and no further.
+    for id in ["alpha", "beta"] {
+        let count = fs::read_to_string(root.join(format!("{id}.log")))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(count, 3, "{id} ran {count} times");
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn with_no_task_every_requested_command_is_refused() {
+    let root = temp_dir("requested-no-task");
+    let config = command_config(&root, vec![requesting_hook(&root, "asks", REQUESTED)]);
+    let dispatcher = dispatcher_for(&config);
+    let (session, _) = session_and_task(&config, &root);
+    let mut outcome = dispatch(&dispatcher, HookEvent::BeforeTool, &root);
+
+    let findings = run_requested(
+        &dispatcher,
+        &mut outcome,
+        &session,
+        None,
+        SessionMode::Code,
+        &root,
+    );
+
+    assert!(!findings.is_empty(), "a refused command made no finding");
+    let refused = events_of(&config.data_dir, "hook_command_refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(
+        refused[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("task")),
+        "{}",
+        refused[0]
+    );
+    assert_eq!(
+        events_of(&config.data_dir, "stored_command_executed").len(),
+        0
     );
 
     let _ = fs::remove_dir_all(&root);

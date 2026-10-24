@@ -16,16 +16,31 @@
 //! findings, warnings, context and requested commands. It does not decide
 //! what a verdict means at an event; that is the call sites' job
 //! (`context.md` §4).
+//!
+//! Requested commands (`context.md` §9): `HookDispatcher::run_requested_commands`
+//! runs a hook's `commands` only when policy would run them unasked, brackets
+//! each with a `hook_command` action marker, and bounds the nested dispatch
+//! through `before_tool` and `after_tool` by `MAX_HOOK_DEPTH`.
 
 use crate::audit::AuditLog;
+use crate::cancel::CancelToken;
+use crate::chat::{CommandRequest, ToolAction};
+use crate::command_runner::CommandTermination;
 use crate::command_runner::kill_process_group;
 use crate::config::Config;
-use crate::finding::{Finding, FindingDraft, FindingSource, Severity, SourceRange};
+use crate::finding::{
+    Finding, FindingDraft, FindingSource, Severity, SourceRange, default_parsers,
+    findings_from_execution,
+};
 use crate::hash::{repository_id_for_root, sha256};
+use crate::mode::{SessionMode, permits};
 use crate::process_registry::{ProcessKind, ProcessRegistry, RegistrationHandle};
+use crate::profile::ProfileId;
 use crate::secret_scanner::SecretScanner;
+use crate::session::{Session, SessionStore, Task};
+use crate::validation::ValidationOrchestrator;
 use serde::{Serialize, Serializer};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
@@ -52,6 +67,11 @@ pub const MAX_HOOK_CONTEXT_CHARS: usize = 4_000;
 pub const MAX_HOOK_COMMANDS: usize = 3;
 /// stderr is diagnostic, so it is cut to its last 8 KiB rather than failed.
 pub const MAX_HOOK_STDERR_BYTES: usize = 8 * 1024;
+/// How deep a hook's requested command may nest before hook dispatch is
+/// skipped for the nested action (`context.md` §9). Past this, the nested
+/// command still runs: blocking it would make a hook unable to run any
+/// command at all (proposal §5.7).
+pub const MAX_HOOK_DEPTH: u32 = 2;
 
 /// What a hook can say about an action, weakest first, so the derived `Ord`
 /// is the resolution order and combining verdicts is `max`.
@@ -957,13 +977,50 @@ impl Default for HookOutcome {
     }
 }
 
-/// Runs the hooks for one event (`context.md` §7, §10, §11).
+/// The stable facts a requested command's nested dispatch needs. `depth` is
+/// the depth of the dispatch that asked for the command; its own
+/// `before_tool` and `after_tool` run at `depth + 1` (`context.md` §9).
+struct RequestedRun<'a> {
+    session: &'a Session,
+    task: &'a Task,
+    mode: SessionMode,
+    repository_root: &'a Path,
+    depth: u32,
+}
+
+/// What `after_tool` sees for a requested command (`context.md` §6).
+fn after_tool_payload(
+    request: &RequestedCommand,
+    execution: Option<&crate::command_runner::CommandExecution>,
+) -> Value {
+    let ok = execution.is_some_and(|execution| {
+        execution.termination == CommandTermination::Exited && execution.exit_code == Some(0)
+    });
+    let mut payload = json!({
+        "tool": "run_command",
+        "paths": [],
+        "command": request.command,
+        "outcome": if ok { "ok" } else { "failed" },
+    });
+    if let Some(execution) = execution {
+        payload["termination"] = json!(execution.termination.as_str());
+        if let Some(code) = execution.exit_code {
+            payload["exitCode"] = json!(code);
+        }
+    }
+    payload
+}
+
+/// Runs the hooks for one event (`context.md` §7, §10, §11) and the commands
+/// they ask for (`§9`).
 #[derive(Debug, Clone)]
 pub struct HookDispatcher {
     config: Config,
     scanner: SecretScanner,
     audit_log: AuditLog,
     data_dir: PathBuf,
+    validation: ValidationOrchestrator,
+    session_store: SessionStore,
 }
 
 /// The fields of one `hook_invoked` event that depend on the run
@@ -977,13 +1034,21 @@ struct InvocationAudit<'a> {
 }
 
 impl HookDispatcher {
-    pub fn new(config: Config, scanner: SecretScanner, audit_log: AuditLog) -> Self {
+    pub fn new(
+        config: Config,
+        scanner: SecretScanner,
+        audit_log: AuditLog,
+        validation: ValidationOrchestrator,
+        session_store: SessionStore,
+    ) -> Self {
         let data_dir = config.data_dir.clone();
         Self {
             config,
             scanner,
             audit_log,
             data_dir,
+            validation,
+            session_store,
         }
     }
 
@@ -1094,6 +1159,418 @@ impl HookDispatcher {
             }
         }
         outcome
+    }
+
+    /// Runs the commands one dispatch's hooks asked for (`context.md` §9).
+    ///
+    /// Only a command policy would run unasked is run: it is classified at
+    /// the repository root and put through the same `permits` check as a
+    /// turn's own command, so Ask mode and a narrower profile refuse it. A
+    /// hook never raises an approval card, so a blocked command, one that
+    /// needs approval, or one the mode or profile refuses is not run; it
+    /// becomes a warning finding and a `hook_command_refused` audit entry.
+    ///
+    /// Each command that runs is bracketed by a `hook_command` action marker,
+    /// and its output becomes `FindingSource::Hook` findings recorded in the
+    /// session through `findings_from_execution`. Before and after it runs,
+    /// `before_tool` and `after_tool` are dispatched at `ctx.depth + 1` with
+    /// the requesting hook excluded. Past [`MAX_HOOK_DEPTH`] that dispatch is
+    /// skipped, `hook_depth_exceeded` is audited, a warning finding is
+    /// returned, and the command still runs.
+    ///
+    /// The commands are taken from `outcome`, so a caller that runs them in
+    /// turn does not run them twice. Nothing here changes the verdict the
+    /// requesting hook produced: its command's result is not evidence for or
+    /// against its answer, and the only field this sets is
+    /// `depth_exceeded`. The returned findings are the ones a call site must
+    /// surface: refusals, the depth report, nested hooks' findings and an
+    /// `after_tool` denial. A command's own output is recorded in the session,
+    /// not returned, so a caller cannot record it twice.
+    pub fn run_requested_commands(
+        &self,
+        outcome: &mut HookOutcome,
+        session: &Session,
+        task: Option<&Task>,
+        mode: SessionMode,
+        repository_root: &Path,
+        ctx: &HookContext,
+    ) -> Vec<Finding> {
+        let commands = std::mem::take(&mut outcome.commands);
+        let mut findings = Vec::new();
+        let mut depth_exceeded = outcome.depth_exceeded;
+        for request in &commands {
+            let Some(task) = task else {
+                self.refuse_requested_command(
+                    request,
+                    None,
+                    "a requested command needs the task it belongs to, and this event has none",
+                    &mut findings,
+                );
+                continue;
+            };
+            let run = RequestedRun {
+                session,
+                task,
+                mode,
+                repository_root,
+                depth: ctx.depth,
+            };
+            self.run_requested_command(request, &run, &mut findings, &mut depth_exceeded);
+        }
+        outcome.depth_exceeded = depth_exceeded;
+        findings
+    }
+
+    /// One requested command: the policy gate, the nested dispatch, the run
+    /// and the recursion. `findings` and `depth_exceeded` outlive the
+    /// recursion so everything raised deep inside reaches the caller of
+    /// [`Self::run_requested_commands`] and marks its outcome.
+    fn run_requested_command(
+        &self,
+        request: &RequestedCommand,
+        run: &RequestedRun<'_>,
+        findings: &mut Vec<Finding>,
+        depth_exceeded: &mut bool,
+    ) {
+        let classification = self
+            .validation
+            .classify_command(run.repository_root, &request.command);
+        let action = ToolAction::Command(CommandRequest {
+            command: request.command.clone(),
+            reason: format!("Requested by hook `{}`", request.hook_id),
+            working_directory: None,
+        });
+        let permission = permits(
+            run.mode,
+            &self.config.profile_capabilities(),
+            &action,
+            Some(&classification),
+            None,
+        );
+        if classification.blocked {
+            let reason = classification.reasons.join("; ");
+            let reason = if reason.is_empty() {
+                "the command policy blocks it".to_string()
+            } else {
+                reason
+            };
+            self.refuse_requested_command(request, Some(run.task), &reason, findings);
+            return;
+        }
+        if classification.requires_approval {
+            self.refuse_requested_command(
+                request,
+                Some(run.task),
+                "the command policy would ask for approval, and a hook never raises an approval card",
+                findings,
+            );
+            return;
+        }
+        if !permission.is_allowed() {
+            self.refuse_requested_command(
+                request,
+                Some(run.task),
+                &crate::mode::refusal_message(permission),
+                findings,
+            );
+            return;
+        }
+
+        let nested_depth = run.depth + 1;
+        let nested = HookContext {
+            depth: nested_depth,
+            // The requesting hook only: a deeper command belongs to another
+            // hook, which is free to see this one (`context.md` §9).
+            excluded: BTreeSet::from([request.hook_id.clone()]),
+        };
+        let mut before = None;
+        if nested_depth > MAX_HOOK_DEPTH {
+            *depth_exceeded = true;
+            self.audit_depth_exceeded(&request.hook_id, nested_depth);
+            findings.push(self.requested_finding(
+                Some(run.task),
+                &request.hook_id,
+                Severity::Warning,
+                format!(
+                    "hook `{}` requested `{}` at hook depth {nested_depth}, past the limit of \
+                     {MAX_HOOK_DEPTH}; it ran without a before_tool or after_tool check",
+                    request.hook_id, request.command
+                ),
+                None,
+            ));
+        } else {
+            let outcome = self.dispatch_command_event(
+                HookEvent::BeforeTool,
+                run,
+                json!({
+                    "tool": "run_command",
+                    "paths": [],
+                    "command": request.command,
+                }),
+                &nested,
+            );
+            findings.extend(outcome.findings.iter().cloned());
+            if matches!(outcome.verdict, Verdict::Deny | Verdict::RequestApproval) {
+                let (denier, reason) = outcome
+                    .reasons
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| (request.hook_id.clone(), String::new()));
+                let reason = match outcome.verdict {
+                    Verdict::Deny => format!("hook `{denier}` denied it: {reason}"),
+                    _ => format!(
+                        "hook `{denier}` asked for approval ({reason}), and a hook never raises \
+                         an approval card"
+                    ),
+                };
+                self.refuse_requested_command(request, Some(run.task), &reason, findings);
+                return;
+            }
+            before = Some(outcome);
+        }
+
+        let execution = self.execute_requested_command(request, run, findings);
+
+        if let Some(before) = before {
+            let after = self.dispatch_command_event(
+                HookEvent::AfterTool,
+                run,
+                after_tool_payload(request, execution.as_ref()),
+                &nested,
+            );
+            findings.extend(after.findings.iter().cloned());
+            if after.verdict == Verdict::Deny {
+                // Nothing is undone (context.md §4); the hook's reason is
+                // recorded as an error so the failure is visible.
+                for (hook_id, reason) in &after.reasons {
+                    findings.push(self.requested_finding(
+                        Some(run.task),
+                        hook_id,
+                        Severity::Error,
+                        format!(
+                            "hook `{hook_id}` was denied after `{}` ran: {reason}",
+                            request.command
+                        ),
+                        None,
+                    ));
+                }
+            }
+            for nested_request in before.commands.iter().chain(after.commands.iter()) {
+                self.run_requested_command(
+                    nested_request,
+                    &RequestedRun {
+                        depth: nested_depth,
+                        ..*run
+                    },
+                    findings,
+                    depth_exceeded,
+                );
+            }
+        }
+    }
+
+    /// Dispatches `event` for one requested command at `run.depth + 1`.
+    fn dispatch_command_event(
+        &self,
+        event: HookEvent,
+        run: &RequestedRun<'_>,
+        payload: Value,
+        nested: &HookContext,
+    ) -> HookOutcome {
+        self.dispatch(
+            event,
+            HookEnvelopeParts {
+                session_id: Some(run.session.id.clone()),
+                task_id: Some(run.task.id.clone()),
+                mode: run.mode.as_str().to_string(),
+                profile: self.profile_id(run.session),
+                payload,
+            },
+            run.repository_root,
+            nested,
+        )
+    }
+
+    /// The profile the repository is running under, for the envelope. No
+    /// selection applies nothing, which is `Full` (`config.rs`, the profile
+    /// merge).
+    fn profile_id(&self, session: &Session) -> String {
+        self.config
+            .permission_profile_by_repository
+            .get(&session.repository_id)
+            .map_or("full", ProfileId::as_str)
+            .to_string()
+    }
+
+    /// Proposes and runs one permitted command behind a `hook_command`
+    /// marker, and turns its output into findings. `None` means it did not
+    /// run; the reason is already a finding.
+    fn execute_requested_command(
+        &self,
+        request: &RequestedCommand,
+        run: &RequestedRun<'_>,
+        findings: &mut Vec<Finding>,
+    ) -> Option<crate::command_runner::CommandExecution> {
+        // A command is a repository write as far as spec 17 is concerned,
+        // exactly as `run_command` is at the turn's own marker.
+        let marker =
+            match self
+                .session_store
+                .start_action(run.task, "hook_command", &request.command, true)
+            {
+                Ok(marker) => marker,
+                Err(error) => {
+                    findings.push(self.requested_finding(
+                        Some(run.task),
+                        &request.hook_id,
+                        Severity::Error,
+                        format!(
+                            "hook `{}` requested `{}`, which could not be started: {error}",
+                            request.hook_id, request.command
+                        ),
+                        None,
+                    ));
+                    return None;
+                }
+            };
+        let reason = format!("Requested by hook `{}`", request.hook_id);
+        let proposal = match self.validation.propose_command_at(
+            run.repository_root,
+            run.repository_root,
+            &request.command,
+            &reason,
+        ) {
+            Ok(proposal) => proposal,
+            Err(error) => {
+                let _ = self.session_store.finish_action(marker, "failed");
+                findings.push(self.requested_finding(
+                    Some(run.task),
+                    &request.hook_id,
+                    Severity::Error,
+                    format!(
+                        "hook `{}` requested `{}`, which could not be proposed: {error}",
+                        request.hook_id, request.command
+                    ),
+                    None,
+                ));
+                return None;
+            }
+        };
+
+        let cancel = CancelToken::new();
+        match self.validation.run_proposal(
+            &proposal.id,
+            false,
+            "policy",
+            Some(&run.task.id),
+            &cancel,
+            &mut |_| {},
+        ) {
+            Ok(record) => {
+                let _ = self
+                    .session_store
+                    .finish_command_action(marker, record.execution.exit_code);
+                for finding in
+                    findings_from_execution(&record.execution, &default_parsers(), &self.scanner)
+                {
+                    let finding = finding
+                        .with_task_id(run.task.id.clone())
+                        .with_origin_ref(format!("hook:{}", request.hook_id));
+                    if let Err(error) = self.session_store.record_finding(&run.session.id, &finding)
+                    {
+                        findings.push(self.requested_finding(
+                            Some(run.task),
+                            &request.hook_id,
+                            Severity::Error,
+                            format!(
+                                "hook `{}` requested `{}`, whose findings could not be recorded: \
+                                 {error}",
+                                request.hook_id, request.command
+                            ),
+                            None,
+                        ));
+                    }
+                }
+                Some(record.execution)
+            }
+            Err(error) => {
+                let _ = self.session_store.finish_action(marker, "failed");
+                findings.push(self.requested_finding(
+                    Some(run.task),
+                    &request.hook_id,
+                    Severity::Error,
+                    format!(
+                        "hook `{}` requested `{}`, which did not run: {error}",
+                        request.hook_id, request.command
+                    ),
+                    None,
+                ));
+                None
+            }
+        }
+    }
+
+    /// Records why a requested command did not run: the audit names the
+    /// hook and the redacted command, and the warning finding names both.
+    fn refuse_requested_command(
+        &self,
+        request: &RequestedCommand,
+        task: Option<&Task>,
+        reason: &str,
+        findings: &mut Vec<Finding>,
+    ) {
+        let _ = self.audit_log.record(
+            "hook_command_refused",
+            &[
+                ("hookId", request.hook_id.clone()),
+                ("command", request.command.clone()),
+                ("reason", reason.to_string()),
+            ],
+        );
+        findings.push(self.requested_finding(
+            task,
+            &request.hook_id,
+            Severity::Warning,
+            format!(
+                "hook `{}` requested `{}`, which was not run: {reason}",
+                request.hook_id, request.command
+            ),
+            None,
+        ));
+    }
+
+    fn requested_finding(
+        &self,
+        task: Option<&Task>,
+        hook_id: &str,
+        severity: Severity,
+        summary: String,
+        details: Option<String>,
+    ) -> Finding {
+        let draft = FindingDraft {
+            source: FindingSource::Hook,
+            severity,
+            summary,
+            details,
+            range: None,
+            code: None,
+        };
+        let finding = Finding::new(draft, &self.scanner).with_origin_ref(format!("hook:{hook_id}"));
+        match task {
+            Some(task) => finding.with_task_id(task.id.clone()),
+            None => finding,
+        }
+    }
+
+    fn audit_depth_exceeded(&self, hook_id: &str, depth: u32) {
+        let _ = self.audit_log.record(
+            "hook_depth_exceeded",
+            &[
+                ("hookId", hook_id.to_string()),
+                ("event", HookEvent::BeforeTool.as_str().to_string()),
+                ("depth", depth.to_string()),
+            ],
+        );
     }
 
     /// A mandatory failure denies; an optional one warns (`context.md` §4,
