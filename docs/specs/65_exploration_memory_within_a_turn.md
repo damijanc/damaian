@@ -10,7 +10,7 @@ window drops those rounds, and nothing carries it into the next turn. Revised
 (requirement 5) and carrying notes into the next turn (requirement 6) were
 added, because investigating is the prerequisite for everything else Damaian
 does (§1). The file keeps its original name so existing links still work.
-Order: 65 of 65
+Order: 65 of 66
 Plan: none. Evidence-driven, like [#47](47_agent_working_capability/proposal.md)
 — an exception to the rule in [`README.md`](README.md).
 Depends on: [#47](47_agent_working_capability/proposal.md) (the read tools,
