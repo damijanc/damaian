@@ -1,13 +1,14 @@
 # Feature Spec: Exploration Round Allowance
 
-Status: In progress. Tasks 1–4 of 6 done (2026-10-18 to 2026-10-23) — the
+Status: Done 2026-10-23. Tasks 1–6 of 6 done (2026-10-18 to 2026-10-23) — the
 `agent_max_exploration_rounds` config key, then round classification and the two
 counters, then repeat detection, then the progress fields and both budget
-messages; see [`tasks.md`](tasks.md). Specified on 2026-10-17 from a session that ran out of tool
-rounds on a reporting-only request; the evidence is in
-[`context.md`](context.md) §1. Planned on 2026-10-18; §2, §5.2 and §5.5
-re-planned on 2026-10-23 against spec 61's round-budget pause, which landed
-first (`tasks.md` C8–C10).
+messages, then the audit fields and the two eval scenarios, then the docs, the
+live re-run and close-out; see [`tasks.md`](tasks.md). Specified on 2026-10-17
+from a session that ran out of tool rounds on a reporting-only request; the
+evidence is in [`context.md`](context.md) §1. Planned on 2026-10-18; §2, §5.2
+and §5.5 re-planned on 2026-10-23 against spec 61's round-budget pause, which
+landed first (`tasks.md` C8–C10).
 Order: 59 of 59
 Plan: none. Like [#47](../47_agent_working_capability/proposal.md), this spec is
 evidence-driven rather than a roadmap graduation — an exception to the rule in
@@ -339,16 +340,27 @@ one uncaught repeat after a resume.
 
 - The round loop's existing audit records gain `explorationRounds` and
   `explorationLimit`: `model_request_prepared` (whose round fields are
-  `toolRound`/`toolRoundLimit`, `chat.rs:2108`) and `turn_continued` (whose are
-  `round`/`roundLimit`, `chat.rs:2358`). There is no separate forced-final or
-  exhausted audit event — exhaustion is visible through
-  `model_request_prepared` at `toolRound == toolRoundLimit` plus the stop
-  reason.
-- No new session-log event. Which rounds were exploration is derivable from the
-  log already: each round opens with a `model_call` marker and its tool calls
-  are recorded as action markers by name. `trace::tool_rounds` in the eval
+  `toolRound`/`toolRoundLimit`, `chat.rs:2108`), `turn_continued` (whose are
+  `round`/`roundLimit`, `chat.rs:2358`), and — since C10 — `round_budget_paused`
+  (whose action counts are `roundsUsed`/`roundsTotal`, `chat.rs:4040`). There is
+  no separate forced-final or exhausted audit event. Exhaustion is visible
+  through `model_request_prepared` at `toolRound == toolRoundLimit` plus the
+  stop reason; a pause names both budgets on its own record, because a reader of
+  the audit trail should not have to infer the reads from the request records
+  that preceded it.
+- No new session-log event. Which rounds dispatched only reads is derivable
+  from the log already: each round opens with a `model_call` marker and its tool
+  calls are recorded as action markers by name. `trace::tool_rounds` in the eval
   harness gains a sibling, `exploration_rounds`, derived the same way, and the
-  run record carries it.
+  run record carries it per run.
+- **What that derived figure can and cannot see.** It counts rounds whose every
+  dispatched tool was a read. It cannot see the engine's charging decision: a
+  repeated read and a read round after the allowance is spent are also all-read
+  rounds, but were charged to the action budget. So on `read_loop` it reads 9
+  while the audit's `explorationRounds` reads 1. The audit is the authority on
+  the allowance's use; the session-log figure measures how much of a turn was
+  read-only dispatches, and the two agree on a turn that never exhausted its
+  allowance or repeated itself (`long_discovery`: 14 and 14).
 
 ### 5.7 Eval scenarios
 
@@ -356,12 +368,20 @@ Two deterministic scenarios, so the behaviour is pinned in CI:
 
 - **`long_discovery`**: a scripted turn of fourteen read-only rounds (reads,
   listings, searches over a fixture repository, no repeats) followed by an
-  answer. With the defaults it completes; with `agent_max_exploration_rounds =
-  0` it stops with `ToolBudgetExhausted`. This is also the long-task scenario
-  #47 §7.2 said was missing.
+  answer. With the defaults it completes. With `agent_max_exploration_rounds =
+  0` every read is an action round, so the turn reaches the eight-round action
+  budget: the engine pauses there (spec 61), and a harness answer of *Answer
+  now* ends it `ToolBudgetExhausted`. The zero-allowance case runs the same
+  scenario with a config overlay and the *Answer now* decision, rather than a
+  third scenario file. This is also the long-task scenario #47 §7.2 said was
+  missing.
 - **`read_loop`**: a scripted turn that reads the same file with the same range
-  every round. It stops with `ToolBudgetExhausted` after one exploration round
-  and the action budget — nine rounds with the defaults, not thirty-three.
+  every round. Round one is exploration; every later round repeats it and is
+  therefore an action round. It reaches the action budget after nine dispatched
+  rounds with the defaults, not thirty-three, and — because the engine pauses
+  rather than stops without a token ceiling — the scenario answers *Answer now*
+  and ends `ToolBudgetExhausted`. Its `exploration_rounds` figure is 9 (all-read
+  rounds) while the audit shows one charged exploration round (§5.6).
 
 A live-tier run of the motivating prompt against `deepseek-v4-flash` is the
 acceptance check that the defaults are sensible (§6).
@@ -377,7 +397,9 @@ needs no change unless that has changed by then.
 ## 6. Acceptance Criteria
 
 - A turn whose rounds are all read-only and non-repeating completes past eight
-  rounds with the defaults (`long_discovery`).
+  rounds with the defaults (`long_discovery`); with the allowance at 0 the same
+  script reaches the action budget and, through *Answer now*, ends
+  `ToolBudgetExhausted`.
 - A turn that mixes reads and commands reaches the action budget — spec 61's
   pause, or #47's continuation under a token ceiling — at the same point it
   does today, counting only its action rounds.
@@ -386,7 +408,8 @@ needs no change unless that has changed by then.
 - A round containing one command and three reads is charged as one action round
   and no exploration round.
 - A repeated identical read is charged as an action round (`read_loop` stops
-  within `1 + agent_max_tool_rounds` rounds plus the forced final call).
+  within `1 + agent_max_tool_rounds` rounds plus the forced final call, after
+  *Answer now*).
 - Once the allowance is spent, further read-only rounds are charged as action
   rounds, and the turn is not stopped at that moment.
 - `agent_max_exploration_rounds = 0` yields the same rounds, stop reason and
@@ -400,7 +423,9 @@ needs no change unless that has changed by then.
 - The progress label shows reads when there are any; a stopped turn names both
   counts and offers *Continue*; nothing on screen says "debugging" for a turn
   that was not one.
-- The eval harness reports `explorationRounds` for every run.
+- The eval harness reports `explorationRounds` for every run, counting rounds
+  whose every dispatched tool was a read; the audit records carry the count the
+  engine actually charged (§5.6).
 - The motivating prompt, re-run live against `deepseek-v4-flash` on this
   repository, completes with an answer rather than *Tool budget exhausted*. If
   it does not, record how many exploration rounds it used before stopping; that
@@ -408,4 +433,37 @@ needs no change unless that has changed by then.
 
 ## 7. Implementation Notes
 
-None yet.
+The per-task record is in [`tasks.md`](tasks.md), including each deliberate
+deviation, the falsification that checked the load-bearing tests, and the
+scoped check results.
+
+- Classification reads `action_effect` and nothing else, so spec 60's read
+  tools — including `list_worktrees` and `read_git_log`, which landed with its
+  Task 4 — became exploration rounds without a tool-name list.
+- The allowance is per turn. `PendingChatTurn.exploration_rounds`
+  (`#[serde(default)]`) carries it across every pause, so *Continue*, a
+  command approval and a plan review all keep the count instead of refreshing
+  it.
+- Repeat detection keys each read by its checkout and canonical arguments, and
+  a round that dispatches a write clears the seen-call set. Two rounds of the
+  live re-run below were charged as action rounds for repeating a read, not
+  because they ran anything.
+- Live re-run (Task 6, 2026-10-23). The motivating prompt, verbatim, against
+  `deepseek-v4-flash` on this repository with native tools on and default
+  budgets: it completed in 13 model calls with **ten read-only rounds and two
+  action rounds**, no round-budget pause and no approval stop. Usage:
+  1,132,515 input tokens (927,232 served from cache, 82%), 8,937 output. The
+  24-round allowance was ample; the repeated reads that became action rounds
+  are the intended bound working. The turn was driven in-process because
+  `damaian ask` cannot resume an approval or a pause; that temporary driver was
+  removed after the run.
+- Task 6's docs also corrected the pre-existing claim that
+  `agent_max_tool_rounds` was the only bound with no token ceiling set; the
+  read-only allowance is a second one.
+- Out of scope, observed during the live run: one line of `audit/events.jsonl`
+  held two concatenated JSON objects (two `git_log_read` records with the same
+  timestamp, from reads dispatched together), so the file was not one event per
+  line at that point. It does not affect this spec's result, but the audit
+  log's line framing deserves its own look.
+- The full seven-check gate is left to CI; the scoped checks that ran locally
+  are recorded in `tasks.md`.

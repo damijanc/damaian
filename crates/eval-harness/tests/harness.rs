@@ -9,7 +9,7 @@ use eval_harness::record::{
 use eval_harness::report;
 use eval_harness::scenario::{self, Tier};
 use eval_harness::trace::{self, Trace};
-use workspace_engine::SecretScanner;
+use workspace_engine::{ConfigOverlay, SecretScanner};
 
 const FAKE_AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 
@@ -263,6 +263,8 @@ fn a_record_serializes_with_the_field_names_the_spec_defines() {
         "tokens",
         "cost",
         "assertions",
+        "toolRounds",
+        "explorationRounds",
     ] {
         assert!(json.get(key).is_some(), "run record is missing `{key}`");
     }
@@ -331,6 +333,48 @@ fn a_missing_audit_log_is_an_empty_trace_not_an_error() {
     assert!(trace.events.is_empty());
 }
 
+fn session_action_started(action: &str) -> String {
+    format!(
+        r#"{{"eventType":"action_started","payload":{{"action":"{action}","markerId":"m","ref":""}}}}"#
+    )
+}
+
+/// Spec 59 §5.6: which rounds were exploration is derived from the run's own
+/// session log, exactly as `tool_rounds` is, rather than from the scenario
+/// script. A round counts once however many reads it dispatched, and any
+/// non-read call in the round makes it an action round.
+#[test]
+fn exploration_rounds_come_from_the_session_log() {
+    let data_dir = eval_harness::guard::eval_data_dir().expect("temp dir");
+    let sessions = data_dir.join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions dir");
+    let log = [
+        // Round one: two reads, both read tools.
+        session_action_started("model_call"),
+        session_action_started("read_file"),
+        session_action_started("read_git_log"),
+        // Round two: a command beside a read — an action round.
+        session_action_started("model_call"),
+        session_action_started("run_command"),
+        session_action_started("read_file"),
+        // A call that dispatched nothing is not a round at all.
+        session_action_started("model_call"),
+        // Round three: reads before any `model_call` still open a round, as
+        // `tool_rounds` already promises, and still count as exploration.
+        session_action_started("list_worktrees"),
+        session_action_started("search_content"),
+    ]
+    .join("\n");
+    std::fs::write(sessions.join("session-1.jsonl"), log).expect("session log");
+
+    assert_eq!(trace::tool_rounds(&data_dir).expect("tool rounds"), 3);
+    assert_eq!(
+        trace::exploration_rounds(&data_dir).expect("exploration rounds"),
+        2,
+        "two all-read rounds, and the mixed round is an action round"
+    );
+}
+
 /// Spec 18 §5.6's token row reported `notApplicable: "spec-19"` until spec 19
 /// landed. It is now a real figure — and an honest one: the mock provider
 /// reports no usage, so every number here is an estimate and must say so.
@@ -397,6 +441,31 @@ fn a_run_never_touches_the_real_data_directory() {
         !run.data_dir
             .starts_with(PathBuf::from(home).join("Library/Application Support")),
         "the run's data dir must be temporary"
+    );
+}
+
+/// The harness owns where a run writes. A scenario may tune budgets through
+/// `config_overlay`, but a `data_dir` line must not redirect state out of the
+/// temporary run directory — the same boundary `guard::assert_safe_data_dir`
+/// protects at the runner's entry.
+#[test]
+fn a_scenario_config_overlay_cannot_move_the_data_directory() {
+    let target = eval_harness::guard::eval_data_dir()
+        .expect("temp dir")
+        .join("elsewhere");
+    let path = scenario::scenarios_dir().join("one_file_patch.toml");
+    let mut loaded = scenario::load(&path).expect("scenario");
+    loaded.config_overlay = Some(
+        ConfigOverlay::parse(&format!("data_dir={}\n", target.display()))
+            .expect("an absolute data_dir is valid config"),
+    );
+
+    let run = eval_harness::runner::run(&loaded).expect("run");
+
+    assert_ne!(run.data_dir, target, "the run moved its data dir");
+    assert!(
+        !target.exists(),
+        "the redirected directory must not be created"
     );
 }
 
@@ -747,6 +816,103 @@ fn the_answer_now_scenario_makes_one_forced_final_call() {
     );
 }
 
+/// Spec 59 §5.7's first scenario, and the long-task case #47 §7.2 said was
+/// missing: fourteen distinct reads are exploration rounds, so the turn passes
+/// the eight-round action budget and still answers.
+#[test]
+fn the_long_discovery_scenario_completes_past_the_action_budget() {
+    let (run, results) = run_and_evaluate("long_discovery");
+    assert_all_passed("long_discovery", &results);
+
+    assert_eq!(run.record.final_status, "completed");
+    assert_eq!(run.record.final_task_status, "complete");
+    assert_eq!(
+        run.record.exploration_rounds, 14,
+        "every one of the scripted reads is a new all-read round"
+    );
+    assert_eq!(run.record.tool_rounds, 14);
+    assert_eq!(
+        run.record.model_calls, 15,
+        "fourteen read rounds plus the answer"
+    );
+    assert_eq!(
+        run.record.continuations, 0,
+        "the action budget was never reached, so nothing paused"
+    );
+}
+
+/// The other half of §5.7's first scenario. With the allowance at zero every
+/// read is an action round, so the turn reaches the eight-round action budget.
+/// With no token ceiling the engine pauses there (spec 61); the harness answers
+/// *Answer now*, and the forced final call still asks for a read, which ends the
+/// turn `ToolBudgetExhausted` (C10).
+#[test]
+fn without_an_exploration_allowance_long_discovery_reaches_the_action_budget() {
+    let path = scenario::scenarios_dir().join("long_discovery.toml");
+    let mut loaded = scenario::load(&path).expect("scenario");
+    loaded.config_overlay = Some(
+        ConfigOverlay::parse("agent_max_exploration_rounds=0\n")
+            .expect("the zero allowance is valid config"),
+    );
+    loaded.round_budget_decision = Some(scenario::RoundBudgetDecision::AnswerNow);
+
+    let run = eval_harness::runner::run(&loaded).expect("deterministic run");
+
+    assert!(
+        run.trace
+            .of_type("model_request_prepared")
+            .iter()
+            .all(|record| record.field("explorationRounds") == Some("0")),
+        "a zero allowance means the turn charges no exploration round"
+    );
+    assert_eq!(
+        run.record.tool_rounds, 8,
+        "eight action rounds, then the pause; the forced final call dispatches nothing"
+    );
+    assert_eq!(
+        run.record.model_calls, 9,
+        "eight rounds plus exactly one forced final call"
+    );
+    assert_eq!(
+        run.record.final_task_status, "tool_budget_exhausted",
+        "the forced call still asked for a read"
+    );
+}
+
+/// Spec 59 §5.7's second scenario: the same file and range every round is a
+/// repeat from round two, so only the first read is exploration. The nine
+/// dispatched rounds are one exploration round plus the eight-round action
+/// budget — not the thirty-two the allowance alone would permit.
+#[test]
+fn the_read_loop_scenario_stops_after_one_exploration_round_and_the_action_budget() {
+    let (run, results) = run_and_evaluate("read_loop");
+    assert_all_passed("read_loop", &results);
+
+    assert_eq!(
+        run.record.exploration_rounds, 9,
+        "every dispatched round was made entirely of reads, which is what the \
+         session log proves; the engine still charged only the first to the \
+         allowance before repeat detection took over"
+    );
+    let requests = run.trace.of_type("model_request_prepared");
+    assert_eq!(
+        requests
+            .last()
+            .and_then(|record| record.field("explorationRounds")),
+        Some("1"),
+        "the turn's own audit records show it charged a single exploration round"
+    );
+    assert_eq!(
+        run.record.tool_rounds, 9,
+        "one exploration round plus the eight action rounds, then the pause"
+    );
+    assert_eq!(
+        run.record.model_calls, 10,
+        "nine dispatched rounds plus the forced final call"
+    );
+    assert_eq!(run.record.final_task_status, "tool_budget_exhausted");
+}
+
 /// Requirement 9, asserted the way §5.5 says: by grepping every artifact the
 /// run produced, the harness's own record and the audit log included.
 ///
@@ -1000,8 +1166,8 @@ fn a_blocked_scenario_is_still_skipped_and_says_why() {
 }
 
 /// Guards the count in spec 18 §6, now that spec 17 has landed: every scenario
-/// runs and none is blocked. Nineteen since spec 61 added
-/// `continue_keeps_state` and `answer_now_ends_the_turn`.
+/// runs and none is blocked. Twenty-one since spec 59 added `long_discovery` and
+/// `read_loop`.
 #[test]
 fn every_scenario_runs_and_none_is_blocked() {
     let all = scenario::load_all().expect("scenarios should load");
@@ -1016,7 +1182,7 @@ fn every_scenario_runs_and_none_is_blocked() {
         Vec::<&str>::new(),
         "no scenario is deferred any more"
     );
-    assert_eq!(all.len(), 19, "nineteen scenarios should run");
+    assert_eq!(all.len(), 21, "twenty-one scenarios should run");
 }
 
 #[test]
@@ -1303,8 +1469,8 @@ fn the_deterministic_tier_runs_every_scenario_and_passes() {
     );
     assert_eq!(
         built.records.len(),
-        19,
-        "all nineteen scenario files should be accounted for"
+        21,
+        "all twenty-one scenario files should be accounted for"
     );
     assert_eq!(
         built

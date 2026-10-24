@@ -81,6 +81,7 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
 
     let materialized = fixture::materialize(&scenario.fixture)?;
     let mut config = base_config(&materialized);
+    apply_scenario_config(&mut config, scenario);
     config.model_provider = "mock".to_string();
     config.model_name = "mock".to_string();
     config.model_providers.push(mock_provider());
@@ -162,7 +163,8 @@ pub fn run_live(scenario: &Scenario) -> Result<Run> {
     })?;
 
     let materialized = fixture::materialize(&scenario.fixture)?;
-    let config = live_config(&materialized.data_dir, &provider, &model);
+    let mut config = live_config(&materialized.data_dir, &provider, &model);
+    apply_scenario_config(&mut config, scenario);
 
     let api_key = std::env::var(&config.model_api_key_env).map_err(|_| {
         ClientError::InvalidInput(format!(
@@ -278,6 +280,22 @@ fn base_config(materialized: &Materialized) -> Config {
         enable_index_watcher: false,
         ..Config::default()
     }
+}
+
+/// Applies the config a scenario declares for itself, at user scope — the
+/// harness is the user in a run. Parsed in `scenario::load`, so a malformed
+/// line fails there rather than being ignored here.
+///
+/// The harness keeps ownership of `data_dir`: a scenario may tune budgets and
+/// tools, but it may not redirect a run's state into the user's real
+/// application-support directory (`guard::assert_safe_data_dir` exists for the
+/// same reason).
+fn apply_scenario_config(config: &mut Config, scenario: &Scenario) {
+    let data_dir = config.data_dir.clone();
+    if let Some(overlay) = scenario.config_overlay.clone() {
+        config.apply_overlay(overlay);
+    }
+    config.data_dir = data_dir;
 }
 
 /// Drives one turn and builds its record. Shared by both tiers so there is one
@@ -453,6 +471,9 @@ fn drive(
     // script's turns described the TOML file, which in the live tier is not
     // even a description of the run. See `trace::tool_rounds`.
     run_record.tool_rounds = trace::tool_rounds(&materialized.data_dir)?;
+    // Spec 59 §5.6: exploration rounds are derived from the same session log,
+    // not from the script, so the figure describes what the run dispatched.
+    run_record.exploration_rounds = trace::exploration_rounds(&materialized.data_dir)?;
 
     // filesChanged is the union of what the engine says it wrote — never a walk
     // of the working tree, which would also catch git's own bookkeeping.

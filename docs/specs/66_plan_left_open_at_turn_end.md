@@ -165,8 +165,8 @@ no-tool-call response at `chat.rs:2703` and the empty decode at `2732`), when
 - the plan is open,
 - `plan_reminder_sent` is false for this turn,
 - there are no pending proposals (a command, patch or plan review), and
-- one more round fits both the round budget (#59's action budget once #59 is
-  built; `agent_max_tool_rounds` before) and the token ceiling's pre-call
+- one more round fits both the round budget (#59's action budget,
+  `agent_max_tool_rounds`) and the token ceiling's pre-call
   check (#21 §5.4),
 
 the loop does not break. It:

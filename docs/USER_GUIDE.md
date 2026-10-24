@@ -99,7 +99,8 @@ Common keys:
 | `model_provider.<id>.context_token_budget` | Per model | How much repository content is sent with each request, in tokens | No |
 | `enable_semantic_search` | `false` | Embedding-based retrieval ([Semantic search](#semantic-search)) | Yes |
 | `enable_worker_sessions` | `false` | [Worker Sessions](#worker-sessions) | No |
-| `agent_max_tool_rounds` | `8` | Tool rounds before a turn pauses ([While a turn runs](#while-a-turn-runs-and-how-it-ended)) | Yes |
+| `agent_max_tool_rounds` | `8` | Action rounds before a turn pauses ([While a turn runs](#while-a-turn-runs-and-how-it-ended)) | Yes |
+| `agent_max_exploration_rounds` | `24` | Read-only rounds before reads start counting as action rounds ([While a turn runs](#while-a-turn-runs-and-how-it-ended)) | Lower only |
 | `agent_max_task_tokens` | none | Token cap per turn ([Capping What One Turn May Spend](#capping-what-one-turn-may-spend)) | Lower only |
 | `command_timeout_secs` | `600` | Deadline for a command Damaian runs | Lower only |
 | `require_approval_for_file_edits` | `true` | Ask before changing files | Turn on only |
@@ -117,7 +118,7 @@ Because that file arrives with a clone, a repository can only make Damaian *more
 - The `require_approval_for_*` flags can be turned on by a repository, not off. MCP and individual MCP servers can be turned off, not on.
 - `command_allowlist` is never taken from repository config; *Allow Always* writes to your own config instead. See [Allow Always](#allow-always).
 - Budgets and preferences — `max_file_bytes`, `max_command_output_bytes`, `audit_retention_days`, `enable_semantic_search`, `agent_max_tool_rounds`, and the root overrides `project_roots_added` and `project_roots_removed` ([Repository Roots](#repository-roots)) — apply as written.
-- The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — and the repository map's `repository_map_max_tokens` (800) can be lowered by a repository but never raised. The same holds for `command_timeout_secs`, `agent_max_task_tokens`, `agent_max_turn_messages`, and `agent_max_exploration_rounds`. They bound how much of your repository a single tool call, or the map, puts into a model request, so raising one would widen what leaves your machine. A repository that tries is told to you like any other rejected key.
+- The caps on what one agent tool returns — `max_read_lines` (400), `max_list_entries` (200), `max_search_matches` (50), and `max_match_line_chars` (500) — and the repository map's `repository_map_max_tokens` (800) can be lowered by a repository but never raised. The same holds for `command_timeout_secs`, `agent_max_task_tokens`, `agent_max_turn_messages`, and `agent_max_exploration_rounds`. The first three bound how much one request may carry; `agent_max_exploration_rounds` bounds how many read-only rounds a turn may take. Raising one would widen what leaves your machine or how long a turn may run. A repository that tries is told to you like any other rejected key.
 
 ### Semantic search
 
@@ -314,11 +315,13 @@ The choice is remembered in the app for each working folder and sent with each r
 
 ### While a turn runs, and how it ended
 
-Progress is shown inside the reply, not in the header. While a turn runs, a line in the assistant's message shows what it is doing ("Waiting for model", a tool's own label, "Streaming", "round 2/8", or "Generating patch" for a file-change request), how long it has been running, and **Stop** when that kind of turn can be stopped. A chat message you send can be stopped. A turn that resumes after you approve a command, a plan or a fallback offer, and a patch being generated, show the line without Stop. When a turn finishes normally, the line disappears.
+Progress is shown inside the reply, not in the header. While a turn runs, a line in the assistant's message shows what it is doing ("Waiting for model", a tool's own label, "Streaming", "round 2/8", "round 2/8 · 12 reads" when the turn has also taken read-only rounds, or "Generating patch" for a file-change request), how long it has been running, and **Stop** when that kind of turn can be stopped. A chat message you send can be stopped. A turn that resumes after you approve a command, a plan or a fallback offer, and a patch being generated, show the line without Stop. When a turn finishes normally, the line disappears.
 
-A turn that reaches its tool-round limit (`agent_max_tool_rounds`, 8 by default) while the assistant still wants a tool does not stop: it pauses, and the reply names the rounds it used against that limit. Select **Continue — N more** to give the same turn another segment of rounds, keeping every message, tool result and plan step it had, or **Answer now** to have the assistant answer with what it has, with no tools. The pause comes before that final call, so nothing is spent until you choose. A turn can be continued up to 64 rounds in total; at that cap only **Answer now** is offered. The pause is saved, so after a restart the same offer is still waiting. With a token cap set, the turn continues on its own instead of pausing (see [Capping What One Turn May Spend](#capping-what-one-turn-may-spend)).
+A round in which the assistant only reads — `read_file`, `list_directory`, `search_content`, `search_codebase`, `read_git_status`, `read_git_diff`, `list_worktrees` or `read_git_log`, with no repeated call — is a *read-only round*. It is charged to `agent_max_exploration_rounds` (24 by default) instead of `agent_max_tool_rounds`. A round that runs a command, proposes a change, asks a question or repeats an earlier read is an *action round* and is charged as before. Spending the read-only allowance never pauses a turn by itself: later reads are simply charged as action rounds. Set `agent_max_exploration_rounds=0` to charge every round the way Damaian did before this allowance existed.
 
-A turn that ends any other way leaves a mark on its message: **Stopped by you**, **Tool budget exhausted** (after **Answer now**; select **Ask again** to start a new turn from the stopped task's own request, carrying its plan forward), **Token budget exhausted**, **Stopped before finishing**, or the error itself when the request failed. The stop and budget marks are still there when you reopen the session. **Stopped before finishing** and a failure's error are shown only in the window where the turn ran; after a reload, a stopped turn reads **Stopped by you** and a failed one has no mark.
+A turn that reaches its action-round limit (`agent_max_tool_rounds`, 8 by default) while the assistant still wants a tool does not stop: it pauses, and the reply names the action rounds it used against that limit and how many read-only rounds it had used. Select **Continue — N more** to give the same turn another segment of action rounds, keeping every message, tool result and plan step it had, or **Answer now** to have the assistant answer with what it has, with no tools. The pause comes before that final call, so nothing is spent until you choose. A turn can be continued up to 64 action rounds in total; at that cap only **Answer now** is offered. The pause is saved, so after a restart the same offer is still waiting. With a token cap set, the turn continues on its own instead of pausing (see [Capping What One Turn May Spend](#capping-what-one-turn-may-spend)).
+
+A turn that ends any other way leaves a mark on its message: **Stopped by you**, **Tool budget exhausted** (after **Answer now**; the reply names the action and read-only rounds it had used, and **Ask again** starts a new turn from the stopped task's own request, carrying its plan forward), **Token budget exhausted**, **Stopped before finishing**, or the error itself when the request failed. The stop and budget marks are still there when you reopen the session. **Stopped before finishing** and a failure's error are shown only in the window where the turn ran; after a reload, a stopped turn reads **Stopped by you** and a failed one has no mark.
 
 ### Agent tools for reading and navigating
 
@@ -1188,10 +1191,11 @@ may cost more than this", and set it against what one large request should
 reasonably cost, not against your budget for the week.
 
 There is no default: without this setting, nothing caps a turn's tokens and
-`agent_max_tool_rounds` remains the only bound. The minimum accepted value is
-1000 — below that, a turn would stop before it could do anything.
+`agent_max_tool_rounds` and `agent_max_exploration_rounds` are the only bounds.
+The minimum accepted value is 1000 — below that, a turn would stop before it
+could do anything.
 
-With the cap set, a turn that reaches its tool-round limit continues on its own
+With the cap set, a turn that reaches its action-round limit continues on its own
 instead of pausing for **Continue** ([While a turn runs](#while-a-turn-runs-and-how-it-ended)),
 and the messages it sends are bounded by `agent_max_turn_messages` so a long
 turn does not grow without limit.
@@ -1202,7 +1206,7 @@ raise the cap and ask again, and the turn picks the plan up where it stopped,
 keeping the evidence its earlier steps had already gathered.
 
 This is different from **Tool budget exhausted**, which means the turn used its
-tool rounds and you chose **Answer now**. One ran out of rounds; the other ran
+action rounds and you chose **Answer now**. One ran out of rounds; the other ran
 out of money.
 
 A repository's own `.damaian/config.conf` may only tighten this cap: it can

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use workspace_engine::{ClientError, Result};
+use workspace_engine::{ClientError, ConfigOverlay, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
@@ -86,6 +86,11 @@ pub struct Asserts {
     /// one message is one round, not N, so this is the other half of the
     /// batching claim. Script-derived, like `tool_calls_at_least`.
     pub tool_rounds_at_most: Option<u64>,
+    /// How many of the run's tool rounds were exploration rounds — every
+    /// dispatched call a read (spec 59 §5.6). Read from the session log, so it
+    /// is a measurement of the run; an exact count is script-dependent in the
+    /// deterministic tier and therefore `deterministic_only`.
+    pub exploration_rounds: Option<u64>,
     /// What the classifier must conclude about the task left mid-action by
     /// `crash_mid_action`, as its `TaskStatus` string.
     pub recovered_classification: Option<String>,
@@ -136,6 +141,11 @@ pub struct Scenario {
     /// keeps driving, so a continued turn's state and a forced final call are
     /// exercised end to end (spec 61 §5.8).
     pub round_budget_decision: Option<RoundBudgetDecision>,
+    /// Config this run needs beyond the defaults, in the same `key=value` form
+    /// as `user.conf` (spec 59 §5.7's zero-allowance case is one). Parsed at the
+    /// boundary so a malformed line is a load error, not a silently ignored
+    /// setting. Applied at user scope: the harness is the user here.
+    pub config_overlay: Option<ConfigOverlay>,
     /// When set, the runner leaves the turn's task mid-action — an
     /// `action_started` with no `action_finished` — then reopens the store and
     /// classifies, which is what a restart does. See [`CrashMidAction`].
@@ -162,6 +172,11 @@ struct RawScenario {
     approval_decision: Option<bool>,
     #[serde(default)]
     round_budget_decision: Option<RoundBudgetDecision>,
+    /// The config as the same `key=value` lines `user.conf` uses. A string
+    /// rather than a table because the engine's parser is the one authority on
+    /// what the keys are and what values they accept.
+    #[serde(default)]
+    config_overlay: Option<String>,
     #[serde(default)]
     crash_mid_action: Option<CrashMidAction>,
     #[serde(default, rename = "turn")]
@@ -283,6 +298,12 @@ pub fn load(path: &Path) -> Result<Scenario> {
             .map(|change| (change.path, change.content)),
         approval_decision: raw.approval_decision,
         round_budget_decision: raw.round_budget_decision,
+        config_overlay: match raw.config_overlay {
+            Some(text) => Some(ConfigOverlay::parse(&text).map_err(|error| {
+                ClientError::InvalidInput(format!("{}: config_overlay: {error}", path.display()))
+            })?),
+            None => None,
+        },
         crash_mid_action: raw.crash_mid_action,
         turns,
         asserts: raw.asserts,
