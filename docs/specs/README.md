@@ -85,15 +85,15 @@ A summary of each spec's own `Status:`, `tasks.md` and `Depends on:` lines on
 this date. Where it disagrees with them, they win; `npm run specs:check`
 reports the disagreement.
 
-This branch and `worktree-spec25-task9` carry four specs that `main` does not:
-**#50, #59 and #62 are Done on this branch, and #25 is Done on its own branch.
-None of the four is merged into `main` yet**, so a reader on `main` should still
-treat all four as In progress until they land there. The entries below describe
-this branch line.
+This branch and `worktree-spec25-task9` carry five specs that `main` does not:
+**#50, #59, #62 and #32 are Done on this branch, and #25 is Done on its own
+branch. None of the five is merged into `main` yet**, so a reader on `main`
+should still treat all five as In progress until they land there. The entries
+below describe this branch line.
 
 - **In progress:** #25 symbols (Tasks 1–8 of 11 here; its close-out is on
-  `worktree-spec25-task9`), #32 hooks (1–9 of 10), #49 prompt cache (accounting
-  slice done; the reuse slice is blocked on #55 or #26).
+  `worktree-spec25-task9`), #49 prompt cache (accounting slice done; the reuse
+  slice is blocked on #55 or #26).
 - **Ready, not started:** #23 verification loop; #65 exploration memory (its
   requirement 8's budget interaction is settled by #59, now done).
 - **Blocked:** #26 on #25's merge; #27, #33, #51, #54 and #55 on #26; #28 on
@@ -308,11 +308,12 @@ Task 8 closed it. No `Depends on:` line names #50 (only
 [#51](51_external_reference_retrieval.md) cites its §5.4 as a cross-reference),
 so nothing is promoted. #50 unblocks nothing, as its own row said before it
 started. This branch line also carries the 2026-10-23 close-outs of #59 and
-#62, and #25 is Done on its own branch (`worktree-spec25-task9`). **None of
-those four is merged into `main` yet**, so nothing here promotes a dependant:
-#26 still waits on #25 until that branch lands. The remaining in-progress specs
-on this branch are #32, #49's reuse slice and #25 itself, whose Done records
-live on its own branch; the ready set is #23 and #65.
+#62, the 2026-10-24 close-out of #32, and #25 is Done on its own branch
+(`worktree-spec25-task9`). **None of those five is merged into `main` yet**, so
+nothing here promotes a dependant: #26 still waits on #25 until that branch
+lands. The remaining in-progress specs on this branch are #49's reuse slice and
+#25 itself, whose Done records live on its own branch; the ready set is #23 and
+#65.
 
 **#25 and #26 are the keystones now that #24 has landed.** #25 is Done on its
 own branch but not yet merged here, and it is the last thing in front of #26.
@@ -323,19 +324,20 @@ these costs more than it looks like it does.
 |---|---|---|
 | 1 | **#25 → #26** | The keystone now that #24 is done: #25 is Done on its branch (`worktree-spec25-task9`) and needs merging; #26, which waits only on #25, is the real unlock once it lands |
 | 2 | #23 verification | Ready now that #22 is done; the last thing in front of #35. Its loop lives in `chat.rs`, so check the parallel rule below before pairing it |
-| 3 | #32 hooks | In progress (Tasks 1–9 of 10 done); unblocks nothing, but it is the one Must-tier Phase 4 package that could start |
-| 4 | #55 compaction | Also unblocks #49's reuse slice, which is why that slice waits |
-| 5 | #27, #54, #51 | The fan-out once #26 has landed |
-| 6 | #28 → #29 → #30 | Memory, strictly serial |
-| 7 | #35 → #36/#37; #33 → #52 | Delivery and extensibility clusters |
-| 8 | #38/#39/#40 | Last, and #40 may legitimately conclude "do not". #38 is deferred; #57 is done, so its stage 1 is due for re-evaluation |
+| 3 | #55 compaction | Also unblocks #49's reuse slice, which is why that slice waits |
+| 4 | #27, #54, #51 | The fan-out once #26 has landed |
+| 5 | #28 → #29 → #30 | Memory, strictly serial |
+| 6 | #35 → #36/#37; #33 → #52 | Delivery and extensibility clusters |
+| 7 | #38/#39/#40 | Last, and #40 may legitimately conclude "do not". #38 is deferred; #57 is done, so its stage 1 is due for re-evaluation |
 
 [#56](56_provider_fallback_consent/proposal.md), the opportunistic one, is done
 (2026-10-12): it closed the half of #48 that had shipped as only a negative
 guarantee.
 [#50](50_model_initiated_clarification/proposal.md) is done on this branch line
 (2026-10-24) and unblocks nothing, which is why it sits off the table rather
-than above #25.
+than above #25. [#32](32_hooks/proposal.md), also done on this branch line
+(2026-10-24), sits off the table for the same reason: no `Depends on:` line
+names it.
 [#57](57_worker_sessions/proposal.md), added on 2026-10-03, sits off the table
 for the same reason: every dependency (#17, #20, #46) is built and nothing
 depends on it. It is done (2026-10-16).
@@ -458,7 +460,7 @@ is ready.
 | 29 | [29_memory_creation_and_consent.md](29_memory_creation_and_consent.md) | **Not started.** Roadmap Phase 3b WP2. The consent gate: `MemoryProposal` and `MemoryEntry` are separate types with one conversion requiring a user confirmation, so unconfirmed persistence is unrepresentable. Instruction-shaped candidates from untrusted origins get no proposal at all. |
 | 30 | [30_memory_retrieval_and_lifecycle.md](30_memory_retrieval_and_lifecycle.md) | **Not started.** Roadmap Phase 3b WP4. Memory reaches the model only as a `ContextItem` in the lowest-priority category, is visible and removable in #27, and is marked stale by hash comparison against its evidence. Proven by prompt-injection evals, not design argument. |
 | 31 | [31_permission_profiles/](31_permission_profiles/proposal.md) | **Done (2026-10-06).** Roadmap Phase 4 WP3, built in nine tasks on top of #34's security subset. Four built-in profiles (Read-only, Safe local, Full, Offline private) plus imported custom ones are applied last and can only narrow; `profile ∩ mode` is checked at every refusal point. Two documented limits: `local` is a command-name heuristic, not a sandbox, and Offline private does not stop model traffic. |
-| 32 | [32_hooks/](32_hooks/proposal.md) | **In progress.** Split into a folder and planned on 2026-10-07 in ten tasks; Tasks 1–9 done, the last on 2026-10-24 (see its `tasks.md`). Roadmap Phase 4 WP2. Nine lifecycle events, hooks as external programs returning a verdict — `deny`/`request_approval`/`warn`/`allow`, with no `approve`, so widening is unrepresentable. A repository may define a hook that stays inactive until reviewed at a hash, and may never touch a user hook. |
+| 32 | [32_hooks/](32_hooks/proposal.md) | **Done 2026-10-24** (started 2026-10-07; Tasks 1–10, the last on 2026-10-24; see its `tasks.md`). Roadmap Phase 4 WP2. Nine lifecycle events, hooks as external programs returning a verdict — `deny`/`request_approval`/`warn`/`allow`, with no `approve`, so widening is unrepresentable. A repository may define a hook that stays inactive until reviewed at a hash, and may never touch a user hook. The workspace gate is left to CI; its own §7.1 records one criterion (the context inspector) as met only as a bounded `hook_context` item until #27. |
 | 33 | [33_mcp_management_and_deferred_discovery.md](33_mcp_management_and_deferred_discovery.md) | **Not started.** Roadmap Phase 4 WP4. Every enabled server's full schema currently reaches every request, outside #26's accounting. Adds a search tool with on-demand schemas, per-tool enable, lazy startup, and treats a remote read-only claim as an assertion that cannot lower an approval requirement. |
 | 34 | [34_repository_config_trust_boundary.md](34_repository_config_trust_boundary.md) | **Done — implemented ahead of #14 onward.** Bug-driven, not a roadmap graduation. `apply_overlay` is scope-blind, so repository config overrides user config: a repo-set `shell` runs its own script for every approved command (verified), a repo-set `model_base_url` exfiltrates the API key and code with no approval, and a repo `command_allowlist` executes commands unprompted. Adds a scope-aware overlay, a forbidden-key list, restrict-only merges, and moves `Allow Always` to user scope keyed by repository. Security subset of #31, extracted so it need not wait for Phase 4. |
 | 35 | [35_commit_preparation.md](35_commit_preparation.md) | **Not started.** Roadmap Phase 5 WP1. Damaian's first write to a user's Git repository. Builds the commit through a private index so the user's staging is never touched, runs hooks rather than bypassing them, and closes a trap: `GitService::diff` redacts, so a user could approve a diff showing `[REDACTED]` and commit the real secret. |

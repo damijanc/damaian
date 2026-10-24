@@ -76,6 +76,71 @@ Two things the boundary deliberately does not cover:
 
 `require_approval_for_all_commands` makes every command ask. *Allow Always* records one exact command for one checkout in user config (see the trust boundary below) and is not offered for blocked commands or commands with shell control syntax. A working mode or permission profile can only narrow what runs. Output of every command is redacted before the model or the UI sees it, and each command runs under `command_timeout_secs` and is registered in the process registry. A command left running by a crash is found by the sweep at the next launch and killed by its recorded pid, only while its recorded start time still matches, and never by name.
 
+## Hooks
+
+A hook ([user guide](docs/USER_GUIDE.md#hooks)) is an executable you, an
+administrator, or a reviewed repository configured to run at one of nine
+lifecycle events. It is **user-trusted code running outside the working mode
+and the permission profile**: it runs as your user, in every mode, and its own
+process is not classified by the command policy. Only what it returns, and what
+it asks Damaian to run, are constrained:
+
+- **There is no widening verdict.** A hook can answer `allow`, `warn`,
+  `request_approval` or `deny`, and nothing else. No verdict grants a
+  permission, re-enables a mode- or profile-refused action, or turns an
+  approval-gated action automatic. A hook cannot edit a patch, a command or a
+  context item. A repository cannot add a widening variant to the enum.
+- **A requested command is an agent action.** The `commands` field runs under
+  `profile ∩ mode`, through the same classification and `permits` check as a
+  turn's command, and only when policy would run it unasked. A command that
+  needs approval, is blocked, or is refused by the profile or Ask mode is not
+  run, and no approval card is raised. A hook therefore cannot use a command
+  request to put a model-independent prompt in front of the user.
+- **The environment is cleared.** A hook gets `PATH`, `HOME`, `USER`, `LANG`
+  and `TMPDIR` if set, plus `DAMAIAN_HOOK_ID`, `DAMAIAN_HOOK_EVENT` and
+  `DAMAIAN_REPOSITORY_ROOT`; never the model API key, an MCP token, or
+  anything else Damaian inherited. It runs in the repository root. Its stdin
+  is the event JSON and is then closed.
+- **Repository hooks require review at a hash.** Hook configuration is a
+  capability key. A repository may define a hook, but it arrives pending and
+  does not run until you approve its current definition hash, computed over
+  the definition fields and the content of every command or argument that
+  resolves to a file inside the repository. The review is stored in your user
+  config; the repository cannot record one. A later change to the definition
+  or the script makes the hook `changed_since_review`, and it stops running
+  rather than executing code you did not approve. A repository can switch off
+  a hook it defined, and can never change, disable, retime or make optional a
+  hook your config or the admin config defines. A permission profile cannot
+  carry a hook.
+- **Failures fail closed.** `mode` defaults to `mandatory`. A spawn failure, a
+  non-zero exit, a timeout, malformed output, an unknown `hookApiVersion`, an
+  oversized response, an unknown field or verdict, or a changed definition
+  blocks a mandatory hook's action. An `optional` hook's failure warns and the
+  action proceeds, explicitly and per hook.
+- **Output is bounded and redacted.** stdout is read to 64 KiB; exceeding the
+  ceiling is a failure, not a truncation. `reason`, `findings` and `context`
+  pass through `SecretScanner` before display, persistence or entry into
+  context, and findings use `FindingSource::Hook` so they are bounded and
+  redacted by the same constructor as every other finding. stderr is kept to
+  its last 8 KiB, redacted, and never sent to the model.
+- **Processes are tracked and killed.** A hook runs in its own process group
+  and is registered in the PID registry. A timeout kills the group, and a hook
+  left running by a crash is found by the next launch's sweep, by recorded pid
+  and start time, never by name.
+- **Nesting is bounded.** A requested command dispatches `before_tool` and
+  `after_tool` at depth + 1 with the requesting hook excluded, so a hook never
+  sees its own command. Past depth 2 the nested dispatch is skipped, the
+  command still runs, and a `hook_depth_exceeded` audit record and warning
+  finding say so.
+- **Deleting a session runs `session_end` only for its own checkout.** The
+  delete request names the repository; a root that does not match the
+  session's repository id is refused before any hook runs.
+
+Every invocation and its outcome is audited as `hook_invoked`, with failure
+kinds distinguished; widening attempts, depth overruns and refused requested
+commands have their own event types, and reviews are recorded as
+`hook_reviewed`.
+
 ## File Access
 
 Reads and writes go through one path policy:
@@ -89,7 +154,7 @@ The model never writes files. An edit comes back as a patch preview, and nothing
 
 ## Audit Log
 
-Security-relevant actions — commands run or refused, patches applied or rejected, approvals, rejected repository config keys, worker spawns and terminations — are appended to `<data_dir>/audit/events.jsonl` (by default under `~/Library/Application Support/DamaianClient/`). Fields are redacted before they are written, and attacker-controlled values such as a rejected repository key's value are never recorded. Files older than `audit_retention_days` are pruned. The log stays on your machine; nothing sends it anywhere.
+Security-relevant actions — commands run or refused, patches applied or rejected, approvals, hook invocations and reviews, rejected repository config keys, worker spawns and terminations — are appended to `<data_dir>/audit/events.jsonl` (by default under `~/Library/Application Support/DamaianClient/`). Fields are redacted before they are written, and attacker-controlled values such as a rejected repository key's value are never recorded. Files older than `audit_retention_days` are pruned. The log stays on your machine; nothing sends it anywhere.
 
 ## Data That Leaves Your Machine
 
@@ -138,7 +203,7 @@ Configuration comes from three files, applied in order: user (`<data_dir>/config
 
 A repository cannot set `shell`, `data_dir`, `allowed_roots`, `secret_patterns`, `audit_enabled`, `block_generated_secrets`, `enable_worker_sessions`, `checkpoint_retention_days`, `checkpoint_max_total_bytes`, `checkpoint_census_max_paths`, any `language_server.<language>` command, or any `model_*` key including a `model_provider.<id>` entry. Those keys redirect where commands run, which programs start unprompted, where model traffic and the API key reference go, where data is written or how long it is kept, or which defences are active; a repository has no legitimate use for any of them. They are ignored, recorded in the audit log as `repository_config_key_rejected` with the key name and class — never the value, which is attacker-controlled text — and reported to the user once per repository. There is deliberately no override.
 
-`restricted_patterns`, `ignore_patterns`, and `command_blocklist` are unioned with the user's, so a repository may add a restriction but never drop one. `require_approval_for_file_edits`, `require_approval_for_risky_commands`, and `require_approval_for_all_commands` may be turned on by a repository, never off. `mcp_enabled` and a server's `enabled` may be turned off, never on, and `mcp_server_allowlist` may only be narrowed. A repository may *define* an MCP server — a useful suggestion — but the definition is created disabled and approval-gated, and it cannot redefine a server the user has already configured. The same holds for hooks: a repository may define a hook of its own, but cannot change a hook the user or admin config already defines.
+`restricted_patterns`, `ignore_patterns`, and `command_blocklist` are unioned with the user's, so a repository may add a restriction but never drop one. `require_approval_for_file_edits`, `require_approval_for_risky_commands`, and `require_approval_for_all_commands` may be turned on by a repository, never off. `mcp_enabled` and a server's `enabled` may be turned off, never on, and `mcp_server_allowlist` may only be narrowed. A repository may *define* an MCP server — a useful suggestion — but the definition is created disabled and approval-gated, and it cannot redefine a server the user has already configured. The same holds for hooks: a repository may define a hook of its own, but it arrives pending review at a definition hash, cannot record its own review, and cannot change a hook the user or admin config already defines.
 
 Limits on how much one tool call, command or turn may read, run or spend may be lowered by a repository and never raised: `command_timeout_secs`, `max_read_lines`, `max_list_entries`, `max_search_matches`, `max_match_line_chars`, `repository_map_max_tokens`, `agent_max_task_tokens`, `agent_max_turn_messages`, and `agent_max_exploration_rounds`. Raising one would widen what leaves your machine or how long a command may run.
 

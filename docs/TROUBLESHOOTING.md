@@ -47,6 +47,7 @@ coding agents are in [AGENTS.md](../AGENTS.md).
 | Applying a patch fails with a conflict | [Patch apply fails with a conflict](#patch-apply-fails-with-a-conflict) |
 | An `edit_file` proposal is refused | [An `edit_file` proposal is refused](#an-edit_file-proposal-is-refused) |
 | `Refused: …` from a mode, a profile or the command policy | [The assistant was refused](#the-assistant-was-refused-the-session-mode-the-permission-profile-or-the-command-policy) |
+| `Refused by hook …`, or a hook blocked, warned, timed out or did not run | [A hook refused, blocked, or did not run](#a-hook-refused-blocked-or-did-not-run) |
 | A command that used to run unasked now asks | [A command that used to run unasked now asks](#a-command-that-used-to-run-unasked-now-asks) |
 | A setting will not stick, or a repository config key has no effect | [Configuration layers](#configuration-layers), [Why a rule is in force](#why-a-rule-is-in-force) |
 | A permission profile key has no effect | [A permission profile key had no effect](#a-permission-profile-key-had-no-effect) |
@@ -657,6 +658,7 @@ Event types grouped by what they tell you:
 | MCP | `mcp_tools_listed`, `mcp_tool_called`, `mcp_tool_call_failed`, `mcp_discovery_failed` |
 | Provider refusals | `provider_refusal`, `provider_fallback_offered`, `provider_fallback_decision` |
 | Browser diagnostics | `browser_diagnostic_approval_decision`, `browser_diagnostic_session_approval_used` |
+| Hooks | `hook_invoked`, `hook_widening_attempt`, `hook_depth_exceeded`, `hook_command_refused`, `hook_reviewed` |
 | Config and profiles | `repository_config_key_rejected`, `permission_profile_set`, `permission_profile_key_rejected`, `permission_profile_imported` |
 | Crash recovery | `task_recovered`, `task_recovery_decision`, `session_log_truncated_tail`, `pending_approval_unavailable`, `reattached_approval_resolved`, `task_usage_recorded_for_lost_call` |
 | Workers | `worker_spawned`, `worker_spawn_failed`, `worker_restarted`, `worker_terminated`, `worker_worktree_removed` |
@@ -1804,6 +1806,10 @@ approval card shows the same line beside the risk badge. The shapes are:
   with the scope that set it: `user`, `repository`, `profile`, `admin` or
   `default`. The same shape names *Ask before test, build and lint commands*
   when `require_approval_for_risky_commands` is on.
+- **Asks first: hook `<id>` requested it: `<reason>`** — a
+  [`before_tool`](USER_GUIDE.md#hooks) hook returned `request_approval` for a
+  command that would otherwise have run unasked. Its audit cause name is
+  `hook_requested`. A hook can add this reason; it can never remove one.
 - **Blocked: …** — a `command_blocklist` rule, a destructive pattern, or the
   permission profile's `command_access`. These offer no approval.
 
@@ -1868,6 +1874,127 @@ switches are `permission_profile_set` audit events, not session events, and a
 profile change takes effect at the same points as a mode change. A refusal inside a turn, before any approval
 card was shown, leaves no proposal at all. What it leaves is a failed
 `action_finished` in the session log, next to the tool-result message.
+
+### A hook refused, blocked, or did not run
+
+A hook ([user guide](USER_GUIDE.md#hooks)) can stop an action, turn a command
+into an approval card, add a warning, or fail closed. Its wording names the
+hook, which is how it is told apart from the other boundaries:
+
+- **`Refused by hook <id>: <reason>`** — a `deny` verdict or a mandatory hook's
+  failure. At `before_tool` it is a grey tool-result bubble and the action is
+  not dispatched: no proposal is stored, no action marker is opened and no
+  approval card appears. At `session_start` it refuses the turn before a
+  session exists; at `before_context` it fails the task with `hook_denied` and
+  shows the reason as the assistant message. At `before_patch_apply` it is the
+  apply error and writes nothing; the file is unchanged and no apply marker
+  exists. At `before_task_complete` it goes to the model as a user-role note,
+  the task does not complete, and the model gets another round within the
+  existing budget.
+- **`Hook <id>: <reason>`** — an `after_tool` denial. It is appended to the
+  tool result the model sees and recorded as an error finding. Nothing is
+  undone: the command or patch already happened. Roll it back with
+  [Rewind](USER_GUIDE.md#rewind) if you agree with the hook. An
+  `after_patch_apply` or `after_check` denial is only an error finding (and,
+  for a patch, a warning on the result).
+- **A warning** is a finding with source **Hook** in the [findings
+  panel](USER_GUIDE.md#findings), and at patch apply it is also on the patch
+  card. An **optional** hook's failure (non-zero exit, timeout, malformed
+  output, version mismatch, output too large, a spawn failure, or a changed
+  review) is a warning and the action proceeds. A **mandatory** hook's failure
+  blocks, so a rule you rely on cannot be disabled by a typo.
+
+The same wording is not used for a mode, profile or command-policy refusal;
+those are in [The assistant was refused](#the-assistant-was-refused-the-session-mode-the-permission-profile-or-the-command-policy).
+
+**Where to look in the audit log.** Every invocation writes one `hook_invoked`
+record with `hookId`, `event`, `sessionId`, `taskId`, `classification`
+(`mandatory`/`optional`), `source`, the effective `verdict`, `outcome`
+(`ok`/`failed`), `durationMs`, and on failure a `failureKind`:
+
+```bash
+jq -c 'select(.eventType=="hook_invoked") | {event: .event, hookId: .hookId, verdict: .verdict, outcome: .outcome, failureKind: .failureKind, durationMs: .durationMs}' "$DATA_DIR/audit/events.jsonl" | tail -20
+```
+
+The failure kinds are `spawn_failed`, `non_zero_exit`, `timeout`,
+`malformed`, `version_mismatch`, `output_too_large` and
+`changed_since_review`. A denial or a request also carries its `reason`; a
+successful `deny` response is `outcome: ok`. Three related records explain the
+rest:
+
+- `hook_widening_attempt` carries `field` or `verdict` and the *name* only,
+  never the value. It is written when a hook returns an unknown field or an
+  unrecognised verdict; the response is then treated as malformed, so a
+  mandatory hook denies.
+- `hook_command_refused` carries the redacted `command` and the `reason` when a
+  command a hook asked Damaian to run was not run. A hook never raises an
+  approval card, so only a command policy would run unasked is run; Ask mode
+  and a narrower profile refuse it.
+- `hook_reviewed` records `repositoryId`, `hookId`, `decision` and the approved
+  `hash`. Pending, declined and disabled hooks are not invoked and write no
+  per-event record.
+
+**Debug the hook itself.** The shell's **Settings › Hooks** page has a **Test**
+button with an event picker; the CLI has the same run and the redacted stderr:
+
+```bash
+damaian hooks /path/to/repo
+damaian hook-run /path/to/repo no_migrations before_tool
+```
+
+`hook-run` prints one hook's own verdict, failure kind, duration and redacted
+stderr against a representative payload for the event. A test run writes no
+`hook_invoked` record because it is not a session invocation; only a review
+writes an audit record (`hook_reviewed`). Both `hook-run` and the Test button
+**refuse a repository hook that is pending, changed since review, declined or
+disabled**, with a message saying which state it is in — make it active first.
+A user's own disabled hook can still be tested.
+
+**A repository hook does not run.** Repository hooks arrive
+**pending review** and stay inactive until you approve the exact definition
+shown in the consent dialog. The review is stored in **your** user config as
+`hook_review.<repository_id>.<hook_id>`; the repository's own
+`.damaian/config.conf` cannot record or replace it. Approving at a stale hash
+is refused with "changed since it was shown to you". If the definition or a
+script inside the repository changes after approval, the hook is **changed
+since review**: it stops running and fails under its own classification
+(mandatory blocks, optional warns) rather than executing the new code.
+Declining keeps it inactive and is reversible from **Settings › Hooks**;
+declined hooks are not shown in the consent notice again. A user or
+administrator hook cannot be changed, disabled, retimed or made optional by a
+repository, and a profile cannot carry a hook at all.
+
+**A depth-exceeded warning.** A hook's requested command can itself trigger
+`before_tool` and `after_tool`, including other hooks. Nesting is capped at
+two levels; past that Damaian skips the nested dispatch, still runs the
+command, and records a warning finding plus `hook_depth_exceeded` (`hookId`,
+`event`, `depth`). The outer action is not blocked: the nested command is one
+the hook deliberately asked for. A rule that needs a chain deeper than two
+hooks is asking Damaian to run more than the guard allows; rewrite the rule to
+run its check inside the hook and return the verdict from there.
+
+**A hook works in Terminal but not from Damaian.** The hook process has a
+cleared environment — only `PATH`, `HOME`, `USER`, `LANG`, `TMPDIR` if set,
+plus `DAMAIAN_HOOK_ID`, `DAMAIAN_HOOK_EVENT` and `DAMAIAN_REPOSITORY_ROOT` —
+and runs in the repository root, not your shell's current directory. It does
+not read your shell profile, and it never gets the model API key or an MCP
+token. Put an absolute shebang/executable path in `command` (or `args`), or
+ensure the program is on the inherited `PATH`.
+
+**Deleting a session runs a `session_end` hook.** `/api/session-delete` takes
+the repository as well as the session id, and refuses a root that is not the
+session's own repository:
+`Session <id> does not belong to repository <root>`. The session is left in
+place and no hook runs. The desktop app sends the open folder; a `curl` or
+script caller must send `repo` too.
+
+**The command line shown for a hook joins its arguments with spaces.** The
+review dialog and the hook listings render `command` followed by `args`
+separated by single spaces, so an argument that itself contains a space cannot
+be told apart from two arguments in that display. The approved review hash
+covers the exact argument list (`args` is `|`-separated in config), so the
+decision still applies to exactly the definition shown; it is the display that
+is ambiguous, not the review. Known limitation, recorded in spec 32 §7.
 
 ### A file read or search result was truncated
 
