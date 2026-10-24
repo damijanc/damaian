@@ -25,7 +25,7 @@ on), [`32_hooks/`](../32_hooks/proposal.md) (`before_task_complete` fires at the
 same completion points; §5.2 fixes the order),
 [`50_model_initiated_clarification/`](../50_model_initiated_clarification/proposal.md)
 (a question pause is not a completion, and its answer is not an approval), and
-[`65_exploration_memory_within_a_turn.md`](../65_exploration_memory_within_a_turn.md)
+[`65_exploration_memory_within_a_turn/`](../65_exploration_memory_within_a_turn/proposal.md)
 (it edits the same loop, `PendingChatTurn` and `bounded_messages`; see
 `context.md` §5).
 

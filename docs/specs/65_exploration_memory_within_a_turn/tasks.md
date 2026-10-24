@@ -567,7 +567,7 @@ criteria. **Files:** `chat.rs`, `tests/exploration_rounds.rs`.
 `session.rs`, `tests/turn_notes.rs` (new).
 
 **Blocked on #26 landing.** Do not start this task until
-[`26_context_assembly.md`](../26_context_assembly.md) is Done and merged.
+[`26_context_assembly/`](../26_context_assembly/proposal.md) is Done and merged.
 Before the first edit, re-read `context.md` §10 and re-check every `chat.rs`
 reference it names; #26 rewrites `build_model_prompt` and the seed block this
 task edits.

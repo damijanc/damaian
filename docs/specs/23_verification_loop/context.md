@@ -527,8 +527,8 @@ executables stall on this Mac (`OBSERVATIONS.md` observation 25).
 
 ## 13. Collision with spec 26 (context assembly)
 
-Spec 26 ([`26_context_assembly.md`](../26_context_assembly.md), Status: Not
-started) rewrites context assembly and the prompt that carries it. It is being
+Spec 26 ([`26_context_assembly/`](../26_context_assembly/proposal.md), Status: In
+progress) rewrites context assembly and the prompt that carries it. It is being
 implemented in parallel with this plan, and both touch `chat.rs`. It must land
 first, for a reason, not only because of file contention.
 

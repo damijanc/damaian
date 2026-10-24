@@ -378,7 +378,7 @@ where spec 59 put its four.
 
 ### #26 context assembly — in progress right now, in another session
 
-[`26_context_assembly.md`](../26_context_assembly.md) rewrites context
+[`26_context_assembly/`](../26_context_assembly/proposal.md) rewrites context
 assembly: `ContextItem` (`context_manager.rs:22`) gains a category, a line
 range, provenance and a root; `build_context` (`context_manager.rs:81`) gains
 per-category budgets, de-duplication, exclusion records and a manifest; the
@@ -421,7 +421,7 @@ next to the seed) touch that first two regions:
 
 ### #66 plan left open at turn end — also edits `chat.rs`
 
-[`66_plan_left_open_at_turn_end.md`](../66_plan_left_open_at_turn_end.md)
+[`66_plan_left_open_at_turn_end/`](../66_plan_left_open_at_turn_end/proposal.md)
 edits the **turn end**: each `StopReason::Answered` break in
 `run_agentic_turn` (the no-tool-call response and the empty-decode path), the
 `step_evidence` buffer, `PendingChatTurn` (adding persisted step evidence), and

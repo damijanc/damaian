@@ -2,7 +2,7 @@
 
 Status: Not started (planned 2026-10-24: see [`tasks.md`](tasks.md)).
 Implementation of the tasks that touch the turn seed waits for
-[#26](../26_context_assembly.md) to land. Specified on 2026-10-18 from a review of
+[#26](../26_context_assembly/proposal.md) to land. Specified on 2026-10-18 from a review of
 [#59](../59_exploration_round_allowance/proposal.md)–[#64](../64_read_only_command_boundary.md),
 asking whether they are enough for Damaian to investigate a large repository
 before changing it. They give a turn the rounds to explore, but nothing keeps
