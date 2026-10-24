@@ -418,7 +418,8 @@ Added 2026-10-24 after two flakes. Both were real defects, not test artefacts.
 `a_reader_racing_registration_and_removal_never_sees_an_unreadable_entry`,
 `registering_a_child_that_already_exited_succeeds_and_records_nothing` and
 `a_temp_file_left_by_a_crashed_owner_is_audited_and_removed` reproduce each case;
-the first two failed before the change.
+the first two failed before the change. The full seven-check gate passed in CI on 2026-10-24
+(Quality run 40118502469, on main after the fix was merged).
 
 ### Test mechanics
 
