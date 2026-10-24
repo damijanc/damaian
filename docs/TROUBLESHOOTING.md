@@ -730,8 +730,8 @@ Follow task state, which is how you spot a turn that died mid-flight — a task
 whose last status is not `complete`, `failed`, `cancelled`,
 `tool_budget_exhausted` or `token_budget_exhausted` never finished. The
 exception is `waiting_for_approval`: a task paused on a proposal (a command, a
-plan review, a provider fallback, or a `round_budget` pause whose file is
-`chat/pending/roundbudget_…`, see
+plan review, a provider fallback, a question the assistant asked, or a
+`round_budget` pause whose file is `chat/pending/roundbudget_…`, see
 [A turn stopped early](#a-turn-stopped-early-which-budget-ran-out)) is waiting
 for you, not dead:
 
@@ -743,6 +743,35 @@ The `.task //` fallbacks are not defensive padding: `task_status_updated`
 genuinely appears in two shapes. `await_approval` wraps the task alongside the
 proposal it is waiting for, and the plain status write does not. Both are
 current.
+
+**A waiting question reads as a different link, not a different status.** Both
+an approval and a question leave the task in `waiting_for_approval`; the newest
+status event says which by the key it carries. `pendingApproval` has `kind` and
+`proposalId`, where `kind` is `command`, `patch`, `plan`, `browser_diagnostic`,
+`mcp_tool`, `provider_fallback` or `round_budget`. `pendingQuestion` has only
+`questionId`, and nothing else. A
+question never writes `pendingApproval`, and `/api/run-command` or
+`/api/reject-command` with a question id runs nothing:
+
+```bash
+jq -r 'select(.eventType=="task_status_updated") | .payload |
+  if .pendingQuestion then "question \(.pendingQuestion.questionId)"
+  elif .pendingApproval then "approval \(.pendingApproval.kind) \(.pendingApproval.proposalId)"
+  else "nothing" end' "$SESSION_FILE"
+```
+
+The question itself lives in two events, not in the status link.
+`question_asked` is written once where the card appears and carries
+`questionId`, the question, `options` and `allowFreeText`; `question_answered`
+is written once with `answer` and `selectedOption` (absent for free text). An
+asked question with no answer event is open; an answered pair is never re-asked,
+and a second answer is refused. Both are read through the active events, so a
+rewind past the question drops them:
+
+```bash
+jq -r 'select(.eventType=="question_asked" or .eventType=="question_answered") |
+  "\(.seq) \(.eventType) \(.payload.questionId)"' "$SESSION_FILE"
+```
 
 Every line is parsed as JSON on read, and a line that does not parse is
 **discarded rather than half-read** — a truncated tail cannot turn into a

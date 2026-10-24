@@ -79,20 +79,26 @@ directory was renamed from `ROADMAP` to `PLAN` because it was never a roadmap:
 
 ## What to build next, and what may run in parallel
 
-### Current state (2026-10-23)
+### Current state (2026-10-24)
 
 A summary of each spec's own `Status:`, `tasks.md` and `Depends on:` lines on
 this date. Where it disagrees with them, they win; `npm run specs:check`
 reports the disagreement.
 
-- **In progress:** #25 symbols (Tasks 1–8 of 11), #32 hooks (1–4 of 10), #49
-  prompt cache (accounting slice done; the reuse slice is blocked on #55 or
-  #26), #50 clarification (1–7 of 8; Task 7 landed 2026-10-24).
+This branch and `worktree-spec25-task9` carry four specs that `main` does not:
+**#50, #59 and #62 are Done on this branch, and #25 is Done on its own branch.
+None of the four is merged into `main` yet**, so a reader on `main` should still
+treat all four as In progress until they land there. The entries below describe
+this branch line.
+
+- **In progress:** #25 symbols (Tasks 1–8 of 11 here; its close-out is on
+  `worktree-spec25-task9`), #32 hooks (1–4 of 10), #49 prompt cache (accounting
+  slice done; the reuse slice is blocked on #55 or #26).
 - **Ready, not started:** #23 verification loop; #65 exploration memory (its
   requirement 8's budget interaction is settled by #59, now done).
-- **Blocked:** #26 on #25; #27, #33, #51, #54 and #55 on #26; #28 on #26 and
-  #27; #29 on #28; #30 on #28 and #29; #35 on #23; #36 on #35; #37 on #33, #35
-  and #36; #52 on #33; #39 on #38; #40 on #38 and #39.
+- **Blocked:** #26 on #25's merge; #27, #33, #51, #54 and #55 on #26; #28 on
+  #26 and #27; #29 on #28; #30 on #28 and #29; #35 on #23; #36 on #35; #37 on
+  #33, #35 and #36; #52 on #33; #39 on #38; #40 on #38 and #39.
 - **Deferred:** #38 (stage 1 is due for re-evaluation now that #57 is done).
 - **Pairing:** two specs may run together only if at most one of them edits
   `chat.rs`, and #26, #55 and #49's reuse slice never run together — see
@@ -297,13 +303,25 @@ condition is now met rather than a dependency: #38's stage 1 was to be
 re-evaluated once #57 shipped (#38's Deferral section). That re-evaluation is
 a decision for the user, and #38 stays deferred until it is made.
 
-**#25 and #26 are the keystones now that #24 has landed.** #25 is the last
-thing in front of #26, and the whole tail waits on #26. Preferring a spec that
-unblocks nothing over one of these costs more than it looks like it does.
+Re-derived on 2026-10-24, when [#50](50_model_initiated_clarification/proposal.md)'s
+Task 8 closed it. No `Depends on:` line names #50 (only
+[#51](51_external_reference_retrieval.md) cites its §5.4 as a cross-reference),
+so nothing is promoted. #50 unblocks nothing, as its own row said before it
+started. This branch line also carries the 2026-10-23 close-outs of #59 and
+#62, and #25 is Done on its own branch (`worktree-spec25-task9`). **None of
+those four is merged into `main` yet**, so nothing here promotes a dependant:
+#26 still waits on #25 until that branch lands. The remaining in-progress specs
+on this branch are #32, #49's reuse slice and #25 itself, whose Done records
+live on its own branch; the ready set is #23 and #65.
+
+**#25 and #26 are the keystones now that #24 has landed.** #25 is Done on its
+own branch but not yet merged here, and it is the last thing in front of #26.
+The whole tail waits on #26. Preferring a spec that unblocks nothing over one of
+these costs more than it looks like it does.
 
 | | Build | Why here |
 |---|---|---|
-| 1 | **#25 → #26** | The keystone now that #24 is done: #25 is in progress, and #26, which waits only on #25, is the real unlock |
+| 1 | **#25 → #26** | The keystone now that #24 is done: #25 is Done on its branch (`worktree-spec25-task9`) and needs merging; #26, which waits only on #25, is the real unlock once it lands |
 | 2 | #23 verification | Ready now that #22 is done; the last thing in front of #35. Its loop lives in `chat.rs`, so check the parallel rule below before pairing it |
 | 3 | #32 hooks | In progress (Tasks 1–4 of 10 done); unblocks nothing, but it is the one Must-tier Phase 4 package that could start |
 | 4 | #55 compaction | Also unblocks #49's reuse slice, which is why that slice waits |
@@ -315,8 +333,9 @@ unblocks nothing over one of these costs more than it looks like it does.
 [#56](56_provider_fallback_consent/proposal.md), the opportunistic one, is done
 (2026-10-12): it closed the half of #48 that had shipped as only a negative
 guarantee.
-[#50](50_model_initiated_clarification/proposal.md) is in progress (Tasks 1–7 of 8 done, the last on 2026-10-24) and unblocks nothing,
-which is why it sits off the table rather than above #25.
+[#50](50_model_initiated_clarification/proposal.md) is done on this branch line
+(2026-10-24) and unblocks nothing, which is why it sits off the table rather
+than above #25.
 [#57](57_worker_sessions/proposal.md), added on 2026-10-03, sits off the table
 for the same reason: every dependency (#17, #20, #46) is built and nothing
 depends on it. It is done (2026-10-16).
@@ -457,7 +476,7 @@ is ready.
 | 47 | [47_agent_working_capability/](47_agent_working_capability/proposal.md) | **Done.** Split into a folder and designed on 2026-09-17; all eight requirements built and closed out on 2026-09-18: ranged reads, `list_directory`, `search_content`, anchor-based region edits, stoppable/timed/streaming commands, a bounded continuation past the eight-round limit and within-round concurrent dispatch of read-only calls. It adds no autonomy. **The live-tier A/B did not support the spec's premise** (§7.2): **+106% tokens** bought **approval stops falling 17 → 4**, not fewer rounds. |
 | 48 | [48_provider_limits_and_backpressure/proposal.md](48_provider_limits_and_backpressure/proposal.md) | **Done.** Roadmap Phase 1 WP7. A provider rate limit ends the turn, and the code written to prevent that cannot see it: a 429 arrives as a parsed error body and returns immediately with no retry, while `is_retryable_message`'s `"rate limit"` and `"429"` arms are reachable only from the transport-failure path — where they never fire, because `curl -sS` exits zero on a 4xx. Captures status and headers via `dump-header` rather than a stdout sentinel a model could emit, classifies refusals from status first and never from prose, honours `Retry-After` under both an attempt count and a wall-clock ceiling, and makes the outcome a `failureKind` on the existing failed state rather than a fourteenth state — three fewer kill-matrix cells for the same information. A refused call records measured zero, so it cannot inflate #19's totals through the estimate written before the call. |
 | 49 | [49_prompt_cache_accounting_and_reuse/](49_prompt_cache_accounting_and_reuse/proposal.md) | **In progress.** Split into a folder and planned on 2026-09-18. Roadmap Phase 1 WP8. The **accounting slice** (requirements 1, 2, 3, 6, 8, plus requirement 5's guard) is **Done as of 2026-09-23**: `cached_input_tokens` and a cached rate, so cost is no longer overstated for providers that cache automatically. The **reuse slice** (requirement 4) remains blocked, because the conversation section is a **sliding window of the last eight messages** that changes the prefix every turn; it waits on #55 or #26. |
-| 50 | [50_model_initiated_clarification/](50_model_initiated_clarification/proposal.md) | **In progress: planned 2026-10-07, Tasks 1–7 of 8 done, the last on 2026-10-24.** Roadmap Phase 2 WP8. An `ask_user` tool whose load-bearing rule is that an answer can never satisfy an approval, enforced by types rather than discipline. It reuses the existing waiting state and reattach machinery, is bounded to two questions per turn, and is absent from the tool list where no user can answer. |
+| 50 | [50_model_initiated_clarification/](50_model_initiated_clarification/proposal.md) | **Done 2026-10-24** (planned 2026-10-07; Tasks 1–8, the last on 2026-10-24; the live usage measurement was not run, see its §7). Roadmap Phase 2 WP8. An `ask_user` tool whose load-bearing rule is that an answer can never satisfy an approval, enforced by types rather than discipline. It reuses the existing waiting state and reattach machinery, is bounded to two questions per turn, and is absent from the tool list where no user can answer. |
 | 51 | [51_external_reference_retrieval.md](51_external_reference_retrieval.md) | **Not started.** Roadmap Phase 3 WP8. Damaian cannot read a page, so every task against a third-party API runs on what the model remembers about an unnamed version of it. `fetch_url` and an optional `search_web`, with fetched content entering as a lowest-priority provenance-labelled `ContextItem` proven non-authoritative by injection evals rather than by argument — #30's treatment of memory, reused. Its §5.3 is the reason it is Should-tier: a URL is the first place the model chooses what leaves the machine, so host approval lives in user scope on the forbidden-for-repository list, a URL carrying repository content or a secret is refused *before* the approval dialog rather than by it, and cross-host redirects are not followed. |
 | 52 | [52_mcp_server_mode.md](52_mcp_server_mode.md) | **Not started.** Roadmap Phase 4 WP6. #06 and #33 are client-side only, so Damaian's indexed search, redaction and path policy are reachable only from its own window — the alternative being to give another tool raw filesystem access. Exposes a read-only subset over stdio, with the set computed as the intersection of read-only and profile-permitted rather than listed, so a tool added later is excluded until classified. The repository is fixed at launch and unreachable from the wire; a server has no user, therefore no approval, therefore nothing that writes. |
 | 53 | [53_session_search_and_export/proposal.md](53_session_search_and_export/proposal.md) | **Done.** Roadmap Phase 1 WP9. A rescope, not greenfield: listing, renaming and deleting already work end to end, and what is missing is finding anything and getting anything out. A bounded scan through #17's parse-first reader rather than a second index, anchored on `seq` because it survives rewinds. Its sharp edge is inherited from #16: `append_message` stores content verbatim and deliberately does not redact, so that a rewind restores what was actually said — which makes export a display path that writes a file, and redaction on the way out mandatory, with the redaction count stated rather than silently applied. |

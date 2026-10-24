@@ -336,6 +336,11 @@ the same terms as a whole-file `propose_patch`. A large file read is reported as
 a range with the file's real line count ("lines 1–400 of 4420"), so a truncated
 result says so rather than reading as the whole file.
 
+`ask_user` is offered alongside them. It lets the assistant ask you one short
+question in the middle of a turn and carry on with your answer; it changes
+nothing by itself, and it is available only where a user can answer (see
+[When the assistant asks you a question](#when-the-assistant-asks-you-a-question)).
+
 The agent can also read the repository's git worktrees without asking.
 `list_worktrees` lists every worktree git has registered for the repository —
 each one's path, branch (or `detached`), short `HEAD`, count of changed files,
@@ -359,6 +364,37 @@ way.
 
 When one model message asks for several read-only tools, they run together and
 their results are reported in the order the model asked for them.
+
+### When the assistant asks you a question
+
+If the request is ambiguous and guessing would spend the turn on the wrong
+reading, the assistant can pause and ask you one short question — "Did you mean
+the CLI or the shell?" — instead of ending the turn. The question appears as a
+card in the assistant's message with two to four suggested answers, plus a
+free-text field when the question allows one. Answer by clicking an option or
+typing a reply and selecting **Send**; the turn then continues with your answer,
+carrying everything it had already read.
+
+- **Answering a question authorises nothing.** It is not an approval. A command,
+  a patch or a configuration change that follows still asks for its own approval
+  on the usual terms, even when your answer was "yes, go ahead".
+- **You can leave it unanswered.** Nothing times out and Damaian never picks an
+  answer for you. The task stays waiting — including after a reload or a crash —
+  until you answer it.
+- **The question and its options are redacted** before they are stored or shown,
+  on the same terms as other model output, so a question quoting a config file
+  cannot carry a key into the transcript. What you type in reply is redacted
+  before it is recorded and sent back to the model. Your own prompt to Damaian
+  is still stored and sent as you typed it, as before.
+- **A question appears only in an interactive desktop conversation.** The
+  command-line tool, the evaluation harness, worker sessions and any unattended
+  run have no one to answer, so `ask_user` is not offered there at all and the
+  assistant proceeds under a stated assumption instead.
+- **Asking is bounded.** Two questions per turn by default
+  (`agent_max_questions_per_turn`, ceiling 4), and each one uses a tool round. A
+  third question in the same turn is refused, and the assistant is told so and
+  carries on. An unanswered question simply waits; an answered one is never
+  asked again.
 
 ## File Changes
 

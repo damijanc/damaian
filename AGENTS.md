@@ -221,6 +221,7 @@ The following are product guarantees. Do not weaken them to make implementation 
 * **Command execution policy.** The command policy determines what may execute without approval. Read-only commands may be eligible for automatic execution; commands with side effects require explicit approval according to policy. Do not widen the allow-list or reduce a risk classification without an explicit specification change.
 * **API keys.** API credentials belong in the macOS Keychain or in explicitly referenced environment variables. `model_api_key_env` may contain a Keychain reference such as `keychain:model-api-key` or an environment-variable name; it must never contain a raw API key. Never write credentials into source code, configuration files, tests, fixtures, logs, or committed documentation.
 * **Patch safety.** Patch application verifies file hashes so that an approved patch cannot silently overwrite changes made after the preview was produced. Do not remove or bypass that protection.
+* **Questions are not approvals.** An answer to a question never satisfies an approval, and a paused turn is resumed only by the route for what it is paused for.
 
 ### Repository configuration is untrusted input
 
