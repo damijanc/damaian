@@ -491,20 +491,23 @@ impl MetricSet {
 /// Whether one recorded tool call counts against §5.6's error rate.
 ///
 /// The engine's marker vocabulary — `ok`, `awaiting_approval`,
-/// `awaiting_review`, `conflict` — contains no error value: a tool failure is
-/// fed back to the model as a tool result and the marker still finishes
-/// normally. So an error here is a call that reached *none* of those states,
-/// which in practice means a marker that never finished at all.
+/// `awaiting_review`, `awaiting_answer`, `conflict` — contains no error value:
+/// a tool failure is fed back to the model as a tool result and the marker
+/// still finishes normally. So an error here is a call that reached *none* of
+/// those states, which in practice means a marker that never finished at all.
 ///
-/// Reading this as `outcome != "ok"` counted a patch waiting for review and a
-/// command waiting for approval as errors, which are the outcomes most
-/// scenarios exist to produce. That went unnoticed while the tool-call list
-/// came from the scenario script, which stamped every entry `ok` — so the
-/// metric reported 0.000 by construction rather than by measurement, and
-/// nothing would have moved it.
+/// Reading this as `outcome != "ok"` counted a patch waiting for review, a
+/// command waiting for approval and a question waiting for an answer as errors,
+/// which are the outcomes the scenarios exist to produce. That went unnoticed
+/// while the tool-call list came from the scenario script, which stamped every
+/// entry `ok` — so the metric reported 0.000 by construction rather than by
+/// measurement, and nothing would have moved it.
 fn is_tool_error(outcome: &str, record_injected_a_crash: bool) -> bool {
     match outcome {
-        "ok" | "awaiting_approval" | "awaiting_review" | "conflict" => false,
+        // A pause for a human decision stops the turn cleanly. `awaiting_answer`
+        // is spec 50's question: without it here, every scripted answer would
+        // be reported as the assistant erring.
+        "ok" | "awaiting_approval" | "awaiting_review" | "awaiting_answer" | "conflict" => false,
         // An unfinished action is the crash signature spec 17 preserves. A
         // scenario that injected a crash is *expected* to leave one, and
         // counting it would report the harness's own interruption as the

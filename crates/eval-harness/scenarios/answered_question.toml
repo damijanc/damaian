@@ -1,0 +1,31 @@
+name = "answered_question"
+fixture = "rust-workspace"
+tier = "deterministic"
+prompt = "Add a retry helper for uploads"
+
+# Spec 50 §9. The scripted answer is what makes this run interactive: it sets
+# `user_present`, so `ask_user` is offered and the system prompt carries no
+# headless paragraph. Every other scenario scripts none, which is the headless
+# default.
+#
+# The answer names an option label, so the runner answers the way a user
+# clicking that option would — with `selectedOption`, not as free text.
+answers = ["src/http_client.rs"]
+
+[[turn]]
+content = ""
+tool_calls = [
+  { name = "ask_user", arguments = { question = "Which module should the retry helper live in?", options = ["src/upload.rs", "src/http_client.rs"], allowFreeText = false } },
+]
+
+[[turn]]
+content = "The retry helper will live in src/http_client.rs."
+
+[assert]
+# The turn paused on a question, the runner answered it, and the next request
+# carried the engine's fixed tool result. Scripted, so the live tier, which
+# records no requests, skips it.
+answer_request_contains = ['The user answered: "src/http_client.rs" (option 1: "src/http_client.rs")']
+final_task_status = "complete"
+tool_calls_at_least = 1
+deterministic_only = ["answer_request_contains", "tool_calls_at_least"]

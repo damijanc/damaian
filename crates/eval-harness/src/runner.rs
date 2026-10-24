@@ -2,10 +2,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use workspace_engine::{
-    AgentCommandProposal, AgentPatchProposal, CancelToken, ClientError, Config, CurlModelTransport,
-    MockModelAdapter, ModelAdapter, ModelProviderConfig, ModelRequest, OpenAICompatibleAdapter,
-    ProcessRegistry, Result, RoundBudgetDecision, SecretScanner, SessionStore, Task, TaskStatus,
-    ToolCall, TurnProgress, TurnSink, UsageSource, WorkspaceEngine, classify_session, resume,
+    AgentCommandProposal, AgentPatchProposal, CancelToken, ChatTurnOptions, ClientError, Config,
+    CurlModelTransport, MockModelAdapter, ModelAdapter, ModelProviderConfig, ModelRequest,
+    OpenAICompatibleAdapter, ProcessRegistry, Result, RoundBudgetDecision, SecretScanner,
+    SessionStore, Task, TaskStatus, ToolCall, TurnProgress, TurnSink, UsageSource, WorkspaceEngine,
+    classify_session, resume,
 };
 
 use crate::fixture::{self, Materialized};
@@ -36,6 +37,12 @@ pub struct Run {
     /// a live provider does not (and the scenario's script does not describe a
     /// live request). `None` means the run did not continue a turn.
     pub continuation_request: Option<String>,
+    /// The message contents of the first model request made after the turn
+    /// paused on a question, which is the request that carried the scripted
+    /// answer back to the model (spec 50 §9). `None` means no question was
+    /// put up for an answer, and, like `continuation_request`, only the
+    /// deterministic tier can supply it.
+    pub answer_request: Option<String>,
     pub trace: Trace,
 }
 
@@ -108,6 +115,7 @@ pub fn run(scenario: &Scenario) -> Result<Run> {
     // `turn_budget_extended` record is written before the resumed loop makes
     // its next call, so the calls before it are the pre-pause ones.
     run.continuation_request = continuation_request(&run.trace, &adapter.requests);
+    run.answer_request = answer_request(&run.trace, &adapter.requests);
     Ok(run)
 }
 
@@ -122,14 +130,36 @@ fn continuation_request(trace: &Trace, requests: &[ModelRequest]) -> Option<Stri
         .iter()
         .filter(|event| event.event_type == "model_request_prepared")
         .count();
-    requests.get(index).map(|request| {
-        request
-            .messages
-            .iter()
-            .map(|message| message.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-    })
+    requests.get(index).map(flattened_request)
+}
+
+/// The request that followed the first turn paused on a question, flattened to
+/// the message contents it sent. `None` when no question was put up for an
+/// answer.
+///
+/// The pause is located by the turn's own audit record (`question_pending`)
+/// rather than by counting requests, so a question asked after any number of
+/// earlier rounds still resolves to the right one.
+fn answer_request(trace: &Trace, requests: &[ModelRequest]) -> Option<String> {
+    let paused_at = trace.events.iter().position(|event| {
+        event.event_type == "model_response_completed"
+            && event.field("status") == Some("question_pending")
+    })?;
+    let index = trace.events[..paused_at]
+        .iter()
+        .filter(|event| event.event_type == "model_request_prepared")
+        .count();
+    requests.get(index).map(flattened_request)
+}
+
+/// One request's message contents, joined for substring assertions.
+fn flattened_request(request: &ModelRequest) -> String {
+    request
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The live tier: the same scenario files against a real provider, **ignoring
@@ -266,6 +296,7 @@ fn skip_if_blocked(scenario: &Scenario) -> Option<Run> {
         patch_proposal: None,
         apply_error: None,
         continuation_request: None,
+        answer_request: None,
         trace: Trace::default(),
     })
 }
@@ -279,6 +310,19 @@ fn base_config(materialized: &Materialized) -> Config {
         // FSEvents registration per scenario.
         enable_index_watcher: false,
         ..Config::default()
+    }
+}
+
+/// The turn options a run drives with.
+///
+/// A scenario that scripts answers is interactive, so `ask_user` is offered and
+/// the system prompt carries no headless paragraph. Everything else keeps the
+/// defaults, which is headless: the tool is absent and the prompt tells the
+/// model to proceed under a stated assumption (spec 50 `context.md` §4, §9).
+fn turn_options(scenario: &Scenario) -> ChatTurnOptions {
+    ChatTurnOptions {
+        user_present: !scenario.answers.is_empty(),
+        ..ChatTurnOptions::default()
     }
 }
 
@@ -313,12 +357,22 @@ fn drive(
 ) -> Result<Run> {
     let mut on_token = |_token: &str| {};
     let started_at_ms = now_millis();
-    let outcome = engine.chat_orchestrator.ask(
+    let never_cancelled = CancelToken::new();
+    let mut discard_progress = |_event: TurnProgress| {};
+    let mut sink = TurnSink {
+        on_token: &mut on_token,
+        on_progress: &mut discard_progress,
+        cancel: &never_cancelled,
+        steering: None,
+    };
+    let outcome = engine.chat_orchestrator.ask_with_session_with_options(
         &materialized.root,
         &scenario.prompt,
         &[],
+        None,
         adapter,
-        &mut on_token,
+        &mut sink,
+        turn_options(scenario),
     );
 
     // Captured before any resume: the resumed turn does not carry the proposal
@@ -336,7 +390,7 @@ fn drive(
 
     // A scenario that scripts an approval decision resumes the turn with it, so
     // the denied path is exercised end to end rather than stopping at the
-    // proposal. `resume_after_command_decision` takes a `TurnSink`, unlike `ask`.
+    // proposal.
     let mut resumed = None;
     if let Some(approved) = scenario.approval_decision
         && let Some(proposal) = &original_command_proposal
@@ -392,7 +446,52 @@ fn drive(
     }
 
     // The resumed turn is the one that finished, so it supersedes the original.
-    let outcome = resumed.unwrap_or(outcome);
+    let mut outcome = resumed.unwrap_or(outcome);
+
+    // Spec 50 §9: a scenario that scripts answers is interactive, so a turn may
+    // pause on a question. Answer each one in order, through the engine's own
+    // resume, until the turn finishes or asks something the script did not
+    // anticipate.
+    let mut answer_index = 0;
+    loop {
+        let question = outcome
+            .as_ref()
+            .ok()
+            .and_then(|result| result.question_proposal.clone());
+        let Some(question) = question else { break };
+        let Some(answer) = scenario.answers.get(answer_index) else {
+            return Err(ClientError::InvalidInput(format!(
+                "{}: the model asked more questions than the scenario scripts: question {} was \
+                 asked, but only {} answer(s) are scripted",
+                scenario.name,
+                answer_index + 1,
+                scenario.answers.len()
+            )));
+        };
+        answer_index += 1;
+        // By option label when one matches — which is how a user clicking an
+        // option answers — and otherwise as free text, which the engine then
+        // accepts or refuses on the question's own terms.
+        let selected_option = question.options.iter().position(|option| option == answer);
+
+        let cancel = CancelToken::new();
+        let mut on_resume_token = |_token: &str| {};
+        let mut on_progress = |_event: TurnProgress| {};
+        let mut sink = TurnSink {
+            on_token: &mut on_resume_token,
+            on_progress: &mut on_progress,
+            cancel: &cancel,
+            steering: None,
+        };
+        outcome = engine.chat_orchestrator.resume_after_answer(
+            &question.question_id,
+            answer,
+            selected_option,
+            adapter,
+            &mut sink,
+        );
+    }
+
     if let Ok(result) = &outcome
         && let Some(usage) = result.usage
     {
@@ -677,6 +776,7 @@ fn drive(
         // Filled by `run` after the deterministic adapter's requests are
         // available; the live tier has no request record to read.
         continuation_request: None,
+        answer_request: None,
         trace,
     })
 }

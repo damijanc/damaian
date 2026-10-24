@@ -318,6 +318,36 @@ pub fn evaluate(
             );
         }
 
+        // Spec 50 §9: the answer reached the model, read from the request the
+        // mock adapter recorded rather than from the session log that request
+        // was rebuilt from.
+        if let Some(wanted) = &asserts.answer_request_contains {
+            match &run.answer_request {
+                Some(request) => {
+                    let missing: Vec<&String> = wanted
+                        .iter()
+                        .filter(|needle| !request.contains(needle.as_str()))
+                        .collect();
+                    push(
+                        "answer_request_contains",
+                        missing.is_empty(),
+                        format!("{wanted:?}"),
+                        if missing.is_empty() {
+                            "all present".to_string()
+                        } else {
+                            format!("missing from the post-answer request: {missing:?}")
+                        },
+                    );
+                }
+                None => push(
+                    "answer_request_contains",
+                    false,
+                    format!("{wanted:?}"),
+                    "no question was answered, so no request followed one".to_string(),
+                ),
+            }
+        }
+
         if let Some(expected) = asserts.exploration_findings {
             let exploration = run.record.findings_by_purpose.exploration;
             push(
