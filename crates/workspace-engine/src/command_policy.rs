@@ -37,17 +37,45 @@ impl CommandRisk {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalCause {
-    Blocklisted { rule: String },
-    Destructive { pattern: String },
-    ShellControl { constructs: String },
+    Blocklisted {
+        rule: String,
+    },
+    Destructive {
+        pattern: String,
+    },
+    ShellControl {
+        constructs: String,
+    },
     Docker,
-    HighRisk { keyword: String },
-    Network { keyword: String },
-    Unknown { program: String },
-    RestrictedPath { path: String },
-    OutsideRepository { path: String },
-    Setting { key: String, source: Option<String> },
-    ProfileBlocked { access: CommandAccess },
+    HighRisk {
+        keyword: String,
+    },
+    Network {
+        keyword: String,
+    },
+    Unknown {
+        program: String,
+    },
+    RestrictedPath {
+        path: String,
+    },
+    OutsideRepository {
+        path: String,
+    },
+    Setting {
+        key: String,
+        source: Option<String>,
+    },
+    ProfileBlocked {
+        access: CommandAccess,
+    },
+    /// A `before_tool` hook asked for a human before an otherwise automatic
+    /// command (spec 32 `context.md` §4). The hook's own redacted reason is
+    /// carried so the card names why, not merely that a hook was involved.
+    HookRequested {
+        hook: String,
+        reason: String,
+    },
 }
 
 impl ApprovalCause {
@@ -67,6 +95,7 @@ impl ApprovalCause {
             Self::OutsideRepository { .. } => "outside_repository",
             Self::Setting { .. } => "setting",
             Self::ProfileBlocked { .. } => "profile_blocked",
+            Self::HookRequested { .. } => "hook_requested",
         }
     }
 
@@ -107,6 +136,9 @@ impl ApprovalCause {
                 "Blocked: the permission profile allows {} commands only",
                 access.as_str()
             ),
+            Self::HookRequested { hook, reason } => {
+                format!("Asks first: hook `{hook}` requested it: {reason}")
+            }
         }
     }
 }

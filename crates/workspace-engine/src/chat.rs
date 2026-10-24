@@ -7,7 +7,9 @@ use crate::clarification::{
     AskUserInput, OPTION_MAX_CHARS, OPTIONS_MAX, OPTIONS_MIN, PendingQuestionRef,
     QUESTION_MAX_CHARS, validate_answer,
 };
-use crate::command_policy::{CommandClassification, CommandRisk, allow_always_eligible};
+use crate::command_policy::{
+    ApprovalCause, CommandClassification, CommandRisk, allow_always_eligible, is_validation_command,
+};
 use crate::command_purpose::CommandPurpose;
 use crate::command_runner::{CommandExecution, CommandTermination};
 use crate::config::{Config, CostEstimate, McpTransport};
@@ -16,8 +18,8 @@ use crate::edit::{GeneratedEdit, PatchStore, RegionEdit, region_edits_to_changes
 use crate::error::{ClientError, ProviderRefusal, Result};
 use crate::file_access::{FileAccessController, LineRange, ReadWindow};
 use crate::finding::{
-    Finding, Severity, default_parsers, findings_from_execution, findings_from_web_record,
-    resolve_finding_path,
+    Finding, FindingDraft, FindingSource, Severity, default_parsers, findings_from_execution,
+    findings_from_web_record, resolve_finding_path,
 };
 use crate::git_service::{DiffOptions, GitService, GitStatus, WorktreeListing};
 use crate::hash::{create_id, now_millis};
@@ -1119,7 +1121,12 @@ impl ChatOrchestrator {
 
         // Three kinds of paused action resume through here: a browser
         // diagnostic, an MCP tool call, or the original shell-command path.
-        let (assistant_summary, tool_result_content) = if let Some(web_call) =
+        // A resumed call that actually dispatches is followed by `after_tool`;
+        // a decline or a refusal dispatches nothing, so there is no event.
+        let mut after_tool_action: Option<ToolAction> = None;
+        let mut after_tool_outcome: Option<ActionOutcome> = None;
+        let mut after_tool_termination: Option<CommandTermination> = None;
+        let (assistant_summary, mut tool_result_content) = if let Some(web_call) =
             &pending.web_diagnostic_call
         {
             let call = web_call.call.clone();
@@ -1169,8 +1176,15 @@ impl ChatOrchestrator {
             let content = if refused {
                 refusal_message(permission)
             } else if approved {
-                self.run_and_record_web_diagnostic(&repository_root, &call, sink)?
-                    .0
+                let (content, failed) =
+                    self.run_and_record_web_diagnostic(&repository_root, &call, sink)?;
+                after_tool_action = Some(ToolAction::WebDiagnostic(call.clone()));
+                after_tool_outcome = Some(if failed {
+                    ActionOutcome::Failed
+                } else {
+                    ActionOutcome::Ok
+                });
+                content
             } else {
                 format!(
                     "The user declined to run `{}` against `{}`. Do not request the same browser diagnostic again; answer using what you already know, noting the limitation if it matters.",
@@ -1200,7 +1214,7 @@ impl ChatOrchestrator {
                 if !permission.is_allowed() {
                     refusal_message(permission)
                 } else {
-                    match mcp.call_tool(
+                    let (content, outcome) = match mcp.call_tool(
                         &mcp_call.server_id,
                         &mcp_call.tool_name,
                         &mcp_call.arguments_json,
@@ -1208,13 +1222,26 @@ impl ChatOrchestrator {
                         Ok(result) => {
                             let text = self.scanner.redact(&result.text).text;
                             if result.is_error {
-                                format!("MCP tool reported an error:\n{text}")
+                                (
+                                    format!("MCP tool reported an error:\n{text}"),
+                                    ActionOutcome::Failed,
+                                )
                             } else {
-                                text
+                                (text, ActionOutcome::Ok)
                             }
                         }
-                        Err(error) => format!("MCP tool call failed: {error}"),
-                    }
+                        Err(error) => (
+                            format!("MCP tool call failed: {error}"),
+                            ActionOutcome::Failed,
+                        ),
+                    };
+                    after_tool_action = Some(ToolAction::McpCall {
+                        server_id: mcp_call.server_id.clone(),
+                        tool_name: mcp_call.tool_name.clone(),
+                        arguments_json: mcp_call.arguments_json.clone(),
+                    });
+                    after_tool_outcome = Some(outcome);
+                    content
                 }
             } else {
                 format!(
@@ -1293,8 +1320,8 @@ impl ChatOrchestrator {
                 // `CommandExit` either (spec 22 `context.md` §14).
                 self.record_command_findings(
                     &repository_root,
-                    &pending.session.id,
-                    &pending.task.id,
+                    &pending.session,
+                    &pending.task,
                     &record.execution,
                 )?;
                 self.record_command_effects(
@@ -1303,6 +1330,12 @@ impl ChatOrchestrator {
                     &pending.task,
                     &census,
                 );
+                after_tool_action = Some(ToolAction::Command(command_request.clone()));
+                after_tool_outcome = Some(ActionOutcome::CommandExit(
+                    record.execution.exit_code,
+                    record.execution.purpose,
+                ));
+                after_tool_termination = Some(record.execution.termination);
                 sandbox_command_context(&record.execution)
             } else {
                 self.validation_orchestrator
@@ -1314,6 +1347,30 @@ impl ChatOrchestrator {
             };
             (tool_call_summary(&command_request), content)
         };
+
+        if let (Some(action), Some(outcome)) =
+            (after_tool_action.as_ref(), after_tool_outcome.as_ref())
+        {
+            let payload =
+                tool_event_payload(&self.scanner, action, Some(outcome), after_tool_termination);
+            let after = self.dispatch_tool_event(
+                HookEvent::AfterTool,
+                &pending.session,
+                &pending.task,
+                &repository_root,
+                payload,
+            );
+            if let Some(note) = hook_after_note(&after) {
+                tool_result_content.push_str("\n\n");
+                tool_result_content.push_str(&note);
+            }
+            self.record_after_refusal(
+                &pending.session.id,
+                &pending.task.id,
+                HookEvent::AfterTool,
+                &after,
+            );
+        }
 
         self.session_store.append_message(
             &pending.session.id,
@@ -2042,19 +2099,141 @@ impl ChatOrchestrator {
     fn record_command_findings(
         &self,
         repository_root: &Path,
-        session_id: &str,
-        task_id: &str,
+        session: &Session,
+        task: &Task,
         execution: &CommandExecution,
     ) -> Result<Option<crate::plan::Evidence>> {
         let findings = findings_from_execution(execution, &default_parsers(), &self.scanner);
-        self.record_findings(
+        let evidence = self.record_findings(
             repository_root,
             Path::new(&execution.working_directory),
-            session_id,
-            task_id,
+            &session.id,
+            &task.id,
             &execution.id,
             findings,
-        )
+        )?;
+        // `after_check` runs only for validation commands, and only after the
+        // findings it describes are already in the log (`context.md` §3). The
+        // ids are evidence of what this check reported, not a path or content.
+        if is_validation_command(&execution.command) {
+            let finding_ids = match &evidence {
+                Some(crate::plan::Evidence::Findings { refs, .. }) => refs.clone(),
+                _ => Vec::new(),
+            };
+            let payload = serde_json::json!({
+                "command": execution.command,
+                "exitCode": execution.exit_code,
+                "termination": execution.termination.as_str(),
+                "findingIds": finding_ids,
+            });
+            let outcome = self.dispatch_tool_event(
+                HookEvent::AfterCheck,
+                session,
+                task,
+                repository_root,
+                payload,
+            );
+            self.record_after_refusal(&session.id, &task.id, HookEvent::AfterCheck, &outcome);
+        }
+        Ok(evidence)
+    }
+
+    /// Dispatches one per-action event, records its findings, and runs any
+    /// commands it requested (`context.md` §9). Every action dispatch goes
+    /// through here so a hook's findings cannot be recorded at one call site
+    /// and forgotten at another.
+    fn dispatch_tool_event(
+        &self,
+        event: HookEvent,
+        session: &Session,
+        task: &Task,
+        repository_root: &Path,
+        payload: serde_json::Value,
+    ) -> HookOutcome {
+        let parts = self
+            .hooks
+            .envelope_parts(Some(session), Some(&task.id), payload);
+        let mut outcome = self
+            .hooks
+            .dispatch(event, parts, repository_root, &HookContext::root());
+        for finding in &outcome.findings {
+            let _ = self.session_store.record_finding(&session.id, finding);
+        }
+        if !outcome.commands.is_empty() {
+            let mode = self.session_store.session_mode(&session.id);
+            let requested = self.hooks.run_requested_commands(
+                &mut outcome,
+                session,
+                Some(task),
+                mode,
+                repository_root,
+                &HookContext::root(),
+            );
+            for finding in &requested {
+                let _ = self.session_store.record_finding(&session.id, finding);
+            }
+        }
+        outcome
+    }
+
+    /// Records what an `after_*` verdict means (`context.md` §4): a `deny` is
+    /// an error finding and undoes nothing; `request_approval` has no approval
+    /// step left and is recorded as a warning.
+    fn record_after_refusal(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        event: HookEvent,
+        outcome: &HookOutcome,
+    ) {
+        let (severity, label) = match outcome.verdict {
+            Verdict::Deny => (Severity::Error, "refused"),
+            Verdict::RequestApproval => (Severity::Warning, "asked for approval"),
+            Verdict::Allow | Verdict::Warn => return,
+        };
+        for (hook_id, reason) in &outcome.reasons {
+            let draft = FindingDraft {
+                source: FindingSource::Hook,
+                severity,
+                summary: format!(
+                    "Hook `{hook_id}` {label} after {}: {reason}",
+                    event.as_str()
+                ),
+                details: None,
+                range: None,
+                code: None,
+            };
+            let finding = Finding::new(draft, &self.scanner)
+                .with_task_id(task_id.to_string())
+                .with_origin_ref(format!("hook:{hook_id}"));
+            let _ = self.session_store.record_finding(session_id, &finding);
+        }
+    }
+
+    /// A `request_approval` at a tool with its own review step is already
+    /// satisfied (`context.md` §4): the patch is reviewed before it applies.
+    /// It still leaves a warning, so the hook's request is visible.
+    fn record_satisfied_approval(&self, session_id: &str, task_id: &str, outcome: &HookOutcome) {
+        if outcome.verdict != Verdict::RequestApproval {
+            return;
+        }
+        for (hook_id, reason) in &outcome.reasons {
+            let draft = FindingDraft {
+                source: FindingSource::Hook,
+                severity: Severity::Warning,
+                summary: format!(
+                    "Hook `{hook_id}` asked for approval before this tool, and the patch review \
+                     already provides it: {reason}"
+                ),
+                details: None,
+                range: None,
+                code: None,
+            };
+            let finding = Finding::new(draft, &self.scanner)
+                .with_task_id(task_id.to_string())
+                .with_origin_ref(format!("hook:{hook_id}"));
+            let _ = self.session_store.record_finding(session_id, &finding);
+        }
     }
 
     /// A recorded browser diagnostic's findings. The repository is walked
@@ -3199,19 +3378,62 @@ impl ChatOrchestrator {
             // call is never batched: there is nothing to overlap.
             // A stop that arrived before the round starts must not begin a
             // batch of reads; the top-of-loop check finishes the turn.
+            //
+            // `before_tool` runs per call before the batch, not inside it: a
+            // hook is a process, and spawning several in parallel would make
+            // their order — and therefore a deny's short-circuit — depend on
+            // scheduling. A call the mode, profile or a hook refuses is taken
+            // out of the batch; its refusal is recorded by the sequential
+            // loop below, which keeps one result per model call.
+            let mut precomputed_permissions: Vec<Option<Permission>> =
+                vec![None; calls_this_round.len()];
+            let mut precomputed_before: Vec<Option<HookOutcome>> =
+                vec![None; calls_this_round.len()];
             let precomputed = if !sink.cancel.is_cancelled()
                 && calls_this_round.len() > 1
                 && calls_this_round
                     .iter()
                     .all(|(_, action)| action_is_batchable_read_only(action))
             {
-                Some(self.run_read_only_batch(
-                    repository_root,
-                    &session,
-                    &task,
-                    &calls_this_round,
-                    sink.cancel,
-                ))
+                let mut batch_actions: Vec<DecodedCall> = Vec::new();
+                let mut batch_indices: Vec<usize> = Vec::new();
+                for (index, (_, action)) in calls_this_round.iter().enumerate() {
+                    let permission = self.action_permission(mode, repository_root, action, &mcp);
+                    precomputed_permissions[index] = Some(permission);
+                    if !permission.is_allowed() {
+                        continue;
+                    }
+                    let payload = tool_event_payload(&self.scanner, action, None, None);
+                    let outcome = self.dispatch_tool_event(
+                        HookEvent::BeforeTool,
+                        &session,
+                        &task,
+                        repository_root,
+                        payload,
+                    );
+                    let allowed =
+                        before_tool_effect(action, outcome.verdict) == BeforeToolEffect::Proceed;
+                    precomputed_before[index] = Some(outcome);
+                    if allowed {
+                        batch_indices.push(index);
+                        batch_actions.push(calls_this_round[index].clone());
+                    }
+                }
+                let mut results: Vec<Option<(String, String, ActionOutcome)>> =
+                    vec![None; calls_this_round.len()];
+                if !batch_actions.is_empty() {
+                    let computed = self.run_read_only_batch(
+                        repository_root,
+                        &session,
+                        &task,
+                        &batch_actions,
+                        sink.cancel,
+                    );
+                    for (index, result) in batch_indices.into_iter().zip(computed) {
+                        results[index] = Some(result);
+                    }
+                }
+                Some(results)
             } else {
                 None
             };
@@ -3244,7 +3466,9 @@ impl ChatOrchestrator {
                 // refused command leaves no stored proposal and no approval card
                 // behind. One site for every class rather than one per arm, so a
                 // new `ToolAction` variant cannot reach its arm unchecked.
-                let permission = self.action_permission(mode, repository_root, &tool_action, &mcp);
+                let permission = precomputed_permissions[index].unwrap_or_else(|| {
+                    self.action_permission(mode, repository_root, &tool_action, &mcp)
+                });
 
                 // The review gate (§5.5). Checked before the action is bracketed,
                 // let alone dispatched: there is no marker to finish and nothing
@@ -3322,6 +3546,70 @@ impl ChatOrchestrator {
                     break;
                 }
 
+                // Spec 32 `context.md` §3: after the mode/profile check and
+                // the plan-review gate, before the action marker. A refusal
+                // here is a tool result like a mode refusal, but nothing was
+                // dispatched, so it leaves no marker, proposal or card.
+                let before_tool = precomputed_before[index].take().unwrap_or_else(|| {
+                    let payload = tool_event_payload(&self.scanner, &tool_action, None, None);
+                    self.dispatch_tool_event(
+                        HookEvent::BeforeTool,
+                        &session,
+                        &task,
+                        repository_root,
+                        payload,
+                    )
+                });
+                let before_effect = before_tool_effect(&tool_action, before_tool.verdict);
+                if before_effect == BeforeToolEffect::Refuse {
+                    let summary = format!(
+                        "Attempted to call `{}`.",
+                        tool_action_marker(&tool_action).0
+                    );
+                    let tool_result = hook_refusal(&before_tool);
+                    self.session_store.append_message(
+                        &session.id,
+                        Some(&task.id),
+                        "assistant",
+                        &summary,
+                    )?;
+                    self.session_store.append_message(
+                        &session.id,
+                        Some(&task.id),
+                        "tool",
+                        &tool_result,
+                    )?;
+                    if let Some(call) = &matched_tool_call {
+                        match round_message {
+                            Some(index) => messages[index].tool_calls.push(call.clone()),
+                            None => {
+                                round_message = Some(messages.len());
+                                messages.push(ModelMessage::assistant_with_tool_calls(
+                                    redacted.clone(),
+                                    vec![call.clone()],
+                                    round_reasoning.clone(),
+                                ));
+                            }
+                        }
+                        messages.push(ModelMessage::tool(call.id.clone(), tool_result));
+                    } else {
+                        messages.push(
+                            ModelMessage::assistant(redacted.clone())
+                                .with_reasoning_content(model_run.reasoning_content.clone()),
+                        );
+                        messages.push(ModelMessage::user(format!(
+                            "Command result:\n{tool_result}"
+                        )));
+                    }
+                    continue;
+                }
+                if before_effect == BeforeToolEffect::SatisfiedApproval {
+                    self.record_satisfied_approval(&session.id, &task.id, &before_tool);
+                }
+                let force_approval = before_effect == BeforeToolEffect::ForceApproval;
+                let force_approval_cause =
+                    force_approval.then(|| hook_cause(&before_tool)).flatten();
+
                 if matches!(tool_action, ToolAction::WebDiagnostic(_)) {
                     web_debug_mode = true;
                 }
@@ -3370,6 +3658,10 @@ impl ChatOrchestrator {
                 // A sandbox command's findings leave its arm through this local
                 // rather than through `ActionOutcome` (spec 22 `context.md` §14).
                 let mut command_findings: Option<crate::plan::Evidence> = None;
+                let mut command_termination: Option<CommandTermination> = None;
+                // Kept for `after_tool`; the dispatch match below consumes the
+                // action's fields.
+                let after_tool_action = tool_action.clone();
                 // A working directory the policy refuses fails the tool result
                 // before anything is proposed or run (spec 24 Task 7). It is
                 // resolved once here so the dispatch arm proposes in the same
@@ -3395,7 +3687,7 @@ impl ChatOrchestrator {
                     };
                 let writes_this_call = permission.is_allowed()
                     && matches!(action_effect(&tool_action), ActionEffect::WritesRepository);
-                let (assistant_summary, tool_result_text, action_outcome) = if !permission
+                let (assistant_summary, mut tool_result_text, action_outcome) = if !permission
                     .is_allowed()
                 {
                     // A failed tool result rather than an error, so the
@@ -3428,7 +3720,15 @@ impl ChatOrchestrator {
                     match precomputed.as_ref() {
                         // Precomputed by the concurrent batch, indexed by the
                         // model's call order.
-                        Some(results) => results[index].clone(),
+                        Some(results) => match results[index].clone() {
+                            Some(result) => result,
+                            None => self.dispatch_read_only_action(
+                                repository_root,
+                                &session,
+                                &task,
+                                &tool_action,
+                            ),
+                        },
                         None => self.dispatch_read_only_action(
                             repository_root,
                             &session,
@@ -3441,12 +3741,24 @@ impl ChatOrchestrator {
                         ToolAction::Command(command_request) => {
                             let working_directory =
                                 self.command_working_directory(repository_root, &command_request);
-                            let proposal = self.validation_orchestrator.propose_command_at(
-                                repository_root,
-                                &working_directory,
-                                &command_request.command,
-                                &command_request.reason,
-                            )?;
+                            let extra_causes = force_approval_cause
+                                .as_ref()
+                                .map(|(hook, reason)| {
+                                    vec![ApprovalCause::HookRequested {
+                                        hook: hook.clone(),
+                                        reason: reason.clone(),
+                                    }]
+                                })
+                                .unwrap_or_default();
+                            let proposal = self
+                                .validation_orchestrator
+                                .propose_command_at_with_causes(
+                                    repository_root,
+                                    &working_directory,
+                                    &command_request.command,
+                                    &command_request.reason,
+                                    extra_causes,
+                                )?;
 
                             if proposal.requires_approval || proposal.blocked {
                                 let response = command_proposal_response(&proposal);
@@ -3526,8 +3838,8 @@ impl ChatOrchestrator {
                             )?;
                             command_findings = self.record_command_findings(
                                 repository_root,
-                                &session.id,
-                                &task.id,
+                                &session,
+                                &task,
                                 &record.execution,
                             )?;
                             let command_context = sandbox_command_context(&record.execution);
@@ -3536,6 +3848,7 @@ impl ChatOrchestrator {
                             // — `CommandExecution` is never persisted to the session log
                             // — so it is carried out of the arm rather than looked up.
                             let exit_code = record.execution.exit_code;
+                            command_termination = Some(record.execution.termination);
                             (
                                 tool_call_summary(&command_request),
                                 command_context,
@@ -3560,6 +3873,24 @@ impl ChatOrchestrator {
                                     // a crash — finish the marker before breaking.
                                     self.session_store
                                         .finish_action(action_marker, "awaiting_review")?;
+                                    let after = self.dispatch_tool_event(
+                                        HookEvent::AfterTool,
+                                        &session,
+                                        &task,
+                                        repository_root,
+                                        tool_event_payload(
+                                            &self.scanner,
+                                            &after_tool_action,
+                                            Some(&ActionOutcome::Ok),
+                                            None,
+                                        ),
+                                    );
+                                    self.record_after_refusal(
+                                        &session.id,
+                                        &task.id,
+                                        HookEvent::AfterTool,
+                                        &after,
+                                    );
                                     let proposal = agent_patch_proposal(&patch);
                                     let mut proposal_run = model_run;
                                     proposal_run.content = response.clone();
@@ -3745,6 +4076,24 @@ impl ChatOrchestrator {
                                     // a crash — finish the marker before breaking.
                                     self.session_store
                                         .finish_action(action_marker, "awaiting_review")?;
+                                    let after = self.dispatch_tool_event(
+                                        HookEvent::AfterTool,
+                                        &session,
+                                        &task,
+                                        repository_root,
+                                        tool_event_payload(
+                                            &self.scanner,
+                                            &after_tool_action,
+                                            Some(&ActionOutcome::Ok),
+                                            None,
+                                        ),
+                                    );
+                                    self.record_after_refusal(
+                                        &session.id,
+                                        &task.id,
+                                        HookEvent::AfterTool,
+                                        &after,
+                                    );
                                     let proposal = agent_patch_proposal(&patch);
                                     let mut proposal_run = model_run;
                                     proposal_run.content = response.clone();
@@ -3781,10 +4130,13 @@ impl ChatOrchestrator {
                                 self.session_store
                                     .browser_diagnostics_allowed_for_session(&session.id)?
                             };
-                            if !call.is_low_risk() && !session_approved {
+                            if force_approval || (!call.is_low_risk() && !session_approved) {
                                 let proposal_id = create_id("webdiag");
-                                let proposal =
-                                    web_diagnostic_approval_proposal(&proposal_id, &call);
+                                let proposal = web_diagnostic_approval_proposal(
+                                    &proposal_id,
+                                    &call,
+                                    force_approval_cause.as_ref(),
+                                );
                                 let response = proposal.prompt.clone();
                                 self.pending_commands.save(&PendingChatTurn {
                                     proposal_id,
@@ -3888,13 +4240,14 @@ impl ChatOrchestrator {
                             // pause the turn exactly like a command needing approval:
                             // persist state keyed by a fresh proposal id and hand the
                             // user a proposal to accept or decline.
-                            if mcp.requires_approval(&server_id) {
+                            if force_approval || mcp.requires_approval(&server_id) {
                                 let proposal_id = create_id("mcp");
                                 let proposal = mcp_approval_proposal(
                                     &proposal_id,
                                     &server_id,
                                     &tool_name,
                                     &arguments_json,
+                                    force_approval_cause.as_ref(),
                                 );
                                 let response = proposal.prompt.clone();
                                 self.pending_commands.save(&PendingChatTurn {
@@ -4132,6 +4485,30 @@ impl ChatOrchestrator {
                     ActionOutcome::Cancelled => self
                         .session_store
                         .finish_action(action_marker, "cancelled")?,
+                }
+
+                // Spec 32 `context.md` §3: after the action's marker is
+                // finished. A mode/profile refusal dispatched nothing and has
+                // no event; a hook refusal returned before the marker.
+                if permission.is_allowed() {
+                    let payload = tool_event_payload(
+                        &self.scanner,
+                        &after_tool_action,
+                        Some(&action_outcome),
+                        command_termination,
+                    );
+                    let after = self.dispatch_tool_event(
+                        HookEvent::AfterTool,
+                        &session,
+                        &task,
+                        repository_root,
+                        payload,
+                    );
+                    if let Some(note) = hook_after_note(&after) {
+                        tool_result_text.push_str("\n\n");
+                        tool_result_text.push_str(&note);
+                    }
+                    self.record_after_refusal(&session.id, &task.id, HookEvent::AfterTool, &after);
                 }
 
                 // Persist the tool call and its result so later turns in this
@@ -5972,6 +6349,150 @@ fn action_is_batchable_read_only(action: &ToolAction) -> bool {
     matches!(action_effect(action), ActionEffect::ReadOnly)
 }
 
+/// What a `before_tool` verdict does to the call about to be dispatched
+/// (`context.md` §4).
+///
+/// `RequestApproval` is not one thing for every tool: a command, MCP call or
+/// web diagnostic has an approval card to move to, while `propose_patch` and
+/// `edit_file` are already reviewed before they apply. Everything else has no
+/// approval step, including `ask_user` — an answer is not an approval, so a
+/// question is refused rather than turned into one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeforeToolEffect {
+    Proceed,
+    ForceApproval,
+    /// Proceed, and record the request as a warning because the existing
+    /// review step already satisfies it.
+    SatisfiedApproval,
+    Refuse,
+}
+
+fn before_tool_effect(action: &ToolAction, verdict: Verdict) -> BeforeToolEffect {
+    match verdict {
+        Verdict::Allow | Verdict::Warn => BeforeToolEffect::Proceed,
+        Verdict::Deny => BeforeToolEffect::Refuse,
+        Verdict::RequestApproval => match action {
+            ToolAction::Command(_) | ToolAction::McpCall { .. } | ToolAction::WebDiagnostic(_) => {
+                BeforeToolEffect::ForceApproval
+            }
+            ToolAction::ProposePatch(_) | ToolAction::EditFile { .. } => {
+                BeforeToolEffect::SatisfiedApproval
+            }
+            _ => BeforeToolEffect::Refuse,
+        },
+    }
+}
+
+/// The `(hook id, reason)` a denial or approval request is shown with.
+fn hook_cause(outcome: &HookOutcome) -> Option<(String, String)> {
+    let hook_id = outcome.deciding_hook.as_deref()?;
+    let reason = outcome
+        .reasons
+        .iter()
+        .find(|(id, _)| id == hook_id)
+        .map(|(_, reason)| reason.clone())
+        .unwrap_or_default();
+    Some((hook_id.to_string(), reason))
+}
+
+/// What an `after_tool` denial appends to the result the model sees
+/// (`context.md` §4).
+fn hook_after_note(outcome: &HookOutcome) -> Option<String> {
+    if outcome.verdict != Verdict::Deny {
+        return None;
+    }
+    let (hook_id, reason) = hook_cause(outcome)?;
+    Some(if reason.is_empty() {
+        format!("Hook `{hook_id}` refused after the action.")
+    } else {
+        format!("Hook `{hook_id}`: {reason}")
+    })
+}
+
+/// The payload for `before_tool` and `after_tool` (`context.md` §6): names and
+/// paths, never file content. A command's text and a URL are redacted here
+/// because the dispatcher redacts the response, not the envelope it sends.
+fn tool_event_payload(
+    scanner: &SecretScanner,
+    action: &ToolAction,
+    outcome: Option<&ActionOutcome>,
+    termination: Option<CommandTermination>,
+) -> serde_json::Value {
+    let (tool, mut paths) = match action {
+        ToolAction::ReadFile { path, .. } => ("read_file", vec![path.clone()]),
+        ToolAction::ListDirectory { dir, .. } => (
+            "list_directory",
+            vec![dir.clone().unwrap_or_else(|| ".".to_string())],
+        ),
+        ToolAction::SearchContent { path_glob, .. } => {
+            ("search_content", path_glob.clone().into_iter().collect())
+        }
+        ToolAction::SearchCodebase { .. } => ("search_codebase", Vec::new()),
+        ToolAction::ReadGitStatus { .. } => ("read_git_status", Vec::new()),
+        ToolAction::ReadGitDiff { paths, .. } => ("read_git_diff", paths.clone()),
+        ToolAction::ListWorktrees { .. } => ("list_worktrees", Vec::new()),
+        ToolAction::ReadGitLog { .. } => ("read_git_log", Vec::new()),
+        ToolAction::ProposePatch(edit) => (
+            "propose_patch",
+            edit.changes
+                .iter()
+                .map(|change| change.path.clone())
+                .collect(),
+        ),
+        ToolAction::EditFile { edits, .. } => (
+            "edit_file",
+            edits.iter().map(|edit| edit.path.clone()).collect(),
+        ),
+        ToolAction::ProposePlan(_) => ("propose_plan", Vec::new()),
+        ToolAction::CompleteStep => ("complete_step", Vec::new()),
+        ToolAction::AskUser(_) => ("ask_user", Vec::new()),
+        ToolAction::Command(_) => ("run_command", Vec::new()),
+        ToolAction::WebDiagnostic(_) => ("web_diagnostic", Vec::new()),
+        ToolAction::McpCall { .. } => ("mcp_call", Vec::new()),
+    };
+    paths = paths
+        .into_iter()
+        .map(|path| scanner.redact(&path).text)
+        .collect();
+    let mut payload = serde_json::json!({"tool": tool, "paths": paths});
+    match action {
+        ToolAction::Command(request) => {
+            payload["command"] = serde_json::json!(scanner.redact(&request.command).text);
+        }
+        ToolAction::McpCall {
+            server_id,
+            tool_name,
+            ..
+        } => {
+            payload["server"] = serde_json::json!(scanner.redact(server_id).text);
+            payload["toolName"] = serde_json::json!(scanner.redact(tool_name).text);
+        }
+        ToolAction::WebDiagnostic(call) => {
+            payload["url"] = serde_json::json!(scanner.redact(&call.url).text);
+        }
+        _ => {}
+    }
+    if let Some(outcome) = outcome {
+        let outcome_name = match outcome {
+            ActionOutcome::Ok | ActionOutcome::FileRead { .. } => "ok",
+            ActionOutcome::CommandExit(Some(0), _) => "ok",
+            ActionOutcome::CommandExit(_, _) => "failed",
+            ActionOutcome::Failed => "failed",
+            ActionOutcome::Cancelled => "refused",
+        };
+        payload["outcome"] = serde_json::json!(outcome_name);
+        if let ActionOutcome::CommandExit(exit_code, _) = outcome {
+            if let Some(code) = exit_code {
+                payload["exitCode"] = serde_json::json!(code);
+            }
+            if let Some(termination) = termination {
+                payload["termination"] = serde_json::json!(termination.as_str());
+            }
+        }
+    }
+    payload
+}
+
 /// The action marker parameters for a dispatched tool: a stable name, a
 /// reference identifying *which* invocation, and whether a crash mid-flight
 /// could have left a side effect.
@@ -7055,6 +7576,7 @@ fn mcp_approval_proposal(
     server_id: &str,
     tool_name: &str,
     arguments_json: &str,
+    hook_cause: Option<&(String, String)>,
 ) -> AgentCommandProposal {
     let arguments = truncate_for_prompt(arguments_json.trim(), 500);
     let prompt = format!(
@@ -7067,9 +7589,18 @@ fn mcp_approval_proposal(
         risk: "mcp".to_string(),
         requires_approval: true,
         blocked: false,
-        // Not a local command: the command policy produced no cause, and the
-        // card already says what this MCP call is in `prompt`.
-        cause: String::new(),
+        // Not a local command: the command policy produced no cause. When a
+        // `before_tool` hook forced this card, its cause is the honest one to
+        // show; otherwise the card already says what the call is in `prompt`.
+        cause: hook_cause
+            .map(|(hook, reason)| {
+                ApprovalCause::HookRequested {
+                    hook: hook.clone(),
+                    reason: reason.clone(),
+                }
+                .plain_words()
+            })
+            .unwrap_or_default(),
         reason: String::new(),
         // An MCP tool call is not a shell command, so `command_allowlist` has
         // nothing to say about it. Per-server `require_approval` in the MCP
@@ -7082,6 +7613,7 @@ fn mcp_approval_proposal(
 fn web_diagnostic_approval_proposal(
     proposal_id: &str,
     call: &WebDiagnosticCall,
+    hook_cause: Option<&(String, String)>,
 ) -> AgentCommandProposal {
     let arguments = truncate_for_prompt(call.arguments_json.trim(), 500);
     // Spec 12 §5.4: anything outside loopback is high risk, whatever the tool.
@@ -7105,9 +7637,17 @@ fn web_diagnostic_approval_proposal(
         risk: risk.to_string(),
         requires_approval: true,
         blocked: false,
-        // Not a local command: its policy cause does not exist, and `prompt`
-        // already names the target and what the diagnostic may do.
-        cause: String::new(),
+        // Not a local command: its policy cause does not exist. A hook that
+        // forced this card supplies the one cause there is to name.
+        cause: hook_cause
+            .map(|(hook, reason)| {
+                ApprovalCause::HookRequested {
+                    hook: hook.clone(),
+                    reason: reason.clone(),
+                }
+                .plain_words()
+            })
+            .unwrap_or_default(),
         reason: String::new(),
         allow_always: false,
         // The session grant covers loopback only, so a remote URL is never
@@ -9949,5 +10489,74 @@ mod approval_prompt_wording_tests {
                 assert!(!text.contains("sandbox-safe"), "{text}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod before_tool_verdict_tests {
+    use super::*;
+
+    fn command() -> ToolAction {
+        ToolAction::Command(CommandRequest {
+            command: "cargo test".to_string(),
+            reason: "test".to_string(),
+            working_directory: None,
+        })
+    }
+
+    fn ask() -> ToolAction {
+        ToolAction::AskUser(crate::clarification::AskUserInput {
+            question: "Which one?".to_string(),
+            options: vec!["The CLI".to_string(), "The shell".to_string()],
+            allow_free_text: false,
+        })
+    }
+
+    /// Criterion 5: `request_approval` is the only verdict that can add an
+    /// approval gate, and no verdict removes one (spec 32 `context.md` §4).
+    /// The exhaustive list is deliberate: a fifth verdict must decide here.
+    #[test]
+    fn only_request_approval_adds_a_gate_and_none_removes_one() {
+        let verdicts = [
+            Verdict::Allow,
+            Verdict::Warn,
+            Verdict::RequestApproval,
+            Verdict::Deny,
+        ];
+        let mut requires_approval = true;
+        for verdict in verdicts {
+            let effect = before_tool_effect(&command(), verdict);
+            requires_approval = requires_approval || effect == BeforeToolEffect::ForceApproval;
+            assert!(
+                requires_approval,
+                "{verdict:?} removed an approval that was already required"
+            );
+            if verdict == Verdict::RequestApproval {
+                assert_eq!(effect, BeforeToolEffect::ForceApproval);
+            }
+        }
+    }
+
+    /// Spec 50: `ask_user` has no approval step and its answer authorises
+    /// nothing, so a hook asking for approval refuses the question rather than
+    /// turning it into a card.
+    #[test]
+    fn request_approval_on_a_question_is_refused() {
+        assert_eq!(
+            before_tool_effect(&ask(), Verdict::RequestApproval),
+            BeforeToolEffect::Refuse
+        );
+    }
+
+    #[test]
+    fn request_approval_on_a_patch_is_already_satisfied() {
+        let patch = ToolAction::ProposePatch(GeneratedEdit {
+            summary: "Change".to_string(),
+            changes: Vec::new(),
+        });
+        assert_eq!(
+            before_tool_effect(&patch, Verdict::RequestApproval),
+            BeforeToolEffect::SatisfiedApproval
+        );
     }
 }

@@ -159,6 +159,12 @@ A new enum in `command_policy.rs`:
 | `OutsideRepository { path }` | "Asks first: refers to `<path>`, outside the repository" |
 | `Setting { key, source: Option<String> }` | "Asks first: *<rule_label(key)>* is on (set by <source>)", omitting " (set by …)" when the source is unknown |
 | `ProfileBlocked { access }` | "Blocked: the permission profile allows <access> commands only" |
+| `HookRequested { hook, reason }` | "Asks first: hook `<hook>` requested it: `<reason>`" |
+
+`HookRequested` is added by spec 32 Task 8: a `before_tool` hook's
+`request_approval` verdict is a real cause even though it comes from outside
+the classifier, and the card must name the hook and its reason rather than
+show `unknown`. Its audit name is `hook_requested`.
 
 `RestrictedPath` is added for the reason spec 64 already emits
 (`RESTRICTED_PATH_REASON`, whose doc comment names this spec); the spec-64

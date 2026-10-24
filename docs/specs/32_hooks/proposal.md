@@ -1,6 +1,6 @@
 # Feature Spec: Hooks
 
-Status: In progress (started 2026-10-07; Tasks 1–7 of 10 done, the last on 2026-10-24). Split into a folder and planned on 2026-10-07. Design
+Status: In progress (started 2026-10-07; Tasks 1–8 of 10 done, the last on 2026-10-24). Split into a folder and planned on 2026-10-07. Design
 unchanged from the original flat spec. Corrections where it no longer matches
 the code, and the decisions it leaves open, are in [`context.md`](context.md),
 not inlined here, the way specs 20, 22, 24 and 31 kept theirs. The most
@@ -393,9 +393,23 @@ report means.
 
 To be completed during implementation. Record:
 
-- The default timeout per event, and the measured overhead of `before_tool`
-  dispatch with one trivial hook configured. That number decides whether hooks
-  are usable on the critical path or only on `after_*` events.
+- **Default timeouts**, unchanged by Task 8 (`config.rs`
+  `HookEvent::default_timeout_ms`): 2,000 ms for `session_start`,
+  `before_context` and `before_tool`; 5,000 ms for `session_end`; 10,000 ms
+  for `before_patch_apply`, `after_patch_apply`, `after_tool`, `after_check`
+  and `before_task_complete`. `hook.<id>.timeout_ms` may lower or raise them
+  up to the 60,000 ms cap.
+- **`before_tool` overhead**, measured 2026-10-24 with one trivial `/bin/sh`
+  hook that consumes its envelope and returns `allow`, 50 `read_file` calls in
+  one batch, against the same turn with no hooks. Debug: 7.6–11.1 ms extra per
+  call (50-read turn 167–312 ms baseline, 674–736 ms with the hook). Release:
+  11.1–11.3 ms per call steady (81–103 ms baseline, 636–654 ms with the hook;
+  the first run after a release build was 21.0 ms/call). The overhead is
+  dominated by spawning a process, not by Damaian's own code, which is why
+  release does not reduce it. It is usable but not free: a 50-read batch adds
+  about 0.55 s, while a one- or two-call round adds roughly 10–20 ms. No design
+  change follows; a user who needs the critical path shorter should use the
+  per-hook timeout and configure `before_tool` only where the rule needs it.
 - Whether the recursion depth limit was ever reached by a legitimate hook.
 - Which events proved to have no clean attachment point. The table in §2 is
   derived from reading the call sites, not from having wired them, and

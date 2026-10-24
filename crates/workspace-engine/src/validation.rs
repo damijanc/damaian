@@ -250,7 +250,37 @@ impl ValidationOrchestrator {
         command: &str,
         reason: &str,
     ) -> Result<CommandProposal> {
-        self.store_proposal(repository_root, working_directory, command, reason, false)
+        self.store_proposal(
+            repository_root,
+            working_directory,
+            command,
+            reason,
+            false,
+            Vec::new(),
+        )
+    }
+
+    /// [`Self::propose_command_at`] with a cause from outside the classifier:
+    /// a `before_tool` hook that asked for approval (spec 32 `context.md` §4).
+    /// The cause is stored with the proposal and written to the same
+    /// `command_proposal_stored` record the eval harness reads, so a prompt a
+    /// hook forced is attributed to the hook rather than to a missing cause.
+    pub fn propose_command_at_with_causes(
+        &self,
+        repository_root: impl AsRef<Path>,
+        working_directory: impl AsRef<Path>,
+        command: &str,
+        reason: &str,
+        extra_causes: Vec<ApprovalCause>,
+    ) -> Result<CommandProposal> {
+        self.store_proposal(
+            repository_root,
+            working_directory,
+            command,
+            reason,
+            false,
+            extra_causes,
+        )
     }
 
     /// `detected` marks a proposal from [`Self::propose_detected_validations`],
@@ -262,16 +292,27 @@ impl ValidationOrchestrator {
         command: &str,
         reason: &str,
         detected: bool,
+        extra_causes: Vec<ApprovalCause>,
     ) -> Result<CommandProposal> {
         let classification =
             self.classify_command_at(&repository_root, &working_directory, command);
-        let proposal = proposal_from_classification(
+        let mut proposal = proposal_from_classification(
             repository_root.as_ref(),
             working_directory.as_ref(),
             reason,
             classification,
             detected,
         );
+        for cause in extra_causes {
+            if proposal.causes.contains(&cause) {
+                continue;
+            }
+            if !proposal.blocked {
+                proposal.requires_approval = true;
+            }
+            proposal.reasons.push(cause.plain_words());
+            proposal.causes.push(cause);
+        }
         self.command_store.save_proposal(&proposal)?;
         self.audit_log.record(
             "command_proposal_stored",
@@ -328,6 +369,7 @@ impl ValidationOrchestrator {
                     &command.command,
                     &format!("Detected project validation command from {}", command.name),
                     true,
+                    Vec::new(),
                 )?);
             }
         }
