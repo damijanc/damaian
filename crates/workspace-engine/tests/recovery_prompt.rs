@@ -253,6 +253,27 @@ fn the_headline_names_spec_21s_plan_actions() {
     );
 }
 
+/// Spec 50's `ask_user` marker. A crash between starting the question and the
+/// pause leaves the marker behind; the sentence names a question rather than
+/// printing the raw tool name, and it never calls the question an approval.
+#[test]
+fn the_headline_names_an_interrupted_question() {
+    let fixture = fixture("headline-question");
+    task_left_in(
+        &fixture,
+        "choose which crate",
+        TaskStatus::RunningTool,
+        Some(("ask_user", "", false)),
+    );
+
+    let recovered = classify_session(&fixture.store, &fixture.audit, &fixture.session_id).unwrap();
+
+    assert_eq!(
+        headline(&recovered[0]),
+        "A question was interrupted before it finished"
+    );
+}
+
 /// Requirement 2: `Resume` is absent for an unknown outcome, and the absence is
 /// explained. The reason is engine-side because the engine is what decided it.
 #[test]

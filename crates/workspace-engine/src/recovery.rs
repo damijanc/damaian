@@ -18,6 +18,7 @@
 
 use crate::audit::AuditLog;
 use crate::chat::PausedTurns;
+use crate::clarification::PendingDecision;
 use crate::edit::PatchStore;
 use crate::error::{ClientError, Result};
 use crate::model::TokenUsage;
@@ -305,6 +306,23 @@ pub enum ReattachedApproval {
         rounds_used: u32,
         rounds_granted: u32,
     },
+    /// A question the turn paused on (spec 50). Unlike the other kinds its
+    /// state is not a proposal file: the question and its answer are events in
+    /// the session log, so this is read back from `question_state`.
+    ///
+    /// It carries no proposal id. Answering it goes through the question route,
+    /// never a command or patch endpoint, and nothing here can be approved.
+    Question {
+        task_id: String,
+        question_id: String,
+        question: String,
+        options: Vec<String>,
+        allow_free_text: bool,
+        /// The answer and, when it was one of the options, which one. Present
+        /// when the crash landed after the answer was recorded: the resumed
+        /// turn then uses it instead of asking again (requirement 4).
+        answered: Option<(String, Option<usize>)>,
+    },
     /// The link or the proposal file is gone, so the task was failed.
     ///
     /// §5.5: never an approval card reconstructed from partial data. The user
@@ -337,53 +355,95 @@ pub fn reattach_pending_approvals(
             continue;
         }
 
-        let pending = store.pending_approval_for(session_id, &task_id)?;
+        let pending = store.pending_decision_for(session_id, &task_id)?;
         let outcome = match &pending {
             // Written by a version that recorded the status but not the link.
             // There is nothing to reattach and nothing to guess from.
             None => Err("the task records no pending proposal".to_string()),
-            Some(PendingApprovalRef { kind, proposal_id }) if kind == "command" => commands
-                .load_proposal(proposal_id)
-                .map(|proposal| ReattachedApproval::Command {
-                    task_id: task_id.clone(),
-                    proposal,
-                })
-                .map_err(|error| {
-                    format!("command proposal {proposal_id} is unreadable: {error:?}")
-                }),
-            Some(PendingApprovalRef { kind, proposal_id }) if kind == "patch" => patches
-                .load(proposal_id)
-                .map(|patch| ReattachedApproval::Patch {
-                    task_id: task_id.clone(),
-                    patch,
-                })
-                .map_err(|error| format!("patch {proposal_id} is unreadable: {error:?}")),
-            Some(PendingApprovalRef { kind, proposal_id }) if kind == "plan" => {
+            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+                if kind == "command" =>
+            {
+                commands
+                    .load_proposal(proposal_id)
+                    .map(|proposal| ReattachedApproval::Command {
+                        task_id: task_id.clone(),
+                        proposal,
+                    })
+                    .map_err(|error| {
+                        format!("command proposal {proposal_id} is unreadable: {error:?}")
+                    })
+            }
+            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+                if kind == "patch" =>
+            {
+                patches
+                    .load(proposal_id)
+                    .map(|patch| ReattachedApproval::Patch {
+                        task_id: task_id.clone(),
+                        patch,
+                    })
+                    .map_err(|error| format!("patch {proposal_id} is unreadable: {error:?}"))
+            }
+            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+                if kind == "plan" =>
+            {
                 reattach_plan(store, paused, session_id, &task_id, proposal_id)
             }
-            Some(PendingApprovalRef { kind, proposal_id }) if kind == "provider_fallback" => paused
-                .provider_fallback_target(proposal_id)
-                .map(|fallback_provider| ReattachedApproval::ProviderFallback {
-                    task_id: task_id.clone(),
-                    proposal_id: proposal_id.clone(),
-                    fallback_provider,
-                })
-                .ok_or_else(|| {
-                    format!("the paused turn behind fallback offer {proposal_id} is gone")
-                }),
-            Some(PendingApprovalRef { kind, proposal_id }) if kind == "round_budget" => paused
-                .round_budget_pause(proposal_id)
-                .map(|pause| ReattachedApproval::RoundBudget {
-                    task_id: task_id.clone(),
-                    proposal_id: proposal_id.clone(),
-                    rounds_used: pause.rounds_used,
-                    rounds_granted: pause.rounds_granted,
-                })
-                .ok_or_else(|| {
-                    format!("the paused turn behind round-budget pause {proposal_id} is gone")
-                }),
-            Some(PendingApprovalRef { kind, .. }) => {
+            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+                if kind == "provider_fallback" =>
+            {
+                paused
+                    .provider_fallback_target(proposal_id)
+                    .map(|fallback_provider| ReattachedApproval::ProviderFallback {
+                        task_id: task_id.clone(),
+                        proposal_id: proposal_id.clone(),
+                        fallback_provider,
+                    })
+                    .ok_or_else(|| {
+                        format!("the paused turn behind fallback offer {proposal_id} is gone")
+                    })
+            }
+            Some(PendingDecision::Approval(PendingApprovalRef { kind, proposal_id }))
+                if kind == "round_budget" =>
+            {
+                paused
+                    .round_budget_pause(proposal_id)
+                    .map(|pause| ReattachedApproval::RoundBudget {
+                        task_id: task_id.clone(),
+                        proposal_id: proposal_id.clone(),
+                        rounds_used: pause.rounds_used,
+                        rounds_granted: pause.rounds_granted,
+                    })
+                    .ok_or_else(|| {
+                        format!("the paused turn behind round-budget pause {proposal_id} is gone")
+                    })
+            }
+            Some(PendingDecision::Approval(PendingApprovalRef { kind, .. })) => {
                 Err(format!("unknown pending approval kind {kind}"))
+            }
+            // The question and its answer live in the log, not in a paused-turn
+            // file: a question link with no `question_asked` event has nothing
+            // to show and nothing to answer, so it is failed like any other
+            // unrecoverable link (§5.5).
+            Some(PendingDecision::Question(question)) => {
+                match store.question_state(session_id, question.question_id()) {
+                    Ok(Some(state)) => Ok(ReattachedApproval::Question {
+                        task_id: task_id.clone(),
+                        question_id: state.question_id,
+                        question: state.question,
+                        options: state.options,
+                        allow_free_text: state.allow_free_text,
+                        answered: state.answer,
+                    }),
+                    Ok(None) => Err(format!(
+                        "question {} has no recorded state",
+                        question.question_id()
+                    )),
+                    Err(error) => Err(format!(
+                        "question {} is unreadable: {error:?}",
+                        question.question_id()
+                    )),
+                }
             }
         };
 
@@ -508,6 +568,10 @@ fn action_subject(action: &str) -> &str {
         // not as a resting place for actions this version knows about.
         "propose_plan" => "Drawing up a plan",
         "complete_step" => "Finishing a plan step",
+        // Spec 50. A crash between starting the question and the pause leaves
+        // this marker; the sentence names a question rather than the raw tool
+        // name, and never calls it an approval.
+        "ask_user" => "A question",
         "run_command" => "A command",
         "model_call" => "A model request",
         "mcp_call" => "An MCP tool call",
@@ -538,6 +602,15 @@ fn state_phrase(previous_status: &str) -> &str {
         Some(_) | None => "working, and nothing recorded on what",
     }
 }
+
+/// The sentence naming a task that stopped to ask the user a question (spec 50
+/// §5.2). It is engine-owned for the same reason [`headline`] is: prose mapped
+/// from a kind in a webview could not be asserted against a session log.
+///
+/// It cannot come from [`state_phrase`]: a waiting task is
+/// `WaitingForApproval`, which classification skips (§5.4 rule 3), and the
+/// status carries no question link. The reattached question carries it instead.
+pub const QUESTION_WAITING_HEADLINE: &str = "A question was waiting for your answer";
 
 /// Why `Resume` is not offered, or `None` when it is.
 ///

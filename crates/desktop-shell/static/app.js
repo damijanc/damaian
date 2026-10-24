@@ -4763,6 +4763,17 @@ function createReattachedApprovalCard(approval) {
     return wrapper;
   }
 
+  // Spec 50 Task 6 replaces this with the answerable question card. Until then
+  // it is shown, not answered: the fall-through below is the patch preview, and
+  // a question must never reach a command or patch endpoint.
+  if (approval.kind === "question") {
+    const payload = approval.payload || {};
+    headline.textContent = payload.headline || "A question was waiting for your answer";
+    note.textContent = payload.question || "";
+    wrapper.append(eyebrow, headline, note);
+    return wrapper;
+  }
+
   const headlines = {
     command: "A command was waiting for your approval when Damaian stopped",
     patch: "A patch was waiting for your review when Damaian stopped",

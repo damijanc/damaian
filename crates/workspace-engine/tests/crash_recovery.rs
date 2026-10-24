@@ -10,8 +10,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use workspace_engine::{
-    AuditLog, ProcessIdentity, ProcessKind, ProcessRegistry, SecretScanner, SessionStore, Task,
-    TaskStatus, WorkerRecord, classify_session,
+    AskUserInput, AuditLog, PendingQuestionRef, ProcessIdentity, ProcessKind, ProcessRegistry,
+    ReattachedApproval, SecretScanner, SessionStore, Task, TaskStatus, WorkerRecord,
+    classify_session,
 };
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -261,6 +262,47 @@ fn reattach(fixture: &Fixture) -> Vec<workspace_engine::ReattachedApproval> {
         &fixture.session_id,
     )
     .unwrap()
+}
+
+/// A task left waiting on a question, as `chat.rs` leaves it: the question and
+/// its options are in the log, and the status event carries the question link.
+/// When `answer` is set the answer event is written too, which is the state a
+/// crash between recording the answer and resuming the turn leaves behind.
+fn task_awaiting_answer(
+    fixture: &Fixture,
+    answer: Option<(&str, usize)>,
+) -> (Task, PendingQuestionRef) {
+    let task = fixture
+        .store
+        .create_task(&fixture.session_id, "ask before choosing", "mock", "m")
+        .unwrap();
+    let question = PendingQuestionRef::new();
+    fixture
+        .store
+        .record_question_asked(
+            &fixture.session_id,
+            &task.id,
+            &question,
+            &AskUserInput {
+                question: "Did you mean the CLI or the shell?".to_string(),
+                options: vec!["The CLI".to_string(), "The shell".to_string()],
+                allow_free_text: false,
+            },
+        )
+        .unwrap();
+    if let Some((answer, selected_option)) = answer {
+        fixture
+            .store
+            .record_question_answered(
+                &fixture.session_id,
+                question.question_id(),
+                answer,
+                Some(selected_option),
+            )
+            .unwrap();
+    }
+    fixture.store.await_answer(&task, &question).unwrap();
+    (task, question)
 }
 
 /// §5.4 rule 2, first half.
@@ -1059,6 +1101,156 @@ fn a_legacy_task_awaiting_approval_is_failed_because_no_link_was_recorded() {
         }
         other => panic!("expected Unavailable, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Questions (spec 50 Task 5)
+//
+// A task waiting on a question is `WaitingForApproval`, so it is not a crash —
+// but recovery is what puts the question card back. A question is not an
+// approval, and an answered one is never asked again.
+// ---------------------------------------------------------------------------
+
+/// Requirement 4's first half: a crash while the question is open reattaches the
+/// question with the text and options it was asked with, and no answer.
+#[test]
+fn a_question_open_at_a_crash_is_reattached_unanswered() {
+    let fixture = fixture("question-open");
+    let (task, question) = task_awaiting_answer(&fixture, None);
+
+    let reattached = reattach(&fixture);
+
+    match &reattached[0] {
+        ReattachedApproval::Question {
+            task_id,
+            question_id,
+            question: text,
+            options,
+            allow_free_text,
+            answered,
+        } => {
+            assert_eq!(task_id, &task.id);
+            assert_eq!(question_id, question.question_id());
+            assert_eq!(text, "Did you mean the CLI or the shell?");
+            assert_eq!(
+                options,
+                &vec!["The CLI".to_string(), "The shell".to_string()]
+            );
+            assert!(!allow_free_text);
+            assert_eq!(answered, &None, "nothing has answered it yet");
+        }
+        other => panic!("an open question should be reattached, got {other:?}"),
+    }
+    // Still the user's to answer. Failing it was the bug Task 5 exists to fix.
+    assert_eq!(
+        status_of(&fixture, &task.id).as_deref(),
+        Some("waiting_for_approval")
+    );
+    // The reattached record carries no proposal id, so no route that needs one
+    // can be reached from it.
+    assert!(
+        !audit_log_text(&fixture).contains("pending_approval_unavailable"),
+        "an open question is recoverable"
+    );
+}
+
+/// Requirement 4's second half: an answer recorded before the crash is carried
+/// on the reattached record, and the store refuses a second, so the resumed turn
+/// cannot replace it or ask again. Resuming with the recorded answer is asserted
+/// by `clarification.rs::an_answered_question_resumes_with_the_recorded_answer_and_is_not_asked_again`,
+/// which models this same crash window.
+#[test]
+fn a_question_answered_before_a_crash_is_not_asked_again() {
+    let fixture = fixture("question-answered");
+    let (task, question) = task_awaiting_answer(&fixture, Some(("The CLI", 0)));
+
+    let reattached = reattach(&fixture);
+
+    match &reattached[0] {
+        ReattachedApproval::Question {
+            task_id,
+            question_id,
+            answered,
+            ..
+        } => {
+            assert_eq!(task_id, &task.id);
+            assert_eq!(question_id, question.question_id());
+            assert_eq!(
+                answered,
+                &Some(("The CLI".to_string(), Some(0))),
+                "the record carries the answer the crash left behind"
+            );
+        }
+        other => panic!("an answered question should still be reattached, got {other:?}"),
+    }
+    assert_eq!(
+        fixture
+            .store
+            .question_state(&fixture.session_id, question.question_id())
+            .unwrap()
+            .and_then(|state| state.answer),
+        Some(("The CLI".to_string(), Some(0)))
+    );
+    // A second answer is refused at the store, which is what "never re-asks"
+    // rests on when a stale card is presented again.
+    let error = fixture
+        .store
+        .record_question_answered(
+            &fixture.session_id,
+            question.question_id(),
+            "The shell",
+            Some(1),
+        )
+        .expect_err("an answered question cannot be answered again");
+    assert!(format!("{error:?}").contains("already answered"));
+    assert_eq!(
+        status_of(&fixture, &task.id).as_deref(),
+        Some("waiting_for_approval")
+    );
+}
+
+/// §5.5's rule: never a card rebuilt from partial data. A question link whose
+/// question is not in the log has nothing to show and nothing to answer, so the
+/// task is failed with the reason said out loud.
+#[test]
+fn a_question_with_no_recorded_state_fails_the_task_with_a_reason() {
+    let fixture = fixture("question-orphan");
+    let task = fixture
+        .store
+        .create_task(&fixture.session_id, "ask before choosing", "mock", "m")
+        .unwrap();
+    let log = fixture
+        .data_dir
+        .join("sessions")
+        .join(format!("{}.jsonl", fixture.session_id));
+    let mut content = fs::read_to_string(&log).unwrap();
+    content.push_str(&format!(
+        "{{\"eventId\":\"evt_question_orphan\",\"seq\":9999,\"timestampMs\":1,\
+          \"eventType\":\"task_status_updated\",\"payload\":{{\"task\":{{\"id\":\"{}\",\
+          \"sessionId\":\"{}\",\"status\":\"waiting_for_approval\"}},\
+          \"pendingQuestion\":{{\"questionId\":\"question_missing\"}}}}}}\n",
+        task.id, fixture.session_id
+    ));
+    fs::write(&log, content).unwrap();
+
+    let reattached = reattach(&fixture);
+
+    match &reattached[0] {
+        ReattachedApproval::Unavailable { task_id, reason } => {
+            assert_eq!(task_id, &task.id);
+            assert!(
+                reason.contains("question_missing") && reason.contains("no recorded state"),
+                "the reason must name the missing question, got: {reason}"
+            );
+        }
+        other => panic!("a question with no state must not be reattached, got {other:?}"),
+    }
+    assert_eq!(
+        status_of(&fixture, &task.id).as_deref(),
+        Some("failed"),
+        "the task must be failed, not left waiting on something that is gone"
+    );
+    assert!(audit_log_text(&fixture).contains("pending_approval_unavailable"));
 }
 
 // ---------------------------------------------------------------------------
