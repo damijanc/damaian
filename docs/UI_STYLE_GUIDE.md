@@ -365,6 +365,26 @@ the UI, because the user is granting consent rather than navigating.
 - **Nothing is pre-selected toward approval.** Focus does not land on the
   primary action.
 
+### Question surface
+
+Spec 50 lets the model ask one bounded question mid-turn. That surface is
+deliberately **not** an approval surface: answering a question authorises
+nothing, and a user who learns to click through questions must not have learned
+to click through approvals. It lives in `.question-card`.
+
+- **It borrows nothing from `.command-approval`** — no header, no risk badge,
+  no footer, no disclosure. The dashed border marks a prompt, not consent.
+- **Every option is a secondary `.btn-sm`, and there is no `.btn-primary`.**
+  No answer is the safe one, so no answer is emphasised. That is §4's "a surface
+  with no safe action has no primary" applied to content as well as outcome.
+- **Nothing is focused or pre-selected.** The card is answerable, not answered
+  by default; the free-text field takes focus only when the user acts on it.
+- **Answered, it shows the answer and disables itself.** The answer is also a
+  user-side transcript message, so a reloaded session reads the exchange as
+  what it was: a question the assistant asked and an answer the user gave.
+- **The question and options are model-authored text**, so they are set with
+  `textContent`: no markdown, no links, no HTML.
+
 ---
 
 ## 6. Density

@@ -4075,7 +4075,14 @@ function appendChatMessage(role, content) {
   // the role visually, and a printed label cost 22px on every message.
   const label = document.createElement("div");
   label.className = "visually-hidden";
-  label.textContent = role === "assistant" ? "Assistant" : role === "user" ? "You" : "System";
+  label.textContent =
+    role === "assistant"
+      ? "Assistant"
+      : role === "user" || role === "answer"
+        ? "You"
+        : role === "question"
+          ? "Assistant question"
+          : "System";
 
   const body = document.createElement("div");
   body.className = "message-body";
@@ -4388,7 +4395,35 @@ function renderMessages(messages, tasks = []) {
   const usageByTask = new Map(
     tasks.filter((task) => typeof task.inputTokens === "number").map((task) => [task.id, task]),
   );
-  return messages.map((message) => {
+  return messages.map((message, index) => {
+    if (message.role === "question") {
+      // The answer event immediately follows its question in the log, so the
+      // next message is what settles this card. Options ride on the question
+      // message from `/api/session`; without them a reload could show the text
+      // but could not answer it.
+      const next = messages[index + 1];
+      const answered =
+        next && next.role === "answer" && next.taskId === message.taskId ? next.content : null;
+      const article = document.createElement("article");
+      article.className = "message question";
+      if (message.seq) article.dataset.seq = message.seq;
+      const label = document.createElement("div");
+      label.className = "visually-hidden";
+      label.textContent = "Assistant question";
+      const card = createQuestionCard(
+        {
+          questionId: message.id,
+          question: message.content,
+          options: message.options || [],
+          allowFreeText: message.allowFreeText === true,
+        },
+        repo(),
+        { answered },
+      );
+      article.append(label, card);
+      $("chat-log").append(article);
+      return { message, bubble: { message: article, body: card } };
+    }
     const bubble = appendChatMessage(message.role, message.content);
     if (message.seq) bubble.message.dataset.seq = message.seq;
     if (message.role === "user") {
@@ -4763,14 +4798,27 @@ function createReattachedApprovalCard(approval) {
     return wrapper;
   }
 
-  // Spec 50 Task 6 replaces this with the answerable question card. Until then
-  // it is shown, not answered: the fall-through below is the patch preview, and
-  // a question must never reach a command or patch endpoint.
+  // A question reattached after a crash is answered by the same card a live or
+  // reloaded question uses. It carries no proposal id, so nothing here can
+  // reach a command or patch endpoint; answering resumes the paused turn
+  // through `/api/answer-question-stream`.
   if (approval.kind === "question") {
     const payload = approval.payload || {};
     headline.textContent = payload.headline || "A question was waiting for your answer";
-    note.textContent = payload.question || "";
+    note.textContent = "Answering continues the turn that asked it. It authorises nothing.";
     wrapper.append(eyebrow, headline, note);
+    wrapper.append(
+      createQuestionCard(
+        {
+          questionId: payload.questionId,
+          question: payload.question,
+          options: payload.options,
+          allowFreeText: payload.allowFreeText,
+        },
+        repo(),
+        { answered: payload.answered ? (payload.answer?.answer ?? "") : null },
+      ),
+    );
     return wrapper;
   }
 
@@ -8409,6 +8457,187 @@ async function appendGitStatusAfterChange(repoPath) {
   appendChatMessage("system", renderGitStatusText(payload));
 }
 
+// Spec 50's question card. It deliberately shares no class with
+// `.command-approval`: no header, no risk badge, no footer and no primary
+// action. Every option is `.btn-sm` at the same weight because no answer is
+// the safe one, and nothing is focused or pre-selected.
+//
+// `answered` is the recorded answer when the card is rebuilt from the
+// transcript or a recovered turn; `null` means it is still open.
+function createQuestionCard(question, questionRepo, { answered = null } = {}) {
+  const wrapper = document.createElement("section");
+  wrapper.className = "question-card";
+  wrapper.dataset.questionId = question.questionId || "";
+  wrapper.dataset.answered = answered === null ? "false" : "true";
+
+  const eyebrow = document.createElement("p");
+  eyebrow.className = "question-card-eyebrow";
+  eyebrow.textContent = "Question";
+
+  const text = document.createElement("p");
+  text.className = "question-card-question";
+  text.textContent = question.question || "";
+
+  const options = document.createElement("div");
+  options.className = "question-card-options";
+
+  const answer = document.createElement("p");
+  answer.className = "question-card-answer";
+  answer.hidden = answered === null;
+  answer.textContent = answered === null ? "" : `You answered: ${answered}`;
+
+  const status = document.createElement("p");
+  status.className = "question-card-status";
+  status.hidden = true;
+
+  const controls = [];
+  const setDisabled = (disabled) => {
+    controls.forEach((control) => {
+      control.disabled = disabled;
+    });
+  };
+  const settle = (value) => {
+    wrapper.dataset.answered = "true";
+    answer.hidden = false;
+    answer.textContent = `You answered: ${value}`;
+    status.hidden = true;
+    status.textContent = "";
+    setDisabled(true);
+  };
+
+  wrapper.append(eyebrow, text);
+
+  if (Array.isArray(question.options)) {
+    question.options.forEach((label, index) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "btn-sm";
+      button.textContent = label;
+      button.addEventListener("click", () => void submit(label, index));
+      controls.push(button);
+      options.append(button);
+    });
+  }
+  wrapper.append(options);
+
+  if (question.allowFreeText) {
+    const row = document.createElement("div");
+    row.className = "question-card-free-text";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = "Type an answer…";
+    input.setAttribute("aria-label", "Your answer");
+    const send = document.createElement("button");
+    send.type = "button";
+    send.className = "btn-sm";
+    send.textContent = "Send";
+    send.addEventListener("click", () => {
+      const value = input.value.trim();
+      if (!value) {
+        input.focus();
+        return;
+      }
+      void submit(value, null);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        send.click();
+      }
+    });
+    controls.push(input, send);
+    row.append(input, send);
+    wrapper.append(row);
+  }
+
+  wrapper.append(answer, status);
+  if (answered !== null) setDisabled(true);
+
+  async function submit(value, selectedOption) {
+    if (chatSubmitting) {
+      toast("A turn is already running");
+      return;
+    }
+    setDisabled(true);
+    status.hidden = false;
+    status.textContent = "Answering…";
+    // The engine records the answer before it resumes, so show it the way a
+    // reload will: as a user-side reply after the question.
+    appendChatMessage("answer", value);
+    const assistantMessage = appendChatMessage("assistant", "");
+    const indicator = startTurnIndicator(assistantMessage);
+    let assistantText = "";
+    let streamError = null;
+    chatSubmitting = true;
+    setComposerBusy(true);
+    try {
+      await streamResumeAnswerRequest(
+        {
+          repo: questionRepo,
+          question_id: question.questionId,
+          answer: value,
+          selected_option: selectedOption === null ? "" : String(selectedOption),
+        },
+        {
+          phase(payload) {
+            indicator.phase(payload);
+          },
+          plan(planPayload) {
+            renderPlanPanel(assistantMessage, planPayload);
+          },
+          webDiagnostic(record) {
+            sessionHasRecordedDiagnostics = true;
+            renderWebDiagnosticCard(assistantMessage, record);
+          },
+          token(token) {
+            assistantText += token;
+            updateChatMessage(assistantMessage, assistantText);
+            indicator.streaming();
+          },
+          done(payload) {
+            if (payload.response && payload.response !== assistantText) {
+              assistantText = payload.response;
+              updateChatMessage(assistantMessage, assistantText);
+            }
+            appendProposals(assistantMessage, payload, questionRepo);
+            if (payload.sessionId) {
+              currentSessionId = payload.sessionId;
+              localStorage.setItem(lastSessionStorageKey(), currentSessionId);
+            }
+            appendContextDisclosure(assistantMessage.body, payload.contextFiles || []);
+            markMessageUsage(assistantMessage, payload.usage);
+            indicator.finish(chatCompletionState(payload));
+            markMessageTurnStop(assistantMessage, payload);
+          },
+          error(payload) {
+            streamError = new Error(payload.error || "Answer failed");
+          },
+        },
+      );
+    } catch (error) {
+      streamError = error;
+    } finally {
+      indicator.finish("failed");
+      chatSubmitting = false;
+      setComposerBusy(false);
+    }
+    if (streamError) {
+      // The card stays open: the engine puts the pause back on a refusal, so a
+      // second attempt is still the same question rather than a new one.
+      renderChatMessageError(assistantMessage, streamError);
+      status.textContent = streamError.message;
+      setDisabled(false);
+      return;
+    }
+    settle(value);
+    await loadSessions(currentSessionId, false);
+    await refreshFindings();
+    void refreshRepoBar();
+  }
+
+  return wrapper;
+}
+
 // Appends whatever proposals a finished chat turn carries. Shared by every
 // `done` handler: a turn can end with a command awaiting approval, a patch
 // awaiting review, or neither, and each handler must treat all of them the
@@ -8431,6 +8660,9 @@ function appendProposals(message, payload, repo) {
   }
   if (payload.roundBudgetProposal) {
     message.body.append(createRoundBudgetOffer(payload.roundBudgetProposal, repo));
+  }
+  if (payload.questionProposal) {
+    message.body.append(createQuestionCard(payload.questionProposal, repo));
   }
 }
 
@@ -9735,6 +9967,12 @@ async function streamResumeCommandRequest(data, handlers) {
 // rather than posting the decision somewhere that would not carry it.
 async function streamResumePlanRequest(data, handlers) {
   return streamRequest("/api/resume-plan-stream", null, data, handlers);
+}
+
+// Like a plan decision, answering a question *is* a turn, so there is no
+// one-shot endpoint to fall back to.
+async function streamResumeAnswerRequest(data, handlers) {
+  return streamRequest("/api/answer-question-stream", null, data, handlers);
 }
 
 // Like a plan decision, answering a fallback offer *is* a turn, so there is no

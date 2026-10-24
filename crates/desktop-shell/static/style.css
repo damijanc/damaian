@@ -882,13 +882,15 @@ button:disabled {
   width: min(880px, 100%);
 }
 
-.message.user {
+.message.user,
+.message.answer {
   align-self: flex-end;
   max-width: min(760px, 88%);
 }
 
 .message.assistant,
-.message.system {
+.message.system,
+.message.question {
   align-self: flex-start;
 }
 
@@ -900,6 +902,11 @@ button:disabled {
 }
 
 .message.user .message-body {
+  border-color: #cbd8d3;
+  background: var(--accent-soft);
+}
+
+.message.answer .message-body {
   border-color: #cbd8d3;
   background: var(--accent-soft);
 }
@@ -3055,6 +3062,79 @@ code.command-approval-command {
   flex-wrap: wrap;
   gap: 6px;
   justify-content: flex-start;
+}
+
+/* Spec 50 §5.5: a question is not an approval. This card shares no selector
+   with `.command-approval` on purpose — no header, no risk badge, no footer —
+   and every option carries the same secondary weight, because no answer is the
+   safe one and a primary would tell the user there is. The dashed border is a
+   prompt, not a consent surface. */
+.question-card {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 12px 14px;
+}
+
+.question-card-eyebrow {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.question-card-question {
+  margin: 0;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.question-card-options {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.question-card-free-text {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Sized like a `.btn-sm`, so the field and its Send sit on one control row. */
+.question-card-free-text input {
+  flex: 1 1 auto;
+  font-size: 12px;
+  padding: 5px 10px;
+}
+
+.question-card-answer {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.question-card-status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+/* A settled card is a record, not a control: it stays readable and stops
+   looking clickable without borrowing the approval card's muted outcome. */
+.question-card[data-answered="true"] {
+  background: var(--surface);
 }
 
 /* The crash recovery prompt (docs/specs/45_crash_recovery_prompt.md). It sits
