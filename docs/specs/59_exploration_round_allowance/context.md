@@ -113,3 +113,60 @@ specs, not here:
   enough that tools were gone is unexamined.
   [#61](../61_continue_the_stopped_turn/proposal.md) moves the pause before that call,
   so it is made only when the user asks for an answer.
+
+## 6. Measured: rounds used by real delegated tasks (2026-10-24)
+
+§5.4 of the proposal chose 24 without a measurement of real turns. This is the
+first one. It comes from another agent, not from Damaian: eleven opencode
+sessions on 2026-10-18, each a single task prompt delegated from Claude Code to
+`deepseek-v4-pro` against this repository (spec planning and spec tasks), each
+run to completion with no round limit. The counts were read from opencode's
+local database (`~/.local/share/opencode/opencode.db`): a round is a
+`step-start` part followed by at least one `tool` part, the same thing
+Damaian counts as a round.
+
+| Task | Rounds | Calls | Read tools | Read-only shell | Edit | Build/test | Other shell | Exploration† | Action† |
+|---|---|---|---|---|---|---|---|---|---|
+| Spec 59 planning | 16 | 39 | 8 | 8 | 0 | 0 | 0 | 16 | 0 |
+| Spec 59 planning (retry) | 31 | 62 | 24 | 1 | 5 | 1 | 0 | 25 | 6 |
+| Spec 62 planning | 49 | 70 | 26 | 10 | 10 | 1 | 2 | 36 | 13 |
+| Spec 61 planning | 50 | 74 | 24 | 13 | 11 | 1 | 1 | 37 | 13 |
+| Spec 61 Task 3 | 64 | 70 | 24 | 13 | 15 | 10 | 2 | 37 | 27 |
+| Spec 64 requirement 5 | 69 | 74 | 20 | 8 | 31 | 10 | 0 | 28 | 41 |
+| Spec 63 Task 4 | 70 | 77 | 29 | 8 | 21 | 12 | 0 | 37 | 33 |
+| Spec 60 Task 4 (two prompts) | 89 | 95 | 26 | 9 | 36 | 13 | 5 | 35 | 54 |
+| Spec 61 Task 2 | 99 | 103 | 41 | 22 | 24 | 12 | 0 | 63 | 36 |
+| Spec 60 Task 5 | 103 | 119 | 37 | 15 | 28 | 17 | 6 | 52 | 51 |
+| Spec 61 Task 1 | 150 | 176 | 50 | 22 | 49 | 25 | 4 | 72 | 78 |
+
+† Exploration is read-tool rounds plus rounds whose shell commands only read
+(`git status`/`log`/`diff`/`show`, `grep`, `ls`, `cat`, `sed -n`, …). Damaian
+serves most of those with read tools, but §4 of the proposal does not count a
+read-only *command* as exploration, so this column is an upper bound for
+Damaian. Action is everything else: any round with an edit, a build or test
+command, or another command.
+
+What it shows:
+
+- **Planning tasks fit the design as specified.** 0–13 action rounds and 16–37
+  exploration rounds: at most one or two *Continue* pauses with today's
+  defaults, and the allowance of 24 covers about half of them.
+- **Implementation tasks do not.** Action rounds were 27–78 (median 41), so
+  with `agent_max_tool_rounds = 8` a typical task pauses five times. Against
+  `ABSOLUTE_TURN_ROUND_CAP` (64): with the allowance at its default of 24, four
+  of the seven would hit the cap before finishing; at the ceiling of 32, three;
+  and Spec 61 Task 1 would hit it even if every read were free.
+  Exploration rounds were 28–72 (median 37), above the default of 24 and, for
+  three of seven, above the ceiling of 32.
+- **Batching does not close the gap.** Implementation tasks averaged 1.04–1.17
+  calls per round, so the model, not the loop, decides that a round holds one
+  call. Planning tasks batched more (1.4–2.4).
+- **Build/test rounds dominate action rounds less than expected:** 10–25 per
+  task, with Spec 61 Task 1's 20 `cargo nextest` runs the outlier. Edits are the
+  larger share (15–49).
+
+Limits on what this proves: opencode's prompts, tools and read windows differ
+from Damaian's (its `read` returns up to 2,000 lines where Damaian's stops at
+400, which would raise Damaian's count); the tasks were sized for an
+unattended agent; and every command ran without an approval stop. It is
+evidence of scale, not a target.

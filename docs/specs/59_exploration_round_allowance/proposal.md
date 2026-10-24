@@ -280,9 +280,12 @@ one uncaught repeat after a resume.
 
 - **Default: 24.** Three times the action budget, so a discovery turn can read
   roughly what the motivating session needed several times over. The number is
-  a starting point and §6's long-task scenario is what checks it. The
-  measurement that would settle it — rounds used by real discovery turns — does
-  not exist yet ([`context.md`](context.md) §3).
+  a starting point and §6's long-task scenario is what checks it. The first
+  measurement of real turns, eleven delegated opencode tasks on this repository
+  ([`context.md`](context.md) §6, 2026-10-24), supports it for planning and
+  discovery (16–37 read rounds) but not for implementation tasks, which read
+  for 28–72 rounds and acted for 27–78. Whether to raise the defaults and caps
+  is undecided and outside this spec (§4).
 - **Ceiling: `ABSOLUTE_EXPLORATION_ROUND_CAP = 32`**, a constant beside
   `ABSOLUTE_TOOL_ROUND_CAP`, with the same doc comment: raising it past the
   constant requires explicit work, not configuration.
