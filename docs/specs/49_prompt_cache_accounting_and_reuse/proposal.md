@@ -242,7 +242,7 @@ first principles.
 ### 5.9 The same problem inside a turn: stepped cutting
 
 Added 2026-10-19, moved here from
-[#65](../65_exploration_memory_within_a_turn.md). Not a requirement yet; an
+[#65](../65_exploration_memory_within_a_turn/proposal.md). Not a requirement yet; an
 idea for the reuse slice to measure.
 
 Inside a turn, `bounded_messages` keeps the newest rounds that fit

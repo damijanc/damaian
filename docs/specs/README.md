@@ -92,9 +92,10 @@ reports the disagreement.
   reuse slice is blocked on #55 or #26). #26 and #49's reuse slice never run
   together.
 - **Ready, not started:** #23 verification loop;
-  #65 exploration memory (its requirement 8's budget interaction is settled by
-  #59); #66 plan left open at turn end (edits `chat.rs`, so it does not pair with
-  #65).
+  #65 exploration memory (planned 2026-10-24 as a folder spec; its requirement
+  8's budget interaction is settled by #59, and its carry-into-the-next-turn
+  task waits for #26); #66 plan left open at turn end (edits `chat.rs`, so it
+  does not pair with #65).
 - **Blocked:** #27, #33, #51, #54 and #55 on #26; #28 on #26 and #27; #29 on
   #28; #30 on #28 and #29; #35 on #23; #36 on #35; #37 on #33, #35 and #36;
   #52 on #33; #39 on #38; #40 on #38 and #39.
@@ -384,20 +385,26 @@ day they were found, and its read-only pipelines (requirements 6–7) followed o
 Task 4 and changed the approval prompt's first line, so its "does not pair with
 another spec that edits `chat.rs`" constraint ended with it. No `Depends on:`
 line names #62, so nothing is promoted.
-[#65](65_exploration_memory_within_a_turn.md), added on 2026-10-18 from a
-review of #59–#64 and revised on 2026-10-19, is ready: #20, #34, #47 and now
-#59 are built. Its requirement 8's budget interaction is settled by #59's
-allowance (default 24, ceiling 32, restrict-only). **It is the next priority.**
-Investigating a large project is the prerequisite for everything else Damaian
-does — an agent that cannot learn a codebase cannot fix, design or implement in
-it — and #65 is what makes that investigation stick: #59 gives a turn the
-rounds, #61 keeps a stopped turn alive, and #65 keeps what those rounds found in
-view once the request window drops them, and carries it into the next turn.
-Nothing formally depends on it, but new feature work should not jump ahead of
-it. It edits `bounded_messages`, `build_model_prompt` and the turn loop in
-`chat.rs`, so it does not pair with another spec that edits that file; #62 has
-finished, so nothing holds it back. Build it next, and its per-turn call list is
-the one #59's Task 3 added.
+[#65](65_exploration_memory_within_a_turn/proposal.md), added on 2026-10-18 from a
+review of #59–#64 and revised on 2026-10-19, is planned as a folder spec
+(2026-10-24: [`proposal.md`](65_exploration_memory_within_a_turn/proposal.md),
+[`context.md`](65_exploration_memory_within_a_turn/context.md),
+[`tasks.md`](65_exploration_memory_within_a_turn/tasks.md)): #20, #34, #47 and
+now #59 are built. Its requirement 8's budget interaction is settled by #59's
+allowance (default 24, ceiling 32, restrict-only). **It remains the next
+priority.** Investigating a large project is the prerequisite for everything
+else Damaian does — an agent that cannot learn a codebase cannot fix, design or
+implement in it — and #65 is what makes that investigation stick: #59 gives a
+turn the rounds, #61 keeps a stopped turn alive, and #65 keeps what those rounds
+found in view once the request window drops them, and carries it into the next
+turn. Nothing formally depends on it, but new feature work should not jump
+ahead of it. It edits `bounded_messages`, the turn seed and the turn loop in
+`chat.rs`, so it does not pair with another spec that edits that file. #62 has
+finished, but #26 is being implemented now and rewrites `build_model_prompt`
+and the assembly around it, so **#65's carry-into-the-next-turn task waits for
+#26 to land**; its earlier tasks do not touch the seed. Its per-turn call list
+extends the identity #59's Task 3 added (`read_call_key`), which covers read
+tools only and is not yet persisted.
 
 ### Parallel work
 
@@ -505,7 +512,7 @@ is ready.
 | 62 | [62_approval_prompts_name_the_reason/](62_approval_prompts_name_the_reason/proposal.md) | **Done 2026-10-23** (started 2026-10-18; Tasks 1–7, the last on 2026-10-23; the live re-run named every prompt's cause, see its §6): `command_policy.rs` gains the closed `ApprovalCause` enum and `CommandClassification.causes`, and `reasons` is rendered from it, so every classifier branch and escalation names its cause as a value — including the `Network`/`HighRisk` split and `Blocklisted`/`Destructive`; the `Setting`/`ProfileBlocked` causes name the `require_approval_for_*` key (with its user/repository/profile source, threaded from the `RepositoryConfigReport`) and the `command_access` block respectively. The approval prompt now leads with the deciding cause's plain words, and "sandbox" has left the model-facing command text and the audit status; the pinned Code prompt and its spec-50 fixtures moved with it. The approval card now shows the first cause and the model's stated reason outside the "Why this command" disclosure, in the live, worker and reattached paths. The proposal stores its `causes` (as values, read back tolerantly by older-file rules) and `command_proposal_stored` audits their names in order, so a session can be analysed by cause without changing any decision. The deterministic eval harness now reports each run's approval prompts grouped by their first cause (`approval_prompts_by_cause`, plus a per-run line), and the new `approval_causes` scenario produces two prompts with distinct causes so the grouping is measured. `USER_GUIDE.md`, `TROUBLESHOOTING.md` and `SECURITY.md` now document the card's two lines, how to read a cause, and what runs without asking without claiming a sandbox. Specified 2026-10-17: every approval said "because it cannot run in sandbox mode", and there is no sandbox. The classifier returns structured `ApprovalCause`s, the prompt's first line names the deciding one (which shell control, which keyword, which setting and who set it), the model's own reason is shown beside it, and "sandbox" leaves every user- and model-facing string. Changes no approval decision. |
 | 63 | [63_exploratory_command_failures/](63_exploratory_command_failures/proposal.md) | **Done 2026-10-23.** Tasks 1–5 built 2026-10-17/18; Task 6 walked the §6 criteria and documented the purpose split. Commands get a purpose (check, exploration, other) that never influences approval; a failed exploration command records no finding and blocks no plan step, while checks and unknown commands behave as today. Prompted by a zsh glob error and an `ls` of a missing directory becoming open **error** findings; the model is now told its shell and zsh's glob rule. |
 | 64 | [64_read_only_command_boundary.md](64_read_only_command_boundary.md) | **Done 2026-10-23.** Found the read-only list is not read-only (`git diff --output=<file>` writes) and replaces the prefix match with a tokenizer, per-program option lists and `PathPolicy` checks on every path argument. It then admits `cd <dir> &&` and `&&`/`|` pipelines of admitted commands into stdin-only filters, and the §5.7 documentation (user guide, security, troubleshooting) was written to close it. |
-| 65 | [65_exploration_memory_within_a_turn.md](65_exploration_memory_within_a_turn.md) | **Not started — the next priority now that #59 is done.** Specified 2026-10-18, revised 2026-10-19. `bounded_messages` sends only the last ~7 rounds, so in a long turn most of what the agent read is gone before it answers. Adds a `turn_notes` tool whose bounded text (default 8,000 characters, restrict-only) is pinned after the seed, never elided, and carried into the next turn of the session. Requirement 8, the budget interaction, is settled by #59's exploration allowance (default 24, ceiling 32, restrict-only). |
+| 65 | [65_exploration_memory_within_a_turn/](65_exploration_memory_within_a_turn/proposal.md) | **Not started — planned 2026-10-24; the next priority now that #59 is done.** Specified 2026-10-18, revised 2026-10-19, planned as a folder spec on 2026-10-24 ([`tasks.md`](65_exploration_memory_within_a_turn/tasks.md)); the task that carries notes into the next turn waits for #26 to land, because both edit the turn seed in `chat.rs`. `bounded_messages` sends only the last ~7 rounds, so in a long turn most of what the agent read is gone before it answers. Adds a `turn_notes` tool whose bounded text (default 8,000 characters, restrict-only) is pinned after the seed, never elided, and carried into the next turn of the session; the elision notice names the calls that left the window and a warning names the round about to leave. Requirement 8, the budget interaction, is settled by #59's exploration allowance (default 24, ceiling 32, restrict-only); the call list extends #59's `read_call_key`, which covers read tools only and is not persisted. |
 | 66 | [66_plan_left_open_at_turn_end.md](66_plan_left_open_at_turn_end.md) | **Not started.** Specified 2026-10-24 from a session that answered in full and left its plan showing step 1 of 4 as *running*: the model never called `complete_step`, the panel labels any `in_progress` step "running" after the turn ended, and step evidence is dropped on every approval resume. Adds one reminder per turn when the model answers with open steps, persists step evidence across pauses and attaches it at turn end, and labels an ended turn's open step "not finished". Closes nothing on the model's behalf (#21 requirement 6). |
 
 **Ordering exception.** Numbers are assigned in creation order, so build order

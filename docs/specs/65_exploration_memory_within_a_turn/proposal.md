@@ -1,38 +1,44 @@
 # Feature Spec: Exploration Memory
 
-Status: Not started. Specified on 2026-10-18 from a review of
-[#59](59_exploration_round_allowance/proposal.md)–[#64](64_read_only_command_boundary.md),
+Status: Not started (planned 2026-10-24: see [`tasks.md`](tasks.md)).
+Implementation of the tasks that touch the turn seed waits for
+[#26](../26_context_assembly.md) to land. Specified on 2026-10-18 from a review of
+[#59](../59_exploration_round_allowance/proposal.md)–[#64](../64_read_only_command_boundary.md),
 asking whether they are enough for Damaian to investigate a large repository
 before changing it. They give a turn the rounds to explore, but nothing keeps
 what the agent found in early rounds in front of it once the turn's request
 window drops those rounds, and nothing carries it into the next turn. Revised
-2026-10-19: the stepped cut moved to #49 (§4), and the pre-cut notice
-(requirement 5) and carrying notes into the next turn (requirement 6) were
-added, because investigating is the prerequisite for everything else Damaian
-does (§1). The file keeps its original name so existing links still work.
+2026-10-19: the stepped cut moved to [#49](../49_prompt_cache_accounting_and_reuse/proposal.md)
+(§4), and the pre-cut notice (requirement 5) and carrying notes into the next
+turn (requirement 6) were added, because investigating is the prerequisite for
+everything else Damaian does (§1). Re-planned 2026-10-24: every code reference
+was re-checked and several claims corrected; the corrections are recorded in
+[`tasks.md`](tasks.md)'s Corrections table.
 Order: 65 of 66
-Plan: none. Evidence-driven, like [#47](47_agent_working_capability/proposal.md)
-— an exception to the rule in [`README.md`](README.md).
-Depends on: [#47](47_agent_working_capability/proposal.md) (the read tools,
+Plan: none. Evidence-driven, like [#47](../47_agent_working_capability/proposal.md)
+— an exception to the rule in [`README.md`](../README.md).
+Depends on: [#47](../47_agent_working_capability/proposal.md) (the read tools,
 `action_effect`, and `bounded_messages` with its restrict-only window) — built;
-[#20](20_working_modes/proposal.md) (the mode matrix a new tool must enter) —
-built; [#34](34_repository_config_trust_boundary.md) (scope classes for the new
+[#20](../20_working_modes/proposal.md) (the mode matrix a new tool must enter) —
+built; [#34](../34_repository_config_trust_boundary.md) (scope classes for the new
 key) — built. Requirement 8 also depends on
-[#59](59_exploration_round_allowance/proposal.md) (the exploration allowance
+[#59](../59_exploration_round_allowance/proposal.md) (the exploration allowance
 and its repeat rule) — built 2026-10-23; everything else in this spec can be
 built without it. Everything else named below is a
 cross-reference, not a prerequisite.
+Also in this spec: [`context.md`](context.md) (the code map and the collision
+notes a task worker needs), [`tasks.md`](tasks.md) (the implementation plan).
 Related implementation specs:
-[`55_conversation_compaction.md`](55_conversation_compaction.md) (summarises a
+[`55_conversation_compaction.md`](../55_conversation_compaction.md) (summarises a
 whole conversation across turns; this spec carries only the agent's own notes,
 and #55 should read them),
-[`61_continue_the_stopped_turn/`](61_continue_the_stopped_turn/proposal.md) (a paused
+[`61_continue_the_stopped_turn/`](../61_continue_the_stopped_turn/proposal.md) (a paused
 turn keeps its state, which now includes its notes; its continuations are what
 make turns long enough for the cut to matter, §1),
-[`49_prompt_cache_accounting_and_reuse`](49_prompt_cache_accounting_and_reuse/proposal.md)
+[`49_prompt_cache_accounting_and_reuse`](../49_prompt_cache_accounting_and_reuse/proposal.md)
 (prefix stability; the stepped cut this spec first proposed now lives in its
 §5.9),
-[`18_local_evaluation_harness`](18_local_evaluation_harness/proposal.md)
+[`18_local_evaluation_harness`](../18_local_evaluation_harness/proposal.md)
 (where the long-turn scenario lands).
 
 ## 1. Motivation
@@ -58,15 +64,16 @@ assistant message plus one result per call, so at two or three calls per round
 the model sees roughly the **last seven rounds**.
 
 An eight-round turn mostly hid this, because few turns got far enough for the
-cut to matter. Two specs change that. #61 (Tasks 1–5 on main since
-2026-10-19) lets the user continue a turn that ran out of rounds: each
+cut to matter. Two specs change that. #61 (Tasks 1–7, Done 2026-10-23) lets the
+user continue a turn that ran out of rounds: each
 *Continue* grants another `agent_max_tool_rounds` segment of the **same** turn,
 up to `ABSOLUTE_TURN_ROUND_CAP` (64) rounds, and replays the saved `messages`
 through `bounded_messages` — so a continued turn is exactly a long turn. #59
-then adds up to 24 read-only rounds to a turn's budget. At the end of a
-32-round turn about three quarters of what the agent read, and everything it
-said to itself about it, is not in the request that writes the answer; at 64
-rounds, about nine tenths. The model then has three options, all bad:
+(built 2026-10-23) then allows up to 24 read-only rounds in a turn's budget. At
+the end of a 32-round turn about three quarters of what the agent read, and
+everything it said to itself about it, is not in the request that writes the
+answer; at 64 rounds, about nine tenths. The model then has three options, all
+bad:
 
 - **Answer from the last seven rounds.** The forced final call — made only
   when the user picks #61's *Answer now* — sees only those, so a report on a
@@ -79,12 +86,15 @@ rounds, about nine tenths. The model then has three options, all bad:
 
 **Between turns.** Real work is several turns: "find out how approvals are
 decided", then "add a cause for X", then "now test it". A new turn sees the
-earlier ones only through `build_model_prompt`, which gives it the last eight
+earlier ones through `build_model_prompt`, which gives it the last eight
 session messages, each cut to 2,000 characters
-([chat.rs:4762](../../crates/workspace-engine/src/chat.rs)). However well
-the investigating turn went, the turn that acts on it starts from a
-2,000-character fragment of its answer and has to investigate again. #55 would
-replace that window with a summary, but it is not started and waits on #26.
+([chat.rs:6101](../../../crates/workspace-engine/src/chat.rs)); a turn that
+takes over from a stopped one also carries the plan
+(`carry_plan_from_the_previous_turn`, [chat.rs:2410](../../../crates/workspace-engine/src/chat.rs)).
+Neither carries what the turn learned. However well the investigating turn
+went, the turn that acts on it starts from a 2,000-character fragment of its
+answer and has to investigate again. #55 would replace that window with a
+summary, but it is not started and waits on #26.
 
 The request window exists for good reasons: it bounds per-call size and cost
 (#47 requirement 6, `OBSERVATIONS.md` entry 6). Raising it only moves the point
@@ -94,43 +104,78 @@ the agent that learned it, that survives the cut and reaches the next turn.
 
 ## 2. Current State
 
-- `bounded_messages` ([chat.rs:4802](../../crates/workspace-engine/src/chat.rs))
+Re-checked against the tree on 2026-10-24; drifted references and three factual
+corrections are recorded in [`tasks.md`](tasks.md).
+
+- `bounded_messages` ([chat.rs:6161](../../../crates/workspace-engine/src/chat.rs))
   keeps `messages[..2]` (system, user), adds one system notice, and keeps the
   newest rounds that fit `max_messages - 3`. It cuts at round starts so a tool
   result never loses its call. If the newest round alone is larger than the
   budget, it is kept whole and the request goes over the bound. It is applied
-  to every request in the turn loop (`chat.rs:2331`), including the requests
-  of a turn #61 continued.
+  to every request in the turn loop
+  ([chat.rs:2911](../../../crates/workspace-engine/src/chat.rs)), including the
+  requests of a turn #61 continued.
 - The notice says how many messages and results were left out, not **which**
-  calls they were. The model cannot tell which reads it already made.
+  calls they were. The model cannot tell which reads it already made. Its text
+  is a literal in `bounded_messages`
+  ([chat.rs:6195](../../../crates/workspace-engine/src/chat.rs)).
 - Nothing warns the model before a round leaves the window. The first it hears
   of a cut is the notice, after the results are gone.
-- `build_model_prompt` (`chat.rs:4748`) seeds a new turn with the last eight
-  session messages, each truncated to 2,000 characters. Nothing else from an
-  earlier turn reaches it.
-- `agent_max_turn_messages` is restrict-only at repository scope and a
-  **Capability** in the key partition (`config.rs:1602`, `config.rs:2812`),
-  labelled "Messages sent per model request" (`effective_policy.rs:161`).
-- `PendingChatTurn` (`chat.rs:4396`) persists the full `messages` array, so a
-  paused turn resumes with every round. The cut only affects what is sent.
-  Since #61 it also carries `round_budget`, and a round-budget pause is one of
-  the ways a turn is persisted and resumed — on every *Continue*, not only
-  after an approval or a crash.
-- #59's seen-call set (its §5.3, not yet built) lives in the loop and is not
-  persisted, so a resumed turn starts with it empty. With #61 that is every
-  *Continue*.
+- `build_model_prompt` ([chat.rs:6101](../../../crates/workspace-engine/src/chat.rs))
+  seeds a new turn with the last eight session messages, each truncated to
+  2,000 characters. Two things from earlier turns also reach it: the plan,
+  when the previous task was stopped or superseded
+  (`carry_plan_from_the_previous_turn`, [chat.rs:2410](../../../crates/workspace-engine/src/chat.rs)),
+  and the context assembled from the repository. What the previous turn
+  **learned** does not.
+- `agent_max_turn_messages` is restrict-only at repository scope
+  ([config.rs:1604–1612](../../../crates/workspace-engine/src/config.rs)) and a
+  **Capability** in the key partition
+  ([config.rs:2843](../../../crates/workspace-engine/src/config.rs)), labelled
+  "Messages sent per model request"
+  ([effective_policy.rs:168](../../../crates/workspace-engine/src/effective_policy.rs)).
+- `PendingChatTurn` ([chat.rs:5696](../../../crates/workspace-engine/src/chat.rs))
+  persists the full `messages` array, so a paused turn resumes with every
+  round. The cut only affects what is sent. Since #61 it also carries
+  `round_budget`, and a round-budget pause is one of the ways a turn is
+  persisted and resumed — on every *Continue*, not only after an approval or a
+  crash. #59 added `exploration_rounds` beside `round`.
+- **#59's repeat detection is built** (Done 2026-10-23): `run_agentic_turn`
+  keeps `seen_read_calls: HashSet<Vec<String>>`
+  ([chat.rs:2760](../../../crates/workspace-engine/src/chat.rs)), keyed by the
+  canonical form `read_call_key` computes for a read tool
+  ([chat.rs:5116](../../../crates/workspace-engine/src/chat.rs)). Keys are
+  computed once per round before dispatch
+  ([chat.rs:3348](../../../crates/workspace-engine/src/chat.rs)) and a
+  dispatched read enters the set after its marker closes; a round that runs a
+  `WritesRepository` call clears it
+  ([chat.rs:4601](../../../crates/workspace-engine/src/chat.rs)). It is **not**
+  persisted: a resumed turn starts empty, which #59 §5.3 accepts. The key is a
+  segmented identity (`tool`, `checkout`, arguments), not display text, and it
+  exists only for the eight read tools.
 - The agent has no way to write anything down that is not a tool call or
   assistant text, and both of those are dropped with their round.
-- `action_effect` (`chat.rs:4960`) classifies every tool as `ReadOnly`,
-  `WritesRepository` or `ShapesTurn`. `ShapesTurn` tools ("writes only the
-  session log") cannot be batched with reads (`action_is_batchable_read_only`).
-  `mode_permits` (`mode.rs:233`) allows the eight read tools in every mode:
-  #47's six plus #60's `list_worktrees` and `read_git_log`.
+- `action_effect` ([chat.rs:6322](../../../crates/workspace-engine/src/chat.rs))
+  classifies every tool as `ReadOnly`, `WritesRepository` or `ShapesTurn`.
+  `ShapesTurn` covers planning, step completion, patches, edits and `ask_user`;
+  those cannot be batched with reads (`action_is_batchable_read_only`,
+  [chat.rs:6348](../../../crates/workspace-engine/src/chat.rs)). `mode_permits`
+  ([mode.rs:233](../../../crates/workspace-engine/src/mode.rs)) allows the eight
+  read tools in every mode — #47's six plus #60's `list_worktrees` and
+  `read_git_log` — and `ask_user`. `permits` ([mode.rs:139](../../../crates/workspace-engine/src/mode.rs))
+  adds the profile axis in `profile_permits`
+  ([mode.rs:155](../../../crates/workspace-engine/src/mode.rs)), whose `match`
+  lists every variant with no wildcard.
 - #55 (not started) summarises a conversation across turns and explicitly
   leaves the in-turn array alone (#61 §4 says the same).
-- The eval harness's deterministic tier scripts every model response, so it
-  can check which calls a run made and how many rounds it used, but not what a
-  request contained (`crates/eval-harness/src/scenario.rs`).
+- The eval harness's deterministic tier scripts every model response, records
+  every request the mock adapter received (`MockModelAdapter.requests`,
+  [model.rs:372](../../../crates/workspace-engine/src/model.rs)), and already
+  asserts on request contents (`continuation_request_contains`,
+  `answer_request_contains`; `runner.rs:117–152`). It can therefore check which
+  calls a run made, how many rounds it used, and what a resumed or answering
+  request contained; it cannot compare a whole request across two runs, and it
+  runs exactly one user turn per scenario.
 
 ## 3. Requirements
 
@@ -182,7 +227,7 @@ the agent that learned it, that survives the cut and reaches the next turn.
     export.
 11. Every notes change is audited with its size and the running total, not its
     text (the text is in the session log). A carry is audited with its size.
-    The audit records of the forced-final and exhausted paths include the notes
+    The audit records of the forced-final and paused paths include the notes
     size. The eval harness reports how many notes calls a run made and how many
     reads repeated an elided call.
 
@@ -239,14 +284,16 @@ model-facing prompts.
 `Notes`. It is not `ReadOnly`, because it changes turn state. It is not
 `ShapesTurn` either, because those cannot be batched with reads, and recording
 a finding in the same round as the read that found it is exactly what should
-happen. `action_is_batchable_read_only` becomes `ReadOnly | Notes`, and the doc
-comment on `action_effect` says the variant also decides the budget class
-(requirement 8). `tool_action_marker` marks it not side-effecting: it writes
-only the session log, as the `ShapesTurn` tools do.
+happen. `action_is_batchable_read_only` becomes `ReadOnly | Notes`, and #59's
+round classification counts a round whose calls are all `ReadOnly` or `Notes`
+as exploration. The doc comment on `action_effect` says the variant also
+decides the budget class (requirement 8). `tool_action_marker` marks it not
+side-effecting: it writes only the session log, as the `ShapesTurn` tools do.
 
-`mode_permits` allows it in every mode. It is offered wherever the read tools
-are offered and `agent_max_turn_notes_chars > 0`. A worker session (#57) gets
-it as any session does.
+`mode_permits` allows it in every mode, and `profile_permits` maps it to no
+capability key, like `AskUser`. It is offered wherever the read tools are
+offered and `agent_max_turn_notes_chars > 0`. A worker session (#57) gets it as
+any session does.
 
 ### 5.2 Where the notes go
 
@@ -276,6 +323,14 @@ None of the three blocks counts toward `max_messages`, so a repository that
 lowers the window cannot push the notes out. The size of the notes is bounded
 by requirement 3 instead, and the notice and the warning by their own caps.
 
+The window budget must stay exactly `max_messages - 3`: today `bounded_messages`
+subtracts the head (2 messages) and one notice. The two extra blocks are
+**added beside** the bounded tail, so the request can exceed `max_messages` by
+their size while the number of round messages kept is unchanged. Shrinking the
+round budget to make room for them would make a repository that lowers
+`agent_max_turn_messages` evict more history than before, which is the opposite
+of this spec's purpose.
+
 `agent_max_turn_notes_chars = 0` keeps every request exactly today's for the
 whole turn (requirement 3).
 
@@ -297,17 +352,29 @@ The session log still holds every result. Your notes are above.
 Each line uses #59 §5.3's canonical form: paths relative to the checkout the
 call read, resolved through `PathPolicy`, and a call into a registered worktree
 names that worktree, so a read of the same path in two checkouts prints as two
-different lines. The list is capped at 40 lines. Past the cap it says "…and N
-more".
+different lines. A call that has no canonical row — a `turn_notes` call, a
+command, a patch proposal — is printed from `tool_action_marker`'s name and
+reference, redacted and truncated, because #59 defines the canonical form only
+for the eight read tools. The list is capped at 40 lines. Past the cap it says
+"…and N more".
 
 The canonical form is computed once per dispatched call and appended to a
-per-turn **call list**, so building the notice and the warning does not
-re-decode calls. The list also marks each round that wrote (#59 §5.3 clears its
-seen-call set there). It is kept whatever the key's value — it is not sent
-unless requirement 4 or 5 applies — because #59 needs it: its seen-call set is
-the list's entries since the last write, and persisting the list (§5.6) is
-what lets a resumed turn rebuild that set. Whichever of #59 and this spec is
-built first adds the list; the other reuses it.
+per-turn **call list**. The list also marks each round that wrote (#59 §5.3
+clears its seen-call set there) and the index of the round's assistant message,
+so the notice can tell which entries precede the cut. It is kept whatever the
+key's value — it is not sent unless requirement 4 or 5 applies — because #59
+needs it: its seen-call set is the list's entries since the last write, and
+persisting the list (§5.6) is what lets a resumed turn rebuild that set.
+
+**#59 landed first and built the identity half only.** `read_call_key`
+([chat.rs:5116](../../../crates/workspace-engine/src/chat.rs)) already computes
+#59 §5.3's canonical form for the eight read tools, and `seen_read_calls` is
+the set built from it. What does not exist is a display rendering, a record for
+non-read calls, a record of which round wrote, or any persistence. This spec
+therefore extends `read_call_key` into a general call-key function (reads plus
+`turn_notes`), adds a renderer over the same resolved data so display and
+identity cannot drift, and adds the persistent list. It does not add a second
+canonical form.
 
 ### 5.4 Warning before the cut
 
@@ -344,16 +411,23 @@ When a turn starts in a session whose previous turn has notes, the new turn's
 `carried: true` and the source task id is written before the first request.
 "Previous turn" is the turn the new one follows in the conversation as it
 stands, read from the session log, so a rewind to before a turn carries the
-notes of the turn before it, not of the turn rewound away. The previous turn's
-final notes include anything it carried itself, so findings flow along the
-session as one record. The model keeps it within the bound by replacing
-rather than appending, as within a turn.
+notes of the turn before it, not of the turn rewound away. The log's
+`active_events` filter already makes `read_tasks` and `read_messages` see only
+the active conversation after a rewind, so the same lookup is correct without
+a second rule. The previous turn's final notes include anything it carried
+itself, so findings flow along the session as one record. The model keeps it
+within the bound by replacing rather than appending, as within a turn.
 
 The carried text keeps the header from §5.2 until the model replaces the whole
 record; an append keeps it, because the carried part is still there. Every
 kind of new turn carries: a normal prompt, #61's *Ask again* (so a turn that
 ran out keeps its findings) and a turn started by a worker (#57). A new
 session starts with no notes.
+
+`carry_plan_from_the_previous_turn`
+([chat.rs:2410](../../../crates/workspace-engine/src/chat.rs)) is the existing
+precedent for finding the previous task, and this spec should reuse its shape
+rather than invent a second ordering rule.
 
 Carrying adds the notes to every request of the next turn from its first one,
 so a session that investigates and then acts pays up to the bound — about
@@ -371,14 +445,16 @@ new turn are its own.
 
 - **Session log:** a `turn_notes` event with the task id, `replace`,
   `carried` and the redacted notes text after the change. The latest event for
-  a task is that task's notes. Older readers skip unknown events.
+  a task is that task's notes. Older readers skip unknown events
+  (`session.rs`'s event replay ignores a type it does not know).
 - **`PendingChatTurn`:** beside #61's `round_budget`, a `#[serde(default)]
-  turn_notes: String` and a `#[serde(default)]` call list (§5.3). A turn
-  written before this spec resumes with no notes and an empty call list, which
-  is today's behaviour.
+  turn_notes: String`, a `#[serde(default)]` carried flag, and a
+  `#[serde(default)]` call list (§5.3). A turn written before this spec
+  resumes with no notes and an empty call list, which is today's behaviour.
 - **Crash recovery** (#17): a task resumed from the log rebuilds its notes from
   its latest `turn_notes` event. Its call list is rebuilt from the tool calls
-  in its saved `messages`.
+  in its saved `messages` with `tool_action_from_call`
+  ([chat.rs:6924](../../../crates/workspace-engine/src/chat.rs)).
 - **#61's pause:** a round-budget pause is a `PendingChatTurn`, so the notes
   and the call list come with it. *Continue* resumes the same turn and resets
   neither. *Answer now*'s forced final call carries the notes block. *Ask
@@ -390,10 +466,13 @@ new turn are its own.
 tokens, under 2% of the 141k-token request in #59 `context.md` §1). Ceiling:
 `ABSOLUTE_TURN_NOTES_CHARS = 32_000`, a constant with the same kind of doc
 comment as `ABSOLUTE_TOOL_ROUND_CAP`. Restrict-only, lower wins, in the same
-loop as `agent_max_turn_messages` (`config.rs:1602`), `=> Capability` in the key
-partition. It touches all eight places a key touches (spec 21 `context.md`
-§3.8), including permission profiles (`profile.rs`) and the effective policy
-label ("Notes size").
+loop as `agent_max_turn_messages`
+([config.rs:1604–1612](../../../crates/workspace-engine/src/config.rs)),
+`=> Capability` in the key partition
+([config.rs:2843](../../../crates/workspace-engine/src/config.rs)). It touches
+all eight places a key touches (spec 21 `context.md` §3.8), including
+permission profiles (`profile.rs`) and the effective policy label ("Notes
+size").
 
 Restrict-only for the same reason as #59 §5.4: a larger value is sent on every
 later call, now across turns too, so raising it spends the user's money. A
@@ -404,18 +483,21 @@ replaces them with something shorter.
 ### 5.8 What the user sees
 
 - A turn that has notes shows a collapsed **Notes** disclosure below the turn's
-  answer, using the disclosure pattern from #41 and #42. It shows the final
-  text after redaction, and says "carried from the previous turn" when the
-  turn started with carried notes. A turn with no notes shows nothing.
+  answer, using the disclosure pattern from #41 and #42
+  (`createDisclosure`, `app.js:4349`). It shows the final text after redaction,
+  and says "carried from the previous turn" when the turn started with carried
+  notes. A turn with no notes shows nothing.
 - Session export includes each turn's final notes and whether they were
   carried.
 - Progress adds `· notes 2.1k` to the round label while a turn runs and has
-  notes, next to #59's `· N reads`.
+  notes, next to #59's `· N reads` (`app.js:4481`).
 
 ### 5.9 Eval and tests
 
-**Engine tests** (in `chat.rs` tests, using a scripted adapter that records
-every request it receives):
+**Engine tests** (in `chat.rs` tests and `tests/exploration_rounds.rs`, using a
+scripted adapter that records every request it receives —
+`MockModelAdapter.requests`, and `ModelRequest` derives `Eq`, as
+`tests/prompt_cache.rs` already relies on):
 
 - notes written in round 2 of a 20-round scripted turn — run past the
   eight-round segment through #61's *Continue* — appear, unchanged, in the
@@ -449,7 +531,10 @@ asserts the turn completes, the run records one notes call, no read repeats an
 elided call, and the second turn's first request carries the notes. The script
 decides the calls, so like `batched_reads` these assertions are
 `deterministic_only`: they pin the dispatch and accounting paths, not model
-behaviour.
+behaviour. The harness runs one user turn per scenario today
+(`runner.rs:368`), so this scenario needs a small `follow_up_prompt` addition
+to `Scenario` and the runner, reusing the same `session_id`; that work is
+planned in `tasks.md` Task 10 rather than assumed.
 
 **Live acceptance (§6):** the real check, because only a real model decides
 whether to take notes and whether they are good enough to work from.
@@ -516,4 +601,7 @@ per-key budget classes.
 
 ## 7. Implementation Notes
 
-None yet.
+None yet. The planning pass on 2026-10-24 corrected this spec's drifted
+references and three factual claims; the table in [`tasks.md`](tasks.md) →
+Corrections records each one, and [`context.md`](context.md) is the code map
+the tasks were written against.
