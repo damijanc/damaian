@@ -1727,11 +1727,12 @@ fn a_markdown_link_resolves_but_a_broken_one_is_still_caught() {
 /// only if both tiers offer the model the same tools.
 ///
 /// They did not. `mock_provider()` sets `supports_native_tools: true`, while
-/// the live tier inherited DeepSeek's built-in `false`, and the patch tool is
-/// only offered when that flag is on. The first live run failed
-/// `patch_touches` on three scenarios with `actual=[]` — the model was never
-/// able to propose a patch, which measured the configuration rather than the
-/// assistant.
+/// the live tier used to inherit DeepSeek's built-in `false`, and the patch
+/// tool is only offered when that flag is on. That default is now true and the
+/// live tier still sets it explicitly, so both tiers and both defaults agree.
+/// The first live run failed `patch_touches` on three scenarios with
+/// `actual=[]` — the model was never able to propose a patch, which measured
+/// the configuration rather than the assistant.
 #[test]
 fn both_tiers_offer_the_model_the_same_tools() {
     let dir = eval_harness::guard::eval_data_dir().expect("temp dir");

@@ -659,7 +659,7 @@ fn handle_worker_route(stream: &mut TcpStream, request: &Request) -> Result<(), 
     let answer = workers::route(
         workers::global(),
         &config,
-        &|config: &Config| resolve_model_api_key(&config.model_api_key_env),
+        &|config: &Config| resolve_shell_model_api_key(config),
         &workers::WorkerRequest {
             method: &request.method,
             path: &request.path,
@@ -1222,7 +1222,7 @@ fn handle_propose_edit(stream: &mut TcpStream, request: &Request) -> Result<(), 
         .map(|value| validate_context_files(&engine, &repo, value))
         .transpose()?
         .unwrap_or_default();
-    let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
+    let api_key = resolve_shell_model_api_key(&engine.config)?;
     let transport = CurlModelTransport::new(
         &engine.config.model_base_url,
         api_key,
@@ -1646,7 +1646,7 @@ fn run_resume_command_request(
     }
 
     let mut adapter = chat_model_adapter(&engine.config, || {
-        resolve_model_api_key(&engine.config.model_api_key_env)
+        resolve_shell_model_api_key(&engine.config)
     })?;
     let mut on_token = |token: &str| {
         let _ = events.send(TurnEvent::Token(token.to_string()));
@@ -1696,7 +1696,7 @@ fn run_resume_plan_request(
     let engine = chat_engine(config_for_repo(&repo)?);
 
     let mut adapter = chat_model_adapter(&engine.config, || {
-        resolve_model_api_key(&engine.config.model_api_key_env)
+        resolve_shell_model_api_key(&engine.config)
     })?;
     let mut on_token = |token: &str| {
         let _ = events.send(TurnEvent::Token(token.to_string()));
@@ -1749,7 +1749,7 @@ fn run_resume_fallback_request(
             Ok(engine)
         },
         &mut |config| {
-            let api_key = resolve_model_api_key(&config.model_api_key_env)?;
+            let api_key = resolve_shell_model_api_key(config)?;
             let transport = CurlModelTransport::new(
                 &config.model_base_url,
                 api_key,
@@ -1842,9 +1842,7 @@ fn run_resume_round_budget_request(
             let engine = chat_engine(config_for_repo(&repo)?);
             Ok(engine)
         },
-        &mut |config| {
-            chat_model_adapter(config, || resolve_model_api_key(&config.model_api_key_env))
-        },
+        &mut |config| chat_model_adapter(config, || resolve_shell_model_api_key(config)),
     )
 }
 
@@ -1953,7 +1951,7 @@ fn run_chat_request(
     events: &std::sync::mpsc::Sender<TurnEvent>,
 ) -> Result<ChatTurnResult, String> {
     run_chat_request_with(form, cancel, events, &mut |config| {
-        chat_model_adapter(config, || resolve_model_api_key(&config.model_api_key_env))
+        chat_model_adapter(config, || resolve_shell_model_api_key(config))
     })
 }
 
@@ -2081,7 +2079,7 @@ fn resume_chat_command(
     decision_options: ResumeDecisionOptions,
 ) -> Result<ChatTurnResult, String> {
     configure_chat_integrations(engine);
-    let api_key = resolve_model_api_key(&engine.config.model_api_key_env)?;
+    let api_key = resolve_shell_model_api_key(&engine.config)?;
     let transport = CurlModelTransport::new(
         &engine.config.model_base_url,
         api_key,
@@ -2295,6 +2293,20 @@ fn resolve_model_api_key(reference: &str) -> Result<String, String> {
         Ok(api_key)
     } else {
         env::var(reference).map_err(|_| format!("{reference} is required"))
+    }
+}
+
+/// The shell's key resolution for model calls.
+///
+/// A missing key is fatal for a remote endpoint, but a loopback runtime such
+/// as Ollama serves without credentials. There the key is empty and the
+/// transport sends no `Authorization` header, rather than making the user
+/// invent and store a credential that is never checked.
+fn resolve_shell_model_api_key(config: &Config) -> Result<String, String> {
+    match resolve_model_api_key(&config.model_api_key_env) {
+        Ok(key) => Ok(key),
+        Err(_) if config.model_endpoint_is_loopback() => Ok(String::new()),
+        Err(error) => Err(error),
     }
 }
 
@@ -4549,11 +4561,12 @@ mod tests {
         json_optional_string, keychain, mcp_browser_arguments, parse_form, parse_path_list,
         percent_decode, plan_json, plan_proposal_json, relay_turn_events, remember_model_api_key,
         render_markdown_with_optional_file_links, repository_config_review_json,
-        repository_config_write_target, require_api_token, run_server, run_terminal_command,
-        save_config_file, spawn_with_shell_stack, sweep_orphaned_processes, task_states_json,
-        task_usage_json, terminal_cwd_for_repo, turn_progress_event, validate_context_files,
-        validate_working_folder, validate_workspace_path, verify_data_dir_schema_at,
-        web_diagnostic_json, web_diagnostic_reveal_target, write_basic_response, write_sse_event,
+        repository_config_write_target, require_api_token, resolve_shell_model_api_key, run_server,
+        run_terminal_command, save_config_file, spawn_with_shell_stack, sweep_orphaned_processes,
+        task_states_json, task_usage_json, terminal_cwd_for_repo, turn_progress_event,
+        validate_context_files, validate_working_folder, validate_workspace_path,
+        verify_data_dir_schema_at, web_diagnostic_json, web_diagnostic_reveal_target,
+        write_basic_response, write_sse_event,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -6949,6 +6962,29 @@ mod tests {
         assert_eq!(cached_model_api_key(account), None);
     }
 
+    /// Local runtimes do not authenticate. A missing key must not stop a
+    /// request to a loopback endpoint, while a remote endpoint still fails
+    /// loudly instead of sending an unauthenticated request.
+    #[test]
+    fn a_missing_model_key_is_allowed_only_for_a_loopback_endpoint() {
+        let mut config = Config {
+            model_api_key_env: format!("DAMAIAN_UNSET_TEST_KEY_{}", std::process::id()),
+            model_base_url: "http://localhost:11434".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(
+            resolve_shell_model_api_key(&config),
+            Ok(String::new()),
+            "local Ollama serves without a key"
+        );
+
+        config.model_base_url = "https://api.example.test".to_string();
+        assert!(
+            resolve_shell_model_api_key(&config).is_err(),
+            "a remote endpoint without a key is still a configuration error"
+        );
+    }
+
     #[test]
     fn desktop_settings_config_path_is_user_only() {
         assert!(desktop_settings_config_path(None).is_ok());
@@ -9326,12 +9362,12 @@ mod tests {
     /// `tests/workers.rs`.
     mod worker_supervisor {
         use super::*;
+        use crate::remember_model_api_key;
         use crate::workers::{
             Refusal, SpawnRequest, SpawnedWorker, StopNext, StopOutcome, StopTarget, Supervisor,
             WorkerRequest, WorkerTimeouts, begin_stop, finish_stop, route,
             workers_to_stop_for_deleted_session,
         };
-        use crate::{remember_model_api_key, resolve_model_api_key};
         use serde_json::{Value, json};
         use std::io::{BufRead, BufReader};
         use std::os::unix::fs::PermissionsExt;
@@ -9508,7 +9544,7 @@ exec /bin/cat > /dev/null
                 route(
                     &self.supervisor,
                     config,
-                    &|config: &Config| resolve_model_api_key(&config.model_api_key_env),
+                    &|config: &Config| resolve_shell_model_api_key(config),
                     &WorkerRequest {
                         method,
                         path,

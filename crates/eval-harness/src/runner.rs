@@ -214,9 +214,9 @@ pub fn live_config(data_dir: &Path, provider: &str, model: &str) -> Config {
     // Both tiers must offer the model the same tools, or their assertions
     // measure different assistants and §5.3's single scenario definition buys
     // nothing. The deterministic tier's mock provider enables the native tool
-    // contract, so the live tier does too — overriding the built-in provider
-    // entry, whose `false` is a conservative default for people's own configs
-    // rather than a statement that the provider cannot do it.
+    // contract, so the live tier does too — setting it explicitly rather than
+    // relying on the provider entry's default, so a result does not change
+    // with that default.
     //
     // This is a deliberate property of the eval configuration and not of the
     // shipped default. `RunRecord::native_tools` carries it into every record

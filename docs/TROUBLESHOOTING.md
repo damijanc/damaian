@@ -348,6 +348,12 @@ API keys live in the macOS Keychain under service `DamaianClient`
 Config holds only a reference: `keychain:<account>`, or the name of an
 environment variable — never a raw key.
 
+A loopback endpoint such as Ollama (local) does not need a key. When the
+reference resolves to nothing on a loopback endpoint, Damaian sends no
+`Authorization` header instead of refusing the request. A missing key is
+tolerated only for a loopback endpoint; every remote provider still requires
+one.
+
 ```bash
 security find-generic-password -s DamaianClient -a model-api-key -w
 ```
@@ -1587,9 +1593,10 @@ A macOS app opened from Finder, the Dock or Launchpad does not read your shell
 profile, so it does not get the variables or the `PATH` your Terminal has. That
 one fact is behind several symptoms:
 
-- `model_api_key_env` names an environment variable that is set in your shell
-  and missing in the app, so [model calls fail](#model-calls-fail). A
-  `keychain:` reference avoids this.
+- For a remote provider, `model_api_key_env` names an environment variable
+  that is set in your shell and missing in the app, so
+  [model calls fail](#model-calls-fail). A `keychain:` reference avoids this.
+  A loopback endpoint such as Ollama (local) does not need a key at all.
 - An MCP stdio server's `command`, or `docker`, resolves in Terminal and not in
   the app. Use an absolute path to the executable.
 - A variable such as `DAMAIAN_MOCK_MODEL_RESPONSE` or `DAMAIAN_DATA_DIR`
@@ -1604,11 +1611,13 @@ terminal instead, as described in
 
 Check in this order:
 
-1. Is the key `Saved`? [Secrets](#secrets) shows how to check without
-   printing it.
+1. For a remote provider, is the key `Saved`? [Secrets](#secrets) shows how to
+   check without printing it. A loopback endpoint such as Ollama (local) does
+   not need one.
 2. If `model_api_key_env` names an environment variable rather than a
    `keychain:` reference, is that variable set in the launching environment?
    See [The app does not see your shell's environment](#the-app-does-not-see-your-shells-environment).
+   This does not apply to a loopback endpoint.
 3. `config-show` — is `model_base_url` the provider you think it is? A repo or
    admin overlay may be redirecting it.
 4. The audit log — a `model_request_prepared` with no matching
@@ -1648,7 +1657,8 @@ entry in `model_providers`, in configuration order, that:
   provider is never offered;
 - has a non-empty `api_key_env`. Only the name is checked. A name with no key
   behind it still gets an offer, and approving it then fails with
-  `<NAME> is required` or a Keychain error. The offer stays open, so
+  `<NAME> is required` or a Keychain error, unless its endpoint is loopback
+  (Ollama local), where no key is needed. The offer stays open, so
   **Keep it failed** still works;
 - has the same `supports_native_tools` as the active provider, because the
   paused turn's messages were built for that contract;
@@ -1689,9 +1699,10 @@ provider, and a refusal there gets a fresh offer.
 
 Usually one of three things, distinguishable from the logs:
 
-- **Native tool-calling is off** for the provider. `propose_patch` and MCP tools
-  require it; the fallback text envelopes are less reliable. Check
-  `model_provider.<id>.supports_native_tools`.
+- **Native tool-calling is off** for the provider. It is on by default, so this
+  usually means an explicit `model_provider.<id>.supports_native_tools=false`.
+  `propose_patch` and MCP tools require it; the fallback text envelopes are less
+  reliable.
 - **The response was truncated** at the output ceiling, and a truncated
   `propose_patch` call leaves unusable partial JSON. With no
   `model_provider.<id>.max_output_tokens` set, Damaian sends a built-in

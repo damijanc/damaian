@@ -8,8 +8,9 @@ source instead, see [Development](DEVELOPMENT.md).
 - A Mac with Apple Silicon. Release builds are made for Apple Silicon only.
 - macOS 14 Sonoma or newer.
 - Git installed and available on the command line.
-- An API key for a supported model provider (OpenAI, DeepSeek, or any
-  OpenAI-compatible endpoint), or a local Ollama.
+- An API key for a supported model provider (OpenAI, DeepSeek, OpenRouter,
+  Ollama Cloud, or any OpenAI-compatible endpoint), or the Ollama app for local
+  models.
 
 ## Install
 
@@ -32,9 +33,9 @@ issue.
 2. Pick one of the **Popular providers**, or select **New** for another
    OpenAI-compatible endpoint. Under **Provider details**, paste your key into
    **API Key**; Damaian stores it in the macOS Keychain and keeps only a
-   reference to it in its config. Turn on **Native tool-calling**: without it
-   the assistant can answer questions but cannot propose file changes or use
-   tools. Select **Save Provider**.
+   reference to it in its config. **Native tool-calling** is on by default;
+   leave it on, because without it the assistant can answer questions but
+   cannot propose file changes or use tools. Select **Save Provider**.
 3. Close Settings, select `+` beside **Projects**, and pick the local Git
    repository you want to work in.
 4. Ask a question in the prompt box.

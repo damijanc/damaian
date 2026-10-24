@@ -10,7 +10,7 @@ This build is a developer preview. Release builds are Developer ID signed and no
 2. Open Settings with `⌘,`. It opens on **Providers**.
 3. Under **Popular providers**, select **+ Connect** beside your provider, or select **New** beside **Configured providers** for any other OpenAI-compatible endpoint. Check **Base URL** and **Models** in **Provider details**.
 4. Paste your key into **API Key**. While **API Key Reference** starts with `keychain:` (Damaian fills one in), the key is stored in macOS Keychain and only the reference is written to your config.
-5. Turn on **Native tool-calling**, then select **Save Provider**. Without native tool-calling the assistant can answer questions but cannot propose file changes ([why](#native-tool-calling)).
+5. Leave **Native tool-calling** on (the default), then select **Save Provider**. Without it the assistant can answer questions but cannot propose file changes ([why](#native-tool-calling)).
 6. Close Settings. In the model picker below the prompt, choose your provider under **Provider** ([Choosing the model and effort](#choosing-the-model-and-effort)).
 7. Select **+** beside **Projects** and pick the Git repository you want to work on.
 8. Ask a question in the prompt box and press `Enter`. To change code, ask for the change, review the patch preview in the conversation, and select **Apply N** ([File Changes](#file-changes)).
@@ -94,7 +94,7 @@ Common keys:
 | `model_base_url` | `https://api.openai.com` | OpenAI-compatible API base URL | No |
 | `model_api_key_env` | `OPENAI_API_KEY` | API key reference: `keychain:model-api-key` for the desktop Keychain flow, or an environment variable name for [CLI and development](#environment-variables-cli-and-development-only) | No |
 | `model_reasoning_level` | `default` | Reasoning effort: `default`, `minimal`, `low`, `medium` or `high` | No |
-| `model_provider.<id>.supports_native_tools` | off | Use the provider's native tool-calling API ([Native tool-calling](#native-tool-calling)) | No |
+| `model_provider.<id>.supports_native_tools` | on | Use the provider's native tool-calling API ([Native tool-calling](#native-tool-calling)) | No |
 | `model_provider.<id>.max_output_tokens` | Per model | Largest reply the model may generate, in tokens ([Output and Context Limits](#output-and-context-limits)) | No |
 | `model_provider.<id>.context_token_budget` | Per model | How much repository content is sent with each request, in tokens | No |
 | `enable_semantic_search` | `false` | Embedding-based retrieval ([Semantic search](#semantic-search)) | Yes |
@@ -132,7 +132,7 @@ Damaian uses OpenAI-compatible chat APIs. Configure providers under **Settings �
 
 ### Adding a provider
 
-The **Providers** page lists your **Configured providers**, then **Popular providers** (OpenAI, DeepSeek, OpenAI compatible and Ollama) that you have not configured yet. **+ Connect** on a popular provider, or **New**, fills the **Provider details** form below:
+The **Providers** page lists your **Configured providers**, then **Popular providers** (OpenAI, DeepSeek, OpenRouter, OpenAI compatible, Ollama (local) and Ollama Cloud) that you have not configured yet. **+ Connect** on a popular provider, or **New**, fills the **Provider details** form below:
 
 - **Name** and **ID** identify the provider. Built-in providers keep their ID.
 - **Base URL** is the OpenAI-compatible API address.
@@ -142,6 +142,8 @@ The **Providers** page lists your **Configured providers**, then **Popular provi
 - **Max output tokens** and **Context budget** ([Output and Context Limits](#output-and-context-limits)).
 
 Select **Save Provider** to write it to your user config, or **Remove** to delete it. **Settings › Models** lists each configured provider's models, with **Configure** to open it here. Saving a provider does not make it the one chat uses: pick it in the composer's [model picker](#choosing-the-model-and-effort), or set `model_provider`.
+
+**Ollama (local)** uses `http://localhost:11434` and needs the [Ollama app](https://ollama.com/download) installed and running on this Mac. It does not check API keys, so you do not need to store one: leave **API Key** blank and keep the filled-in Keychain reference. **Ollama Cloud** uses `https://ollama.com`; create a key under **Keys** in your [ollama.com account settings](https://ollama.com/settings/keys), then paste it into **API Key**.
 
 ### The Model API Key panel
 
@@ -165,7 +167,7 @@ If the [effective policy view](#reading-the-effective-policy-view) still shows a
 
 ### Native tool-calling
 
-Turn on **Native tool-calling** for the provider in **Provider details** (or set `model_provider.<id>.supports_native_tools=true`). Built-in providers leave it off, and without it the assistant can answer questions but cannot propose file changes, make plans, or use [MCP](#mcp-servers) or any other tools.
+**Native tool-calling** is on by default for built-in and user-defined providers (or set `model_provider.<id>.supports_native_tools=false` to turn it off). With it the assistant can propose file changes, make plans, and use [MCP](#mcp-servers) and the other tools. Without it the assistant can answer questions but cannot do any of those. Turn it off only for a provider that does not implement the OpenAI tool-calling API reliably.
 
 ### Configuration examples
 
@@ -175,7 +177,7 @@ Every example below is user-scope configuration: enter it in Settings, or write 
 cargo run -p damaian-cli -- config-set user model_provider deepseek
 ```
 
-Naming a built-in provider fills in most of the setup. `model_provider=deepseek` or `model_provider=openai` sets the base URL, the default model, and the key variable for that provider; set the other keys only to override one of those. You still need to turn on [Native tool-calling](#native-tool-calling).
+Naming a built-in provider fills in most of the setup. `model_provider=deepseek`, `model_provider=openrouter`, or `model_provider=openai` sets the base URL, the default model, and the key variable for that provider; set the other keys only to override one of those. [Native tool-calling](#native-tool-calling) is on by default.
 
 Example DeepSeek configuration:
 
@@ -186,7 +188,7 @@ model_base_url=https://api.deepseek.com
 model_api_key_env=keychain:model-api-key
 ```
 
-The same pattern applies to OpenAI or any OpenAI-compatible provider.
+The same pattern applies to OpenAI, OpenRouter, or any OpenAI-compatible provider. OpenRouter defaults to `https://openrouter.ai/api/v1` with `anthropic/claude-sonnet-4.5`, `openai/gpt-4.1`, and `deepseek/deepseek-chat`; set `model_name` to use another model it serves.
 
 If an older configuration still names `deepseek-chat` or `deepseek-reasoner`, update it. Those were compatibility aliases that DeepSeek retired on 24 July 2026; the current models are `deepseek-v4-flash` and `deepseek-v4-pro`.
 
@@ -1366,7 +1368,7 @@ If model calls fail, open Settings and confirm the **Model API Key** status is *
 
 If the assistant announces a file change, such as `Let me create all the necessary files:`, but no patch appears, its reply was cut off at the model's output limit. Ask it to create fewer files at a time, or raise **Max output tokens** in **Provider details**. See [Output and Context Limits](#output-and-context-limits).
 
-If the assistant answers questions but never proposes file changes or uses MCP tools, turn on [Native tool-calling](#native-tool-calling) for the provider.
+If the assistant answers questions but never proposes file changes or uses MCP tools, check that [Native tool-calling](#native-tool-calling) is still on for the provider.
 
 If macOS warns that the app is from an unidentified developer, see [macOS Installation](./MACOS_INSTALLATION.md#install). A release build should never show that warning.
 

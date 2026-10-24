@@ -425,12 +425,7 @@ fn run() -> workspace_engine::Result<()> {
                     .chat_orchestrator
                     .ask(repo, &prompt, &[], &mut adapter, &mut on_token)?
             } else {
-                let api_key = env::var(&engine.config.model_api_key_env).map_err(|_| {
-                    workspace_engine::ClientError::InvalidInput(format!(
-                        "{} is required for live model calls. Set DAMAIAN_MOCK_MODEL_RESPONSE for local smoke tests.",
-                        engine.config.model_api_key_env
-                    ))
-                })?;
+                let api_key = live_model_api_key(&engine.config)?;
                 let transport = CurlModelTransport::new(
                     &engine.config.model_base_url,
                     api_key,
@@ -479,12 +474,7 @@ fn run() -> workspace_engine::Result<()> {
                     .edit_orchestrator
                     .propose_edit(repo, &prompt, &[], None, &mut adapter)?
             } else {
-                let api_key = env::var(&engine.config.model_api_key_env).map_err(|_| {
-                    workspace_engine::ClientError::InvalidInput(format!(
-                        "{} is required for live model calls. Set DAMAIAN_MOCK_MODEL_RESPONSE for local smoke tests.",
-                        engine.config.model_api_key_env
-                    ))
-                })?;
+                let api_key = live_model_api_key(&engine.config)?;
                 let transport = CurlModelTransport::new(
                     &engine.config.model_base_url,
                     api_key,
@@ -654,6 +644,21 @@ fn engine_for_repo(repo: &str) -> workspace_engine::Result<WorkspaceEngine> {
     Ok(WorkspaceEngine::new(Config::load_for_repository(Some(
         Path::new(repo),
     ))?))
+}
+
+/// The key for a live model call. A loopback endpoint such as local Ollama
+/// serves without credentials, so a missing reference becomes an empty key
+/// and the transport sends no `Authorization` header. A remote endpoint still
+/// fails loudly rather than sending an unauthenticated request.
+fn live_model_api_key(config: &Config) -> workspace_engine::Result<String> {
+    match env::var(&config.model_api_key_env) {
+        Ok(api_key) => Ok(api_key),
+        Err(_) if config.model_endpoint_is_loopback() => Ok(String::new()),
+        Err(_) => Err(workspace_engine::ClientError::InvalidInput(format!(
+            "{} is required for live model calls. Set DAMAIAN_MOCK_MODEL_RESPONSE for local smoke tests.",
+            config.model_api_key_env
+        ))),
+    }
 }
 
 /// What this repository's config asked for and did not get, and any

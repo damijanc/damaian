@@ -405,10 +405,10 @@ pub struct ModelProviderConfig {
     pub base_url: String,
     pub api_key_env: String,
     pub models: Vec<String>,
-    /// Opt-in: whether to use the provider's native `tools`/`tool_calls`
-    /// contract instead of the `DAMAIAN_COMMAND_V1` text envelope. Defaults
-    /// to false so existing providers are unaffected until explicitly
-    /// enabled.
+    /// Whether to use the provider's native `tools`/`tool_calls` contract
+    /// instead of the `DAMAIAN_COMMAND_V1` text envelope. Defaults to true;
+    /// set it to false for a provider that does not implement the contract
+    /// reliably.
     pub supports_native_tools: bool,
     /// Explicit `max_tokens` to send with every request to this provider.
     /// `None` omits the field and lets the provider apply its own default —
@@ -1794,8 +1794,8 @@ impl Config {
 
     /// Whether the active model provider is configured to use native
     /// `tools`/`tool_calls` instead of the `DAMAIAN_COMMAND_V1` text
-    /// envelope. Defaults to false for any provider that hasn't explicitly
-    /// opted in.
+    /// envelope. Defaults to true for every provider; an explicit
+    /// `supports_native_tools=false` opts out.
     pub fn supports_native_tools(&self) -> bool {
         self.model_provider_config(&self.model_provider)
             .cloned()
@@ -1815,6 +1815,14 @@ impl Config {
             .or_else(|| builtin_model_provider_config(&self.model_provider))
             .map(|provider| provider.supports_explicit_cache_breakpoints)
             .unwrap_or(false)
+    }
+
+    /// Whether the active model endpoint is a loopback address. Local
+    /// runtimes such as Ollama serve without credentials, so callers
+    /// resolving the API key may treat a missing key as empty rather than a
+    /// configuration error. Remote endpoints keep failing loudly.
+    pub fn model_endpoint_is_loopback(&self) -> bool {
+        crate::web_diagnostics::is_loopback_url(&self.model_base_url)
     }
 
     /// The explicit `max_tokens` to send for the active provider and model.
@@ -2054,7 +2062,7 @@ impl Config {
             base_url: overlay.base_url.unwrap_or_default(),
             api_key_env: overlay.api_key_env.unwrap_or_default(),
             models: overlay.models.unwrap_or_default(),
-            supports_native_tools: overlay.supports_native_tools.unwrap_or(false),
+            supports_native_tools: overlay.supports_native_tools.unwrap_or(true),
             max_output_tokens: overlay.max_output_tokens,
             context_token_budget: overlay.context_token_budget,
             provider_reports_usage: overlay.provider_reports_usage.unwrap_or(true),
@@ -3724,7 +3732,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
                 "gpt-4.1-mini".to_string(),
                 "o4-mini".to_string(),
             ],
-            supports_native_tools: false,
+            supports_native_tools: true,
             max_output_tokens: None,
             context_token_budget: None,
             provider_reports_usage: true,
@@ -3743,12 +3751,36 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
                 std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string()),
                 "deepseek-v4-pro".to_string(),
             ],
-            supports_native_tools: false,
+            supports_native_tools: true,
             // Fallback for a DeepSeek model not in `builtin_model_output_tokens`.
             // Deliberately the conservative legacy ceiling: an unrecognized
             // model may still be a legacy alias, and a too-small ceiling costs
             // an extra round trip whereas a too-large one is a hard API error.
             max_output_tokens: Some(8192),
+            context_token_budget: None,
+            provider_reports_usage: true,
+            price_per_million_input_tokens: None,
+            price_per_million_output_tokens: None,
+            price_per_million_cached_input_tokens: None,
+            supports_explicit_cache_breakpoints: false,
+        }),
+        "openrouter" => Some(ModelProviderConfig {
+            id: "openrouter".to_string(),
+            label: "OpenRouter".to_string(),
+            // OpenRouter publishes `/api/v1` as its base. The transport strips
+            // a trailing `/v1` before appending `/v1/chat/completions`, so
+            // both this and the bare `/api` form work.
+            base_url: std::env::var("OPENROUTER_BASE_URL")
+                .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string()),
+            api_key_env: "OPENROUTER_API_KEY".to_string(),
+            models: vec![
+                std::env::var("OPENROUTER_MODEL")
+                    .unwrap_or_else(|_| "anthropic/claude-sonnet-4.5".to_string()),
+                "openai/gpt-4.1".to_string(),
+                "deepseek/deepseek-chat".to_string(),
+            ],
+            supports_native_tools: true,
+            max_output_tokens: None,
             context_token_budget: None,
             provider_reports_usage: true,
             price_per_million_input_tokens: None,
@@ -3762,7 +3794,7 @@ fn builtin_model_provider_config(id: &str) -> Option<ModelProviderConfig> {
             base_url: "https://api.openai.com".to_string(),
             api_key_env: "OPENAI_API_KEY".to_string(),
             models: vec!["configured-model".to_string()],
-            supports_native_tools: false,
+            supports_native_tools: true,
             max_output_tokens: None,
             context_token_budget: None,
             provider_reports_usage: true,
@@ -3844,7 +3876,10 @@ fn parse_price(provider_key: &str, value: &str) -> Result<f64> {
 }
 
 fn is_builtin_model_provider(id: &str) -> bool {
-    matches!(id, "openai" | "deepseek" | "openai-compatible")
+    matches!(
+        id,
+        "openai" | "deepseek" | "openrouter" | "openai-compatible"
+    )
 }
 
 fn push_model_provider_config(output: &mut String, provider: &ModelProviderConfig) {
@@ -4148,6 +4183,7 @@ pub fn normalize_model_provider(value: &str) -> Result<String> {
     let provider = match normalized.as_str() {
         "open-ai" | "openai" => "openai".to_string(),
         "deep-seek" | "deepseek" | "deedseek" => "deepseek".to_string(),
+        "open-router" | "openrouter" => "openrouter".to_string(),
         "custom" | "openai-compatible" | "open-ai-compatible" => "openai-compatible".to_string(),
         "" => {
             return Err(ClientError::InvalidInput(

@@ -4901,6 +4901,70 @@ fn config_overlay_applies_provider_defaults_and_reasoning_level() {
 }
 
 #[test]
+fn openrouter_builtin_provider_resolves_its_endpoint_key_and_models() {
+    let mut config = Config::default();
+    config.apply_overlay(
+        ConfigOverlay::parse(
+            "model_provider=openrouter\n\
+             model_provider.openrouter.label=OpenRouter\n",
+        )
+        .unwrap(),
+    );
+
+    assert_eq!(config.model_provider, "openrouter");
+    assert_eq!(config.model_base_url, "https://openrouter.ai/api/v1");
+    assert_eq!(config.model_api_key_env, "OPENROUTER_API_KEY");
+    assert_eq!(config.model_name, "anthropic/claude-sonnet-4.5");
+    assert!(config.supports_native_tools());
+
+    let provider = config
+        .model_provider_config("openrouter")
+        .expect("the partial overlay is seeded from the built-in entry");
+    assert_eq!(
+        provider.models,
+        vec![
+            "anthropic/claude-sonnet-4.5".to_string(),
+            "openai/gpt-4.1".to_string(),
+            "deepseek/deepseek-chat".to_string(),
+        ]
+    );
+    assert!(provider.provider_reports_usage);
+}
+
+#[test]
+fn a_user_defined_provider_defaults_to_native_tool_calling() {
+    let mut config = Config::default();
+    config.apply_overlay(
+        ConfigOverlay::parse(
+            "model_provider=acme\n\
+             model_provider.acme.base_url=https://acme.example.test\n\
+             model_provider.acme.api_key_env=ACME_API_KEY\n\
+             model_provider.acme.models=acme-1\n",
+        )
+        .unwrap(),
+    );
+
+    assert!(config.supports_native_tools());
+}
+
+#[test]
+fn an_explicit_native_tool_opt_out_is_kept() {
+    let mut config = Config::default();
+    config.apply_overlay(
+        ConfigOverlay::parse(
+            "model_provider=acme\n\
+             model_provider.acme.base_url=https://acme.example.test\n\
+             model_provider.acme.api_key_env=ACME_API_KEY\n\
+             model_provider.acme.models=acme-1\n\
+             model_provider.acme.supports_native_tools=false\n",
+        )
+        .unwrap(),
+    );
+
+    assert!(!config.supports_native_tools());
+}
+
+#[test]
 fn provider_usage_reporting_defaults_on_and_can_be_turned_off() {
     // On by default so a provider that supports the standard field is measured
     // without the user configuring anything; off is the escape hatch for one

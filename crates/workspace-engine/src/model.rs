@@ -577,14 +577,30 @@ impl CurlModelTransport {
     }
 
     fn chat_completions_url(&self) -> String {
-        format!("{}/v1/chat/completions", self.base_url)
+        // Tolerate a base URL that already names the OpenAI-compatible
+        // version, such as OpenRouter's `/api/v1`. Without this, a provider's
+        // published base would be sent to `/v1/v1/chat/completions`.
+        let base = self.base_url.trim_end_matches('/');
+        let base = base.strip_suffix("/v1").unwrap_or(base);
+        format!("{base}/v1/chat/completions")
     }
 
     fn curl_config(&self, request_body: &str, header_path: &Path) -> String {
+        // Local runtimes such as Ollama serve without credentials. An empty
+        // key means "send no Authorization header", not "Bearer " with
+        // nothing after it.
+        let authorization = if self.api_key.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "header = \"authorization: Bearer {}\"\n",
+                escape_curl_config_value(&self.api_key)
+            )
+        };
         format!(
-            "request = \"POST\"\nurl = \"{}\"\nheader = \"content-type: application/json\"\nheader = \"authorization: Bearer {}\"\ndata-binary = \"{}\"\ndump-header = \"{}\"\nconnect-timeout = {CONNECT_TIMEOUT_SECS}\nspeed-limit = 1\nspeed-time = {STALL_TIMEOUT_SECS}\nmax-time = {MAX_TIME_SECS}\n",
+            "request = \"POST\"\nurl = \"{}\"\nheader = \"content-type: application/json\"\n{}data-binary = \"{}\"\ndump-header = \"{}\"\nconnect-timeout = {CONNECT_TIMEOUT_SECS}\nspeed-limit = 1\nspeed-time = {STALL_TIMEOUT_SECS}\nmax-time = {MAX_TIME_SECS}\n",
             escape_curl_config_value(&self.chat_completions_url()),
-            escape_curl_config_value(&self.api_key),
+            authorization,
             escape_curl_config_value(request_body),
             escape_curl_config_value(&header_path.display().to_string())
         )
@@ -2201,6 +2217,51 @@ mod tests {
         assert!(
             config.contains("data-binary = \"{\\\"model\\\":\\\"test\\\",\\\"messages\\\":[]}\"")
         );
+    }
+
+    // Some providers publish a base that already names `/v1`; OpenRouter is
+    // one. Appending the full `/v1/chat/completions` blindly doubled the
+    // version segment and sent the request to `/v1/v1/chat/completions`.
+    #[test]
+    fn chat_completions_url_tolerates_a_base_url_that_already_names_a_version() {
+        for (base, expected) in [
+            (
+                "https://openrouter.ai/api/v1",
+                "https://openrouter.ai/api/v1/chat/completions",
+            ),
+            (
+                "https://openrouter.ai/api/v1/",
+                "https://openrouter.ai/api/v1/chat/completions",
+            ),
+            (
+                "http://localhost:11434/",
+                "http://localhost:11434/v1/chat/completions",
+            ),
+            (
+                "https://api.example.test",
+                "https://api.example.test/v1/chat/completions",
+            ),
+        ] {
+            let transport = CurlModelTransport::new(base, "key", test_registry(), test_data_dir());
+            assert_eq!(transport.chat_completions_url(), expected, "base {base}");
+        }
+    }
+
+    // Local runtimes such as Ollama serve without credentials. Sending
+    // `Bearer ` with nothing after it is not an API key, and some local
+    // servers reject it.
+    #[test]
+    fn an_empty_api_key_sends_no_authorization_header() {
+        let transport = CurlModelTransport::new(
+            "http://localhost:11434",
+            "",
+            test_registry(),
+            test_data_dir(),
+        );
+        let config = transport.curl_config("{}", Path::new("h.headers"));
+
+        assert!(!config.contains("authorization:"));
+        assert!(config.contains("content-type: application/json"));
     }
 
     /// A scratch data directory, so constructing a transport never writes into

@@ -75,8 +75,9 @@ API keys under your control.
 
 - A Mac with Apple Silicon, running macOS 14 (Sonoma) or newer
 - Git installed and on your `PATH`
-- An API key for a supported model provider (OpenAI, DeepSeek, or any
-  OpenAI-compatible endpoint), or a local Ollama
+- An API key for a supported model provider (OpenAI, DeepSeek, OpenRouter,
+  Ollama Cloud, or any OpenAI-compatible endpoint), or the Ollama app for local
+  models
 
 No Node.js runtime is required to run the packaged app.
 
@@ -93,8 +94,8 @@ No Node.js runtime is required to run the packaged app.
 
 1. Open Damaian and select `+` beside **Projects** to pick a local Git
    repository.
-2. Open **Settings** (`⌘,`), add your model provider details, turn on
-   **Native tool-calling** for the provider, and use the **Model API Key**
+2. Open **Settings** (`⌘,`), add your model provider details, leave
+   **Native tool-calling** on (the default), and use the **Model API Key**
    controls to store your key in the Keychain. Without native tool-calling the
    assistant can answer questions but cannot propose file changes.
 3. Ask a question about the repository in the conversation, or request a change

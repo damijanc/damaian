@@ -755,7 +755,8 @@ pub(crate) struct WorkerRequest<'a> {
 }
 
 /// Every worker route (tasks.md, Interfaces). `api_key` resolves the model key
-/// for a spawn or restart; the shell passes `resolve_model_api_key`.
+/// for a spawn or restart; the shell passes `resolve_shell_model_api_key`,
+/// which allows an empty key for a loopback runtime.
 ///
 /// With `enable_worker_sessions` off, everything refuses except the list,
 /// which keeps running workers reachable (§5.0), and the setting's own read.

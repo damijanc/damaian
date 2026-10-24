@@ -98,6 +98,8 @@ Prompts and the context Damaian assembles go to the model provider you configure
 
 The provider API key is stored in the macOS Keychain under the service `DamaianClient`, or read from an environment variable you name. Config holds only a reference to it (`keychain:<account>` or the variable's name), never the key itself.
 
+A loopback provider such as Ollama (local) may run without a key. When the reference resolves to nothing on a loopback endpoint, Damaian sends no `Authorization` header instead of refusing the request. A missing key is tolerated only for a loopback endpoint; every non-loopback endpoint still requires one.
+
 ## Git Read Hardening
 
 Every git read — `read_git_status`, `read_git_diff`, `read_git_log` and

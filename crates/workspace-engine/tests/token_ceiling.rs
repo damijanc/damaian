@@ -126,12 +126,13 @@ fn a_turn_stops_before_the_call_that_would_cross_the_ceiling() {
     // point of this ceiling is that it does *not* spend a call to discover it
     // has run out, and only the exact number can say so.
     //
-    // 2, measured rather than assumed: the check runs before each request is
-    // built, and two calls now accumulate enough estimated usage to cross the
-    // 1000-token ceiling, so the third iteration stops before its request is
-    // built. This was 3 before spec 63 requirement 7 named the shell in the
-    // system prompt — a slightly longer prompt crosses sooner. The
-    // `force_final` shape would make it 3. If this number moves, check *why*
+    // 1, measured rather than assumed: the check runs before each request is
+    // built. Native tool-calling is on by default now, so the first request
+    // already carries the tool definitions and crosses the 1000-token ceiling;
+    // the second iteration stops before its request is built. This was 2 before
+    // that default changed, and 3 before spec 63 requirement 7 named the shell
+    // in the system prompt — a slightly longer prompt crosses sooner. The
+    // `force_final` shape would make it 2. If this number moves, check *why*
     // before updating it — a change here is a change in what the ceiling
     // costs.
     let repo = temp_repo("stops");
@@ -140,7 +141,7 @@ fn a_turn_stops_before_the_call_that_would_cross_the_ceiling() {
 
     assert_eq!(result.task.status, TaskStatus::TokenBudgetExhausted);
     assert_eq!(
-        calls, 2,
+        calls, 1,
         "the ceiling must not spend a model call discovering it was reached"
     );
 }

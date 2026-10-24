@@ -47,7 +47,7 @@ const projectsCollapsedStorageKey = "damaian:projectsCollapsed";
 const pinnedContextStoragePrefix = "damaian:pinnedContextFiles";
 const chatModelPrefsStoragePrefix = "damaian:chatModelPrefs";
 
-const builtInProviderIds = ["openai", "deepseek", "openai-compatible"];
+const builtInProviderIds = ["openai", "deepseek", "openrouter", "openai-compatible"];
 const builtInProviderIdSet = new Set(builtInProviderIds);
 const builtInModelProviderPresets = {
   openai: {
@@ -63,6 +63,13 @@ const builtInModelProviderPresets = {
     apiKeyEnv: "DEEPSEEK_API_KEY",
     defaultModel: "deepseek-v4-flash",
     models: ["deepseek-v4-flash", "deepseek-v4-pro"],
+  },
+  openrouter: {
+    label: "OpenRouter",
+    baseUrl: "https://openrouter.ai/api/v1",
+    apiKeyEnv: "OPENROUTER_API_KEY",
+    defaultModel: "anthropic/claude-sonnet-4.5",
+    models: ["anthropic/claude-sonnet-4.5", "openai/gpt-4.1", "deepseek/deepseek-chat"],
   },
   "openai-compatible": {
     label: "Custom",
@@ -96,17 +103,30 @@ const popularProviderPresets = [
     description: "DeepSeek chat and reasoning models",
   },
   {
+    id: "openrouter",
+    label: "OpenRouter",
+    description: "Many models through one API key",
+  },
+  {
     id: "openai-compatible",
     label: "OpenAI compatible",
     description: "Custom hosted compatible endpoint",
   },
   {
-    id: "ollama",
-    label: "Ollama",
-    description: "Local OpenAI-compatible runtime",
-    baseUrl: "http://localhost:11434/v1",
-    apiKeyEnv: "keychain:ollama-api-key",
+    id: "ollama-local",
+    label: "Ollama (local)",
+    description: "Local models on this Mac",
+    baseUrl: "http://localhost:11434",
+    apiKeyEnv: "keychain:ollama-local-api-key",
     models: ["llama3.1", "qwen2.5-coder"],
+  },
+  {
+    id: "ollama-cloud",
+    label: "Ollama Cloud",
+    description: "Hosted models on ollama.com",
+    baseUrl: "https://ollama.com",
+    apiKeyEnv: "keychain:ollama-cloud-api-key",
+    models: ["gpt-oss:120b", "qwen3-coder:480b", "deepseek-v3.1:671b"],
   },
 ];
 
@@ -2624,6 +2644,7 @@ function normalizeChatProvider(value) {
   if (provider === "deep-seek" || provider === "deepseek" || provider === "deedseek") {
     return "deepseek";
   }
+  if (provider === "open-router" || provider === "openrouter") return "openrouter";
   if (
     provider === "custom" ||
     provider === "open-ai-compatible" ||
@@ -2745,7 +2766,7 @@ function syncProviderCatalogFromPolicy(policyText) {
       apiKeyEnv: provider.apiKeyEnv || existing.apiKeyEnv || "",
       defaultModel: models[0] || existing.defaultModel || "",
       models,
-      supportsNativeTools: provider.supportsNativeTools ?? existing.supportsNativeTools ?? false,
+      supportsNativeTools: provider.supportsNativeTools ?? existing.supportsNativeTools ?? true,
       // Blank means "use the built-in per-model default", which only the
       // engine knows, so the UI carries the value through untouched rather
       // than substituting a number of its own.
@@ -3104,7 +3125,7 @@ function renderProviderConfigForm(providerId = $("provider-config-select").value
   $("provider-key-ref-input").value = provider.apiKeyEnv || `keychain:${id}-api-key`;
   $("provider-api-key-input").value = "";
   $("provider-models-input").value = (provider.models || []).join("\n");
-  $("provider-native-tools-input").checked = provider.supportsNativeTools === true;
+  $("provider-native-tools-input").checked = provider.supportsNativeTools !== false;
   $("provider-max-output-tokens-input").value = provider.maxOutputTokens || "";
   $("provider-context-budget-input").value = provider.contextTokenBudget || "";
   $("provider-remove-btn").disabled = !configuredProviderIds.has(id);
@@ -3120,7 +3141,7 @@ function clearProviderConfigForm() {
   $("provider-key-ref-input").value = "keychain:";
   $("provider-api-key-input").value = "";
   $("provider-models-input").value = "";
-  $("provider-native-tools-input").checked = false;
+  $("provider-native-tools-input").checked = true;
   $("provider-max-output-tokens-input").value = "";
   $("provider-context-budget-input").value = "";
   $("provider-remove-btn").disabled = true;
